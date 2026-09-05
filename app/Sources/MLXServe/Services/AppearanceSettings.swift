@@ -13,12 +13,78 @@ enum InterfacePrefKey {
     static let accentColor = "accentColorName"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
+    static let chatColumn = "chatColumnWidth"
     /// Default `TerminalTheme` id for new sandbox terminals; a session can
     /// override it from its row's context menu.
     static let terminalTheme = "terminalTheme"
     /// "#RRGGBB" ground painted under the default terminal theme; "" = the
     /// theme's own.
     static let terminalBackground = "terminalBackground"
+}
+
+/// How wide a conversation reads, as a fraction of the SCREEN rather than of
+/// the window.
+///
+/// Measuring the screen is what makes the setting mean something: the reading
+/// width becomes a physical constant the eye can learn, and resizing the window
+/// eats the margins rather than reflowing every line. Shrink the window past
+/// the setting's own width and the text starts wrapping to the window instead,
+/// because there is nothing left to give.
+enum ChatColumnWidth: String, CaseIterable, Identifiable {
+    case narrow, medium, wide
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .narrow: return "Narrow"
+        case .medium: return "Medium"
+        case .wide: return "Wide"
+        }
+    }
+    /// The reading width in POINTS, or nil for "let the window decide"
+    /// (`ChatMetrics.contentWidthFraction` of it, not the whole thing).
+    ///
+    /// Points rather than a fraction of anything: a reading measure is a
+    /// physical property of text, not of the furniture around it. 840 is
+    /// roughly 60 characters at the default size, 1260 half again as much.
+    var proseWidth: CGFloat? {
+        switch self {
+        case .narrow: return 840
+        case .medium: return 1260
+        case .wide: return nil
+        }
+    }
+
+    /// How wide your own turn may get before it wraps.
+    ///
+    /// Narrower than the column it sits in, because a right-aligned bubble that
+    /// reaches the same left edge as the reply below it stops reading as one
+    /// side of a conversation. It stops growing at Medium: past that the
+    /// question is already a paragraph, and a wider one only makes the ragged
+    /// left edge harder to follow back to.
+    var userBubbleWidth: CGFloat {
+        switch self {
+        case .narrow: return 700
+        case .medium, .wide: return 900
+        }
+    }
+
+    /// F1 / F2 / F3, narrowest first, in View ▸ Interface.
+    ///
+    /// Spelled as the raw function-key scalars because `KeyEquivalent` has no
+    /// named cases for them; these are AppKit's `NSF1FunctionKey` and its two
+    /// successors. Unmodified, since the menu is where they are discoverable
+    /// and nothing else in the app claims a bare function key.
+    var menuShortcut: KeyEquivalent {
+        switch self {
+        case .narrow: return KeyEquivalent("\u{F704}")
+        case .medium: return KeyEquivalent("\u{F705}")
+        case .wide: return KeyEquivalent("\u{F706}")
+        }
+    }
+
+    static var current: ChatColumnWidth {
+        ChatColumnWidth(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.chatColumn) ?? "") ?? .wide
+    }
 }
 
 enum AppAppearanceMode: String, CaseIterable, Identifiable {

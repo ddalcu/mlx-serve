@@ -1801,6 +1801,10 @@ struct ChatDetailView: View {
     // on the row stack, which is what forces the rebuild.
     @AppStorage(InterfacePrefKey.textSize) private var interfaceTextSize = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var interfaceCompact = false
+    /// Read here only to re-render the transcript when it changes: the indents
+    /// are baked into cached attributed strings, so the rows have to be rebuilt
+    /// rather than re-laid-out.
+    @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
@@ -1850,8 +1854,10 @@ struct ChatDetailView: View {
 
     /// The shared reading measure all three capped sites (transcript,
     /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
+    /// Settings ▸ Interface ▸ Chat Column: the reading column every capped
+    /// site shares - transcript, composer and the empty-state greeting.
     private var contentWidth: CGFloat {
-        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+        ChatMetrics.proseWidth(panelWidth: columnWidth)
     }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
@@ -2459,8 +2465,10 @@ struct ChatDetailView: View {
                                         ? { appState.forkSession(sessionId, from: m.id) }
                                         : nil)
                                 .id(m.id)
-                            case .toolCall(let call, let results):
-                                ToolCallRow(call: call, results: results).id(call.id)
+                            case .toolCall(let call, let results, let calls, let owned):
+                                ToolCallRow(call: call, results: results, calls: calls,
+                                            ownedHandles: owned,
+                                            sessionId: sessionId).id(call.id)
                             }
                         }
                         // Live media generation, under the tool-call row that
@@ -2481,7 +2489,7 @@ struct ChatDetailView: View {
                     // @AppStorage pair above). Only fires on a Settings edit —
                     // the transcript isn't even visible then (Settings is a
                     // mode of this window), so the scroll reset is unseen.
-                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)")
+                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -3917,6 +3925,10 @@ struct MessageBubble: View {
     /// new chat and this one is left alone. nil when there would be nothing to
     /// fork (`ChatFork.isForkable`) or on a read-only surface.
     var onFork: (() -> Void)?
+    /// Drives the action row on your own turn AND under a reply. Tracked on the
+    /// whole row, not on the buttons: they start invisible, and a hover target
+    /// you cannot see is one you cannot aim at.
+    @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3937,31 +3949,61 @@ struct MessageBubble: View {
         }
     }
 
-    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
-    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
-    /// label, so the "Thinking" text was a dead click target — same fix as the
-    /// Agents editor's Advanced row (the label holds no buttons of its own, so
-    /// a tap gesture here can't swallow child clicks).
+    /// Still working on the reasoning itself: the reply has not started, so the
+    /// brain is what the model is currently doing rather than a record of what
+    /// it did.
+    private var isThinkingNow: Bool {
+        message.isStreaming && message.content.isEmpty
+    }
+
+    /// Reasoning accordion. Hand-built rather than a `DisclosureGroup`, which
+    /// puts its chevron on the LEADING edge and offers no way to move it.
+    /// Everything else follows from that: the header is a plain button spanning
+    /// the full width, so the WHOLE strip toggles rather than just the words —
+    /// macOS hit-tests only the disclosure triangle on a `DisclosureGroup`'s
+    /// label, which left "Thinking" a dead click target.
     @ViewBuilder
     private var thinkingBlock: some View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-            DisclosureGroup(isExpanded: $thinkingExpanded) {
-                Text(reasoning)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Thinking", systemImage: "brain")
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain")
+                            .symbolEffect(.pulse, isActive: isThinkingNow)
+                        // Just "Thinking" while it happens; the duration
+                        // arrives with the answer.
+                        Text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds))
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
+                    }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
+                    // The strip is mostly empty space, and empty space in a
+                    // stack has nothing to hit-test against.
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
-                    }
+                }
+                .buttonStyle(.plain)
+
+                if thinkingExpanded {
+                    Text(reasoning)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .padding(8)
-            .background(.quaternary.opacity(0.5))
+            // Padding and fill arrive WITH the content. Collapsed, this is one
+            // grey line of type in the transcript rather than a container, so
+            // the chevron sits at the column's own edge instead of one padding
+            // short of it.
+            .padding(.horizontal, thinkingExpanded ? ChatMetrics.bubblePaddingH : 0)
+            .padding(.vertical, thinkingExpanded ? ChatMetrics.bubblePaddingV : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(thinkingExpanded ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                         : AnyShapeStyle(Color.clear))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
@@ -3971,7 +4013,6 @@ struct MessageBubble: View {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                // Reasoning (collapsible)
                 thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
@@ -3983,7 +4024,7 @@ struct MessageBubble: View {
                 // it is the original the generator wrote, not a re-encode.
                 if let images = message.images, !images.isEmpty,
                    message.media?.contains(where: { $0.kind == .image }) != true {
-                    HStack(spacing: 4) {
+                    AttachmentFlowLayout(spacing: ChatMetrics.attachmentSpacing) {
                         ForEach(images) { img in
                             // No bytes: the file under `attachments/` is gone,
                             // or this message predates attachments on disk and
@@ -3998,16 +4039,27 @@ struct MessageBubble: View {
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
                             } else if let nsImage = NSImage(data: img.data) {
+                                // One height, width from the picture's own
+                                // ratio, and `.fill` so the frame is covered
+                                // rather than letterboxed — the rounded corners
+                                // clip the FRAME, so a letterboxed picture
+                                // would leave them cutting empty space and the
+                                // photo itself square.
                                 Image(nsImage: nsImage)
                                     .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 400, maxHeight: 300)
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
+                                           height: ChatMetrics.attachmentHeight)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                     .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
                                     .help("Double-click to open in Preview")
                             }
                         }
                     }
+                    // The whole column, not the bubble's reading measure: how
+                    // many photos fit on a line has nothing to do with how long
+                    // a line of text should be.
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
                 // Generated tracks / clips, attached by path (see ChatMediaRef).
@@ -4092,7 +4144,13 @@ struct MessageBubble: View {
                     .background(bubbleBackground)
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
-                    .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
+                    // The bubble's OWN cap, so its text wraps at a reading
+                    // measure while a row of attachments above it may be wider.
+                    // Applied here rather than to the text: the bubble hugs its
+                    // content, and a frame on the text itself would stretch a
+                    // one-line question across the whole width.
+                    .frame(maxWidth: message.role == .user ? ChatMetrics.userBubbleMaxWidth : .infinity,
+                           alignment: isBare ? .leading : .trailing)
                 }
 
                 // A cut reply's notice: DATA on the message, drawn as a footnote
@@ -4116,10 +4174,47 @@ struct MessageBubble: View {
                 }
 
                 if showsFooter { footer }
+                if showsUserActions { userActions }
             }
+            // Compact draws no action row on YOUR turn, so the space it would
+            // have taken is partly given back explicitly — without it your
+            // question sits flush against the reply to it. A reply gets air of
+            // its own, because the gap that separates two turns is the one
+            // after an answer, not the one inside a question-and-answer pair.
+            //
+            // Keyed on the FOOTER, not on the role: a turn is several rows (a
+            // reasoning-only message whose output was tool calls, the tool
+            // card, then the reply), and paying the gap per assistant ROW put
+            // it under a bare thinking block too — an unexplained hole in the
+            // middle of one answer.
+            .padding(.bottom, message.role == .user
+                     ? ChatMetrics.userBubbleBottomPadding
+                     : (showsFooter ? ChatMetrics.assistantTurnBottomPadding : 0))
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
+            // The column, not a cap: the two things inside a user turn take
+            // their own widths (the bubble a reading measure, a row of
+            // attachments as much as it can use), and capping here would put
+            // the narrower of the two in charge of both.
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
 
-            if message.role == .assistant { Spacer(minLength: 60) }
+            // No spacer on the assistant's side. A reply IS the column: the
+            // user picks its width in Settings ▸ Interface, so an extra 60pt
+            // inside it was a margin on top of a margin — and it was what kept
+            // the reasoning block's chevron short of the edge. Generated media
+            // and the progress card carry their own fixed widths (400/420 in
+            // `ChatMediaAttachmentView`), so nothing here was relying on it.
+            //
+            // Your own turn keeps its spacer: that one separates the two sides
+            // of the conversation rather than trimming an edge.
         }
+        // A stack with no background has nothing to hit-test against, so the
+        // hover ended wherever the bubble did — including over the action row,
+        // which is transparent until hovered. Moving towards the buttons made
+        // them vanish.
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
             if onEdit != nil {
@@ -4218,6 +4313,7 @@ struct MessageBubble: View {
     /// bubble.
     private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
 
+
     private var bubbleBackground: Color {
         if isBare { return .clear }
         return message.role == .user ? Color.accentColor : Color(.controlBackgroundColor)
@@ -4230,25 +4326,22 @@ struct MessageBubble: View {
             && !message.isAgentSummary && !message.content.isEmpty
     }
 
-    /// Timestamp and token stats on the left, actions pinned to the right.
+    /// One left-aligned strip under a reply: when it was written, what you can
+    /// do to it, and how fast it came.
+    ///
+    /// Left, like every other row in the transcript — the reply IS the column,
+    /// so pinning its controls to the far right left them stranded next to
+    /// nothing. The two facts are pills that stay legible at rest and open on
+    /// hover, so the strip is short until you ask it for more.
+    ///
+    /// The buttons hold their height in BOTH densities and only their opacity
+    /// changes: your own turn can drop its row in compact (the context menu
+    /// still has everything), but a reply's row also carries Regenerate and
+    /// Continue, which have no other home on the face of the transcript.
     private var footer: some View {
-        HStack(spacing: 8) {
-            Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            if let tps = message.tokensPerSecond, tps > 0 {
-                Label("\(Int(tps)) tokens/sec", systemImage: "gauge.with.needle")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            if let completion = message.completionTokens {
-                Text("(\(completion) tokens)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Spacer(minLength: 8)
+        HStack(spacing: 6) {
+            StatPill(text: message.timestamp.formatted(date: .omitted, time: .shortened),
+                     expanded: message.timestamp.formatted(date: .numeric, time: .shortened))
 
             // Which version of this reply you are reading. Left of the actions
             // because it is a statement about the text above it, not another
@@ -4276,7 +4369,7 @@ struct MessageBubble: View {
             }
 
             HStack(spacing: 2) {
-                footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
@@ -4305,16 +4398,76 @@ struct MessageBubble: View {
                                  action: onDelete)
                 }
             }
+            // Always visible, unlike your own turn's row. A reply's actions
+            // include Regenerate and Continue, which have no other home on the
+            // face of the transcript — and hiding them behind hover made the
+            // strip flicker as the pointer crossed the column.
+
+            if let tps = message.tokensPerSecond, tps > 0 {
+                StatPill(text: "\(Int(tps)) tok/sec",
+                         expanded: message.completionTokens.map {
+                             "\(Int(tps)) tok/sec (\($0) tokens)"
+                         } ?? "\(Int(tps)) tok/sec")
+            }
+
+            Spacer(minLength: 0)
         }
         .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
-        .padding(.top, 2)
+        // A paragraph's worth of air over the strip, so it reads as a footnote
+        // to the reply rather than as its last line. Compact keeps the hairline
+        // gap — that is the density it was asked for.
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
     }
 
-    private func footerButton(_ icon: String, help: String,
+
+    /// Your own turn had these four only in a context menu, which is a place
+    /// nobody looks unless they already suspect something is there. The reply
+    /// below has carried the same actions on its face all along.
+    ///
+    /// Hidden in compact mode rather than faded: compact exists to fit more
+    /// conversation on screen, and a row that is invisible but still occupies
+    /// its height would take that back. The context menu keeps working, so
+    /// nothing becomes unreachable.
+    private var showsUserActions: Bool {
+        message.role == .user && !message.isStreaming && !ChatMetrics.compactMode
+    }
+
+    /// Revealed on hover over the whole turn - bubble, attachments and this row
+    /// together - because a control that appears only once the pointer is
+    /// already on top of it cannot be discovered by moving towards it.
+    private var userActions: some View {
+        HStack(spacing: 2) {
+            footerButton("square.on.square", help: "Copy this message") { copyMessage() }
+            if onEdit != nil {
+                footerButton("pencil", help: "Edit this message and send it again") { startEditing() }
+            }
+            if let onFork {
+                // Flipped: the built-in glyph branches downward, and this
+                // branches BACK from a message already above you.
+                footerButton("arrow.trianglehead.branch",
+                             help: "Start a new chat from this message",
+                             flipped: true, action: onFork)
+            }
+            if let onDelete {
+                footerButton("trash", help: "Delete this message from the conversation",
+                             action: onDelete)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.top, 2)
+        .opacity(isHovered ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+        // Nothing to click while invisible: a fully faded row would otherwise
+        // still swallow clicks meant for the transcript behind it.
+        .allowsHitTesting(isHovered)
+    }
+
+    private func footerButton(_ icon: String, help: String, flipped: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
+                .scaleEffect(y: flipped ? -1 : 1)
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 18)
                 .contentShape(Rectangle())
@@ -4329,17 +4482,81 @@ struct MessageBubble: View {
     }
 }
 
+/// A fact about a reply — when it was written, how fast it came — short at
+/// rest and complete on hover.
+///
+/// The full version floats ABOVE THE POINTER like a tooltip rather than growing
+/// in place: a pill that widens pushes the buttons beside it sideways, and a
+/// button that moves the moment you approach it is a button you miss. It needs
+/// its own opaque ground because the resting tint is nearly invisible by
+/// design, and the strip underneath would otherwise read through it.
+private struct StatPill: View {
+    let text: String
+    let expanded: String
+
+    @State private var pointer: CGPoint?
+
+    var body: some View {
+        label(text)
+            // Continuous, not `onHover`: the position is the point of it.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location): pointer = location
+                case .ended: pointer = nil
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if let pointer {
+                    label(expanded)
+                        .background(Color(nsColor: .textBackgroundColor), in: Capsule())
+                        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+                        .fixedSize()
+                        // Above the pointer and slightly left of it, so the
+                        // cursor never sits on top of the text it revealed.
+                        .offset(x: pointer.x - 10, y: -24)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            // Later siblings draw over earlier ones, so without this the
+            // buttons paint on top of the pill that just opened.
+            .zIndex(pointer == nil ? 0 : 1)
+    }
+
+    private func label(_ string: String) -> some View {
+        Text(string)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.secondary.opacity(0.1), in: Capsule())
+    }
+}
+
 // MARK: - Tool-call grouping (collapse call + result into one collapsible row)
 
 /// A renderable transcript row: a normal message, or a tool call paired with its
 /// result(s) so they show as a single collapsible row instead of two bubbles.
 enum ChatRow: Identifiable, Equatable {
     case message(ChatMessage)
-    case toolCall(call: ChatMessage, results: [ChatMessage])
+    /// `calls` is the STRUCTURED record from the assistant message that made
+    /// the call — it lives one message earlier than the summary this row is
+    /// keyed on, so the builder carries it across. Empty for a history written
+    /// before the calls were recorded; the card falls back to the summary text.
+    /// `ownedHandles` are the background handles this row may still speak for.
+    ///
+    /// Handles are reused: the registry starts again at `bg1` every launch, so
+    /// asking it "is bg1 alive?" made every OLD card claiming bg1 light up as
+    /// running — a card from last week offering to kill a process started
+    /// today. The LAST row to announce a handle owns it; earlier ones show
+    /// nothing.
+    case toolCall(call: ChatMessage, results: [ChatMessage], calls: [SerializedToolCall],
+                  ownedHandles: [String])
     var id: UUID {
         switch self {
         case .message(let m): return m.id
-        case .toolCall(let c, _): return c.id
+        case .toolCall(let c, _, _, _): return c.id
         }
     }
 }
@@ -4411,15 +4628,28 @@ enum ChatRowBuilder {
         let visible = messages.filter { $0.toolCallId == nil }
         var rows: [ChatRow] = []
         var i = 0
+        // The structured calls ride the assistant message that MADE them, which
+        // is the one before the summary. Held here so the card can show the
+        // arguments as the model sent them instead of re-reading the string the
+        // engine flattened them into.
+        var pendingCalls: [SerializedToolCall] = []
+        // Which message owns each handle: the LAST one to announce it. The
+        // registry hands out `bg1` again on the next launch, so without this a
+        // week-old card claims whatever `bg1` happens to be today.
+        let owned = ProcessCardControls.handleOwnership(
+            visible.map { ($0.id, $0.processHandles ?? []) })
         while i < visible.count {
             let m = visible[i]
+            if let calls = m.toolCalls, !calls.isEmpty { pendingCalls = calls }
             if isCallSummary(m) {
                 var results: [ChatMessage] = []
                 var j = i + 1
                 while j < visible.count, isResultSummary(visible[j]) {
                     results.append(visible[j]); j += 1
                 }
-                rows.append(.toolCall(call: m, results: results))
+                rows.append(.toolCall(call: m, results: results, calls: pendingCalls,
+                                      ownedHandles: owned[m.id] ?? []))
+                pendingCalls = []
                 i = j
             } else {
                 rows.append(.message(m))
@@ -4435,45 +4665,117 @@ enum ChatRowBuilder {
 private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
+    /// The structured record, from the message that made the call. Empty on an
+    /// older history, where the summary text is all there is.
+    var calls: [SerializedToolCall] = []
+    /// Handles this row still speaks for — see `ChatRow.toolCall`. Empty on
+    /// every card an older run's handle was reassigned away from.
+    var ownedHandles: [String] = []
+    /// The conversation this card belongs to. A handle is only an identity
+    /// INSIDE one chat — see `ProcessRegistry.isAlive(handle:sessionId:)`.
+    var sessionId: UUID?
     @State private var expanded = false
-    @State private var hovering = false
     @EnvironmentObject var processRegistry: ProcessRegistry
+
+    /// Still working: the summary streams until the tools return.
+    private var isRunning: Bool { call.isStreaming }
+
+    private var title: String {
+        ToolCallDisplay.title(calls: calls, summary: call.content)
+    }
+
+    /// One flat list across every call in the round. Used only for the header's
+    /// headline, which describes the FIRST call.
+    private var argumentRows: [ToolCallDisplay.Argument] {
+        calls.flatMap { ToolCallDisplay.arguments(fromJSON: $0.arguments) }
+    }
+
+    /// One call with its own arguments and its own result.
+    ///
+    /// A model can ask for several tools in one answer (`tool_calls` is an
+    /// array and the engine runs them in order), and flattening them put two
+    /// `query` rows under each other with nothing saying which result belonged
+    /// to which. The summaries arrive in call order, so index is the pairing —
+    /// the result messages carry no id of their own.
+    private struct CallGroup: Identifiable {
+        let id: String
+        let name: String
+        /// The argument that chooses this tool's behaviour (`browse`'s action),
+        /// shown as part of its name.
+        let variant: String?
+        let arguments: [ToolCallDisplay.Argument]
+        let result: String?
+        /// Set when this call started a background process, read out of its own
+        /// result text — the only place the association exists.
+        let handle: String?
+    }
+
+    private var groups: [CallGroup] {
+        let bodies = results.map { ToolCallDisplay.resultBody($0.content) }
+        // No structured record (an older history): fall back to one group per
+        // result, named from the summary, so the card still draws.
+        guard !calls.isEmpty else {
+            return bodies.enumerated().map { i, body in
+                CallGroup(id: "legacy-\(i)", name: title, variant: nil, arguments: [], result: body,
+                          handle: ToolCallDisplay.backgroundHandle(inResult: body))
+            }
+        }
+        return calls.enumerated().map { i, call in
+            let body = i < bodies.count ? bodies[i] : nil
+            let args = ToolCallDisplay.arguments(fromJSON: call.arguments)
+            return CallGroup(
+                id: call.id.isEmpty ? "call-\(i)" : call.id,
+                name: call.name,
+                variant: ToolCallDisplay.variant(toolName: call.name, arguments: args),
+                arguments: args,
+                result: body,
+                handle: body.flatMap { ToolCallDisplay.backgroundHandle(inResult: $0) })
+        }
+    }
+
+    /// Handles no group claimed — a process whose result text did not name it,
+    /// or one from a history with no structured calls. They keep their button
+    /// in the header rather than disappearing.
+    private var unclaimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).unclaimed
+    }
+
+    /// Handles whose pill lives inside the panel, beside the call that started
+    /// them — so while the panel is shut they have no representation at all.
+    private var claimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).claimed
+    }
 
     /// Live background-process handles this card started — drives the kill X.
     /// Independent of `call.isStreaming` so the X stays after the tool returns,
     /// and it vanishes once the registry flips the process dead.
+    ///
+    /// Reads `ownedHandles`, not `call.processHandles`: names are reused across
+    /// launches, and the registry only knows the name. Scoped to this chat for
+    /// the same reason one step further out — ownership inside a transcript
+    /// cannot see a card in ANOTHER conversation holding the same name.
     private var killableHandles: [String] {
-        ProcessCardControls.killable(handles: call.processHandles, isAlive: processRegistry.isAlive)
+        ProcessCardControls.killable(handles: ownedHandles) {
+            processRegistry.isAlive(handle: $0, sessionId: sessionId)
+        }
     }
 
-    /// At least one background process from this card is still alive — drives the
-    /// green "running" border. Goes false the moment the registry flips the last
-    /// one dead (e.g. you click its X), so border + kill X disappear together.
-    private var isRunningBackground: Bool { !killableHandles.isEmpty }
-
+    /// Built like the reasoning block, for the same reasons: the chevron
+    /// belongs at the column's trailing edge (a `DisclosureGroup` cannot put it
+    /// there), the whole strip toggles, and the padding and fill arrive WITH
+    /// the content so a settled call is one tinted line rather than a card.
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                headerRow
-                if expanded { expandedResults }
-            }
-            .padding(.horizontal, ChatMetrics.bubblePaddingH)
-            .padding(.vertical, ChatMetrics.bubblePaddingV)
-            .background(Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius)
-                    .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
-            )
-            .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
-            // Recede a settled tool call so the assistant's prose carries the
-            // conversation; full opacity while it's running, hovered, or expanded.
-            .opacity(call.isStreaming || hovering || expanded ? 1.0 : 0.35)
-            .animation(.easeInOut(duration: 0.15), value: hovering)
-            .onHover { hovering = $0 }
-
-            Spacer(minLength: 60)
+        VStack(alignment: .leading, spacing: 10) {
+            headerRow
+            if expanded { expandedBody }
         }
+        .padding(.horizontal, expanded ? ChatMetrics.bubblePaddingH : 0)
+        .padding(.vertical, expanded ? ChatMetrics.bubblePaddingV : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(expanded ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(Color.clear))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // Broken out into separately type-checked pieces — a single deeply nested
@@ -4481,77 +4783,334 @@ private struct ToolCallRow: View {
     // SwiftUI type-checker into pathological (effectively non-terminating)
     // compile times.
     @ViewBuilder private var headerRow: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-            } label: {
-                headerLabel
-            }
-            .buttonStyle(.plain)
-            .disabled(results.isEmpty)
-
-            ProcessKillButtons(handles: killableHandles) { processRegistry.kill(handle: $0) }
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+        } label: {
+            headerLabel
         }
+        .buttonStyle(.plain)
     }
 
+    /// Tinted rather than grey: a tool call is the model ACTING, and the accent
+    /// is what the user's own turn is drawn in. Softened, because it is
+    /// machinery beside the prose rather than part of it.
     @ViewBuilder private var headerLabel: some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(Self.stripBold(call.content))
-                .font(.caption.monospaced())
-                .multilineTextAlignment(.leading)
-                .foregroundStyle(.primary)
-            Spacer(minLength: 6)
-            if call.isStreaming {
-                GeneratingIndicator()
-            } else if !results.isEmpty {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, isActive: isRunning)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
+            if calls.count > 1 {
+                multiToolTitle
+            } else {
+                singleToolTitle
             }
+            Spacer(minLength: 8)
+            // Before the chevron, in both states: a collapsed card is where
+            // you most need to know something is still running, and where the
+            // border says it least.
+            //
+            // One call keeps its pill here; several put theirs beside their own
+            // tool name inside the panel, so it is clear WHICH process each one
+            // stops. Anything no call claimed stays here either way.
+            ForEach(headerHandles, id: \.self) { handle in
+                ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+            }
+            // A shut multi-tool card hides the per-call buttons with the panel,
+            // so it says only THAT something is running. No button: with several
+            // calls, one X in the header could not say which process it stops.
+            if !expanded, groups.count > 1, !claimedHandles.isEmpty {
+                RunningIndicator()
+            }
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
     }
 
-    @ViewBuilder private var expandedResults: some View {
-        ForEach(results) { r in
-            Text(Self.stripBold(r.content))
+    /// Pills that belong in the header rather than beside a call: every live
+    /// handle when there is one call, and only the unclaimed ones when there
+    /// are several.
+    private var headerHandles: [String] {
+        groups.count > 1 ? unclaimedHandles : killableHandles
+    }
+
+    /// A tool's name, with the argument that chooses its behaviour attached to
+    /// it: `browse:click`. The tool is its identity (monospaced, tinted), the
+    /// variant is a value (grey, reading face) — but they read as one name,
+    /// which is what they are.
+    /// The ONE place a tool's name is drawn (header, multi-tool strip, and each
+    /// line inside the panel), so `<server>__<tool>` reads as a path everywhere
+    /// or nowhere.
+    @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
+        Text(ToolCallDisplay.displayName(name))
+            .font(.caption.monospaced())
+            .foregroundStyle(Color.accentColor.opacity(0.7))
+        if let variant {
+            Text(":" + variant)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                // Belongs to the name beside it, not to the gap after it.
+                .padding(.leading, -4)
+        }
+    }
+
+    /// One call: the tool, what it was about, and what came of it.
+    @ViewBuilder private var singleToolTitle: some View {
+        toolLabel(name: title,
+                  variant: calls.first.map {
+                      ToolCallDisplay.variant(toolName: $0.name, arguments: argumentRows)
+                  } ?? nil)
+        // What the call was ABOUT, so a settled row says what it did without
+        // being opened. Grey and in the reading face: it is a VALUE, not part
+        // of the tool's identity.
+        if let headline {
+            Text("· " + headline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                // A path's tail is the useful half, so a long one loses its
+                // middle rather than its filename.
+                .truncationMode(.middle)
+        }
+        // What came of it — arrives with the result, so it is absent while the
+        // call is still running.
+        if let resultHeadline {
+            Text("· " + resultHeadline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+    }
+
+    /// Several calls in one answer: the tools themselves, and nothing about
+    /// their arguments — with two `webSearch` calls in a row, one query in the
+    /// header would look like the only one.
+    ///
+    /// Past three, the tail becomes a count. Four monospaced names fill the
+    /// strip and stop being readable as a list.
+    @ViewBuilder private var multiToolTitle: some View {
+        let shown = groups.count > 3 ? Array(groups.prefix(2)) : groups
+        let hidden = groups.count - shown.count
+
+        ForEach(Array(shown.enumerated()), id: \.offset) { index, group in
+            if index > 0 { middot }
+            toolLabel(name: group.name, variant: group.variant)
+        }
+        if hidden > 0 {
+            middot
+            Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    /// The separator between names: grey and in the reading face, so the
+    /// monospaced tool names read as the list and it reads as punctuation.
+    private var middot: some View {
+        Text("·")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var headline: String? {
+        guard let name = calls.first?.name else { return nil }
+        return ToolCallDisplay.headline(toolName: name, arguments: argumentRows)
+    }
+
+    private var resultHeadline: String? {
+        guard let name = calls.first?.name, let first = results.first else { return nil }
+        return ToolCallDisplay.resultHeadline(toolName: name,
+                                              result: ToolCallDisplay.resultBody(first.content))
+    }
+
+    /// Arguments and the result in two columns, split by a rule.
+    ///
+    /// A `Grid` rather than stacked paragraphs: the names are short and the
+    /// values are not, so putting the values on a shared left edge is what
+    /// makes four arguments scannable instead of four sentences. The name
+    /// column takes only what it needs — `Grid` sizes a column to its widest
+    /// cell, and the names are the narrow half by construction.
+    @ViewBuilder private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                // Only worth naming when there is more than one: with a single
+                // call the name is already in the header above.
+                if groups.count > 1 {
+                    HStack(spacing: 0) {
+                        toolLabel(name: group.name, variant: group.variant)
+                        Spacer(minLength: 8)
+                        // On the tool name's own line, at the trailing edge —
+                        // so with two parallel shells each pill is beside the
+                        // call it belongs to.
+                        if let handle = group.handle, killableHandles.contains(handle) {
+                            ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+                        }
+                    }
+                    .padding(.top, index == 0 ? 0 : 4)
+                }
+                callGrid(group)
+            }
+        }
+    }
+
+    @ViewBuilder private func callGrid(_ group: CallGroup) -> some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 10, verticalSpacing: 6) {
+            ForEach(group.arguments) { arg in
+                gridRow(name: arg.name, value: arg.value)
+            }
+
+            if let result = group.result {
+                if !group.arguments.isEmpty {
+                    // Separates what was ASKED from what came BACK. Spans both
+                    // columns, so it reads as one break across the panel rather
+                    // than as a rule under the names.
+                    GridRow { Divider().gridCellColumns(2) }
+                }
+                GridRow {
+                    Text("result")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                    // The pill sits on the tool name's line above, not here:
+                    // beside a wrapped result it would float somewhere in the
+                    // middle of the panel.
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    /// Name in the tool's own monospaced face (it IS an identifier), value in
+    /// the reading face beside it.
+    @ViewBuilder private func gridRow(name: String, value: String) -> some View {
+        GridRow {
+            Text(name)
                 .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.leading)
+                // Never wrapped: a broken key turns the column into prose and
+                // the values lose the edge they are lined up against.
+                .fixedSize(horizontal: true, vertical: false)
+            Text(value)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+}
 
-    /// The summary strings use `**name**` markdown bold; the compact mono header
-    /// and body render as plain text, so strip the `**` markers.
-    static func stripBold(_ s: String) -> String {
-        s.replacingOccurrences(of: "**", with: "")
+/// One live background process: a turning gear that says it is running, and a
+/// button that stops it, in one pill.
+///
+/// Two glyphs rather than one, because they answer different questions and
+/// only one of them is clickable — a single red ✕ said "you can stop this" but
+/// never "this is still going", and the card's green border was the only thing
+/// carrying that, which is invisible on a collapsed row.
+/// The state half of the pill: says a process is live, offers nothing. Shown on
+/// its own where the stop button would be a lie about which process it stops —
+/// a collapsed multi-tool card, whose per-call buttons are inside the panel.
+private struct RunningIndicator: View {
+    @Environment(\.colorScheme) private var scheme
+    @State private var pulsing = false
+
+    /// Dark green on the light tint; lifted in dark mode, where the same ink
+    /// over a dark-backed 20% green is unreadable.
+    private var ink: Color {
+        scheme == .dark ? Color(red: 0.44, green: 0.82, blue: 0.50)
+                        : Color(red: 0.05, green: 0.42, blue: 0.16)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            // A pulsing dot beside the word is what reads as "live" at caption
+            // size — a detailed glyph loses its shape there and its motion with
+            // it.
+            //
+            // Animated by hand rather than with `.symbolEffect`: `circle.fill`
+            // is a single-layer symbol with no negative space, so the built-in
+            // scale effect had nothing to move and rendered dead still.
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7))
+                .foregroundStyle(ink)
+                .scaleEffect(pulsing ? 0.55 : 1)
+                .opacity(pulsing ? 0.45 : 1)
+                .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true),
+                           value: pulsing)
+                .onAppear { pulsing = true }
+                .accessibilityHidden(true)
+
+            Text("running")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(ink)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.green.opacity(0.2), in: Capsule())
     }
 }
 
-/// Per-handle red kill X for a tool-call card's live background processes. Its
-/// own type (not an inline ForEach in ToolCallRow.body) so the SwiftUI
-/// type-checker handles it as an isolated, trivial unit.
+/// The stop control, a sibling of the pill rather than a passenger inside it:
+/// the badge says what is true, the button does something, and a control on a
+/// status background reads as part of the status.
+private struct StopProcessButton: View {
+    let handle: String
+    let onKill: (String) -> Void
+
+    var body: some View {
+        Button { onKill(handle) } label: {
+            // Sized off the row rather than a point size: `maxHeight` takes the
+            // height the pill beside it set, and `.fit` squares it — the two
+            // stay level through Dynamic Type.
+            Image(systemName: "xmark.circle.fill")
+                .resizable()
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, .red)
+                .aspectRatio(contentMode: .fit)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Stop background process \(handle)")
+        .accessibilityLabel("Stop background process \(handle)")
+    }
+}
+
+/// The indicator with the button that stops that one process beside it. Used
+/// wherever the pill can name WHICH process an X would kill: a single-tool
+/// header, and each tool's own line inside an expanded multi-tool panel.
+private struct ProcessPill: View {
+    let handle: String
+    let onKill: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            RunningIndicator()
+            StopProcessButton(handle: handle, onKill: onKill)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+/// The pills for a set of handles. Its own type (not an inline `ForEach`) so
+/// the SwiftUI type-checker handles it as an isolated, trivial unit.
 private struct ProcessKillButtons: View {
     let handles: [String]
     let onKill: (String) -> Void
 
     var body: some View {
         ForEach(handles, id: \.self) { handle in
-            Button {
-                onKill(handle)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.red)
-                    .symbolRenderingMode(.hierarchical)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Stop background process \(handle)")
+            ProcessPill(handle: handle, onKill: onKill)
         }
     }
 }
@@ -4665,9 +5224,41 @@ struct MarkdownText: View {
         case paragraph(String)
         case heading(Int, String)              // level, text
         case code(String, String)              // language, content
-        case listItem(String)
+        /// marker (`•`, `1.`, `2)`), text. The marker is CARRIED rather than
+        /// re-derived at render time: the parser used to drop a list's numbers
+        /// and the renderer drew a bullet for every item, so an ordered list
+        /// arrived unordered and any "see step 3" above it pointed at nothing.
+        case listItem(String, String)
+        case quote(String)                     // `>` lines, already merged
         case xmlBlock(String)                  // raw XML/tag content
         case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
+    }
+
+    /// The list marker at the head of a line, and what follows it — or nil when
+    /// the line is prose.
+    ///
+    /// Anchored and shaped, not "starts with a digit and has a full stop
+    /// somewhere": that test made a list of `1 pes. A kočka spolu.` and threw
+    /// away everything up to the stop, leaving `• A kočka spolu.` A marker is
+    /// at most nine digits (CommonMark's limit) followed by `.` or `)` and a
+    /// space, and nothing else on this line decides it.
+    fileprivate static func listItem(in line: String) -> (marker: String, text: String)? {
+        if line.hasPrefix("- ") || line.hasPrefix("* ") {
+            return ("•", String(line.dropFirst(2)))
+        }
+        guard let match = line.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
+            return nil
+        }
+        return (String(line[match]).trimmingCharacters(in: .whitespaces),
+                String(line[match.upperBound...]))
+    }
+
+    /// The text of a quoted line, or nil when the line is not quoted. `>` alone
+    /// is a blank line inside a quote and keeps the block open.
+    fileprivate static func quoteBody(in line: String) -> String? {
+        if line.hasPrefix("> ") { return String(line.dropFirst(2)) }
+        if line == ">" { return "" }
+        return nil
     }
 
     fileprivate static func parseBlocks(source: String) -> [Block] {
@@ -4767,18 +5358,22 @@ struct MarkdownText: View {
                 continue
             }
 
-            // List item
-            if line.starts(with: "- ") || line.starts(with: "* ") ||
-               (line.count >= 3 && line.first?.isNumber == true && line.contains(". ")) {
-                let text: String
-                if line.starts(with: "- ") || line.starts(with: "* ") {
-                    text = String(line.dropFirst(2))
-                } else if let dotIdx = line.firstIndex(of: "."), line[line.index(after: dotIdx)] == " " {
-                    text = String(line[line.index(dotIdx, offsetBy: 2)...])
-                } else {
-                    text = line
+            // Quote. Consecutive `>` lines are ONE quote: a quoted paragraph
+            // arrives wrapped at the model's own width, with a marker on every
+            // line, and a block per line would draw a stack of bars.
+            if quoteBody(in: line) != nil {
+                var quoted: [String] = []
+                while i < lines.count, let body = quoteBody(in: lines[i]) {
+                    quoted.append(body)
+                    i += 1
                 }
-                blocks.append(.listItem(text))
+                blocks.append(.quote(quoted.joined(separator: "\n")))
+                continue
+            }
+
+            // List item
+            if let item = listItem(in: line) {
+                blocks.append(.listItem(item.marker, item.text))
                 i += 1
                 continue
             }
@@ -4794,9 +5389,14 @@ struct MarkdownText: View {
             i += 1
             while i < lines.count {
                 let next = lines[i]
+                // A paragraph ends where a list begins — for NUMBERED items as
+                // well, which models write without a blank line above them.
+                // Only bullets broke it, so "Here are the steps:\n1. …" ran the
+                // whole list into the sentence.
                 if next.trimmingCharacters(in: .whitespaces).isEmpty ||
                    next.hasPrefix("#") || next.hasPrefix("```") ||
-                   next.starts(with: "- ") || next.starts(with: "* ") ||
+                   listItem(in: next) != nil ||
+                   quoteBody(in: next) != nil ||
                    next.hasPrefix("<") ||
                    next.trimmingCharacters(in: .whitespaces).hasPrefix("|") {
                     break
@@ -4827,10 +5427,16 @@ struct MarkdownText: View {
     }
 
     static func attributedString(for source: String, theme: LaTeXTheme) -> NSAttributedString {
-        // The text size rides the key: fonts are baked into the cached string,
-        // so a Settings ▸ Interface change with the old key would hand every
-        // re-rendered row back at the size it was built at.
-        let key = "\(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\(source)" as NSString
+        // Every Interface setting baked into the string rides the key: fonts
+        // AND paragraph styles are built in, so a Settings change with the old
+        // key would hand every re-rendered row back exactly as it was. Density
+        // is here because compact changes the leading (`proseLineHeightMultiple`)
+        // — without it, ⌃C looked like it did nothing to a transcript already
+        // on screen.
+        let key = """
+        \(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\
+        \(ChatMetrics.compactMode)\u{0}\(source)
+        """ as NSString
         if let hit = renderCache.object(forKey: key) { return hit }
         let built = buildAttributedString(for: source, theme: theme)
         renderCache.setObject(built, forKey: key)
@@ -4843,19 +5449,29 @@ struct MarkdownText: View {
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = parseBlocks(source: source)
+
+        func isItem(_ index: Int) -> Bool {
+            guard index >= 0, index < blocks.count else { return false }
+            if case .listItem = blocks[index] { return true }
+            return false
+        }
+
         for (idx, block) in blocks.enumerated() {
-            if idx > 0 { result.append(blockSpacer()) }
+            // A spacer between every pair of blocks put a full paragraph break
+            // between two bullets — every item is its own block. Items carry
+            // their own rhythm instead; the spacer still opens and closes the
+            // list as a whole.
+            if idx > 0, !(isItem(idx) && isItem(idx - 1)) { result.append(blockSpacer()) }
             switch block {
             case .paragraph(let text):
                 // Leading + a real gap after each paragraph (single-newline
                 // "**Label.** text" runs the models love are paragraphs too),
-                // and the reading measure as a POSITIVE tailIndent — an
-                // absolute wrap point, so prose stops at ~45em while tables,
-                // code and XML keep the full column.
+                // and the reading measure as SYMMETRIC indents: a negative
+                // tailIndent is measured from the trailing edge, so prose sits
+                // centred in the column while tables keep its full width.
                 let p = NSMutableParagraphStyle()
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 p.paragraphSpacing = 8
-                p.tailIndent = ChatMetrics.proseMeasure
                 let para = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
                 para.addAttribute(.paragraphStyle, value: p,
                                   range: NSRange(location: 0, length: para.length))
@@ -4870,7 +5486,6 @@ struct MarkdownText: View {
                 p.paragraphSpacingBefore = 10
                 p.paragraphSpacing = 2
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
-                p.tailIndent = ChatMetrics.proseMeasure
                 let heading = NSMutableAttributedString(
                     attributedString: renderInline(text, theme: theme, fontSize: size)
                 )
@@ -4885,11 +5500,11 @@ struct MarkdownText: View {
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 4
+                // Its own gutter, so the tinted block stands off the text.
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 p.tailIndent = -8
-                // Less air than prose — a listing wants rows. And never the
-                // prose measure: code keeps the full column.
+                // Less air than prose — a listing wants rows.
                 p.lineHeightMultiple = ChatMetrics.codeLineHeightMultiple
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
@@ -4901,27 +5516,77 @@ struct MarkdownText: View {
                 linkifyBareUrls(code)
                 result.append(code)
 
-            case .listItem(let text):
-                let bullet = NSAttributedString(string: "• ", attributes: [
+            case .listItem(let marker, let text):
+                let bullet = NSAttributedString(string: marker + " ", attributes: [
                     .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                // Hanging indent measured off the bullet itself, so wrapped
-                // lines align under the text at every text size.
+                // Hanging indent measured off the marker itself, so wrapped
+                // lines align under the text at every text size — and under a
+                // two-digit number as readily as under a bullet.
                 p.headIndent = bullet.size().width.rounded(.up)
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
-                p.paragraphSpacing = 4
-                p.tailIndent = ChatMetrics.proseMeasure
+                // Tight between items, a paragraph's worth after the last one —
+                // so the air under a list matches the air above it, which comes
+                // from the paragraph's own spacing plus the block spacer.
+                p.paragraphSpacing = isItem(idx + 1) ? 4 : 8
                 let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
                 combined.append(inline)
+                // The block spacer used to be the ONLY newline between blocks,
+                // so suppressing it between items ran a whole list into one
+                // paragraph with the markers inline. An item that is followed
+                // by another ends itself, carrying its own paragraph style so
+                // the break costs its 4 points and nothing more.
+                if isItem(idx + 1) { combined.append(NSAttributedString(string: "\n")) }
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
 
             case .table(let headers, let rows, let alignments):
                 result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
+
+            case .quote(let text):
+                // The bar is a one-cell `NSTextTable` with a border on its
+                // leading edge: an attributed string has no "rule beside this
+                // paragraph" attribute, and the table machinery is already here
+                // for markdown tables — so no custom drawing in the text view.
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(3, type: .absoluteValueType, for: .border, edge: .minX)
+                cell.setBorderColor(NSColor.separatorColor, for: .minX)
+                // Air between the bar and the words (padding, INSIDE the rule)
+                // and between the block and the prose around it (margin,
+                // outside it). Without the margin the sentence after a quote
+                // started one ordinary line below its last line, as if it were
+                // the same paragraph.
+                //
+                // The vertical padding is LOPSIDED on purpose: prose leads at
+                // 1.4, and a line's extra leading sits above its letters, so
+                // equal padding put visibly more bar above the first line than
+                // below the last one. The bar is what the eye measures, not the
+                // line box.
+                cell.setWidth(10, type: .absoluteValueType, for: .padding, edge: .minX)
+                cell.setWidth(0, type: .absoluteValueType, for: .padding, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .maxY)
+
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 4
+                let quoted = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
+                let range = NSRange(location: 0, length: quoted.length)
+                quoted.addAttribute(.paragraphStyle, value: p, range: range)
+                // Quoted words are someone else's, and the bar already says so;
+                // the softer ink keeps them from competing with the reply.
+                quoted.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: range)
+                result.append(quoted)
 
             case .xmlBlock(let content):
                 let p = NSMutableParagraphStyle()
@@ -4982,6 +5647,16 @@ struct MarkdownText: View {
         table.numberOfColumns = cols
         let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
         let dividerColor = NSColor.separatorColor
+        // Lighter than the rules, or the header reads as a filled bar rather
+        // than as a heading.
+        //
+        // A tint of the PAGE, not a faded label colour: `quaternaryLabelColor`
+        // is ink, so thinning it still darkens the row — the header only ever
+        // got greyer. Blending the text background a few percent toward the
+        // label goes the other way in light mode and stays a lift in dark mode,
+        // which is what "lighter" means in both.
+        let headerFill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
 
         func textAlignment(_ column: Int) -> NSTextAlignment {
             guard column < alignments.count else { return .left }
@@ -4992,6 +5667,18 @@ struct MarkdownText: View {
             }
         }
 
+        // The grid: one hairline under every row, a full-weight rule under the
+        // header, and an outline drawn by the cells that sit on the table's
+        // edges — `NSTextTable` has no frame of its own to stroke, and no
+        // corner radius either, so the outline is four sets of cell borders and
+        // the corners stay square.
+        //
+        // Only ever `.maxY` between rows: a neighbour's `.minY` would land on
+        // the same line and draw it twice as thick.
+        let outlineWeight: CGFloat = 1
+        let rowRuleWeight: CGFloat = 0.5
+        let lastRow = rows.count   // header is row 0
+
         func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
             for column in 0..<cols {
                 let text = column < cells.count ? cells[column] : ""
@@ -5001,12 +5688,39 @@ struct MarkdownText: View {
                 )
                 block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
                 block.setWidth(6, type: .absoluteValueType, for: .padding)
-                // Divider under the header row only — no vertical borders,
-                // no rules between data rows, matching the "minimal GFM"
-                // look chat UIs use.
+
                 if rowIndex == 0 {
-                    block.setBorderColor(dividerColor, for: .maxY)
-                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                    // Header: its own fill, lighter than the rules around it,
+                    // and the top of the outline.
+                    block.backgroundColor = headerFill
+                    block.setBorderColor(dividerColor, for: .minY)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minY)
+                    // Air ABOVE the table, as a margin on its first row. The
+                    // block spacer between blocks carries paragraph spacing,
+                    // and a text table does not honour the spacing of the
+                    // paragraph before it — so a heading sat flush on the
+                    // header rule however much air its own style asked for.
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .minY)
+                }
+                if rowIndex == lastRow {
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .maxY)
+                }
+                // Bottom edge: the outline on the last row, a hairline between
+                // rows everywhere else. The header's own rule stays at full
+                // weight — it separates the labels from the data.
+                block.setBorderColor(dividerColor, for: .maxY)
+                block.setWidth(rowIndex == lastRow || rowIndex == 0 ? outlineWeight : rowRuleWeight,
+                               type: .absoluteValueType, for: .border, edge: .maxY)
+
+                // Sides of the outline. No rules BETWEEN columns: vertical
+                // rules turn a comparison into a spreadsheet.
+                if column == 0 {
+                    block.setBorderColor(dividerColor, for: .minX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minX)
+                }
+                if column == cols - 1 {
+                    block.setBorderColor(dividerColor, for: .maxX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .maxX)
                 }
                 let pStyle = NSMutableParagraphStyle()
                 pStyle.textBlocks = [block]
@@ -5168,6 +5882,50 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
+        tintInlineCode(result, bodyFont: bodyFont)
+    }
+
+    /// Give `` `code` `` its own ground.
+    ///
+    /// Square, not rounded: a background is one attribute, and rounding it
+    /// would mean overriding the text view's own background drawing — which
+    /// would then have to handle selection and line wrapping itself.
+    ///
+    /// Found by the parser's INTENT, and only by that.
+    ///
+    /// The obvious probe — does this run's font carry the `.monoSpace`
+    /// symbolic trait — answers NO for `NSFont.monospacedSystemFont`, whose
+    /// descriptor does not advertise it. A run already rendering in SF Mono
+    /// tests as prose, so a trait check here would be a branch that never
+    /// fires while looking like a safety net.
+    private static func tintInlineCode(_ result: NSMutableAttributedString, bodyFont: NSFont) {
+        let full = NSRange(location: 0, length: result.length)
+        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize,
+                                               weight: .regular)
+        result.enumerateAttributes(in: full, options: []) { attrs, range, _ in
+            guard isInlineCode(attrs[.inlinePresentationIntent]),
+                  // A fenced block sets its own ground and its own colours.
+                  attrs[.backgroundColor] == nil
+            else { return }
+            // A MARKER, not a `.backgroundColor`: that attribute paints the
+            // whole line fragment, and prose leads at 1.4, so the box climbed
+            // into the descenders of the line above. `IntrinsicTextView` draws
+            // this one itself, at the height of the code's own letters.
+            //
+            // The size is re-set with it: the parser's own code face comes in
+            // at the body size, which runs wide beside the sentence around it.
+            result.addAttributes([.font: mono, .inlineCodeGround: true], range: range)
+        }
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber` of the
+    /// option set's raw value, not as the Swift type.
+    private static func isInlineCode(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.code) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.code)
+        }
+        return false
     }
 
     /// Shared detector — creating an NSDataDetector is not free and renderInline
@@ -5244,6 +6002,13 @@ fileprivate struct DisplayLaTeXView: View {
     }
 }
 
+extension NSAttributedString.Key {
+    /// Marks an inline code span. Carries no appearance of its own — the ground
+    /// is drawn by `IntrinsicTextView`, which is the only way to control its
+    /// HEIGHT (see `tintInlineCode`).
+    static let inlineCodeGround = NSAttributedString.Key("MLXInlineCodeGround")
+}
+
 // MARK: - SelectableMarkdownNSText (NSTextView wrapper)
 
 /// NSViewRepresentable around an NSTextView. NSTextView is the only AppKit text
@@ -5312,6 +6077,60 @@ fileprivate final class IntrinsicTextView: NSTextView {
     override func invalidateIntrinsicContentSize() {
         cachedHeight = nil
         super.invalidateIntrinsicContentSize()
+    }
+
+    /// Paint the inline-code grounds under the glyphs.
+    ///
+    /// Drawn here rather than as a `.backgroundColor` attribute because that
+    /// attribute fills the LINE FRAGMENT — at 1.4 leading the box reached the
+    /// descenders of the line above and looked like a rendering fault. Ours is
+    /// the code's own ascender-to-descender band, rounded, and it costs the
+    /// rounding for free now that we hold the rect.
+    ///
+    /// Before `super`, so selection and the glyphs land on top of it.
+    override func draw(_ dirtyRect: NSRect) {
+        drawInlineCodeGrounds()
+        super.draw(dirtyRect)
+    }
+
+    private func drawInlineCodeGrounds() {
+        guard let layoutManager, let textContainer, let textStorage else { return }
+        let origin = textContainerOrigin
+        // The same tint as a table header: a few percent of the PAGE toward the
+        // ink, which lightens in both appearances — thinning a label colour
+        // only ever darkens (see `renderTable`).
+        let fill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
+        fill.setFill()
+
+        textStorage.enumerateAttribute(.inlineCodeGround,
+                                       in: NSRange(location: 0, length: textStorage.length),
+                                       options: []) { value, range, _ in
+            guard value != nil else { return }
+            let font = textStorage.attribute(.font, at: range.location,
+                                             effectiveRange: nil) as? NSFont
+            // The letters' own band, centred in whatever the line gives it.
+            let band = ((font?.ascender ?? 10) - (font?.descender ?? -3)) + 2
+            let glyphs = layoutManager.glyphRange(forCharacterRange: range,
+                                                  actualCharacterRange: nil)
+            // One rect per line: a span that wraps gets a box on each.
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphs,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: textContainer
+            ) { rect, _ in
+                var box = rect.offsetBy(dx: origin.x, dy: origin.y)
+                if box.height > band {
+                    box = box.insetBy(dx: 0, dy: (box.height - band) / 2)
+                }
+                // Room around the letters: 4 points either side, and 4 below —
+                // the view is flipped, so growing the height grows DOWNWARD,
+                // away from the line above.
+                box = box.insetBy(dx: -4, dy: 0)
+                box.size.height += 4
+                NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+            }
+        }
     }
 
     override func didChangeText() {
