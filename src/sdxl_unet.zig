@@ -143,8 +143,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !UnetCo
     };
     errdefer allocator.free(cfg.num_heads);
 
-    const tlpb = root.get("transformer_layers_per_block") orelse return error.MissingTransformerLayers;
-    cfg.transformer_layers = switch (tlpb) {
+    // SDXL's own config always states this explicitly (it varies per stage:
+    // `[1, 2, 10]`), but diffusers defaults `transformer_layers_per_block` to
+    // 1 when the key is absent — which is exactly SD 1.x's `unet/config.json`
+    // (no per-stage depth ever needed there), so an absent key means 1 at
+    // every stage rather than a load error.
+    cfg.transformer_layers = if (root.get("transformer_layers_per_block")) |tlpb| switch (tlpb) {
         .array => try u32s.read(allocator, tlpb),
         .integer => blk: {
             const out = try allocator.alloc(u32, cfg.block_out_channels.len);
@@ -152,6 +156,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !UnetCo
             break :blk out;
         },
         else => return error.BadTransformerLayers,
+    } else blk: {
+        const out = try allocator.alloc(u32, cfg.block_out_channels.len);
+        @memset(out, 1);
+        break :blk out;
     };
     errdefer allocator.free(cfg.transformer_layers);
 
@@ -1096,19 +1104,24 @@ test "sdxl unet: config parse reads the real checkpoint contract" {
     try testing.expect(cfg.has_micro_conditioning);
 }
 
-test "sdxl unet: an SD 1.x config (no addition_embed_type) parses with micro-conditioning off" {
+test "sdxl unet: an SD 1.x config (no addition_embed_type, no transformer_layers_per_block) parses with micro-conditioning off" {
     const a = testing.allocator;
     // SD 1.5's real `unet/config.json` shape, trimmed to the keys the parser
     // reads: no `addition_embed_type` at all (the key CLIP-only SD 1.x never
-    // declares), scalar `attention_head_dim` (8, not per-stage), and a fourth
-    // attention-free stage the way diffusers' own config ships it.
+    // declares), no `transformer_layers_per_block` either (SDXL is the family
+    // that varies per stage and states it; SD 1.x has never needed it, and
+    // diffusers defaults the field to 1 when absent — live 2026-09-05, a
+    // real SD 1.5 pull threw `MissingTransformerLayers` because the parser
+    // treated the key as mandatory), scalar `attention_head_dim` (8, not
+    // per-stage), and a fourth attention-free stage the way diffusers' own
+    // config ships it.
     const json =
         \\{"_class_name":"UNet2DConditionModel","act_fn":"silu",
         \\"attention_head_dim":8,"block_out_channels":[320,640,1280,1280],
         \\"cross_attention_dim":768,
         \\"down_block_types":["CrossAttnDownBlock2D","CrossAttnDownBlock2D","CrossAttnDownBlock2D","DownBlock2D"],
         \\"in_channels":4,"layers_per_block":2,"norm_eps":1e-05,"norm_num_groups":32,
-        \\"out_channels":4,"transformer_layers_per_block":1,
+        \\"out_channels":4,
         \\"up_block_types":["UpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D","CrossAttnUpBlock2D"],
         \\"use_linear_projection":true}
     ;
@@ -1120,6 +1133,9 @@ test "sdxl unet: an SD 1.x config (no addition_embed_type) parses with micro-con
     try testing.expectEqualSlices(u32, &[_]u32{ 320, 640, 1280, 1280 }, cfg.block_out_channels);
     // Scalar attention_head_dim broadcasts to every stage.
     try testing.expectEqualSlices(u32, &[_]u32{ 8, 8, 8, 8 }, cfg.num_heads);
+    // Absent transformer_layers_per_block defaults to 1 at every stage, the
+    // same value diffusers' own UNet2DConditionModel defaults it to.
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 1, 1, 1 }, cfg.transformer_layers);
     try testing.expectEqualSlices(bool, &[_]bool{ true, true, true, false }, cfg.down_has_attn);
     try testing.expectEqualSlices(bool, &[_]bool{ false, true, true, true }, cfg.up_has_attn);
 }
