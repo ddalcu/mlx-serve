@@ -2236,9 +2236,17 @@ extension ImageModelPreset {
 
     /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
+    ///
+    /// SD 3.5 is the same story for a different reason: its adapters target the
+    /// MMDiT's joint blocks, a different module tree from the UNet convention
+    /// `lora.canonicalizeSdxl` speaks, so `gen.zig`'s `.sd3` arm returns 0
+    /// matched by construction. Offering the picker would be advertising a
+    /// control that always 400s — the flag is a claim about the SERVER's arm,
+    /// not about the ecosystem having adapters.
     var supportsLoRA: Bool {
         switch variant {
         case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .sd3, .sd3Turbo: return false
         default: return true
         }
     }
