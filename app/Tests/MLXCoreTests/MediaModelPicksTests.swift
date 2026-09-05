@@ -54,8 +54,12 @@ final class MediaModelPicksTests: XCTestCase {
     /// for anything in a capability still gets the smallest option, flagged, not
     /// an empty picker that reads as "unsupported".
     func testATinyMacStillGetsAPickFlaggedAsTooBig() {
+        // Below every catalogue entry's approxRAMGB (SD-Turbo, the cheapest
+        // image model, needs 4 GB) — `meetsSystemRequirements` is `>=`, so
+        // sitting exactly on a model's figure would make it "fit" and defeat
+        // the point of this test.
         let picks = MediaModelPicks.featured(ImageModelPreset.all,
-                                             physicalMemoryBytes: 4 * gb,
+                                             physicalMemoryBytes: 2 * gb,
                                              capabilityOf: \.capabilityLabel)
         XCTAssertFalse(picks.isEmpty, "never an empty picker")
         for pick in picks {
