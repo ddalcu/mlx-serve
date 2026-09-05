@@ -31,6 +31,44 @@ final class ProcessCardControlsTests: XCTestCase {
         XCTAssertEqual(out, [])
     }
 
+    // MARK: - Which CHAT a handle belongs to
+
+    /// Ownership within one transcript is only half the answer: the counter is
+    /// app-wide, so `bg1` in an old chat and `bg1` started today in another
+    /// chat are the same NAME. Asked globally, the old card lit up as running
+    /// and its ✕ would have killed a stranger's process.
+    ///
+    /// `registerSandboxed` is the one entry point that registers without
+    /// launching anything, which is what makes this testable.
+    @MainActor
+    func testAHandleIsOnlyAliveForTheChatThatStartedIt() {
+        let registry = ProcessRegistry()
+        let mine = UUID(), theirs = UUID()
+        let p = registry.registerSandboxed(command: "sleep 9", guestPID: 42,
+                                           logPath: "/tmp/x.log", sessionId: mine)
+
+        XCTAssertTrue(registry.isAlive(handle: p.handle, sessionId: mine))
+        XCTAssertFalse(registry.isAlive(handle: p.handle, sessionId: theirs),
+                       "another chat's card must not claim this process")
+    }
+
+    /// A surface with no session of its own (a task run's transcript) keeps the
+    /// old, global answer rather than losing its badge.
+    @MainActor
+    func testASessionlessCallerStillSeesTheProcess() {
+        let registry = ProcessRegistry()
+        let p = registry.registerSandboxed(command: "sleep 9", guestPID: 42,
+                                           logPath: "/tmp/x.log", sessionId: UUID())
+        XCTAssertTrue(registry.isAlive(handle: p.handle, sessionId: nil))
+    }
+
+    @MainActor
+    func testAnUnknownHandleIsAliveForNobody() {
+        let registry = ProcessRegistry()
+        XCTAssertFalse(registry.isAlive(handle: "bg1", sessionId: UUID()))
+        XCTAssertFalse(registry.isAlive(handle: "bg1", sessionId: nil))
+    }
+
     // MARK: - Which card a reused handle belongs to
 
     /// Numbering restarts at `bg1` every launch, and the registry knows only the

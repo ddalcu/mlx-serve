@@ -2467,7 +2467,8 @@ struct ChatDetailView: View {
                                 .id(m.id)
                             case .toolCall(let call, let results, let calls, let owned):
                                 ToolCallRow(call: call, results: results, calls: calls,
-                                            ownedHandles: owned).id(call.id)
+                                            ownedHandles: owned,
+                                            sessionId: sessionId).id(call.id)
                             }
                         }
                         // Live media generation, under the tool-call row that
@@ -4670,6 +4671,9 @@ private struct ToolCallRow: View {
     /// Handles this row still speaks for — see `ChatRow.toolCall`. Empty on
     /// every card an older run's handle was reassigned away from.
     var ownedHandles: [String] = []
+    /// The conversation this card belongs to. A handle is only an identity
+    /// INSIDE one chat — see `ProcessRegistry.isAlive(handle:sessionId:)`.
+    var sessionId: UUID?
     @State private var expanded = false
     @EnvironmentObject var processRegistry: ProcessRegistry
 
@@ -4749,9 +4753,13 @@ private struct ToolCallRow: View {
     /// and it vanishes once the registry flips the process dead.
     ///
     /// Reads `ownedHandles`, not `call.processHandles`: names are reused across
-    /// launches, and the registry only knows the name.
+    /// launches, and the registry only knows the name. Scoped to this chat for
+    /// the same reason one step further out — ownership inside a transcript
+    /// cannot see a card in ANOTHER conversation holding the same name.
     private var killableHandles: [String] {
-        ProcessCardControls.killable(handles: ownedHandles, isAlive: processRegistry.isAlive)
+        ProcessCardControls.killable(handles: ownedHandles) {
+            processRegistry.isAlive(handle: $0, sessionId: sessionId)
+        }
     }
 
     /// Built like the reasoning block, for the same reasons: the chevron

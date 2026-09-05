@@ -304,6 +304,20 @@ final class ProcessRegistry: ObservableObject {
         processes.first { $0.handle == handle }?.status.isAlive ?? false
     }
 
+    /// Alive AND started by this chat.
+    ///
+    /// The counter is app-wide and restarts at `bg1` every launch, so a handle
+    /// is only an identity WITHIN one conversation: asked globally, a card in
+    /// an old chat reported a process another chat started today as its own,
+    /// and offered a ✕ that would have killed it. A nil `sessionId` (a surface
+    /// with no session of its own, such as a task run's transcript) keeps the
+    /// global answer rather than losing its badge.
+    func isAlive(handle: String, sessionId: UUID?) -> Bool {
+        guard let sessionId else { return isAlive(handle: handle) }
+        return processes.first { $0.handle == handle && $0.sessionId == sessionId }?
+            .status.isAlive ?? false
+    }
+
     /// Incremental output since the last read, or nil for an unknown handle.
     func readOutput(handle: String) -> String? {
         processes.first { $0.handle == handle }?.output.readNew()
