@@ -3185,13 +3185,35 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
         const kv_bits: u64 = defaultKvBits();
-        // The hot-cache ASK is the a93e2c0 term, read only on the ungated arm
-        // (`prefillChunkCap`); the gated arm ignores it by construction.
-        // Through the accessor, never the global: at pin time nothing has
-        // published a clamped budget yet so this IS the raw ask (a93e2c0's
-        // `prefix_cache_mem_bytes`), and if a later model pins after a publish
-        // the accessor is the one that knows the switch retired it.
-        const hot_cache_ask = resolvedPrefixCacheMem();
+        // The hot-cache ASK, and WHICH ask (PR #363, two gated inputs).
+        //
+        // a93e2c0 passed `prefix_cache_mem_bytes` — the operator's raw number.
+        // The accessor returns the RESOLVED budget once a model has published
+        // one, so in a multi-model registry the SECOND model to load pins its
+        // prefill width against the FIRST model's clamped budget: an input
+        // a93e2c0 never fed it, on every arch. Single-model boot is identical
+        // either way (nothing has published yet), which is why this went
+        // unnoticed. The gated arch keeps the accessor — it is the arm the
+        // publish was measured on; every other arch reads the raw ask.
+        const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
+        // The OVERRIDE's precedence is the second gated input.
+        //
+        // a93e2c0's `pinPrefillChunk` had no override arm at all: it pinned
+        // the MACHINE RUNG, and `generate.effectivePrefillChunk` then let an
+        // explicit `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` outrank the
+        // pin at forward time. `billedPrefillChunk` moved that precedence into
+        // the PIN, which is the audit-S8 fix — the bill should describe the
+        // forward — but `config.pinned_prefill_chunk` is read by the admission
+        // bill, by the ungated `clampedPrefixCacheMem` reserve and by
+        // `computeMemoryContext`'s ADVERTISED context, so on every arch that
+        // sets the flag three numbers moved at once, unmeasured.
+        //
+        // KNOWN LIMIT of the ungated arm, inherited from a93e2c0 and stated
+        // rather than silently fixed: with `--prefill-chunk` set, a non-qwen4
+        // boot bills and advertises against the machine rung while the forward
+        // runs the flag's width. That inconsistency IS a93e2c0's behaviour;
+        // closing it is a change that owes the archs it touches a measurement.
+        const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
@@ -3199,7 +3221,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             active_mem,
             sizerCtxKvBytes(config, kv_bits),
             hot_cache_ask,
-            explicitPrefillChunk(),
+            pin_override,
         );
         // The ctx bar narrows the rung on the GATED arch only, so say when it
         // is the binding one — a chunk pinned at 512 by a large `--ctx-size`
@@ -3529,7 +3551,11 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// by name in the scan that forbids the rest): a93e2c0 parity means the ASK, not
 /// the resolved budget — reading the budget here is audit S6's one-step loop,
 /// which is a different bug from the one this preserves.
-fn legacyCtxSizingCacheReserve() u64 {
+///
+/// TWO callers, both a93e2c0-parity arms: the context sizer's reserve
+/// (`ctxSizingCacheReserve`) and the prefill pin's hot-cache term
+/// (`pinPrefillChunk`). One reader, so the exemption stays a single line.
+fn legacyPrefixCacheAsk() u64 {
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -3701,7 +3727,7 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
 /// to pin the new one.
 fn longCtxTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "qwen4_exp";
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 40;
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 2;
@@ -3880,7 +3906,7 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
 /// two are the numbers `--ctx-size 1048576` multiplies into 20,736 MiB.
 fn qwen4RequestTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "qwen4_exp";
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
     cfg.full_attention_interval = 4;
     cfg.num_attention_heads = 24;
@@ -4508,9 +4534,9 @@ test "the session bill and the advertised context read ONE reserve and ONE margi
     // The resolver holds both arms, and the constant is defined once.
     const res_body = declBody(src, "fn ctxSizingCache" ++ "Reserve(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, res_body, "CTX_SIZING_CACHE_" ++ "RESERVE") != null);
-    try t.expect(std.mem.indexOf(u8, res_body, "legacyCtxSizingCache" ++ "Reserve()") != null);
+    try t.expect(std.mem.indexOf(u8, res_body, "legacyPrefixCache" ++ "Ask()") != null);
     // The ask is read in ONE place, and it is not the resolved budget.
-    const legacy_body = declBody(src, "fn legacyCtxSizingCache" ++ "Reserve(") orelse return error.CallSiteMoved;
+    const legacy_body = declBody(src, "fn legacyPrefixCache" ++ "Ask(") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, legacy_body, "resolvedPrefixCache" ++ "Mem()") == null);
 
     // ONE margin: both consumers apply it through the shared helper rather than
@@ -5093,6 +5119,35 @@ test "the post-load admission line is armed by the registry, and consumed once" 
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "firstRequest" ++ "AfterLoad());"));
 }
 
+/// Iterate the PRODUCTION lines of a Zig source: every line outside a
+/// top-level `test "..." { ... }` block. Twin of `model.zig`'s — duplicated
+/// rather than exported because it is test scaffolding, and neither file
+/// should grow a production dependency on the other for it. See that copy for
+/// why the `indexOf("\ntest \"")` window it replaces is unsound here.
+const ProdLineScan = struct {
+    src: []const u8,
+    pos: usize = 0,
+    in_test: bool = false,
+
+    fn next(self: *ProdLineScan) ?[]const u8 {
+        while (self.pos < self.src.len) {
+            const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
+            const line = self.src[self.pos..end];
+            self.pos = end + 1;
+            if (self.in_test) {
+                if (std.mem.eql(u8, line, "}")) self.in_test = false;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "test \"")) {
+                self.in_test = true;
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+};
+
 test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" {
     // `prefixCacheMemForLoad` clamps, but the clamped value used to reach only
     // `initWithMem`: the auto-context sizer and the ANE gate kept reserving
@@ -5104,16 +5159,29 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
     const needle = "prefix_cache_mem" ++ "_bytes";
     const accessor = "resolvedPrefix" ++ "CacheMem()";
 
-    // PRODUCTION window only. The rule is about the two RESERVES that used to
-    // read the ask instead of the accessor; a test that deliberately drives the
+    // PRODUCTION lines only. The rule is about the RESERVES that used to read
+    // the ask instead of the accessor; a test that deliberately drives the
     // global (setting it, or saving and restoring it) is exercising the
-    // contract, not bypassing it, and scoping the scan is what keeps the
-    // exemption list from growing one entry per such test until it stops
-    // catching anything.
-    const prod = src[0 .. std.mem.indexOf(u8, src, "\ntest \"") orelse src.len];
-    var lines = std.mem.splitScalar(u8, prod, '\n');
-    while (lines.next()) |line| {
+    // contract, not bypassing it.
+    //
+    // NOT `src[0 .. indexOf("\ntest \"")]`. That is what this scan was narrowed
+    // to a round ago, and in server.zig the first test is at line 104 of
+    // 24,129 — so the loop below ran ZERO times, the guard was dead, and the
+    // `// legacy_ask_read` marker deliberately placed on `legacyPrefixCacheAsk`
+    // so this scan would exempt it by name became unreachable dead annotation
+    // (audit addendum 4, item 7). `ProdLineScan` skips top-level `test` blocks
+    // instead, which reaches every production line.
+    //
+    // The counters below are the point: a scan whose window collapses reports
+    // "no violations" forever, and only a hit count can tell that apart from a
+    // real pass. This is the same failure the arch-literal scan in `model.zig`
+    // had, and both were introduced in the same round.
+    var scan = ProdLineScan{ .src = src };
+    var inspected: usize = 0;
+    var exempted_by_name: usize = 0;
+    while (scan.next()) |line| {
         if (std.mem.indexOf(u8, line, needle) == null) continue;
+        inspected += 1;
         const trimmed = std.mem.trim(u8, line, " \t");
         // The declaration, the accessor's own fallback, and prose.
         if (std.mem.startsWith(u8, trimmed, "///")) continue;
@@ -5125,11 +5193,15 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
         // than the global — the exemption has to follow it, or the accessor
         // convicts itself and the scan can never be green.
         if (std.mem.indexOf(u8, trimmed, "HOT_CACHE_MEM_" ++ "UNRESOLVED") != null) continue;
-        // The ONE deliberate read: `legacyCtxSizingCacheReserve` reproduces
-        // a93e2c0's context sizing for every arch outside the long-context
-        // gate, and a93e2c0 billed the ASK. Exempted BY NAME rather than by
-        // shape, so a second bypass cannot inherit the exemption.
-        if (std.mem.indexOf(u8, trimmed, "legacy_ask" ++ "_read") != null) continue;
+        // The ONE deliberate read: `legacyPrefixCacheAsk` reproduces a93e2c0's
+        // context-sizing reserve AND its prefill-pin hot-cache term for every
+        // arch outside the long-context gate, and a93e2c0 billed the ASK.
+        // Exempted BY NAME rather than by shape, so a second bypass cannot
+        // inherit the exemption.
+        if (std.mem.indexOf(u8, trimmed, "legacy_ask" ++ "_read") != null) {
+            exempted_by_name += 1;
+            continue;
+        }
         // A line that names the ask AND calls the accessor in one expression is
         // COMPARING the two — that is the fallback contract, which is the one
         // thing that has to read both. A bypass reads the ask INSTEAD of the
@@ -5138,6 +5210,13 @@ test "every post-load hot-cache reserve reads the RESOLVED budget, not the ask" 
         std.debug.print("unmediated read of the hot-cache ASK: {s}\n", .{trimmed});
         return error.UnmediatedAskRead;
     }
+    // The scan ran, and it reached the line the named exemption is FOR. Both
+    // are load-bearing: `inspected == 0` is the dead-window failure, and
+    // `exempted_by_name == 0` means the one deliberate a93e2c0-parity read
+    // moved or lost its marker, in which case the exemption is no longer
+    // documenting anything.
+    try t.expect(inspected > 0);
+    try t.expectEqual(@as(usize, 1), exempted_by_name);
 
     // And the two reserves that used to read it now go through the accessor.
     // The ANE gate still reads the RESOLVED budget — it is asking what the
@@ -5231,7 +5310,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// afterwards is the session the server ADVERTISES. Two reserves there means
 /// the floor is sized for a session the box is never asked to serve.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
-    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyCtxSizingCacheReserve();
+    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
@@ -5681,6 +5760,44 @@ fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
 /// failed.
 const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
 
+/// The body of the pre-flight memory 400, in ONE place.
+///
+/// Two arms, chosen by whether the bill CARRIES the hot cache. With the
+/// credits present the message quotes them, because they are what the guard
+/// compared and the operator's first question is "why didn't it just drop a
+/// cache entry?". With the credits structurally zero — every arch outside
+/// `longCtxGated`, where `prefillAdmissionBill` drops both — quoting them
+/// asserts that a resident cache holds nothing, which is false and
+/// client-visible. That arm is a93e2c0's exact sentence
+/// (`git show a93e2c0:src/server.zig:3261`), which named no cache at all —
+/// the honest message where the cache is genuinely not part of the decision.
+///
+/// The discriminator is the ARCH GATE, not `bill.evictable`, and that is a
+/// deliberate second choice. Keying on the byte count reads better on the
+/// merits — a gated bill on an empty cache also holds nothing, and "~0MB" is
+/// no more true there — but it CHANGES the qwen4_exp message: that arch does
+/// reach this arm with an empty cache (a large first request, before anything
+/// is resident), and it used to render the long sentence with two zeroes. This
+/// round's mandate is zero qwen4-path changes, so the gated arch keeps its
+/// bytes exactly, zeroes and all, and only the ungated arm moves — to
+/// a93e2c0's sentence, which is what it had. Revisit on the merits later,
+/// separately, where it can be measured as its own change.
+///
+/// Caller owns the returned bytes.
+fn memoryRefusalMessage(
+    allocator: std.mem.Allocator,
+    prompt_len: usize,
+    needed_mb: u64,
+    avail_mb: u64,
+    bill: AdmissionBill,
+    carries_cache: bool,
+) ![]u8 {
+    if (!carries_cache) {
+        return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+    }
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
+}
+
 /// The message `error.PrefillDoesNotFit` sends (`mapGenerationError`, the one
 /// reader, on every surface and both paths). The request was
 /// refused BEFORE its first forward, by the same estimator the connection
@@ -5970,8 +6087,12 @@ pub fn chooseRequestPrefillChunk(
     chunk_override: u32,
     warm: WarmPrefix,
 ) u32 {
-    if (chunk_override > 0) return chunk_override;
+    // The arch gate FIRST. An ungated arch has no per-request width at all —
+    // its answer is the load-time pin, which is what a93e2c0 billed — and
+    // honouring the override above the gate handed it a width a93e2c0's bill
+    // never saw (`pinPrefillChunk` deliberately pins the RUNG there).
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
+    if (chunk_override > 0) return chunk_override;
     for (PREFILL_CHUNK_LADDER) |rung| {
         // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim,
         // which has no upper bound at its source — clamp before narrowing
@@ -6582,7 +6703,15 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // deferral arm above rather than being refused on a cold bill. So the
         // message says the one thing that is true on this path and does not
         // reach for a branch that can no longer be taken.
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
+        // The cache clause is only TRUE where the bill CARRIES the cache. Off
+        // the long-context gate both credits are structurally zero
+        // (`prefillAdmissionBill` drops them), so this sentence rendered
+        // "holds ~0MB more, all of which can be reclaimed (~0MB — the
+        // shortfall is elsewhere)" on a box with a multi-GB resident cache: a
+        // client-visible 400 stating a falsehood, on exactly the archs the
+        // gate exists to leave alone. `memoryRefusalMessage` is the ONE
+        // formatter, so the two arms cannot drift.
+        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.longCtxGated());
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -22300,7 +22429,7 @@ test "an MLX failure is a named memory 503, and main installs the latch that mak
 /// mixed-4-8bit, `--ctx-size 1048576 --kv-quant 8`, on an M5 Max 128 GB.
 fn qwen4ExpOomConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "qwen4_exp";
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
     cfg.full_attention_interval = 4; // 12 caching layers, 36 GatedDeltaNet
     cfg.num_attention_heads = 24;
@@ -24125,4 +24254,96 @@ test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
     // `publishHotCacheResidency` is NOT inside the gate — it runs for every
     // arch at every other call site.
     try t.expect(std.mem.count(u8, sch, "publishHotCacheResidency(sch);") > 1);
+}
+
+test "memoryRefusalMessage: the 400 names the hot cache only where the bill carries it" {
+    // PR #363. Gate 4 zeroes both credits off `longCtxGated`, and this message
+    // formats them — so a non-qwen4 refusal read "the hot prefix cache holds
+    // ~0MB more, all of which can be reclaimed (~0MB — the shortfall is
+    // elsewhere)" on a box with a multi-GB resident cache. Client-visible, and
+    // false on exactly the archs the gate exists to leave alone.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    // UNGATED → a93e2c0's exact sentence, byte for byte
+    // (`git show a93e2c0:src/server.zig:3261`).
+    const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, false);
+    defer t.allocator.free(bare);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB available. Reduce prompt size or use a smaller model.",
+        bare,
+    );
+
+    // GATED → the message quotes what the guard compared.
+    const rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, true);
+    defer t.allocator.free(rich);
+    try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
+    try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
+
+    // THE qwen4 BYTE CHECK. The gated arch reaches this arm with an EMPTY hot
+    // cache — a large first request, before anything is resident — and it used
+    // to render the long sentence with two zeroes. Keying the discriminator on
+    // `bill.evictable` would have read better on the merits and silently
+    // changed those bytes, so the gate decides and qwen4 keeps them.
+    const q4_cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, true);
+    defer t.allocator.free(q4_cold);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        q4_cold,
+    );
+    // ...and the ungated arm never renders that sentence, at any bill.
+    const ungated_rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, false);
+    defer t.allocator.free(ungated_rich);
+    try t.expectEqualStrings(bare, ungated_rich);
+
+    // ONE formatter: the refusal site does not spell either sentence itself.
+    const src = @embedFile("server.zig");
+    const at = std.mem.indexOf(u8, src, "const msg = try memoryRefusal" ++ "Message(") orelse return error.CallSiteMoved;
+    // The call site asks the ONE predicate, never re-derives the condition.
+    try t.expect(std.mem.indexOf(u8, src[at..@min(src.len, at + 160)], "config.longCtx" ++ "Gated())") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "but only ~{d}MB is available and the hot " ++ "prefix cache"));
+}
+
+test "pinPrefillChunk: the explicit width and the hot-cache ask are both gated" {
+    // Two ungated inputs the sweep found (audit addendum 4 / completeness
+    // sweep items 1 and 2). Both feed `config.pinned_prefill_chunk`, which the
+    // admission bill, the ungated `clampedPrefixCacheMem` reserve and
+    // `computeMemoryContext`'s ADVERTISED context all read.
+    //
+    // `pinPrefillChunk` reads live memory, so the SHAPE is pinned by source;
+    // the arithmetic it delegates to is pure and pinned elsewhere.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "pub fn pinPrefillChunk(") orelse return error.CallSiteMoved;
+
+    // (1) The OVERRIDE. a93e2c0's `pinPrefillChunk` had no override arm: it
+    // pinned the machine RUNG and let `generate.effectivePrefillChunk` apply
+    // the flag at forward time. Gated, the pin takes the override (audit S8);
+    // ungated it must pass 0 so the rung is what gets pinned.
+    try t.expect(std.mem.indexOf(u8, body, "const pin_override: u32 = if (config.longCtx" ++ "Gated()) explicitPrefill" ++ "Chunk() else 0;") != null);
+    try t.expect(std.mem.indexOf(u8, body, "            pin_override,\n") != null);
+
+    // (2) WHICH ask. a93e2c0 passed the raw `--prefix-cache-mem`; the accessor
+    // returns the RESOLVED budget once a model has published one, so in a
+    // multi-model registry the second model to load pinned against the first
+    // model's clamped budget.
+    try t.expect(std.mem.indexOf(u8, body, "if (config.longCtx" ++ "Gated()) resolvedPrefix" ++ "CacheMem() else legacyPrefixCache" ++ "Ask()") != null);
+
+    // The per-request chooser asks the ARCH before the override, for the same
+    // reason: an ungated arch's answer is the load-time pin, which is what
+    // a93e2c0 billed.
+    const chooser = declBody(src, "pub fn chooseRequestPrefillChunk(") orelse return error.CallSiteMoved;
+    const gate_at = std.mem.indexOf(u8, chooser, "perRequestPrefillChunkEnabled(config)) return load_time_pin;") orelse return error.CallSiteMoved;
+    const ovr_at = std.mem.indexOf(u8, chooser, "if (chunk_override > 0) return chunk_override;") orelse return error.CallSiteMoved;
+    try t.expect(gate_at < ovr_at);
 }

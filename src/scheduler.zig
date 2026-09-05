@@ -6431,6 +6431,11 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
+        // ONE predicate for both halves of the pad-waste change: the kv-length
+        // RULE (`batchKvLenOf`) and the SORT that orders by it. Reading them
+        // from one place is what stops a group being ordered by a93e2c0's key
+        // and capped by the new one.
+        const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtxGated() else false;
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than
@@ -6443,20 +6448,44 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             // alongside the slots so the sort key and the waste ratio are
             // literally the same numbers.
             var kv_lens: [32]u32 = undefined;
-            for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
-            // Ascending by length, slots and lengths moving together. Insertion
-            // sort: `group.len <= 32`, and this runs once per decode tick.
-            var i: usize = 1;
-            while (i < group.len) : (i += 1) {
-                const slot_i = group[i];
-                const len_i = kv_lens[i];
-                var j = i;
-                while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
-                    group[j] = group[j - 1];
-                    kv_lens[j] = kv_lens[j - 1];
+            // ARCH GATE (PR #363). The STABLE insertion sort is part of the
+            // pad-waste change, not a neutral rewrite: a93e2c0 ordered the
+            // group with `std.sort.pdq`, which is UNSTABLE, so on equal keys
+            // the two sorts hand `batchedKvKeepCount` different slots in the
+            // tail — and the tail is what falls to serial decode, i.e. a
+            // different KERNEL for that slot. Off qwen4_exp every key is
+            // `cache.step`, which is 0 forever on a hybrid trunk, so EVERY key
+            // is equal and the choice of sort decides the whole ordering. That
+            // is the loudest possible version of the difference, on exactly
+            // the archs nobody measured.
+            //
+            // So the ungated arm takes a93e2c0's call verbatim
+            // (`git show a93e2c0:src/scheduler.zig:5530`) and derives the
+            // lengths afterwards, which is also a93e2c0's order of operations.
+            if (gate_batch_kv_len) {
+                for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+                // Ascending by length, slots and lengths moving together.
+                // Insertion sort: `group.len <= 32`, and this runs once per
+                // decode tick. STABLE, so slots that tie keep arrival order.
+                var i: usize = 1;
+                while (i < group.len) : (i += 1) {
+                    const slot_i = group[i];
+                    const len_i = kv_lens[i];
+                    var j = i;
+                    while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                        group[j] = group[j - 1];
+                        kv_lens[j] = kv_lens[j - 1];
+                    }
+                    group[j] = slot_i;
+                    kv_lens[j] = len_i;
                 }
-                group[j] = slot_i;
-                kv_lens[j] = len_i;
+            } else {
+                std.sort.pdq(*Slot, group, {}, struct {
+                    fn lt(_: void, a: *Slot, b: *Slot) bool {
+                        return a.cache.step < b.cache.step;
+                    }
+                }.lt);
+                for (group, 0..) |g, i| kv_lens[i] = @intCast(g.cache.step);
             }
             const keep = batchedKvKeepCount(kv_lens[0..group.len]);
             if (keep < group.len) {
@@ -7598,7 +7627,13 @@ test "the batched group takes its kv length from the ONE accessor, never cache.s
     const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "batchKvLen()") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "cache.step") == null);
+    // `cache.step` IS present now — deliberately, as the ungated arm's key
+    // (a93e2c0's). The rule it stands for is unchanged and is now per-arm: the
+    // GATED arm must never read it. Bound the window at the `else`, so a
+    // `cache.step` creeping back into the gated half is still caught.
+    const gated_at = std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {") orelse return error.MissingGate;
+    const else_at = std.mem.indexOfPos(u8, body, gated_at, "\n            } else {") orelse return error.MissingLegacyArm;
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..else_at], "cache.step") == null);
     // The cap's log names the number it compared, not just its outcome.
     try testing.expect(std.mem.indexOf(u8, body, "pad-waste cap: kept") != null);
     try testing.expect(std.mem.indexOf(u8, body, "batchedPadWaste(") != null);
@@ -8690,4 +8725,38 @@ test "every round-cost layout assignment routes through the ONE resolver" {
         try testing.expect(std.mem.indexOf(u8, window, "layout" ++ " = .legacy") == null);
         try testing.expect(std.mem.indexOf(u8, window, "Layout = if (") == null);
     }
+}
+
+test "the batched group's SORT is gated with its kv-length rule" {
+    // Completeness-sweep item 4. The stable insertion sort is part of the
+    // pad-waste change, not a neutral rewrite: a93e2c0 ordered the group with
+    // `std.sort.pdq`, which is UNSTABLE, so on equal keys the two sorts hand
+    // `batchedKvKeepCount` different slots in the tail — and the tail falls to
+    // SERIAL decode, i.e. a different kernel for that slot.
+    //
+    // Off qwen4_exp every key is `cache.step`, which is 0 forever on a hybrid
+    // trunk, so EVERY key ties and the choice of sort decides the whole
+    // ordering. That is the loudest possible version of the difference, on
+    // exactly the archs nobody measured.
+    const src = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
+    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
+    const body = src[start..end];
+
+    // ONE predicate for both halves — the rule and the sort that orders by it.
+    try testing.expect(std.mem.indexOf(u8, body, "const gate_batch_kv_len = if (group[0].model.config) |c| c.longCtx" ++ "Gated() else false;") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {") != null);
+
+    // The ungated arm is a93e2c0's call verbatim, keyed on `cache.step`, with
+    // the lengths derived AFTER the sort (a93e2c0's order of operations).
+    const legacy_at = std.mem.indexOf(u8, body, "std.sort.pdq(*Slot, group, {}, struct {") orelse return error.MissingLegacySort;
+    const legacy = body[legacy_at..@min(body.len, legacy_at + 320)];
+    try testing.expect(std.mem.indexOf(u8, legacy, "return a.cache.step < b.cache.step;") != null);
+    try testing.expect(std.mem.indexOf(u8, legacy, "kv_lens[i] = @intCast(g.cache.step);") != null);
+
+    // ...and the gated arm keys on the accessor, never on `step`.
+    const gated_at = std.mem.indexOf(u8, body, "if (gate_batch_kv_len) {").?;
+    try testing.expect(gated_at < legacy_at);
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..legacy_at], "kv_lens[i] = g.batchKvLen();") != null);
+    try testing.expect(std.mem.indexOf(u8, body[gated_at..legacy_at], "cache.step") == null);
 }

@@ -7044,8 +7044,99 @@ test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
 
     // Every other file that gates on this family goes through a predicate, so
     // none of them carries the literal in production code at all.
-    for ([_][]const u8{ @embedFile("server.zig"), @embedFile("scheduler.zig"), @embedFile("generate.zig"), @embedFile("prefix_cache.zig"), @embedFile("kv_disk_cache.zig") }) |file| {
-        const impl = file[0 .. std.mem.indexOf(u8, file, "\ntest \"") orelse file.len];
-        try t.expectEqual(@as(usize, 0), std.mem.count(u8, impl, lit));
+    //
+    // NOT `file[0 .. indexOf("\ntest \"")]`. That idiom is only sound where the
+    // tests TRAIL the code, which is true of THIS file and false of the ones
+    // below: server.zig's first test sits at line 104 of 24,129, so the window
+    // was the import block and this loop asserted a fact about 0.4% of the file
+    // (audit addendum 4, item 1). `ProdLineScan` skips top-level `test` blocks
+    // instead, which reaches the other 99.6%.
+    //
+    // Each file also names a declaration PAST ITS OWN FIRST TEST BLOCK that
+    // the scan must have seen. That is the falsifiability check, and the
+    // needles are chosen against each file's old window rather than "somewhere
+    // deep": a zero-hit result looks identical whether the scan read the whole
+    // file or one line, so only reachability separates a real pass from the
+    // vacuous one this replaces. Every needle below is unreachable under the
+    // old `indexOf("\ntest \"")` window.
+    const files = [_]struct { src: []const u8, deep: []const u8, exempt: usize }{
+        // first test at line 104 of 24,129 — the window was the import block.
+        // Its three exemptions are `longCtxTestConfig`, `qwen4RequestTestConfig`
+        // and `qwen4ExpOomConfig`: test fixtures at column 0, production by
+        // position and test data by purpose.
+        .{ .src = @embedFile("server.zig"), .deep = "pub fn prefillAdmissionBill(", .exempt = 3 },
+        .{ .src = @embedFile("scheduler.zig"), .deep = "pub fn loadRequirementBytes(", .exempt = 0 },
+        .{ .src = @embedFile("generate.zig"), .deep = "pub fn sampleTokenLazy(", .exempt = 0 },
+        .{ .src = @embedFile("prefix_cache.zig"), .deep = "fn testWriteCacheLayer(", .exempt = 0 },
+        .{ .src = @embedFile("kv_disk_cache.zig"), .deep = "fn makeArange(", .exempt = 0 },
+    };
+    for (files) |f| {
+        var scan = ProdLineScan{ .src = f.src };
+        var lines: usize = 0;
+        var hits: usize = 0;
+        var saw_deep = false;
+        var exempt: usize = 0;
+        while (scan.next()) |line| {
+            lines += 1;
+            if (std.mem.startsWith(u8, line, f.deep)) saw_deep = true;
+            if (std.mem.indexOf(u8, line, lit) == null) continue;
+            // ONE named escape, spelled AT the line: a test FIXTURE that
+            // constructs a qwen4_exp config sits at column 0 outside any
+            // `test` block (server.zig's `longCtxTestConfig`,
+            // `qwen4RequestTestConfig`, `qwen4ExpOomConfig`), so it is
+            // production by position and test data by purpose. Exempted by
+            // NAME, never by shape — a real gate cannot acquire the marker by
+            // accident, and a fixture that loses it is caught here.
+            if (std.mem.indexOf(u8, line, "arch-scan-" ++ "exempt") != null) {
+                exempt += 1;
+                continue;
+            }
+            hits += 1;
+        }
+        try t.expectEqual(@as(usize, 0), hits);
+        // The exemption count is EXACT, so a fixture that loses its marker is
+        // caught as a hit and a fourth one that acquires it is caught here.
+        try t.expectEqual(f.exempt, exempt);
+        // The scan ran, and it ran deep enough to matter.
+        try t.expect(lines > 0);
+        try t.expect(saw_deep);
     }
 }
+
+/// Iterate the PRODUCTION lines of a Zig source: every line outside a
+/// top-level `test "..." { ... }` block.
+///
+/// Top-level declarations start at column 0 and so do their closing braces,
+/// which makes `}` at column 0 an exact terminator for a test block — a nested
+/// close is always indented, and a `\\` multiline string is too.
+///
+/// This exists because `src[0 .. indexOf("\ntest \"")]` — the idiom several
+/// scans in this tree used — silently degenerates to a near-empty window in
+/// any file whose tests are interleaved rather than trailing, and a scan over
+/// an empty window passes forever (audit addendum 4, items 1 and 7). Duplicated
+/// verbatim in `server.zig`'s test region rather than exported: it is test
+/// scaffolding, and neither file should grow a production dependency on the
+/// other for it.
+const ProdLineScan = struct {
+    src: []const u8,
+    pos: usize = 0,
+    in_test: bool = false,
+
+    fn next(self: *ProdLineScan) ?[]const u8 {
+        while (self.pos < self.src.len) {
+            const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
+            const line = self.src[self.pos..end];
+            self.pos = end + 1;
+            if (self.in_test) {
+                if (std.mem.eql(u8, line, "}")) self.in_test = false;
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "test \"")) {
+                self.in_test = true;
+                continue;
+            }
+            return line;
+        }
+        return null;
+    }
+};
