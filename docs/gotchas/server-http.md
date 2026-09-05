@@ -3884,24 +3884,103 @@ billed, `gcToBudget` priced the tier low, and the footprint drifted past
 tier; fixed for everyone (`an ssm/spec-only append bills the SPEC sidecar's byte
 delta`, red at 80,739 vs 118,668).
 
-`publishResolvedPrefixCacheMem` stays ungated **on purpose**, and it is the one
-place this round knowingly departs from a93e2c0 on other archs: a93e2c0's ANE
+**This fix IS live on qwen4_exp** — correcting a premise this ledger and the
+round-2 brief both carried. The claim was that qwen4 never writes a spec
+sidecar because `MtpCacheRef.kv()` returns null for the in-checkpoint head.
+That was true at a93e2c0 and is **false on this tree**: `generate.kv()`'s
+`.qwen4` arm returns `&t.qwen4_mtp.?.cache` whenever `mtpHeadPersistEnabled()`,
+and `mtpHeadPersistFromEnv(null)` returns **true** — head persistence is
+default-ON (`MLX_SERVE_MTP_HEAD_PERSIST=0` turns it off). `metaVersionFor`
+returns 5 for exactly that case. So on qwen4_exp with `--mtp` +
+`--prefix-cache-disk` a v5 sidecar IS written, `specWorkPending` CAN be true —
+notably through its own v5-upgrade arm, which fires on every entry of a tier
+carried over from an older build — and the delta really moves `e.bytes` and
+`tier.total_bytes`.
+
+What the delta cannot reach is a DECISION: its only consumer is `gcToBudget`,
+which is a no-op unless `total_bytes > max_bytes`. The judge boots at
+`--prefix-cache-disk 100GB` against tiers of ~20-28 GB, so the budget never
+binds and no eviction moves — which is why the root_all5 judge table still
+stands for root_all6. **That is a run-configuration argument, not a property:**
+under a tight `--prefix-cache-disk` this fix does change qwen4 eviction. Nobody
+writing the PR body should repeat the `kv()` → null claim.
+
+`publishResolvedPrefixCacheMem` stays ungated **on purpose**: a93e2c0's ANE
 gate reserved the RAW `--prefix-cache-mem` while the cache could only ever hold
 the clamp, so three places disagreed about how many bytes the cache holds.
-Publishing a number the cache is actually capped at cannot over-admit, and it
-only affects `--ane-prefill` boots. Recorded here so it can be objected to
-rather than discovered.
+Publishing a number the cache is actually capped at cannot over-admit.
+
+Its reach is **wider than "`--ane-prefill` boots"**, which this ledger claimed
+and the code does not support. `resolvedPrefixCacheMem()` has three ungated
+production readers: the `serve()` boot banner (`Hot prefix cache: ENABLED
+(mem-cap=…)` now prints the RESOLVED cap where a93e2c0 printed the raw ask —
+cosmetic, operator-visible, every arch); `aneGateHeadroom`; and — until this
+round — `pinPrefillChunk`. The third was the one that mattered and is now
+gated: off `longCtxGated` the pin reads `legacyPrefixCacheAsk()`, because in a
+multi-model registry the SECOND model to load was sizing its prefill width
+against the FIRST model's clamped budget, an input a93e2c0 never fed it.
+Single-model boot was identical either way, which is why it went unnoticed.
+
+### Class C — the completeness sweep's seven, gated in round 3
+
+The auditor's line-by-line sweep of `a93e2c0..00b7a8e -- src/` found seven
+changed hunks the ledger had no row for. Five change behaviour off qwen4_exp
+and are gated; two are log-only and are recorded as such.
+
+| # | site | what changed for other archs | gate |
+|---|---|---|---|
+| 12 | `pinPrefillChunk` → `billedPrefillChunk` override precedence, and `chooseRequestPrefillChunk`'s short-circuit | a93e2c0 pinned the machine RUNG and let `generate.effectivePrefillChunk` apply an explicit `--prefill-chunk` / `MLX_SERVE_PREFILL_CHUNK` at forward time. The PR moved that precedence into the PIN — the audit-S8 fix — and the pin is read by the admission bill, by the ungated `clampedPrefixCacheMem` reserve and by `computeMemoryContext`'s **advertised** context, so three numbers moved at once on every arch that sets the flag | `pin_override` is `explicitPrefillChunk()` only when gated, else 0; the chooser asks the arch BEFORE the override |
+| 13 | `pinPrefillChunk` reading `resolvedPrefixCacheMem()` | in a multi-model registry the second model to load pinned its width against the first model's CLAMPED budget — an input a93e2c0 never fed it. Single-model boot is identical, which is why it went unnoticed | ungated reads `legacyPrefixCacheAsk()`, the raw `--prefix-cache-mem` |
+| 14 | the memory-refusal 400 body | gate 4 zeroes both credits off the gate, and the message formats them: every non-qwen4 refusal read "the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere)" on a box with a multi-GB resident cache. Client-visible, and false | `memoryRefusalMessage` — one formatter, two arms, discriminated on `bill.evictable`; the zero arm is a93e2c0's exact sentence, pinned byte for byte |
+| 15 | `scheduler`'s batched-group sort | the stable insertion sort replaced `std.sort.pdq`, which is UNSTABLE. On equal keys the two hand `batchedKvKeepCount` different slots in the tail, and the tail falls to SERIAL decode — a different kernel. Off qwen4 every key is `cache.step`, 0 forever on a hybrid, so EVERY key ties and the sort decides the whole ordering | `gate_batch_kv_len`, the same predicate as the kv-length rule, read once per group so a group cannot be ordered by one key and capped by the other |
+| 16 | `round_cost.BUCKET_NAMES[5]` | the legacy grid's top bucket is unbounded `32k+`; the array spells the long grid's `32-64k`. Every `[spec-stats]` / `[mtp-trace]` / adaptive-switch line on a sidecar-MTP pack labelled a 374k request "32-64k" — the number right, the label a lie | `bucketName(layout, b)`; labels only, no cell/edge/plan moves |
+
+**Known limit of the ungated arm of row 12,** inherited from a93e2c0 and stated
+rather than silently fixed: with `--prefill-chunk` set, a non-qwen4 boot bills
+and advertises against the machine rung while the forward runs the flag's
+width. That inconsistency *is* a93e2c0's behaviour; closing it is a change that
+owes the archs it touches a measurement.
+
+### Log-only, recorded so the sweep is closed
+
+`[spec-stats]`'s new fields (`width_trials=`, `table=`, the serial-row and
+EV-plan terms) and the `[admission]` verdict line are **emitted, never read**.
+`logAdmissionDecision` derives its verdict from the same `AdmissionBill` the
+guard acts on, so off the gate it prints `reclaimable=0 MB` and the arm it
+names is a93e2c0's reject — a true statement about a bill whose credits the
+gate dropped. No decision keys on either line.
+
+### Two ungated costs gate 4 leaves behind
+
+Recorded because they are real and unmeasured, not because they are wrong:
+
+1. **The 400's text** — closed by row 14 above.
+2. **Publishing machinery every ungated arch pays for and never reads.**
+   `publishHotCacheResidency` calls `publishHotCacheDigests`, which allocates
+   and takes `digest_mu` on every commit, eviction, invalidation and model
+   switch; and `prefillAdmissionBill` calls `reclaimableHotCacheBytesFor` **per
+   request on the connection thread**, hashing the prompt under the same mutex
+   — then discards the result at the ungated return. a93e2c0 had none of it. No
+   correctness impact: the two scalars are the class-A use-after-free fix and
+   must stay. The DIGEST half arguably belongs inside the gate; left as-is this
+   round because moving it is a threading change, not a text change, and it
+   owes a measurement of its own.
+
+**A coupling worth stating:** gate 4's ungated identity rests on gate 1 holding.
+`needed` reduces to a93e2c0's expression only because the reservation is zeroed
+(`generate.reservedPrefillTokens`) and `checkAttentionMemory` passes a cold
+`.{}` warm prefix. Break gate 1 and gate 4's arm stops being a93e2c0's.
 
 ### Sweep extension: aad0315 → f3f0a25
 
 | commit | site | class | note |
 |---|---|---|---|
-| `c7f0657` | ONE error mapping for streaming and non-streaming | **A** | a streaming fault answered differently from the same non-streaming fault. Pinned by `a streaming fault answers with the SAME mapped error a non-streaming one does` |
-| `035da33` | a latched MLX failure ends the request, never a 200 | **A** | the terminator reads the latch BEFORE it publishes, and is the only publisher. `peekErrorName names the class WITHOUT consuming the latch`, `a finish over a latched MLX failure ends the request as an ERROR, never a 200`, `the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher` |
+| `c7f0657` | ONE error mapping for streaming and non-streaming (`mapGenerationError` / `sendGenerationError`) | **A** | a streaming fault answered differently from the same non-streaming fault. `mapGenerationError` is the one classifier and `sendGenerationError` the one emitter, so a surface cannot answer twice. Pinned by `a streaming fault answers with the SAME mapped error a non-streaming one does` |
+| `035da33` | a latched MLX failure ends the request, never a 200 (`publishSlotTerminator`) | **A** | `publishSlotTerminator` is the ONE publisher and it reads the latch BEFORE it publishes, so no path can end a latched request with a success terminator. `peekErrorName names the class WITHOUT consuming the latch`, `a finish over a latched MLX failure ends the request as an ERROR, never a 200`, `the slot terminator reads the MLX latch BEFORE it publishes, and is the only publisher` |
 | `db9fa58` | `DiskTier.deinit` lifts the writer pause before `w.drain()` | **A** | a paused background writer deadlocked `zig build test` (the B-A1 hang this branch reproduced on aad0315). `DiskTier: deinit RETURNS with the writer paused, and lands what was queued`, `every test that PAUSES the background writer owes a deferred unpause`, `kv_disk_writer: a PAUSED writer deinits without blocking` |
 | `8959c78` | the post-eviction re-ask is the width that runs, in both directions | **C, already gated** | `postEvictionPrefillChunk` runs only where there IS a per-request width, i.e. behind `perRequestPrefillChunk` — which A-1 now routes through `longCtxGated()`. `the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width` |
 | `124f19d` | the warm KV credit fires only where the restore CHECKS OUT its entry (B-A3) | **C, subsumed** | `WarmPrefix.will_donate` gates `creditedRows`; off qwen4_exp the credit is already zero because `prefillRequestTerms` returns `.{}` (gate 4). The two compose — the fold's fix tightens the gated arm, this branch removes the ungated one |
-| `e59e259` | one round-cost `Layout` resolver | **D** | `layoutFor` is the single resolver and `Layout.legacy` keeps a sidecar pack booting warm off the `rc1` file 26.9.1 wrote. Verified gated, not assumed: `layoutFor is THE round-cost layout resolver`, `every round-cost layout assignment routes through the ONE resolver` |
+| `e59e259` | one round-cost `Layout` resolver (`layoutFor`, `migrateLegacy`) | **D** | `layoutFor` is the single resolver and `Layout.legacy` keeps a sidecar pack booting warm off the `rc1` file 26.9.1 wrote. `migrateLegacy` lifts a six-bucket table onto the long grid behind `if (layout != .long) return null;`, so a sidecar pack's `rc1` file is read in place and never rewritten. Verified gated, not assumed: `layoutFor is THE round-cost layout resolver`, `every round-cost layout assignment routes through the ONE resolver` |
 
 ### The round-cost / planner cluster — class D, verified
 
