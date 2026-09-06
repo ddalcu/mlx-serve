@@ -15227,14 +15227,14 @@ pub const Transformer = struct {
         const emb_dim: usize = st.table.dim * nh;
         const host = try self.allocator.alloc(f32, n * emb_dim);
         defer self.allocator.free(host);
-        var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
+        var gclk: ProfClock = if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
         // The pool's arm is a kv-length question (`PREFILL_PREFETCH_MIN_KV`):
         // the mapping is resident early in a prompt and evicted late in one.
         // `ctx.moe_seq_offset` is the PRE-chunk position and has not advanced
         // yet at this point in the layer loop — `cache.step` cannot stand in,
         // it is 0 forever on a GDN trunk (layer 0 is linear).
         st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
-        if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
+        if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         std.debug.assert(pk.len == host.len);
         for (host, 0..) |v, i| {
             const u: u32 = @bitCast(v);
@@ -15783,7 +15783,7 @@ pub const Transformer = struct {
             const key_rows = mlx.getShape(keys)[1];
             if (key_rows != kv) return error.QsaHistoryGap;
         }
-        if (std.c.getenv("QWEN4_NO_POOLED") != null and entry.qsa_pooled.ctx != null) {
+        if (envFlagCached(&qwen4_no_pooled_env, "QWEN4_NO_POOLED") and entry.qsa_pooled.ctx != null) {
             _ = mlx.mlx_array_free(entry.qsa_pooled);
             entry.qsa_pooled = .{ .ctx = null };
         }
@@ -15830,7 +15830,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ batch, n_new, idx_hd }, 3, self.s));
             try self.qsaAppendPooled(entry, new3, nb_cached);
         }
-        if (std.c.getenv("QWEN4_DEBUG_SCORES") != null) {
+        if (envFlagCached(&qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
             const qs = mlx.getShape(entry.qsa_pooled);
             std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
         }
@@ -15857,7 +15857,7 @@ pub const Transformer = struct {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
             // single-row selection for the decode gatherer.
-            const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+            const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(k32));
@@ -15893,7 +15893,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(scores);
         try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [B,S,nb] (scale is monotone — skipped)
 
-        if (std.c.getenv("QWEN4_DEBUG_SCORES") != null) {
+        if (envFlagCached(&qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
             var f = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(f);
             try mlx.check(mlx.mlx_astype(&f, scores, .float32, self.s));
@@ -16212,7 +16212,7 @@ pub const Transformer = struct {
         const pnh = weights.get(mtp_prefix ++ ".pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
         var cache = try KVCache.init(allocator, config.num_hidden_layers + 1);
         errdefer cache.deinit();
-        log.info("[qwen4] MTP head loaded (1 hyper-connected QSA+MoE layer; spec wiring pending)\n", .{});
+        log.info("[qwen4] MTP head loaded (1 hyper-connected QSA+MoE layer; drafts armed by --mtp)\n", .{});
         return .{
             .layer = layer,
             .pre_norm_emb = pne,
@@ -25610,17 +25610,42 @@ fn batchedExpertDecodePolicy(model_type: []const u8, gather_force: bool, batched
 
 var moe_gather_force_env: ?bool = null;
 var moe_batched_force_env: ?bool = null;
+/// Caches for the qwen4 per-layer diagnostic switches. `qsaMaskFromQk` runs
+/// once per full-attention layer per forward and `pleGatherBf16` twice per
+/// gather; a `getenv` there is a libc scan of the whole environ block for an
+/// answer that is constant for the life of the process.
+var qwen4_no_pooled_env: ?bool = null;
+var qwen4_debug_scores_env: ?bool = null;
+var qwen4_profile_fwd_env: ?bool = null;
+var qwen4_profile_qsa_env: ?bool = null;
+/// PRESENCE semantics: `FOO=0` reads as ON. Never substitute this for
+/// `diagEnvOnCached` — a harness exporting `FOO=0` would arm the switch.
 fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
     if (cache.*) |v| return v;
     const v = std.c.getenv(name) != null;
     cache.* = v;
     return v;
 }
+/// The diagnostic-switch decision, split from the `getenv` so both readers
+/// below are testable without touching the process environment (std.c exposes
+/// no `setenv`).
+fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
+    const v = raw orelse return false;
+    return v[0] != '0';
+}
 /// Diagnostic env switch: set and not `0`. `FOO=0` exported by a harness must
 /// never arm a sync profiler (the qwen4 MTP verify once measured 70 ms).
 fn diagEnvOn(name: [*:0]const u8) bool {
-    const v = std.c.getenv(name) orelse return false;
-    return v[0] != '0';
+    return diagEnvValueOn(std.c.getenv(name));
+}
+/// `diagEnvOn` for a HOT path: same semantics (absent or `0` = off), asked
+/// once. The cache is per switch, module-level, and never reset — the answer
+/// cannot change under a running process in any way we serve.
+fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
+    if (cache.*) |v| return v;
+    const v = diagEnvOn(name);
+    cache.* = v;
+    return v;
 }
 fn useBatchedExpertDecode(self: *const Transformer) bool {
     return batchedExpertDecodePolicy(
@@ -47869,4 +47894,78 @@ test "the qwen4 layer loop proves the PLE landed before the model is handed back
     // The predicate itself lives in model.zig, beside the config check whose
     // invariant it completes.
     try testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "pub fn " ++ helper) != null);
+}
+
+// --- qwen4 diagnostics: the load line and the per-layer env reads (F6/F7) ---
+
+test "the qwen4 MTP head load line names the arm that runs, never a pending one" {
+    // The head loads with the trunk and its spec wiring is LIVE: scheduler.zig
+    // hands it over as `MtpHeadRef.qwen4`, the draft rerank head is built at
+    // load, and `/v1/models` reports `mtp_loaded: true`. The line kept calling
+    // that wiring "pending" for releases after it landed, so the one
+    // in-process proof that the head exists read as "loaded but inert" — and
+    // that is the line every MTP test greps for. Rule: announce the arm that
+    // actually RUNS. Needles are assembled at comptime so this test's own
+    // source cannot satisfy (or trip) the scan.
+    const src = @embedFile("transformer.zig");
+    // The marker stays a PREFIX: tests/test_mtp_equivalence.sh greps it.
+    try testing.expect(std.mem.indexOf(u8, src, "\"[qwen4] MTP head " ++ "loaded (") != null);
+    // `params.mtp_enabled` is a scheduler-side LoadParams field and is NOT
+    // visible at load time, so the line names what arms the head rather than
+    // claiming a state it cannot know.
+    try testing.expect(std.mem.indexOf(u8, src, "armed by " ++ "--mtp") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "spec wiring " ++ "pending") == null);
+}
+
+test "diagEnvValueOn is the one diagnostic-switch decision: absent or 0 is off" {
+    // Split out of `diagEnvOn` so the decision is testable without touching
+    // the process environment (std.c exposes no setenv). A harness exporting
+    // `FOO=0` must never arm a sync profiler — the qwen4 MTP verify once
+    // measured 70 ms because `getenv != null` armed one.
+    try testing.expectEqual(false, diagEnvValueOn(null));
+    try testing.expectEqual(false, diagEnvValueOn("0"));
+    try testing.expectEqual(true, diagEnvValueOn("1"));
+    try testing.expectEqual(true, diagEnvValueOn("on"));
+    // Both readers must route through it, so the cached variant cannot drift
+    // into `envFlagCached`'s PRESENCE semantics (where `FOO=0` reads as on).
+    const src = @embedFile("transformer.zig");
+    const dcl = std.mem.indexOf(u8, src, "fn diagEnvOnCached(" ++ "cache: *?bool") orelse return error.CachedVariantGone;
+    const end = std.mem.indexOfPos(u8, src, dcl, "\n}\n") orelse return error.CachedVariantGone;
+    try testing.expect(std.mem.indexOf(u8, src[dcl..end], "diagEnvOn(" ++ "name)") != null);
+}
+
+test "diagEnvOnCached answers once and latches" {
+    var cache: ?bool = null;
+    try testing.expectEqual(false, diagEnvOnCached(&cache, "MLX_SERVE_NO_SUCH_DIAG_SWITCH_PROBE"));
+    try testing.expectEqual(@as(?bool, false), cache);
+    // The latch is the point: the hot path must not re-read the environment.
+    cache = true;
+    try testing.expectEqual(true, diagEnvOnCached(&cache, "MLX_SERVE_NO_SUCH_DIAG_SWITCH_PROBE"));
+}
+
+test "the qwen4 per-layer QSA and PLE paths read no env var per layer" {
+    // `qsaMaskFromQk` runs on every full-attention layer of every forward (12
+    // per decode step on the 125B pack) and `pleGatherBf16` asked twice per
+    // gather. `getenv` is a libc scan of the whole environ block, for
+    // diagnostic switches whose answer is constant for the life of the
+    // process. Both functions read through the cached readers instead.
+    //
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan; the functions are named because the class is "a hot
+    // per-layer path", not "this file".
+    const src = @embedFile("transformer.zig");
+    const sigs = [_][]const u8{ "fn qsaMask" ++ "FromQk(", "fn pleGather" ++ "Bf16(" };
+    for (sigs) |sig| {
+        const start = std.mem.indexOf(u8, src, sig) orelse return error.HotFunctionGone;
+        const rest = src[start..];
+        // A method body ends at the next declaration at the same indent.
+        const a = std.mem.indexOf(u8, rest[1..], "\n    fn ") orelse rest.len - 1;
+        const b = std.mem.indexOf(u8, rest[1..], "\n    pub fn ") orelse rest.len - 1;
+        const body = rest[0 .. @min(a, b) + 1];
+        try testing.expect(std.mem.indexOf(u8, body, "std.c." ++ "getenv(") == null);
+        try testing.expect(std.mem.indexOf(u8, body, "diagEnv" ++ "On(") == null);
+        // ...and the cached readers ARE what they use, so a rewrite that drops
+        // the switch entirely does not read as a pass.
+        try testing.expect(std.mem.indexOf(u8, body, "Cached(&qwen4_") != null);
+    }
 }

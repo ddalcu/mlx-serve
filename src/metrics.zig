@@ -115,6 +115,12 @@ pub const Metrics = struct {
     // is off or no covered model is resident (zero-when-off invariant).
     ane_int8_bytes: Gauge,
     ane_layers: Gauge,
+    // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so
+    // far. The 51 GB table decides whether the first long prompt takes 55 s
+    // or 174 s, and until this gauge the only surface was a log line at
+    // COMPLETION. Zero whenever no table is warming (published by the warm
+    // thread, so this is a lock-free read like the ANE pair above).
+    ngram_warm_bytes: Gauge,
 
     pub fn init() Metrics {
         return .{
@@ -143,6 +149,7 @@ pub const Metrics = struct {
             .mlx_cache_bytes = Gauge.init(),
             .ane_int8_bytes = Gauge.init(),
             .ane_layers = Gauge.init(),
+            .ngram_warm_bytes = Gauge.init(),
         };
     }
 
@@ -255,6 +262,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
     try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
     try writeGauge(w, "mlx_serve:ane_layers", "Layers covered by compiled ANE prefill programs, mlp + gdn (0 when off)", m.ane_layers.load());
+    try writeGauge(w, "mlx_serve:ngram_warm_bytes", "Bytes of the qwen4 n-gram table read so far by the background page-cache warm (0 when off or done with no table resident)", m.ngram_warm_bytes.load());
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -297,7 +305,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"mlx_active_bytes\":{d}," ++
             "\"mlx_cache_bytes\":{d}," ++
             "\"ane_int8_bytes\":{d}," ++
-            "\"ane_layers\":{d}" ++
+            "\"ane_layers\":{d}," ++
+            "\"ngram_warm_bytes\":{d}" ++
             "}},\"histograms\":{{",
         .{
             m.prompt_tokens_total.load(),
@@ -319,6 +328,7 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.mlx_cache_bytes.load(),
             m.ane_int8_bytes.load(),
             m.ane_layers.load(),
+            m.ngram_warm_bytes.load(),
         },
     );
 
@@ -789,4 +799,23 @@ test "renderJson output parses as valid JSON via stdlib parser" {
     // Verify counters sub-object has expected key
     const counters = obj1.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_success_total").?.integer);
+}
+
+test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
+    // The qwen4 background page-cache warm of `ngram_table.bin` is a 51 GB
+    // read that decides whether the first long prompt takes 55 s or 174 s.
+    // It had no scrapeable surface at all; this is the gauge a bench harness
+    // polls to know the box is warm before it times anything.
+    const testing = std.testing;
+    var m = Metrics.init();
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &jw);
+    try testing.expect(std.mem.indexOf(u8, jbuf[0..jw.end], "\"ngram_warm_bytes\":0") != null);
+
+    m.ngram_warm_bytes.set(17_179_869_184);
+    var pbuf: [64 * 1024]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&pbuf);
+    try renderPrometheus(&m, &pw);
+    try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "mlx_serve:ngram_warm_bytes 17179869184") != null);
 }

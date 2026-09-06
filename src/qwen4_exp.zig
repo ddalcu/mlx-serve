@@ -157,6 +157,38 @@ fn warmEnabled() bool {
     return v;
 }
 
+/// What the background page-cache warm has read so far, and the table's total
+/// size. Published by the warm thread and read lock-free by the metrics
+/// sampler and `/props` (the `ane.live_*` pattern). Both are zero whenever no
+/// table is warming, so the zero-when-off invariant holds.
+pub var live_warm_bytes = std.atomic.Value(u64).init(0);
+pub var live_warm_total = std.atomic.Value(u64).init(0);
+
+/// A line at the first chunk past each 8 GB step, or after 10 s of silence --
+/// whichever comes first, never twice for one step, and no backlog after a
+/// jump. Pure: `warmMain` owns the clock, this owns only the decision, so the
+/// cadence is testable without a thread or a 51 GB file.
+pub const WARM_LOG_BYTES: u64 = 8 << 30;
+pub const WARM_LOG_NS: u64 = 10_000_000_000;
+
+pub const WarmProgress = struct {
+    next_bytes: u64 = WARM_LOG_BYTES,
+    last_ns: u64 = 0,
+
+    pub fn should(self: *WarmProgress, bytes: u64, elapsed_ns: u64) bool {
+        const by_bytes = bytes >= self.next_bytes;
+        const by_time = elapsed_ns -| self.last_ns >= WARM_LOG_NS;
+        if (!by_bytes and !by_time) return false;
+        while (self.next_bytes <= bytes) self.next_bytes += WARM_LOG_BYTES;
+        self.last_ns = elapsed_ns;
+        return true;
+    }
+};
+
+fn asGb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
+}
+
 pub const NgramTable = struct {
     map: []align(std.heap.page_size_min) const u8,
     rows: u64,
@@ -332,6 +364,8 @@ pub const NgramTable = struct {
             th.join();
             self.warm_thread = null;
         }
+        live_warm_bytes.store(0, .release);
+        live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
@@ -346,9 +380,19 @@ pub const NgramTable = struct {
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
-        if (!warmEnabled() or self.fd < 0 or self.warm_thread != null) return;
+        if (self.fd < 0 or self.warm_thread != null) return;
+        // The off arm SAYS so: a cold first request faults 48 rows/token off
+        // the SSD (38k prompt: 174 s vs 55 s warm), and without a line the
+        // only symptom is a first request that looks hung.
+        if (!warmEnabled()) {
+            log.info("[qwen4] ngram table warm: disabled (MLX_SERVE_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
+            return;
+        }
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
+        live_warm_bytes.store(0, .release);
+        live_warm_total.store(self.map.len, .release);
+        log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(self.map.len)});
         self.warm_thread = std.Thread.spawn(.{}, warmMain, .{self}) catch null;
     }
 
@@ -358,6 +402,7 @@ pub const NgramTable = struct {
         const t0 = std.Io.Timestamp.now(wio, .boot);
         var off: u64 = 0;
         const total: u64 = self.map.len;
+        var prog: WarmProgress = .{};
         while (off < total) {
             if (self.warm_stop.load(.acquire)) return;
             const want: usize = @intCast(@min(total - off, WARM_CHUNK));
@@ -365,9 +410,13 @@ pub const NgramTable = struct {
             if (got <= 0) return;
             off += @intCast(got);
             self.warm_bytes.store(off, .release);
+            live_warm_bytes.store(off, .release);
+            // One clock read per 8 MB pread is free next to the read itself.
+            const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
+            if (prog.should(off, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(off), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
         }
         const secs: f64 = @as(f64, @floatFromInt(t0.untilNow(wio, .boot).nanoseconds)) / 1e9;
-        log.info("[qwen4] ngram table warm: {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ @as(f64, @floatFromInt(total)) / 1073741824.0, secs });
+        log.info("[qwen4] ngram table warm: done, {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ asGb(total), secs });
     }
 
     /// Dequantize one row into `out[0..dim]` (mx.quantize packing: element i
@@ -1221,4 +1270,28 @@ test "NgramHash.init refuses a config past its fixed arrays instead of asserting
     // The widest shape the arrays DO hold still builds.
     const wide = try NgramHash.init(248320, 5, 8, 20_000_000, 128, 1234, 0, 248044);
     try testing.expectEqual(@as(u32, 32), wide.n_heads);
+}
+
+test "WarmProgress emits on the byte step, on the silence timeout, and never twice for one step" {
+    // The warm is a 51 GB background read that took 174 s vs 55 s of first-
+    // request difference and said NOTHING until it finished, so a slow first
+    // prompt had no in-process explanation. Cadence is a pure function of
+    // (bytes so far, elapsed) so it is testable without a thread or a file.
+    const GB: u64 = 1 << 30;
+    const S: u64 = 1_000_000_000;
+    var p: WarmProgress = .{};
+    // Nothing before the first step, however long it takes... except that a
+    // long silence is itself worth a line.
+    try testing.expect(!p.should(1 * GB, 1 * S));
+    try testing.expect(!p.should(2 * GB, 9 * S));
+    try testing.expect(p.should(3 * GB, 10 * S)); // silence timeout
+    try testing.expect(!p.should(4 * GB, 11 * S)); // clock restarted by that line
+    // Crossing the byte step emits once, and the step advances past it.
+    try testing.expect(p.should(WARM_LOG_BYTES, 12 * S));
+    try testing.expect(!p.should(WARM_LOG_BYTES, 13 * S));
+    try testing.expect(!p.should(WARM_LOG_BYTES + 1, 13 * S));
+    // A jump of several steps still emits exactly once and does not backlog.
+    try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
+    try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
+    try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
 }

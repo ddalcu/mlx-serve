@@ -30,6 +30,7 @@ const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const ane_mod = @import("ane.zig");
+const qwen4_mod = @import("qwen4_exp.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -7878,7 +7879,9 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
-    ane_json: []const u8,
+    /// Leading-comma JSON fragments spliced before the root close (the ANE
+    /// object, the qwen4 n-gram warm object). Concatenated by the handler.
+    extra_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
@@ -7900,8 +7903,17 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
-        ane_json,
+        extra_json,
     });
+}
+
+/// The /props "ngram_warm" object: how far the qwen4 background page-cache
+/// warm of `ngram_table.bin` has got. Empty (absent) when no table is
+/// warming, so the zero-when-off invariant holds on every other arch. Pure --
+/// the handler feeds it the two atomics.
+fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
+    if (total == 0) return allocator.dupe(u8, "");
+    return std.fmt.allocPrint(allocator, ",\"ngram_warm\":{{\"bytes\":{d},\"total\":{d}}}", .{ bytes, total });
 }
 
 /// The /props "ane" object (A8): mode, coverage, geometry and the int8
@@ -7997,7 +8009,14 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     };
     defer allocator.free(ane_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
+    // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
+    // whenever no table is warming, so the object is absent off qwen4_exp.
+    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
+    defer allocator.free(ngram_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ane_json, ngram_json });
+    defer allocator.free(extra_json);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -11953,6 +11972,8 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // (ane.publishLive / deinit), so this is a lock-free read.
     ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
     ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
+    // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
+    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -20435,6 +20456,44 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     try testing.expectEqual(@as(i64, 1), rows_json.items[0].object.get("instance").?.integer);
     try testing.expectEqual(@as(i64, 2), rows_json.items[1].object.get("instance").?.integer);
     try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
+}
+
+test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
+    // The warm is a 51 GB background read whose only surface was one line at
+    // COMPLETION, so "is the first request slow because the table is cold?"
+    // was unanswerable in-process. Absent (no qwen4 table) = no object, which
+    // keeps the zero-when-off invariant every other diagnostic here holds to.
+    const none = try ngramWarmPropsJson(testing.allocator, 0, 0);
+    defer testing.allocator.free(none);
+    try testing.expectEqualStrings("", none);
+
+    const frag = try ngramWarmPropsJson(testing.allocator, 17_179_869_184, 54_975_581_388);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ngram_warm\":{\"bytes\":17179869184,\"total\":54975581388}", frag);
+
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen4_exp";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const w = (parsed.value.object.get("ngram_warm") orelse return error.MissingNgramWarm).object;
+    try testing.expectEqual(@as(i64, 17_179_869_184), w.get("bytes").?.integer);
+    try testing.expectEqual(@as(i64, 54_975_581_388), w.get("total").?.integer);
+
+    // Both fragments splice at the same slot, so an ANE boot on a qwen4 pack
+    // must still parse.
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 1, .eval_failures = 0 }};
+    const ane = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 1, &one);
+    defer testing.allocator.free(ane);
+    const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
+    defer testing.allocator.free(both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, both);
+    defer testing.allocator.free(body2);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
+    defer parsed2.deinit();
+    try testing.expect(parsed2.value.object.get("ane") != null);
+    try testing.expect(parsed2.value.object.get("ngram_warm") != null);
 }
 
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
