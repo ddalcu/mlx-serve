@@ -257,19 +257,12 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-/// Would a line at `level` be written? For call sites whose ARGUMENTS cost
-/// something to compute (byte divisions, a verdict string, a formatted
-/// number): `emit` is only reached inside the four wrappers above, but the
-/// argument tuple is built by the caller either way. Ask this first and build
-/// nothing when the answer is no.
+/// Would a line at `level` be written? Ask first when the arguments are costly to build.
 pub fn enabled(level: Level) bool {
     return @intFromEnum(current_level) >= @intFromEnum(level);
 }
 
-/// `info`/`debug`/`warn` with the level chosen at RUNTIME. One line, one
-/// format string, one set of arguments — the alternative is the same `print`
-/// duplicated per level, which is how two arms of the same log drift into
-/// quoting different numbers.
+/// `info`/`debug`/`warn` with the level chosen at runtime.
 pub fn atLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
     if (enabled(level)) emit(fmt, args);
 }
@@ -447,9 +440,8 @@ test "enabled/atLevel: the level check a caller can ask BEFORE building its argu
         try testing.expect(enabled(lv));
     }
 
-    // `enabled` is exactly the predicate the four wrappers use, so a caller
-    // that asks first and then calls `atLevel` cannot disagree with them.
     current_level = .info;
     atLevel(.debug, "suppressed {d}\n", .{1});
     atLevel(.info, "written {d}\n", .{2});
 }
+

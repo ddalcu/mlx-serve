@@ -71,11 +71,7 @@ la=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json
 echo "  prompt_tokens|answer: $la"
 check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" "1"
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
-# Assert the INVARIANT (some QSA attention arm engaged), never one kernel's
-# name: dispatch priority moves, and a needle for the arm that lost the race
-# reads as a regression on a healthy tree. Prefill (S >= 16): the gather kernel
-# `[qsa-gather] engaged` serves first, the msv_attn_p256 mask arm
-# `[qsa-fused] engaged` is its fallback (MLX_SERVE_QSA_GATHER=0 selects it).
+# Assert the invariant (some QSA attention arm engaged), never one kernel's name.
 check "qsa prefill attention arm engaged (gather kernel or msv_attn_p256 mask arm)" "$(grep -cE '\[qsa-gather\] engaged|\[qsa-fused\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 # Decode (S=1): `[qsa-decode-gather] engaged` serves it, since the fused kernel
 # floors at S=2 — `MLX_SERVE_QSA_ATTN_MIN_S=1` hands the row to `[qsa-attn]`.
@@ -84,14 +80,8 @@ echo "[5b] MTP past the QSA budget (verify rows under the QSA mask)"
 longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")
 lm=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$longm" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")
 check "needle recovered under MTP" "$(echo "$lm" | grep -c 'PELICAN-42')" "1"
-# Verify widths (S=2..15): the fused QSA kernel `[qsa-attn] engaged` serves them
-# first, but ONLY on a quantized cache — this boot passes no `--kv-quant`, so
-# the cache is dense and the fused kernel declines by design (#363: its old
-# dense arm was the PREFILL kernel at a verify width). The arms that serve here
-# are the union gather `[qsa-verify-gather] engaged` past its kv floor and,
-# below that, `splitMaskedSdpa256` (`[sdpa-split] masked arm engaged`) under the
-# dense mask. Any of the three satisfies the invariant; naming one would pin a
-# dispatch priority that moves.
+# Verify widths: the fused kernel serves only a quantized cache; this boot is dense, so the
+# union gather or the masked split arm serves. Any of the three satisfies the invariant.
 check "verify-width masked attention arm engaged" "$(grep -cE '\[qsa-attn\] engaged|\[qsa-verify-gather\] engaged|\[sdpa-split\] masked arm engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 echo "[6] MTP head: engagement + greedy equivalence"
 base=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
@@ -196,14 +186,9 @@ echo "  mtp: $(echo "$tm" | tr '\n' ' ' | cut -c1-60)  plain: $(echo "$tp" | tr 
 check "exactly one more mtp engagement" "$(python3 -c "print($(grep -c 'spec-stats\] mode=mtp' "$LOG") - $nm0)")" "1"
 check "mtp answer == serial (tie-aware)" "$(same_or_tie "$pm" "$tm")" "1"
 check "plain answer == serial (tie-aware)" "$(same_or_tie "$pp" "$tp")" "1"
-# S21. The head is module-owned, so anything that hands it between slots — the
-# sticky-serial release included — risks the head's key history and its cache
-# position disagreeing. `qsaMaskFromQk` raises then, and the request dies. A 200
-# is not the bar: assert the ABSENCE of the gap over the whole run so far.
+# The head is module-owned; anything that hands it between slots risks `QsaHistoryGap`.
 check "no QSA history gap anywhere in the run" "$(grep -c 'QsaHistoryGap' "$LOG")" "0"
-# If the adaptive switch fired on this run (it needs kv past its floor and a
-# measured serial cell, so it usually does not), the release is a ONE-SHOT per
-# request and the slot must have kept serving.
+# If the adaptive switch fired, the release is a one-shot per request.
 n_rel=$(grep -c 'sticky-serial: module head released' "$LOG")
 if [ "$n_rel" -gt 0 ]; then
   echo "  sticky-serial releases this run: $n_rel"

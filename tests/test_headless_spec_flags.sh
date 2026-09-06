@@ -104,12 +104,8 @@ else
     check "bare default boot" 0
 fi
 
-# `--max-tokens` used to feed only the offline `--prompt` mode: in serve mode
-# the flag was parsed and dropped, and an OpenAI client that omits max_tokens
-# (opencode does on every turn) resolved to the whole remaining context — a
-# budget the admission bill then RESERVES capacity for. Headless is the mode
-# that matters (the app always launches it) and it hand-rolls its own
-# ServerConfig literal, which is exactly how the --pld* trio was eaten.
+# `--max-tokens` used to feed only the offline `--prompt` mode; headless hand-rolls its own
+# ServerConfig literal, which is how the --pld* trio was eaten.
 echo "[4/5] --max-tokens reaches the serve-mode omitted-field default"
 if boot --max-tokens 4096; then
     grep -q "default max_tokens for omitted requests: 4096" "$LOG"

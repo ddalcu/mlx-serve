@@ -311,8 +311,7 @@ App-side (Swift). The Sandbox window's Terminal tab runs agent CLIs INSIDE the A
 - **Session lifecycle** (`SandboxSessionTabs` + per-tab runtimes): MULTIPLE concurrent sessions, one tab each (N sessions = N ssh connections into the same dropbear/mirror; stable display names "pi"/"pi 2"); per tab preparing (`AgentSandbox.startCliSession`: boot → dropbear preflight → materialize → mirror wait) → live → exited. Live terminals are NEVER unmounted (ZStack + opacity — unmount terminates the ssh). Each live session PINS the shared guest (`pinCliSession`; remount-needing workspace switch throws `remountBlockMessage`); Stop guest / app quit end it. Preflight gates (`SandboxCliPreflight`, each a distinct alert with the fix named): sandbox on, guest networking on (offer to enable), server running, server bound `0.0.0.0`, dropbear present (stale cached image → `staleImageMessage` + `repullBaseImage`, which stops the guest BLOCKING before deleting the cached image dir — same ordering rule as the factory reset, pinned by `testRepullStopsTheGuestBeforeDeletingTheImageCache`).
 - **Factory reset** (Settings → Agent Sandbox → Reset Sandbox, red + confirmation): `AgentSandbox.resetAllData` stops the guest (blocking, off-main — deleting a rootfs under a still-stopping VM risks a partial cache), deletes `~/.mlx-serve/sandbox` (kernel, images incl. ALL in-guest state, ssh identity — scope pinned by AgentSandboxTests) and clears the transcript; next use re-provisions from scratch.
 - **Smoke**: `SANDBOX_SMOKE=1` phase 5 proves boot → mirror → `ssh 'echo SSH_OK'` (SKIPs on a pre-dropbear image); `SANDBOX_SMOKE_AGENT=pi` adds the in-guest install + `--version`.
-- **Images and the guest kernel are two pinned artifacts that bump TOGETHER** (moved out of CLAUDE.md 2026-09-05): `containers/agent-shell-mlxserve/` builds the guest OCI image (`make push` publishes, `make export` writes a local tarball) and bakes dropbear in (cross-pinned by `SandboxSSHTests`); `containers/guest-kernel/` builds kernel 6.6 with the fuse owner-read clamp (#150) via `build.sh` → `kernel-arm64.gz`. The kernel tag is named in BOTH `AgentSandbox.kernelTag` and `scripts/fetch-guest-rootfs.sh` — bump them together or the fetch script pulls a rootfs the app will not boot against.
-
+- **Images and the guest kernel are two pinned artifacts that bump TOGETHER**: `containers/agent-shell-mlxserve/` builds the guest OCI image (`make push` publishes, `make export` writes a tarball) and bakes dropbear in (pinned by `SandboxSSHTests`); `containers/guest-kernel/` builds kernel 6.6 with the fuse owner-read clamp (#150) via `build.sh` → `kernel-arm64.gz`, tag pinned by `AgentSandbox.kernelTag` + `scripts/fetch-guest-rootfs.sh`.
 - **Out of scope (v1)**: PTY-over-vsock (networking-off sessions), vsock reverse tunnel, VM surviving app quit, multi-session manager, opencode/claude rows (add as registry rows later).
 
 ## Website & LLM tier list (`website/`)
@@ -390,35 +389,28 @@ Assistant shape (no embed table, no lm_head — borrows the trunk's): `encoder.f
 
 At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's
 entry ~24 GB (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history,
-SSM checkpoints, pooled banks) + transients 3–7 GB against a ~107.5 GB ceiling.
-RAM therefore holds the model and ONE session; the SSD is the capacity tier, and
-`--prefix-cache-disk` becomes the real limit (~100 GB ≈ four 1M sessions). A
-disk hit streams the entry back in seconds against ~25 minutes of re-prefill.
+SSM checkpoints, pooled banks) + transients 3-7 GB against a ~107.5 GB ceiling.
+RAM therefore holds the model and ONE session; the SSD is the capacity tier and
+`--prefix-cache-disk` is the real limit (~100 GB ≈ four 1M sessions). A disk hit
+streams the entry back in seconds against ~25 minutes of re-prefill.
 
-ONE arch predicate — `ModelConfig.ssdFirstCapable()` (`model_type ==
-"qwen4_exp"`) AND `prefix_cache.ssdFirstEnabled()`
-(`MLX_SERVE_PREFIX_SSD_FIRST`, default on) — is read at a single place, the
-scheduler's disk-tier attach, into `HotPrefixCache.ssd_first`, and mirrored onto
-`DiskTier.ssd_first` and the writer arm. Every mechanism reads that field, never
-a model_type; a source scan pins the single arming site and each mechanism's
-test carries an arm B for the legacy path.
+One predicate, `prefix_cache.ssdFirstActive` (`ModelConfig.ssdFirstCapable()` AND
+`MLX_SERVE_PREFIX_SSD_FIRST` AND a disk tier), is read at the scheduler's
+disk-tier attach into `HotPrefixCache.ssd_first` and mirrored onto
+`DiskTier.ssd_first`; every mechanism reads that field, never a model_type.
 
 | mechanism | what it does |
 |---|---|
-| 1 — flush the LIVE cache | `capturePendingDisk` records the live snapshot, FULL token record, checkpoints and spec snaps at commit, BEFORE the RAM byte-budget trim; the flush prefers that record. All handles refcount-shared, consumed once, dropped on invalidation. |
-| 2 — background writer | `src/kv_disk_writer.zig`: one thread, FIFO, ~1 GiB host-byte permit, prefix-scoped epoch fence at the tier's one directory-removal site. The inference thread keeps the device→host readback; `serializeSafetensors` writes mlx's own image so `mlx_load_safetensors` reads it back. `meta.json` is submitted after its chunks ⇒ FIFO lands the index LAST; every file is tmp+rename. `max_flush_bytes` becomes `SSD_FIRST_READBACK_BYTES` (2 GiB/flush readback bound), not a truncation cliff. |
-| 3 — per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk; the scheduler passes `full_prompt[0..abs_pos]`, which `appendCommit` reads as an EXTEND, so chunks `[0, kv_len/chunk)` are never rewritten. A killed prefill leaves a restorable chunk-aligned prefix. Gate: `writeThroughArmed`. |
-| 4 — checkpoint-bearing chunks | SSM checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk that closes their position ⇒ a hybrid entry restores from its FIRST flush. |
-| 5 — budget semantics | `server.ssdFirstPrefixCacheMem` floors RAM at one entry at the working context (the entry IS the live KV) and `--prefix-cache-mem` becomes the IDLE allowance (0 = none idle) — a deliberate, qwen4_exp-only change, logged once at load naming the flag. Disk budget = `min(operator cap, free − min(64 GiB, 10% of volume))`, 1 GiB store floor, re-read via `volumeSpace` before every store; below the floor no NEW entry persists and existing ones stay restorable. `MIN_DISK_ADVANTAGE_TOKENS` unchanged. |
-| 6 — evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: RAM keeps the most-recently-used entry (the active session), every other entry spills and leaves — only when its copy comes back COMPLETE. `DiskTier.sweepSiblings` → `sweepBase` walks the OTHER fingerprints under `<base>`: strays (an entry dir with no `meta.json`) always go, and LRU eviction fires once the siblings together exceed one budget. The live tier's own root is skipped — during a write-through its newest entry legitimately has chunks and no index yet. |
-| 7 — reservation adoption | `snapshot`/`restore` refcount-SHARE the capacity buffer, so a restored entry carries the previous turn's `#353` reservation and the grow guard does not fire. `KVCache.kv_cap_buf_grows` counts the moments a second whole-cache copy exists; the guard asserts zero across a sufficient-capacity restore, with a negative arm proving it can see one. |
+| 1 flush the LIVE cache | `capturePendingDisk` records the live snapshot, full token record, checkpoints and spec snaps at commit, BEFORE the RAM byte-budget trim; the flush prefers that record. Refcount-shared, consumed once. |
+| 2 background writer | `src/kv_disk_writer.zig`: one thread, FIFO, ~1 GiB host-byte permit, prefix-scoped epoch fence at the tier's one directory-removal site, failures attributed to their entry. The inference thread keeps the device→host readback and hands over bytes; `meta.json` is submitted after its chunks so the index lands LAST; every file is tmp+rename. |
+| 3 per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk (one chunk per boundary, only for a new span of at least one chunk; `MLX_SERVE_SSD_WRITE_THROUGH=0`): a killed prefill leaves a restorable chunk-aligned prefix. |
+| 4 checkpoint-bearing chunks | SSM checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk that closes their position, so a hybrid entry restores from its first flush. |
+| 5 budget semantics | `server.ssdFirstPrefixCacheMem` floors RAM at one session at the working context (the entry IS the live KV) and `--prefix-cache-mem` becomes the IDLE allowance (0 = none idle), logged once at load. Disk budget = `min(operator cap, free − min(64 GiB, 10% of volume))`, 1 GiB store floor, re-read via `volumeSpace` before every store. |
+| 6 evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: every idle entry is written; past the allowance the durable ones are shed first, then the rest (naming why). `DiskTier.sweepSiblings` walks the other fingerprints under `<base>`: aged strays go, LRU past one budget's worth. |
+| 7 chunk sharing + restore by move | A prefix-diverging turn hard-links the donor's LANDED chunks (manifest v6, `MLX_SERVE_SSD_CHUNK_SHARE=0`); a full-prefix hit checks the entry out so the first append donates in place (`MLX_SERVE_RESTORE_MOVE=0`). |
 
-The prefill WIDTH is not part of this: it is a per-REQUEST decision
-(`chooseRequestPrefillChunk`, gated on `ModelConfig.perRequestPrefillChunk()` —
-the same arch), and SSD-first deliberately has no second chooser for it.
-
-No manifest bump: the on-disk format is unchanged (v5), pinned by a
-both-directions legacy↔SSD-first restore test instead of a version number.
+The prefill width is not part of this: it is a per-request decision
+(`chooseRequestPrefillChunk`, gated on `ModelConfig.perRequestPrefillChunk()`).
 `volumeSpace` hand-declares darwin's `struct statfs` (std has no binding in this
 Zig) with a plausibility guard so a wrong layout fails SAFE to the operator cap.
 

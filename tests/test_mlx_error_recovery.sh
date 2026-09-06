@@ -1,19 +1,8 @@
 #!/bin/bash
-# An MLX error costs ONE REQUEST, never the server (issue #353).
-#
-# Before the mlx-c error handler was replaced, a Metal working-set OOM went
-# `mlx_error(...)` -> `mlx_error_handler_default_` -> exit(-1): no status line,
-# no connection close, every in-flight request gone with the process. The
-# invariant now is the pair — the failing request answers with a NAMED memory
-# error, and the NEXT request on the same server succeeds.
-#
-# `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal OOM at the n-th
-# `mlx.checkError` of the process (the prefill chunk loop's checkpoint) and
-# disarms itself, so one boot exercises both halves. `MLX_SERVE_MLX_FAULT_STEP`
-# is its decode-checkpoint twin.
-#
-# Arm [6] is the STREAMING half of the same contract: the mapped 503 and its
-# message reach an SSE client as an `error` event, not a raw Zig error name.
+# An MLX error costs ONE REQUEST, never the server (#353). mlx-c's default handler was
+# exit(-1). `MLX_SERVE_MLX_FAULT_CHUNK=<n>` / `_STEP=<n>` latch a synthetic Metal OOM at the
+# n-th prefill-chunk / decode-step checkpoint and disarm, so one boot exercises the failure
+# (a 503 with a body, `[mlx]` in the log) and the recovery (200 on the next request).
 #
 # Usage: ./tests/test_mlx_error_recovery.sh [model_dir] [port]
 set -u
@@ -28,9 +17,7 @@ bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 [ -x ./zig-out/bin/mlx-serve ] || { echo "FAIL: build with -Doptimize=ReleaseFast first"; exit 1; }
 
 LOG=$(mktemp -t mlxerr).log
-# Chunk 2, not 1: at chunk 1 the checkpoint runs before the prefill has done
-# any MLX work at all, so the arm would pass against an engine that never
-# reaches a forward. The prompt below is long enough to take a second chunk.
+# Chunk 2, not 1, so real forward work precedes the fault.
 MLX_SERVE_MLX_FAULT_CHUNK=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
@@ -49,11 +36,8 @@ echo "[1] the request that hits the injected MLX error is refused, by name"
 # its narrowest), so the fault lands after real forward work.
 FAULT_PROMPT=$(python3 -c "print('Explain the following list. ' + ' '.join(str(i) for i in range(4000)))")
 CODE=$(req "$FAULT_PROMPT")
-# 503 is the memory class; the shape that must NEVER appear is an empty reply
-# from a dead socket, so a body is as load-bearing as the code.
-# 503 ONLY: the injected message is the Metal working-set abort, so the memory
-# CLASSIFICATION is part of what is under test. Accepting 500 as well made the
-# arm unable to fail on a misclassification, which is the interesting bug.
+# 503 ONLY: the memory classification is part of what is under test, and a body is as
+# load-bearing as the code.
 case "$CODE" in
   503) ok "injected MLX OOM answered 503 ($(head -c 120 /tmp/mlxerr_body.json))" ;;
   000|"") bad "no HTTP response — the server died (the #353 symptom)" ;;
@@ -78,10 +62,7 @@ CODE3=$(req "Say goodbye.")
 
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 
-# ── the DECODE checkpoint ────────────────────────────────────────────────────
-# Same invariant one phase later. Before this, a decode-time MLX failure was
-# never consumed: the request finished 200 emitting from buffers Metal never
-# wrote, and the latch became the NEXT request's 503.
+# The decode checkpoint: a decode-time failure used to finish 200 and become the next request's 503.
 echo "[4] an MLX error during DECODE fails that request, not the next one"
 LOG2=$(mktemp -t mlxerr2).log
 MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
@@ -104,13 +85,7 @@ else
   bad "post-decode-fault request status $CODE5: $(head -c 200 /tmp/mlxerr_body.json)"
 fi
 
-# ── the STREAMING half answers the same mapped error ─────────────────────────
-# External review of PR #363, item 2. The 400/503 mapping lived only on the
-# non-streaming arms; every streaming arm wrote `Internal server error:
-# GenerationOutOfMemory` as a `server_error` into an SSE frame. Agents stream,
-# so the named, actionable error was the one nobody saw. The SSE head is
-# already on the wire when a decode fault lands, so the status is 200 by
-# construction — what is under test is the terminal EVENT.
+# The streaming half: the SSE head is already on the wire, so the bar is the terminal `error` event.
 echo "[6] a decode-time MLX error on a STREAMING request sends the mapped SSE error"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 LOG3=$(mktemp -t mlxerr3).log
@@ -137,15 +112,9 @@ CODE7=$(req "Say hello.")
 [ "$CODE7" = "200" ] && ok "the request after a streaming decode fault answered 200" ||
   bad "post-streaming-fault request status $CODE7"
 
-# ── every guard reads the CLAMPED max_tokens ─────────────────────────────────
-# A long prompt with NO max_tokens field: the omitted value is the
-# `omittedMaxTokensDefault` sentinel (maxInt(u32)/4), and a guard that bills a
-# reservation from the RAW value refuses every prompt past 32k tokens with a
-# 400 that names an impossible number of megabytes.
+# A long prompt with NO max_tokens field: the omitted sentinel (maxInt/4) must be clamped before the guard bills it.
 echo "[5] a long prompt with NO max_tokens field is admitted"
-# Needs a prompt past KVCache.RESERVE_MIN_TOKENS (32k) that still fits the
-# model's context, so a small-context checkpoint skips this arm rather than
-# reporting a context-overflow 400 as if it were the reservation bug.
+# Needs a prompt past KVCache.RESERVE_MIN_TOKENS (32k) that still fits the context.
 CTX=$(curl -s -m 10 "$BASE/v1/models" | python3 -c "import json,sys; d=json.load(sys.stdin); print(max([m.get('context_length',0) for m in d.get('data',[])] or [0]))" 2>/dev/null || echo 0)
 if [ "${CTX:-0}" -lt 65536 ]; then
   echo "  SKIP: model context $CTX < 65536 — no room for a 45k-token prompt"

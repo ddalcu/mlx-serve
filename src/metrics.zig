@@ -115,11 +115,7 @@ pub const Metrics = struct {
     // is off or no covered model is resident (zero-when-off invariant).
     ane_int8_bytes: Gauge,
     ane_layers: Gauge,
-    // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so
-    // far. The 51 GB table decides whether the first long prompt takes 55 s
-    // or 174 s, and until this gauge the only surface was a log line at
-    // COMPLETION. Zero whenever no table is warming (published by the warm
-    // thread, so this is a lock-free read like the ANE pair above).
+    // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so far; zero when nothing is warming.
     ngram_warm_bytes: Gauge,
 
     pub fn init() Metrics {
@@ -802,10 +798,6 @@ test "renderJson output parses as valid JSON via stdlib parser" {
 }
 
 test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
-    // The qwen4 background page-cache warm of `ngram_table.bin` is a 51 GB
-    // read that decides whether the first long prompt takes 55 s or 174 s.
-    // It had no scrapeable surface at all; this is the gauge a bench harness
-    // polls to know the box is warm before it times anything.
     const testing = std.testing;
     var m = Metrics.init();
     var jbuf: [64 * 1024]u8 = undefined;

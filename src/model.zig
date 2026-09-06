@@ -775,25 +775,9 @@ pub const ModelConfig = struct {
     /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
-    /// Whether this arch resolves its prefill chunk PER REQUEST instead of
-    /// once at load. Load-time sizing has to reserve for the WHOLE configured
-    /// session — at `--ctx-size 1048576` the context's own KV is 20.7 GB of a
-    /// 28.2 GB serving budget, so the widest affordable rung is 1024 and every
-    /// ordinary prompt prefills at that width for the rest of the boot. But an
-    /// ordinary prompt does not hold a 1M-token cache: the same box ran 384k
-    /// prompts at chunk 4096 inside the ceiling (peak 90.3 GB of ~93 GiB). The
-    /// bill that knows the difference is the ADMISSION bill, which is per
-    /// request, so that is where the width belongs.
-    ///
-    /// qwen4_exp only, on purpose. It is the arch with a 1M advertised context
-    /// and the QSA terms that make the load-time bill so lopsided; every other
-    /// arch keeps the load-time pin exactly, unmeasured.
-    ///
-    /// DELEGATES, and does not re-spell the arch: this predicate is the ONLY
-    /// gate on the admission re-ask, the tail-merge bound and the per-chunk
-    /// adapter, so a second spelling of the same condition is three mechanisms
-    /// that can silently disagree with the other five about which archs are
-    /// in. `longCtxGated` is the ONE body (scan-pinned below).
+    /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
+    /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
+    /// prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
         return self.longCtxGated();
     }
@@ -820,16 +804,8 @@ pub const ModelConfig = struct {
 
     /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
     /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
-    /// layer. Not kv-quantized. Zero on archs without an indexer.
-    ///
-    /// This is ONE copy — what a hot-cache ENTRY holds, and (with
-    /// `MLX_SERVE_QSA_HISTORY_SHARE` on) what a live slot holds: the newest
-    /// checkpoint takes a VIEW of the slot's buffer at commit
-    /// (`transformer.handoffQsaHistoryToLatest`). With the switch off the
-    /// prefill-end attach MATERIALIZES a second copy that lives beside the
-    /// buffer for the whole decode. `server.statePerTokenBilled` is the
-    /// billed width (copies + the f32 score bank) and is what the sizer and
-    /// the guard both read — never this helper directly.
+    /// layer. Not kv-quantized. Zero on archs without an indexer. ONE copy; the billed
+    /// width (copies + score bank) is `server.statePerTokenBilled`.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
@@ -838,13 +814,8 @@ pub const ModelConfig = struct {
         return n * hd * 2 + n * hd * 2 / ratio;
     }
 
-    /// f32 bytes of the QSA block-score operand ONE token occupies on a LIVE
-    /// slot: `SSMCacheEntry.qsa_score_bank` is `[B, 1, idx_hd, nb]` per
-    /// full-attn layer, one block per `ratio` tokens, rebuilt whenever a
-    /// block completes and resident for the request (1,536 B/tok on
-    /// qwen4_exp — 1.1 GB at 786k). Never in an entry (`ssmFreeQsaState` at
-    /// slot teardown); never billed until the one-copy history bill made
-    /// the gap visible. Zero on archs without an indexer.
+    /// f32 bytes per token of the QSA block-score operand a live slot holds
+    /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
@@ -853,18 +824,8 @@ pub const ModelConfig = struct {
         return n * hd * 4 / ratio;
     }
 
-    /// Bytes ONE SSM checkpoint holds: the recurrent state plus the conv
-    /// window of every LINEAR layer, materialized (`captureSsmCheckpoint`
-    /// forces an owned copy of each). The QSA key history is NOT here: it
-    /// lands on ONE checkpoint (the newest), not on every one — as a VIEW of
-    /// the live buffer at commit, or as the prefill-end copy with
-    /// `MLX_SERVE_QSA_HISTORY_SHARE=0` — and `server.statePerTokenBilled`
-    /// prices it per token (one copy, or two on that arm).
-    ///
-    /// GatedDeltaNet state is `[B, v_heads, v_head_dim, key_head_dim]` bf16
-    /// and the conv window is `[B, kernel-1, 2*key_dim + value_dim]` bf16 —
-    /// the shapes `gatedDeltaNet` allocates. Zero on an arch with no linear
-    /// layers (nothing to checkpoint).
+    /// Bytes one SSM checkpoint holds: recurrent state + conv window of every linear layer.
+    /// The QSA key history is not here (it lands on the newest checkpoint only).
     pub fn ssmCheckpointBytes(self: *const ModelConfig) u64 {
         if (self.linear_num_value_heads == 0) return 0;
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
@@ -947,34 +908,14 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
 
-    /// THE long-context blast-radius predicate. ONE definition for every
-    /// mechanism PR #363 introduced, so a non-qwen4_exp arch is byte-identical
-    /// to a93e2c0 on all of them at once.
-    ///
-    /// The PR was measured, tuned and benchmarked on ONE checkpoint
-    /// (Qwen3.8-Flash-Next) at 100k-1M tokens. Every mechanism in it is a
-    /// TRADE — a reservation that pre-buys memory, a pad-waste cap that
-    /// un-batches, a retention policy that moves where a warm turn restores,
-    /// an admission term that refuses earlier, a chunk bar that narrows the
-    /// forward — and none of those trades was measured anywhere else. A trade
-    /// applied to an arch nobody priced it on is a regression waiting for a
-    /// bug report, so the trades are opt-in BY ARCHITECTURE and the fixes
-    /// (double frees, errdefer scopes, the MLX error latch) are not.
-    ///
-    /// Never hand-roll the condition at a call site: a site with its own
-    /// conjunct is a second predicate, and the two drift (the
-    /// `supportsBatchedGdnDecode` story, one file up). Sites that cannot see a
-    /// ModelConfig mirror this ONCE into a field at wiring time
-    /// (`HotPrefixCache.cp_thin`, the `qsa_history_required`
-    /// pattern) and are scan-pinned to it.
+    /// The long-context blast-radius predicate: every long-context mechanism (KV
+    /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
+    /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
     pub fn longCtxGated(self: *const ModelConfig) bool {
         return self.isQwen4();
     }
 
-    /// SSD-first prefix cache (`MLX_SERVE_PREFIX_SSD_FIRST`): the ONE arch
-    /// predicate every SSD-first mechanism checks. True only for qwen4_exp —
-    /// every other arch keeps today's RAM-first behaviour byte-identically.
-    /// Delegates to `longCtxGated` so the blast radius has ONE body.
+    /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
         return self.longCtxGated();
     }
@@ -1546,9 +1487,7 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
     return gd;
 }
 
-/// One qwen4_exp integer bound, read STRICTLY: a wrong-typed or negative value
-/// is a refusal, never the silently-kept default the `if (v == .integer)`
-/// reads used to leave behind. Absent stays absent (the field's default).
+/// One qwen4_exp integer bound, read strictly: wrong-typed or negative refuses.
 fn qwen4ConfigU64(cfg_obj: std.json.ObjectMap, key: []const u8) !?u64 {
     const v = cfg_obj.get(key) orelse return null;
     if (v != .integer or v.integer < 0) return error.InvalidQwen4ConfigField;
@@ -1561,20 +1500,10 @@ fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
     return @intCast(v);
 }
 
-/// Range-check every qwen4_exp bound that a forward pass indexes a FIXED
-/// array with or divides by. Called at the END of the qwen4_exp branch, once
-/// every field is parsed; the names travel to the client as
-/// "Model load failed: <name>" (#144).
-///
-/// Why load-time and not `@max(x, 1)` at the use site: the fallback would
-/// serve a model whose geometry does not match its own checkpoint, which is
-/// the failure this arch is least able to show (coherent-looking tokens from
-/// a trunk missing its n-gram term, or a block selector reading the wrong
-/// stride).
+/// Range-check every qwen4_exp bound the forward indexes a fixed array with or divides by.
+/// Names travel to the client as "Model load failed: <name>".
 fn validateQwen4Config(config: *const ModelConfig) !void {
-    // `NgramHash.multipliers` is [MAX_NGRAM_SIZE]i64, indexed 0..ngram_size-1,
-    // and `SSMCacheEntry.ple_prev` is written (ngram_size - 1) deep.
-    // ngram_size 1 is zero heads: a hash that writes no row ids at all.
+    // `NgramHash.multipliers` is [MAX_NGRAM_SIZE]i64; `ple_prev` is written ngram_size-1 deep.
     if (config.ngram_size < 2 or config.ngram_size > qwen4_exp.MAX_NGRAM_SIZE) {
         return error.InvalidQwen4NgramSize;
     }
@@ -1583,36 +1512,22 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
     if ((config.ngram_size - 1) * config.heads_per_ngram > qwen4_exp.MAX_HEADS) {
         return error.InvalidQwen4NgramHeads;
     }
-    // total_rows rounds up THROUGH the divisor, and every per-head vocab is
-    // the (global+1)-th prime after vocab_base - 1.
     if (config.ngram_vocab_divisor == 0 or config.ngram_vocab_base < 2) {
         return error.InvalidQwen4NgramVocab;
     }
-    // The QSA arm keys on `indexer_n_heads > 0` ALONE, and the forward then
-    // divides kv by the ratio (a zero divisor is illegal behaviour, not a
-    // trap, in ReleaseFast) and selects `budget / ratio` blocks.
+    // The forward divides kv by the ratio and selects `budget / ratio` blocks.
     if (config.indexer_n_heads > 0) {
         if (config.indexer_head_dim == 0) return error.InvalidQwen4Indexer;
         if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
         if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
     }
-    // Parsed in the branch, re-asserted here so the invariant sits in ONE
-    // readable place: 1-based id → 0-based ordinal inside the trunk.
     if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i32, @intCast(config.num_hidden_layers))) {
         return error.InvalidQwen4PleLayer;
     }
 }
 
-/// True when the layer loop installed the PLE on EXACTLY the layer the config
-/// names. `has_ple[i]` = layer i carries PLE weights. Pure so the check that
-/// runs after layer construction is testable without a checkpoint.
-///
-/// A NEGATIVE index means the build asks for no PLE at all — `loadQwen4Mtp`
-/// copies the trunk config and sets -1 because the MTP head's single QSA+MoE
-/// layer carries none — and is satisfied by a loop that installed none. A
-/// SHIPPED config missing `ple_layer_ids` never reaches here: the parse
-/// refuses it with `InvalidQwen4PleLayer`, and `validateQwen4Config` still
-/// demands an in-range index.
+/// True when the layer loop installed the PLE on exactly the layer the config names. A negative
+/// index asks for no PLE (the MTP head's own layer) and is satisfied by a loop that installed none.
 pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
     if (ple_layer_idx < 0) return std.mem.indexOfScalar(bool, has_ple, true) == null;
     if (ple_layer_idx >= has_ple.len) return false;
@@ -2438,19 +2353,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // trunk: attention, the QSA indexer and the MTP head all read it, so
         // a scaled rotation cannot desync the block selector from attention.
         try parseYarnRopeParameters(&config, cfg_obj);
-        // Every field below sizes a FIXED array, divides, or places the PLE.
-        // `if (v == .integer)` silently kept the DEFAULT for a wrong-typed
-        // value and `@intCast` swallowed a negative one, and the only bound
-        // check downstream was a `std.debug.assert` — compiled out of every
-        // ReleaseFast binary we ship (#363 ledger 26-29). Read strictly here,
-        // range-check in `validateQwen4Config` once every field is in.
+        // Read strictly; range-checked in `validateQwen4Config` once every field is in.
         if (try qwen4ConfigU32(cfg_obj, "hc_count")) |v| config.hc_count = v;
         if (try qwen4ConfigU32(cfg_obj, "hc_lowrank")) |v| config.hc_lowrank = v;
         {
-            // The config lists 1-based ids and we support exactly ONE
-            // injection point; placement downstream is by EXACT equality, so
-            // an absent or out-of-trunk id is a trunk with no n-gram term at
-            // all rather than a diagnosable failure.
             const v = cfg_obj.get("ple_layer_ids") orelse return error.InvalidQwen4PleLayer;
             if (v != .array or v.array.items.len != 1 or v.array.items[0] != .integer) {
                 return error.InvalidQwen4PleLayer;
@@ -7015,20 +6921,11 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
 }
 
 test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
-    // PR #363's mechanisms — the KV capacity reservation, the batched
-    // pad-waste cap's kv-length rule, span-preserving checkpoint thinning, the
-    // new admission-bill terms and the prefill chunk's ctx bar — were measured
-    // on qwen4_exp alone. Every one of them asks THIS predicate, so a
-    // non-qwen4 arch is byte-identical to a93e2c0 on all of them at once.
     const t = std.testing;
     var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
     try t.expect(qwen4.longCtxGated());
-    // ... and the SSD-first predicate is the SAME body, never a second one.
     try t.expect(qwen4.ssdFirstCapable());
 
-    // The archs the reviewer named: the 27B sidecar-MTP pack (qwen3_5), the
-    // other hybrids that reach every checkpoint/batching site, and a plain
-    // dense attention arch.
     for ([_][]const u8{
         "qwen3_5",
         "qwen3_5_moe",
@@ -7049,177 +6946,7 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
     }
 }
 
-test "ModelConfig.longCtxGated: ONE body — ssdFirstCapable delegates, nothing hand-rolls the string" {
-    // Class pin. The failure this prevents is a site growing its own
-    // conjunct: two predicates that agree today and drift at the next arch.
-    const t = std.testing;
-    const src = @embedFile("model.zig");
-    const decl = "pub fn ssdFirstCapable(self: *const ModelConfig) bool {";
-    const at = std.mem.indexOf(u8, src, decl) orelse return error.PredicateMoved;
-    const body = src[at .. at + 200];
-    try t.expect(std.mem.indexOf(u8, body, "self.longCtxGated()") != null);
-
-    // `longCtxGated` itself is the only non-test place the model_type string
-    // is compared for this purpose: `isQwen4` is the string, and the gate
-    // reads it.
-    const gate = "pub fn longCtxGated(self: *const ModelConfig) bool {";
-    const gat = std.mem.indexOf(u8, src, gate) orelse return error.PredicateMoved;
-    try t.expect(std.mem.indexOf(u8, src[gat .. gat + 400], "self.isQwen4()") != null);
-    // ...and `perRequestPrefillChunk` — the ONLY gate on the admission re-ask,
-    // the tail-merge bound and the per-chunk adapter — delegates too, rather
-    // than spelling the arch a second time.
-    const prc = "pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {";
-    const pat = std.mem.indexOf(u8, src, prc) orelse return error.PredicateMoved;
-    try t.expect(std.mem.indexOf(u8, src[pat .. pat + 120], "self.longCtxGated()") != null);
-}
-
-test "ModelConfig: no policy predicate hand-rolls the qwen4_exp literal" {
-    // The real class pin. Counting predicate CALLS cannot catch this — a new
-    // gate that writes `std.mem.eql(u8, self.model_type, "qwen4_exp")` inline
-    // adds no call and reads identically today, then drifts the moment the
-    // family gains a second `model_type` (the `_text` sibling the PARSER
-    // already collapses, a rename, a second Flash-Next pack). PR #363 shipped
-    // exactly that: `perRequestPrefillChunk` spelled the arch itself and was
-    // the only gate on three mechanisms.
-    //
-    // The literal has three legitimate homes and they are not predicates: the
-    // arch's NAME (`isQwen4`), the sampling-defaults FAMILY list, and the
-    // config parser's dispatch/canonicalization. So the bar is scoped to what
-    // it is about — every `bool` predicate on ModelConfig except `isQwen4`
-    // must be free of it.
-    const t = std.testing;
-    const whole = @embedFile("model.zig");
-    const prod = whole[0 .. std.mem.indexOf(u8, whole, "\ntest \"") orelse whole.len];
-    const lit = "\"qwen4" ++ "_exp\"";
-    const sig = "(self: *const ModelConfig) bool {";
-
-    var decls = std.mem.splitSequence(u8, prod, "\n    pub fn ");
-    _ = decls.next(); // everything before the first declaration
-    var checked: usize = 0;
-    while (decls.next()) |decl| {
-        if (std.mem.indexOf(u8, decl, sig) == null) continue;
-        // The body ends at this declaration's closing brace (column 4).
-        const body = decl[0 .. std.mem.indexOf(u8, decl, "\n    }") orelse decl.len];
-        if (std.mem.indexOf(u8, body, lit) == null) continue;
-        const name = body[0 .. std.mem.indexOfScalar(u8, body, '(') orelse body.len];
-        checked += 1;
-        try t.expectEqualStrings("isQwen4", name);
-    }
-    // The scan found something, i.e. the split/sig shape still matches this
-    // file: a silently-zero scan is the failure mode of every source pin.
-    try t.expectEqual(@as(usize, 1), checked);
-
-    // Every other file that gates on this family goes through a predicate, so
-    // none of them carries the literal in production code at all.
-    //
-    // NOT `file[0 .. indexOf("\ntest \"")]`. That idiom is only sound where the
-    // tests TRAIL the code, which is true of THIS file and false of the ones
-    // below: server.zig's first test sits at line 104 of 24,129, so the window
-    // was the import block and this loop asserted a fact about 0.4% of the file
-    // (audit addendum 4, item 1). `ProdLineScan` skips top-level `test` blocks
-    // instead, which reaches the other 99.6%.
-    //
-    // Each file also names a declaration PAST ITS OWN FIRST TEST BLOCK that
-    // the scan must have seen. That is the falsifiability check, and the
-    // needles are chosen against each file's old window rather than "somewhere
-    // deep": a zero-hit result looks identical whether the scan read the whole
-    // file or one line, so only reachability separates a real pass from the
-    // vacuous one this replaces. Every needle below is unreachable under the
-    // old `indexOf("\ntest \"")` window.
-    const files = [_]struct { src: []const u8, deep: []const u8, exempt: usize }{
-        // first test at line 104 of 24,129 — the window was the import block.
-        // Its three exemptions are `longCtxTestConfig`, `qwen4RequestTestConfig`
-        // and `qwen4ExpOomConfig`: test fixtures at column 0, production by
-        // position and test data by purpose.
-        .{ .src = @embedFile("server.zig"), .deep = "pub fn prefillAdmissionBill(", .exempt = 3 },
-        .{ .src = @embedFile("scheduler.zig"), .deep = "pub fn loadRequirementBytes(", .exempt = 0 },
-        .{ .src = @embedFile("generate.zig"), .deep = "pub fn sampleTokenLazy(", .exempt = 0 },
-        .{ .src = @embedFile("prefix_cache.zig"), .deep = "fn testWriteCacheLayer(", .exempt = 0 },
-        .{ .src = @embedFile("kv_disk_cache.zig"), .deep = "fn makeArange(", .exempt = 0 },
-    };
-    for (files) |f| {
-        var scan = ProdLineScan{ .src = f.src };
-        var lines: usize = 0;
-        var hits: usize = 0;
-        var saw_deep = false;
-        var exempt: usize = 0;
-        while (scan.next()) |line| {
-            lines += 1;
-            if (std.mem.startsWith(u8, line, f.deep)) saw_deep = true;
-            if (std.mem.indexOf(u8, line, lit) == null) continue;
-            // ONE named escape, spelled AT the line: a test FIXTURE that
-            // constructs a qwen4_exp config sits at column 0 outside any
-            // `test` block (server.zig's `longCtxTestConfig`,
-            // `qwen4RequestTestConfig`, `qwen4ExpOomConfig`), so it is
-            // production by position and test data by purpose. Exempted by
-            // NAME, never by shape — a real gate cannot acquire the marker by
-            // accident, and a fixture that loses it is caught here.
-            if (std.mem.indexOf(u8, line, "arch-scan-" ++ "exempt") != null) {
-                exempt += 1;
-                continue;
-            }
-            hits += 1;
-        }
-        try t.expectEqual(@as(usize, 0), hits);
-        // The exemption count is EXACT, so a fixture that loses its marker is
-        // caught as a hit and a fourth one that acquires it is caught here.
-        try t.expectEqual(f.exempt, exempt);
-        // The scan ran, and it ran deep enough to matter.
-        try t.expect(lines > 0);
-        try t.expect(saw_deep);
-    }
-}
-
-/// Iterate the PRODUCTION lines of a Zig source: every line outside a
-/// top-level `test "..." { ... }` block.
-///
-/// Top-level declarations start at column 0 and so do their closing braces,
-/// which makes `}` at column 0 an exact terminator for a test block — a nested
-/// close is always indented, and a `\\` multiline string is too.
-///
-/// This exists because `src[0 .. indexOf("\ntest \"")]` — the idiom several
-/// scans in this tree used — silently degenerates to a near-empty window in
-/// any file whose tests are interleaved rather than trailing, and a scan over
-/// an empty window passes forever (audit addendum 4, items 1 and 7). Duplicated
-/// verbatim in `server.zig`'s test region rather than exported: it is test
-/// scaffolding, and neither file should grow a production dependency on the
-/// other for it.
-const ProdLineScan = struct {
-    src: []const u8,
-    pos: usize = 0,
-    in_test: bool = false,
-
-    fn next(self: *ProdLineScan) ?[]const u8 {
-        while (self.pos < self.src.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '\n') orelse self.src.len;
-            const line = self.src[self.pos..end];
-            self.pos = end + 1;
-            if (self.in_test) {
-                if (std.mem.eql(u8, line, "}")) self.in_test = false;
-                continue;
-            }
-            if (std.mem.startsWith(u8, line, "test \"")) {
-                self.in_test = true;
-                continue;
-            }
-            return line;
-        }
-        return null;
-    }
-};
-
-// ── qwen4_exp load-time bound validation (#363 ledger 26-29) ─────────────
-//
-// Every bound below sizes a FIXED array or divides in the forward, and the
-// only guard the arch shipped with was a `std.debug.assert` in
-// `qwen4_exp.NgramHash.init` — compiled OUT of every ReleaseFast binary, i.e.
-// out of every binary we ship. A config claiming `heads_per_ngram: 16` wrote
-// 64 i64s into two 32-element arrays inside `NgramHash` before the model had
-// produced a single token.
-
-/// One qwen4_exp config document with `extra` fields spliced in. Every field
-/// the arch needs is here so a case document differs from the good one in
-/// exactly the field under test.
+/// One qwen4_exp config document with `extra` fields spliced in.
 fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
     return "{\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48," ++
         "\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"head_dim\":256," ++
@@ -7229,28 +6956,20 @@ fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
         extra ++ "}";
 }
 
-/// The shipped pack's own values for everything this section validates.
 const QWEN4_GOOD_FIELDS =
     "\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8," ++
     "\"ngram_vocab_size_base\":20000000,\"make_ngram_vocab_size_divisible_by\":128," ++
     "\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048,\"indexer_compress_ratio\":4";
 
 test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
-    // The good pack still loads — a validator that refuses the shipped
-    // checkpoint is worse than no validator.
     const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
     try testing.expectEqual(@as(u32, 3), good.ngram_size);
     try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
 
-    // multipliers[8] is indexed 0..ngram_size-1, and SSMCacheEntry.ple_prev
-    // is [MAX_NGRAM_SIZE]u32 written ngram_size-1 deep.
     try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":9,\"heads_per_ngram\":8"),
     ));
-    // n_heads = (ngram_size-1)*heads_per_ngram, so ngram_size 1 is zero heads
-    // and a zero-length hash — the rowIds loop then reads self.multipliers[0]
-    // for a row it never writes.
     try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":1,\"heads_per_ngram\":8"),
@@ -7259,12 +6978,10 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":0"),
     ));
-    // (5-1)*16 = 64 rows into vocab[32]/offsets[32].
     try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":5,\"heads_per_ngram\":16"),
     ));
-    // total_rows rounds up THROUGH the divisor.
     try testing.expectError(error.InvalidQwen4NgramVocab, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"make_ngram_vocab_size_divisible_by\":0"),
@@ -7272,9 +6989,6 @@ test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load er
 }
 
 test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
-    // `if (v == .integer)` kept the DEFAULT for a string-spelled bound, so a
-    // converter typo produced a model that loaded and hashed with the wrong
-    // geometry; a negative one went straight into `@intCast` to u32.
     try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
@@ -7294,14 +7008,10 @@ test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a si
 }
 
 test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
-    // The QSA arm keys on `indexer_n_heads > 0` alone, and the forward then
-    // divides by `indexer_compress_ratio` (@divTrunc by 0 is illegal
-    // behaviour in ReleaseFast) and picks `budget / ratio` blocks.
     try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
     ));
-    // block_topk = budget / ratio must select at least one block.
     try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2,\"indexer_compress_ratio\":4"),
@@ -7310,8 +7020,6 @@ test "qwen4_exp config: an armed QSA indexer must carry a usable budget and rati
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_budget\":2048,\"indexer_compress_ratio\":4"),
     ));
-    // Dense attention (no indexer) leaves every indexer field at 0 and must
-    // still load: the zeros are never read.
     const dense = try parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8"),
@@ -7321,10 +7029,6 @@ test "qwen4_exp config: an armed QSA indexer must carry a usable budget and rati
 }
 
 test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
-    // Placement is by EXACT equality against `ple_layer_idx` in the layer
-    // loop, so an id past the trunk (or an absent list, which defaults the
-    // index to -1) built a qwen4 trunk with NO n-gram injection at all: the
-    // 32 GB table loads, the hash runs, and nothing is ever added.
     try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ngram_size\":3"),
@@ -7337,7 +7041,6 @@ test "qwen4_exp config: the PLE layer id must name exactly one layer that exists
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[49]"),
     ));
-    // We support ONE injection point; two ids used to parse as "the first".
     try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":[2,5]"),
@@ -7350,26 +7053,17 @@ test "qwen4_exp config: the PLE layer id must name exactly one layer that exists
         testing.allocator,
         qwen4CaseJson("\"ple_layer_ids\":2"),
     ));
-    // The shipped 1-based id 2 is layer 1.
     const c = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
     try testing.expectEqual(@as(i32, 1), c.ple_layer_idx);
 }
 
 test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer" {
-    // A load error, not a log line: the config check above cannot see a
-    // layer loop that skipped the placement (a prefix change, a `continue`),
-    // and the failure mode is silent — coherent-looking tokens from a trunk
-    // missing its 51B-parameter n-gram term.
     try testing.expect(qwen4PleInstalledAt(&.{ false, true, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 2));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 4));
-    // A NEGATIVE index is a build that asks for no PLE at all, not a broken
-    // one: `Transformer.loadQwen4Mtp` copies the trunk config and sets
-    // `ple_layer_idx = -1` on purpose, because the MTP head's single QSA+MoE
-    // layer carries none. Refusing that is what took the real pack's load
-    // down. The invariant stays two-sided: with -1 no layer may carry PLE.
+    // A negative index is a build that asks for no PLE (`loadQwen4Mtp` sets -1 for the head's layer).
     try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
     try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, -1));

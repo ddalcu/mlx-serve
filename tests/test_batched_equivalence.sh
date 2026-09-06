@@ -436,24 +436,10 @@ wait $KVQ_PID 2>/dev/null || true
 rm -f "$KVQ_LOG"
 echo -e "${GREEN}PASS${NC} batched decode survives --kv-quant 8 (server alive, completion returned)"
 
-# ── pad-waste cap arm (opt-in: MLX_SERVE_PADWASTE_ARM=1) ──────────────────
-# Everything above runs streams of comparable length, where the pad-waste cap
-# never has anything to veto. This arm runs the pair the cap EXISTS for: one
-# ~1k-token stream beside one ~64k one. `padAndStackBatchedKV` pads every slot
-# to the group's longest, so batching those two makes the 1k slot build a
-# 64k-wide KV tensor every tick — a per-tick transient no gate bills, whose
-# failure mode is an uncatchable Metal OOM.
-#
-# It was dead on every trunk with a LINEAR global layer 0 (GDN qwen3_5 /
-# qwen4_exp, gated-conv lfm2, mamba2 nemotron_h, KDA bailing_hybrid): the cap
-# was fed `cache.step`, which only advances inside `update` on layer 0 and so
-# reads 0 forever there. Every slot reported 0, the waste ratio was 1.0 for any
-# group, and the cap kept everybody — silently, because the output is fine.
-#
-# Off by default: it needs a long-context checkpoint and a multi-minute 64k
-# prefill. The bar is the SPLIT, not bytes — batching decisions on these archs
-# change by design, so byte-equality across a changed group would be the wrong
-# bar (the forced-N=1 arm and the N=2 near-tie arm above carry that).
+# Pad-waste cap arm (opt-in: MLX_SERVE_PADWASTE_ARM=1): one ~1k-token stream beside one ~64k
+# one. The cap was dead on every linear-layer-0 trunk (it read `cache.step`, 0 forever there).
+# The bar is the SPLIT, not bytes. Off by default: it needs a long-context checkpoint and a
+# multi-minute 64k prefill.
 if [ "${MLX_SERVE_PADWASTE_ARM:-0}" = "1" ]; then
     echo
     echo "== pad-waste cap: a 1k stream must NOT batch with a 64k one =="
@@ -513,10 +499,7 @@ PW_PYEOF
         tail -20 "$PW_LOG"; cleanup_padwaste; exit 1
     fi
 
-    # The long stream first, and the short one only once the long one is
-    # DECODING — otherwise the short request finishes during the 64k prefill
-    # and the two never form a group at all. Streaming makes "decoding" an
-    # observable: the first SSE bytes land when the first token is emitted.
+    # The long stream first, and the short one only once the long one is decoding.
     curl -s -N -m 900 -X POST -H "Content-Type: application/json" -d @"$PW_LONG" \
         "$BASE/v1/chat/completions" > "$PW_LONG_BODY" &
     PW_A=$!

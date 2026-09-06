@@ -1692,162 +1692,19 @@ Two things learned on the way:
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
 
-## An ACE-Step task is a conditioning stream, not a code path (2026-08)
+## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
 
-`complete` (vocal2bgm) and `cover` look like two features and are one forward.
-What changes is the DiT's context stream and the instruction line that rides
-with it; everything downstream is the same graph.
-
-`complete` puts the source clip's RAW VAE latent into the context as
-`[src|ones]` alongside its own instruction line. `cover` runs the latent
-through the pooler into FSQ and then the detokenizer. The FSQ step is the part
-that is easy to get half-right: it is a soft clamp, `c·tanh(z/c)` with
-`c = L/(L−1)`, followed by the hard-clamp floor grid — and it is *both*, in
-that order. Either alone produces something that decodes to plausible audio and
-is not the reference's quantization, which is exactly the failure mode that
-survives a listening test. In both tasks the source clip's length IS the track
-length; there is no separate duration to honour.
-
-The FSQ weights are not in the main checkpoint. They ship as a separate DENSE
-bf16 `fsq.safetensors` and load lazily through `ensureFsq`, so a pack that has
-never run `cover` has never touched them — which means a missing or malformed
-file surfaces on the first `cover` request rather than at load, and must be a
-named refusal rather than a crash there.
-
-## A padded vocabulary row is not a token, and the sampler must not draw one (2026-08)
-
-`vocab_size` in a checkpoint's config is a MATRIX DIMENSION, rounded up for the
-kernel. The rows between the last real token and that dimension decode to
-nothing at all. Nothing stops the sampler picking one — they carry logits like
-any other row — and when it does, the response contains a token the tokenizer
-cannot render.
-
-The legitimate set is DERIVED rather than declared: `tokenizer.reservedOutputIds`
-plus `definedVocabSize` feed `installSuppressMask`, which masks
-`[defined, logits_dim)` along with the reserved specials. The one trap is
-double-trimming: a checkpoint that declares `unpadded_vocab_size` has ALREADY
-sliced those rows off, so applying the mask as well would suppress real tokens
-at the top of the vocabulary. One trim, never both.
-
-Logprobs stay RAW. The mask is sampling POLICY — what this server is willing to
-emit — while the `logprobs` field is a report of what the MODEL said. Applying
-the mask to the reported distribution would make the field lie about the
-checkpoint, and a client comparing our logprobs against a reference
-implementation would see a discrepancy that has nothing to do with the model.
-`MLX_SERVE_SUPPRESS_RESERVED=0` restores the unmasked sampler for exactly that
-kind of comparison.
-
-## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, 2026-09)
-
-**The rule: a bound that comes from a file on disk and sizes a fixed array,
-divides, or places a layer must be checked at LOAD, with a named error. A
-`std.debug.assert` is not that check — `-Doptimize=ReleaseFast` compiles it
-out, and ReleaseFast is the only mode we ship (and the only mode CLAUDE.md
-allows for benchmarking).** Four qwen4_exp defects, found by reading the load
-path rather than by a failure; ledger rows 26-29 in `docs/gotchas/server-http.md`.
-
-All four are qwen4_exp-only **by construction** rather than by a predicate:
-the fields are parsed inside `if (model_type == "qwen4_exp")`, `NgramHash` and
-`NgramTable` are constructed at one site each inside `if (config.isQwen4())`,
-and `ngram_table.bin` exists in no other pack.
-
-### 1. The n-gram hash wrote its fixed arrays from the config
-
-`NgramHash` keeps `multipliers: [MAX_NGRAM_SIZE]i64` and
-`vocab`/`offsets: [MAX_HEADS]i64`, and fills `ngram_size` and
-`(ngram_size - 1) * heads_per_ngram` of them — both straight from
-`config.json`, both `@intCast` with no range check. `SSMCacheEntry.ple_prev`
-is the same bound again, written `ngram_size - 1` deep on every slot. The only
-guard was `std.debug.assert(h.n_heads <= MAX_HEADS and ngram_size <= 8)`.
-
-A pack claiming `heads_per_ngram: 16` with `ngram_size: 5` writes 64 i64s into
-two 32-element arrays inside a heap-allocated `Qwen4State`, before the model
-has produced a token. In `zig build test` the assert catches it; in the binary
-users run, nothing does.
-
-The fix is at both ends: `model.validateQwen4Config` refuses the config, and
-`NgramHash.init` is now fallible with the same errors, so a hand-built config
-that never went through the parser is refused too. `MAX_NGRAM_SIZE` is a
-public constant and `ple_prev` is declared with it, so the array and the bound
-cannot drift apart.
-
-A second half of the same defect: `if (v == .integer)` silently kept the
-DEFAULT for a wrong-typed value (a converter that wrote `"ngram_size": "3"`
-got the default 3, not a refusal), and a negative one went straight into
-`@intCast` to `u32` — a panic in Debug ("integer does not fit in destination
-type"), illegal behaviour in ReleaseFast. Both are `InvalidQwen4ConfigField`.
-
-### 2. The QSA indexer's divisor was never checked
-
-`indexer_head_dim` / `indexer_budget` / `indexer_compress_ratio` default to 0,
-and the QSA arm keys on `indexer_n_heads > 0` **alone**. The forward then does
-`@divTrunc(kv, ratio)` at about ten sites and picks `budget / ratio` blocks.
-Division by zero is illegal behaviour in ReleaseFast; `block_topk == 0` selects
-no blocks at all.
-
-Two sites had already grown local patches — `if (ratio == 0) return 0` in the
-transient estimator, `@max(ratio, 1)` in the billing. Those are the wrong
-shape: they let a checkpoint whose block stride does not match its own weights
-serve, which on this arch produces plausible text rather than an error. The
-check belongs at load (`InvalidQwen4Indexer`), and the dense arm
-(`indexer_n_heads == 0`, every indexer field 0) still loads untouched.
-
-### 3. The n-gram table header was trusted
-
-`ngram_table.bin` is 32 GB, mmapped, and sliced with offsets taken from its own
-header — which was read through bare `.?` / `.string` / `.array` / `.integer`
-unwraps, with only the biases region's END bounds-checked. A truncated or
-hand-edited header did not fail the load: in ReleaseFast the unchecked unwrap
-produced whatever followed. A `weight` region claiming rows it does not hold
-let `row()` (which asserts only `r < self.rows`) and `preadSite` read past the
-mapping.
-
-`bits` was tied only by `dim * bits == wcols * 32`, which accepts 32 — and at
-32, `(@as(u32, 1) << @intCast(bits)) - 1` in `dequantRow` is an illegal shift.
-It now must be a width `mx.quantize` actually packs, `{2,3,4,5,6,8}`.
-
-Each of the three regions is now proven to hold exactly `rows × cols × dtype`
-bytes, to describe the same rows as the others, to be pairwise disjoint, and to
-end inside the mapping. Disjointness matters because a self-consistent lie is
-still a lie: overlapping regions mean one bank is reading the other's bytes as
-its own dtype.
-
-The converter stamps `"format": "mlx-serve-ngram"` and the shipped
-`Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` pack carries it, so the stamp is
-now enforced **when present** — a table written by something else that reused
-the safetensors shape is refused. Tables written before the converter added the
-stamp have none, so absence is accepted and logged once.
-
-### 4. Nothing proved the PLE was ever installed
-
-`ple_layer_ids` was read as "the first integer of the array, if it happens to
-be an array of integers", defaulting to `ple_layer_idx = -1`, and placement in
-the layer loop is by EXACT equality against that index. So a config naming a
-layer outside the trunk — or a non-integer, or an absent list — built a qwen4
-trunk with **no n-gram injection at all**: the 32 GB table still opens, the
-hash still runs, the PLE weights are simply never loaded and the term is never
-added. The output of that model is coherent-looking text.
-
-Load now requires exactly one id in `1..=num_hidden_layers` (we support one
-injection point; two ids used to parse as "the first"), and `initMoeLayers`
-proves after construction that exactly one layer carries PLE weights, at that
-index, returning `error.Qwen4PleNotInstalled` otherwise. A load error, not a
-log line — the failure is invisible in the output, so a line in a log is a
-line nobody reads. The predicate (`model.qwen4PleInstalledAt`) is pure and
-lives beside the config check whose invariant it completes; the call site is
-scan-pinned.
-
-`NgramHash.init(..., ple_layer_index = 0)` is unchanged and correct: that
-argument is the PLE's ORDINAL among the injection points the config lists, not
-the trunk layer number — the reference seeds the per-head multipliers and
-primes from the ordinal. The oracle fixture pins it (its config says
-`ple_layer_ids = [2]` and its reference row ids reproduce with 0 here), and the
-call site now says so.
-
-### The shape of the refusal
-
-Every one of these is a named error that crosses the inference thread by
-`@errorName` and comes back out as `Model load failed: <name>`, so the operator
-sees `InvalidQwen4NgramHeads` rather than a generic 500. `loadErrorFromName`
-deliberately does NOT special-case them: they are load failures, not memory
-failures, and guessing a diagnosis is worse than reporting the honest one.
+`NgramHash.init` wrote `[MAX_HEADS]` and `[MAX_NGRAM_SIZE]` arrays from
+`heads_per_ngram` and `ngram_size` behind a `std.debug.assert`, which is
+compiled out of every ReleaseFast binary we ship: a config claiming 16 heads
+wrote 64 i64s into two 32-element arrays. The indexer's `compress_ratio` was
+never checked (a zero divisor is illegal behaviour, not a trap), the n-gram
+table header was read with bare `.?`/`.string`/`.array` unwraps on a 32 GB
+mmap the engine then slices with, and nothing proved the PLE was ever
+installed (placement is by exact equality against `ple_layer_idx`; an absent
+or out-of-trunk id built a trunk with no n-gram term that emitted plausible
+text). `model.validateQwen4Config` reads every bound strictly and refuses by
+NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
+reaching the client as `Model load failed: <name>`), `NgramTable.parse`
+checks every header field and proves every region sits inside the mapping,
+and a PLE the layer loop never installed is a load error.

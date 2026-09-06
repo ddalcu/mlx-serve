@@ -295,10 +295,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
                 \\
             , .{ base_url, model, model, model, model, budget.output });
-            // A model outside Claude Code's own catalog is assumed to hold 200k
-            // and auto-compacted there; this is the documented override. Same
-            // rule as every other agent's context field: declare the ADVERTISED
-            // number verbatim, and say nothing when there is none.
+            // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
             if (budget.context > 0) {
                 try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
             }
@@ -810,9 +807,7 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
 }
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {
-    // Claude Code 2.1.x assumes 200k for any model outside its own catalog and
-    // auto-compacts there; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented
-    // override. Declared VERBATIM, like every other agent's context field.
+    // Claude Code assumes 200k outside its catalog; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the override.
     const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, &.{});
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432") != null);

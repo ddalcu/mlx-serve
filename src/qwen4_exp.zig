@@ -43,11 +43,7 @@ fn nthPrimeAfter(start: u64, count: u32) u64 {
     return p;
 }
 
-/// `NgramHash.vocab` / `.offsets` are [MAX_HEADS]i64 and `.multipliers` is
-/// [MAX_NGRAM_SIZE]i64; `SSMCacheEntry.ple_prev` is [MAX_NGRAM_SIZE]u32. Both
-/// bounds are CONFIG-driven, so `model.validateQwen4Config` refuses a
-/// checkpoint past them at load — the `std.debug.assert` that used to be the
-/// only guard is compiled out of every shipped ReleaseFast binary.
+/// Config-driven bounds; `model.validateQwen4Config` refuses a checkpoint past them at load.
 pub const MAX_HEADS = 32;
 pub const MAX_NGRAM_SIZE = 8;
 
@@ -62,14 +58,8 @@ pub const NgramHash = struct {
     offsets: [MAX_HEADS]i64,
     total_rows: u64,
 
-    /// `ple_layer_index` is the PLE's ORDINAL among the injection points the
-    /// config lists (the reference hashes with the ordinal, not the trunk
-    /// layer number), so it is 0 for the one PLE we support — pinned by the
-    /// oracle fixture below, whose config says `ple_layer_ids=[2]`.
-    ///
-    /// Fallible: every bound here writes a fixed array, and an assert is not
-    /// a guard in ReleaseFast. Same errors as `model.validateQwen4Config`, so
-    /// a hand-built config that skips the parser is refused too.
+    /// `ple_layer_index` is the PLE's ordinal among the config's injection points (0 for the
+    /// one we support). Fallible: every bound writes a fixed array.
     pub fn init(unigram_vocab: u32, ngram_size: u32, heads_per_ngram: u32, vocab_base: u64, divisor: u64, seed: u64, ple_layer_index: u32, eos: u32) !NgramHash {
         if (ngram_size < 2 or ngram_size > MAX_NGRAM_SIZE) return error.InvalidQwen4NgramSize;
         if (heads_per_ngram == 0 or (ngram_size - 1) * heads_per_ngram > MAX_HEADS) {
@@ -157,17 +147,12 @@ fn warmEnabled() bool {
     return v;
 }
 
-/// What the background page-cache warm has read so far, and the table's total
-/// size. Published by the warm thread and read lock-free by the metrics
-/// sampler and `/props` (the `ane.live_*` pattern). Both are zero whenever no
-/// table is warming, so the zero-when-off invariant holds.
+/// What the background page-cache warm has read so far, and the table's total size. Published
+/// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
 pub var live_warm_bytes = std.atomic.Value(u64).init(0);
 pub var live_warm_total = std.atomic.Value(u64).init(0);
 
-/// A line at the first chunk past each 8 GB step, or after 10 s of silence --
-/// whichever comes first, never twice for one step, and no backlog after a
-/// jump. Pure: `warmMain` owns the clock, this owns only the decision, so the
-/// cadence is testable without a thread or a 51 GB file.
+/// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
 pub const WARM_LOG_BYTES: u64 = 8 << 30;
 pub const WARM_LOG_NS: u64 = 10_000_000_000;
 
@@ -233,9 +218,7 @@ pub const NgramTable = struct {
         return t;
     }
 
-    /// Widths `mx.quantize` actually packs and `dequantRow` unpacks. 32 makes
-    /// `(1 << bits) - 1` an illegal shift; 7 is not a width mlx emits, and the
-    /// `dim * bits == wcols * 32` tie alone accepts both.
+    /// Widths `mx.quantize` packs and `dequantRow` unpacks.
     fn bitsSupported(bits: u32) bool {
         return switch (bits) {
             2, 3, 4, 5, 6, 8 => true,
@@ -254,11 +237,8 @@ pub const NgramTable = struct {
         }
     };
 
-    /// One header entry (`weight` / `scales` / `biases`), every access checked
-    /// and the region proven to hold EXACTLY `rows x cols x elem` bytes inside
-    /// the mapping. Wrong type or missing ⇒ `NgramTableHeader`; a region that
-    /// lies about its own size ⇒ `NgramTableRegion`; one that runs off the end
-    /// ⇒ `NgramTableTruncated`.
+    /// One header entry, every access checked and the region proven to hold exactly
+    /// `rows x cols x elem` bytes inside the mapping.
     fn headerRegion(
         obj: std.json.ObjectMap,
         key: []const u8,
@@ -298,9 +278,7 @@ pub const NgramTable = struct {
         return r;
     }
 
-    /// The converter stamps `"format": "mlx-serve-ngram"` and the shipped pack
-    /// carries it; tables written before the stamp existed do not, so absence
-    /// is accepted (once, loudly) and a DIFFERENT format is a refusal.
+    /// Absent `format` stamp is accepted once, loudly; a different format is a refusal.
     var stamp_warned: bool = false;
 
     fn parse(map: []align(std.heap.page_size_min) const u8, header: []const u8, data_off: usize) !NgramTable {
@@ -310,10 +288,6 @@ pub const NgramTable = struct {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, header, .{}) catch return error.NgramTableHeader;
         if (parsed != .object) return error.NgramTableHeader;
         const obj = parsed.object;
-        // Every access below used to be a bare `.?` / `.string` / `.array` /
-        // `.integer` on a header read from a 32 GB file the engine then slices
-        // with: in ReleaseFast a missing field did not fail the load, it read
-        // whatever the unchecked unwrap produced (#363 ledger 28).
         const meta_v = obj.get("__metadata__") orelse return error.NgramTableHeader;
         if (meta_v != .object) return error.NgramTableHeader;
         const meta = meta_v.object;
@@ -334,9 +308,7 @@ pub const NgramTable = struct {
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
         const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
         const bi = try headerRegion(obj, "biases", "BF16", 2, map.len, data_off);
-        // One table: the three regions describe the SAME rows, the two
-        // parameter banks the same groups, and no region may lend its bytes
-        // to another (a self-consistent lie is still a lie).
+        // The three regions describe the same rows and may not overlap.
         if (sc.rows != w.rows or bi.rows != w.rows or sc.cols != bi.cols) return error.NgramTableRegion;
         if (w.overlaps(sc) or w.overlaps(bi) or sc.overlaps(bi)) return error.NgramTableRegion;
 
@@ -381,9 +353,7 @@ pub const NgramTable = struct {
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
         if (self.fd < 0 or self.warm_thread != null) return;
-        // The off arm SAYS so: a cold first request faults 48 rows/token off
-        // the SSD (38k prompt: 174 s vs 55 s warm), and without a line the
-        // only symptom is a first request that looks hung.
+        // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
             log.info("[qwen4] ngram table warm: disabled (MLX_SERVE_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
             return;
@@ -448,43 +418,16 @@ pub const NgramTable = struct {
     }
 
     /// Gather + concatenate the `n_heads` rows of each token: `out` is
-    /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the
-    /// context position this gather runs AT (the pre-chunk `moe_seq_offset`
-    /// on a prefill, 0 on decode and on the warmup forward) and picks the
-    /// wide arm; the OUTPUT is byte-identical either way.
+    /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the context position this
+    /// gather runs at and picks the wide arm; the output is byte-identical either way.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
         const need: usize = self.wcols * 4 + self.scols * 4;
-        // The pool served DECODE widths only, on the assumption that a
-        // 4096-row prefill chunk is "mostly page-cache hits" so 1024 wake
-        // rounds cost more than they save. Measured 2026-09-04 on the 374k
-        // ladder (M5 Max, 128 GB, chunk 4096, QWEN4_PROFILE_FWD=all), the
-        // assumption does not hold once MLX active climbs toward the ceiling:
-        // this gather -- a pure host read, no MLX and no sync inside the timer
-        // -- went 67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and
-        // kv 355k, 31% of the whole prefill slowdown, while gathering the same
-        // rows per token at both ends. The weights evict the 32 GB mapping and
-        // the serial faults land on the compressor (per-process `pagein` stays
-        // 0; `vm_stat` shows the decompressions), which is exactly the
-        // serialize-on-the-VM-map-lock case the pool exists to fan out.
-        //
-        // The batching loop below ALREADY walks in MAX_ROWS groups, so a
-        // prefill gather needs no new scratch and no change to the pool's
-        // contract: `bufs` stays [MAX_ROWS][ROW_BUF] and `run` still fans
-        // 3*rows preads over the 48 workers. Only the length gate moves.
-        // Read path, so the output is byte-identical either way; the win (or
-        // the wake-round loss at small kv) is timing only. Which is exactly
-        // why the arm is a kv GATE and not a flag: the same pool that saves
-        // 200 ms per 1000 tokens at kv 355k costs 2-7% at every rung up to
-        // 256k, where the mapping is still resident. `PREFILL_PREFETCH_MIN_KV`
-        // above carries both A/Bs; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces.
+        // Prefill-width gathers ride the pool only past `PREFILL_PREFETCH_MIN_KV`: a resident
+        // table loses 2-7% to the wake rounds, an evicted one (weights pushed the 32 GB
+        // mapping out) went 67.7 -> 267.9 ms per 1000 tokens on the serial walk.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len);
-        // Announce the arm that actually RUNS, not the lever that permits it.
-        // `wide_ok` alone reported POOLED for the two silent fallbacks this
-        // line exists to catch — no pool on this box, or a row wider than
-        // ROW_BUF — so a QWEN4_PLE_PREFETCH_PREFILL A/B on such a box read as
-        // "the lever does nothing" for precisely the reason it was added to
-        // rule out. Every condition the gather itself tests is tested here.
+        // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
         if (wide) notePrefillGatherArm(pooled, row_ids.len);
         if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
@@ -537,9 +480,7 @@ const PrefetchPool = struct {
     bufs: [MAX_ROWS][ROW_BUF]u8 = undefined,
     pending: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(u32) = .init(0),
-    /// Fan-out rounds issued. Diagnostics, and the ENGAGEMENT counter the
-    /// prefill test reads -- a pooled gather and a serial one produce the same
-    /// bytes, so equality alone cannot prove which path ran.
+    /// Fan-out rounds issued; the engagement counter the prefill test reads.
     runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
 
@@ -623,27 +564,11 @@ fn plePrefetchEnabled() bool {
     return v;
 }
 
-/// One-shot per arm: an A/B whose ON side silently fell back to the serial walk
-/// (no pool on this box, a row wider than ROW_BUF) would read as "the lever does
-/// nothing" rather than as a broken arm. Engagement is SAID, never inferred from
-/// timing -- and BOTH arms say something, so the off arm is positively
-/// identified too instead of being asserted by absence. Atomic because the
-/// counters are read by the pool's workers, though the PLE gather itself only
-/// ever runs on the inference thread.
-/// Narrowest gather that is a genuine PREFILL chunk rather than a warmup or a
-/// short forward. A chunk is `tokens x heads_per_ngram` rows, so 1024 is well
-/// under any real chunk (4096 tokens x 16 heads = 65536) and well over the
-/// widths a warmup produces.
+/// One-shot engagement lines per arm; both arms say something.
+/// Narrowest gather that is a genuine prefill chunk rather than a warmup forward.
 pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
 
 /// [arm][bucket]: arm 0/1 = serial/pooled, bucket 0/1 = warmup/prefill width.
-/// Two lines per arm at most. The bucket split exists because the first wide
-/// gather in a process is a WARMUP forward (measured: 128 rows = 8 tokens x 16
-/// heads), so a single one-shot printed "128 rows, 2 batches" and described the
-/// wrong call — true about the arm, misleading about the work. The warmup line
-/// is kept rather than dropped: it identifies the arm within a second of boot,
-/// and an A/B that never reaches a prefill width would otherwise print nothing
-/// and read as an unproven (VOID) boot.
 pub var ple_prefill_arm_said: [2][2]std.atomic.Value(bool) =
     .{ .{ .init(false), .init(false) }, .{ .init(false), .init(false) } };
 
@@ -664,46 +589,14 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
 pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
-/// The kv length past which a prefill gather WIDER than one pool batch takes
-/// the pool. Not a tuning knob and not an opt-in: the pool measures as a COST
-/// at every rung anyone has driven, and as a large WIN in the one regime
-/// nobody could drive as an A/B — two facts about the same mapping.
-///
-///  - RESIDENT table: the pool LOSES, everywhere it was measured. Both A/Bs
-///    were driven from the #363 BENCH RECORD, not from this tree -- the
-///    drivers are `ab_ple_prefetch.sh` and `ab_ple_prefetch_long.sh` under
-///    `~/claude-tmp/bench-qwen4-ladder`, beside their llmprobe JSON; nothing
-///    under `tests/` runs them. Short prompts (M4 Max 13.4k, 758 tok/s serial
-///    vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill 5.3-8.5% slower
-///    at 4k/8k/16k, 6/6 cells, fp16 and kv8 alike). Long prompts, same binary,
-///    cold boots, kv8, off-vs-default cold prefill: 4k +7.1%, 8k +5.9%, 16k
-///    +6.5% -- then 64k -0.7% and 128k -0.1%, inside the noise, and 256k +2.1%
-///    (n=1). The rows are page-cache hits, so the 1024 wake rounds buy nothing
-///    anywhere up to 256k.
-///  - EVICTED table: the pool is why the gather stays flat, and this is the
-///    ONLY measured win. M5 Max 374k ladder (2026-09-04, chunk 4096): the
-///    serial gather went 67.7 -> 267.9 ms per 1000 prompt tokens between
-///    kv 24k and kv 355k -- 31% of the whole prefill slowdown -- because the
-///    weights evict the 32 GB mapping and each fault lands on the
-///    compressor. It is not an A/B: the regime only exists once MLX active
-///    has climbed toward the ceiling, which a paired short run cannot stage.
-///
-/// So the threshold is the TOP of the measured-cost range, not the middle of
-/// a bracket: 262144, past every rung the long A/B drove and below the 374k
-/// evidence. A lower number (65536 was the first guess) hands
-/// the pool three rungs it demonstrably loses on to buy a win nobody has
-/// isolated. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides it, and the 374k
-/// ladder re-driven as a paired A/B is what should move it next.
+/// The kv length past which a wide prefill gather takes the pool: the top of the measured
+/// cost range (the pool loses at every rung to 256k on a resident table; the only win is the
+/// evicted table on the 374k ladder). `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides.
 pub const PREFILL_PREFETCH_MIN_KV: u64 = 262144;
 
-/// Three states, because the A/B needs both forced arms and the shipped one.
 pub const PrefillPrefetchMode = enum { off, kv_gated, on };
 
-/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = the kv gate, `0` = always the
-/// serial walk, `1` = always the pool. `diagEnvOn` discipline holds where it
-/// applies -- an exported `=0` can only turn the pool OFF, never arm it.
-/// Separate from `QWEN4_PLE_PREFETCH`, which turns the pool off entirely: a
-/// pool that was never created cannot serve either width.
+/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = the kv gate, `0` = serial walk, `1` = pool.
 pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
     const r = raw orelse return .kv_gated;
     if (r.len == 0) return .kv_gated;
@@ -712,8 +605,7 @@ pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
     return .kv_gated;
 }
 
-/// The threshold, or the constant when the override is absent or unparsable
-/// (a typo must not silently disable the long-context arm).
+/// The threshold, or the constant when the override is absent or unparsable.
 pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
     const r = raw orelse return PREFILL_PREFETCH_MIN_KV;
     const t = std.mem.trim(u8, r, " \t");
@@ -721,7 +613,6 @@ pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
     return std.fmt.parseInt(u64, t, 10) catch PREFILL_PREFETCH_MIN_KV;
 }
 
-/// Pure: the arm a wide gather takes at this kv length.
 pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64) bool {
     return switch (mode) {
         .off => false,
@@ -882,39 +773,23 @@ pub const Qwen4State = struct {
 };
 
 test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools" {
-    // Two A/Bs, two regimes of one mapping: the pool costs 4-5% prefill on a
-    // WARM table (M4 Max 13.4k, 758 vs 725 tok/s; M5 Max 5.3-8.5% at
-    // 4k/8k/16k, 6/6 cells) and saves 67.7 -> 267.9 ms per 1000 tokens once
-    // the weights have evicted the table (M5 Max 374k ladder). So neither a
-    // flat opt-in nor a flat default is right — the kv length decides.
     const min = PREFILL_PREFETCH_MIN_KV;
     try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min));
-    // EVERY rung the long A/B drove is below the floor (bench record, not a
-    // tree script -- see PREFILL_PREFETCH_MIN_KV): the pool
-    // cost 7.1/5.9/6.5% at 4k/8k/16k, tied at 64k/128k and cost 2.1% at 256k.
-    // It never measurably paid, so the floor sits at the TOP of that range.
     for ([_]u64{ 4096, 8192, 16_384, 65_536, 131_072, 262_143 }) |kv| {
         try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min));
     }
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min));
-    // The one measured win, the 374k ladder's evicted table.
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min));
-    // An injected threshold moves the boundary and nothing else.
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096));
     try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072));
-    // Both forced arms ignore it entirely.
     try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min));
     try testing.expect(plePrefillPrefetchWanted(.on, 0, min));
 
-    // `diagEnvOn` discipline: absent is the GATE, and an exported `=0` can
-    // only force the serial walk — it can never arm the pool.
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(null));
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
     try testing.expectEqual(PrefillPrefetchMode.off, plePrefillPrefetchModeFromEnv("0"));
     try testing.expectEqual(PrefillPrefetchMode.on, plePrefillPrefetchModeFromEnv("1"));
 
-    // The threshold override, and its failure mode: a typo keeps the
-    // constant rather than silently disabling the long-context arm.
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(null));
     try testing.expectEqual(@as(u64, 131_072), plePrefillPrefetchMinKvFromEnv("131072"));
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv("64k"));
@@ -923,9 +798,7 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
-    // 4-bit, group 32, dim 32 -> wcols 4 u32 (16 B), scols 1 (2 B scale + 2 B
-    // bias). 4096 rows, so a prefill-width gather is 64 pool batches and the
-    // old `row_ids.len <= MAX_ROWS` gate rejected it outright.
+    // 4-bit, group 32, dim 32 -> wcols 4 u32, scols 1. 4096 rows = 64 pool batches.
     const ROWS: usize = 4096;
     const HDR: usize = 512;
     const W: usize = ROWS * 16;
@@ -939,7 +812,6 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     std.mem.writeInt(u64, buf[0..8], HDR, .little);
     @memset(buf[8 .. 8 + HDR], ' ');
     @memcpy(buf[8..][0..header.len], header);
-    // Every row distinct: a constant fill would let a wrong-row gather pass.
     for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
 
     var td = std.testing.tmpDir(.{});
@@ -955,12 +827,9 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer warm_override = null;
     var t = try NgramTable.open(path);
     defer t.close();
-    // A box that cannot spawn the 48 workers has no pooled path to compare.
     const pool = t.pool orelse return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 32), t.dim);
 
-    // Non-sequential ids: a serial mmap walk and a fanned-out pread set must
-    // agree on ORDER as well as content.
     const ids = try testing.allocator.alloc(i64, ROWS);
     defer testing.allocator.free(ids);
     for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ROWS);
@@ -969,10 +838,6 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const got = try testing.allocator.alloc(f32, ROWS * t.dim);
     defer testing.allocator.free(got);
 
-    // The engagement line is what an A/B asserts its arm on, so the BUCKET it
-    // reports is load-bearing: the first wide gather in a live process is a
-    // warmup forward (128 rows), and a single one-shot therefore described the
-    // warmup while claiming to describe the prefill.
     ple_prefill_arm_said[0][0].store(false, .monotonic);
     ple_prefill_arm_said[0][1].store(false, .monotonic);
     ple_prefill_arm_said[1][0].store(false, .monotonic);
@@ -983,33 +848,24 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
         }
     }.f;
 
-    // Kill switch: decode-only gate, so a 4096-row gather takes the serial
-    // mmap path and issues NO pool round.
-    // The KV GATE, through the live gather with the threshold injected: a
-    // short prompt takes the serial mmap walk and issues NO pool round.
+    // Below the kv gate: serial mmap walk, no pool round.
     ple_prefill_min_kv_override = 65_536;
     defer ple_prefill_min_kv_override = null;
     const before = pool.runs.load(.monotonic);
     t.gather(ids, ref, 8192);
     try testing.expectEqual(before, pool.runs.load(.monotonic));
-    // ROWS(4096) >= PREFILL_SAY_MIN_ROWS: the serial arm speaks at PREFILL
-    // width and says nothing in the warmup bucket.
     try testing.expect(said(0, 1));
     try testing.expect(!said(0, 0));
     try testing.expect(!said(1, 1) and !said(1, 0));
 
-    // ... and the SAME gather, at a kv past the threshold, rides the pool in
-    // MAX_ROWS batches. Nothing else about the call changed.
+    // Past the threshold the same gather rides the pool.
     t.gather(ids, got, 131_072);
     try testing.expectEqual(before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expect(said(1, 1));
     try testing.expect(!said(1, 0));
 
-    // Read path: byte-identical, not merely close — that is what makes the
-    // arm a pure timing decision.
     try testing.expectEqualSlices(f32, ref, got);
 
-    // The forced arms outrank the kv length in both directions.
     ple_prefill_prefetch_override = false;
     defer ple_prefill_prefetch_override = null;
     const forced_off = pool.runs.load(.monotonic);
@@ -1021,9 +877,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expectEqual(forced_off + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expectEqualSlices(f32, ref, got);
 
-    // A wide-but-short gather (> MAX_ROWS, < PREFILL_SAY_MIN_ROWS) is the
-    // warmup shape the live A/B actually hit first: it reports the warmup
-    // bucket, and does NOT re-fire the prefill-width line.
+    // A wide-but-short gather (> MAX_ROWS, < PREFILL_SAY_MIN_ROWS) reports the warmup bucket.
     const warm = ids[0..128];
     const w_out = try testing.allocator.alloc(f32, warm.len * t.dim);
     defer testing.allocator.free(w_out);
@@ -1031,8 +885,6 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expect(said(1, 0));
     try testing.expectEqualSlices(f32, got[0 .. warm.len * t.dim], w_out);
 
-    // A decode-width gather (<= MAX_ROWS) is not "wide" at all, so it must
-    // leave both buckets of the serial arm exactly as they were.
     const serial_warm_before = said(0, 0);
     const dec = ids[0..16];
     const d_ref = try testing.allocator.alloc(f32, dec.len * t.dim);
@@ -1095,10 +947,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     t3.close();
 }
 
-/// A whole `ngram_table.bin` image (length prefix + `header` + a data region
-/// big enough for `data_bytes`) in one page-aligned buffer, so a case document
-/// differs from the good one in exactly the header field under test.
-/// Caller frees with `std.heap.page_allocator.free`.
+/// A whole `ngram_table.bin` image in one page-aligned buffer. Caller frees with the page allocator.
 fn ngramTestImage(header: []const u8, data_bytes: usize) ![]align(std.heap.page_size_min) u8 {
     const hlen: usize = 512;
     std.debug.assert(header.len <= hlen);
@@ -1112,12 +961,10 @@ fn ngramTestImage(header: []const u8, data_bytes: usize) ![]align(std.heap.page_
 
 fn ngramTestParse(header: []const u8, data_bytes: usize) !NgramTable {
     const buf = try ngramTestImage(header, data_bytes);
-    // The map outlives the parse for the length of the test; freed by the
-    // caller's `defer` on the same allocator (`parse` never takes ownership).
     return NgramTable.parse(buf, buf[8..520], 520);
 }
 
-/// rows 4, dim 64, 4-bit, group 32 ⇒ wcols 8, scols 2; w 128 B, s/b 16 B each.
+/// rows 4, dim 64, 4-bit, group 32 => wcols 8, scols 2; w 128 B, s/b 16 B each.
 const NGRAM_GOOD_HEADER =
     "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
     "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1126,22 +973,16 @@ const NGRAM_GOOD_HEADER =
 const NGRAM_GOOD_BYTES = 160;
 
 test "ngram table header: a missing or wrong-typed field is a named error, never a trap" {
-    // `meta.object.get("bits").?.string` and `w.object.get("shape").?.array
-    // .items[1]` were unchecked on a 32 GB file the engine mmaps and then
-    // slices with: in ReleaseFast a truncated or hand-edited header did not
-    // fail the load, it read whatever followed the mapping.
     const t = try ngramTestParse(NGRAM_GOOD_HEADER, NGRAM_GOOD_BYTES);
     try testing.expectEqual(@as(u64, 4), t.rows);
     try testing.expectEqual(@as(u32, 64), t.dim);
     try testing.expectEqual(@as(u32, 4), t.bits);
     std.heap.page_allocator.free(@constCast(t.map));
 
-    // No __metadata__ at all.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // Metadata present, `bits` missing.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1149,7 +990,6 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // `bits` spelled as a JSON number, not the safetensors metadata string.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":4,\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1157,7 +997,6 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // A 1-D weight shape: `items[1]` used to index out of bounds.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4],\"data_offsets\":[0,128]}," ++
@@ -1165,7 +1004,6 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // A dtype the reader cannot serve: the row math is u32 words + bf16 pairs.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"F32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1173,7 +1011,6 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // A file written by something else that reused the safetensors shape.
     try testing.expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"format\":\"pt\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1184,9 +1021,6 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
 }
 
 test "ngram table header: bits must be a width mx.quantize actually ships" {
-    // `(@as(u32, 1) << @intCast(self.bits)) - 1` in dequantRow is illegal at
-    // 32 and wrong at every width mlx does not pack — and `dim * bits ==
-    // wcols * 32` alone accepts 32 (dim 64, wcols 64).
     try testing.expectError(error.NgramTableBits, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"32\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,64],\"data_offsets\":[0,1024]}," ++
@@ -1211,9 +1045,6 @@ test "ngram table header: bits must be a width mx.quantize actually ships" {
 }
 
 test "ngram table header: every region is bounded, sized by its own shape and disjoint" {
-    // Only the biases' END was checked, so a weight region claiming rows it
-    // does not hold let `row()` and `preadSite` slice past the mapping —
-    // `row()` asserts `r < self.rows` and nothing else.
     // Weight region too small for rows x wcols x 4.
     try testing.expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
@@ -1222,8 +1053,7 @@ test "ngram table header: every region is bounded, sized by its own shape and di
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // Scales overlapping the weights: one of the two is reading the other's
-    // bytes as its own dtype.
+    // Scales overlapping the weights.
     try testing.expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1231,7 +1061,6 @@ test "ngram table header: every region is bounded, sized by its own shape and di
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // A row count of zero divides by nothing but gathers from everything.
     try testing.expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[0,8],\"data_offsets\":[0,0]}," ++
@@ -1239,7 +1068,6 @@ test "ngram table header: every region is bounded, sized by its own shape and di
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[0,2],\"data_offsets\":[0,0]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // Scales and biases must describe the SAME rows as the weights.
     try testing.expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1247,7 +1075,6 @@ test "ngram table header: every region is bounded, sized by its own shape and di
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    // Past the end of the mapping.
     try testing.expectError(error.NgramTableTruncated, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
@@ -1258,25 +1085,16 @@ test "ngram table header: every region is bounded, sized by its own shape and di
 }
 
 test "NgramHash.init refuses a config past its fixed arrays instead of asserting" {
-    // The assert this replaces was `std.debug.assert(h.n_heads <= MAX_HEADS
-    // and ngram_size <= 8)`: present in `zig build test`, absent from every
-    // ReleaseFast binary we ship, where the loop below it wrote 64 i64s into
-    // two 32-element arrays.
     try testing.expectError(error.InvalidQwen4NgramSize, NgramHash.init(248320, 9, 8, 20_000_000, 128, 1234, 0, 248044));
     try testing.expectError(error.InvalidQwen4NgramSize, NgramHash.init(248320, 1, 8, 20_000_000, 128, 1234, 0, 248044));
     try testing.expectError(error.InvalidQwen4NgramHeads, NgramHash.init(248320, 5, 16, 20_000_000, 128, 1234, 0, 248044));
     try testing.expectError(error.InvalidQwen4NgramHeads, NgramHash.init(248320, 3, 0, 20_000_000, 128, 1234, 0, 248044));
     try testing.expectError(error.InvalidQwen4NgramVocab, NgramHash.init(248320, 3, 8, 20_000_000, 0, 1234, 0, 248044));
-    // The widest shape the arrays DO hold still builds.
     const wide = try NgramHash.init(248320, 5, 8, 20_000_000, 128, 1234, 0, 248044);
     try testing.expectEqual(@as(u32, 32), wide.n_heads);
 }
 
 test "WarmProgress emits on the byte step, on the silence timeout, and never twice for one step" {
-    // The warm is a 51 GB background read that took 174 s vs 55 s of first-
-    // request difference and said NOTHING until it finished, so a slow first
-    // prompt had no in-process explanation. Cadence is a pure function of
-    // (bytes so far, elapsed) so it is testable without a thread or a file.
     const GB: u64 = 1 << 30;
     const S: u64 = 1_000_000_000;
     var p: WarmProgress = .{};

@@ -56,12 +56,7 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
-// `--max-tokens N` in SERVE mode: the default for a request that omits the
-// field (0 = flag not given → today's context-pegged sentinel). File-level for
-// the same reason as the two above — five serve paths hand-roll their own
-// ServerConfig literal, and the app always launches the headless one, so a
-// value threaded through only `main()` would be eaten everywhere it matters.
-// The offline `--prompt` cap is a separate local that keeps defaulting to 100.
+// Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
@@ -379,19 +374,11 @@ pub fn main(init: std.process.Init) !void {
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
-    // Resolve every lazily-cached QSA env read here, on the main thread,
-    // before the HTTP and inference threads exist: first touch of a
-    // `?bool`/`?c_int` cache from two threads is a non-atomic race, and these
-    // are process constants.
+    // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
-    // Same discipline, prefix-cache module (audit N7).
     @import("prefix_cache.zig").warmEnvCaches();
 
-    // And make an MLX failure an ERROR rather than the end of the process.
-    // mlx-c's default handler prints and calls exit(-1), so a Metal
-    // working-set OOM mid-prefill killed the server with no 503 and no
-    // connection close (issue #353). Same reasoning as the line above for
-    // living here: ONCE, above every subcommand branch.
+    // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
 
     // Materialize CLI args from the iterator API into a flat slice
@@ -586,11 +573,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
             i += 1;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
-            // …and in serve mode the same number is the OMITTED-field default
-            // for every chat surface (body > launch flag > generation_config >
-            // hardcoded). Assigned only when the flag is actually given, so a
-            // bare boot keeps the sentinel byte for byte — the offline default
-            // of 100 must never become a serve default.
             serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
@@ -727,9 +709,6 @@ pub fn main(init: std.process.Init) !void {
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
-            // Set-once module override (same contract as
-            // --mtp-history-window): ONE value read by the HTTP admission
-            // gate and by nextMtp's per-round check. 0 = unlimited.
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
@@ -1415,14 +1394,6 @@ pub fn main(init: std.process.Init) !void {
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
 
-        // The round-cost table's bucket grid is a property of the MODEL, not
-        // of the path that loaded it. The serve path resolves it at load;
-        // without this the offline `--prompt` path kept the struct default and
-        // planned MTP for a qwen4_exp checkpoint on the six-bucket legacy grid
-        // — no serial row, and 62k and 374k folded into one cell — while
-        // `serve` planned the same checkpoint on the nine-bucket one (audit
-        // addendum 3). No cache key here: offline never persists, it only has
-        // to measure into the right grid.
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.

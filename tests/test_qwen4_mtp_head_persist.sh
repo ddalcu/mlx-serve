@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
-# Qwen3.8-Flash-Next (qwen4_exp): the in-checkpoint MTP head's committed
-# history rides the prefix cache.
-#
-# The head is NOT KV-only — it owns a QSA index-key history and pooled block
-# bank beside its own KV — so before this it was neither committed nor
-# restored, and a prefix-cache hit drafted from `qwen4MtpReset`: an EMPTY
-# head at a 62.7k-token cursor. Measured (62.7k prose prompt, auto MTP):
-# cold prefill m_avg 2.94 / acc 1.59 -> 54.1 tok/s, the SAME prompt as a
-# cache hit m_avg 1.00 / acc 0.59 -> 52.2 tok/s, i.e. serial (51.1).
-#
-# What this asserts is the INVARIANT, never a checkpoint's acceptance:
-#   - the second turn is a hot-cache hit AND the head is restored (log line),
-#   - the restored-head answer matches the persist-OFF answer tie-aware,
-#   - `MLX_SERVE_MTP_HEAD_PERSIST=0` restores the old behaviour exactly (no
-#     restore line, still a correct answer).
+# qwen4_exp: the in-checkpoint MTP head's committed history rides the prefix cache. The head
+# is not KV-only (it owns a QSA key history), so a cache hit used to draft from an empty head.
+# Asserts the invariant: the second turn is a hot-cache hit AND the head is restored, the
+# answer matches the persist-OFF answer, and `MLX_SERVE_MTP_HEAD_PERSIST=0` shows no restore line.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_head_persist.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
@@ -27,12 +16,7 @@ pass=0; fail=0
 BASELINE_FREE_MB=0   # set below, before the first boot
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 
-# Cleanup is armed HERE — before anything can start a server — and is never
-# disarmed. An earlier version set the trap inside run_arm AFTER the boot and
-# cleared it with `trap - EXIT` at the end of each arm, so any failure outside
-# that window (including `set -u` killing the script before the first boot)
-# left an engine running and blocked the next executor's port. `SPID` is
-# initialised so `set -u` cannot make the handler itself the failure.
+# Cleanup is armed before anything can start a server and never disarmed.
 SPID=""
 stop_srv() {
   [ -n "${SPID:-}" ] || return 0
@@ -42,12 +26,8 @@ stop_srv() {
 }
 trap stop_srv EXIT INT TERM
 
-# Arm 2's preflight can see arm 1's 100 GB pack still resident and refuse the
-# load (`available 36.51 GB` -> LoadFailed): `kill` returns as soon as the
-# signal is delivered, but the kernel reclaims a pack of this size well after
-# the process is gone. So "stopped" is TWO conditions -- the PID is reaped AND
-# free memory is back near where it was before the first boot -- and the wait
-# lives in one function both arms go through.
+# "Stopped" is two conditions: the PID is reaped AND free memory is back near where it was,
+# or arm 2's preflight sees arm 1's 100 GB pack still resident.
 MEM_RECOVER_GAP_MB=10240   # tolerance: the pack is ~100 GB, so 10 GB is noise
 MEM_RECOVER_TIMEOUT_S=90
 
@@ -92,10 +72,7 @@ filler=('The archivist catalogued the shelves in the long hall. ')*700
 print(json.dumps({'messages':[{'role':'user','content':filler+' The secret code is PELICAN-42. '+filler+' What is the secret code? Answer with the code only.'}],'max_tokens':24,'temperature':0,'enable_thinking':False,'enable_mtp':True}))"; }
 
 run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_HEAD_PERSIST value
-  # ONE declaration PER LINE. `local a="$1" b="$DIR/$a.log"` expands every word
-  # on the line before any of the assignments take effect, so the third
-  # initialiser read `$name` while it was still unset and `set -u` killed the
-  # script at the top of the first arm.
+  # One declaration per line: `local a="$1" b="$DIR/$a.log"` expands before assigning.
   local name="$1"
   local persist="$2"
   local log="$DIR/$name.log"
@@ -110,10 +87,7 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_HEAD_PERSIST value
   curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" >/dev/null
   curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" > "$DIR/$name.answer"
-  # Through the SAME helper the trap uses, so the two can never disagree about
-  # what "stopped" means; the trap stays armed for the next arm. stop_srv
-  # clears SPID, so the PID is captured before the call and the memory wait
-  # follows it -- the next arm's preflight must not see this pack.
+  # Through the same helper the trap uses; SPID is captured before the call.
   local was="$SPID"
   stop_srv
   wait_for_release "$was" "$BASELINE_FREE_MB"
