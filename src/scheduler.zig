@@ -5732,6 +5732,38 @@ fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
 }
 
 var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
+var write_through_off_logged = std.atomic.Value(bool).init(false);
+var write_through_env_cached: ?bool = null;
+
+/// `MLX_SERVE_SSD_WRITE_THROUGH=0` takes mechanism 3 out of the prefill chunk
+/// loop: the end-of-request commit then persists the whole turn, exactly as
+/// every non-SSD-first arch already does.
+///
+/// A genuine two-arm tradeoff, which is why it is a lever and not a constant.
+/// ON, a killed or cancelled prefill leaves a chunk-aligned restorable prefix
+/// on the SSD and pays the staging inside THIS turn's TTFT. OFF, the same
+/// bytes are written after the response — nothing is lost while the process
+/// lives, and a kill mid-prefill loses the turn's progress. It is also the
+/// only way to A/B the mechanism's TTFT cost against an otherwise identical
+/// binary; the arm is provable from the log either way (`persisted N/M` lines
+/// inside a prefill, or the one-shot decline below).
+pub fn writeThroughEnabledFromEnv(raw: ?[]const u8) bool {
+    const v = raw orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
+
+/// Read on the INFERENCE thread only (`writeThroughArmed` is called from the
+/// prefill arming site and nowhere else), so the lazy `?bool` is not the
+/// two-thread first-touch race `warmEnvCaches` exists for.
+fn writeThroughEnabled() bool {
+    if (write_through_env_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_SSD_WRITE_THROUGH") orelse break :blk writeThroughEnabledFromEnv(null);
+        break :blk writeThroughEnabledFromEnv(std.mem.sliceTo(raw, 0));
+    };
+    write_through_env_cached = v;
+    return v;
+}
 
 /// The ONE gate for mechanism 3: SSD-first arch predicate + a live background
 /// writer (so the chunk write never runs on the inference thread) + a disk
@@ -5739,6 +5771,16 @@ var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
 /// slot (plus this turn's un-cached span) so it can be unit-tested.
 fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    if (!writeThroughEnabled()) {
+        // Logged from INSIDE the SSD-first arm only (below `hc.ssd_first`
+        // would be too late — the arch check is the next line — so the flag
+        // is what gates the line, and every other arch stays silent because
+        // it never reaches this function with a cache at all).
+        if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
+            log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
+        }
+        return false;
+    }
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
@@ -8437,6 +8479,39 @@ test "SSD-first behaviour is gated on ONE arch predicate at one place per mechan
     const cb = source[cs..ce];
     try testing.expect(std.mem.indexOf(u8, cb, "if (!hc.ssd_first) return;") != null);
     try testing.expect(std.mem.indexOf(u8, cb, "if (d.writer == null) return;") != null);
+}
+
+test "MLX_SERVE_SSD_WRITE_THROUGH=0 takes mechanism 3 out of the prefill, and only that" {
+    // The lever exists because mechanism 3 is the one PR-#363 term that runs
+    // inside the prefill chunk loop and is sized by the KV dtype, so an
+    // fp16-vs-8-bit prefill comparison has to be able to switch it off against
+    // an otherwise identical binary. Absent / empty / anything-but-"0" keeps
+    // the shipping behaviour: a lever that could be armed by an unrelated
+    // exported empty string is the "`getenv != null` is ARMED by `=0`" defect
+    // one layer up.
+    try testing.expect(writeThroughEnabledFromEnv(null));
+    try testing.expect(writeThroughEnabledFromEnv(""));
+    try testing.expect(writeThroughEnabledFromEnv("1"));
+    try testing.expect(writeThroughEnabledFromEnv("true"));
+    try testing.expect(!writeThroughEnabledFromEnv("0"));
+
+    // Scan: the gate reads it, and nothing ELSE does — the switch must not
+    // reach the end-of-request commit (`flushPendingDisk`), the spill, or the
+    // disk tier at all. OFF means "persist after the response", never "do not
+    // persist": an entry still leaves RAM only behind a durable copy.
+    const whole = @embedFile("scheduler.zig");
+    const source = whole[0 .. std.mem.indexOf(u8, whole, "test \"SSD-first behaviour is gated") orelse whole.len];
+    const gs = std.mem.indexOf(u8, source, "fn writeThroughArmed(slot: *Slot, new_span: usize) bool {") orelse
+        return error.MissingWriteThroughGate;
+    const ge = std.mem.indexOfPos(u8, source, gs, "\n}\n") orelse return error.MissingWriteThroughGateEnd;
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source[gs..ge], "if (!writeThrough" ++ "Enabled()) {"));
+    // Two occurrences in the whole production window: the definition and that
+    // one call. A third would be a second reader of a switch whose ONLY job is
+    // to keep mechanism 3 out of the prefill.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "writeThrough" ++ "Enabled()"));
+    // The declined arm is announced ONCE, so a long run's log stays readable
+    // while still proving which arm it was.
+    try testing.expect(std.mem.indexOf(u8, source[gs..ge], "write_through_off_logged.swap(true, .monotonic)") != null);
 }
 
 test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {

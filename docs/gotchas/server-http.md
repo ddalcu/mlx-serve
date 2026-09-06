@@ -4281,3 +4281,135 @@ The general shape worth keeping: **a `?T` global whose fallback is also a legal
 production value cannot report that it was read too early.** Where the read
 order matters, publish before the call that needs it and let one helper own the
 precedence, rather than letting each caller decide what a null means.
+
+## The mid-prefill write-through is on the critical path — and 20× too small to be the fp16 loss (2026-09-06)
+
+### The claim
+
+The qwen4 ladder showed `--kv-quant off` (fp16 KV) prefill at **−6.7…−10.8%**
+against `a93e2c0` at the 2k/4k/8k/16k rungs, while the same rungs at
+`--kv-quant 8` landed **−1.4…−3.8%**. The loss scales with KV bytes, and the
+one term PR #363 adds inside the prefill window whose size is a function of the
+stored KV dtype is the SSD-first mid-prefill write-through (`generate.zig`'s
+chunk loop → `scheduler.prefillWriteThroughCb` → `DiskTier.appendCommitBounded`,
+zero occurrences at `a93e2c0`). Its log prices it in the same breath:
+
+```
+PR fp16 :  [disk-cache] persisted 1024/2013 tokens (+1 chunks, 0 ssm-cp, 24.0 MB, 6ms)
+PR kv8  :  [disk-cache] persisted 1024/2011 tokens (+1 chunks, 0 ssm-cp, 12.8 MB, 4ms)
+```
+
+24.0 KB/token vs 12.8 — exactly the dtype ratio.
+
+### What is actually on the inference thread, per chunk boundary
+
+Reading the path end to end, one boundary costs, in order, all on the sole mlx
+caller: `harvestWriteFailures` + `dropPoisonedEntries` + a `statfs`
+(`refreshDiskBudget`, SSD-first refreshes the budget before every store) + the
+supersede/extend scan; then per file `appendSlice` (lazy slices),
+`materializeContiguous` (one `mlx_contiguous` per tensor and **ONE** batched
+`mlx_eval` — a GPU sync), `encodeSafetensors` (a fresh host `alloc` plus a
+`@memcpy` of the whole payload), and `Writer.submit`; then `tokens.bin`
+(rewritten every call, tens of KB) and `writeMeta`. **Only the file write is
+off-thread.** The dominant term is the alloc+memcpy of freshly-faulted host
+pages, not the eval.
+
+### The arithmetic that acquits it
+
+The tier's own stopwatch spans everything above except the pre-`sw` harvest and
+statfs, so the logged milliseconds ARE the on-thread cost. Summing every
+mid-prefill (`N/M`, N < M) line of `logs/ab_fp16_pr.server.log` per request:
+
+| rung | write-through calls | on-thread ms | prefill wall | share of prefill | observed regression |
+|---|---|---|---|---|---|
+| 2k | 1 | 6 | 1.22 s | 0.5% | −127 ms |
+| 4k | 2 | 19 | 2.87 s | 0.7% | −230 ms |
+| 8k | 4 | 26 | 6.23 s | 0.4% | −670 ms |
+| 16k | 8 | 55 | 13.03 s | 0.4% | −875 ms |
+
+**The term is ~5% of the loss it was proposed to explain**, and the fp16-minus-kv8
+delta it contributes is 1–3 ms per call — under 0.1% of a prefill. Two further
+facts weaken the "exactly 2×" framing: the 24.0-vs-12.8 MB pair is only the KV
+chunk, and **more than half the mid-prefill bytes and ~80% of its milliseconds
+are SSM CHECKPOINT bytes** (56.3 MB at fp16 vs 49.6 at kv8 — barely dtype-scaled:
+GDN conv/ssm state does not follow `--kv-quant`), and the analyst's own caveat
+stands — the fp16 cells are n = 1–2 against an ~11% intrinsic spread.
+
+So the honest verdict is **not** "the write-through is off the critical path".
+It is on it, it is measurable, and it is far too small. Both remaining
+suspects the six same-direction cells could be hiding are outside this term.
+
+### Two of the three redesigns are unsafe, and the reason is the loop order
+
+- **"Move the host read behind the chunk's own eval"** (append the staging
+  copies to the chunk's eval vector): the write-through must run AFTER
+  `try mlx.checkError()` consumed the chunk's latch. Metal at the working-set
+  edge returns ZEROS before it aborts, so staging before the latch check
+  publishes garbage as a durable, indexed, restorable prefix that later requests
+  restore FROM, permanently. That is exactly defect B0b, and `generate.zig`'s
+  loop-order scan pins `clear → check → wt`.
+- **"Hand the writer a lazily-evaluated snapshot"**: mlx arrays are
+  inference-thread-owned; the writer would have to free them. Mechanism 2's one
+  invariant is that only BYTES cross the boundary.
+- **"Coalesce to a byte bound instead of every chunk"** is safe but buys only
+  the fixed per-call overhead (statfs, scans, `tokens.bin`), which the table
+  above shows is not where the time is — and it coarsens the durability
+  granularity the mechanism exists for.
+
+### What DID move: the checkpoint file was never routed through the writer
+
+`DiskTier.writeSsmFile` called `mlx_save_safetensors` — a whole **synchronous
+filesystem write** — while mechanism 4 deliberately writes a checkpoint
+"beside the chunk that closes its position, outside the byte budget", i.e.
+inside the prefill chunk loop. So the single largest on-thread term of the
+write-through was the one file mechanism 2 never covered: on the deployed pack
+a boundary that adds a checkpoint logs 9–17 ms against 2–6 ms for one that does
+not. It now stages exactly like a KV chunk (`serializeSafetensors` → `submit`),
+so the on-thread cost drops to the readback the design already accepts.
+
+Three things had to come with it:
+
+1. **The encoder learned `__metadata__`.** `loadSsmFile` REFUSES a file without
+   `layers` / `init` (and reads `qsa_ratio`), so the hand-rolled
+   `encodeSafetensors` now takes `[]const MetaPair` and emits them. It
+   REFUSES a value that would need JSON escaping rather than writing a header
+   `mlx_load_safetensors` cannot read back — a silently-broken checkpoint reads
+   as corruption a whole session later.
+2. **Borrowed handles are retained.** The staged list OWNS what it holds
+   (`freeNamed`, and `materializeContiguous` frees what it replaces), so a
+   checkpoint's `conv_state`/`aux_state` goes in through `mlx_array_set`.
+   Without it the staging frees the live checkpoint's state out from under the
+   entry that still owns it.
+3. **`deleteSsmFile` fences the queue first.** A staged file may still be
+   queued when retention drops its position; delete-then-write recreates a file
+   no index names — bytes the tier can never bill, spill or free.
+
+Durability is unchanged: the FIFO still lands `meta.json` last (it is submitted
+after every chunk AND the checkpoint), the restore side already drains the
+entry (`restoreIntoHybrid` → `drainEntry`), `bytesFreedByRemoving` already
+fences the whole directory, and a lost blob is still attributed by PATH
+(`entryIdFromPath` reads `e<id>/`, whatever the filename).
+
+### The lever, and why it is one
+
+`MLX_SERVE_SSD_WRITE_THROUGH=0` takes mechanism 3 out of the prefill chunk
+loop; the end-of-request commit then persists the whole turn, as every
+non-SSD-first arch already does. A genuine two-arm tradeoff (a killed prefill
+loses its chunk-aligned progress, in exchange for the staging leaving this
+turn's TTFT) and the only way to A/B the mechanism against an otherwise
+identical binary — which the project's own bench rule demands, with the arm
+provable from its log either way: `persisted N/M` lines inside a prefill, or
+the one-shot `prefill write-through disabled` line. `A/B: ab_fp16_wt.sh`.
+
+### The rule
+
+**A term that is ON the critical path is not thereby the regression.** Price it
+against the wall clock it is accused of before redesigning it: the tier already
+logged its own milliseconds, and one column of arithmetic separated a 0.4%
+term from a 7% loss.
+
+### Blast-radius ledger row
+
+| # | site | reach off qwen4 | class | why |
+|---|---|---|---|---|
+| 18 | `kv_disk_cache.writeSsmFile` staged arm + `encodeSafetensors` metadata + `deleteSsmFile` fence; `scheduler.writeThroughEnabled` | none | **D — unreachable, guard verified** | every new arm is behind `if (self.writer)`, and `DiskTier.writer` is armed at exactly one production site (`scheduler.zig`, inside `if (entry.prefix_cache.?.ssd_first)`, itself `prefix_cache.ssdFirstActive` = qwen4_exp + env + a live tier). A tier with no writer takes the unchanged `mlx_save_safetensors` arm byte for byte. The lever gates only `writeThroughArmed`, which already returns false on `!hc.ssd_first` |

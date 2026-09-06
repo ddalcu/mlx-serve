@@ -1393,7 +1393,7 @@ pub const DiskTier = struct {
         // Shares the per-flush byte budget with the chunk writes above.
         const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
-        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_len, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes) catch |err| {
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_len, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s) catch |err| {
             chunk_sizes.deinit(self.allocator);
             return err;
         };
@@ -1590,7 +1590,7 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_rel);
         const e = &self.entries.items[idx];
         var written_bytes: u64 = 0;
-        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes);
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s);
         errdefer ssm_res.deinit(self.allocator);
 
         // Captured BEFORE the sidecar write overwrites it: this path bills a
@@ -1970,7 +1970,7 @@ pub const DiskTier = struct {
         if (self.writer) |w| {
             // Mechanism 2: the readback stays here (mlx arrays are
             // inference-thread-owned); only BYTES cross to the writer.
-            const bytes = self.serializeSafetensors(list.items, s) catch |err| {
+            const bytes = self.serializeSafetensors(list.items, no_meta, s) catch |err| {
                 self.allocator.free(path);
                 return err;
             };
@@ -2064,23 +2064,47 @@ pub const DiskTier = struct {
     /// results are VIEWS, and a raw data-pointer read must prove row-major
     /// contiguity before it can be trusted) — with ONE batched eval for the
     /// whole chunk, in `materializeContiguous`.
-    fn serializeSafetensors(self: *DiskTier, tensors: []NamedTensor, s: mlx.mlx_stream) ![]u8 {
+    fn serializeSafetensors(self: *DiskTier, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) ![]u8 {
         try materializeContiguous(tensors, s);
-        return self.encodeSafetensors(tensors);
+        return self.encodeSafetensors(tensors, meta);
+    }
+
+    /// One `__metadata__` entry of a staged safetensors header. The only
+    /// values this tier writes are counts, an index list and a ratio, so the
+    /// encoder REFUSES anything needing JSON escaping rather than emitting a
+    /// header `mlx_load_safetensors` cannot read back.
+    pub const MetaPair = struct { key: []const u8, value: []const u8 };
+
+    /// No `__metadata__` at all — the KV chunk files' form.
+    const no_meta: []const MetaPair = &[_]MetaPair{};
+
+    /// Is `v` safe to place inside a JSON string with no escaping? Printable
+    /// ASCII minus the two characters that would need it.
+    fn plainJsonAscii(v: []const u8) bool {
+        for (v) |c| {
+            if (c < 0x20 or c > 0x7e or c == '"' or c == '\\') return false;
+        }
+        return true;
     }
 
     /// Header + payload encode over an ALREADY-materialized tensor list.
     /// Touches no stream and evaluates nothing: the byte image is a function
     /// of the tensors' names, dtypes, shapes and buffers alone, which is what
     /// makes the eval STRATEGY (batched vs per-tensor) byte-invisible.
-    fn encodeSafetensors(self: *DiskTier, tensors: []const NamedTensor) ![]u8 {
+    fn encodeSafetensors(self: *DiskTier, tensors: []const NamedTensor, meta: []const MetaPair) ![]u8 {
         var data_len: u64 = 0;
         for (tensors) |*t| data_len += nbytesOf(t.arr);
 
         var header = std.ArrayList(u8).empty;
         defer header.deinit(self.allocator);
         const hw = &header;
-        try hw.appendSlice(self.allocator, "{\"__metadata__\":{}");
+        try hw.appendSlice(self.allocator, "{\"__metadata__\":{");
+        for (meta, 0..) |m, mi| {
+            if (!plainJsonAscii(m.key) or !plainJsonAscii(m.value)) return error.DiskCacheBadMetadata;
+            if (mi > 0) try hw.appendSlice(self.allocator, ",");
+            try hw.print(self.allocator, "\"{s}\":\"{s}\"", .{ m.key, m.value });
+        }
+        try hw.appendSlice(self.allocator, "}");
         var off: u64 = 0;
         for (tensors) |*t| {
             const nb = nbytesOf(t.arr);
@@ -2187,6 +2211,7 @@ pub const DiskTier = struct {
         old_bytes: []const u64,
         cps_opt: ?[]const transformer_mod.SSMCheckpoint,
         written_bytes: *u64,
+        s: mlx.mlx_stream,
     ) !SsmPersistResult {
         const cps: []const transformer_mod.SSMCheckpoint = cps_opt orelse &[_]transformer_mod.SSMCheckpoint{};
         if (cps.len == 0 and old_positions.len == 0) {
@@ -2227,7 +2252,7 @@ pub const DiskTier = struct {
                 complete = false;
                 continue; // budget exhausted — persist on a later flush
             }
-            const sz = try self.writeSsmFile(dir_rel, cp);
+            const sz = try self.writeSsmFile(dir_rel, cp, s);
             written_bytes.* += sz;
             try pairs.append(self.allocator, .{ .pos = p, .bytes = sz });
         }
@@ -2247,19 +2272,40 @@ pub const DiskTier = struct {
         return .{ .positions = positions, .bytes = bytes, .complete = complete };
     }
 
-    /// Write one SSM checkpoint as `s{pos:0>7}.safetensors`. Per-layer tensors
-    /// keyed "l{i}.conv"/"l{i}.ssm" (absent = null state); the `initialized`
-    /// bitmap rides the safetensors metadata map because `initialized=true`
-    /// with both states null is a valid shape. Returns the file size.
-    fn writeSsmFile(self: *DiskTier, dir_rel: []const u8, cp: *const transformer_mod.SSMCheckpoint) !u64 {
-        const tensor_map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-        const meta_map = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    /// Write — or, under SSD-first, STAGE — one SSM checkpoint as
+    /// `s{pos:0>7}.safetensors`. Per-layer tensors keyed "l{i}.conv"/"l{i}.ssm"
+    /// (absent = null state); the `initialized` bitmap rides the safetensors
+    /// metadata map because `initialized=true` with both states null is a
+    /// valid shape. Returns the file's byte size — the staged arm knows it
+    /// exactly, so no post-write stat.
+    ///
+    /// The staged arm is why this collects into a `NamedTensor` list instead
+    /// of straight into an mlx map. Mechanism 4 writes a checkpoint beside the
+    /// chunk that closes its position — i.e. INSIDE the prefill chunk loop, on
+    /// the inference thread — and `mlx_save_safetensors` there is a whole
+    /// SYNCHRONOUS filesystem write. On qwen4_exp that is ~56 MB per
+    /// checkpoint against the KV chunk's 24 MB, and it is the largest single
+    /// term of the mid-prefill write-through (8-15 ms of its 9-17 ms).
+    /// Mechanism 2's split applies to it unchanged: the readback stays on this
+    /// thread (mlx arrays are inference-thread-owned), only BYTES cross to the
+    /// writer, and the FIFO still lands this file before the `meta.json` that
+    /// indexes it — the restore side already drains the entry first
+    /// (`restoreIntoHybrid` -> `drainEntry`), so a checkpoint is never read
+    /// back before it lands.
+    fn writeSsmFile(
+        self: *DiskTier,
+        dir_rel: []const u8,
+        cp: *const transformer_mod.SSMCheckpoint,
+        s: mlx.mlx_stream,
+    ) !u64 {
+        var list = std.ArrayList(NamedTensor).empty;
+        defer self.freeNamed(&list);
+        var meta = std.ArrayList(MetaPair).empty;
+        defer meta.deinit(self.allocator);
 
         var lc_buf: [24]u8 = undefined;
         const lc = try std.fmt.bufPrint(&lc_buf, "{d}\x00", .{cp.layers.len});
-        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "layers", @ptrCast(lc.ptr)));
+        try meta.append(self.allocator, .{ .key = "layers", .value = lc[0 .. lc.len - 1] });
 
         var init_buf = std.ArrayList(u8).empty;
         defer init_buf.deinit(self.allocator);
@@ -2270,8 +2316,11 @@ pub const DiskTier = struct {
             const ns = std.fmt.bufPrint(&num_buf, "{d}", .{li}) catch unreachable;
             try init_buf.appendSlice(self.allocator, ns);
         }
+        const init_len = init_buf.items.len;
         try init_buf.append(self.allocator, 0); // NUL-terminate for the C API
-        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "init", @ptrCast(init_buf.items.ptr)));
+        // Taken AFTER the last append: an earlier slice would dangle across
+        // the `ArrayList` growth that NUL-termination can trigger.
+        try meta.append(self.allocator, .{ .key = "init", .value = init_buf.items[0..init_len] });
 
         // qwen4_exp aux state rides the same file: `l{d}.aux` / `l{d}.pooled`
         // tensors and `l{d}.ple` = uint32 [9] (valid flag, then the 8 token
@@ -2283,28 +2332,65 @@ pub const DiskTier = struct {
             const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
             inline for (names, arrs) |name, arr| {
                 if (arr.ctx != null) {
-                    const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name ++ "\x00", .{li});
-                    defer self.allocator.free(key);
-                    try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), arr));
+                    const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name, .{li});
+                    errdefer self.allocator.free(key);
+                    // The list OWNS every handle it holds (`freeNamed` frees
+                    // them, `materializeContiguous` frees what it replaces), so
+                    // a BORROWED checkpoint handle is retained first. Without
+                    // the retain the staged path frees the live checkpoint's
+                    // state out from under the entry that still owns it.
+                    var owned = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(owned);
+                    try mlx.check(mlx.mlx_array_set(&owned, arr));
+                    try list.append(self.allocator, .{ .key = key, .arr = owned });
                 }
             }
             if (l.ple_prev_valid) {
                 var ple: [9]u32 = undefined;
                 ple[0] = 1;
                 for (l.ple_prev, 0..) |t, i| ple[1 + i] = t;
+                // `mlx_array_new_data` COPIES shape-worth of bytes, so `ple`
+                // may die at the end of this block.
                 const ple_arr = mlx.mlx_array_new_data(&ple, &[_]c_int{9}, 1, .uint32);
-                defer _ = mlx.mlx_array_free(ple_arr);
-                const key = try std.fmt.allocPrint(self.allocator, "l{d}.ple\x00", .{li});
-                defer self.allocator.free(key);
-                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), ple_arr));
+                errdefer _ = mlx.mlx_array_free(ple_arr);
+                const key = try std.fmt.allocPrint(self.allocator, "l{d}.ple", .{li});
+                errdefer self.allocator.free(key);
+                try list.append(self.allocator, .{ .key = key, .arr = ple_arr });
             }
             if (!ratio_written and (l.aux_state.ctx != null or l.qsa_pooled.ctx != null)) {
                 const rs = try std.fmt.bufPrint(&ratio_buf, "{d}\x00", .{l.qsa_ratio});
-                try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "qsa_ratio", @ptrCast(rs.ptr)));
+                try meta.append(self.allocator, .{ .key = "qsa_ratio", .value = rs[0 .. rs.len - 1] });
                 ratio_written = true;
             }
         }
 
+        if (self.writer) |w| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
+            const bytes = self.serializeSafetensors(list.items, meta.items, s) catch |err| {
+                self.allocator.free(path);
+                return err;
+            };
+            const n = bytes.len;
+            w.submit(path, bytes); // takes both buffers
+            return n;
+        }
+
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        for (meta.items) |m| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
+            defer self.allocator.free(kz);
+            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
+            defer self.allocator.free(vz);
+            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
+        }
+        for (list.items) |*t| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
+            defer self.allocator.free(kz);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(kz.ptr), t.arr));
+        }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors\x00", .{ dir_rel, cp.pos });
         defer self.allocator.free(path);
         try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
@@ -2314,6 +2400,12 @@ pub const DiskTier = struct {
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
         defer self.allocator.free(path);
+        // Retention drops this position — but a checkpoint is STAGED now, so
+        // the file may still be sitting in the writer's queue. Deleting first
+        // and letting the write land afterwards recreates a file no index
+        // names: bytes the tier can never bill, spill or free. `fence` is a
+        // prefix match, and a full path is its own prefix.
+        if (self.writer) |w| w.fence(path);
         std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
     }
 
@@ -4487,6 +4579,229 @@ test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
     }
 }
 
+test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem write on the inference thread" {
+    // Mechanism 4 writes a checkpoint beside the chunk that closes its
+    // position, i.e. INSIDE the prefill chunk loop on the sole mlx caller, and
+    // it did so with `mlx_save_safetensors` — a whole synchronous filesystem
+    // write. On qwen4_exp that file is ~56 MB against the KV chunk's 24 MB and
+    // it is the LARGEST single term of the mid-prefill write-through (the
+    // measured `[disk-cache] persisted ...` lines price a boundary that adds a
+    // checkpoint at 9-17 ms against 2-6 ms for one that does not). Mechanism 2
+    // already says the file write belongs to the writer thread; the checkpoint
+    // was simply never routed through it.
+    //
+    // Bars, all timing-free:
+    //   * the commit RETURNS with the checkpoint still staged (nothing on disk);
+    //   * it is staged BEFORE the `meta.json` that indexes it, so the FIFO
+    //     lands it first and a kill mid-flush can never leave an index naming
+    //     a checkpoint that is not there;
+    //   * the staged bytes are a real safetensors image: a FRESH tier scans
+    //     the entry and hybrid-restores every part of the checkpoint,
+    //     `__metadata__` included (layers / init / qsa_ratio) — the hand-rolled
+    //     encoder has to reproduce what `mlx_save_safetensors` wrote.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32); // >= MIN_PERSIST_TOKENS
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // A checkpoint with every optional part qwen4_exp carries: GDN conv/ssm
+    // state, the QSA key history + pooled block keys, and the PLE token
+    // window (the one uint32 tensor, and the `qsa_ratio` metadata key).
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    const aux_shape = [_]c_int{ 1, 12, 4 };
+    const pooled_shape = [_]c_int{ 1, 3, 4 };
+    src128[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src128[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src128[2].qsa_ratio = 4;
+    src128[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
+    src128[1].ple_prev_valid = true;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src128, s);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    // SSD-first refreshes the budget from FREE SPACE on every store, so a
+    // test that does not arm this asserts the tester's disk (item 1).
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+    tier.writer.?.setPaused(true);
+    // A failed assertion below must not hang the SUITE: teardown drains, and
+    // a drain against a paused writer waits forever.
+    defer tier.writer.?.setPaused(false);
+
+    try testing.expectEqual(
+        PersistOutcome.persisted,
+        try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s),
+    );
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(@as(u32, 128), tier.entries.items[0].ssm_positions[0]);
+
+    // Bar 1: the checkpoint file is NOT on disk — the commit returned without
+    // writing it. (Red before the fix: `mlx_save_safetensors` had already put
+    // it there, on this thread, whatever the writer was doing.)
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{}),
+    );
+    try testing.expectEqual(@as(u64, 0), tier.writer.?.filesWritten());
+    // ...and its recorded size is the staged image's exact length, not a stat.
+    try testing.expect(tier.entries.items[0].ssm_bytes[0] > 0);
+
+    // Bar 2: staged BEFORE meta.json, which the FIFO therefore lands last.
+    var paths = std.ArrayList([]const u8).empty;
+    defer {
+        for (paths.items) |pp| testing.allocator.free(pp);
+        paths.deinit(testing.allocator);
+    }
+    try tier.writer.?.stagedPaths(&paths, testing.allocator);
+    const cp_at = for (paths.items, 0..) |pp, i| {
+        if (std.mem.endsWith(u8, pp, "/s0000128.safetensors")) break i;
+    } else return error.CheckpointNotStaged;
+    const meta_at = for (paths.items, 0..) |pp, i| {
+        if (std.mem.endsWith(u8, pp, "/meta.json")) break i;
+    } else return error.MetaNotStaged;
+    try testing.expect(cp_at < meta_at);
+
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    const st = try tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{});
+    try testing.expectEqual(tier.entries.items[0].ssm_bytes[0], st.size);
+
+    // Bar 3: a FRESH tier reads the hand-rolled image back — tensors AND the
+    // `__metadata__` the loader demands (`layers` gates the layer count,
+    // `init` the initialized bitmap, `qsa_ratio` the compress ratio).
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 500.0), ssmArrVal(dst[0].ssm_state, 0, s));
+    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
+    try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
+    try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
+    // The KV rode the same commit and still restores.
+    try testing.expectEqual(
+        try cacheValueAt(&cache, 0, 127, 3, s),
+        try cacheValueAt(&cache2, 0, 127, 3, s),
+    );
+}
+
+test "scan: an SSM checkpoint file never reaches the filesystem from the inference thread" {
+    // Class guard for mechanism 2's rule — "the inference thread keeps the
+    // device→host readback and hands ONE writer thread a plain host byte
+    // buffer per file". A round-trip test cannot see a regression here: a
+    // synchronous `mlx_save_safetensors` produces the same bytes at the same
+    // path, just on the wrong thread and inside TTFT. So the SHAPE is pinned:
+    // whenever a writer is armed the checkpoint is staged, and the
+    // synchronous save is only reachable BELOW that arm (the legacy tier,
+    // which has no writer at all). Needles split — this scan sits in the same
+    // file it reads.
+    const source = @embedFile("kv_disk_cache.zig");
+    const fs = std.mem.indexOf(u8, source, "fn writeSsmFile(") orelse return error.MissingSsmWriter;
+    const fe = std.mem.indexOfPos(u8, source, fs, "\n    }\n") orelse return error.MissingSsmWriterEnd;
+    const body = source[fs..fe];
+    const staged = std.mem.indexOf(u8, body, "if (self.writer) |w| {") orelse return error.SsmNotStaged;
+    const submit = std.mem.indexOfPos(u8, body, staged, "w.submit(path, bytes)") orelse return error.SsmNotSubmitted;
+    const save = std.mem.indexOf(u8, body, "mlx_save" ++ "_safetensors(") orelse return error.MissingLegacyArm;
+    try testing.expect(submit < save); // the staged arm returns before it
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "mlx_save" ++ "_safetensors("));
+    // The staged arm goes through the shared encoder, so the chunk file and
+    // the checkpoint file cannot drift apart in format or in eval strategy.
+    try testing.expect(std.mem.indexOf(u8, body, "self.serialize" ++ "Safetensors(list.items, meta.items, s)") != null);
+    // A staged file may still be QUEUED when retention drops its position, so
+    // the delete fences the queue first — otherwise the write lands after the
+    // delete and leaves bytes no index names.
+    const ds = std.mem.indexOf(u8, source, "fn deleteSsmFile(") orelse return error.MissingSsmDelete;
+    const de = std.mem.indexOfPos(u8, source, ds, "\n    }\n") orelse return error.MissingSsmDeleteEnd;
+    const del = source[ds..de];
+    const fence_at = std.mem.indexOf(u8, del, "w.fence(path)") orelse return error.SsmDeleteNotFenced;
+    const unlink_at = std.mem.indexOf(u8, del, "deleteFileAbsolute").?;
+    try testing.expect(fence_at < unlink_at);
+}
+
+test "DiskTier: the staged encoder carries __metadata__, and refuses a value it cannot escape" {
+    // The checkpoint's `layers` / `init` / `qsa_ratio` keys are the reason the
+    // staged path needs metadata at all: `loadSsmFile` REFUSES a file without
+    // them (`error.DiskCacheCorruptSsm`). The encoder writes JSON by hand, so
+    // the two bars are that mlx reads the header back and that a value which
+    // would need escaping is refused rather than emitted.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-meta", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 128, 8, 0.0, .float32);
+
+    var list = std.ArrayList(DiskTier.NamedTensor).empty;
+    defer tier.freeNamed(&list);
+    try tier.appendSlice(&list, 0, "k", cache.entries[0].keys, 0, 128, s);
+
+    const meta = [_]DiskTier.MetaPair{
+        .{ .key = "layers", .value = "3" },
+        .{ .key = "init", .value = "0,1,2" },
+        .{ .key = "qsa_ratio", .value = "4" },
+    };
+    const bytes = try tier.serializeSafetensors(list.items, &meta, s);
+    defer testing.allocator.free(bytes);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "meta-probe.safetensors", .data = bytes });
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/meta-probe.safetensors\x00", .{base});
+    defer testing.allocator.free(path);
+
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var tensor_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+    inline for (.{ .{ "layers", "3" }, .{ "init", "0,1,2" }, .{ "qsa_ratio", "4" } }) |kv| {
+        var got: [*:0]const u8 = undefined;
+        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_string_get(&got, meta_map, kv[0]));
+        try testing.expectEqualStrings(kv[1], std.mem.span(got));
+    }
+    // The tensor rode along: metadata must not displace the data section.
+    var back = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(back);
+    try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&back, tensor_map, "l0.k"));
+
+    // Refusal: a value with a quote would produce a header mlx cannot parse,
+    // and a silently-broken checkpoint file reads as corruption a whole
+    // session later.
+    const bad = [_]DiskTier.MetaPair{.{ .key = "init", .value = "0\",\"x" }};
+    try testing.expectError(error.DiskCacheBadMetadata, tier.encodeSafetensors(list.items, &bad));
+}
+
 test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
     // Mechanism 2, both bars in one hermetic arm:
     //  * the inference thread does the READBACK and returns — it never waits
@@ -5052,7 +5367,7 @@ test "DiskTier: the staged serializer evals ONCE per chunk, byte-identically to 
 
     // Bar 1: one batched eval for the whole list, however many tensors it holds.
     const before = serialize_eval_count.load(.monotonic);
-    const got = try tier.serializeSafetensors(a.items, s);
+    const got = try tier.serializeSafetensors(a.items, DiskTier.no_meta, s);
     defer testing.allocator.free(got);
     try testing.expectEqual(@as(u64, 1), serialize_eval_count.load(.monotonic) - before);
 
@@ -5060,7 +5375,7 @@ test "DiskTier: the staged serializer evals ONCE per chunk, byte-identically to 
     // yields the SAME image. The encode itself evals nothing.
     try materializeLegacyPerTensorForTest(b.items, s);
     const mid = serialize_eval_count.load(.monotonic);
-    const want = try tier.encodeSafetensors(b.items);
+    const want = try tier.encodeSafetensors(b.items, DiskTier.no_meta);
     defer testing.allocator.free(want);
     try testing.expectEqual(mid, serialize_eval_count.load(.monotonic));
     try testing.expect(got.len > 4096);
