@@ -44574,6 +44574,206 @@ fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     return active;
 }
 
+// ── Handle-ownership class scans (PR #363 ledger 23) ────────────────────────
+//
+// #353 changed what an MLX failure COSTS: mlx-c's default handler called
+// `exit(-1)`, so every `try` below a handle was dead code. `installErrorHandler`
+// turned all of them into live unwinds, and the ownership bugs that had been
+// unreachable since the day they were written became reachable on the hottest
+// decode arms in the tree. These scans pin the two shapes that are not merely
+// leaks but DOUBLE FREES — a leak costs memory, a double free costs the
+// process, and the byte-based oracle below cannot see either one when the
+// handle is a view that never materialized a buffer.
+//
+// Indentation is the scope proxy, not brace counting: `zig fmt` makes it exact
+// and it is immune to the Metal kernel source literals in this file, which are
+// full of braces.
+const HandleScan = struct {
+    const Live = struct { ident: []const u8, indent: usize, line: usize };
+
+    fn indentOf(line: []const u8) usize {
+        var i: usize = 0;
+        while (i < line.len and line[i] == ' ') i += 1;
+        return i;
+    }
+
+    /// The identifier inside the first `mlx_array_free(...)` on the line.
+    fn freeArg(line: []const u8) ?[]const u8 {
+        const needle = "mlx_array" ++ "_free(";
+        const p = std.mem.indexOf(u8, line, needle) orelse return null;
+        const rest = line[p + needle.len ..];
+        const e = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        const arg = std.mem.trim(u8, rest[0..e], " ");
+        if (arg.len == 0) return null;
+        for (arg) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.' and c != '[' and c != ']') return null;
+        }
+        return arg;
+    }
+
+    /// Does `line` assign `ident` (`x = …` or `x.ctx = …`)?
+    fn assigns(line: []const u8, ident: []const u8) bool {
+        if (!std.mem.startsWith(u8, line, ident)) return false;
+        const rest = std.mem.trimStart(u8, line[ident.len..], " ");
+        if (std.mem.startsWith(u8, rest, "= ")) return true;
+        if (std.mem.startsWith(u8, rest, ".ctx")) {
+            return std.mem.indexOfScalar(u8, rest, '=') != null;
+        }
+        return false;
+    }
+
+    fn split(allocator: std.mem.Allocator, src: []const u8) !std.ArrayList([]const u8) {
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |l| try out.append(allocator, l);
+        return out;
+    }
+};
+
+test "no scope arms an errdefer AND a defer over the same mlx handle" {
+    // `takeContig` did exactly this: `errdefer free(view)`, then the take, then
+    // `defer free(view)` — both in the function scope. On the first failure of
+    // the `mlx_contiguous` below them, the defer freed `view` and the errdefer
+    // freed it again. It runs 12x per full-attention layer per forward through
+    // `qsaDecodeGatherAttn` / `qsaVerifyGatherAttn`, i.e. on every decode round
+    // of a long qwen4_exp request.
+    //
+    // An errdefer in an INNER scope is not the bug: Zig cancels it when that
+    // block exits normally, so the `qkv_ane` / `z_ane` pair in the ANE prefill
+    // arm (errdefer inside `if (ok) {}`, defer in the enclosing block) is
+    // correct and the indentation rule below acquits it.
+    //
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan.
+    const allocator = testing.allocator;
+    const files = [_][]const u8{ @embedFile("transformer.zig"), @embedFile("generate.zig") };
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    var violations: usize = 0;
+    var armed: usize = 0;
+    for (files) |src| {
+        var lines = try HandleScan.split(allocator, src);
+        defer lines.deinit(allocator);
+
+        var live: [64]HandleScan.Live = undefined;
+        var n_live: usize = 0;
+        for (lines.items, 1..) |raw, lineno| {
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (t.len == 0) continue;
+            const ind = HandleScan.indentOf(raw);
+            // A line at indent `ind` closes every scope deeper than it.
+            var k: usize = 0;
+            var w: usize = 0;
+            while (k < n_live) : (k += 1) {
+                if (live[k].indent <= ind) {
+                    live[w] = live[k];
+                    w += 1;
+                }
+            }
+            n_live = w;
+            if (std.mem.startsWith(u8, t, err_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    if (n_live < live.len) {
+                        live[n_live] = .{ .ident = id, .indent = ind, .line = lineno };
+                        n_live += 1;
+                        armed += 1;
+                    }
+                }
+            } else if (std.mem.startsWith(u8, t, def_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    for (live[0..n_live]) |e| {
+                        if (std.mem.eql(u8, e.ident, id)) {
+                            std.debug.print("[scan] double-free pair: errdefer line {d} + defer line {d} both free `{s}`\n", .{ e.line, lineno, id });
+                            violations += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The scan must have SEEN the shape it polices, or it is asserting nothing.
+    try testing.expect(armed > 50);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
+test "a bare free of a handle whose errdefer is still armed surrenders it before the next fallible call" {
+    // The other half of the same class, and the one a `defer`-vs-`errdefer`
+    // scan cannot see: `forwardQwen4With` freed `h` at the hyper-connection
+    // mixer and then called the fallible `lmHeadProject`, with the
+    // function-scope errdefer still reading `h` at unwind time — a double free
+    // over the 248,320-wide head, the single allocation most likely to trip
+    // the error latch. `buildFusedQkv`'s concat helper had the same shape.
+    //
+    // The rule: past a bare free of an errdefer-armed handle, either the very
+    // next statement re-binds the handle (`x = …`, `x.ctx = …`) or no fallible
+    // call may run before that errdefer's scope closes.
+    const allocator = testing.allocator;
+    const files = [_][]const u8{ @embedFile("transformer.zig"), @embedFile("generate.zig") };
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    const free_stmt = "_ = mlx.mlx_array" ++ "_free(";
+    const try_kw = "tr" ++ "y ";
+    var violations: usize = 0;
+    var checked: usize = 0;
+    for (files) |src| {
+        var lines = try HandleScan.split(allocator, src);
+        defer lines.deinit(allocator);
+
+        var live: [64]HandleScan.Live = undefined;
+        var n_live: usize = 0;
+        for (lines.items, 0..) |raw, idx| {
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (t.len == 0) continue;
+            const ind = HandleScan.indentOf(raw);
+            var k: usize = 0;
+            var w: usize = 0;
+            while (k < n_live) : (k += 1) {
+                if (live[k].indent <= ind) {
+                    live[w] = live[k];
+                    w += 1;
+                }
+            }
+            n_live = w;
+            if (std.mem.startsWith(u8, t, err_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    if (n_live < live.len) {
+                        live[n_live] = .{ .ident = id, .indent = ind, .line = idx + 1 };
+                        n_live += 1;
+                    }
+                }
+                continue;
+            }
+            if (std.mem.startsWith(u8, t, def_kw)) continue;
+            if (!std.mem.startsWith(u8, t, free_stmt)) continue;
+            const id = HandleScan.freeArg(t) orelse continue;
+            var arm_indent: ?usize = null;
+            for (live[0..n_live]) |e| {
+                if (std.mem.eql(u8, e.ident, id)) arm_indent = e.indent;
+            }
+            const e_ind = arm_indent orelse continue;
+            checked += 1;
+            // Next non-blank statement re-binds it?
+            var j = idx + 1;
+            while (j < lines.items.len and std.mem.trim(u8, lines.items[j], " \t\r").len == 0) j += 1;
+            if (j < lines.items.len and HandleScan.assigns(std.mem.trim(u8, lines.items[j], " \t\r"), id)) continue;
+            // Else: no fallible call may run while that errdefer is still armed.
+            while (j < lines.items.len) : (j += 1) {
+                const l2 = lines.items[j];
+                const t2 = std.mem.trim(u8, l2, " \t\r");
+                if (t2.len == 0) continue;
+                if (HandleScan.indentOf(l2) < e_ind) break; // errdefer scope closed
+                if (std.mem.startsWith(u8, t2, try_kw) or std.mem.indexOf(u8, t2, " " ++ try_kw) != null) {
+                    std.debug.print("[scan] dangling errdefer: line {d} frees `{s}`, line {d} can still throw under it\n", .{ idx + 1, id, j + 1 });
+                    violations += 1;
+                    break;
+                }
+            }
+        }
+    }
+    try testing.expect(checked > 0);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
 test "takeContig releases `view` exactly once on every faulted op (CPU stream, no GPU)" {
     // Driven with the fault injector at `mlx.check`: `arm(k)` fails the k-th checked call, so
     // the sweep walks every error path. On the pre-fix shape k = 2 double-frees and aborts.
