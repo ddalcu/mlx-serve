@@ -56,6 +56,13 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--max-tokens N` in SERVE mode: the default for a request that omits the
+// field (0 = flag not given → today's context-pegged sentinel). File-level for
+// the same reason as the two above — five serve paths hand-roll their own
+// ServerConfig literal, and the app always launches the headless one, so a
+// value threaded through only `main()` would be eaten everywhere it matters.
+// The offline `--prompt` cap is a separate local that keeps defaulting to 100.
+var serve_default_max_tokens: u32 = 0;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -111,7 +118,8 @@ fn printUsage(io: std.Io) void {
         \\                      inputs get a 400 naming index/count/limit, never truncation)
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
-        \\  --max-tokens <n>    Max tokens to generate (default: 100)
+        \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
+        \\                      mode, the default for requests that omit the field
         \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
         \\                      Serve: default for requests that omit `temperature`
         \\                      (otherwise the model's generation_config.json, then 1.0)
@@ -578,6 +586,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
             i += 1;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+            // …and in serve mode the same number is the OMITTED-field default
+            // for every chat surface (body > launch flag > generation_config >
+            // hardcoded). Assigned only when the flag is actually given, so a
+            // bare boot keeps the sentinel byte for byte — the offline default
+            // of 100 must never become a serve default.
+            serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
             temperature = try std.fmt.parseFloat(f32, args[i]);
@@ -1377,6 +1391,7 @@ pub fn main(init: std.process.Init) !void {
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
+            .default_max_tokens = serve_default_max_tokens,
             .default_temperature = if (temp_explicit) temperature else null,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
@@ -1795,6 +1810,7 @@ fn runGenServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -1925,6 +1941,7 @@ fn runHeadlessServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -2139,6 +2156,7 @@ fn runDs4Serve(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
@@ -2413,6 +2431,7 @@ fn runLlamaServe(
         .max_context_size = effective_ctx,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,

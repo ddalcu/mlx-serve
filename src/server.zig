@@ -480,6 +480,17 @@ pub const ServerConfig = struct {
     default_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
+    /// Default `max_tokens` for a request that OMITS the field, set by
+    /// `--max-tokens N` in serve mode. 0 = flag not given (today's behaviour:
+    /// the omitted-field sentinel, which `clampMaxTokens` resolves to the
+    /// whole remaining context). Same ladder as the sampling defaults above —
+    /// body > launch flag > model generation_config > hardcoded — and it
+    /// exists for the same reason: agent clients send nothing. `opencode`
+    /// omits `max_tokens` on every turn, and an omitted budget is a budget of
+    /// "the rest of the window", which the admission bill then reserves
+    /// capacity for. On a 786k-context model that is enough to keep a second
+    /// concurrent request out. Read through `launchMaxTokensDefault`.
+    default_max_tokens: u32 = 0,
     /// `--mtp`: force the native MTP head ON for MoE targets too. The
     /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
     /// verify-forward expert-routing caution the drafter shares), which makes
@@ -1113,7 +1124,27 @@ const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 /// return 4096 — an omitted-max_tokens client silently capped at 4096 tokens,
 /// truncating any large tool call. Same class as the 256 default it replaced.
 fn omittedMaxTokensDefault(effective_ctx: u32) u32 {
+    return omittedMaxTokensDefaultWith(effective_ctx, launchMaxTokensDefault());
+}
+
+/// The pure core of the above, with the launch default (`--max-tokens N`,
+/// 0 = unset) passed rather than read — so the "no flag is byte-identical to
+/// before the flag existed" characterization is a unit test rather than a
+/// claim. The flag outranks BOTH fallbacks: it is the operator naming how
+/// much generation an anonymous client may pre-buy, and it is the only lever
+/// there is for a client that never sends the field.
+fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32) u32 {
+    if (launch_default > 0) return launch_default;
     return if (effective_ctx > 0) std.math.maxInt(u32) / 4 else 4096;
+}
+
+/// The ONE read of `ServerConfig.default_max_tokens`. Every surface that
+/// resolves an omitted `max_tokens` comes through here, or through
+/// `omittedMaxTokensDefault`, which is built on it — a surface that read the
+/// field itself would drift the moment the resolution changed (the
+/// `runHeadlessServe` flag-eater class, one layer up). 0 = flag not given.
+pub fn launchMaxTokensDefault() u32 {
+    return server_config.default_max_tokens;
 }
 
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
@@ -1500,6 +1531,9 @@ pub fn serve(
         log.info("Reasoning budget: {d} tokens\n", .{server_config.default_reasoning_budget});
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
+    }
+    if (launchMaxTokensDefault() > 0) {
+        log.info("default max_tokens for omitted requests: {d}\n", .{launchMaxTokensDefault()});
     }
     if (server_config.default_enable_pld) {
         log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
@@ -15151,11 +15185,14 @@ fn handleAnthropicMessages(
     }
     const root = parsed.value.object;
 
-    // max_tokens is required in Anthropic API
-    const max_tokens: u32 = if (root.get("max_tokens")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => 0,
-    } else 0;
+    // max_tokens is required in the Anthropic API — but through the ONE parse
+    // helper, so a negative value is an omission here exactly as it is on the
+    // OpenAI surfaces (`@intCast` of a negative was UB in ReleaseFast) and so
+    // the `--max-tokens` launch default reaches this surface too. `0` from the
+    // helper means "absent or <= 0"; the launch default is the only thing that
+    // may stand in for it, and with no flag the 400 is unchanged.
+    const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
+    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
     if (max_tokens == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
         return;
@@ -17073,11 +17110,11 @@ fn handleResponsesInner(
     // echo `null` (vs. our internal default) in the response envelope.
     const req_max_output_tokens: ?u32 = blk: {
         const v = root.get("max_output_tokens") orelse root.get("max_tokens");
-        // <= 0 is treated as "auto" (null here → context-pegged default below).
-        break :blk if (v) |val| switch (val) {
-            .integer => |i| if (i > 0) @as(?u32, @intCast(i)) else null,
-            else => null,
-        } else null;
+        // <= 0 is treated as "auto" (null here → the omitted-field default
+        // below, which is the `--max-tokens` launch value when one was given).
+        // Through the ONE parse helper: `0` back from it means "absent or <= 0".
+        const r = resolveRequestMaxTokens(v, 0);
+        break :blk if (r > 0) r else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
@@ -19640,6 +19677,135 @@ test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positiv
     try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .string = "999" }, auto));
     // A real positive cap is honored verbatim.
     try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
+}
+
+test "--max-tokens is the omitted-field default: unset is byte-identical, set wins" {
+    const t = std.testing;
+    // The ladder the sampling defaults already document — body > launch flag >
+    // model generation_config > hardcoded — now covers max_tokens too. The
+    // launch flag is the OMITTED-field default only: a request that sends the
+    // field keeps it.
+    //
+    // Characterization first. With no flag (0 = unset) the omitted-field
+    // default is byte-for-byte what it was before the flag existed: the huge
+    // sentinel when the context is known, a finite 4096 when it is not.
+    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefaultWith(32768, 0));
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(0, 0));
+
+    // Flag set: the launch value outranks BOTH fallbacks (a known context and
+    // an unknown one), because it is the operator saying how much generation
+    // an anonymous client may pre-buy.
+    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(786_432, 65536));
+    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(0, 65536));
+
+    // The context clamp still sits on top: the flag is a budget, not a lease.
+    try t.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(omittedMaxTokensDefaultWith(32768, 65536), 1500, 32768));
+
+    // A request that SENDS max_tokens is untouched by the flag, in both
+    // directions (smaller and larger than it).
+    const auto = omittedMaxTokensDefaultWith(786_432, 65536);
+    try t.expectEqual(@as(u32, 128), resolveRequestMaxTokens(.{ .integer = 128 }, auto));
+    try t.expectEqual(@as(u32, 200_000), resolveRequestMaxTokens(.{ .integer = 200_000 }, auto));
+    // …and <= 0 is still an omission, so it takes the flag.
+    try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, auto));
+
+    // The live wrapper reads the ServerConfig field through the ONE accessor.
+    // (via @field so the scan test's "exactly one reader" needle stays true).
+    const slot = &@field(server_config, "default_max_tokens");
+    const orig = slot.*;
+    defer slot.* = orig;
+    slot.* = 0;
+    try t.expectEqual(@as(u32, 0), launchMaxTokensDefault());
+    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefault(32768));
+    slot.* = 4096;
+    try t.expectEqual(@as(u32, 4096), launchMaxTokensDefault());
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(32768));
+}
+
+test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
+    const t = std.testing;
+    // The admission reservation reads the RESOLVED budget, so the flag reaches
+    // it for free — this is the seam that pins that it does. `opencode` sends
+    // no max_tokens at all, so every one of its turns arrives here.
+    const KVCache = transformer_mod.KVCache;
+    const ctx: u64 = 786_432;
+    const seq: u64 = 400_000; // past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+
+    // No flag: the sentinel, which `clampMaxTokens` turns into the whole
+    // remaining window — 386k tokens of generation nobody asked for. The
+    // RESERVE_GEN_HEADROOM cap is the only thing keeping that off the bill.
+    const no_flag = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 0), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, @intCast(ctx - seq)), no_flag);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, no_flag, chunk, ctx));
+
+    // Flag set BELOW the headroom: the reservation is prompt + the flag,
+    // exactly. The operator's number reaches the admission bill.
+    const flagged = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 2048), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, 2048), flagged);
+    try t.expectEqual(seq + 2048 + chunk, KVCache.reservedTokens(seq, flagged, chunk, ctx));
+    try t.expect(KVCache.reservedTokens(seq, flagged, chunk, ctx) < KVCache.reservedTokens(seq, no_flag, chunk, ctx));
+
+    // A flag ABOVE the headroom bills only the headroom: the launch default
+    // bounds the GENERATION, the headroom bounds the RESERVATION. Two
+    // different jobs, and the flag must not be read as a licence to reserve.
+    const big = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 65536), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, 65536), big);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, big, chunk, ctx));
+}
+
+test "every text surface resolves an omitted max_tokens through ONE helper" {
+    // Class guard for `--max-tokens`. Five request surfaces read a max_tokens
+    // field (/v1/chat/completions, /v1/completions, /v1/messages,
+    // /v1/responses, and Ollama's /api/*, which translates `num_predict` into
+    // an OpenAI body and rides the chat handler). A surface that parsed the
+    // field itself would silently ignore the launch flag — the same class as
+    // the hand-rolled ServerConfig literals that used to eat --pld*. Needles
+    // are split so this test's own source cannot satisfy them, and the
+    // ServerConfig field is reached below through @field for the same reason.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+
+    // The ServerConfig field has exactly ONE reader in the whole file…
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "server_config.default_max" ++ "_tokens"));
+    // …and it is the accessor.
+    try t.expect(std.mem.indexOf(u8, src, "pub fn launchMaxTokens" ++ "Default() u32 {\n    return server_config.default_max" ++ "_tokens;\n}") != null);
+    // The launch default is APPLIED in one place: the pure core.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (launch_default > 0) return launch" ++ "_default;"));
+
+    // /v1/chat/completions and /v1/completions share a spelling…
+    const openai = "resolveRequest" ++ "MaxTokens(\n        root.get(\"max_tokens\") orelse root.get(\"max_completion_tokens\"),\n        omittedMaxTokens" ++ "Default(getEffectiveContextLength(config)),\n    );";
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, openai));
+    // …/v1/responses keeps its own (it must know whether the field was SENT,
+    // to echo null in the envelope) but parses through the same helper…
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const r = resolveRequest" ++ "MaxTokens(v, 0);"));
+    // …and /v1/messages, where Anthropic REQUIRES the field, lets the launch
+    // default stand in for the 400 rather than for a sentinel.
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const req_max_tokens: u32 = resolveRequest" ++ "MaxTokens(root.get(\"max_tokens\"), 0);"));
+    // Nothing hand-rolls the parse any more (this was the Anthropic surface's
+    // shape, and its `@intCast` of a negative was UB in ReleaseFast).
+    try t.expectEqual(@as(usize, 0), std.mem.count(u8, src, "root.get(\"max_tokens\")) |v| switch (v)"));
+}
+
+test "every serve path passes the --max-tokens default (the flag-eater class)" {
+    // main.zig hand-rolls FIVE ServerConfig literals (MLX serve, media serve,
+    // headless, ds4, llama) and the app always launches the headless one — the
+    // exact shape that ate --pld/--pld-draft-len/--pld-key-len. A launch flag
+    // that reaches only `main()`'s literal is a flag that does nothing in the
+    // mode that ships. Bar: every literal handed to `serve()` names the field,
+    // and the CLI value is a FILE-LEVEL var so they can all see it.
+    const t = std.testing;
+    const m = @embedFile("main.zig");
+    const serve_calls = std.mem.count(u8, m, "server_mod.serve(io, allocator, params,");
+    try t.expectEqual(@as(usize, 5), serve_calls);
+    try t.expectEqual(serve_calls, std.mem.count(u8, m, ".default_max" ++ "_tokens = serve_default_max_tokens,"));
+    // The flag sets it (and only when actually given — a bare boot must keep
+    // the offline default of 100 out of serve mode).
+    try t.expect(std.mem.indexOf(u8, m, "var serve_default_max" ++ "_tokens: u32 = 0;") != null);
+    try t.expect(std.mem.indexOf(u8, m, "serve_default_max" ++ "_tokens = max_tokens;") != null);
+    // …and `--max-tokens` is still in the arg loop's match list (an arg loop
+    // with no else branch is a silent flag eater).
+    try t.expect(std.mem.indexOf(u8, m, "std.mem.eql(u8, args[i], \"--max-tokens\")") != null);
 }
 
 test "StreamHeartbeat: a write resets the deadline, silence expires it" {

@@ -4562,3 +4562,34 @@ transfers**: `errdefer` only up to the point the caller takes over, then
 `defer`; never both in one scope; and a bare free is a transfer, so it must
 either re-bind the handle or be the last thing that can happen under its
 `errdefer`.
+
+---
+
+## The sentinel is OURS: an omitted `max_tokens` reserves the window
+
+The client never sent a billion. `omittedMaxTokensDefault` is a SENTINEL
+(`maxInt(u32)/4`) that `clampMaxTokens` resolves to `ctx - prompt`, which is the
+right OpenAI semantics for GENERATION — and the wrong number for everything
+downstream that prices a budget, because the admission bill reserves KV for the
+budget the request resolved to. On a 786k-context model an omitted-`max_tokens`
+turn therefore books the whole remaining window (`KVCache.RESERVE_GEN_HEADROOM`
+is what caps that at 8192 rows today; nothing else does), and agent clients omit
+the field on every turn — opencode never sends it. So the only lever an operator
+has over a client that asks for nothing is a LAUNCH default:
+`--max-tokens N` in serve mode is the omitted-field default for every chat
+surface, one rung of the documented ladder (body > launch flag >
+`generation_config.json` > hardcoded), 0 = unset and byte-identical to before.
+
+**The rule.** *A default that only the server can name belongs on the launch
+line, and it is read through ONE helper.* `launchMaxTokensDefault()` is the
+single reader of `ServerConfig.default_max_tokens`; `omittedMaxTokensDefaultWith`
+is the pure core (so "no flag is unchanged" is a unit test, not a claim); all
+four JSON surfaces parse through `resolveRequestMaxTokens`, including
+`/v1/messages`, where Anthropic REQUIRES the field and the launch default stands
+in for the 400 rather than for a sentinel — and where the old hand-rolled parse
+`@intCast`ed a negative into a `u32` (UB in ReleaseFast). And the CLI value is a
+FILE-LEVEL var in main.zig: five serve paths hand-roll their own `ServerConfig`
+literal and the app always launches the headless one, which is exactly how
+`--pld*` was eaten. Guards: `every text surface resolves an omitted max_tokens
+through ONE helper`, `every serve path passes the --max-tokens default (the
+flag-eater class)`, `tests/test_headless_spec_flags.sh` [5].
