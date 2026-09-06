@@ -4014,6 +4014,27 @@ therefore boots warm off its existing table rather than re-measuring — which i
 the property that would otherwise have been a silent first-request regression
 on that pack.
 
+### Class A — round 4: the load-time bill read a width the boot never configured
+
+| # | site | reach | class | fix |
+|---|---|---|---|---|
+| 17 | `server.defaultKvBits` → every load-time bill (`prefixCacheMemForLoad` incl. BOTH the SSD-first and the RAM-first arm, `pinPrefillChunk`, `computeMemoryContext`, `aneGateHeadroom`) | every arch, every boot that passes `--kv-quant` | **A — genuine bug fix, ungated** | `defaultKvBits` asked `global_scheduler`, which `serve` assigns only AFTER `Scheduler.init` returns — and that call IS the model load, so no load-time bill ever had a scheduler to ask and all of them silently priced bf16. The boot publishes its parsed width (`configured_kv_quant`) from the same `LoadParams.kv_quant_config` the scheduler is about to adopt, and ONE helper (`configuredKvQuant`) answers for the whole process |
+
+Not gated, and deliberately so: pricing a `--kv-quant 8` session at bf16 is
+wrong on every arch, not a qwen4_exp policy. The **advertised** context moves
+with it — `computeMemoryContext` shared the one `kv_bits` local — so on a
+quantized boot this arch-independently corrects both the hot-cache budget and
+the `context_length` every agent CLI reads once per session. The direction is
+always the same (the bill shrinks, the advertised context grows or holds), so
+it cannot over-admit relative to the shipped behaviour.
+
+Measured on the deployed qwen4_exp pack at `--ctx-size 786432 --kv-quant 8`:
+the SSD-first boot line billed one session at 22,464 MB (29,952 B/tok = dense
+24,576 + `statePerTokenBilled` 5,376) and printed **the same figure with the
+flag and without it** — the tell. At 8 bits it is 13,824 MB (18,432 B/tok), so
+the budget took ~8.6 GB of idle allowance (~11 GB at 1M) for KV the cache never
+holds.
+
 ### The rule this leaves
 
 A "qwen4_exp long-context" change that touches a shared function is a
@@ -4158,3 +4179,105 @@ the same count-record-drop path a real ENOSPC takes. The bar the tests read is
 the VERDICT (`Entry.spill_durable`), not the eviction it licenses: the idle
 allowance is a HARD cap, so tier 3 sheds a non-durable entry too — deliberately,
 knowing that loses only work.
+
+## A load-time bill runs INSIDE `Scheduler.init`, so there is no scheduler to ask (2026-09-06)
+
+Deployed flags on the 69 GB qwen4_exp pack — `--ctx-size 786432 --kv-quant 8
+--prefix-cache-mem 10GB --prefix-cache-disk 100GB` — and the SSD-first boot
+line in `~/.mlx-serve/logs/mlx-serve-22222.log`:
+
+```
+[hot-cache] SSD-first budget 32704 MB = one session at the working
+context (22464 MB) + 10240 MB idle
+```
+
+The same 22,464 MB printed on a boot with `--kv-quant off`. Two runs, same
+number both ways: the flag was not reaching the bill at all.
+
+22,464 MiB / 786,432 tokens = 29,952 B/tok, which decomposes exactly: the
+DENSE KV (24,576) plus `statePerTokenBilled` (5,376). At 8 bits the same
+session is 13,056 + 5,376 = 18,432 B/tok = 13,824 MB. The budget was holding
+~8.6 GB of idle allowance (~11 GB at a 1M context) against KV the cache can
+never store, because the cache stores it at 8 bits.
+
+### The ordering that caused it
+
+`defaultKvBits` read the width off `global_scheduler`, falling back to dense
+when there is none. That fallback looks like an offline-path convenience. It is
+in fact the ONLY arm any load-time bill ever took:
+
+```
+serve():
+  sch = Scheduler.init(...)   ← the model LOAD happens in here, and with it
+                                 prefixCacheMemForLoad, pinPrefillChunk,
+                                 computeMemoryContext, aneGateHeadroom
+  global_scheduler = &sch     ← only now can anyone ask
+```
+
+Every bill that prices a session runs before the assignment. The scheduler's
+`kv_quant_config` is correct, adopted straight from `LoadParams`, and by the
+time a request can read it the bills that shaped the process are long done.
+Nothing was ever null-checked wrongly and no width was ever parsed wrongly —
+the read was simply always too early, and a `?T` fallback made "too early"
+indistinguishable from "not configured".
+
+### The rule
+
+**A load-time bill cannot ask the scheduler anything.** The boot publishes what
+the load needs BEFORE the call that loads, from the same value the scheduler is
+about to adopt, and ONE helper answers for the whole process:
+
+```zig
+configured_kv_quant = load_params.kv_quant_config;  // before Scheduler.init
+defer configured_kv_quant = null;
+
+fn configuredKvQuant() transformer_mod.KVQuantConfig {
+    if (global_scheduler) |sch| return sch.kv_quant_config;
+    return configured_kv_quant orelse transformer_mod.KVQuantConfig.dense;
+}
+```
+
+Three answers, in the order the process produces them: the scheduler's once it
+exists, the boot's published value while the load that precedes it is running,
+dense when no flag was given. The load and the requests that follow it bill one
+width by construction, and the absence of a flag is still dense — that is an
+answer, not a defect to fix.
+
+`defaultKvBits` reads it, and so do the two hand-spelled copies that remained
+(`resolveKvAttnFused`, `prefillAdmissionBill`). ONE reader of
+`sch.kv_quant_config` is left in the module, inside the helper.
+
+### Reach, and why it is not gated
+
+Both load-time arms of `prefixCacheMemForLoad` shared the one `kv_bits` local,
+so the RAM-first arm carried the identical defect and is fixed by the same
+helper. `computeMemoryContext` reads it too, so on a quantized boot the
+**advertised** `context_length` was also computed at bf16 — a number every
+agent CLI reads once per session. This is class A in the #363 ledger: a
+`--kv-quant 8` session priced at bf16 is wrong on every arch, so it ships
+ungated.
+
+### The guard
+
+Three tests, because the defect has three separable halves.
+
+1. **The deployed numbers, red-on-revert** (expected 8, found 16): 786,432
+   tokens at `--kv-quant 8` is 13,824 MB, at `off` is 22,464 MB, an unpublished
+   process is still dense, and the delta the defect took out of the idle
+   allowance is 8,640 MB.
+2. **The boot line and the floor are ONE quantity.** `ssdFirstSessionKvBytes`
+   was extracted so a test can run the boot's own arithmetic rather than a
+   retyped product; the test asserts the call site uses it and that exactly one
+   definition exists, so a later edit cannot fix the helper and leave the call
+   site spelling the product out again at whatever width was handy.
+3. **A class scan**: no load-time bill reads a width the boot did not
+   configure. It walks `prefixCacheMemForLoad`, `pinPrefillChunk`,
+   `computeMemoryContext` and `aneGateHeadroom`, requiring each to read
+   `defaultKvBits()` and to contain neither `sch.kv_quant_config` nor a
+   hand-spelled `KVQuantConfig.dense`. Needles are split so the scan's own
+   source cannot satisfy them.
+
+The general shape worth keeping: **a `?T` global whose fallback is also a legal
+production value cannot report that it was read too early.** Where the read
+order matters, publish before the call that needs it and let one helper own the
+precedence, rather than letting each caller decide what a null means.
