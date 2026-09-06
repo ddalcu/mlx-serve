@@ -5718,16 +5718,22 @@ llmprobe 4k/32k rungs, decode tok/s per boot:
 | PR gated (3 boots) | 70.5, 67.5, 76.2 | 54.2, 55.7, 55.0 |
 | PR ungated (2 boots) | 75.1, 75.1 | 52.5, 53.7 |
 
-The mechanism on the sidecar arch is the cross-request EV seed (#350, on main
-since 26.9.1 shipped, `MLX_SERVE_MTP_EV_SEED`): a short low-acceptance request
-seeds the next request's `a[m_lo]` narrow, and the arm-once schedule never
-re-widens it. Same short conformance requests, tokens per round: 26.9.1 3.57,
-main and the gated arm 1.44 (34 rounds where 26.9.1 runs 14), ungated 4.73. The
-gated PR's 4k boot B sat 57 rounds at m_lo=2 with `wt=175 tgt=3`. So main
-regresses 27B short context against 26.9.1, the gate preserves that, and the
-re-read is the fix at hand: 4k +5% vs gated, ties shipped at 32k (−1%, inside
-the per-boot swing). `schedulePeriodReread` now answers yes for every layout
-and stays a predicate so an arch can opt out with a measurement.
+Same short conformance requests, tokens per round: 26.9.1 3.57, main and the
+gated arm 1.44 (34 rounds where 26.9.1 runs 14), ungated 4.73. The gated PR's
+4k boot B sat 57 rounds at m_lo=2 with `wt=175 tgt=3`. So main regresses 27B
+short context against 26.9.1, the gate preserves that, and the re-read is the
+fix at hand: 4k +5% vs gated, ties shipped at 32k (−1%, inside the per-boot
+swing). `schedulePeriodReread` now answers yes for every layout and stays a
+predicate so an arch can opt out with a measurement.
+
+The first suspect for the narrow START was the cross-request EV seed (#350, on
+main since 26.9.1, seeds any MTP head incl. the sidecar and skips its warmup).
+Acquitted: `MLX_SERVE_MTP_EV_SEED=0` on the ungated build, 2 boots, 71.4/51.3
+at 4k/32k — no better than seed-on 75.1/53.1, and the same short requests still
+started narrow (39 rounds at 1.33 vs 26.9.1's 14 at 3.57). Whatever makes a
+sidecar head start narrow on main is still open; the re-read only guarantees it
+gets re-measured. Same-session bench.sh cells after 7 h of GPU: 26.9.1 65 mtp,
+merged tree 65.9/63.8/64.6 — the headline ties, the ladder swings per boot.
 
 **Not the cause** (checked and acquitted): the planner (`mtpRoundPlan`,
 `mtpEvPlanSrc`, `MtpCostSource`, the regime gate, `mtpWidthTrialTarget`) is

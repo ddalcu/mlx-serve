@@ -568,11 +568,11 @@ pub const TrialSchedule = struct {
 /// shipped qwen4-only (ledger row 20, "archs nobody measured"); the sidecar
 /// arch was then measured on Qwen3.8-27B/M4 Max, 2 boots per arm, 4k/32k:
 /// gated 71.4/55.0, ungated 75.1/53.1, 26.9.1 73.9/53.7, main d9e1ceb
-/// 68.6/54.8. The cross-request EV seed (#350, on main since 26.9.1) hands
-/// a short low-acceptance request's a[m_lo] to the next one, and the
-/// arm-once schedule never re-widens it: 1.44 tok/round on the same short
-/// requests 26.9.1 runs at 3.57. Kept as a predicate so a layout can opt
-/// out with a measurement, never a literal.
+/// 68.6/54.8. The arm-once schedule never re-widened a request that
+/// started narrow: 1.44 tok/round on the same short requests 26.9.1 runs
+/// at 3.57. The narrow START is main's, not the EV seed's (#350):
+/// `MLX_SERVE_MTP_EV_SEED=0` on the ungated build measured 71.4/51.3, no
+/// better. Kept as a predicate so a layout can opt out with a measurement.
 pub fn schedulePeriodReread(layout: Layout) bool {
     _ = layout;
     return true;
