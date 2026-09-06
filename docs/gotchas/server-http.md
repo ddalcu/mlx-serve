@@ -4048,6 +4048,23 @@ qwen4_exp by a WRITER that only SSD-first arms, not by an arch predicate.
 |---|---|---|---|---|
 | 19 | `kv_disk_cache.writeSsmFile` staged arm + `encodeSafetensors` metadata + `deleteSsmFile` fence; `scheduler.writeThroughEnabled` | none | **D — unreachable, guard verified** | every new arm is behind `if (self.writer)`, and `DiskTier.writer` is armed at exactly one production site (`scheduler.zig`, inside `if (entry.prefix_cache.?.ssd_first)`, itself `prefix_cache.ssdFirstActive` = qwen4_exp + env + a live tier). A tier with no writer takes the unchanged `mlx_save_safetensors` arm byte for byte. The lever gates only `writeThroughArmed`, which already returns false on `!hc.ssd_first` |
 
+### Round 6 — the M4 Max follow-ups (rows 20-22)
+
+An external tester on an M4 Max ran the branch and pushed three changes. Two
+are qwen4_exp-only by construction; the third is not, and is gated.
+
+| # | site | reach off qwen4_exp | class | gate / why not |
+|---|---|---|---|---|
+| 20 | `round_cost.TrialSchedule.force` re-reading its period every round | **every MTP arch and every DFlash/DSpark block drafter.** `TrialSchedule` has two consumers: `Generator.MtpWidthTrial` (aliased, driven from `mtpRoundPlanInner` for any model with a head, `.qwen` sidecars included) and `WidthChooser.trial` (`MLX_SERVE_DFLASH_CHOOSER=1`). Neither is arch-gated | **C — gated** | `round_cost.schedulePeriodReread(layout)` — `.long` is `layoutFor`'s qwen4_exp answer and nothing else's, so the ONE `Layout` already in hand at both call sites is the predicate. `force` takes it as an argument; `armed_at` is maintained on both arms and read only on the gated one, so the ungated schedule is a93e2c0's byte for byte. The stall reproduces on a93e2c0 (`DB1-base`: 45 rounds at w1, 72.5 tok/s), but the re-read moves WHICH rounds of a request carry a 3-4% trial block, and the 27B sidecar pack was never measured on it. Tests: `the trial-period re-read is qwen4-only; a legacy-layout schedule keeps a93e2c0's date`, `a sidecar boot's width-trial SCHEDULE is a93e2c0's too` (both run the tester's own trace shape on both arms; the second also scans the production call site for the layout argument) |
+| 21 | `qwen4_exp.NgramTable.gather`'s wide-prefill arm | **none.** The n-gram PLE table exists on no other arch: `Qwen4State` hangs off `Transformer.qwen4`, and `gather`'s only production caller is `pleGatherBf16`, reached from `forwardQwen4With` alone | **A — qwen4-only by construction** | Shipped as a KV GATE, not the opt-in the tester proposed: the pool costs 5-8% prefill on a resident table (M4 Max 13.4k 758 vs 725 tok/s; M5 Max 4k/8k/16k, 6/6 cells, fp16 and kv8) and saves 67.7 → 267.9 ms per 1000 tokens on an evicted one (M5 Max 374k ladder). A flat opt-in buys the first back by re-opening the second. `PREFILL_PREFETCH_MIN_KV` (65536, a placeholder pending the 64k/128k/256k A/B) is compared against the PRE-chunk `ctx.moe_seq_offset` — `cache.step` cannot stand in, it is 0 forever on a GDN trunk. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` moves it; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm, and absent means the gate |
+| 22 | `Generator.MTP_ADAPTIVE_MIN_KV` 8192 → 32768 | **none.** Its two readers are `serialCellWanted` (behind `mtpAdaptiveModelOk` → `xfm.qwen4_mtp != null`) and `mtpAdaptiveSerialStep` (behind `mtpAdaptiveArchEligible` → head `== .qwen4`). Both predicates were verified by reading their bodies, not their comments | **A — qwen4-only by construction** | The per-bucket tables show rounds losing to serial from the 32-64k bucket up, and at 8192 the probes landed inside the 8k cell of every M4 Max ladder — 8 serial tokens teaching a bucket whose answer was never in doubt. `MLX_SERVE_MTP_ADAPTIVE_MIN_KV` still overrides (`mtpAdaptiveMinKv`), and `--max-mtp-ctx` / `MLX_SERVE_MTP_FORCE_DEPTH` still outrank the whole mechanism |
+
+Also in the round, log-only and recorded as such: `mtpRoundPlan` gained a
+`[mtp-plan]` debug line (one per planned round, every input the planner read)
+behind `log.isDebug()`, split from the pure `mtpRoundPlanInner`. Nothing keys
+on it, it formats nothing at `info`, and every term it reads is a pure
+function of state the planner had already computed.
+
 ### The rule this leaves
 
 A "qwen4_exp long-context" change that touches a shared function is a

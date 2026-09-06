@@ -289,8 +289,11 @@ pub const NgramTable = struct {
     }
 
     /// Gather + concatenate the `n_heads` rows of each token: `out` is
-    /// `[ids.len / n_heads][n_heads * dim]` row-major.
-    pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32) void {
+    /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the
+    /// context position this gather runs AT (the pre-chunk `moe_seq_offset`
+    /// on a prefill, 0 on decode and on the warmup forward) and picks the
+    /// wide arm; the OUTPUT is byte-identical either way.
+    pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
         const need: usize = self.wcols * 4 + self.scols * 4;
         // The pool served DECODE widths only, on the assumption that a
         // 4096-row prefill chunk is "mostly page-cache hits" so 1024 wake
@@ -310,11 +313,13 @@ pub const NgramTable = struct {
         // contract: `bufs` stays [MAX_ROWS][ROW_BUF] and `run` still fans
         // 3*rows preads over the 48 workers. Only the length gate moves.
         // Read path, so the output is byte-identical either way; the win (or
-        // the wake-round loss at small kv) is timing only.
-        // QWEN4_PLE_PREFETCH_PREFILL=1 opts in; the default keeps the
-        // decode-only gate (a warm table loses 4-5% prefill to the pool).
+        // the wake-round loss at small kv) is timing only. Which is exactly
+        // why the arm is a kv GATE and not a flag: the same pool that saves
+        // 200 ms per 1000 tokens at kv 355k costs 5-8% at kv 4-16k, where
+        // the mapping is still resident. `PREFILL_PREFETCH_MIN_KV` above
+        // carries both A/Bs; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const wide_ok = !wide or plePrefillPrefetchEnabled();
+        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len);
         // Announce the arm that actually RUNS, not the lever that permits it.
         // `wide_ok` alone reported POOLED for the two silent fallbacks this
         // line exists to catch — no pool on this box, or a row wider than
@@ -490,37 +495,98 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
     const width: []const u8 = if (bucket == 1) "prefill width" else "warmup width";
     if (pooled) {
         const batches = (rows + PrefetchPool.MAX_ROWS - 1) / PrefetchPool.MAX_ROWS;
-        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; QWEN4_PLE_PREFETCH_PREFILL=1 is set)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS });
+        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; past kv {d}, QWEN4_PLE_PREFETCH_PREFILL=0 forces the serial walk)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS, plePrefillPrefetchMinKv() });
     } else {
-        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; QWEN4_PLE_PREFETCH_PREFILL=1 opts into the pool)\n", .{ width, rows });
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; the pool engages past kv {d}, QWEN4_PLE_PREFETCH_PREFILL_MIN_KV overrides)\n", .{ width, rows, plePrefillPrefetchMinKv() });
     }
 }
 
-/// Test seam for the prefill gate below (the env is read once per process).
+/// Test seams for the prefill gate below (both envs are read once per process).
 pub var ple_prefill_prefetch_override: ?bool = null;
+pub var ple_prefill_min_kv_override: ?u64 = null;
 
-/// Whether a gather WIDER than one pool batch may use the pool at all. OPT-IN:
-/// `QWEN4_PLE_PREFETCH_PREFILL=1` enables it, absent or `0` keeps the decode-
-/// only gate. The pool was built for a cold/evicted table (rows faulting from
-/// SSD one at a time); on a WARM table it costs 4-5% prefill at every rung
-/// (M4 Max, 13.4k prompt: 758 tok/s serial vs 725 pooled, 6/6 cells at
-/// 8k/32k), so the default is the serial walk. Separate from
-/// `QWEN4_PLE_PREFETCH`, which still turns the pool off entirely -- a pool
-/// that was never created cannot serve either width.
-fn plePrefillPrefetchEnabled() bool {
-    if (ple_prefill_prefetch_override) |v| return v;
+/// The kv length past which a prefill gather WIDER than one pool batch takes
+/// the pool. Not a tuning knob and not an opt-in: two A/Bs bracket it, and
+/// they disagree because they measured two different regimes of the SAME
+/// mapping.
+///
+///  - WARM table, short prompts: the pool LOSES. M4 Max 13.4k prompt, 758
+///    tok/s serial vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill
+///    5.3-8.5% slower at 4k/8k/16k, 6/6 cells, same sign on fp16 and kv8.
+///    The rows are page-cache hits, so the 1024 wake rounds buy nothing.
+///  - EVICTED table, long prompts: the pool is why the gather stays flat.
+///    M5 Max 374k ladder (2026-09-04, chunk 4096): the serial gather went
+///    67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and kv 355k --
+///    31% of the whole prefill slowdown -- because the weights evict the
+///    32 GB mapping and each fault lands on the compressor.
+///
+/// So the arm follows the kv length, per CHUNK: below the threshold the
+/// mapping is still resident and the serial walk is cheap; above it every
+/// row is a fault and the pool is what fans them out. A flat opt-in would
+/// have bought back the short-prompt loss by re-opening the long one.
+/// 65536 sits between the two measured regimes (highest losing rung 16k,
+/// lowest winning evidence past 300k) and is replaced by the 64k/128k/256k
+/// A/B now running; `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides it.
+pub const PREFILL_PREFETCH_MIN_KV: u64 = 65536;
+
+/// Three states, because the A/B needs both forced arms and the shipped one.
+pub const PrefillPrefetchMode = enum { off, kv_gated, on };
+
+/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = the kv gate, `0` = always the
+/// serial walk, `1` = always the pool. `diagEnvOn` discipline holds where it
+/// applies -- an exported `=0` can only turn the pool OFF, never arm it.
+/// Separate from `QWEN4_PLE_PREFETCH`, which turns the pool off entirely: a
+/// pool that was never created cannot serve either width.
+pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
+    const r = raw orelse return .kv_gated;
+    if (r.len == 0) return .kv_gated;
+    if (r[0] == '0') return .off;
+    if (r[0] == '1') return .on;
+    return .kv_gated;
+}
+
+/// The threshold, or the constant when the override is absent or unparsable
+/// (a typo must not silently disable the long-context arm).
+pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
+    const r = raw orelse return PREFILL_PREFETCH_MIN_KV;
+    const t = std.mem.trim(u8, r, " \t");
+    if (t.len == 0) return PREFILL_PREFETCH_MIN_KV;
+    return std.fmt.parseInt(u64, t, 10) catch PREFILL_PREFETCH_MIN_KV;
+}
+
+/// Pure: the arm a wide gather takes at this kv length.
+pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64) bool {
+    return switch (mode) {
+        .off => false,
+        .on => true,
+        .kv_gated => kv_len >= min_kv,
+    };
+}
+
+fn plePrefillPrefetchMinKv() u64 {
+    if (ple_prefill_min_kv_override) |v| return v;
     const S = struct {
-        var v: ?bool = null;
+        var v: ?u64 = null;
     };
     if (S.v) |v| return v;
-    const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL");
-    const v = plePrefillPrefetchFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL_MIN_KV");
+    const v = plePrefillPrefetchMinKvFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
     S.v = v;
     return v;
 }
 
-fn plePrefillPrefetchFromEnv(raw: ?[]const u8) bool {
-    return if (raw) |r| std.mem.eql(u8, r, "1") else false;
+fn plePrefillPrefetchEnabled(kv_len: u64) bool {
+    if (ple_prefill_prefetch_override) |v| return v;
+    const S = struct {
+        var v: ?PrefillPrefetchMode = null;
+    };
+    const mode = S.v orelse blk: {
+        const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL");
+        const m = plePrefillPrefetchModeFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+        S.v = m;
+        break :blk m;
+    };
+    return plePrefillPrefetchWanted(mode, kv_len, plePrefillPrefetchMinKv());
 }
 
 pub fn bf16ToF32(u: u16) f32 {
@@ -648,14 +714,39 @@ pub const Qwen4State = struct {
     }
 };
 
-test "ngram prefill prefetch is opt-in: absent or 0 = serial walk, 1 = pool" {
-    // The pool costs 4-5% prefill on a WARM table (M4 Max, 13.4k prompt,
-    // 758 vs 725 tok/s, 6/6 cells across 8k/32k); it only pays while rows
-    // still fault from SSD, so the default is the serial walk.
-    try testing.expect(!plePrefillPrefetchFromEnv(null));
-    try testing.expect(!plePrefillPrefetchFromEnv("0"));
-    try testing.expect(plePrefillPrefetchFromEnv("1"));
-    try testing.expect(!plePrefillPrefetchFromEnv(""));
+test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools" {
+    // Two A/Bs, two regimes of one mapping: the pool costs 4-5% prefill on a
+    // WARM table (M4 Max 13.4k, 758 vs 725 tok/s; M5 Max 5.3-8.5% at
+    // 4k/8k/16k, 6/6 cells) and saves 67.7 -> 267.9 ms per 1000 tokens once
+    // the weights have evicted the table (M5 Max 374k ladder). So neither a
+    // flat opt-in nor a flat default is right — the kv length decides.
+    const min = PREFILL_PREFETCH_MIN_KV;
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 16_384, min));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, min - 1, min));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min));
+    // An injected threshold moves the boundary and nothing else.
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072));
+    // Both forced arms ignore it entirely.
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, min));
+
+    // `diagEnvOn` discipline: absent is the GATE, and an exported `=0` can
+    // only force the serial walk — it can never arm the pool.
+    try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(null));
+    try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
+    try testing.expectEqual(PrefillPrefetchMode.off, plePrefillPrefetchModeFromEnv("0"));
+    try testing.expectEqual(PrefillPrefetchMode.on, plePrefillPrefetchModeFromEnv("1"));
+
+    // The threshold override, and its failure mode: a typo keeps the
+    // constant rather than silently disabling the long-context arm.
+    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(null));
+    try testing.expectEqual(@as(u64, 131_072), plePrefillPrefetchMinKvFromEnv("131072"));
+    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv("64k"));
+    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(""));
+    try testing.expectEqual(@as(u64, 0), plePrefillPrefetchMinKvFromEnv("0")); // an explicit always-on
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
@@ -721,10 +812,12 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
 
     // Kill switch: decode-only gate, so a 4096-row gather takes the serial
     // mmap path and issues NO pool round.
-    ple_prefill_prefetch_override = false;
-    defer ple_prefill_prefetch_override = null;
+    // The KV GATE, through the live gather with the threshold injected: a
+    // short prompt takes the serial mmap walk and issues NO pool round.
+    ple_prefill_min_kv_override = 65_536;
+    defer ple_prefill_min_kv_override = null;
     const before = pool.runs.load(.monotonic);
-    t.gather(ids, ref);
+    t.gather(ids, ref, 8192);
     try testing.expectEqual(before, pool.runs.load(.monotonic));
     // ROWS(4096) >= PREFILL_SAY_MIN_ROWS: the serial arm speaks at PREFILL
     // width and says nothing in the warmup bucket.
@@ -732,14 +825,27 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expect(!said(0, 0));
     try testing.expect(!said(1, 1) and !said(1, 0));
 
-    // Opted in: the same gather rides the pool in MAX_ROWS batches.
-    ple_prefill_prefetch_override = true;
-    t.gather(ids, got);
+    // ... and the SAME gather, at a kv past the threshold, rides the pool in
+    // MAX_ROWS batches. Nothing else about the call changed.
+    t.gather(ids, got, 131_072);
     try testing.expectEqual(before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expect(said(1, 1));
     try testing.expect(!said(1, 0));
 
-    // Read path: byte-identical, not merely close.
+    // Read path: byte-identical, not merely close — that is what makes the
+    // arm a pure timing decision.
+    try testing.expectEqualSlices(f32, ref, got);
+
+    // The forced arms outrank the kv length in both directions.
+    ple_prefill_prefetch_override = false;
+    defer ple_prefill_prefetch_override = null;
+    const forced_off = pool.runs.load(.monotonic);
+    t.gather(ids, got, 1_000_000);
+    try testing.expectEqual(forced_off, pool.runs.load(.monotonic));
+    try testing.expectEqualSlices(f32, ref, got);
+    ple_prefill_prefetch_override = true;
+    t.gather(ids, got, 0);
+    try testing.expectEqual(forced_off + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expectEqualSlices(f32, ref, got);
 
     // A wide-but-short gather (> MAX_ROWS, < PREFILL_SAY_MIN_ROWS) is the
@@ -748,7 +854,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const warm = ids[0..128];
     const w_out = try testing.allocator.alloc(f32, warm.len * t.dim);
     defer testing.allocator.free(w_out);
-    t.gather(warm, w_out);
+    t.gather(warm, w_out, 0); // forced on: the warmup forward runs at kv 0
     try testing.expect(said(1, 0));
     try testing.expectEqualSlices(f32, got[0 .. warm.len * t.dim], w_out);
 
@@ -762,10 +868,10 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer testing.allocator.free(d_got);
     ple_prefill_prefetch_override = false;
     const dec_before = pool.runs.load(.monotonic);
-    t.gather(dec, d_ref);
+    t.gather(dec, d_ref, 1_000_000);
     try testing.expectEqual(dec_before + 1, pool.runs.load(.monotonic)); // still pooled
     ple_prefill_prefetch_override = true;
-    t.gather(dec, d_got);
+    t.gather(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
 }

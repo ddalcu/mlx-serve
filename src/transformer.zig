@@ -15210,7 +15210,12 @@ pub const Transformer = struct {
         const host = try self.allocator.alloc(f32, n * emb_dim);
         defer self.allocator.free(host);
         var gclk: ProfClock = if (diagEnvOn("QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
-        st.table.gather(rows, host);
+        // The pool's arm is a kv-length question (`PREFILL_PREFETCH_MIN_KV`):
+        // the mapping is resident early in a prompt and evicted late in one.
+        // `ctx.moe_seq_offset` is the PRE-chunk position and has not advanced
+        // yet at this point in the layer loop — `cache.step` cannot stand in,
+        // it is 0 forever on a GDN trunk (layer 0 is linear).
+        st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
         if (diagEnvOn("QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         std.debug.assert(pk.len == host.len);
         for (host, 0..) |v, i| {

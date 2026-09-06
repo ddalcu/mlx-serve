@@ -506,15 +506,23 @@ pub const EXPLORE_BLOCK: u32 = 3;
 /// `idx % period` was tried first and chained trials because the block's
 /// own observation moved the period.
 ///
-/// The period is re-read EVERY round and a shorter one pulls the next trial
-/// in (`armed_at + period`); a longer one never pushes it out. The period
-/// follows the bucket the planner READS, and a request in a cold bucket
-/// reads its nearest active neighbour for its first rounds: on the M4 Max
-/// 32k trace the `<2k` neighbour priced w(m_lo+1) 20-60% over w(m_lo) (short
-/// low-acceptance requests), the schedule armed at period 124-256, and when
-/// the own bucket activated three rounds later (m_lo+1 unmeasured, period
-/// EXPLORE_PERIOD_COLD) it kept the neighbour's date — no trial for the whole
-/// request, `a[m_lo]` frozen at its seed, w1 for 45-91 rounds.
+/// Under `reread` the period is re-read EVERY round and a shorter one pulls
+/// the next trial in (`armed_at + period`); a longer one never pushes it out.
+/// The period follows the bucket the planner READS, and a request in a cold
+/// bucket reads its nearest active neighbour for its first rounds: on the M4
+/// Max 32k trace the `<2k` neighbour priced w(m_lo+1) 20-60% over w(m_lo)
+/// (short low-acceptance requests), the schedule armed at period 124-256, and
+/// when the own bucket activated three rounds later (m_lo+1 unmeasured,
+/// period EXPLORE_PERIOD_COLD) it kept the neighbour's date — no trial for
+/// the whole request, `a[m_lo]` frozen at its seed, w1 for 45-91 rounds.
+///
+/// GATED (PR #363 blast radius, ledger row 20): `reread` is the caller's arch
+/// answer, `schedulePeriodReread(table.layout)` at both call sites. The stall
+/// reproduces on a93e2c0 too, but the re-read moves WHICH rounds of a request
+/// carry a trial block (3-4% each), and the only schedule a sidecar-MTP pack
+/// or a DFlash block drafter was ever measured on is a93e2c0's arm-once one.
+/// `armed_at` is maintained on both arms and read only on the gated one, so
+/// an ungated schedule is byte-identical to a93e2c0.
 pub const TrialSchedule = struct {
     trial_end: u32 = 0,
     next_trial: u32 = 0,
@@ -523,7 +531,7 @@ pub const TrialSchedule = struct {
     last_idx: ?u32 = null,
     last_force: bool = false,
 
-    pub fn force(t: *TrialSchedule, round_idx: u32, period: u32) bool {
+    pub fn force(t: *TrialSchedule, round_idx: u32, period: u32, reread: bool) bool {
         if (t.last_idx == round_idx) return t.last_force;
         t.last_idx = round_idx;
         t.last_force = blk: {
@@ -533,7 +541,7 @@ pub const TrialSchedule = struct {
                 t.next_trial = round_idx + period;
                 break :blk false;
             }
-            t.next_trial = @min(t.next_trial, t.armed_at + period);
+            if (reread) t.next_trial = @min(t.next_trial, t.armed_at + period);
             if (round_idx >= t.next_trial) {
                 t.trials += 1;
                 t.trial_end = round_idx + EXPLORE_BLOCK;
@@ -555,6 +563,14 @@ pub const TrialSchedule = struct {
         }
     }
 };
+
+/// Which archs re-read the trial period every round (PR #363 blast radius,
+/// ledger row 20). `.long` is `layoutFor`'s qwen4_exp answer and nothing
+/// else's, so this is the qwen4-only predicate this module can spell without
+/// importing ModelConfig — the same reason `layoutFor` takes an `anytype`.
+pub fn schedulePeriodReread(layout: Layout) bool {
+    return layout == .long;
+}
 
 /// Period from the measured ms/tok gap between two widths (a width G worse,
 /// run once in G/DRAG rounds, costs ~DRAG of throughput); the default while
@@ -686,7 +702,10 @@ pub const WidthChooser = struct {
         if (self.trialTarget(t, bucket)) |target| {
             self.trial.startAt(round_idx);
             const period = trialPeriod(t.msPerTok(self.current, bucket), t.msPerTok(target, bucket));
-            if (self.trial.force(round_idx, period)) return .{ .width = target, .trial = true };
+            // A block drafter is a sidecar arch: `.legacy`, so the schedule
+            // is a93e2c0's. The layout answers rather than a literal `false`
+            // so a future gated arch inherits the re-read with the grid.
+            if (self.trial.force(round_idx, period, schedulePeriodReread(t.layout))) return .{ .width = target, .trial = true };
         }
         return .{ .width = self.current, .trial = false };
     }
@@ -1054,14 +1073,24 @@ test "round_cost: trialPeriod and TrialSchedule blocks" {
     var forced: u32 = 0;
     var i: u32 = 3;
     while (i < 103) : (i += 1) {
-        const f = t.force(i, 8);
-        try testing.expectEqual(f, t.force(i, 8));
+        const f = t.force(i, 8, false);
+        try testing.expectEqual(f, t.force(i, 8, false));
         if (f) forced += 1;
     }
     try testing.expectEqual(t.trials * EXPLORE_BLOCK, forced);
+    // A CONSTANT period is the one shape the two arms cannot disagree on:
+    // `min(next_trial, armed_at + period)` is `next_trial` at every round.
+    var g = TrialSchedule{};
+    var g_forced: u32 = 0;
+    i = 3;
+    while (i < 103) : (i += 1) if (g.force(i, 8, true)) {
+        g_forced += 1;
+    };
+    try testing.expectEqual(forced, g_forced);
+    try testing.expectEqual(t.trials, g.trials);
     var s = TrialSchedule{};
     s.startAt(3);
-    try testing.expect(s.force(3, 8)); // starts at once, not a period later
+    try testing.expect(s.force(3, 8, false)); // starts at once, not a period later
 }
 
 test "round_cost: a shorter period pulls an armed TrialSchedule in (cold own bucket after a neighbour's long period)" {
@@ -1072,22 +1101,60 @@ test "round_cost: a shorter period pulls an armed TrialSchedule in (cold own buc
     // UNMEASURED (period EXPLORE_PERIOD_COLD), and the schedule kept 136:
     // no trial for the whole request, `a[m_lo]` frozen at its seed.
     var t = TrialSchedule{};
-    try testing.expect(!t.force(12, 124));
+    try testing.expect(!t.force(12, 124, true));
     try testing.expectEqual(@as(u32, 136), t.next_trial);
     var i: u32 = 13;
-    while (i < 18) : (i += 1) try testing.expect(!t.force(i, 124));
+    while (i < 18) : (i += 1) try testing.expect(!t.force(i, 124, true));
     // The read bucket changed: from here the period is the cold one.
-    try testing.expect(!t.force(18, EXPLORE_PERIOD_COLD));
+    try testing.expect(!t.force(18, EXPLORE_PERIOD_COLD, true));
     try testing.expectEqual(@as(u32, 12 + EXPLORE_PERIOD_COLD), t.next_trial);
-    try testing.expect(!t.force(19, EXPLORE_PERIOD_COLD));
-    try testing.expect(t.force(20, EXPLORE_PERIOD_COLD));
+    try testing.expect(!t.force(19, EXPLORE_PERIOD_COLD, true));
+    try testing.expect(t.force(20, EXPLORE_PERIOD_COLD, true));
     try testing.expectEqual(@as(u32, 1), t.trials);
     // A LONGER period never pushes an armed schedule out (that is the
     // deadlock's shape); the block re-arms from its own end.
     var u = TrialSchedule{};
-    try testing.expect(!u.force(5, 8));
-    try testing.expect(!u.force(6, 200));
+    try testing.expect(!u.force(5, 8, true));
+    try testing.expect(!u.force(6, 200, true));
     try testing.expectEqual(@as(u32, 13), u.next_trial);
+}
+
+test "round_cost: the trial-period re-read is qwen4-only; a legacy-layout schedule keeps a93e2c0's date (L27, ledger row 20)" {
+    // The gate. `schedulePeriodReread` is the ONE predicate, and it answers
+    // for the layout `layoutFor` resolves: `.long` is qwen4_exp and nothing
+    // else, `.legacy` is every sidecar-MTP pack and every DFlash drafter.
+    try testing.expect(schedulePeriodReread(.long));
+    try testing.expect(!schedulePeriodReread(.legacy));
+
+    // The tester's own M4 Max trace shape, run on the UNGATED arm: armed at
+    // round 12 from the `<2k` neighbour's 124, the own bucket activates at
+    // 18 with the cold period 8, and the date does not move. Transcribed from
+    // `git show a93e2c0:src/round_cost.zig` — that tree has no `armed_at` and
+    // re-reads the period only after a trial fires, so `next_trial` stays 136
+    // and the whole 100-round request runs without a trial.
+    var legacy = TrialSchedule{};
+    try testing.expect(!legacy.force(12, 124, false));
+    try testing.expectEqual(@as(u32, 136), legacy.next_trial);
+    var i: u32 = 13;
+    while (i < 136) : (i += 1) {
+        const period: u32 = if (i < 18) 124 else EXPLORE_PERIOD_COLD;
+        try testing.expect(!legacy.force(i, period, false));
+    }
+    try testing.expectEqual(@as(u32, 136), legacy.next_trial);
+    try testing.expectEqual(@as(u32, 0), legacy.trials);
+    // ... and it fires on a93e2c0's date, not one pulled in.
+    try testing.expect(legacy.force(136, EXPLORE_PERIOD_COLD, false));
+    try testing.expectEqual(@as(u32, 1), legacy.trials);
+
+    // `startAt` is the block drafter's entry and is arm-once on BOTH arms:
+    // the two schedules agree round for round while the period is constant.
+    var a = TrialSchedule{};
+    var b = TrialSchedule{};
+    a.startAt(3);
+    b.startAt(3);
+    i = 3;
+    while (i < 60) : (i += 1) try testing.expectEqual(a.force(i, 8, false), b.force(i, 8, true));
+    try testing.expectEqual(a.trials, b.trials);
 }
 
 /// Synthetic block drafter: per-position acceptance p, round ms linear in

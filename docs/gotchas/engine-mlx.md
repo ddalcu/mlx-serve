@@ -5688,6 +5688,25 @@ request climbs w2 -> w3 -> w4 trials. The A/B on the 32k rung stays noisy
 (llmprobe's prose prompt has `a[2]` ~0.35, so w3 is the right answer there);
 what the fix buys is the floor: no request sits at w1 for a whole reply.
 
+**And the fix is GATED, because the STALL is not the whole story.** The stall
+reproduces on a93e2c0 — `DB1-base`, 45 rounds at w1, 72.5 tok/s — so this is a
+bug fix, not a PR #363 regression, and the first instinct was to ship it for
+everyone. `TrialSchedule` has two consumers and neither is arch-gated:
+`Generator.MtpWidthTrial` is an alias of it and `mtpRoundPlanInner` drives it
+for ANY model with an MTP head (the qwen3.5/3.6/3.8 sidecars included), and
+`WidthChooser.trial` drives it for every DFlash/DSpark block drafter under
+`MLX_SERVE_DFLASH_CHOOSER=1`. What the re-read changes for those archs is not
+the plan — `mtpEvPlanSrc` and `mtpWidthTrialTarget` are untouched, and the L27
+characterization test pins both to a93e2c0 — but WHICH ROUNDS of a request
+carry a trial block, and a block costs the request carrying it 3-4%. That is a
+planner change on an arch nobody measured, which is exactly what the ledger
+forbids. So `force` takes a `reread` argument, both call sites answer it with
+`round_cost.schedulePeriodReread(table.layout)` (`.long` is `layoutFor`'s
+qwen4_exp answer and nothing else's), and `armed_at` is maintained on both arms
+but read only on the gated one — an ungated schedule is a93e2c0 byte for byte.
+Ledger row 20. The lesson generalises: **"it is broken on main too" argues that
+a fix is owed, never that it is safe to ship unmeasured.**
+
 **Not the cause** (checked and acquitted): the planner (`mtpRoundPlan`,
 `mtpEvPlanSrc`, `MtpCostSource`, the regime gate, `mtpWidthTrialTarget`) is
 byte-identical between base and PR; the table (`observe`, `foldInto`,
@@ -5702,6 +5721,43 @@ different luck), and its 9-bucket layout has more cold buckets past 32k.
   shape). Measured here first: the prefill kernel at verify widths ran 4-8%
   behind the union gather (66.0/66.1 vs 68.7/71.2 tok/s at 32K/64K). The
   quantized arm stays (+12..20% at kv8).
-- PLE prefill prefetch pool opt-in (`QWEN4_PLE_PREFETCH_PREFILL=1`): -4..-5%
-  prefill on a warm table, 6/6 cells (13.4k: 758 serial vs 725 pooled).
 - `MTP_ADAPTIVE_MIN_KV` 8192 -> 32768: the probes sat inside the 8k cell.
+  Ledger row 22 — qwen4-only by construction, both readers behind
+  `mtpAdaptiveModelOk` / `mtpAdaptiveArchEligible`.
+
+## One pool, two regimes of one mapping: the PLE prefill prefetch is a KV GATE (2026-09-06)
+
+The parked `pread` pool exists because a random read into an EVICTED 32 GB
+mmap is an SSD fault and faults on one mapping serialize on the VM map lock.
+26.9.1 let it serve decode only; #363 extended it to prefill widths on the
+374k-ladder evidence, and the M4 Max tester then measured it LOSING.
+
+Both measurements are right, and they are measurements of different mappings:
+
+| regime | evidence | verdict |
+|---|---|---|
+| resident (page-cache hits) | M4 Max 13.4k prompt, 758 tok/s serial vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill 5.3-8.5% slower at 4k/8k/16k, 6/6 cells, same sign on fp16 and kv8 | the 1024 wake rounds buy nothing |
+| evicted (weights took the pages) | M5 Max 374k ladder, chunk 4096: the SAME serial gather went 67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and kv 355k — 31% of the whole prefill slowdown, gathering the same rows per token at both ends | the pool is why the gather stays flat |
+
+So the tester's opt-in would have bought the short-prompt loss back by
+re-opening the long-context one, on the exact ladder the feature was built
+for. The arm is a KV GATE instead, decided PER CHUNK:
+`plePrefillPrefetchWanted(mode, kv_len, min_kv)` is the pure predicate,
+`PREFILL_PREFETCH_MIN_KV` (65536) the constant, and `kv_len` is
+`ctx.moe_seq_offset` read at the gather — the PRE-chunk position, because the
+layer loop has not advanced it yet. **`cache.step` cannot stand in**: a GDN
+trunk's layer 0 is linear, so it is 0 forever (the same trap that roped every
+batched qwen3_5 decode token at position 0). A 374k prompt therefore walks its
+first ~16 chunks and pools the rest, which is precisely the shape the ladder
+measured.
+
+65536 is a PLACEHOLDER between the two regimes — highest losing rung 16k,
+lowest winning evidence past 300k — pending a 64k/128k/256k A/B; it is a named
+constant with both A/Bs in its doc comment so the number can be replaced
+without re-deriving why it exists. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` moves
+it. `QWEN4_PLE_PREFETCH_PREFILL` is three-state and follows `diagEnvOn`
+discipline where it applies: absent = the gate, `0` = always serial, `1` =
+always pooled — an exported `=0` can only turn the pool OFF, never arm it.
+`QWEN4_PLE_PREFETCH=0` still kills the pool outright; a pool that was never
+created serves neither width. Output is byte-identical on every arm — this is
+a read path, and the whole question is timing. Ledger row 21.

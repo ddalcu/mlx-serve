@@ -8905,7 +8905,8 @@ pub const Generator = struct {
             const base_settled = self.mtp_m_lo_streak >= 2;
             if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
                 const period = mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
-                if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period)) {
+                const reread = round_cost.schedulePeriodReread(self.xfm.round_cost.layout);
+                if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period, reread)) {
                     plan = mtpWidthTrialPlan(target);
                 }
             }
@@ -8956,8 +8957,14 @@ pub const Generator = struct {
     /// idempotent per round because `mtpRoundPlan` has two call sites.
     pub const MtpWidthTrial = round_cost.TrialSchedule;
 
-    pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32) bool {
-        return t.force(round_idx, period);
+    /// `reread` is the ARCH answer (`round_cost.schedulePeriodReread`), not a
+    /// tuning flag: PR #363 ledger row 20. qwen4_exp re-reads the period every
+    /// round so a cold bucket cannot inherit a neighbour's 124-round date;
+    /// every sidecar-MTP pack keeps a93e2c0's arm-once schedule, since the
+    /// re-read moves which rounds carry a 3-4% trial block and no sidecar
+    /// arch was measured here.
+    pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32, reread: bool) bool {
+        return t.force(round_idx, period, reread);
     }
 
     /// Rounds between width trials: the regime's drag rule on the measured
@@ -13644,8 +13651,8 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
     var forced: u32 = 0;
     var i: u32 = 10;
     while (i < 210) : (i += 1) {
-        const f = Generator.mtpWidthTrialForce(&wt, i, 8);
-        try testing.expectEqual(f, Generator.mtpWidthTrialForce(&wt, i, 8)); // asked twice, same answer
+        const f = Generator.mtpWidthTrialForce(&wt, i, 8, true);
+        try testing.expectEqual(f, Generator.mtpWidthTrialForce(&wt, i, 8, true)); // asked twice, same answer
         if (f) forced += 1;
     }
     // Identity checkable from the log: forced rounds == block * trials.
@@ -13704,7 +13711,9 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
         var plan = Generator.mtpEvPlanSrc(&a, 8, src, m_lo_prev + 1);
         if (plan.m_lo == m_lo_prev) streak += 1 else streak = 0;
         if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8, streak >= 2)) |target| {
-            if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo))) plan = Generator.mtpWidthTrialPlan(target);
+            // `t` is a default (`.legacy`) table, so this loop runs the
+            // UNGATED schedule — a93e2c0's, which is what it was fitted on.
+            if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo), round_cost.schedulePeriodReread(t.layout))) plan = Generator.mtpWidthTrialPlan(target);
         }
         // Run it: a two-chunk plan extends (confidence is high), so the
         // realized width is m_hi — and, as in mtpRoundEndObserve, only a
@@ -16012,6 +16021,45 @@ test "L27 characterization: a sidecar (legacy-layout) boot plans EXACTLY as a93e
         @as(?u32, 3),
         G.mtpWidthTrialTarget(&warm, kv, .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 }, cap, true),
     );
+}
+
+test "L27 characterization: a sidecar boot's width-trial SCHEDULE is a93e2c0's too (ledger row 20)" {
+    // `mtpWidthTrialTarget` above answers WHICH width; this answers WHICH
+    // ROUND, and a trial block costs the request carrying it 3-4%. The M4 Max
+    // stall (a cold bucket inheriting its `<2k` neighbour's 124-round date)
+    // reproduces on a93e2c0, but the re-read that fixes it is qwen4-only:
+    // a legacy-layout table gets a93e2c0's arm-once schedule, transcribed
+    // from `git show a93e2c0:src/round_cost.zig`.
+    const G = Generator;
+    const legacy = round_cost.Table{ .layout = .legacy };
+    const long = round_cost.Table{ .layout = .long };
+    try testing.expect(!round_cost.schedulePeriodReread(legacy.layout));
+    try testing.expect(round_cost.schedulePeriodReread(long.layout));
+
+    // Same trace shape on both arms: armed at 12 from a 124-round neighbour,
+    // the own bucket activates at 18 with EXPLORE_PERIOD_COLD.
+    const run = struct {
+        fn f(reread: bool) ?u32 {
+            var wt = G.MtpWidthTrial{};
+            var i: u32 = 12;
+            while (i < 200) : (i += 1) {
+                const period: u32 = if (i < 18) 124 else round_cost.EXPLORE_PERIOD_COLD;
+                if (G.mtpWidthTrialForce(&wt, i, period, reread)) return i;
+            }
+            return null;
+        }
+    }.f;
+    try testing.expectEqual(@as(?u32, 136), run(false)); // a93e2c0
+    try testing.expectEqual(@as(?u32, 20), run(true)); // qwen4_exp
+
+    // The WIRING, not just the predicate: the one production call site reads
+    // the table's own layout. Delete the argument and this arm stays green
+    // while every sidecar pack silently takes qwen4's schedule.
+    const src = @embedFile("generate.zig");
+    const impl = productionDeclSource(src, "    fn mtpRoundPlanInner(") orelse return error.CallSiteMoved;
+    try testing.expect(windowHasNoTestBlock(impl));
+    const force = std.mem.indexOf(u8, impl, "mtpWidthTrial" ++ "Force(") orelse return error.CallSiteMoved;
+    try testing.expect(std.mem.indexOf(u8, impl[0..force], "round_cost.schedule" ++ "PeriodReread(self.xfm.round_cost.layout)") != null);
 }
 
 test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's (L27)" {
