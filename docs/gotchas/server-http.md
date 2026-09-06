@@ -4022,3 +4022,84 @@ cross-arch change until a predicate says otherwise. The predicate is
 ModelConfig mirrors it ONCE into a field at wiring time
 (`HotPrefixCache.cp_thin`, the `qsa_history_required` pattern) and
 is scan-pinned to it.
+
+## A trivial share is a LIEN on the whole entry: the cold 786k prompt that was refused with a full cache (2026-09-06)
+
+The deployed shape (`--ctx-size 786432 --kv-quant 8 --mtp --prefix-cache-mem 10GB
+--prefix-cache-entries 4 --prefix-cache-disk 100GB`, unpinned chunk, M5 Max 128 GB,
+`iogpu.wired_limit_mb=120000`), after llmprobe walked 4k…524k cold prompts. The next
+request was a COLD 786,369-token prompt sharing nothing with anything resident, and
+`~/.mlx-serve/logs/mlx-serve-22222.log` says:
+
+```
+[admission] needed=23692 MB available=19191 MB reclaimable=23012 MB width=512 verdict=evict
+  [hot-cache] idle allowance exceeded: dropped unpersistable entry (partial copy) 524497 tokens, 11476.3 MB
+  [hot-cache] SSD-first: wrote 0 idle entries to disk, evicted 2; RAM holds the active session + 10240 MB idle allowance
+  [hot-cache] reused 9/786369 tokens (matched 11; entry 1/1)
+[scheduler] prefill refused: 786369 tokens do not fit even with an empty hot cache
+  prompt 786369 tokens needs ~23692MB at prefill chunk 512 (the narrowest width tried),
+  ~14713MB available after evicting ~11476MB of hot cache — refused before prefill
+```
+
+The cache was never empty, and the refusal says so in its own numbers: it quotes
+11,476 MB of hot cache it could not evict, in the same line that calls the cache empty.
+
+### Where the memory was
+
+`available` is `currentGpuMemoryCeiling(active) - active` (server.zig), and on this box
+the ceiling is the PHYSICAL term, not the 120 GB wired limit: at boot, weights 71,813 MB
+resident and `available=39344`, i.e. a ceiling of ~111,157 MB against a wired limit of
+117,187. So `available` is the MLX pool plus free system RAM, and the terms between
+"45 GB beyond the weights" and 14,713 MB were:
+
+| term | MB | note |
+|---|---|---|
+| weights | 71,813 | `[preflight] weights ~70.13 GB`, inside `active` |
+| the resident 524,464-token session entry | 11,476 | held by the entry AND by the slot — see below |
+| SSD write-through staged host blobs | ~4,558 | exactly the 19,191 → 14,713 drop; the two `[disk-cache] persisted … 2053.6/2504.0 MB` flushes |
+| OS + other processes | ~10,900 | the boot gap, 131,072 − 111,157 |
+
+What is NOT a term, and was the first suspicion: the one-session reservation (22,464 MB)
+and the idle allowance (10,240 MB) are LOAD-time cache-budget numbers
+(`ssdFirstBudgetForLoad`) and are never subtracted at admission; and the MLX allocator
+pool is CREDITED, not charged — it is inside `physicalMemoryCeiling`'s footprint term, so
+`ceiling - active` returns it.
+
+### The actual defect
+
+`KVCache.restore` (transformer.zig) is `mlx_array_set` per layer: it refcount-SHARES the
+entry's arrays — the WHOLE allocation, not the matched rows — and the clamp that follows
+it is `truncate`, which past `len == 0` is offset-only and frees nothing. So an 11-token
+match on a 524,464-token entry hands the slot all 11.5 GB of it. Then
+`evictLruToAdmit`'s `protect_restored` skips that entry as `last_restored_used`, whose
+stated justification is that evicting it would free nothing anyway — true, and made true
+BY the restore. One entry in the cache, protected, and the pass reports an empty cache.
+
+The same prompt with a ZERO match is fine: `match == null` takes `truncate(0, s)`, which
+DOES free, and the entry is then the sole owner and evictable. Matching eleven tokens
+instead of none cost 11,476 MB and turned an admissible request into a 503.
+
+### The rule
+
+A restore may not pin an entry that hands back less than 1/`RESTORE_PIN_RATIO` (64) of
+what it pins, once the entry is past `RESTORE_PIN_MIN_BYTES` (1 GB) — below that there is
+nothing to reclaim and the question does not arise, which is what keeps short
+conversations (whose whole value is the full reuse) away from the test.
+`prefix_cache.restoreWouldPinEntry` is the pure predicate; the decline runs BEFORE
+`bumpCounter` and before `last_restored_used` is written, because those two writes are
+exactly what the admission pass and the SSD-first spill read. SSD-first only: the steady
+state where ONE resident entry is a whole session and the next request shares its
+preamble and nothing else is that arm's, and it is the arm this was measured on.
+
+On the live numbers: 14,713 + 11,476 = 26,189 MB against a 23,692 MB bill — the refused
+request admits. The bill itself was honest, and is not the thing to argue with:
+786,369 × 13,056 KV + 786,369 × 5,376 state = 13,821 MB, plus the chunk-512 transient,
+the stream and dequant terms, the retained SSM checkpoints, the QSA mask and the margin.
+
+### Follow-up, not fixed here
+
+`last_restored_used` is assigned BEFORE the hybrid fall-throughs in the same function
+(`effective_matched == 0`: no checkpoint at or below the match, or a restore that carries
+no QSA history). Those arms `truncate(0, s)` and return `matched = 0` — a cold prefill —
+but leave the marker set, so the donor entry stays protected from the admission eviction
+pass for a request that shares nothing with it. Same class as the above, one arm along.

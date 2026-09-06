@@ -455,6 +455,10 @@ pub const HotPrefixCache = struct {
     /// SSD-first mechanism 1: the live-cache state of the most recent commit,
     /// flushed instead of the (possibly trimmed) RAM entry.
     pending_disk: ?PendingDiskFlush = null,
+    /// Byte floor for the restore-pin rule (`restoreWouldPinEntry`). A field
+    /// rather than a constant so a test can reproduce the live shape without
+    /// allocating a gigabyte of KV; nothing outside tests writes it.
+    restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -1226,6 +1230,24 @@ pub const HotPrefixCache = struct {
         }
         const m = match.?;
         const e = &self.entries.items[m.idx];
+        // DECLINE A RESTORE THAT IS A LIEN (see `restoreWouldPinEntry`).
+        // Taken BEFORE the bump and before `last_restored_used`: a declined
+        // entry must stay both evictable by the admission pass and idle for
+        // the SSD-first spill, and both of those read exactly those two
+        // writes. SSD-first only — that is the steady state where the one
+        // resident entry is a whole session and the next request shares its
+        // preamble and nothing else, and it is the arm this was measured on.
+        if (self.ssd_first and restoreWouldPinEntry(e.kv_bytes, self.restore_pin_min_bytes, e.tokens.len, m.shared)) {
+            try target_cache.truncate(0, s);
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            target_moe_seq_offset.* = 0;
+            log.info("  [hot-cache] declined a {d}-token restore from a {d}-token entry ({d} MB): the share is a lien on the whole entry; cold prefill\n", .{
+                m.shared,
+                e.tokens.len,
+                e.kv_bytes / (1024 * 1024),
+            });
+            return .{ .matched = 0, .full_match = false };
+        }
         e.last_used = self.bumpCounter();
         // Identity of the entry THIS request is about to run on. `restore`
         // refcount-SHARES its buffers with the slot's cache, so evicting it
@@ -2703,6 +2725,40 @@ pub const HotPrefixCache = struct {
     /// the machine could serve — the exact failure the eviction exists to
     /// prevent.
     pub const SHARED_RETURN_DIVISOR: u64 = 4;
+
+    /// A RESTORE IS A LIEN ON THE WHOLE ENTRY. `KVCache.restore` refcount-
+    /// SHARES the entry's arrays — the entire allocation, not the matched
+    /// rows — and the clamp that follows is `truncate`, which is offset-only
+    /// and frees nothing. So a slot that matched 11 tokens of a 524k-token
+    /// entry holds all 11.5 GB of it, and `evictLruToAdmit` then protects
+    /// that entry (`last_restored_used`) because evicting it would free
+    /// nothing anyway. The identical prompt with a ZERO match takes the miss
+    /// arm's `truncate(0, s)` and frees every byte.
+    ///
+    /// LIVE 2026-09-05 (mlx-serve-22222.log ~1283-1298), the deployed
+    /// qwen4_exp shape: a cold 786,369-token prompt matched 11 tokens of the
+    /// resident 524,464-token session, was admitted by the connection thread
+    /// (`needed=23692 MB available=19191 MB`) and then refused by the
+    /// inference thread — `~14713MB available after evicting ~11476MB of hot
+    /// cache` — with an eviction pass that could not touch the single entry
+    /// in the cache. Declining that 11-token restore returns the entry to the
+    /// pass: 14,713 + 11,476 = 26,189 MB against a 23,692 MB bill.
+    ///
+    /// The rule, therefore: a restore may not pin an entry that hands back
+    /// less than 1/`RESTORE_PIN_RATIO` of what it pins. Below
+    /// `restore_pin_min_bytes` there is nothing to reclaim and the question
+    /// does not arise — short conversations, whose whole value is the full
+    /// reuse, never reach this test.
+    pub const RESTORE_PIN_MIN_BYTES: u64 = 1 << 30;
+    pub const RESTORE_PIN_RATIO: usize = 64;
+
+    /// PURE: would restoring `shared` rows from an entry of `entry_tokens`
+    /// rows and `kv_bytes` bytes be a lien rather than a hit?
+    pub fn restoreWouldPinEntry(kv_bytes: u64, min_bytes: u64, entry_tokens: usize, shared: usize) bool {
+        if (kv_bytes < min_bytes) return false;
+        if (shared == 0) return true;
+        return entry_tokens > shared *| RESTORE_PIN_RATIO;
+    }
 
     pub fn evictLruToAdmit(
         self: *HotPrefixCache,
@@ -4574,6 +4630,155 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
     try testing.expect(rest.accounted_bytes > 0);
     try testing.expect(rest.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR < rest.accounted_bytes);
     try testing.expect(rest.shared_stop);
+}
+
+test "a trivial share of a whole session is a LIEN, and the admission pass gets the entry back" {
+    // LIVE 2026-09-05, the deployed qwen4_exp shape (--ctx-size 786432
+    // --kv-quant 8 --mtp --prefix-cache-mem 10GB --prefix-cache-entries 4
+    // --prefix-cache-disk 100GB, wired 120000, M5 Max 128 GB). A cold
+    // 786,369-token prompt shared ELEVEN tokens with the one resident entry —
+    // the previous 524,464-token session, 11,476 MB — and:
+    //
+    //   [admission] needed=23692 MB available=19191 MB ... verdict=evict
+    //   [hot-cache] reused 9/786369 tokens (matched 11; entry 1/1)
+    //   [scheduler] prefill refused: ... do not fit even with an empty hot cache
+    //     ... ~14713MB available after evicting ~11476MB of hot cache
+    //
+    // The cache was never empty: the 11-token restore refcount-SHARED the
+    // whole 11.5 GB allocation into the slot and marked the entry
+    // `last_restored_used`, so `evictLruToAdmit` skipped the only entry there
+    // was — and evicting it would have returned nothing anyway, because the
+    // slot held it. Declining that restore is worth 11,476 MB against a
+    // 23,692 MB bill on 14,713 MB of headroom.
+    const t = testing;
+    // The arithmetic the live log refused on, and the arithmetic after.
+    try t.expect(23_692 > 14_713); // refused
+    try t.expect(14_713 + 11_476 >= 23_692); // admitted
+
+    // ...and the predicate, at those numbers. A 100k-token share of the same
+    // entry is a real hit and stays one; a small entry never reaches the test
+    // whatever it shares (a short chat's whole value is the full reuse).
+    const MB: u64 = 1 << 20;
+    const floor = HotPrefixCache.RESTORE_PIN_MIN_BYTES;
+    try t.expect(HotPrefixCache.restoreWouldPinEntry(11_476 * MB, floor, 524_464, 11));
+    try t.expect(!HotPrefixCache.restoreWouldPinEntry(11_476 * MB, floor, 524_464, 100_000));
+    try t.expect(!HotPrefixCache.restoreWouldPinEntry(60 * MB, floor, 218, 11));
+
+    // The live shape, in miniature: ONE resident session entry, a prompt that
+    // shares its preamble and nothing else, and a slot that keeps whatever
+    // the lookup hands it (that is what makes the share a pin).
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssd_first = true; // the arm this was measured on
+    hc.restore_pin_min_bytes = 1 << 20; // a 2 MB entry stands in for 11.5 GB
+
+    var session: [4096]u32 = undefined;
+    for (&session, 0..) |*x, i| x.* = @intCast(i + 1);
+    // Shares the first 11 ids and diverges — the live 11-of-524,464.
+    var cold: [4096]u32 = undefined;
+    for (&cold, 0..) |*x, i| x.* = if (i < 11) @as(u32, @intCast(i + 1)) else @intCast(i + 5_000_001);
+
+    // ONE cache, because that is the live lifecycle: the slot that served the
+    // session commits it and is then handed the next request. Its handles are
+    // the entry's second reference — which is why the restore's share pins
+    // and the decline's `truncate(0)` releases.
+    var slot_cache = try KVCache.init(testing.allocator, 8);
+    defer slot_cache.deinit();
+    try testFillCache(&slot_cache, s, 8, 4096);
+    for (slot_cache.entries) |*e| {
+        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+    }
+    try hc.commit(&slot_cache, &session, false);
+    try t.expectEqual(@as(usize, 1), hc.entryCount());
+    try t.expect(hc.entries.items[0].kv_bytes > hc.restore_pin_min_bytes);
+
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, null, s, &cold, false, 0, null, null);
+
+    // Declined: eleven rows are not worth a lien on the session.
+    try t.expectEqual(@as(usize, 0), hit.matched);
+    try t.expect(!hit.full_match);
+    try t.expectEqual(@as(usize, 0), moe_off);
+    // Nothing to protect, and the slot holds none of the entry's buffers.
+    try t.expect(hc.last_restored_used == null);
+    try t.expectEqual(@as(usize, 0), slot_cache.step);
+
+    // ...so the admission pass reclaims it, and reclaims REAL bytes — the
+    // whole point (`report.bytes` is the live delta, not the billing).
+    const Fits = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
+            return cache.entryCount() == 0;
+        }
+    };
+    const rep = hc.evictLruToAdmit(786_369, &hc, Fits.call, true);
+    try t.expect(rep.admitted);
+    try t.expectEqual(@as(usize, 1), rep.entries);
+    try t.expect(rep.bytes > 0);
+    try t.expect(!rep.shared_stop);
+}
+
+test "a PROPORTIONATE share still restores, and is still protected" {
+    // The inverse, and the reason the rule is a ratio and not a floor: an
+    // entry a request genuinely continues hands back most of what it pins,
+    // and dropping it would only throw away the hit. Same cache, same
+    // eviction pass, opposite verdict.
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    hc.restore_pin_min_bytes = 1 << 20;
+
+    var session: [4096]u32 = undefined;
+    for (&session, 0..) |*x, i| x.* = @intCast(i + 1);
+    // Shares 2048 of 4096 — a ratio of 2, far inside RESTORE_PIN_RATIO.
+    var warm: [4096]u32 = undefined;
+    for (&warm, 0..) |*x, i| x.* = if (i < 2048) @as(u32, @intCast(i + 1)) else @intCast(i + 5_000_001);
+
+    var src_cache = try KVCache.init(testing.allocator, 8);
+    defer src_cache.deinit();
+    try testFillCache(&src_cache, s, 8, 4096);
+    for (src_cache.entries) |*e| {
+        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+    }
+    try hc.commit(&src_cache, &session, false);
+
+    var slot_cache = try KVCache.init(testing.allocator, 8);
+    defer slot_cache.deinit();
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, null, s, &warm, false, 0, null, null);
+    try t.expectEqual(@as(usize, 2048), hit.matched);
+    try t.expect(hc.last_restored_used != null);
+
+    const Never = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            _ = ctx;
+            return false;
+        }
+    };
+    const rep = hc.evictLruToAdmit(786_369, null, Never.call, true);
+    try t.expectEqual(@as(usize, 0), rep.entries);
+    try t.expectEqual(@as(usize, 1), hc.entryCount());
+
+    // ...and the rule is SSD-first's. Off it, even the lien restores.
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc2.deinit();
+    hc2.restore_pin_min_bytes = 1 << 20;
+    var src2 = try KVCache.init(testing.allocator, 8);
+    defer src2.deinit();
+    try testFillCache(&src2, s, 8, 4096);
+    try hc2.commit(&src2, &session, false);
+    var cold: [4096]u32 = undefined;
+    for (&cold, 0..) |*x, i| x.* = if (i < 11) @as(u32, @intCast(i + 1)) else @intCast(i + 6_000_001);
+    var slot2 = try KVCache.init(testing.allocator, 8);
+    defer slot2.deinit();
+    var off2: usize = 0;
+    const hit2 = try hc2.lookupAndRestore(&slot2, &off2, null, s, &cold, false, 0, null, null);
+    try t.expectEqual(@as(usize, 11), hit2.matched);
 }
 
 test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
