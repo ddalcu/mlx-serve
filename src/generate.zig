@@ -1196,6 +1196,8 @@ pub const Generator = struct {
     mtp_drafted_tokens: u64 = 0,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
+    /// Speculative rounds that rolled recurrent state back on a partial accept.
+    partial_rounds: u64 = 0,
     /// Extension dry-spell gate: consecutive extension-CONSIDERED rounds
     /// whose confidence gate did not clear, and the single-chunk cooldown
     /// that a full dry streak triggers (see mtpExtDryAllows).
@@ -1540,7 +1542,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1549,6 +1551,7 @@ pub const Generator = struct {
                     self.mtp_depth,
                     self.mtp_drafted_tokens,
                     self.mtp_ext_rounds,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     @tagName(self.spec_disable_reason),
                     @tagName(self.mtp_adaptive.arm),
@@ -1585,7 +1588,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -1593,6 +1596,7 @@ pub const Generator = struct {
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
@@ -3683,6 +3687,7 @@ pub const Generator = struct {
                 const step_keep = kv_snap.step;
                 try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
                 self.ctx.cache.step = step_keep;
+                self.partial_rounds += 1;
                 for (self.ctx.ssm_entries.?) |*entry| {
                     try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
                 }
@@ -4676,6 +4681,7 @@ pub const Generator = struct {
                 if (self.ctx.ssm_entries) |entries| {
                     const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
                     if (!gdn_captured) return error.SpecRollbackUnavailable;
+                    self.partial_rounds += 1;
                     for (entries) |*entry| {
                         try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
                     }
