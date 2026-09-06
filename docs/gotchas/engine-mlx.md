@@ -5805,3 +5805,101 @@ always pooled — an exported `=0` can only turn the pool OFF, never arm it.
 `QWEN4_PLE_PREFETCH=0` still kills the pool outright; a pool that was never
 created serves neither width. Output is byte-identical on every arm — this is
 a read path, and the whole question is timing. Ledger row 21.
+
+## One leaked `mlx_array` per decode tick wedged the process at the 65,535 MTLSharedEvent cap (2026-09-06, qwen4_exp, M5 Max)
+
+**Symptom.** After ~98k decoded tokens over 185 requests, every request started
+failing and never recovered: `MLX error: [Event::Event] Failed to create Metal
+shared event`, on every later eval, until the process was killed. No OOM (21.9
+GB free at the wedge), nothing in the memory meters, no crash. `ioclasscount`
+on the wedged pid held **exactly 65,535** `IOSurfaceSharedEvent` — the 16-bit
+system cap — against 9 after the kill.
+
+**Mechanism.** MLX 0.32.2 mints one `MTLSharedEvent` per `eval_impl` call
+(`backend/metal/event.cpp:16`, the only `newSharedEvent` in the tree; there is
+no pool). In **async** mode that one event is stamped onto *every array of the
+tape* (`transforms.cpp:236-247`) and released only when the array is consumed by
+a later eval, read on the host, or destroyed. Decode ticks eval through
+`mlx_async_eval`; prefill evals synchronously and a sync eval stamps nothing.
+So **any array handle left alive after an async decode tick pins one Metal
+shared event forever**, and 65,535 of them wedge the process. A leak of one
+handle per tick reaches the cap in about a day of steady decoding.
+
+**The leak.** `transformer.ropeAngleRows` — the probe that reads the stock RoPE
+kernel's own cos|sin floats out for the fused decode QK-norm+RoPE kernels — had
+its YaRN arm written as
+
+```zig
+var scaled = mlx.mlx_array_new();
+errdefer _ = mlx.mlx_array_free(scaled);   // ← success path kept it
+...
+try mlx.check(mlx.mlx_multiply(&scaled, rotated, ms, s));
+var flat = mlx.mlx_array_new();            // ← no errdefer either
+try mlx.check(mlx.mlx_reshape(&flat, scaled, &flat_shape, 1, s));
+return flat;
+```
+
+`flat` is a reshape VIEW of `scaled` and holds its own reference, so `scaled`
+was the caller's to drop — but only the error path dropped it. `errdefer` on an
+intermediate reads like ownership hygiene and is the exact opposite of it: the
+error path was clean and the **success** path leaked, once per call.
+
+**Why one per TICK, and why only qwen4_exp.** `Transformer.qkAngleRowsFor`
+caches the table keyed on (family, offset, rd, rows) with a correct
+free-before-assign, so the 11 other full-attention layers of a forward hit the
+cache; the offset moves every tick, so exactly one rebuild — one leak — per
+tick. Measured rates matched to three digits: 1.000 leaked events per token
+with `--no-mtp`, 0.74/token with MTP (= 1 per tick), and 65,535 events over
+≈70-78k estimated ticks. The `mscale != 1.0` arm only runs when the model ropes
+with a YaRN attention factor, and the multi-row table only feeds the **hd-256**
+fused kernel — qwen4_exp is the one shipped arch that is both (head_dim 256 ×
+partial_rotary_factor 0.25, `rope_type: "yarn"`, factor 4.0 → mscale 1.1386).
+The qwen3.5 27B control engages the same kernel through the `mscale == 1.0`
+early return and leaks nothing, which is why the kill switch
+`MLX_SERVE_QK_NORM_ROPE_FUSED=0` removed the growth (738 → 8-18 events per 1k
+tokens) while the sibling arch never showed it.
+
+**Fix.** `defer` for `scaled` (the view keeps its own reference; the unscaled
+arm already did exactly this for `rotated`), plus the missing `errdefer` on
+`flat` in both arms — the fault sweep found that second one, an error-path leak
+of the whole probe→rope→reshape graph, on its own.
+
+**Oracle.** Events cannot be counted in-process (mlx-c exposes no array or
+event count), but a leaked handle also pins its buffer, so settled residency is
+the observable: `mlxSettledActiveBytes` (synchronize + `mlx_clear_cache`, so the
+number is a function of ownership alone) across the `mlx.fault` sweep that the
+`qwen4MtpForward` ownership audit already uses — here over **every** path of the
+probe including k == 0, the un-faulted success. Red-on-revert is exact: 256
+bytes at k == 0, mscale 1.1386 — one `[rd=64]` f32 table per call. The first
+form of the test (256 calls, free each, compare settled bytes) read
+"retained 65536 bytes over 256 calls", i.e. 256 bytes every time.
+
+**Measured, same tree (origin/main a93e2c0), same workload** (4 x W1 = 18,000
+decoded tokens, `ioclasscount IOSurfaceSharedEvent` on the live pid, Qwen3.8
+Flash Next mixed-4/8-bit, `--mtp`, M5 Max):
+
+| after | unfixed | fixed |
+|---|---:|---:|
+| W1 #1 | 3,406 | 1,195 |
+| W1 #2 | 6,822 | 997 |
+| W1 #3 | 10,519 | 1,066 |
+| W1 #4 | 14,426 | 1,111 |
+| **per 1k generated tokens** | **801.4** | **61.7 and falling** |
+
+Unfixed is dead linear — ~3,500 events per 4,500 tokens, i.e. the 65,535 cap at
+about 82k tokens, which is what the incident hit. Fixed does not grow at all:
+the same absolute ~1.1k for one W1 as for four, so it is bounded steady-state
+retention (live KV / prefix-cache arrays stamped by the last async eval), and
+both arms return to the pre-boot 9 on kill. Note the residual is a property of
+the tree: on the PR #363 tree the kernel-off arm reads 8-18 per 1k, on
+origin/main it reads ~284 for one W1 and saturates — same bounded set, measured
+over a shorter run.
+
+**Rules this leaves.** (1) An `errdefer` on an mlx handle the function does not
+return is a leak on the success path, not a guard — say why the success path may
+drop it (`defer`) or say who consumes it. (2) A view returned from a helper does
+not free the parent handle; the helper must. (3) A per-tick leak is invisible to
+every memory meter when the array is small — the meter that finds it is
+`ioclasscount IOSurfaceSharedEvent` on the live pid, and the in-process bar is a
+settled-residency balance across a fault sweep. Meter driver:
+`~/claude-tmp/bench-qwen4-ladder/incident-metal-event/leak_probe.sh`.

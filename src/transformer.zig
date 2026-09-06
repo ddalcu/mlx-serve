@@ -26010,16 +26010,23 @@ pub fn ropeAngleRows(
     try mlx.check(mlx.mlx_fast_rope(&rotated, probe, rd, false, base, 1.0, offset, freqs, s));
     if (mscale == 1.0) {
         var flat = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(flat);
         const flat_shape = [_]c_int{rows * rd};
         try mlx.check(mlx.mlx_reshape(&flat, rotated, &flat_shape, 1, s));
         return flat;
     }
+    // `defer`, not `errdefer`: the reshape below is a VIEW of `scaled`, which
+    // keeps its own reference, so the intermediate handle is ours to drop on
+    // the success path too. As an `errdefer` it survived every SUCCESSFUL call
+    // — one live array per decode tick, each pinning the `mlx_async_eval`
+    // event stamped on it, to the 65,535 MTLSharedEvent cap.
     var scaled = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(scaled);
+    defer _ = mlx.mlx_array_free(scaled);
     const ms = mlx.mlx_array_new_float(mscale);
     defer _ = mlx.mlx_array_free(ms);
     try mlx.check(mlx.mlx_multiply(&scaled, rotated, ms, s));
     var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
     const flat_shape = [_]c_int{rows * rd};
     try mlx.check(mlx.mlx_reshape(&flat, scaled, &flat_shape, 1, s));
     return flat;
@@ -43290,6 +43297,75 @@ test "qk norm rope fused: bit-identical incl. YaRN freqs + mscale (rd=64)" {
 
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pair[0], rq, s));
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pair[1], rk, s));
+    }
+}
+
+
+// The angle table the fused decode QK-norm+RoPE kernels read is rebuilt once
+// per decode tick (`qkAngleRowsFor` keys the cache on the offset, which moves
+// every tick), and on a YaRN model it is built through the `mscale != 1.0`
+// arm. That arm registered only an `errdefer` for its `scaled` intermediate,
+// so every SUCCESSFUL call left one live `mlx_array` behind. Decode evaluates
+// through `mlx_async_eval`, which stamps the tick's `MTLSharedEvent` onto
+// every array of the tape and releases it only when the array is consumed or
+// destroyed — so each leaked handle pinned one event and the process wedged at
+// the 65,535 IOSurfaceSharedEvent cap, every later eval dying with
+// "[Event::Event] Failed to create Metal shared event". qwen4_exp is the one
+// shipped arch that ropes with a YaRN mscale AND is hd 256 (so its
+// full-attention layers take the multi-row fused arm), which is why the
+// qwen3.5 sibling on the same kernel never leaked.
+//
+// Events are invisible in-process, but a leaked handle also pins its buffer,
+// so settled residency is the observable — the same oracle and fault sweep the
+// `qwen4MtpForward` ownership audit uses, here over EVERY path of the probe
+// including k == 0, the un-faulted success.
+test "ropeAngleRows hands back every array it builds, success path included" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+
+    // A YaRN-shaped denominator vector: `mlx_fast_rope` takes freqs OR base.
+    var freq_buf: [32]f32 = undefined;
+    for (&freq_buf, 0..) |*f, i| f.* = std.math.pow(f32, 10000000.0, @as(f32, @floatFromInt(i)) / 32.0);
+    const f_shape = [_]c_int{32};
+    const freqs = mlx.mlx_array_new_data(&freq_buf, &f_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(freqs);
+    try mlx.check(mlx.mlx_array_eval(freqs));
+    const no_base = mlx.mlx_optional_float{ .value = 0, .has_value = false };
+    // qwen4_exp geometry: head_dim 256 x partial_rotary_factor 0.25.
+    const rd: c_int = 64;
+
+    // 1.0 is the unscaled arm every non-YaRN model takes; the second value is
+    // the YaRN attention factor at `factor: 4.0` (0.1*ln(4)+1).
+    for ([_]f32{ 1.0, 1.1386294364929199 }) |mscale| {
+        // One un-faulted call warms the allocator and counts the checked ops
+        // the probe issues, which is the sweep's upper bound.
+        const c0 = mlx.op_count.load(.monotonic);
+        const warm = try ropeAngleRows(s, rd, no_base, freqs, 0, 1, allocator, mscale);
+        const n_ops = mlx.op_count.load(.monotonic) - c0;
+        try mlx.check(mlx.mlx_array_eval(warm));
+        _ = mlx.mlx_array_free(warm);
+        try testing.expect(n_ops >= 2);
+
+        var k: u64 = 0;
+        while (k <= n_ops) : (k += 1) {
+            const base = mlxSettledActiveBytes(s);
+            mlx.fault.arm(k); // arm(0) is a no-op arm: the SUCCESS path
+            const r = ropeAngleRows(s, rd, no_base, freqs, @intCast(k + 1), 1, allocator, mscale);
+            mlx.fault.disarm();
+            if (r) |a| {
+                // Eval materializes every array the call built, so a handle it
+                // kept for itself holds real Metal bytes the oracle can see.
+                try mlx.check(mlx.mlx_array_eval(a));
+                _ = mlx.mlx_array_free(a);
+            } else |err| try testing.expectEqual(error.MlxError, err);
+            const after = mlxSettledActiveBytes(s);
+            if (after != base) std.debug.print(
+                "[angle-rows] mscale={d} k={d}: base {d} after {d}\n",
+                .{ mscale, k, base, after },
+            );
+            try testing.expectEqual(base, after);
+        }
     }
 }
 
