@@ -3563,12 +3563,14 @@ pub const Generator = struct {
         // without re-running forward, and re-use them for both stochastic
         // accept tests and the correction sample.
         const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
+        var per_pos_logits_n: usize = 0;
         defer {
-            for (per_pos_logits) |arr| _ = mlx.mlx_array_free(arr);
+            for (per_pos_logits[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(per_pos_logits);
         }
         for (per_pos_logits, 0..) |*slot, idx| {
             slot.* = mlx.mlx_array_new();
+            per_pos_logits_n = idx + 1;
             const start = [_]c_int{ 0, @intCast(idx), 0 };
             const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
             try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
@@ -3854,8 +3856,9 @@ pub const Generator = struct {
         // `draft_arrs[i]` is the lazy [1] argmax output of drafter step i.
         // Owned here; freed at end of nextDrafter (after verify uses them).
         const draft_arrs = try allocator.alloc(mlx.mlx_array, m);
+        var draft_arrs_n: usize = 0;
         defer {
-            for (draft_arrs) |arr| _ = mlx.mlx_array_free(arr);
+            for (draft_arrs[0..draft_arrs_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(draft_arrs);
         }
 
@@ -3885,6 +3888,7 @@ pub const Generator = struct {
                 // Sample lazily — `sampleTokenLazy` for greedy returns the
                 // argmax as a [1]-shaped lazy array. NO eval here.
                 draft_arrs[i] = self.sampleLazy(step_out.logits);
+                draft_arrs_n = i + 1;
                 _ = mlx.mlx_array_free(step_out.logits);
 
                 // Roll h_prev forward.
@@ -3930,12 +3934,14 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            var drafts_2d_n: usize = 0;
             defer {
-                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
                 allocator.free(drafts_2d);
             }
             for (draft_arrs, drafts_2d) |dlazy, *out| {
                 out.* = mlx.mlx_array_new();
+                drafts_2d_n += 1;
                 try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
             }
             const vec = mlx.mlx_vector_array_new();
@@ -4705,12 +4711,14 @@ pub const Generator = struct {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
         } else {
             const sliced = try allocator.alloc(mlx.mlx_array, cap_out.len);
+            var sliced_n: usize = 0;
             defer {
-                for (sliced) |a| _ = mlx.mlx_array_free(a);
+                for (sliced[0..sliced_n]) |a| _ = mlx.mlx_array_free(a);
                 allocator.free(sliced);
             }
             for (cap_out, sliced) |full, *out| {
                 out.* = mlx.mlx_array_new();
+                sliced_n += 1;
                 const fsh = mlx.getShape(full);
                 const start = [_]c_int{ 0, 0, 0 };
                 const stop = [_]c_int{ 1, @intCast(n_commit), fsh[2] };
@@ -5672,12 +5680,14 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            var drafts_2d_n: usize = 0;
             defer {
-                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
                 allocator.free(drafts_2d);
             }
             for (draft_arrs[0..m], drafts_2d) |dlazy, *out| {
                 out.* = mlx.mlx_array_new();
+                drafts_2d_n += 1;
                 try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
             }
             const vec = mlx.mlx_vector_array_new();
@@ -5752,8 +5762,9 @@ pub const Generator = struct {
         const vl_shape = mlx.getShape(verify_logits);
 
         var per_pos_probs: ?[]mlx.mlx_array = null;
+        var per_pos_probs_n: usize = 0;
         defer if (per_pos_probs) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_probs_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         var accept_p_vec = mlx.mlx_array_new();
@@ -5761,8 +5772,9 @@ pub const Generator = struct {
         var accept_q_vec = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(accept_q_vec);
         var corr_samples: ?[]mlx.mlx_array = null;
+        var corr_samples_n: usize = 0;
         defer if (corr_samples) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..corr_samples_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         // Batched-corrections path: ONE [1+m] pre-sampled correction array
@@ -5799,6 +5811,7 @@ pub const Generator = struct {
             per_pos_probs = slots;
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_probs_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, probs_all, &start, 3, &stop, 3, &slice_strides, 3, s));
@@ -5808,12 +5821,14 @@ pub const Generator = struct {
             // draft id array → [m] f32 after one eval.
             {
                 const taken = try allocator.alloc(mlx.mlx_array, m);
+                var taken_n: usize = 0;
                 defer {
-                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
                     allocator.free(taken);
                 }
                 for (0..m) |k| {
                     taken[k] = mlx.mlx_array_new();
+                    taken_n = k + 1;
                     try mlx.check(mlx.mlx_take_axis(&taken[k], slots[k], draft_arrs[k], -1, s));
                 }
                 const vec = mlx.mlx_vector_array_new();
@@ -5829,12 +5844,14 @@ pub const Generator = struct {
             // the sampled draft, for the Leviathan ratio (sharp drafts only).
             if (q_probs) |qslots| {
                 const taken = try allocator.alloc(mlx.mlx_array, m);
+                var taken_n: usize = 0;
                 defer {
-                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
                     allocator.free(taken);
                 }
                 for (0..m) |k| {
                     taken[k] = mlx.mlx_array_new();
+                    taken_n = k + 1;
                     try mlx.check(mlx.mlx_take_axis(&taken[k], qslots[k], draft_arrs[k], -1, s));
                 }
                 const vec = mlx.mlx_vector_array_new();
@@ -5859,6 +5876,7 @@ pub const Generator = struct {
             corr_samples = corrs;
             for (corrs, 0..) |*slot, a| {
                 slot.* = mlx.mlx_array_new();
+                corr_samples_n = a + 1;
                 if (a < m) {
                     // residual = max(target_p − proposal, 0): the proposal is
                     // the FULL sharpened q distribution under sharp drafts
@@ -14687,4 +14705,94 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "errpath: spec-decode mlx_array fill loops free only the built prefix" {
+    // Review §5.1: `allocator.alloc(mlx_array, n)` + defer over the WHOLE
+    // slice + `try` in the fill. A mid-loop throw leaves later slots uninit
+    // (0xaa… / heap junk) and the defer `delete`s them. The counter shape
+    // (`for (buf[0..n])`) is what `mtpChainBuild` already uses. Needles are
+    // split so this test cannot satisfy itself.
+    const src = @embedFile("generate.zig");
+    const sites = [_]struct { tag: []const u8, needle: []const u8 }{
+        .{ .tag = "nextPld.per_pos_logits", .needle = "const per_pos_" ++ "logits = try allocator.alloc(mlx.mlx_array, 1 + m);" },
+        .{ .tag = "nextDrafter.draft_arrs", .needle = "const draft_" ++ "arrs = try allocator.alloc(mlx.mlx_array, m);" },
+        .{ .tag = "nextDrafter.drafts_2d", .needle = "const drafts_" ++ "2d = try allocator.alloc(mlx.mlx_array, m);" },
+        .{ .tag = "nextDflash.sliced", .needle = "const sliced = try allocator.alloc(mlx.mlx_array, cap_" ++ "out.len);" },
+        .{ .tag = "nextMtp.drafts_2d", .needle = "for (draft_arrs[0..m], drafts_" ++ "2d) |dlazy, *out|" },
+        .{ .tag = "nextMtp.slots", .needle = "per_pos_" ++ "probs = slots;" },
+        .{ .tag = "nextMtp.taken", .needle = "try mlx.check(mlx.mlx_take_" ++ "axis(&taken[k], slots[k], draft_arrs[k], -1, s));" },
+        .{ .tag = "nextMtp.corrs", .needle = "corr_" ++ "samples = corrs;" },
+    };
+    var missing: usize = 0;
+    var unguarded: usize = 0;
+    for (sites) |site| {
+        const at = std.mem.indexOf(u8, src, site.needle) orelse {
+            std.debug.print("[errpath-uninit] missing site {s}\n", .{site.tag});
+            missing += 1;
+            continue;
+        };
+        const lo = if (at > 2500) at - 2500 else 0;
+        const hi = @min(src.len, at + 900);
+        const win = src[lo..hi];
+        if (std.mem.indexOf(u8, win, "[0..") == null) {
+            std.debug.print("[errpath-uninit] {s} still frees the whole slice\n", .{site.tag});
+            unguarded += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), missing);
+    try testing.expectEqual(@as(usize, 0), unguarded);
+}
+
+test "errpath: a 2-slot fill loop frees only built handles on every faulted op" {
+    // Class pin for §5.1. HEAD's whole-slice defer `delete`s slot 1 while it
+    // is still uninitialised; the abort is the red half under a GPU stream.
+    // The guarded arm is the counter shape the 8 sites now use.
+    mlx.installErrorHandler();
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (s.ctx == null) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var host = [_]f32{ 1.5, 2.5, 3.5, 4.5 };
+    const shape = [_]c_int{ 2, 2 };
+    const seed = mlx.mlx_array_new_data(&host, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(seed);
+    try mlx.check(mlx.mlx_array_eval(seed));
+
+    const H = struct {
+        fn guarded(alloc: std.mem.Allocator, st: mlx.mlx_stream, src: mlx.mlx_array) !void {
+            const out = try alloc.alloc(mlx.mlx_array, 2);
+            var built: usize = 0;
+            defer {
+                for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
+                alloc.free(out);
+            }
+            for (out, 0..) |*slot, i| {
+                slot.* = mlx.mlx_array_new();
+                built = i + 1;
+                try mlx.check(mlx.mlx_multiply(slot, src, src, st));
+                try mlx.check(mlx.mlx_array_eval(slot.*));
+            }
+        }
+    };
+
+    const c0 = mlx.op_count.load(.monotonic);
+    try H.guarded(allocator, s, seed);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    try testing.expect(n_ops >= 2);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = H.guarded(allocator, s, seed);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |_| {} else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+        }
+    }
+    try testing.expectEqual(n_ops, fired);
 }
