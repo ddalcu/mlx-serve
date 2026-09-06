@@ -516,13 +516,16 @@ pub const EXPLORE_BLOCK: u32 = 3;
 /// period EXPLORE_PERIOD_COLD) it kept the neighbour's date — no trial for
 /// the whole request, `a[m_lo]` frozen at its seed, w1 for 45-91 rounds.
 ///
-/// GATED (PR #363 blast radius, ledger row 20): `reread` is the caller's arch
-/// answer, `schedulePeriodReread(table.layout)` at both call sites. The stall
-/// reproduces on a93e2c0 too, but the re-read moves WHICH rounds of a request
-/// carry a trial block (3-4% each), and the only schedule a sidecar-MTP pack
-/// or a DFlash block drafter was ever measured on is a93e2c0's arm-once one.
-/// `armed_at` is maintained on both arms and read only on the gated one, so
-/// an ungated schedule is byte-identical to a93e2c0.
+/// `reread` is a PARAMETER, not a policy: `schedulePeriodReread(table.layout)`
+/// answers it at both call sites, and since ae0574e it answers yes for EVERY
+/// layout (PR #363 ledger row 20). It shipped qwen4-only because the re-read
+/// moves WHICH rounds of a request carry a trial block (3-4% each) and no
+/// sidecar-MTP pack had been measured on it; then one was — Qwen3.8-27B
+/// 4-bit on an M4 Max, 4k 75.1 ungated vs 70.5-76.2 gated, 32k 53.1 vs 55.0,
+/// both inside the per-boot swing, first trial at round 20 not 136 — and the
+/// gate came off. `armed_at` is maintained on both arms; `reread = false` is
+/// a93e2c0's arm-once schedule and now survives only as what the
+/// characterization tests drive.
 pub const TrialSchedule = struct {
     trial_end: u32 = 0,
     next_trial: u32 = 0,
@@ -708,9 +711,12 @@ pub const WidthChooser = struct {
         if (self.trialTarget(t, bucket)) |target| {
             self.trial.startAt(round_idx);
             const period = trialPeriod(t.msPerTok(self.current, bucket), t.msPerTok(target, bucket));
-            // A block drafter is a sidecar arch: `.legacy`, so the schedule
-            // is a93e2c0's. The layout answers rather than a literal `false`
-            // so a future gated arch inherits the re-read with the grid.
+            // The chooser re-reads its period too: `schedulePeriodReread`
+            // answers yes for `.legacy` as well since ae0574e. UNMEASURED
+            // here — this consumer is opt-in (`MLX_SERVE_DFLASH_CHOOSER=1`)
+            // and the 27B numbers behind the ungating are the MTP consumer's.
+            // The layout answers rather than a literal so a layout can still
+            // opt out with a measurement.
             if (self.trial.force(round_idx, period, schedulePeriodReread(t.layout))) return .{ .width = target, .trial = true };
         }
         return .{ .width = self.current, .trial = false };

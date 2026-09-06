@@ -8957,12 +8957,12 @@ pub const Generator = struct {
     /// idempotent per round because `mtpRoundPlan` has two call sites.
     pub const MtpWidthTrial = round_cost.TrialSchedule;
 
-    /// `reread` is the ARCH answer (`round_cost.schedulePeriodReread`), not a
-    /// tuning flag: PR #363 ledger row 20. qwen4_exp re-reads the period every
-    /// round so a cold bucket cannot inherit a neighbour's 124-round date;
-    /// every sidecar-MTP pack keeps a93e2c0's arm-once schedule, since the
-    /// re-read moves which rounds carry a 3-4% trial block and no sidecar
-    /// arch was measured here.
+    /// `reread` is the LAYOUT answer (`round_cost.schedulePeriodReread`), not
+    /// a tuning flag: PR #363 ledger row 20. Every layout re-reads the period
+    /// since ae0574e, so a cold bucket cannot inherit a neighbour's 124-round
+    /// date. It shipped qwen4-only (the re-read moves which rounds carry a
+    /// 3-4% trial block, and no sidecar arch had been measured); the 27B
+    /// sidecar pack was then measured on an M4 Max and the gate came off.
     pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32, reread: bool) bool {
         return t.force(round_idx, period, reread);
     }
@@ -16050,8 +16050,8 @@ test "L27 characterization: a sidecar boot's width-trial SCHEDULE re-reads its p
             return null;
         }
     }.f;
-    try testing.expectEqual(@as(?u32, 136), run(false)); // a93e2c0
-    try testing.expectEqual(@as(?u32, 20), run(true)); // qwen4_exp
+    try testing.expectEqual(@as(?u32, 136), run(false)); // a93e2c0's arm-once
+    try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
 
     // The WIRING, not just the predicate: the one production call site reads
     // the table's own layout. Delete the argument and this arm stays green
