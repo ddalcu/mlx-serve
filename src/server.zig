@@ -429,10 +429,8 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 fn resolveKvAttnFused(explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
     const scheme: kv_quant_mod.Scheme = if (kv_override) |o|
         o.scheme
-    else if (global_scheduler) |sch|
-        sch.kv_quant_config.scheme
     else
-        .off;
+        configuredKvQuant().scheme;
     return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
 
@@ -609,6 +607,30 @@ fn getTimeoutNs() u64 {
 /// inference request handler routes through this; the scheduler's
 /// inference thread is the single mlx-call site.
 var global_scheduler: ?*scheduler_mod.Scheduler = null;
+
+/// The boot's parsed `--kv-quant`, published by `serve()` from the SAME
+/// `LoadParams.kv_quant_config` it is about to hand `Scheduler.init` — so it
+/// is readable during the LOAD, which is the whole point.
+///
+/// `Scheduler.init` performs the model load (and with it every load-time bill:
+/// the hot-cache budget, the prefill pin, the auto-context sizer) BEFORE
+/// `serve` assigns `global_scheduler`. A bill that asked the scheduler for the
+/// width therefore got the dense fallback on every boot: measured live
+/// 2026-09-06 on the deployed qwen4_exp pack at `--ctx-size 786432
+/// --kv-quant 8`, the SSD-first line billed one session at 22,464 MB (bf16,
+/// 29,952 B/tok) instead of 13,824 MB (18,432 B/tok) — ~8.6 GB of idle
+/// allowance the box affords and the cache never got, ~11 GB at 1M.
+var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
+
+/// THE process-wide kv-quant config, at any point in the process's life:
+/// the scheduler's once it exists, the boot's published value while the load
+/// that precedes it is still running, dense when no flag was given. One
+/// helper, because a load-time bill and the request-time guard that re-bills
+/// the same request must not answer with two different widths.
+fn configuredKvQuant() transformer_mod.KVQuantConfig {
+    if (global_scheduler) |sch| return sch.kv_quant_config;
+    return configured_kv_quant orelse transformer_mod.KVQuantConfig.dense;
+}
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
 /// `serve()`); handleConnection resolves `model` body fields against this
@@ -1273,6 +1295,12 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
+    // BEFORE `Scheduler.init`, because that call IS the model load and every
+    // load-time bill inside it asks for the KV width. The scheduler adopts this
+    // very value (`Scheduler.init`: `.kv_quant_config = params.kv_quant_config`),
+    // so the load and the requests that follow it bill one width.
+    configured_kv_quant = load_params.kv_quant_config;
+    defer configured_kv_quant = null;
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
     //    Transformer/vision/drafter load, JIT compile, and warmup before
@@ -2868,9 +2896,12 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// The process-wide KV width a request gets when it names none — the same
 /// expression `checkAttentionMemory` falls back to, so the sizer and the
 /// admission guard read one answer.
+///
+/// Through `configuredKvQuant`, so a LOAD-TIME bill gets the boot's
+/// `--kv-quant` and not the dense fallback: every one of them runs inside
+/// `Scheduler.init`, before there is a scheduler to ask.
 fn defaultKvBits() u64 {
-    const cfg: transformer_mod.KVQuantConfig =
-        if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense;
+    const cfg: transformer_mod.KVQuantConfig = configuredKvQuant();
     return if (cfg.scheme == .off) 16 else cfg.bits;
 }
 
@@ -3435,6 +3466,11 @@ pub fn resolvedContextForLoad(
 /// `computeMemoryContext` pass. The session this bills is the session
 /// `pinAutoContext` advertises a moment later; a reserve of its own here made
 /// them two numbers.
+///
+/// BITS ARE A PARAMETER, and the boot's configured width is what the caller
+/// must pass (`defaultKvBits`, which reads `configuredKvQuant`). Billing this
+/// session at bf16 on a `--kv-quant 8` boot is the 22,464-vs-13,824 MB defect;
+/// the tokens are the same either way, the per-token bill is not.
 fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
     return resolvedContextForLoad(
         server_config.max_context_size,
@@ -3446,6 +3482,18 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
         config.contextCap(),
     );
+}
+
+/// The BYTES the SSD-first budget floors at: one session at the working
+/// context, at the width the cache actually stores. The number the boot line
+/// prints as "one session at the working context (N MB)".
+///
+/// A helper rather than a spelled-out product at the call site so a test can
+/// run the boot's own arithmetic, and so the width this is billed at has ONE
+/// reader to point a scan at.
+fn ssdFirstSessionKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u64 {
+    return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk);
 }
 
 /// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included, so the
@@ -3633,8 +3681,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     const ssd_chunk: u64 = pinPrefillChunk(config);
     // NOT `getEffectiveContextLength`: on an auto boot it is still unpinned here
     // and re-derives through the cache ask (see `resolvedContextForLoad`).
-    const ssd_ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-        ssdFirstSessionTokensNow(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
+    const ssd_ctx_kv: u64 = ssdFirstSessionKvBytes(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
     // SSD-first takes the whole decision or none of it — ONE line here, so a
     // change to how `ctx_kv` / the transient reserve are computed above merges
     // without touching this arm.
@@ -4451,6 +4498,164 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
     try t.expect(floor_old > floor_now);
     try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
+}
+
+test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
+    // LIVE, twice on 2026-09-06, deployed flags (`--ctx-size 786432
+    // --kv-quant 8 --prefix-cache-disk ...`), on the 69 GB qwen4_exp pack:
+    //
+    //   [hot-cache] SSD-first budget 32704 MB = one session at the working
+    //   context (22464 MB) + 10240 MB idle
+    //
+    // and the SAME 22,464 MB with `--kv-quant off`. 22,464 MiB / 786,432
+    // tokens = 29,952 B/tok = the DENSE KV (24,576) + `statePerTokenBilled`
+    // (5,376) — i.e. the flag never reached the bill. At 8 bits the same
+    // session is 13,056 + 5,376 = 18,432 B/tok = 13,824 MB, so the budget took
+    // ~8.6 GB out of the idle allowance (~11 GB at 1M) for KV the cache never
+    // holds.
+    //
+    // CAUSE: `defaultKvBits` asked `global_scheduler`, and `serve` assigns that
+    // AFTER `Scheduler.init` — which is the call that performs the load, and
+    // with it every load-time bill. There was no scheduler to ask yet, so the
+    // dense fallback answered on every boot.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const MiB: u64 = 1 << 20;
+    // One copy of the QSA history + the score bank, as the deployed pack bills
+    // it — the `statePerTokenBilled` half of both numbers below.
+    transformer_mod.qsa_history_share_override = true;
+    defer transformer_mod.qsa_history_share_override = null;
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+    try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
+    try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
+
+    // The deployed boot: an explicit `--ctx-size`, so the session is 786,432
+    // tokens whatever the box's ceiling is and the two numbers below differ in
+    // the WIDTH and in nothing else.
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 786_432;
+    const ceiling: u64 = 109_395 * MiB;
+    const active: u64 = 69_827 * MiB;
+    const chunk: u32 = cfg.pinned_prefill_chunk;
+
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+
+    // `--kv-quant 8`, no scheduler yet: exactly the state the load runs in.
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    try t.expectEqual(@as(u64, 8), defaultKvBits());
+    try t.expectEqual(
+        @as(u64, 13_824 * MiB),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(), ceiling, active, chunk),
+    );
+
+    // `--kv-quant off` keeps bf16 — the flag's absence is not a regression to
+    // fix, it is the answer.
+    configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    try t.expectEqual(@as(u64, 16), defaultKvBits());
+    try t.expectEqual(
+        @as(u64, 22_464 * MiB),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(), ceiling, active, chunk),
+    );
+    // ...and so does a process that has published nothing at all (the offline
+    // path, and every test that never booted a server).
+    configured_kv_quant = null;
+    try t.expectEqual(@as(u64, 16), defaultKvBits());
+
+    // What the defect cost, at the deployed context: the whole difference comes
+    // out of the idle allowance, because the budget is one session PLUS idle.
+    const idle: u64 = 10 * 1024 * MiB;
+    const transient: u64 = prefillTransientReserve(&cfg, 8, chunk);
+    const at8 = ssdFirstPrefixCacheMem(idle, ceiling, active, 13_824 * MiB, transient);
+    const at16 = ssdFirstPrefixCacheMem(idle, ceiling, active, 22_464 * MiB, transient);
+    try t.expectEqual(@as(u64, 8_640 * MiB), at16 -| at8);
+}
+
+test "the SSD-first budget's session bill and the boot line are ONE quantity" {
+    // The log prints `ctx_kv` and the floor is `ctx_kv + idle`; if the bill
+    // moves with the configured width, so must both. Scan + arithmetic, so a
+    // future edit cannot fix the helper and leave the call site spelling the
+    // product out again at whatever width was handy.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const helper = "ssdFirstSession" ++ "KvBytes(";
+    const site = declBody(src, "pub fn prefixCacheMemForLoad(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, site, helper) != null);
+    // ONE definition, and the call site does not re-derive the product.
+    try t.expectEqual(@as(usize, 1), countDecls(src, "fn " ++ helper));
+
+    const cfg = qwen4RequestTestConfig();
+    const MiB: u64 = 1 << 20;
+    const ceiling: u64 = 109_395 * MiB;
+    const active: u64 = 69_827 * MiB;
+    const chunk: u32 = cfg.pinned_prefill_chunk;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) +| statePerTokenBilled(&cfg);
+    try t.expectEqual(
+        per_tok *| @as(u64, ssdFirstSessionTokensNow(&cfg, 8, ceiling, active, chunk)),
+        ssdFirstSessionKvBytes(&cfg, 8, ceiling, active, chunk),
+    );
+}
+
+test "no load-time bill reads a KV width the boot did not configure" {
+    // CLASS guard. Every load-time bill runs INSIDE `Scheduler.init`, before
+    // `global_scheduler` exists, so any site that asks the scheduler directly
+    // for the kv-quant config silently bills bf16 on a quantized boot — the
+    // 22,464-vs-13,824 MB defect, once per site. There is ONE reader of the
+    // scheduler's field left (`configuredKvQuant`), and it falls back to the
+    // boot's published value before it falls back to dense.
+    //
+    // Needles split so this scan's own source cannot satisfy them.
+    const t = std.testing;
+    const src = @embedFile("server.zig");
+    const one = "configured" ++ "KvQuant()";
+    const sched_read = "sch.kv_" ++ "quant_config";
+
+    // The width helper reads the ONE source, and no longer the scheduler.
+    const bits = declBody(src, "fn defaultKv" ++ "Bits(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, bits, one) != null);
+    try t.expect(std.mem.indexOf(u8, bits, sched_read) == null);
+    try t.expect(std.mem.indexOf(u8, bits, "KVQuantConfig." ++ "dense") == null);
+
+    // Every load-time bill takes its width from that helper, and none of them
+    // spells a width (or a scheme) by hand.
+    for ([_][]const u8{
+        "pub fn prefixCacheMemForLoad(",
+        "pub fn pinPrefillChunk(",
+        "fn computeMemoryContext(",
+        "pub fn aneGateHeadroom(",
+    }) |decl| {
+        const body = declBody(src, decl) orelse return error.CallSiteMoved;
+        std.testing.expect(std.mem.indexOf(u8, body, "defaultKv" ++ "Bits()") != null) catch |err| {
+            std.debug.print("load-time bill does not read the configured width: {s}\n", .{decl});
+            return err;
+        };
+        try t.expect(std.mem.indexOf(u8, body, sched_read) == null);
+        try t.expect(std.mem.indexOf(u8, body, "KVQuantConfig." ++ "dense") == null);
+    }
+
+    // ONE reader of the scheduler's field in the whole module, and it is the
+    // helper. (The request-time admission bill reads the same helper, with the
+    // per-request override in front of it — two spellings of the process-wide
+    // default is how one of them goes stale.)
+    var reads: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, sched_read)) |at| {
+        i = at + 1;
+        reads += 1;
+    }
+    try t.expectEqual(@as(usize, 1), reads);
+    const helper_body = declBody(src, "fn configured" ++ "KvQuant(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, helper_body, sched_read) != null);
+    try t.expect(std.mem.indexOf(u8, helper_body, "configured_kv" ++ "_quant orelse") != null);
+
+    // ...and the boot publishes it BEFORE the call that performs the load.
+    const serve_body = declBody(src, "pub fn serve(") orelse return error.CallSiteMoved;
+    const pub_at = std.mem.indexOf(u8, serve_body, "configured_kv" ++ "_quant = load_params.kv_quant_config;") orelse
+        return error.PublishMissing;
+    const init_at = std.mem.indexOf(u8, serve_body, "scheduler_mod.Scheduler." ++ "init(") orelse
+        return error.LoadCallMoved;
+    try t.expect(pub_at < init_at);
 }
 
 test "an explicit --ctx-size boot never consults the session reserve" {
@@ -6386,8 +6591,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
 
-    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
-        (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
+    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse configuredKvQuant();
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
