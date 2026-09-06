@@ -6485,7 +6485,7 @@ pub const SSMCacheEntry = struct {
     qsa_key_rows: c_int = 0,
     /// Pooled-bank accelerators, same discipline: `qsa_pooled_buf` is the capacity buffer
     /// `qsa_pooled` views; `qsa_score_bank` is the f32 `[B, 1, hd, nb]` score operand,
-    /// rebuilt only when a block completes.
+    /// a view of `qsa_score_buf`, which grows by appended columns as blocks complete.
     qsa_pooled_buf: mlx.mlx_array = .{ .ctx = null },
     qsa_pooled_blocks: c_int = 0,
     qsa_score_bank: mlx.mlx_array = .{ .ctx = null },
@@ -8771,13 +8771,15 @@ pub const PlePending = struct {
     capture: bool,
 };
 
-/// The QSA pooled-block RoPE tables for one forward: every full-attention layer ropes the
-/// same blocks at the same positions, so they are a property of the forward (qwen4_exp
-/// rebuilt them 12 times). The key carries `gen` and the `ForwardCtx` pointer because the
-/// M-RoPE arm also reads the ctx's position table.
+/// The QSA pooled-block RoPE tables, shared by every full-attention layer of a forward
+/// and across forwards while the key holds. The key is the block position (`base`,
+/// `step`, `n`, dtype) and, on the M-RoPE arm, the position table compared by pointer
+/// and length only; it is never dereferenced through the key. The table's owner slot
+/// frees it only after `markQsaPooledRopeStale`, and the one free site is scan-pinned,
+/// so a same-address table cannot hit. Connection threads write nothing here except
+/// the atomic `stale`; the inference thread frees and rebuilds. Hashing the table's
+/// contents into the key would turn this address compare into a use after free.
 const QsaPooledRope = struct {
-    gen: u64 = 0,
-    ctx: ?*const ForwardCtx = null,
     base: c_int = 0,
     step: c_int = 0,
     n: c_int = 0,
@@ -8797,7 +8799,6 @@ const QsaPooledRope = struct {
         if (self.sin.ctx != null) _ = mlx.mlx_array_free(self.sin);
         self.cos = .{ .ctx = null };
         self.sin = .{ .ctx = null };
-        self.ctx = null;
         self.mrope_pos = null;
         self.stale.store(false, .monotonic);
     }
@@ -9882,9 +9883,9 @@ pub const Transformer = struct {
     qsa_consts: QsaBlockConsts = .{},
     /// QSA pooled-block cos/sin, built once per forward (`QsaPooledRope`).
     qsa_pooled_rope: QsaPooledRope = .{},
-    /// Bumped by every forward entry that can reach QSA; part of the `qsa_pooled_rope` key.
+    /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
     fwd_gen: u64 = 0,
-    /// Test meter: how many times `qsaScoreBank` rebuilt the transposed f32 operand.
+    /// Test meter: how many times `qsaScoreBank` built or extended the transposed f32 operand.
     qsa_score_bank_builds: usize = 0,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
@@ -15355,8 +15356,6 @@ pub const Transformer = struct {
             try self.ropeCosSinFromFreqs(rope_dims, try self.ropeInvFreq(rope_dims, self.config.rope_theta), @floatFromInt(base), @floatFromInt(step), n, dt);
         c.cos = cs.cos;
         c.sin = cs.sin;
-        c.gen = self.fwd_gen;
-        c.ctx = ctx;
         c.base = base;
         c.step = step;
         c.n = n;
@@ -45611,7 +45610,7 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     defer _ = mlx.mlx_array_free(per_layer);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(hoisted, per_layer, s));
 
-    // A new forward rebuilds (the M-RoPE arm's position table is not in the key).
+    // A new forward at the same position hits: the forward counter is not in the key.
     t.fwd_gen += 1;
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
