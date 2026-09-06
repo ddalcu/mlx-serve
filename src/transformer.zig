@@ -6181,24 +6181,32 @@ pub const KVCache = struct {
         const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
         if (initialized and offset > 0) {
             var new_buf = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(new_buf);
             try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
             const off_c: c_int = @intCast(offset);
             const su_start = [_]c_int{ 0, 0, 0, 0 };
             const su_stop = [_]c_int{ B, heads, off_c, last_dim };
             const su_strides = [_]c_int{ 1, 1, 1, 1 };
             var old_data = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(old_data);
             try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
             var updated = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(updated);
             try mlx.check(mlx.mlx_slice_update(&updated, new_buf, old_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
             _ = mlx.mlx_array_free(old_data);
+            old_data = .{ .ctx = null };
             _ = mlx.mlx_array_free(new_buf);
+            new_buf = .{ .ctx = null };
             _ = mlx.mlx_array_free(buf.*);
             buf.* = updated;
+            updated = .{ .ctx = null };
         } else {
-            _ = mlx.mlx_array_free(buf.*);
             var new_buf = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(new_buf);
             try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
+            _ = mlx.mlx_array_free(buf.*);
             buf.* = new_buf;
+            new_buf = .{ .ctx = null };
         }
     }
 
@@ -44574,6 +44582,36 @@ fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     return active;
 }
 
+/// `mlx_metal_is_available` is true for a Metal-enabled build even when this
+/// process has no GPU (headless / sandboxed). A 2x2 zeros+eval is the real
+/// gate for the fault-injection tests below.
+fn mlxDeviceUsable() bool {
+    // `mlx_metal_is_available` is true for a Metal-enabled build even when
+    // this process cannot create a GPU stream (headless / sandboxed). Probe
+    // a real stream + a 1x1 zeros so leak tests skip instead of exit(-1).
+    mlx.installErrorHandler();
+    var trash: [256]u8 = undefined;
+    if (mlx.errorPending()) _ = mlx.takeError(&trash);
+    if (mlx.noGpuBackend()) return false;
+    const s = mlx.gpuStream();
+    if (s.ctx == null) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    const shape = [_]c_int{ 1, 1 };
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    if (mlx.mlx_zeros(&a, &shape, 2, .float32, s) != 0) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    if (mlx.mlx_array_eval(a) != 0) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    return true;
+}
+
 // ── Handle-ownership class scans (PR #363 ledger 23) ────────────────────────
 //
 // #353 changed what an MLX failure COSTS: mlx-c's default handler called
@@ -44814,6 +44852,107 @@ test "takeContig releases `view` exactly once on every faulted op (CPU stream, n
         }
     }
     try testing.expectEqual(@as(usize, 2), fired);
+}
+
+test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a CPU stream" {
+    // Negative control for the series. A CPU-stream 4 MiB eval is MlxError
+    // here and `mlxSettledActiveBytes` on a CPU stream is mlx-c `exit(-1)`, so
+    // the leak oracle is the GPU-gated shape already in this file (`mlx check
+    // fault injection`). A deliberate leak of one eval'd 4 MiB array must move
+    // settled active bytes by more than half the array.
+    if (!mlxDeviceUsable()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const n_elem: usize = 1 << 20; // 4 MiB, well above allocator noise
+    const host = try allocator.alloc(f32, n_elem);
+    defer allocator.free(host);
+    @memset(host, 1.5);
+    const shape = [_]c_int{@intCast(n_elem)};
+    const threshold = (n_elem * @sizeOf(f32)) / 2;
+    const s = mlx.gpuStream();
+    const seed = mlx.mlx_array_new_data(host.ptr, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(seed);
+    try mlx.check(mlx.mlx_array_eval(seed));
+    const base = mlxSettledActiveBytes(s);
+    var leaked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&leaked, seed, seed, s));
+    try mlx.check(mlx.mlx_array_eval(leaked));
+    const after = mlxSettledActiveBytes(s);
+    std.debug.print("[errpath-oracle] GPU 4MiB: base={d} after={d} delta={d} threshold={d}\n", .{
+        base, after, after -| base, threshold,
+    });
+    _ = mlx.mlx_array_free(leaked);
+    try testing.expect(after > base + threshold);
+}
+
+test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
+    // Source-order pin for the live double free: HEAD frees `buf.*` then
+    // `mlx_zeros`. A failed zeros (the most likely OOM in the tree) leaves
+    // the caller's handle holding a freed ctx; `freeKVEntry` frees it again.
+    // Bound the function by the next method so a short window cannot pick up
+    // `buildSliceView`'s else. The runtime abort test below is the other half.
+    const src = @embedFile("transformer.zig");
+    const needle = "fn grow" ++ "QuantBuf(";
+    const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
+    const end = std.mem.indexOfPos(u8, src, start + needle.len, "fn writeAtOffset(") orelse return error.HelperMoved;
+    const body = src[start..end];
+    const else_at = std.mem.lastIndexOf(u8, body, "} else {") orelse return error.ElseArmMoved;
+    const arm = body[else_at..];
+    const zeros_at = std.mem.indexOf(u8, arm, "mlx_zeros(&new_buf") orelse return error.ZerosMoved;
+    const free_at = std.mem.indexOf(u8, arm, "mlx_array_free(buf.*)") orelse return error.FreeMoved;
+    if (zeros_at >= free_at) std.debug.print("[growQuantBuf] else-arm order: zeros@{d} free@{d}\n", .{ zeros_at, free_at });
+    try testing.expect(zeros_at < free_at);
+}
+
+test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no double free)" {
+    // HEAD frees `buf.*` THEN calls `mlx_zeros`. A latched OOM (or `arm(k)`)
+    // returns with the caller's handle holding a freed, non-null ctx;
+    // `freeKVEntry` then frees it again and the process aborts. That abort is
+    // the red half, matching `takeContig`. After the fix the old buffer stays
+    // owned across the fallible alloc, so the post-error free is legal.
+    if (!mlxDeviceUsable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const heads: c_int = 1;
+    const last_dim: c_int = 4;
+    const old_cap: c_int = 2;
+    const new_cap: c_int = 8;
+    const old_shape = [_]c_int{ B, heads, old_cap, last_dim };
+
+    var warm = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(warm));
+    const c0 = mlx.op_count.load(.monotonic);
+    try KVCache.growQuantBuf(s, &warm, false, 0, new_cap, B, heads, last_dim, .float32);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    try mlx.check(mlx.mlx_array_eval(warm));
+    try testing.expectEqual(@as(c_int, new_cap), mlx.getShape(warm)[2]);
+    _ = mlx.mlx_array_free(warm);
+    try testing.expect(n_ops >= 1);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        var buf = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(buf));
+        mlx.fault.arm(k);
+        const r = KVCache.growQuantBuf(s, &buf, false, 0, new_cap, B, heads, last_dim, .float32);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |_| {
+            // Unreachable for k in 1..=n_ops: the un-faulted run counted those
+            // ops. Free the replacement so a silent success is not a leak.
+            _ = mlx.mlx_array_free(buf);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+            // The load-bearing assertion: this free must be legal. On HEAD it
+            // is a double free and the test binary aborts here.
+            _ = mlx.mlx_array_free(buf);
+        }
+    }
+    try testing.expectEqual(n_ops, fired);
 }
 
 test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
