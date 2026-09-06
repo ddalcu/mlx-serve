@@ -4035,6 +4035,12 @@ flag and without it** — the tell. At 8 bits it is 13,824 MB (18,432 B/tok), so
 the budget took ~8.6 GB of idle allowance (~11 GB at 1M) for KV the cache never
 holds.
 
+### Class A — round 5: the fused QSA kernel's dense arm was the prefill kernel
+
+| # | site | reach | class | what |
+|---|---|---|---|---|
+| 18 | `transformer.qsaSparseAttn`'s dense-KV arm | **qwen4_exp only** — QSA layers exist on no other arch, so the blast radius off qwen4 is zero by construction, not by a gate | **A — regression fix, ungated** | The PR's new fused kernel is tried first at verify widths. On `--kv-quant off` its "dense arm" handed the call to `gatherQsa256`, the PREFILL kernel, whose grid is one threadgroup per (row, kv head) — 8 threadgroups at S=4 / Hk=2, no split-K. It pre-empted `qsaVerifyGatherAttn`, the arm a93e2c0 ran there: **16k fp16 decode 77.7 vs 93.6 tok/s, -17% at equal acceptance**. 16k kv8 (the quantized arm, the one that was measured) ties; 8k fp16 ties, because the verify kv floor blocks both trees. Now `qsaSparseAttnServes(has_quant_triple, seq_len, min_s)` — one pure predicate — declines a dense cache, so dense KV falls through to the union gather exactly as at a93e2c0. `MLX_SERVE_QSA_ATTN_KERNEL=0` is unmoved and still evaluated first. Story: `docs/gotchas/engine-mlx.md`, "A fused kernel's dense arm was the PREFILL kernel at a verify width" |
+
 ### The rule this leaves
 
 A "qwen4_exp long-context" change that touches a shared function is a

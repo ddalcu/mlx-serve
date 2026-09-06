@@ -85,10 +85,14 @@ longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['e
 lm=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$longm" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])")
 check "needle recovered under MTP" "$(echo "$lm" | grep -c 'PELICAN-42')" "1"
 # Verify widths (S=2..15): the fused QSA kernel `[qsa-attn] engaged` serves them
-# first; `splitMaskedSdpa256` (`[sdpa-split] masked arm engaged`) is the arm
-# behind it — reached through the verify gather or the dense mask, and selected
-# outright by MLX_SERVE_QSA_ATTN_KERNEL=0. Either satisfies the invariant.
-check "verify-width masked attention arm engaged" "$(grep -cE '\[qsa-attn\] engaged|\[sdpa-split\] masked arm engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
+# first, but ONLY on a quantized cache — this boot passes no `--kv-quant`, so
+# the cache is dense and the fused kernel declines by design (#363: its old
+# dense arm was the PREFILL kernel at a verify width). The arms that serve here
+# are the union gather `[qsa-verify-gather] engaged` past its kv floor and,
+# below that, `splitMaskedSdpa256` (`[sdpa-split] masked arm engaged`) under the
+# dense mask. Any of the three satisfies the invariant; naming one would pin a
+# dispatch priority that moves.
+check "verify-width masked attention arm engaged" "$(grep -cE '\[qsa-attn\] engaged|\[qsa-verify-gather\] engaged|\[sdpa-split\] masked arm engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 echo "[6] MTP head: engagement + greedy equivalence"
 base=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 mtp=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":true}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")

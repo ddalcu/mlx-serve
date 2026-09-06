@@ -3879,6 +3879,29 @@ pub fn qsaAttnMinS() c_int {
     return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
+/// Does the fused sparse-attention kernel serve this call? A pure function of
+/// the three things that decide it, so the arm choice is pinned without a GPU.
+///
+/// The `has_quant_triple` conjunct carries the whole finding. There is no
+/// fused DENSE arm and there never was one: `--kv-quant off` was served by
+/// handing the call to `gatherQsa256`, the PREFILL kernel, whose grid is one
+/// threadgroup per (row, kv head) — 8 threadgroups at S=4 / Hk=2 / nsg=3,
+/// which starves the GPU exactly the way S == 1 does. It has no split-K, so
+/// nothing recovers the grid at a verify width. Measured at 16k fp16: decode
+/// 77.7 vs 93.6 tok/s, -17% against `qsaVerifyGatherAttn` — the arm it
+/// pre-empted, and the arm a93e2c0 ran there (#363). The caller's own
+/// contract already said so ("a verify-width selection must never fall into
+/// [the prefill kernel]"); this conjunct is that sentence, enforced.
+///
+/// Dense KV therefore falls through to `qsaVerifyGatherAttn`, whose union
+/// gather reads ~2049 of the kv rows and hands them to a masked SDPA. The
+/// kill switch is unmoved: `MLX_SERVE_QSA_ATTN_KERNEL=0` still restores the
+/// union gather for the quantized arm too.
+pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int, min_s: c_int) bool {
+    if (seq_len < min_s or seq_len >= FUSED256_MIN_Q_LEN) return false;
+    return has_quant_triple;
+}
+
 var qsa_attn_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
@@ -4096,8 +4119,8 @@ var qsa_attn_engaged_bits: OneShotBits = .{};
 /// plus its own tail, reading the packed KV triples in-kernel. Null = declined
 /// — the caller keeps `qsaVerifyGatherAttn` and, below that, the dense mask.
 ///
-/// `--kv-quant off` needs no kernel of its own here: `gatherQsa256` has no
-/// q-length floor, so the dense arm is that kernel called at this width.
+/// QUANTIZED KV only. A dense cache declines here and is served by the union
+/// gather; `qsaSparseAttnServes` carries the reason and the measurement.
 pub fn qsaSparseAttn(
     s: mlx.mlx_stream,
     q_rope: mlx.mlx_array, // [1, Hq, S, 256] bf16, post-RoPE
@@ -4118,7 +4141,11 @@ pub fn qsaSparseAttn(
     // with split-K, S == 1 has a real grid, so whether the fused kernel beats
     // `qsaDecodeGatherAttn` there is a measurement, and the lever is how it
     // gets made. Prefill keeps `gatherQsa256`.
-    if (seq_len < qsaAttnMinS() or seq_len >= FUSED256_MIN_Q_LEN) return null;
+    //
+    // A DENSE cache declines on the same line: this kernel reads packed
+    // triples, and the "dense arm" that used to stand in for it was the
+    // prefill kernel at a verify width. See `qsaSparseAttnServes`.
+    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, qsaAttnMinS())) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
@@ -4129,23 +4156,6 @@ pub fn qsaSparseAttn(
     _ = bs[2];
     if (ratio <= 0) return null;
 
-    // Dense cache: the prefill kernel already IS this kernel's dense arm.
-    if (!kv_view.has_quant_triple) {
-        if (kv_view.k.ctx == null or kv_view.v.ctx == null) return null;
-        const dense = (try gatherQsa256(s, q_rope, kv_view.k, kv_view.v, attn_scale, blocks, ratio)) orelse return null;
-        // Bit +8: the two arms must not share a one-shot slot, or whichever
-        // ran first would silence the other's engagement line for the process.
-        // +8 keeps the dense arm's bits disjoint from the quantized arm's.
-        // The widen is explicit rather than resting on `qsaWidthBucket`
-        // returning `u2` two hundred lines away: at `u3` the sum wraps a `u5`.
-        if (qsa_attn_engaged_bits.take(@as(u5, @intCast(@as(u8, qsaWidthBucket(seq_len)) + 8)))) {
-            log.info(
-                "[qsa-attn] engaged (S={d} kv={d} quant=off) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather\n",
-                .{ seq_len, mlx.getShape(kv_view.k)[2] },
-            );
-        }
-        return dense;
-    }
     if (kv_view.bits != 4 and kv_view.bits != 8) return null;
     if (kv_view.group_size == 0 or @rem(@as(c_int, 256), @as(c_int, @intCast(kv_view.group_size))) != 0) return null;
     // One quant group per 8-dim staging chunk: a group must never split one.
@@ -40291,7 +40301,7 @@ fn qsaAttnCacheFixture(
     return try cache.update(0, k1, v1, s, 0);
 }
 
-test "qsa sparse attn: one fused dispatch equals the union gather at verify widths (dense + affine-8, strided cache)" {
+test "qsa sparse attn: one fused dispatch equals the union gather at verify widths (affine-8 strided cache; dense declines)" {
     // (a) The bar is the arm this replaces. Both produce bf16 `[1,Hq,S,256]`
     // from the SAME selection, so a difference can only be reduction order —
     // the fused kernel accumulates per row over its own blocks in one online
@@ -40366,19 +40376,27 @@ test "qsa sparse attn: one fused dispatch equals the union gather at verify widt
         defer _ = mlx.mlx_array_free(mask);
         const scale: f32 = 1.0 / 16.0;
 
-        // Dense arm: `gatherQsa256` at this width. Reference is the dense
-        // [S, kv] mask SDPA — the contract both arms implement.
+        // Dense arm: there ISN'T one. `qsaSparseAttn` declines a dense cache
+        // outright (#363) — its old dense arm was `gatherQsa256`, the prefill
+        // kernel, whose grid is 8 threadgroups at this width. So the parity
+        // bar for `--kv-quant off` is the arm that actually serves it, on the
+        // same shapes the fused kernel is measured on below.
         var dview = DenseKVView{ .k = k_dense, .v = v_dense, .owned = false };
-        const got_d = (try qsaSparseAttn(s, q, &dview, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
-        defer _ = mlx.mlx_array_free(got_d);
+        try std.testing.expect((try qsaSparseAttn(s, q, &dview, blocks, ratio, scale)) == null);
         const ref_d = try attn256Reference(q, k_dense, v_dense, scale, "array", mask, s);
         defer _ = mlx.mlx_array_free(ref_d);
-        const dd = try attn256MaxDiff(got_d, ref_d, s);
-        const dc = try attn256Cosine(got_d, ref_d, s);
-        const d_bar = try attn256UlpBar(ref_d, s);
-        std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} dense: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), dd, dc, d_bar });
-        try std.testing.expect(dc > 0.99999);
-        try std.testing.expect(dd <= d_bar);
+        // The union gather has a no-win decline of its own (a selection that
+        // covers the whole cache buys nothing); where it fires the dense mask
+        // arm serves and there is no second implementation to compare.
+        if (try qsaVerifyGatherAttn(s, q, &dview, blocks, ratio, scale)) |got_d| {
+            defer _ = mlx.mlx_array_free(got_d);
+            const dd = try attn256MaxDiff(got_d, ref_d, s);
+            const dc = try attn256Cosine(got_d, ref_d, s);
+            const d_bar = try attn256UlpBar(ref_d, s);
+            std.debug.print("[qsa-attn] S={d} kv={d} kb={d} gqa={d} dense->union gather: max diff {d:.6} cos {d:.7} (bar {d:.6})\n", .{ c.s, c.kv, c.kb, @divExact(c.hq, c.hkv), dd, dc, d_bar });
+            try std.testing.expect(dc > 0.99999);
+            try std.testing.expect(dd <= d_bar);
+        }
 
         // Packed arm: a REAL affine-8 cache, filled in two appends so the
         // view is a strided slice of a larger capacity buffer.
@@ -40610,32 +40628,89 @@ test "qsa dispatch: each arm's width floor is its own (MIN_S never moves the uni
     // arms are pure functions of (seq_len, fused_min_s) once `qsa_ok` holds.
     const Arm = enum { fused, decode_gather, union_gather, dense_mask };
     const pick = struct {
-        fn f(seq_len: c_int, min_s: c_int) Arm {
-            if (seq_len >= min_s and seq_len < FUSED256_MIN_Q_LEN) return .fused;
+        fn f(quant: bool, seq_len: c_int, min_s: c_int) Arm {
+            // The fused arm's own predicate, called rather than restated:
+            // a model that paraphrases the code under test can agree with a
+            // version of it that no longer exists.
+            if (qsaSparseAttnServes(quant, seq_len, min_s)) return .fused;
             if (seq_len == 1) return .decode_gather;
             if (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) return .union_gather;
             return .dense_mask;
         }
     }.f;
 
-    // Shipped default: decode gathers, 2..15 fused, prefill falls through.
-    try std.testing.expectEqual(Arm.decode_gather, pick(1, QSA_ATTN_MIN_S_DEFAULT));
-    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(sq, QSA_ATTN_MIN_S_DEFAULT));
-    try std.testing.expectEqual(Arm.dense_mask, pick(FUSED256_MIN_Q_LEN, QSA_ATTN_MIN_S_DEFAULT));
+    // Shipped default on a QUANTIZED cache: decode gathers, 2..15 fused,
+    // prefill falls through.
+    try std.testing.expectEqual(Arm.decode_gather, pick(true, 1, QSA_ATTN_MIN_S_DEFAULT));
+    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(true, sq, QSA_ATTN_MIN_S_DEFAULT));
+    try std.testing.expectEqual(Arm.dense_mask, pick(true, FUSED256_MIN_Q_LEN, QSA_ATTN_MIN_S_DEFAULT));
 
     // MIN_S=6 narrows the fused kernel and NOTHING else. This is the bug:
     // S=2..5 must land on the union gather, never on the dense mask.
-    try std.testing.expectEqual(Arm.decode_gather, pick(1, 6));
-    for ([_]c_int{ 2, 3, 4, 5 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(sq, 6));
-    for ([_]c_int{ 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(sq, 6));
+    try std.testing.expectEqual(Arm.decode_gather, pick(true, 1, 6));
+    for ([_]c_int{ 2, 3, 4, 5 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(true, sq, 6));
+    for ([_]c_int{ 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(true, sq, 6));
 
     // MIN_S=1 hands S=1 to the fused kernel; the decode gather is its fallback.
-    try std.testing.expectEqual(Arm.fused, pick(1, 1));
+    try std.testing.expectEqual(Arm.fused, pick(true, 1, 1));
 
     // Disabling the fused kernel entirely leaves every width served as before.
     const off = FUSED256_MIN_Q_LEN;
-    try std.testing.expectEqual(Arm.decode_gather, pick(1, off));
-    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(sq, off));
+    try std.testing.expectEqual(Arm.decode_gather, pick(true, 1, off));
+    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(true, sq, off));
+}
+
+test "qsa dispatch: a DENSE KV cache at a verify width takes the union gather, never the prefill kernel" {
+    // #363. `--kv-quant off` at 16k decoded 77.7 tok/s against a93e2c0's 93.6
+    // at the SAME spec acceptance (2.50 vs 2.62 accepted per round): a 27%
+    // more expensive round at equal width. The logs name the term —
+    //
+    //   a93e2c0 : [qsa-verify-gather] engaged (S=4 kv=16385 rows=8197)
+    //   this PR : [qsa-gather] engaged: msv_attn_qsa256 S=4 kv=16385 ...
+    //
+    // — `qsaSparseAttn` is tried FIRST, and on a dense cache its arm was
+    // `gatherQsa256`, the PREFILL kernel. That kernel's grid is
+    // (S*32, Hk*nsg, 1) threads with a (32, nsg, 1) group: at S=4, Hk=2 it is
+    // EIGHT threadgroups, and it has no split-K to recover them. It is not a
+    // verify-width kernel and never was; the caller's own contract already
+    // said "a verify-width selection must never fall into it". The quantized
+    // arm (split-K, in-kernel dequant) is the one that was measured, and it
+    // is untouched: at 16k kv8 the two trees tie.
+    //
+    // Hermetic: the arm choice is a pure predicate, so no GPU is needed.
+    const min_s = QSA_ATTN_MIN_S_DEFAULT;
+    for ([_]c_int{ 2, 3, 4, 5, 6, 7, 8 }) |sq| {
+        // Quantized: the fused kernel serves, exactly as measured.
+        try std.testing.expect(qsaSparseAttnServes(true, sq, min_s));
+        // Dense: declines, so the caller reaches `qsaVerifyGatherAttn`.
+        try std.testing.expect(!qsaSparseAttnServes(false, sq, min_s));
+    }
+    // The quant conjunct never WIDENS the kernel: the two width bounds still
+    // bind on a quantized cache.
+    try std.testing.expect(!qsaSparseAttnServes(true, 1, min_s));
+    try std.testing.expect(!qsaSparseAttnServes(true, FUSED256_MIN_Q_LEN, min_s));
+    try std.testing.expect(!qsaSparseAttnServes(false, 1, min_s));
+    try std.testing.expect(!qsaSparseAttnServes(false, FUSED256_MIN_Q_LEN, min_s));
+    // ...and MIN_S=1 still reaches S=1, on a quantized cache only.
+    try std.testing.expect(qsaSparseAttnServes(true, 1, 1));
+    try std.testing.expect(!qsaSparseAttnServes(false, 1, 1));
+
+    // CLASS GUARD. The decline is what makes the prefill kernel unreachable
+    // from a verify width; a later "dense arm" that calls `gatherQsa256` back
+    // into `qsaSparseAttn` would restore the regression with every predicate
+    // above still green. So the body is scanned: `qsaSparseAttn` must not
+    // call it at all.
+    const src = @embedFile("transformer.zig");
+    const fn_start = std.mem.indexOf(u8, src, "pub fn qsaSparse" ++ "Attn(").?;
+    const fn_end = std.mem.indexOfPos(u8, src, fn_start, "\n}\n").?;
+    const body = src[fn_start..fn_end];
+    try std.testing.expect(std.mem.indexOf(u8, body, "gatherQsa" ++ "256(") == null);
+    // The kill switch stays the FIRST word: `MLX_SERVE_QSA_ATTN_KERNEL=0`
+    // must decline before any of this, so it still restores the union gather
+    // on both cache layouts.
+    const kill = std.mem.indexOf(u8, body, "if (!qsaAttnKernel" ++ "Enabled()) return null;").?;
+    const serves = std.mem.indexOf(u8, body, "qsaSparseAttn" ++ "Serves(kv_view.has_quant_triple").?;
+    try std.testing.expect(kill < serves);
 }
 
 test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q heads equals 12 serving one each" {
@@ -40681,8 +40756,21 @@ test "qsa sparse attn: gqa tile reuse is invariant — one kv head serving 12 q 
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
 
-    var v_reuse = DenseKVView{ .k = k1, .v = v1, .owned = false }; // gqa 12
-    var v_noreuse = DenseKVView{ .k = k12c, .v = v12c, .owned = false }; // gqa 1
+    // The kernel reads PACKED triples, so both fixtures must be REAL
+    // quantized caches. On a dense view `qsaSparseAttn` declines (#363), and
+    // before that decline this test was measuring `gatherQsa256`'s tile reuse
+    // rather than the fused kernel's. Identical inputs quantize identically
+    // per (head, token), so the identity bar is unchanged.
+    const qcfg = kv_quant.KVQuantConfig.affine(8);
+    var cache_r = try KVCache.initWithConfig(ta, 1, qcfg);
+    defer cache_r.deinit();
+    var v_reuse = try qsaAttnCacheFixture(ta, s, k1, v1, kv, @divTrunc(kv, 2), qcfg, &cache_r); // gqa 12
+    defer v_reuse.deinit();
+    try std.testing.expect(v_reuse.has_quant_triple);
+    var cache_n = try KVCache.initWithConfig(ta, 1, qcfg);
+    defer cache_n.deinit();
+    var v_noreuse = try qsaAttnCacheFixture(ta, s, k12c, v12c, kv, @divTrunc(kv, 2), qcfg, &cache_n); // gqa 1
+    defer v_noreuse.deinit();
     const a = (try qsaSparseAttn(s, q, &v_reuse, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
     defer _ = mlx.mlx_array_free(a);
     const b = (try qsaSparseAttn(s, q, &v_noreuse, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
@@ -40760,7 +40848,15 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
     defer _ = mlx.mlx_array_free(kd);
     const vd = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kv, 256 }, s);
     defer _ = mlx.mlx_array_free(vd);
-    var dv = DenseKVView{ .k = kd, .v = vd, .owned = false };
+    // The width gate and the kill switch are only observable on a cache the
+    // kernel would otherwise SERVE, so the fixture is a real affine-8 cache.
+    // A dense view declines for a reason of its own, asserted last.
+    const qcfg = kv_quant.KVQuantConfig.affine(8);
+    var qcache = try KVCache.initWithConfig(ta, 1, qcfg);
+    defer qcache.deinit();
+    var dv = try qsaAttnCacheFixture(ta, s, kd, vd, kv, @divTrunc(kv, 2), qcfg, &qcache);
+    defer dv.deinit();
+    try std.testing.expect(dv.has_quant_triple);
 
     const H = struct {
         fn blocksFor(alloc: std.mem.Allocator, r: std.Random, seq: c_int, kvv: c_int, kb: c_int, rat: c_int) ![]i32 {
@@ -40798,9 +40894,38 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
         defer _ = mlx.mlx_array_free(bl6);
         const ok = (try qsaSparseAttn(s, q6, &dv, bl6, ratio, 1.0)) orelse return error.SparseAttnDeclined;
         _ = mlx.mlx_array_free(ok);
-        qsa_attn_kernel_override = false;
-        defer qsa_attn_kernel_override = null;
-        try std.testing.expect((try qsaSparseAttn(s, q6, &dv, bl6, ratio, 1.0)) == null);
+        {
+            qsa_attn_kernel_override = false;
+            defer qsa_attn_kernel_override = null;
+            try std.testing.expect((try qsaSparseAttn(s, q6, &dv, bl6, ratio, 1.0)) == null);
+        }
+        // ...and the SAME width on a DENSE cache declines with the kernel
+        // fully enabled (#363), at any kv: quant is the only difference.
+        var dense_view = DenseKVView{ .k = kd, .v = vd, .owned = false };
+        try std.testing.expect(!dense_view.has_quant_triple);
+        try std.testing.expect((try qsaSparseAttn(s, q6, &dense_view, bl6, ratio, 1.0)) == null);
+    }
+    // The decline is only useful if the caller has somewhere to go, and that
+    // somewhere has a kv floor of its own (16384) — so the shape the fp16
+    // regression was measured at is the shape this asserts: a dense cache
+    // past the verify floor, where `qsaVerifyGatherAttn` serves and
+    // `qsaSparseAttn` used to steal the call for the prefill kernel.
+    {
+        const big_kv: c_int = 20000;
+        const kbig = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, big_kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(kbig);
+        const vbig = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, big_kv, 256 }, s);
+        defer _ = mlx.mlx_array_free(vbig);
+        const q4 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 4, 256 }, s);
+        defer _ = mlx.mlx_array_free(q4);
+        const b4 = try H.blocksFor(ta, rnd, 4, big_kv, 128, ratio);
+        defer ta.free(b4);
+        const bl4 = mlx.mlx_array_new_data(b4.ptr, &[_]c_int{ 1, 4, 128 }, 3, .int32);
+        defer _ = mlx.mlx_array_free(bl4);
+        var big_dense = DenseKVView{ .k = kbig, .v = vbig, .owned = false };
+        try std.testing.expect((try qsaSparseAttn(s, q4, &big_dense, bl4, ratio, 1.0)) == null);
+        const via_gather = (try qsaVerifyGatherAttn(s, q4, &big_dense, bl4, ratio, 1.0)) orelse return error.VerifyGatherDeclined;
+        _ = mlx.mlx_array_free(via_gather);
     }
 }
 

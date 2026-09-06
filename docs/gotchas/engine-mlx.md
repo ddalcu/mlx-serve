@@ -5562,3 +5562,80 @@ The long-context audit claimed the qwen4_exp indexer history was "billed/held tw
 Fix: a boundary move. The prefill attaches nothing; `scheduler.commitSlotIfApplicable` calls `handoffQsaHistoryToLatest` right before `commitWithMediaState`, and the newest snap takes an `mlx_slice` VIEW of the live capacity buffer (a refcount, zero allocation) — the slot, the buffer's other owner, is torn down next. Past `QSA_HANDOFF_MAX_SLACK_ROWS` of unused capacity (a long generated tail) the handoff materializes instead, so an entry never pins a quarter more than `ssmCheckpointBytes` bills. The cancel sink goes through the same dispatcher (`attachQsaHistoryOnHandoff`). `applyQsaHistoryAt`'s sliced arm became a view too (one fewer transient in the first warm chunk); the byte-budget trim keeps its real copy (a trim must FREE, #330). `statePerTokenBilled` = one copy + the score bank (5,376 B/tok) while the share and the KV reservation are both on, two copies + bank otherwise; it reads the LEVERS, never the append-shape flag. `MLX_SERVE_QSA_HISTORY_SHARE=0` restores the prefill-end copy and its bill together. Bars: the three transformer handoff tests (zero-allocation share, the slack materialization, restore-view vs trim-copy), the prefix-cache handoff-vs-copy parity test, the server bill test, and scan pins on the generate gate and the commit ordering. Restore bytes are identical to the copy arm, so the hybrid restore-parity bar (chunking class, ~0.3 nats top-5) is unchanged.
 
 Rule of thumb this leaves behind: a copy made so a snapshot can OUTLIVE its source is only necessary while the source is still MUTATING; move the copy to the source's death and it becomes a refcount.
+
+## A fused kernel's "dense arm" was the PREFILL kernel at a verify width (2026-09-06, qwen4_exp, M5 Max)
+
+`--kv-quant off` at 16k decoded **77.7 tok/s against a93e2c0's 93.6, -17%**, at
+the same spec acceptance (2.50 vs 2.62 accepted per round). Same width, so the
+round itself got 27% more expensive per token: `round_ms/apr` 21.03 vs 16.55.
+At 8k fp16 the two trees tie, and at 16k **kv8** they tie. One rung, one dtype.
+
+The first analysis pass acquitted the QSA arms and it was right about what it
+looked at: no QSA eligibility predicate reads the KV dtype, the arm MIX at 16k
+is the same on both dtypes, and the dense `[S, kv]` mask arm is *cheaper* on
+fp16 than on 8-bit (kv8 must materialize the same bf16 slab on top of reading
+the packed source). What that pass compared was PR-fp16 against PR-kv8. The
+term only appears when the same dtype is compared **across trees**, and then
+the logs name it in one line each:
+
+```
+a93e2c0 :  [qsa-verify-gather] engaged (S=4 kv=16385 rows=8197)
+this PR :  [qsa-gather] engaged: msv_attn_qsa256 S=4 kv=16385 blocks=512 bk=32
+           [qsa-attn]   engaged (S=4 kv=16385 quant=off)
+```
+
+`qsaSparseAttn` is new in the PR and is tried FIRST. Its quantized arm — split-K,
+in-kernel dequant of the packed triples — is the thing that was designed,
+measured and defended, and it is untouched by any of this. But it also had a
+**dense arm**, and the dense arm was not a kernel of its own:
+
+```zig
+// Dense cache: the prefill kernel already IS this kernel's dense arm.
+if (!kv_view.has_quant_triple) {
+    const dense = (try gatherQsa256(...)) orelse return null;
+```
+
+`gatherQsa256` is the **prefill** kernel. Its grid is `(S*32, Hk*nsg, 1)`
+threads over a `(32, nsg, 1)` group — one threadgroup per (row, kv head). At a
+prefill width of 2066 rows that is thousands of threadgroups; at a verify width
+of S=4 with Hk=2 it is **eight**, and it has no split-K to recover them. The
+comment's premise ("`gatherQsa256` has no q-length floor, so the dense arm is
+that kernel called at this width") is true about the *guards* and false about
+the *machine*: a kernel with no floor is not thereby a kernel that performs at
+every width. It has no floor because prefill is the only caller that ever
+reached it.
+
+Three things should have caught it earlier and each missed for its own reason:
+
+* **The dispatch site already forbade it in words.** Twenty lines below, the
+  fallthrough to `gatherQsa256` carries the comment *"The prefill kernel has no
+  q_len floor of its own; a verify-width selection must never fall into it."*
+  The new kernel's dense arm did exactly that, from above. A contract stated in
+  a comment binds only the call it sits on.
+* **The parity tests passed, because parity was never the question.** The dense
+  arm's numbers are right — `gatherQsa256` computes the same attention. A cos /
+  max-diff bar cannot see a grid that is 8 threadgroups wide.
+* **Two unit tests were quietly measuring the wrong kernel.** The dense halves
+  of the parity test and of the whole "gqa tile reuse is invariant" test built
+  `DenseKVView`s, so every assertion they made about "the fused kernel" was in
+  fact about `gatherQsa256`. A test that hands a fixture the code under test
+  DELEGATES away is green about someone else's behaviour.
+
+**The fix is the conjunct that was missing:** `qsaSparseAttnServes(has_quant_triple,
+seq_len, min_s)` — a pure predicate, so the arm choice is pinned without a GPU
+— and a dense cache declines, falling through to `qsaVerifyGatherAttn` (the
+union gather of ~2049 of the kv rows plus a masked SDPA), which is what
+a93e2c0 ran there. The kill switch is unmoved and still first:
+`MLX_SERVE_QSA_ATTN_KERNEL=0` restores the union gather on both layouts.
+
+The class guard is a source scan of `qsaSparseAttn`'s body for a
+`gatherQsa256(` call, because the predicate assertions stay green under a
+re-added dense arm and the numeric bars stay green forever.
+
+**The rule.** *A kernel is eligible for the shapes it was MEASURED on; "it has
+no guard against this shape" is not a measurement.* Where a fused path grows a
+second arm for a layout its own kernel cannot serve, that arm needs its own
+floor and its own A/B — or it should decline and let the existing arm serve.
+And when an A/B shows one cell moving, compare **the same cell across trees**
+before concluding from within-tree ratios: PR-fp16 vs PR-kv8 exonerated the
+arms; PR-fp16 vs main-fp16 convicted them.
