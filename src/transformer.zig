@@ -14359,6 +14359,7 @@ pub const Transformer = struct {
         const strides = [_]c_int{ 1, 1, 1 };
         var mixed = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&mixed, h, &start, 3, &stop, 3, &strides, 3, self.s));
+        errdefer _ = mlx.mlx_array_free(mixed);
         const inj_shape = [_]c_int{ batch, seq_len, hc, 1 };
         return .{ .mixed = mixed, .inj = try standinOnes(&inj_shape, self.s) };
     }
@@ -14394,8 +14395,10 @@ pub const Transformer = struct {
         if (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled() and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
             var pd: HcPending = undefined;
             pd.out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(pd.out);
             try mlx.check(mlx.mlx_array_set(&pd.out, out));
             pd.inj = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(pd.inj);
             try mlx.check(mlx.mlx_array_set(&pd.inj, inj));
             pending.* = pd;
             return;
@@ -14558,9 +14561,12 @@ pub const Transformer = struct {
             std.debug.assert(ctx.ple_pending == null);
             @memset(pk, 0);
             const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+            errdefer _ = mlx.mlx_array_free(emb);
             var emb_ref = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(emb_ref);
             try mlx.check(mlx.mlx_array_set(&emb_ref, emb));
             var ids_ref = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(ids_ref);
             try mlx.check(mlx.mlx_array_set(&ids_ref, token_ids));
             ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
             return emb;
@@ -15879,7 +15885,10 @@ pub const Transformer = struct {
         // Vision rows splice into the `hidden`-wide embeddings BEFORE the
         // hyper-connection tile (the reference masked_scatters, then repeats).
         var emb = try self.embedding(token_ids);
-        emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        {
+            errdefer _ = mlx.mlx_array_free(emb);
+            emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        }
         defer _ = mlx.mlx_array_free(emb);
         const x_shape = mlx.getShape(emb);
         const batch: c_int = x_shape[0];
@@ -16043,18 +16052,21 @@ pub const Transformer = struct {
         var pclk: ProfClock = if (prof_on) ProfClock.init() else undefined;
 
         var h = try self.embedding(token_ids);
+        {
+            errdefer _ = mlx.mlx_array_free(h);
 
-        // Inkling: RMS norm on the embeddings (model.llm.embed_norm).
-        if (is_inkling) {
-            if (self.embedding_norm) |en| {
-                const normed_emb = try self.rmsNorm(h, en);
-                _ = mlx.mlx_array_free(h);
-                h = normed_emb;
+            // Inkling: RMS norm on the embeddings (model.llm.embed_norm).
+            if (is_inkling) {
+                if (self.embedding_norm) |en| {
+                    const normed_emb = try self.rmsNorm(h, en);
+                    _ = mlx.mlx_array_free(h);
+                    h = normed_emb;
+                }
             }
-        }
 
-        // Splice vision embeddings at image_token_id positions (prefill only)
-        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+            // Splice vision embeddings at image_token_id positions (prefill only)
+            h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+        }
 
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
@@ -17596,7 +17608,9 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sf);
         var cos = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&cos, cf, dtype, self.s));
+        errdefer _ = mlx.mlx_array_free(cos);
         var sin = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(sin);
         try mlx.check(mlx.mlx_astype(&sin, sf, dtype, self.s));
         return .{ .cos = cos, .sin = sin };
     }
@@ -27880,19 +27894,20 @@ pub fn hcReadFused(
     const ipart = n_out[1];
     defer _ = mlx.mlx_array_free(ipart);
     var stream_out = n_out[2];
+    errdefer if (stream_out.ctx != null) {
+        _ = mlx.mlx_array_free(stream_out);
+    };
     if (wr == 0) {
         _ = mlx.mlx_array_free(stream_out);
         stream_out = .{ .ctx = null };
     } else {
         const xsh = mlx.getShape(x);
         var shaped = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(shaped);
         try mlx.check(mlx.mlx_reshape(&shaped, stream_out, xsh.ptr, @intCast(xsh.len), s));
         _ = mlx.mlx_array_free(stream_out);
         stream_out = shaped;
     }
-    errdefer if (stream_out.ctx != null) {
-        _ = mlx.mlx_array_free(stream_out);
-    };
     var d_out: [2]mlx.mlx_array = undefined;
     try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
     const act = d_out[0];
