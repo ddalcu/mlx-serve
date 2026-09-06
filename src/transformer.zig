@@ -13983,7 +13983,7 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        // `out` holds mlx handles, so freeing the slice alone leaks every one.
+        // Each slot holds an mlx handle; free the handles before the slice.
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
@@ -14105,7 +14105,7 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        // `out` holds mlx handles, so freeing the slice alone leaks every one.
+        // Each slot holds an mlx handle; free the handles before the slice.
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
@@ -44770,7 +44770,7 @@ test "no scope arms an errdefer AND a defer over the same mlx handle" {
             }
         }
     }
-    // The scan must have SEEN the shape it polices, or it is asserting nothing.
+    // The scan must have seen the shape it polices, else it asserts nothing.
     try testing.expect(armed > 50);
     try testing.expectEqual(@as(usize, 0), violations);
 }
@@ -44896,8 +44896,8 @@ test "takeContig releases `view` exactly once on every faulted op (CPU stream, n
 }
 
 test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a GPU stream" {
-    // Calibrates the leak oracle: a deliberately leaked 4 MiB eval'd array
-    // must move settled active bytes by more than half the array.
+    // Oracle check: a 4 MiB array leaked on purpose must move the settled
+    // active-bytes count by at least half its size.
     if (!mlxDeviceUsable()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const n_elem: usize = 1 << 20; // 4 MiB, well above allocator noise
@@ -44923,8 +44923,8 @@ test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a GPU stream"
 }
 
 test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
-    // Source-order pin: the new buffer must exist before the old one is freed,
-    // bounded by the next method so the window cannot reach another `else`.
+    // Pins the order: allocate the new buffer, then free the old one. The
+    // search window ends at the next method.
     const src = @embedFile("transformer.zig");
     const needle = "fn grow" ++ "QuantBuf(";
     const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
@@ -44939,8 +44939,8 @@ test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
 }
 
 test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
-    // Source-order pin: the first `built = i + 1` must precede the first
-    // `trimRowsOwned`, so the errdefer covers the entry being filled.
+    // Pins the order: the counter advances before the first fallible call,
+    // so the errdefer covers the entry being filled.
     const src = @embedFile("transformer.zig");
     const needle = "pub fn trimmed" ++ "Copy(";
     const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
@@ -44953,8 +44953,8 @@ test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
 }
 
 test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no double free)" {
-    // A faulted `mlx_zeros` must leave the caller's old buffer owned, so the
-    // free below is legal; freeing it first makes that free a double free.
+    // A failed mlx_zeros leaves the caller's old buffer owned. The free below
+    // is then legal; freeing it first would free it twice.
     if (!mlxDeviceUsable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const B: c_int = 1;
@@ -44986,13 +44986,13 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
         if (r) |_| {
-            // Unreachable for k in 1..=n_ops; free the replacement anyway.
+            // Not reached for k in 1..=n_ops; free the replacement in case.
             _ = mlx.mlx_array_free(buf);
         } else |err| {
             try testing.expectEqual(error.MlxError, err);
             try testing.expect(did);
             fired += 1;
-            // The load-bearing assertion: this free must be legal.
+            // This free must be legal; it is the assertion.
             _ = mlx.mlx_array_free(buf);
         }
     }
