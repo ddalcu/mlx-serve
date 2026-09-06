@@ -4479,10 +4479,16 @@ fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
 /// add-materialized take of packed rows still reads back wrong, so this uses
 /// the canonical contiguous primitive.
 fn takeContig(s: mlx.mlx_stream, src: mlx.mlx_array, idx: mlx.mlx_array, axis: c_int) !mlx.mlx_array {
+    // ONE owner for `view`: the `defer` covers the take's own failure (the
+    // handle is a valid empty array from `mlx_array_new`) AND every exit past
+    // it. The pair this replaced — an `errdefer` here plus a `defer` after the
+    // take, both in the function scope — DOUBLE FREED `view` the moment
+    // `mlx_contiguous` below reported failure. Unreachable until #353 turned
+    // mlx-c's `exit(-1)` into a Zig unwind; live on every decode round since,
+    // 12x per full-attention layer through the two QSA gatherers.
     var view = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(view);
-    try mlx.check(mlx.mlx_take_axis(&view, src, idx, axis, s));
     defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_take_axis(&view, src, idx, axis, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_contiguous(&out, view, false, s));
@@ -15619,6 +15625,14 @@ pub const Transformer = struct {
     /// past the budget (dense group — the plain batched mask suffices).
     fn qsaMaskBatched(self: *Transformer, slots: []const *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, layer: u32) !mlx.mlx_array {
         const N = slots.len;
+        // `qwen4AttnWith`'s cleanup owns the GROUP ctx's fields; the per-slot
+        // ctxs reached here have no other net. Without this, one throw below
+        // orphaned a slot's selection AND left it non-null, and the slot stayed
+        // poisoned for the life of the request.
+        errdefer for (slots) |sc| {
+            if (sc.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(sc.qsa_blocks);
+            sc.qsa_blocks = .{ .ctx = null };
+        };
         const w: c_int = mlx.getShape(qk)[2];
         const masks = try self.allocator.alloc(mlx.mlx_array, N);
         defer self.allocator.free(masks);
@@ -15837,6 +15851,13 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_eval(k32));
                 clk = ProfClock.init();
             }
+            // Free before assign: the field's null invariant used to rest
+            // entirely on a `defer` registered BELOW a fallible call, so one
+            // throw left a live handle here and every later tick overwrote it
+            // — a `[1,1,kb]` int32 handle leaked per tick per slot, with no
+            // buffer of its own for any byte-based oracle to see.
+            if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
+            ctx.qsa_blocks = .{ .ctx = null };
             ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, offset, seq_len, nb, block_topk);
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(ctx.qsa_blocks));
@@ -16129,6 +16150,15 @@ pub const Transformer = struct {
     /// Full-attention layer with the QSA mask threaded through
     /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
     fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
+        // Registered ABOVE the fallible builders below, not under them: the
+        // mask and the block selection are this call's to release on EVERY
+        // exit, and `qsaMask` can throw with `ctx.qsa_blocks` already written.
+        defer {
+            if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
+            ctx.qsa_mask = .{ .ctx = null };
+            if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
+            ctx.qsa_blocks = .{ .ctx = null };
+        }
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
@@ -16141,12 +16171,6 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.qsa_mask, m);
             }
         };
-        defer {
-            if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
-            ctx.qsa_mask = .{ .ctx = null };
-            if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
-            ctx.qsa_blocks = .{ .ctx = null };
-        }
         return self.gatedFullAttnWith(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill);
     }
 
@@ -16658,10 +16682,17 @@ pub const Transformer = struct {
         if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, h);
 
         const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+        // The function-scope errdefer above is still armed and reads `h` at
+        // unwind time, so the handle must be surrendered on the same two lines
+        // it is released, or the fallible `lmHeadProject` below (the
+        // 248,320-wide head — the single allocation most likely to trip the
+        // error latch) frees it a SECOND time.
         _ = mlx.mlx_array_free(h);
+        h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
         const final = mix.mixed;
         if (self.embedding_mode or ctx.skip_lm_head) return final;
+        errdefer _ = mlx.mlx_array_free(final);
         const logits = try self.lmHeadProject(final, ctx.argmax_only);
         _ = mlx.mlx_array_free(final);
         return logits;
@@ -27178,8 +27209,11 @@ fn buildFusedQkv(
             var out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_contiguous(&out, joined, false, str));
-            _ = mlx.mlx_array_free(joined);
+            // Past the LAST fallible call, never before it: freeing `joined`
+            // above left the errdefer armed on a dangling handle, so an eval
+            // failure here double freed it (same class as `takeContig`).
             try mlx.check(mlx.mlx_array_eval(out));
+            _ = mlx.mlx_array_free(joined);
             return out;
         }
     }.run;
@@ -45395,6 +45429,306 @@ fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     return active;
+}
+
+// ── Handle-ownership class scans (PR #363 ledger 23) ────────────────────────
+//
+// #353 changed what an MLX failure COSTS: mlx-c's default handler called
+// `exit(-1)`, so every `try` below a handle was dead code. `installErrorHandler`
+// turned all of them into live unwinds, and the ownership bugs that had been
+// unreachable since the day they were written became reachable on the hottest
+// decode arms in the tree. These scans pin the two shapes that are not merely
+// leaks but DOUBLE FREES — a leak costs memory, a double free costs the
+// process, and the byte-based oracle below cannot see either one when the
+// handle is a view that never materialized a buffer.
+//
+// Indentation is the scope proxy, not brace counting: `zig fmt` makes it exact
+// and it is immune to the Metal kernel source literals in this file, which are
+// full of braces.
+const HandleScan = struct {
+    const Live = struct { ident: []const u8, indent: usize, line: usize };
+
+    fn indentOf(line: []const u8) usize {
+        var i: usize = 0;
+        while (i < line.len and line[i] == ' ') i += 1;
+        return i;
+    }
+
+    /// The identifier inside the first `mlx_array_free(...)` on the line.
+    fn freeArg(line: []const u8) ?[]const u8 {
+        const needle = "mlx_array" ++ "_free(";
+        const p = std.mem.indexOf(u8, line, needle) orelse return null;
+        const rest = line[p + needle.len ..];
+        const e = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        const arg = std.mem.trim(u8, rest[0..e], " ");
+        if (arg.len == 0) return null;
+        for (arg) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.' and c != '[' and c != ']') return null;
+        }
+        return arg;
+    }
+
+    /// Does `line` assign `ident` (`x = …` or `x.ctx = …`)?
+    fn assigns(line: []const u8, ident: []const u8) bool {
+        if (!std.mem.startsWith(u8, line, ident)) return false;
+        const rest = std.mem.trimStart(u8, line[ident.len..], " ");
+        if (std.mem.startsWith(u8, rest, "= ")) return true;
+        if (std.mem.startsWith(u8, rest, ".ctx")) {
+            return std.mem.indexOfScalar(u8, rest, '=') != null;
+        }
+        return false;
+    }
+
+    fn split(allocator: std.mem.Allocator, src: []const u8) !std.ArrayList([]const u8) {
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |l| try out.append(allocator, l);
+        return out;
+    }
+};
+
+test "no scope arms an errdefer AND a defer over the same mlx handle" {
+    // `takeContig` did exactly this: `errdefer free(view)`, then the take, then
+    // `defer free(view)` — both in the function scope. On the first failure of
+    // the `mlx_contiguous` below them, the defer freed `view` and the errdefer
+    // freed it again. It runs 12x per full-attention layer per forward through
+    // `qsaDecodeGatherAttn` / `qsaVerifyGatherAttn`, i.e. on every decode round
+    // of a long qwen4_exp request.
+    //
+    // An errdefer in an INNER scope is not the bug: Zig cancels it when that
+    // block exits normally, so the `qkv_ane` / `z_ane` pair in the ANE prefill
+    // arm (errdefer inside `if (ok) {}`, defer in the enclosing block) is
+    // correct and the indentation rule below acquits it.
+    //
+    // Needles are assembled at comptime so this test's own source cannot
+    // satisfy the scan.
+    const allocator = testing.allocator;
+    const src = @embedFile("transformer.zig");
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    var lines = try HandleScan.split(allocator, src);
+    defer lines.deinit(allocator);
+
+    var live: [64]HandleScan.Live = undefined;
+    var n_live: usize = 0;
+    var violations: usize = 0;
+    var armed: usize = 0;
+    for (lines.items, 1..) |raw, lineno| {
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (t.len == 0) continue;
+        const ind = HandleScan.indentOf(raw);
+        // A line at indent `ind` closes every scope deeper than it.
+        var k: usize = 0;
+        var w: usize = 0;
+        while (k < n_live) : (k += 1) {
+            if (live[k].indent <= ind) {
+                live[w] = live[k];
+                w += 1;
+            }
+        }
+        n_live = w;
+        if (std.mem.startsWith(u8, t, err_kw)) {
+            if (HandleScan.freeArg(t)) |id| {
+                if (n_live < live.len) {
+                    live[n_live] = .{ .ident = id, .indent = ind, .line = lineno };
+                    n_live += 1;
+                    armed += 1;
+                }
+            }
+        } else if (std.mem.startsWith(u8, t, def_kw)) {
+            if (HandleScan.freeArg(t)) |id| {
+                for (live[0..n_live]) |e| {
+                    if (std.mem.eql(u8, e.ident, id)) {
+                        std.debug.print("[scan] double-free pair: errdefer line {d} + defer line {d} both free `{s}`\n", .{ e.line, lineno, id });
+                        violations += 1;
+                    }
+                }
+            }
+        }
+    }
+    // The scan must have SEEN the shape it polices, or it is asserting nothing.
+    try testing.expect(armed > 50);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
+test "a bare free of a handle whose errdefer is still armed surrenders it before the next fallible call" {
+    // The other half of the same class, and the one a `defer`-vs-`errdefer`
+    // scan cannot see: `forwardQwen4With` freed `h` at the hyper-connection
+    // mixer and then called the fallible `lmHeadProject`, with the
+    // function-scope errdefer still reading `h` at unwind time — a double free
+    // over the 248,320-wide head, the single allocation most likely to trip
+    // the error latch. `buildFusedQkv`'s concat helper had the same shape.
+    //
+    // The rule: past a bare free of an errdefer-armed handle, either the very
+    // next statement re-binds the handle (`x = …`, `x.ctx = …`) or no fallible
+    // call may run before that errdefer's scope closes.
+    const allocator = testing.allocator;
+    const src = @embedFile("transformer.zig");
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    const free_stmt = "_ = mlx.mlx_array" ++ "_free(";
+    const try_kw = "tr" ++ "y ";
+    var lines = try HandleScan.split(allocator, src);
+    defer lines.deinit(allocator);
+
+    var live: [64]HandleScan.Live = undefined;
+    var n_live: usize = 0;
+    var violations: usize = 0;
+    var checked: usize = 0;
+    for (lines.items, 0..) |raw, idx| {
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (t.len == 0) continue;
+        const ind = HandleScan.indentOf(raw);
+        var k: usize = 0;
+        var w: usize = 0;
+        while (k < n_live) : (k += 1) {
+            if (live[k].indent <= ind) {
+                live[w] = live[k];
+                w += 1;
+            }
+        }
+        n_live = w;
+        if (std.mem.startsWith(u8, t, err_kw)) {
+            if (HandleScan.freeArg(t)) |id| {
+                if (n_live < live.len) {
+                    live[n_live] = .{ .ident = id, .indent = ind, .line = idx + 1 };
+                    n_live += 1;
+                }
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, t, def_kw)) continue;
+        if (!std.mem.startsWith(u8, t, free_stmt)) continue;
+        const id = HandleScan.freeArg(t) orelse continue;
+        var arm_indent: ?usize = null;
+        for (live[0..n_live]) |e| {
+            if (std.mem.eql(u8, e.ident, id)) arm_indent = e.indent;
+        }
+        const e_ind = arm_indent orelse continue;
+        checked += 1;
+        // Next non-blank statement re-binds it?
+        var j = idx + 1;
+        while (j < lines.items.len and std.mem.trim(u8, lines.items[j], " \t\r").len == 0) j += 1;
+        if (j < lines.items.len and HandleScan.assigns(std.mem.trim(u8, lines.items[j], " \t\r"), id)) continue;
+        // Else: no fallible call may run while that errdefer is still armed.
+        while (j < lines.items.len) : (j += 1) {
+            const l2 = lines.items[j];
+            const t2 = std.mem.trim(u8, l2, " \t\r");
+            if (t2.len == 0) continue;
+            if (HandleScan.indentOf(l2) < e_ind) break; // errdefer scope closed
+            if (std.mem.startsWith(u8, t2, try_kw) or std.mem.indexOf(u8, t2, " " ++ try_kw) != null) {
+                std.debug.print("[scan] dangling errdefer: line {d} frees `{s}`, line {d} can still throw under it\n", .{ idx + 1, id, j + 1 });
+                violations += 1;
+                break;
+            }
+        }
+    }
+    try testing.expect(checked > 0);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
+test "every qsa_blocks assignment frees the handle it replaces or is provably null" {
+    // The field is the only per-token-per-layer handle slot on the qwen4_exp
+    // forward, and its null invariant used to rest entirely on a `defer` that
+    // `qwen4AttnWith` registered BELOW the fallible builder that writes it. One
+    // throw left a live `[1,1,kb]` int32 handle in the slot, and every later
+    // tick overwrote it: a handle leaked per tick per slot, holding no buffer
+    // of its own, so no byte-based oracle in this file could see it.
+    const src = @embedFile("transformer.zig");
+    const field = "qsa_" ++ "blocks";
+    const assign = field ++ " = ";
+    const null_rhs = ".{ .ctx = null }";
+    var i: usize = 0;
+    var seen_writes: usize = 0;
+    var seen_live: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, assign)) |pos| : (i = pos + assign.len) {
+        const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..pos], '\n')) |p| p + 1 else 0;
+        const line_end = std.mem.indexOfScalarPos(u8, src, pos, '\n') orelse src.len;
+        const line = std.mem.trim(u8, src[line_start..line_end], " \t\r");
+        // A struct field DEFAULT is a declaration, not a write.
+        if (std.mem.indexOf(u8, line, ": mlx.mlx_array = ") != null) continue;
+        seen_writes += 1;
+        const rhs = src[pos + assign.len .. line_end];
+        if (std.mem.startsWith(u8, std.mem.trim(u8, rhs, " \t\r"), null_rhs)) continue;
+        seen_live += 1;
+        // A live write must be preceded, within the three statements above it,
+        // by a free of the very handle it replaces.
+        const lhs = std.mem.trim(u8, src[line_start .. pos + field.len], " \t\r");
+        var back = line_start;
+        var hops: usize = 0;
+        var ok = false;
+        while (hops < 3 and back > 0) : (hops += 1) {
+            const prev_end = back - 1;
+            const prev_start = if (std.mem.lastIndexOfScalar(u8, src[0..prev_end], '\n')) |p| p + 1 else 0;
+            const prev = std.mem.trim(u8, src[prev_start..prev_end], " \t\r");
+            if (HandleScan.freeArg(prev)) |freed| {
+                if (std.mem.eql(u8, freed, lhs)) {
+                    ok = true;
+                    break;
+                }
+            }
+            back = prev_start;
+        }
+        if (!ok) std.debug.print("[scan] `{s}` written live with no free-before-assign: {s}\n", .{ lhs, line });
+        try testing.expect(ok);
+    }
+    // Both the field default and the real writes must be in range, or the
+    // needle drifted and this test is asserting nothing.
+    try testing.expect(seen_writes >= 3);
+    try testing.expect(seen_live >= 1);
+}
+
+test "takeContig releases `view` exactly once on every faulted op (CPU stream, no GPU)" {
+    // The instance regression for the double free, driven with the fault
+    // injector at `mlx.check`: `arm(k)` makes the k-th succeeding checked call
+    // report failure, so the sweep walks every error path of the function
+    // without patching it. k = 2 is the one that mattered — the take has
+    // landed, `view` is a live handle, and `mlx_contiguous` reports failure.
+    // On the pre-fix shape the defer and the errdefer both fire and this
+    // ABORTS the test binary; that abort is the red half of the proof, since
+    // a double free is not an assertion failure.
+    //
+    // CPU stream throughout: `take_axis` + `contiguous` need no Metal, so this
+    // runs anywhere the suite runs.
+    const s = mlx.mlx_default_cpu_stream_new();
+    const rows = 8;
+    const cols = 4;
+    var host: [rows * cols]f32 = undefined;
+    for (&host, 0..) |*v, n| v.* = @floatFromInt(n);
+    const shape = [_]c_int{ rows, cols };
+    const srcarr = mlx.mlx_array_new_data(&host, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(srcarr);
+    var idx_host = [_]u32{ 5, 0, 3, 3 };
+    const ish = [_]c_int{idx_host.len};
+    const idx = mlx.mlx_array_new_data(&idx_host, &ish, 1, .uint32);
+    defer _ = mlx.mlx_array_free(idx);
+
+    // Un-faulted run: counts the checked ops the helper issues (2 — the take
+    // and the contiguous) and proves the happy path still works.
+    const c0 = mlx.op_count.load(.monotonic);
+    const warm = try takeContig(s, srcarr, idx, 0);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    try mlx.check(mlx.mlx_array_eval(warm));
+    try testing.expectEqual(@as(c_int, idx_host.len), mlx.getShape(warm)[0]);
+    _ = mlx.mlx_array_free(warm);
+    try testing.expectEqual(@as(u64, 2), n_ops);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = takeContig(s, srcarr, idx, 0);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |ok| {
+            _ = mlx.mlx_array_free(ok);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), fired);
 }
 
 test "mlx check fault injection: the ownership shape releases its array on every faulted op" {

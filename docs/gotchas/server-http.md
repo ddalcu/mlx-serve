@@ -4058,6 +4058,7 @@ are qwen4_exp-only by construction; the third is not, and is gated.
 | 20 | `round_cost.TrialSchedule.force` re-reading its period every round | **every MTP arch and every DFlash/DSpark block drafter.** `TrialSchedule` has two consumers: `Generator.MtpWidthTrial` (aliased, driven from `mtpRoundPlanInner` for any model with a head, `.qwen` sidecars included) and `WidthChooser.trial` (`MLX_SERVE_DFLASH_CHOOSER=1`). Neither is arch-gated | **C — gated** | `round_cost.schedulePeriodReread(layout)` — `.long` is `layoutFor`'s qwen4_exp answer and nothing else's, so the ONE `Layout` already in hand at both call sites is the predicate. `force` takes it as an argument; `armed_at` is maintained on both arms and read only on the gated one, so the ungated schedule is a93e2c0's byte for byte. The stall reproduces on a93e2c0 (`DB1-base`: 45 rounds at w1, 72.5 tok/s), but the re-read moves WHICH rounds of a request carry a 3-4% trial block, and the 27B sidecar pack was never measured on it. Tests: `the trial-period re-read is qwen4-only; a legacy-layout schedule keeps a93e2c0's date`, `a sidecar boot's width-trial SCHEDULE is a93e2c0's too` (both run the tester's own trace shape on both arms; the second also scans the production call site for the layout argument) |
 | 21 | `qwen4_exp.NgramTable.gather`'s wide-prefill arm | **none.** The n-gram PLE table exists on no other arch: `Qwen4State` hangs off `Transformer.qwen4`, and `gather`'s only production caller is `pleGatherBf16`, reached from `forwardQwen4With` alone | **A — qwen4-only by construction** | Shipped as a KV GATE, not the opt-in the tester proposed: the pool costs 5-8% prefill on a resident table (M4 Max 13.4k 758 vs 725 tok/s; M5 Max 4k/8k/16k, 6/6 cells, fp16 and kv8) and saves 67.7 → 267.9 ms per 1000 tokens on an evicted one (M5 Max 374k ladder). A flat opt-in buys the first back by re-opening the second. `PREFILL_PREFETCH_MIN_KV` (262144 — the follow-up `ab_ple_prefetch_long.sh` (a BENCH-RECORD driver under `~/claude-tmp/bench-qwen4-ladder`, not a `tests/` script) found the pool a cost at 4k/8k/16k, neutral at 64k/128k and a cost again at 256k, so the floor sits ABOVE every rung anyone drove) is compared against the PRE-chunk `ctx.moe_seq_offset` — `cache.step` cannot stand in, it is 0 forever on a GDN trunk. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` moves it; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm, and absent means the gate |
 | 22 | `Generator.MTP_ADAPTIVE_MIN_KV` 8192 → 32768 | **none.** Its two readers are `serialCellWanted` (behind `mtpAdaptiveModelOk` → `xfm.qwen4_mtp != null`) and `mtpAdaptiveSerialStep` (behind `mtpAdaptiveArchEligible` → head `== .qwen4`). Both predicates were verified by reading their bodies, not their comments | **A — qwen4-only by construction** | The per-bucket tables show rounds losing to serial from the 32-64k bucket up, and at 8192 the probes landed inside the 8k cell of every M4 Max ladder — 8 serial tokens teaching a bucket whose answer was never in doubt. `MLX_SERVE_MTP_ADAPTIVE_MIN_KV` still overrides (`mtpAdaptiveMinKv`), and `--max-mtp-ctx` / `MLX_SERVE_MTP_FORCE_DEPTH` still outrank the whole mechanism |
+| 23 | `transformer.takeContig` handle ownership; `forwardQwen4With`'s `h`/`final`; `buildFusedQkv`'s concat helper; `ctx.qsa_blocks` free-before-assign + `qsaMaskBatched`'s per-slot handles | **`takeContig`, `forwardQwen4With` and the `qsa_blocks` sites are qwen4_exp only** (QSA layers and the hyper-connection mixer exist on no other arch; `takeContig`'s three production callers are `qsaDecodeGatherAttn` / `qsaVerifyGatherAttn` / a test). **`buildFusedQkv` is NOT**: its one production caller is `fusedQkvFor`, called only from `lagunaAttnWith`, so it reaches **laguna** whenever `MLX_SERVE_FUSED_QKV=1` (opt-in, default off) — a load-time path, not a per-token one | **A — bug fixes, ungated** | Two double frees and a per-tick handle leak, all of them error paths that were dead code until #353 replaced mlx-c's `exit(-1)` with a Zig unwind. Nothing on a success path moves, so no arch's output changes; the fixes ship for everyone. Class guards: `no scope arms an errdefer AND a defer over the same mlx handle`, `a bare free of a handle whose errdefer is still armed surrenders it before the next fallible call`, `every qsa_blocks assignment frees the handle it replaces or is provably null`. Instance regression: `takeContig releases \`view\` exactly once on every faulted op (CPU stream, no GPU)` — it SEGVs on 2e096a7 and passes here. Story below: "#353 did not create these bugs, it made them reachable" |
 
 Also in the round, log-only and recorded as such: `mtpRoundPlan` gained a
 `[mtp-plan]` debug line (one per planned round, every input the planner read)
@@ -4444,3 +4445,119 @@ Row **19** of the PR #363 ledger, above: class **D**, unreachable off qwen4_exp
 because every new arm is behind `if (self.writer)` and the writer is armed at
 exactly one production site. The row itself lives with the other round-5 rows
 rather than being restated here, so the class and the guard have one wording.
+
+---
+
+## #353 did not create these bugs, it made them reachable (PR #363 ledger 23)
+
+Three defects, all on error paths, all written long before this PR, all dead
+code until `mlx.installErrorHandler` landed. mlx-c's default error handler
+calls `exit(-1)`; with it installed, an MLX failure is a `return error.MlxError`
+from `mlx.check`, and every `try` on the decode path became a live unwind
+through cleanup nobody had ever executed. Two of the three are DOUBLE FREES,
+which is the one failure mode a byte-based ownership oracle cannot see: the
+process dies before any number is read.
+
+### 1. `takeContig` — an `errdefer` and a `defer` over the same handle
+
+```zig
+var view = mlx.mlx_array_new();
+errdefer _ = mlx.mlx_array_free(view);          // armed
+try mlx.check(mlx.mlx_take_axis(&view, src, idx, axis, s));
+defer _ = mlx.mlx_array_free(view);             // ALSO armed, same scope
+var out = mlx.mlx_array_new();
+errdefer _ = mlx.mlx_array_free(out);
+try mlx.check(mlx.mlx_contiguous(&out, view, false, s));   // if THIS reports failure…
+return out;
+```
+
+Unwinding runs deferred expressions in reverse registration order: free `out`,
+free `view`, free `view` again. `takeContig` is called six times per
+full-attention layer from `qsaDecodeGatherAttn` and six more from
+`qsaVerifyGatherAttn` — the two hottest new QSA arms — so on a long qwen4_exp
+request this is armed on every decode round of every layer.
+
+The fix is not to delete the `errdefer`: that would leak the empty handle when
+the take itself reports failure. It is to give `view` **one owner covering
+every exit** — the `defer`, hoisted above the take, where the handle is already
+a valid freeable array from `mlx_array_new`.
+
+**An `errdefer` in an INNER scope is not this bug.** Zig cancels it when the
+block exits normally, so the ANE prefill arm's `qkv_ane` / `z_ane` — `errdefer`
+inside `if (ok) { … }`, `defer` in the enclosing block — is correct. The class
+scan uses indentation as its scope proxy (`zig fmt` makes it exact, and it is
+immune to the Metal kernel string literals a brace counter would choke on) and
+acquits that pair. On 2e096a7 the scan reports exactly one pair.
+
+### 2. `forwardQwen4With` and `buildFusedQkv` — a bare free under a live errdefer
+
+The other half of the class, invisible to a `defer`-vs-`errdefer` scan:
+
+```zig
+const mix = try self.hcReadPending(&h, …);
+_ = mlx.mlx_array_free(h);                 // h is now dangling
+…
+const logits = try self.lmHeadProject(final, ctx.argmax_only);  // errdefer for `h` STILL armed
+```
+
+The function-scope `errdefer` reads `h` at unwind time, so if `lmHeadProject`
+fails — the 248,320-wide head, the single allocation in the forward most likely
+to trip the error latch — `h` is freed twice and `final` leaks. Fix: surrender
+the handle (`h = .{ .ctx = null };`) on the line after the free, and give
+`final` its own `errdefer`.
+
+The scan written for that shape found a **second, previously unreported**
+instance: `buildFusedQkv`'s `cat.run` freed `joined` between `mlx_contiguous`
+and `mlx_array_eval`, leaving the errdefer armed across the eval. Fixed by
+moving the free past the last fallible call. That one is not qwen4-only — its only production
+caller is `lagunaAttnWith`, so it reaches laguna under the opt-in
+`MLX_SERVE_FUSED_QKV=1`, once per layer at first use rather than per token.
+
+The rule the scan encodes: **past a bare free of a handle whose `errdefer` is
+still armed, either the next statement re-binds the handle or nothing fallible
+may run before that `errdefer`'s scope closes.**
+
+### 3. `ctx.qsa_blocks` — the one per-token-per-layer handle slot
+
+`ctx.qsa_blocks` is written inside `qsaMaskFromQk` and released by a `defer` in
+`qwen4AttnWith`. That `defer` was registered **below** the fallible `qsaMask`
+call that writes the field, so the field's null invariant did not hold on the
+error path: one throw left a live `[1,1,kb]` int32 handle in the slot, and the
+next tick's assignment overwrote it. Those handles hold no buffer of their own,
+so neither `mlx_get_active_memory` nor the repo's `mlxSettledActiveBytes` sweep
+can see the leak — only a per-handle count could, and mlx-c exposes none.
+
+Three changes, each necessary:
+
+1. **Free before assign** at the write site. Belt to the braces, and the only
+   thing that bounds the damage if a fourth path ever writes the field.
+2. **Hoist the cleanup above the fallible builders** in `qwen4AttnWith`, so the
+   field is this call's to release on every exit, not just the ones that reach
+   the bottom.
+3. **An `errdefer` over all slots in `qsaMaskBatched`.** `qwen4AttnWith`'s
+   cleanup owns the GROUP ctx's field; the per-slot `ForwardCtx`s it walks have
+   no other net, so a throw at `qsaMaskFromBlocks` orphaned a slot's handle
+   **and left it non-null** — one leak per tick per slot for the life of the
+   request, poisoned forever. It needs `--max-concurrent > 1` to be reachable,
+   which is why no single-slot boot ever showed it.
+
+### What was NOT done here
+
+The same audit lists ~25 more sites of the shape "`var x = mlx_array_new();`
+followed by a fallible call with no guard on `x`" — kernel outputs allocated
+before an `mlx_vector_array_get`, closure callbacks that `return -1` without
+freeing their output, `dflash.zig`'s two discarded `DenseKVView`s. They are
+LEAKS, not double frees, and they do not share one mechanical fix: some want an
+`errdefer`, some want a struct-scoped cleanup, some (the compiled closures)
+cannot use Zig cleanup at all because they are `callconv(.c)` and return an
+`int`. Applying one pattern blindly to all of them would manufacture more
+instances of defect 1. They are a follow-up, and the two class scans shipped
+here are the ratchet that will catch the next one.
+
+### The rule
+
+**One owner per handle, and the owner is chosen by where ownership actually
+transfers**: `errdefer` only up to the point the caller takes over, then
+`defer`; never both in one scope; and a bare free is a transfer, so it must
+either re-bind the handle or be the last thing that can happen under its
+`errdefer`.
