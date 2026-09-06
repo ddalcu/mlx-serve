@@ -8138,7 +8138,12 @@ pub const Generator = struct {
     /// against roughly 95 serial, so a bad switch there costs ~2x, against
     /// ~10% at 62.7k. Long context is the only place the feature was ever
     /// argued for, and the whole ladder it was built from starts past 32k.
-    pub const MTP_ADAPTIVE_MIN_KV: u32 = 8192;
+    ///
+    /// 32768, not 8192: the per-bucket tables show rounds losing to serial
+    /// from the 32-64k bucket up. At 8-16k the probes (8 serial tokens x up
+    /// to 3 per bucket) cost more than a switch there could ever buy, and on
+    /// M4 Max the 8192 floor put them inside the 8k cell of every ladder.
+    pub const MTP_ADAPTIVE_MIN_KV: u32 = 32768;
 
     /// May the adaptive switch run at this context at all? Pure, and read
     /// BEFORE the vote and the probe alike: a probe below the floor would
@@ -8705,7 +8710,7 @@ pub const Generator = struct {
     /// on qwen4_exp, whose verify row is BYTES and whose depth-2 round costs
     /// 2.05 serial forwards. A sidecar pack (qwen3.5/3.6/3.8) has a different
     /// verify surface entirely, so `model_has_mtp` let every such model past
-    /// 8192 KV spend up to MAX_SERIAL_PROBES x MTP_ADAPTIVE_PROBE_TOKENS
+    /// MTP_ADAPTIVE_MIN_KV spend up to MAX_SERIAL_PROBES x MTP_ADAPTIVE_PROBE_TOKENS
     /// serial tokens per bucket probing, and switch speculation off on a
     /// calibration that was never taken on it. The head KIND is the arch:
     /// `.qwen4` is the in-checkpoint head, `.qwen` is every sidecar.
@@ -8782,7 +8787,54 @@ pub const Generator = struct {
         return false;
     }
 
+    /// One debug line per planned round, every input the planner read:
+    /// the diff of two boots' traces names the round where a stalled width
+    /// controller (w1/w2 in a cold 4-16k bucket) first diverges from a
+    /// climbing one. Zero cost at info: nothing is formatted unless debug.
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        if (!log.isDebug()) return self.mtpRoundPlanInner();
+        const disabled_before = self.spec_disabled_runtime;
+        const serial_left_before = self.mtp_serial_left;
+        const plan = self.mtpRoundPlanInner();
+        const kv_len = self.mtpKvLen();
+        const t = &self.xfm.round_cost;
+        const b = self.mtpAdaptiveBucket(kv_len);
+        const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, if (mtpCostTableEnabled()) t else null);
+        const serial_step: []const u8 = if (!disabled_before and self.spec_disabled_runtime)
+            "switch"
+        else if (self.mtp_serial_left > serial_left_before)
+            "probe"
+        else
+            "none";
+        var cells: [256]u8 = undefined;
+        const a = self.mtp_ev_accept;
+        const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
+        log.debug(
+            "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
+            .{
+                self.mtp_ev_rounds,                        kv_len,
+                round_cost.bucketName(t.layout, b),        plan.m_lo,
+                plan.m_hi,                                 plan.tau_ln,
+                a[0],                                      a[1],
+                a[2],                                      a[3],
+                a[4],                                      a[5],
+                if (src.fromTable()) "table" else "prior", if (plan.width_trial) "w" else "-",
+                if (plan.width_trial) plan.m_lo else 0,    serial_step,
+                self.mtp_m_lo_streak,                      self.mtp_serial_left,
+                t.dropped_transition,                      t.dropped_contended,
+                t.dropped_bad,                             cap_row,
+                cap_free,                                  self.spec_cost_solo,
+                self.mtp_regime.trial_end,                 self.mtp_width_trial.next_trial,
+                self.mtp_width_trial.trial_end,            target,
+                t.formatBucket(b, &cells),
+            },
+        );
+        return plan;
+    }
+
+    fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
         if (mtpForcedDepth()) |d| {
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
@@ -15180,7 +15232,7 @@ test "serialCellWanted: --no-mtp must not fold a serial cell (the head weights a
 test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
     const G = Generator;
     const floor = G.MTP_ADAPTIVE_MIN_KV;
-    try testing.expectEqual(@as(u32, 8192), floor);
+    try testing.expectEqual(@as(u32, 32768), floor);
 
     // llmprobe-shaped traffic: in the 2026-09-04 A/B, 11 of 14 switches were
     // in the `<2k` bucket and every one of them was a short llmprobe request.
@@ -15199,6 +15251,10 @@ test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is 
     // feature was actually argued for are all above it.
     try testing.expect(!G.mtpAdaptiveKvEligible(0, floor));
     try testing.expect(!G.mtpAdaptiveKvEligible(floor - 1, floor));
+    // The 8k and 16k rungs live below the floor: the probes cost more than
+    // a switch there could buy (rounds lose to serial from 32-64k up).
+    try testing.expect(!G.mtpAdaptiveKvEligible(8_200, floor));
+    try testing.expect(!G.mtpAdaptiveKvEligible(16_400, floor));
     try testing.expect(G.mtpAdaptiveKvEligible(floor, floor));
     try testing.expect(G.mtpAdaptiveKvEligible(62_755, floor)); // the A/B prose prompt
     try testing.expect(G.mtpAdaptiveKvEligible(374_000, floor)); // the ladder's top rung

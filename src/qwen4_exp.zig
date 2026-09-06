@@ -311,7 +311,8 @@ pub const NgramTable = struct {
         // 3*rows preads over the 48 workers. Only the length gate moves.
         // Read path, so the output is byte-identical either way; the win (or
         // the wake-round loss at small kv) is timing only.
-        // QWEN4_PLE_PREFETCH_PREFILL=0 restores the decode-only gate.
+        // QWEN4_PLE_PREFETCH_PREFILL=1 opts in; the default keeps the
+        // decode-only gate (a warm table loses 4-5% prefill to the pool).
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const wide_ok = !wide or plePrefillPrefetchEnabled();
         // Announce the arm that actually RUNS, not the lever that permits it.
@@ -489,18 +490,22 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
     const width: []const u8 = if (bucket == 1) "prefill width" else "warmup width";
     if (pooled) {
         const batches = (rows + PrefetchPool.MAX_ROWS - 1) / PrefetchPool.MAX_ROWS;
-        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; QWEN4_PLE_PREFETCH_PREFILL=0 restores the serial mmap walk)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS });
+        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; QWEN4_PLE_PREFETCH_PREFILL=1 is set)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS });
     } else {
-        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; QWEN4_PLE_PREFETCH_PREFILL=0 is set)\n", .{ width, rows });
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; QWEN4_PLE_PREFETCH_PREFILL=1 opts into the pool)\n", .{ width, rows });
     }
 }
 
 /// Test seam for the prefill gate below (the env is read once per process).
 pub var ple_prefill_prefetch_override: ?bool = null;
 
-/// Whether a gather WIDER than one pool batch may use the pool at all. Default
-/// on; `QWEN4_PLE_PREFETCH_PREFILL=0` restores the decode-only gate. Separate
-/// from `QWEN4_PLE_PREFETCH`, which still turns the pool off entirely -- a pool
+/// Whether a gather WIDER than one pool batch may use the pool at all. OPT-IN:
+/// `QWEN4_PLE_PREFETCH_PREFILL=1` enables it, absent or `0` keeps the decode-
+/// only gate. The pool was built for a cold/evicted table (rows faulting from
+/// SSD one at a time); on a WARM table it costs 4-5% prefill at every rung
+/// (M4 Max, 13.4k prompt: 758 tok/s serial vs 725 pooled, 6/6 cells at
+/// 8k/32k), so the default is the serial walk. Separate from
+/// `QWEN4_PLE_PREFETCH`, which still turns the pool off entirely -- a pool
 /// that was never created cannot serve either width.
 fn plePrefillPrefetchEnabled() bool {
     if (ple_prefill_prefetch_override) |v| return v;
@@ -509,9 +514,13 @@ fn plePrefillPrefetchEnabled() bool {
     };
     if (S.v) |v| return v;
     const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL");
-    const v = raw == null or raw.?[0] != '0';
+    const v = plePrefillPrefetchFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
     S.v = v;
     return v;
+}
+
+fn plePrefillPrefetchFromEnv(raw: ?[]const u8) bool {
+    return if (raw) |r| std.mem.eql(u8, r, "1") else false;
 }
 
 pub fn bf16ToF32(u: u16) f32 {
@@ -639,6 +648,16 @@ pub const Qwen4State = struct {
     }
 };
 
+test "ngram prefill prefetch is opt-in: absent or 0 = serial walk, 1 = pool" {
+    // The pool costs 4-5% prefill on a WARM table (M4 Max, 13.4k prompt,
+    // 758 vs 725 tok/s, 6/6 cells across 8k/32k); it only pays while rows
+    // still fault from SSD, so the default is the serial walk.
+    try testing.expect(!plePrefillPrefetchFromEnv(null));
+    try testing.expect(!plePrefillPrefetchFromEnv("0"));
+    try testing.expect(plePrefillPrefetchFromEnv("1"));
+    try testing.expect(!plePrefillPrefetchFromEnv(""));
+}
+
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
     // 4-bit, group 32, dim 32 -> wcols 4 u32 (16 B), scols 1 (2 B scale + 2 B
     // bias). 4096 rows, so a prefill-width gather is 64 pool batches and the
@@ -713,7 +732,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expect(!said(0, 0));
     try testing.expect(!said(1, 1) and !said(1, 0));
 
-    // Default: the same gather rides the pool in MAX_ROWS batches.
+    // Opted in: the same gather rides the pool in MAX_ROWS batches.
     ple_prefill_prefetch_override = true;
     t.gather(ids, got);
     try testing.expectEqual(before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));

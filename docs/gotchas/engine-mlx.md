@@ -5087,7 +5087,7 @@ own reseed clock, never width 0: sharing `seq` with the width cells would reseed
 the serial cell every time a width cell moved. Crossing a bucket re-decides from
 scratch. The periodic re-open (`MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`) is default
 OFF, and re-entry must PROVE the head is in sync before it drafts again.
-`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (8192) kills both the vote and the probe below the
+`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (32768) kills both the vote and the probe below the
 floor; `--max-mtp-ctx` and `MLX_SERVE_MTP_FORCE_DEPTH` outrank the whole mechanism.
 `MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` is the zero-cost kill switch.
 
@@ -5113,9 +5113,11 @@ serial, so a bad switch costs ~2x there against ~10% at 62.7k. It is also the
 one regime the feature was never argued for; the case for it begins past 32k,
 where a verify row becomes bytes.
 
-`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (default 8192) gates the vote AND the probe
-from one predicate above both — a probe below the floor would spend 8 serial
-tokens teaching a bucket that is never allowed to decide. It is the symmetric
+`MLX_SERVE_MTP_ADAPTIVE_MIN_KV` (default 32768, raised from 8192: the per-bucket
+tables show rounds losing to serial from the 32-64k bucket up, and at 8192 the
+probes landed inside the 8k cell of every M4 Max ladder) gates the vote AND the
+probe from one predicate above both — a probe below the floor would spend 8
+serial tokens teaching a bucket that is never allowed to decide. It is the symmetric
 knob to `--max-mtp-ctx`: a ceiling past which speculation stays off, a floor
 below which it stays on.
 
@@ -5639,3 +5641,67 @@ floor and its own A/B — or it should decline and let the existing arm serve.
 And when an A/B shows one cell moving, compare **the same cell across trees**
 before concluding from within-tree ratios: PR-fp16 vs PR-kv8 exonerated the
 arms; PR-fp16 vs main-fp16 convicted them.
+
+## The width-trial schedule kept a neighbour bucket's date; a cold bucket never trialled (2026-09-05, M4 Max, base AND PR #363)
+
+**Symptom.** Flash-Next 4-bit, `--mtp`, kv off, llmprobe 32k rung: some boots decode
+at 1.85-2.4 tok/step (66-72 tok/s) where others reach 3.6-3.9 (82-84). Same ms/tok
+per width in `[spec-stats]`, so the round is not slower, it is narrower: the first
+request in the bucket runs 45-91 rounds at w1 (`32-64k:w1:15.44/91`, avg 0.92
+tok/round) and never climbs. Seen on PR #363 first (its 4-8k rep-1 cell, then
+32k), then reproduced on the base a93e2c0 (`DB1-base`: 45 rounds at w1, 72.5 tok/s).
+
+**Trace.** A debug line per planned round (`[mtp-plan] r= kv= bucket= m_lo= m_hi=
+a=[..] src= trial= serial_step= cap= solo= rte= wt=<next>/<end> tgt= cells=`) on
+both arms, parsed by `~/claude-tmp/pr363/trace/plan_trace.py`. The stalled rounds
+read: `tgt=2` (the trial wants m_lo+1, unmeasured in the own bucket, period
+`EXPLORE_PERIOD_COLD`) and `wt=136/0` from round 12 onward: the schedule's next
+trial is round 136, ~120 rounds out, and never moves.
+
+**Mechanism.** `mtpAdaptiveBucket`/`bucketToRead` hand a COLD bucket its nearest
+ACTIVE neighbour for the first rounds, which after llmprobe's short low-acceptance
+requests is `<2k` with w(m_lo+1) priced 20-60% over w(m_lo) (short prose: w2 17.9
+vs w1 13.6 ms/tok). `mtpWidthTrialPeriod` reads that gap through `trialPeriod` and
+returns 124-256. `TrialSchedule.force` armed `next_trial = round + period` ONCE
+and re-read the period only after a trial fired. Three rounds later the own bucket
+activates (MIN_SAMPLES at w1), the period is the cold 8, and the schedule keeps the
+neighbour's date. No trial for the whole request.
+
+Why that is a stall and not a slow climb: `mtpEvObserve` only touches `a[i]` for
+`i < drafted`, so a single-chunk w1 plan never re-observes `a[1]`; the request
+inherits `a[1]` 0.37-0.44 from the short requests' seed and the EV argmax stays
+w1. The regime gate throttles two-chunk extension at long kv (the one other
+observer of `a[1]`), and the width trial (the intended escape) is the thing that
+never fires. When the own bucket does get a w2 cell it comes from the EV's own
+few rounds there (3 samples incl. a zero-accept round: `w2:14.97/3` vs
+`w1:14.34`), and a two-chunk plan neither feeds the table (extension rounds are
+not observed) nor trials a measured width (`mtpWidthTrialTarget` returns null on
+two-chunk plans), so the stale cell stands.
+
+**Fix.** `TrialSchedule.force` re-reads the period every round and a SHORTER one
+pulls the date in: `next_trial = min(next_trial, armed_at + period)`; a longer
+period never pushes it out (that is the deadlock's shape). `armed_at` is the
+round the schedule was last set (arm, block end, `startAt`). Unit test: armed at
+12 with period 124, called with the cold period at 18, fires at 20. Live
+(`D6-prfix2`): `wt=268` at r=17, `wt=20` at r=18, trials at 20/31/42..., the
+request climbs w2 -> w3 -> w4 trials. The A/B on the 32k rung stays noisy
+(llmprobe's prose prompt has `a[2]` ~0.35, so w3 is the right answer there);
+what the fix buys is the floor: no request sits at w1 for a whole reply.
+
+**Not the cause** (checked and acquitted): the planner (`mtpRoundPlan`,
+`mtpEvPlanSrc`, `MtpCostSource`, the regime gate, `mtpWidthTrialTarget`) is
+byte-identical between base and PR; the table (`observe`, `foldInto`,
+`bucketToRead`, `trusted`) is identical below 32k; the serial probe
+(`mtpAdaptiveSerialStep`) only costs its 8 tokens; `cap`/`cap_free` read 6/6
+and `spec_cost_solo` true on every stalled round. The PR showed it more often
+because its `<2k` cells came out w1-cheapest more often (the same short requests,
+different luck), and its 9-bucket layout has more cold buckets past 32k.
+
+**Also in this round** (same branch, M4 Max, kv off is the default):
+- `qsaSparseAttn` declined on a dense cache: c02f97f (the PR author's fix, same
+  shape). Measured here first: the prefill kernel at verify widths ran 4-8%
+  behind the union gather (66.0/66.1 vs 68.7/71.2 tok/s at 32K/64K). The
+  quantized arm stays (+12..20% at kv8).
+- PLE prefill prefetch pool opt-in (`QWEN4_PLE_PREFETCH_PREFILL=1`): -4..-5%
+  prefill on a warm table, 6/6 cells (13.4k: 758 serial vs 725 pooled).
+- `MTP_ADAPTIVE_MIN_KV` 8192 -> 32768: the probes sat inside the 8k cell.

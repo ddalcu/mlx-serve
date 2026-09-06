@@ -505,9 +505,20 @@ pub const EXPLORE_BLOCK: u32 = 3;
 /// idempotent per round (a planner may ask twice for the same round).
 /// `idx % period` was tried first and chained trials because the block's
 /// own observation moved the period.
+///
+/// The period is re-read EVERY round and a shorter one pulls the next trial
+/// in (`armed_at + period`); a longer one never pushes it out. The period
+/// follows the bucket the planner READS, and a request in a cold bucket
+/// reads its nearest active neighbour for its first rounds: on the M4 Max
+/// 32k trace the `<2k` neighbour priced w(m_lo+1) 20-60% over w(m_lo) (short
+/// low-acceptance requests), the schedule armed at period 124-256, and when
+/// the own bucket activated three rounds later (m_lo+1 unmeasured, period
+/// EXPLORE_PERIOD_COLD) it kept the neighbour's date — no trial for the whole
+/// request, `a[m_lo]` frozen at its seed, w1 for 45-91 rounds.
 pub const TrialSchedule = struct {
     trial_end: u32 = 0,
     next_trial: u32 = 0,
+    armed_at: u32 = 0,
     trials: u32 = 0,
     last_idx: ?u32 = null,
     last_force: bool = false,
@@ -518,12 +529,15 @@ pub const TrialSchedule = struct {
         t.last_force = blk: {
             if (round_idx < t.trial_end) break :blk true;
             if (t.next_trial == 0) {
+                t.armed_at = round_idx;
                 t.next_trial = round_idx + period;
                 break :blk false;
             }
+            t.next_trial = @min(t.next_trial, t.armed_at + period);
             if (round_idx >= t.next_trial) {
                 t.trials += 1;
                 t.trial_end = round_idx + EXPLORE_BLOCK;
+                t.armed_at = t.trial_end;
                 t.next_trial = t.trial_end + period;
                 break :blk true;
             }
@@ -535,7 +549,10 @@ pub const TrialSchedule = struct {
     /// Start trialling at `round_idx` instead of one period later (a block
     /// drafter with no serial measurement must not run eight rounds blind).
     pub fn startAt(t: *TrialSchedule, round_idx: u32) void {
-        if (t.next_trial == 0) t.next_trial = @max(1, round_idx);
+        if (t.next_trial == 0) {
+            t.armed_at = @max(1, round_idx);
+            t.next_trial = t.armed_at;
+        }
     }
 };
 
@@ -1045,6 +1062,32 @@ test "round_cost: trialPeriod and TrialSchedule blocks" {
     var s = TrialSchedule{};
     s.startAt(3);
     try testing.expect(s.force(3, 8)); // starts at once, not a period later
+}
+
+test "round_cost: a shorter period pulls an armed TrialSchedule in (cold own bucket after a neighbour's long period)" {
+    // M4 Max 32k trace (2026-09-05): the schedule armed at round 12 from the
+    // nearest ACTIVE bucket (`<2k`, w4 priced 20% over w3 by short
+    // low-acceptance requests) with period 124 -> next_trial 136. Three
+    // rounds later the request's own bucket activated with its m_lo+1
+    // UNMEASURED (period EXPLORE_PERIOD_COLD), and the schedule kept 136:
+    // no trial for the whole request, `a[m_lo]` frozen at its seed.
+    var t = TrialSchedule{};
+    try testing.expect(!t.force(12, 124));
+    try testing.expectEqual(@as(u32, 136), t.next_trial);
+    var i: u32 = 13;
+    while (i < 18) : (i += 1) try testing.expect(!t.force(i, 124));
+    // The read bucket changed: from here the period is the cold one.
+    try testing.expect(!t.force(18, EXPLORE_PERIOD_COLD));
+    try testing.expectEqual(@as(u32, 12 + EXPLORE_PERIOD_COLD), t.next_trial);
+    try testing.expect(!t.force(19, EXPLORE_PERIOD_COLD));
+    try testing.expect(t.force(20, EXPLORE_PERIOD_COLD));
+    try testing.expectEqual(@as(u32, 1), t.trials);
+    // A LONGER period never pushes an armed schedule out (that is the
+    // deadlock's shape); the block re-arms from its own end.
+    var u = TrialSchedule{};
+    try testing.expect(!u.force(5, 8));
+    try testing.expect(!u.force(6, 200));
+    try testing.expectEqual(@as(u32, 13), u.next_trial);
 }
 
 /// Synthetic block drafter: per-position acceptance p, round ms linear in
