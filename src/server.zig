@@ -1136,8 +1136,15 @@ fn omittedMaxTokensDefault(effective_ctx: u32) u32 {
 /// there is for a client that never sends the field.
 fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32) u32 {
     if (launch_default > 0) return launch_default;
-    return if (effective_ctx > 0) std.math.maxInt(u32) / 4 else 4096;
+    return if (effective_ctx > 0) AUTO_MAX_TOKENS_SENTINEL else 4096;
 }
+
+/// The "the client named no budget, peg it to the window" sentinel, in ONE
+/// place. It is not a number anybody asked for: `clampMaxTokens` reduces it to
+/// `context - prompt`. Every surface that PRINTS or JUDGES a budget compares
+/// against this rather than re-spelling `maxInt(u32) / 4` — the two log lines
+/// that spelled it out as if a client had sent it are what this constant fixes.
+const AUTO_MAX_TOKENS_SENTINEL: u32 = std.math.maxInt(u32) / 4;
 
 /// The ONE read of `ServerConfig.default_max_tokens`. Every surface that
 /// resolves an omitted `max_tokens` comes through here, or through
@@ -1160,6 +1167,65 @@ fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
         .integer => |i| if (i > 0) @intCast(i) else auto_default,
         else => auto_default,
     };
+}
+
+/// Who decided the effective `max_tokens`: the client's own field, the
+/// operator's `--max-tokens` launch default standing in for an omitted one, or
+/// nobody (auto — peg to the window).
+const MaxTokensOrigin = enum { client, launch_default, auto };
+
+/// The origin of the number `resolveRequestMaxTokens` returns, read from the
+/// SAME two inputs so the label and the number beside it cannot disagree. A
+/// present-and-positive field is the client's; otherwise the launch default if
+/// one was given; otherwise auto.
+fn maxTokensOrigin(requested: ?std.json.Value, launch_default: u32) MaxTokensOrigin {
+    if (requested) |val| switch (val) {
+        .integer => |i| if (i > 0) return .client,
+        else => {},
+    };
+    return if (launch_default > 0) .launch_default else .auto;
+}
+
+/// Widest string `describeMaxTokens` writes: a 10-digit budget plus
+/// " (launch default)".
+const MAX_TOKENS_DESC_LEN: usize = 27;
+
+/// Render the request log's `max_tokens=` field. A log line reports what
+/// HAPPENED: printing our omitted-field sentinel as `max_tokens=1073741823`
+/// read to an outside auditor as a client asking for a billion tokens
+/// ("budget from each agent accumulated into one giant pool") when in fact the
+/// client had sent nothing at all. Auto prints as `auto` — or `auto (N)` when
+/// the auto budget is the finite unknown-context fallback, which really does
+/// cap generation — a launch-filled budget names whose number it is, and a
+/// client's own number prints bare. Writes into a caller-owned stack buffer:
+/// the lines it feeds allocate nothing.
+fn describeMaxTokens(buf: []u8, value: u32, origin: MaxTokensOrigin) []const u8 {
+    return switch (origin) {
+        .client => std.fmt.bufPrint(buf, "{d}", .{value}) catch "?",
+        .launch_default => std.fmt.bufPrint(buf, "{d} (launch default)", .{value}) catch "?",
+        .auto => if (value == AUTO_MAX_TOKENS_SENTINEL)
+            "auto"
+        else
+            std.fmt.bufPrint(buf, "auto ({d})", .{value}) catch "auto",
+    };
+}
+
+/// Does the generation budget warrant the "budget squeezed" WARNING — i.e. did
+/// somebody name a number the remaining window cannot pay (the tool-call
+/// truncation nudge)? The auto sentinel is excluded by construction: it is
+/// always more than 4x anything that remains, so it used to fire this warning
+/// on every omitted-budget request past a quarter of the window, quoting a
+/// number no client ever sent.
+fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
+    if (max_tokens == AUTO_MAX_TOKENS_SENTINEL) return false;
+    return remaining < max_tokens / 4;
+}
+
+/// The auto budget's own tightness question. With no requested number to fall
+/// short OF, "squeezed" can only mean the PROMPT ate the window, so the bar is
+/// the window itself: under a quarter of it left.
+fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
+    return remaining < effective_ctx / 4;
 }
 
 /// Finish reason for a response whose generated text yielded tool calls.
@@ -7120,8 +7186,14 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     const prompt: u32 = @intCast(@min(prompt_len, effective_ctx));
     if (prompt >= effective_ctx) return 1; // at least 1 token
     const remaining = effective_ctx - prompt;
-    if (remaining < max_tokens / 4) {
+    if (maxTokensBudgetSqueezed(max_tokens, remaining)) {
         log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
+    } else if (max_tokens == AUTO_MAX_TOKENS_SENTINEL and autoBudgetWindowTight(remaining, effective_ctx)) {
+        // The client named no budget, so nothing it asked for is at risk: this
+        // is context, not a deviation. It rides debug — at warn it fired on
+        // every long-prompt auto request and quoted the sentinel as if it were
+        // a client's ask, which is exactly how it got misread.
+        log.debug("  generation budget squeezed: {d} of the window remain (auto budget; prompt={d}, ctx={d})\n", .{ remaining, prompt, effective_ctx });
     }
     if (max_tokens > remaining) {
         log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d})\n", .{ max_tokens, remaining, effective_ctx, prompt });
@@ -9041,10 +9113,13 @@ fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = resolveRequestMaxTokens(
-        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
+    // For the request log line only: which of the three sources this came from.
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -9356,7 +9431,8 @@ fn handleChatCompletions(
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
 
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template. ds4-backed models render through the engine's
@@ -9598,10 +9674,13 @@ fn handleCompletions(
         return;
     }
 
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = resolveRequestMaxTokens(
-        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
+    // For the request log line only: which of the three sources this came from.
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -9686,7 +9765,8 @@ fn handleCompletions(
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
-    log.info("POST /v1/completions (max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ max_tokens, temperature, top_p, top_k, is_stream });
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
     log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
 
     // Tokenize prompt directly (no chat template). ds4-backed models
@@ -15346,6 +15426,9 @@ fn handleAnthropicMessages(
     // may stand in for it, and with no flag the 400 is unchanged.
     const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
     const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
+    // For the request log line only. This surface 400s on a missing budget, so
+    // the origin here is never `.auto`.
+    const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
     if (max_tokens == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
         return;
@@ -15768,8 +15851,9 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
@@ -19875,6 +19959,72 @@ test "--max-tokens is the omitted-field default: unset is byte-identical, set wi
     try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(32768));
 }
 
+test "describeMaxTokens: an omitted max_tokens logs as auto, never as the sentinel" {
+    const t = std.testing;
+    var buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+
+    // The defect: `max_tokens=1073741823` on the request line is OUR sentinel
+    // for "the client said nothing", and an auditor read it as a client asking
+    // for a billion tokens ("budget from each agent accumulated into one giant
+    // pool"). The line must say what actually happened.
+    try t.expectEqualStrings("auto", describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .auto));
+
+    // The auto budget is only the sentinel when the context is KNOWN; with an
+    // unknown context it is a finite 4096 that really does cap generation, so
+    // the line names it rather than hiding it behind a bare "auto".
+    try t.expectEqualStrings("auto (4096)", describeMaxTokens(&buf, 4096, .auto));
+
+    // `--max-tokens N` filled an omitted field: the number is real, but it is
+    // the operator's, not the client's, and the line says whose it is.
+    try t.expectEqualStrings("65536 (launch default)", describeMaxTokens(&buf, 65536, .launch_default));
+
+    // A client that sent the field gets its own number back, unadorned.
+    try t.expectEqualStrings("4096", describeMaxTokens(&buf, 4096, .client));
+
+    // Origin comes from the SAME inputs `resolveRequestMaxTokens` reads, so
+    // the label can't disagree with the number beside it.
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(null, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = 0 }, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = -5 }, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .string = "999" }, 0));
+    try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(null, 65536));
+    try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(.{ .integer = 0 }, 65536));
+    // A sent field outranks the flag, so it is the CLIENT's number either way.
+    try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 65536));
+    try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 0));
+
+    // The buffer is exactly big enough for the widest line the helper writes
+    // (the sentinel under the launch-default form), so no call site can
+    // silently truncate it.
+    try t.expectEqualStrings(
+        "1073741823 (launch default)",
+        describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .launch_default),
+    );
+}
+
+test "the max_tokens squeeze warning is silent for the auto budget, loud for a real over-ask" {
+    const t = std.testing;
+
+    // A real over-ask: the client named a number and the window can't pay it.
+    // That is the warning's whole point (the tool-call truncation nudge).
+    try t.expect(maxTokensBudgetSqueezed(32768, 4000));
+    try t.expect(!maxTokensBudgetSqueezed(32768, 30000));
+
+    // The sentinel is always > 4x whatever remains, so before this fix EVERY
+    // omitted-budget request past a quarter of the window printed a warning
+    // quoting a number no client ever sent. There is nothing to be short OF.
+    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 4000));
+    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 1));
+
+    // The auto budget's own tightness question is about the WINDOW, not about
+    // a requested number: it fires when the prompt has eaten three quarters of
+    // the context. It is diagnostic, so it rides log.debug (see clampMaxTokens).
+    try t.expect(autoBudgetWindowTight(4000, 32768));
+    try t.expect(!autoBudgetWindowTight(30000, 32768));
+    // A launch default is a real number and takes the real predicate.
+    try t.expect(maxTokensBudgetSqueezed(65536, 4000));
+}
+
 test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
     const t = std.testing;
     // The admission reservation reads the RESOLVED budget, so the flag reaches
@@ -19927,8 +20077,13 @@ test "every text surface resolves an omitted max_tokens through ONE helper" {
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "if (launch_default > 0) return launch" ++ "_default;"));
 
     // /v1/chat/completions and /v1/completions share a spelling…
-    const openai = "resolveRequest" ++ "MaxTokens(\n        root.get(\"max_tokens\") orelse root.get(\"max_completion_tokens\"),\n        omittedMaxTokens" ++ "Default(getEffectiveContextLength(config)),\n    );";
+    const openai_field = "const requested_max_tokens = root.get(\"max_tokens\") orelse root.get(\"max_completion" ++ "_tokens\");";
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, openai_field));
+    const openai = "resolveRequest" ++ "MaxTokens(\n        requested_max_tokens,\n        omittedMaxTokens" ++ "Default(getEffectiveContextLength(config)),\n    );";
     try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, openai));
+    // …and each labels the number it logs from the SAME parsed field, so the
+    // request line can never claim a client sent a budget it did not send.
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, src, "maxTokens" ++ "Origin(requested_max_tokens, launchMaxTokensDefault());"));
     // …/v1/responses keeps its own (it must know whether the field was SENT,
     // to echo null in the envelope) but parses through the same helper…
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, src, "const r = resolveRequest" ++ "MaxTokens(v, 0);"));
