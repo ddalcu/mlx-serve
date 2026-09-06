@@ -1965,3 +1965,67 @@ the hot-cache clamp, the auto-context pin and the admission bill all read
 the wrapper is the only caller of `physicalMemoryCeiling`. A floor that reached the admission
 bill but not the auto-context pin would advertise a context the guard then refuses, so the
 test counts the call sites ("every GPU-ceiling consumer reads ONE helper").
+
+## Every warm append on a growing chain was billed a COLD prefill (2026-09-07)
+
+Same incident as the ceiling story above, second defect. Three consecutive turns of the same
+448k agent session, each appending a few hundred tokens to a prefix the hot cache had just
+restored, were billed `needed=21640 MB` (width 4096), `needed=18284 MB` (width 2048) and
+`needed=13450 MB` (width 512, refused) — whole-KV bills, on turns where 448,531 of 448,604
+rows were already resident and pinned by the request's own prefix.
+
+**The gate.** `WarmPrefix.creditedRows` was all-or-nothing:
+
+```zig
+if (reserved > self.capacity_tokens) return 0;
+```
+
+`reserved` is `prompt + RESERVE_GEN_HEADROOM (8192) + chunk`, and `capacity_tokens` is what the
+buffer holds. The turn that last grew the cache set the capacity to ITS OWN
+`prompt + 8192 + chunk`; the next turn's prompt is a few hundred tokens longer, so its
+`reserved` is above that capacity — and stays above it for the ~29 turns until the next grow.
+The gate is therefore true on essentially EVERY warm turn of a growing chain, and the credit
+never applied. The three live bills are the proof: they differ only by the prefill width.
+
+**Why the gate was written that way, and why it is wrong.** The reasoning was that past the
+restored capacity the cache grows, a grow copies the buffer, so the whole new capacity is
+allocated beside the old one and nothing is donated. Half of that is true. `growQuantBuf`
+allocates the new buffer, `mlx_slice_update`s the old rows into it and drops OUR reference to
+the old one — but the graph node holds the old buffer until that node EVALUATES. How much of
+the old cache is alive at once is therefore a property of the prefill layer loop's EVAL
+CADENCE, not of the cache's size. Measured hermetically rather than argued (transformer.zig,
+"a KV capacity grow's coexistence window is the EVAL CADENCE"; 12 layers of an affine-8 cache
+filled to 4096 rows, one row appended to each, peak above steady, per-layer buffer ~1.7 MB):
+
+| eval cadence | peak above steady | in layers |
+|---|---|---|
+| 1 | 3,648 KB | ~2 (one old beside one new) |
+| 4 (`MOE_EVAL_EVERY_N_LAYERS`) | 5,104 KB | ~3 |
+| 12 (one eval for the whole forward) | 22,704 KB | 12 — the WHOLE old cache |
+
+qwen4_exp prefills through `forwardQwen4With`, which evals every `MOE_EVAL_EVERY_N_LAYERS`
+layers (`prefillEvalCadence` drops to 1 only when scores + dequant exceed 2 GiB; at 448k with a
+fused hd-256 kernel the dequant term is 876 MB, so the cadence stays 4). It caches 12 of 48
+layers, so exactly ONE attention layer falls in a 4-layer window: 465 MB of old buffer, against
+the 5,584 MB the gate re-billed.
+
+**The fix.** `creditedRows` credits the rows the buffer HOLDS —
+`min(matched, capacity, reserved)` — and `PrefillRequestTerms.grow_coexist_bytes` bills one eval
+window of old buffers when the append actually grows (`WarmPrefix.grows(seq)`, i.e.
+`prompt > capacity`; a reservation above the prompt allocates nothing by itself). Two arms stay
+exactly as they were: a SHARED restore (`will_donate == false`) is refcount-bound and copied
+whole by the first append, so it credits nothing; and an append narrower than
+`prefillEvalCadenceApplies` (32 tokens) skips the mid-loop eval entirely, so it pays the whole
+old cache — the coexistence term then cancels the credit precisely, which is the case the old
+gate had in mind.
+
+The incident's refused turn: 13,450 -> 7,051 MB at width 512, and 9,711 MB at width 2048, so
+the ladder no longer narrows to the floor at all. A turn whose buffer already covers the prompt
+grows nothing and pays 6,469 MB.
+
+**A proportional `RESERVE_GEN_HEADROOM` was considered and declined.** A grow fires on
+`prompt > capacity` and raises capacity to `prompt + headroom + chunk`, so the interval between
+grows is `(headroom + chunk) / tokens-per-turn`: 29 turns at 448k with the flat 8192, and 31
+turns with `max(8192, 2% of prompt)` = 8,972 rows — two turns further apart, for +9 MB of KV on
+every request at that length. The re-grow frequency was never the cost. Being billed a cold
+prefill on the turn that grows was.

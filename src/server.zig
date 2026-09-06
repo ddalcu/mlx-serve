@@ -4448,14 +4448,81 @@ pub const WarmPrefix = struct {
     /// is copied whole by the first append, so crediting it is an under-bill.
     will_donate: bool = false,
 
-    /// Rows of KV this request will not allocate. All-or-nothing on the capacity gate.
+    /// Rows of KV this request will not allocate: the rows the restored buffer already HOLDS.
+    ///
+    /// This used to be all-or-nothing on `reserved > capacity_tokens`, and `reserved` is
+    /// `prompt + RESERVE_GEN_HEADROOM + chunk` — above the capacity the PREVIOUS turn sized as
+    /// soon as the prompt has grown by a single token. On an agent chain adding a few hundred
+    /// tokens a turn that gate is true on every warm turn, so the credit never applied and a
+    /// 448k append was billed its whole 5,585 MB of KV as if it were cold (live 2026-09-06:
+    /// three consecutive turns billed 21,640 / 18,284 / 13,450 MB, the last one refused).
+    /// What a grow actually costs beyond the rows already there is the new capacity minus the
+    /// old — which is what `reserved - credited` leaves — plus one eval window of old buffers,
+    /// billed separately as `PrefillRequestTerms.grow_coexist_bytes`.
+    ///
+    /// `will_donate` still gates the whole credit: a SHARED restore is refcount-bound and the
+    /// first append copies the entire prefix, so nothing there is donated.
     pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
         if (!self.will_donate) return 0;
         if (self.matched_tokens == 0) return 0;
-        if (reserved > self.capacity_tokens) return 0;
-        return @min(self.matched_tokens, reserved);
+        return @min(@min(self.matched_tokens, self.capacity_tokens), reserved);
+    }
+
+    /// Does this append have to grow the buffers at all? The per-layer grow fires on
+    /// `offset + new_len > capacity`, i.e. exactly when the prompt outruns the restored
+    /// capacity. A reservation ABOVE the prompt does not by itself allocate anything: it only
+    /// raises the capacity of a grow that some later token forces.
+    pub fn grows(self: WarmPrefix, seq: u64) bool {
+        if (!self.will_donate or self.matched_tokens == 0) return false;
+        return seq > self.capacity_tokens;
     }
 };
+
+/// PURE: the most attention (KV-caching) layers that can fall inside one window of `window`
+/// consecutive layers. `window` is the prefill loop's eval cadence, so this is how many old KV
+/// buffers can be alive at once while a warm append grows the cache.
+fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u32 {
+    const n = config.num_hidden_layers;
+    if (window == 0 or n == 0) return 0;
+    if (window >= n) return config.attnCacheLayerCount();
+    var best: u32 = 0;
+    var start: u32 = 0;
+    while (start + window <= n) : (start += 1) {
+        var count: u32 = 0;
+        var i: u32 = start;
+        while (i < start + window) : (i += 1) {
+            if (!config.isLinearLayer(i)) count += 1;
+        }
+        if (count > best) best = count;
+    }
+    return @min(best, config.attnCacheLayerCount());
+}
+
+/// PURE: bytes of OLD KV buffer alive beside the new ones while a warm append grows the cache.
+///
+/// `transformer.growQuantBuf` allocates the new buffer, copies the old rows in and drops our
+/// reference to the old one — but the graph node holds it until that node EVALUATES. So how
+/// much of the old cache coexists with the new is decided by the prefill layer loop's eval
+/// cadence, not by the size of the cache. MEASURED hermetically (transformer.zig, "a KV
+/// capacity grow's coexistence window is the EVAL CADENCE": 12-layer affine-8 cache, peak above
+/// steady) — cadence 1 keeps ~2 layers, cadence 4 keeps ~3, one eval for the whole forward
+/// keeps all 12, i.e. the whole old cache.
+///
+/// A forward narrower than the cadence minimum (`prefillEvalCadenceApplies`) skips the mid-loop
+/// eval entirely and therefore DOES pay the whole old cache; a short append takes that arm.
+fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, kv_per_tok: u64) u64 {
+    if (!warm.grows(seq)) return 0;
+    const attn = config.attnCacheLayerCount();
+    if (attn == 0) return 0;
+    const span: u64 = seq -| warm.matched_tokens;
+    const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
+        attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
+    else
+        attn;
+    if (window == 0) return 0;
+    // The old buffer's own size, spread over the layers that cache.
+    return warm.capacity_tokens *| kv_per_tok / attn *| window;
+}
 
 /// Per-request bytes that scale with the prompt rather than the chunk.
 pub const PrefillRequestTerms = struct {
@@ -4469,6 +4536,10 @@ pub const PrefillRequestTerms = struct {
     /// Bytes of the KV terms above already resident in the buffer the restore handed this slot
     /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
     shared_resident_bytes: u64 = 0,
+    /// Old KV buffers that coexist with the new ones while a warm append GROWS the cache.
+    /// Zero when nothing grows, when the restore was shared (the whole copy is billed
+    /// uncredited instead), and on every arch outside the gate.
+    grow_coexist_bytes: u64 = 0,
 };
 
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
@@ -4497,7 +4568,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
@@ -4668,6 +4739,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
+        .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
     };
 }
 
@@ -17851,6 +17923,95 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve > 1024);
 }
 
+test "a proportional RESERVE_GEN_HEADROOM buys no fewer grows at 448k" {
+    // Considered and DECLINED, arithmetic here so the next reader does not re-derive it. The
+    // worry was that the flat 8192-token headroom makes a chain adding ~300 tokens a turn
+    // re-grow often. It does not: a grow fires on `prompt > capacity`, and the grow that fires
+    // raises capacity to `prompt + RESERVE_GEN_HEADROOM + chunk`, so the interval between grows
+    // is `(headroom + chunk) / tokens-per-turn` — 29 turns at 448k. `max(8192, 2% of prompt)`
+    // at 448,604 tokens is 8,972 rows: 31 turns, two turns further apart, for +10 MB of KV on
+    // every request at that length. The re-grow was never the cost; being billed a COLD prefill
+    // on the turn that grows was, and that is `creditedRows`.
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+    const cfg = qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const chunk: u64 = 512;
+    const per_turn: u64 = 300;
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+
+    const flat = transformer_mod.KVCache.RESERVE_GEN_HEADROOM;
+    const proportional = @max(flat, seq * 2 / 100);
+    try t.expectEqual(@as(u64, 8_972), proportional);
+    // Turns between grows, both policies.
+    try t.expectEqual(@as(u64, 29), (flat + chunk) / per_turn);
+    try t.expectEqual(@as(u64, 31), (proportional + chunk) / per_turn);
+    // ...for this much more KV on every request at that length.
+    try t.expectEqual(@as(u64, 9), (proportional - flat) * kv_per_tok / mb);
+    // For scale: what the turn that grows used to be over-billed.
+    const grows = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = true };
+    const terms = prefillRequestTerms(&cfg, seq, @intCast(getEffectiveContextLength(&cfg) - seq), kv_bits, chunk, grows);
+    try t.expectEqual(@as(u64, 5_584), terms.shared_resident_bytes / mb);
+}
+
+test "a warm append is billed the rows it ALLOCATES, not the rows it already holds" {
+    // The incident's third turn. `creditedRows` was all-or-nothing on `reserved >
+    // capacity_tokens`, and `reserved` is `prompt + 8192 + chunk`, so on a chain that grows by
+    // a few hundred tokens a turn it is ALWAYS above the buffer the previous turn sized —
+    // every warm append was billed as if it were cold. The three live turns confirm it: the
+    // two admitted ones needed 21,640 MB and 18,284 MB, whole-KV bills, and the refused one
+    // 13,450 MB, when 448,531 of its 448,604 rows were already resident.
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+    const cfg = qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const matched: u64 = 448_531;
+    const chunk: u64 = 512;
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
+
+    // Pessimal reading of the entry: capacity exactly the rows it matched, so the append DOES
+    // grow every attention layer.
+    const grows = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = true };
+    const g = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, grows);
+    // The rows it holds are credited, and only the growth is billed.
+    try t.expectEqual(matched *| kv_per_tok, g.shared_resident_bytes);
+    try t.expectEqual((reserved - matched) *| kv_per_tok, g.reserved_kv_bytes +| (seq - matched) *| kv_per_tok);
+    // ...plus the old buffers that coexist inside one eval window while it grows.
+    // qwen4_exp caches 12 of 48 layers, so exactly one lands in a 4-layer eval window: 465 MB
+    // of old buffer, against the 5,584 MB the all-or-nothing gate used to re-bill.
+    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS));
+    try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows);
+    // 13,450 -> 7,051 MB: it fits the 12,934 MB the refusal quoted, with room for a wider
+    // width (2,048 bills 9,711 MB, so the ladder stops narrowing at 512).
+    try t.expectEqual(@as(u64, 7_051), needed / mb);
+    try t.expectEqual(@as(u64, 9_711), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
+
+    // A buffer the previous turn sized above this prompt grows NOTHING, so there is no
+    // coexistence window at all.
+    const fits = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 450_048, .will_donate = true };
+    const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
+    try t.expectEqual(@as(u64, 0), f.grow_coexist_bytes);
+    try t.expectEqual(@as(u64, 6_469), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+
+    // A SHARED restore is copied whole by the first append, so it credits nothing and bills no
+    // coexistence window either — the copy IS the uncredited allocation. Byte-identical to before.
+    const shared = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = false };
+    const sh = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, shared);
+    try t.expectEqual(@as(u64, 0), sh.shared_resident_bytes);
+    try t.expectEqual(@as(u64, 0), sh.grow_coexist_bytes);
+    try t.expectEqual(@as(u64, 13_450), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, shared) / mb);
+
+    // A COLD prompt is untouched: nothing matched, nothing credited, no window.
+    const cold = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+    try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
+    try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
+}
+
 test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     // MEASURED on the incident box, 2026-09-07: `sysctl iogpu.wired_limit_mb` = 120000 and
     // Metal's `recommendedMaxWorkingSetSize` = 125,829,120,000 bytes = 120,000 MB. They are the
@@ -17909,8 +18070,11 @@ test "the refused 448k warm append is admitted at width 512 once the ceiling hon
     const matched: u64 = 448_531;
     // No max_tokens on the wire reserves ctx - prompt.
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
-    const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = true };
+    // The shared-restore arm: the bill the incident actually quoted, and the one the warm-append
+    // credit fix (a separate commit) leaves untouched, so this test stays about the CEILING.
+    const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = false };
     const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, warm);
+    try t.expectEqual(@as(u64, 13_450), needed / mb);
 
     // The ceiling at the refusal: `available` was 12,934 MB under a ~100,656 MB ceiling, so the
     // footprint was ~87,722 MB (the request's own prefix was resident and pinned).
@@ -21877,10 +22041,13 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
 
 test "a chain extension that OUTGROWS the resident entry is credited nothing" {
     const t = std.testing;
-    // The 1M rung: 1,047,556 tokens over the same resident 786,707-token entry. The credit is
-    // zero here on purpose: past the restored buffer's capacity a grow allocates the whole new
-    // capacity beside the protected entry. The guard no longer refuses it on a cold bill; the
-    // inference thread decides.
+    // The 1M rung: 1,047,556 tokens over the same resident 786,707-token entry. Past the
+    // restored buffer's capacity the cache GROWS — but per layer, and the prefill loop's eval
+    // cadence releases each old buffer at the next boundary (measured: transformer.zig, "a KV
+    // capacity grow's coexistence window is the EVAL CADENCE"). So the resident rows are still
+    // credited and what the grow adds is billed: the new capacity beyond the old, plus ONE eval
+    // window of old buffers. Billing the whole new capacity beside the whole old one is what
+    // made every warm turn of a growing chain pay a cold bill (live 2026-09-06).
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 1_047_556;
     const chunk: u64 = 512;
@@ -21892,9 +22059,15 @@ test "a chain extension that OUTGROWS the resident entry is credited nothing" {
     try t.expectEqual(@as(u64, 1_048_268), reserved);
     const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity, .will_donate = true };
     try t.expect(reserved > capacity);
-    try t.expectEqual(@as(u64, 0), extend.creditedRows(reserved));
+    try t.expect(extend.grows(seq));
+    try t.expectEqual(@as(u64, 786_707), extend.creditedRows(reserved));
+    const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const ext_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, extend);
+    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    try t.expectEqual(capacity * per_tok / cfg.attnCacheLayerCount() * window, ext_terms.grow_coexist_bytes);
     try t.expectEqual(
-        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}),
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) -
+            (786_707 * per_tok - ext_terms.grow_coexist_bytes) * 5 / 4,
         prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, extend),
     );
 
@@ -21985,10 +22158,29 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     // which is what the `.{}` arm above is for.
     try t.expect(cold > shared_same_span);
 
-    // The capacity gate still binds on top of the checkout.
+    // The capacity is a CEILING on the credit, not a switch that turns it off: a buffer holding
+    // 700,000 rows donates 700,000 of them and the request is billed the growth on top (the
+    // all-or-nothing gate is what made every warm turn of a growing chain pay a cold bill).
     const outgrown = (CheckoutCase{}).warm(matched, 700_000);
     try t.expect(outgrown.will_donate);
-    try t.expectEqual(@as(u64, 0), outgrown.creditedRows(reserved));
+    try t.expectEqual(@as(u64, 700_000), outgrown.creditedRows(reserved));
+    try t.expect(outgrown.grows(seq));
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const og_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, outgrown);
+    // This append is 31 tokens wide, BELOW `prefillEvalCadenceApplies`: the layer loop runs one
+    // eval for the whole forward, so every old buffer is alive at once and the coexistence term
+    // is the whole restored cache — exactly cancelling the credit, as the old gate assumed.
+    try t.expect(seq - matched < 32);
+    try t.expectEqual(700_000 * kv_per_tok, og_terms.grow_coexist_bytes);
+    try t.expectEqual(shared_same_span, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, outgrown));
+    // An append wide enough to take the cadence pays ONE eval window instead, and that is the
+    // difference between the old bill and the new one.
+    const wide = WarmPrefix{ .matched_tokens = 700_000, .capacity_tokens = 700_000, .will_donate = true };
+    const wide_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, wide);
+    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    try t.expect(window < cfg.attnCacheLayerCount());
+    try t.expectEqual(700_000 * kv_per_tok / cfg.attnCacheLayerCount() * window, wide_terms.grow_coexist_bytes);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, wide) < shared_same_span);
 }
 
 test "pinnedResidentBytes names the entry a restore would share, and only that" {
@@ -22220,12 +22412,17 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     // The bill term by term, from the same inputs `prefillMemoryNeeded` reads.
     const kv_bits: u64 = 8;
     const max_tokens: u32 = 418_224;
-    // The restored buffer is smaller than the reservation, so it grows: the KV credit is correctly zero.
-    const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
+    // The restored buffer is smaller than the reservation, so it grows. The rows it HOLDS are
+    // still credited; the growth and one eval window of old buffers are what it pays. (This
+    // block keeps the original turn-B decomposition by pricing the SHARED restore of the same
+    // span, whose credit is zero for the other reason: a refcount-bound restore is copied whole.)
+    const turn_b_donating = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
+    const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = false };
     const reserve_rows = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
     try t.expectEqual(seq + transformer_mod.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
     try t.expect(reserve_rows > turn_b.capacity_tokens);
     try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
+    try t.expectEqual(@as(u64, 364_478), turn_b_donating.creditedRows(reserve_rows));
 
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
     const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);

@@ -12302,7 +12302,7 @@ pub const Transformer = struct {
     // ── Forward dispatch ──
 
     const EVAL_EVERY_N_LAYERS: u32 = 48;
-    const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
+    pub const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
     /// Per-layer prefill transient (bytes) above which the layer loop eval()s
@@ -38721,6 +38721,89 @@ test "decodeAsyncLadderStride: ships OFF (measured negative); auto/<n> opt in" {
     try t.expectEqual(@as(u32, 4), Transformer.decodeAsyncLadderStride("4"));
     // Garbage stays OFF rather than silently enabling a measured-negative lever.
     try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride("banana"));
+}
+
+test "a KV capacity grow's coexistence window is the EVAL CADENCE, not the forward" {
+    // What a warm append's KV bill is allowed to assume. `growQuantBuf` allocates the new
+    // buffer, copies the old rows into it and drops OUR reference to the old one, but the
+    // graph node holds it until the node evaluates — so how much of the old cache coexists
+    // with the new one is decided by the prefill layer loop's eval cadence, not by the size
+    // of the cache. Measured here rather than reasoned about: 12 layers of an affine-8 cache
+    // filled to 4096 rows, then one row appended to every layer.
+    //
+    // MEASURED (M5 Max, 2026-09-07), peak above steady, per-layer buffer ~1.7 MB:
+    //   cadence 1  -> +3,648 KB  (~2 layers: one old beside one new)
+    //   cadence 4  -> +5,104 KB  (~3 layers)
+    //   cadence 12 -> +22,704 KB (~12 layers: the WHOLE old cache, one eval for the forward)
+    // The prefill loops eval every `MOE_EVAL_EVERY_N_LAYERS` layers, so a growing warm append
+    // holds a cadence window of old buffers, NOT the whole cache — which is what
+    // `server.PrefillRequestTerms.grow_coexist_bytes` bills.
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const L: u32 = 12;
+    const C_OLD: c_int = 4096;
+    var cache = try KVCache.initWithConfig(t.allocator, L, kv_quant.KVQuantConfig.affine(8));
+    defer cache.deinit();
+    const mk = struct {
+        fn f(str: mlx.mlx_stream, len: c_int, d: c_int) !mlx.mlx_array {
+            const shape = [_]c_int{ 1, 2, len, d };
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&a, &shape, 4, .bfloat16, str));
+            return a;
+        }
+    }.f;
+    for (0..L) |li| {
+        const k = try mk(s, C_OLD, 128);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try mk(s, C_OLD, 128);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(@intCast(li), k, v, s, 0);
+        defer dv.deinit();
+        try mlx.check(mlx.mlx_array_eval(dv.k));
+    }
+    _ = mlx.mlx_clear_cache();
+    var steady: usize = 0;
+    _ = mlx.mlx_get_active_memory(&steady);
+    const per_layer: usize = steady / L;
+
+    var deltas: [3]usize = .{ 0, 0, 0 };
+    for ([_]u32{ 1, Transformer.MOE_EVAL_EVERY_N_LAYERS, L }, 0..) |cadence, ci| {
+        _ = mlx.mlx_clear_cache();
+        _ = mlx.mlx_reset_peak_memory();
+        var held = std.ArrayList(mlx.mlx_array).empty;
+        defer held.deinit(t.allocator);
+        for (0..L) |li| {
+            const k = try mk(s, 1, 128);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try mk(s, 1, 128);
+            defer _ = mlx.mlx_array_free(v);
+            const dv = try cache.update(@intCast(li), k, v, s, 0);
+            try held.append(t.allocator, dv.k);
+            _ = mlx.mlx_array_free(dv.v);
+            if ((li + 1) % cadence == 0) {
+                for (held.items) |h| try mlx.check(mlx.mlx_array_eval(h));
+                for (held.items) |h| _ = mlx.mlx_array_free(h);
+                held.clearRetainingCapacity();
+            }
+        }
+        for (held.items) |h| try mlx.check(mlx.mlx_array_eval(h));
+        for (held.items) |h| _ = mlx.mlx_array_free(h);
+        var peak: usize = 0;
+        _ = mlx.mlx_get_peak_memory(&peak);
+        deltas[ci] = peak -| steady;
+        var now: usize = 0;
+        _ = mlx.mlx_get_active_memory(&now);
+        steady = now;
+    }
+    // Per-layer freeing: a couple of layers, never the cache.
+    try t.expect(deltas[0] < 3 * per_layer);
+    // The shipped cadence keeps a small window — well under half the cache.
+    try t.expect(deltas[1] < L / 2 * per_layer);
+    try t.expect(deltas[1] >= deltas[0]);
+    // One eval for the whole forward holds the WHOLE old cache. This is the arm a forward
+    // narrower than the cadence minimum takes, and why the bill falls back to it there.
+    try t.expect(deltas[2] > 3 * deltas[1]);
+    try t.expect(deltas[2] >= (L - 2) * per_layer);
 }
 
 test "prefillEvalCadenceApplies: spec-verify-width forwards skip the cadence entirely" {
