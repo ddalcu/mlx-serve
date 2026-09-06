@@ -57,7 +57,7 @@ Sampling defaults for request fields the client OMITS resolve as: request body >
 | `Models/{ChatModels,AgentModels}.swift` | `ChatMessage`, `ChatImage`, `SerializedToolCall`, `AgentPlan` |
 | `Services/APIClient.swift` | HTTP + SSE streaming client |
 | `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager` |
-| `Services/AgentBudget.swift` | `AgentBudget.forServerContext` + `AgentConfigs` — derives the context/output budget written into third-party agent CLI configs (pi `models.json`, opencode provider, Claude Code `CLAUDE_CODE_MAX_OUTPUT_TOKENS`) from the server's advertised `meta.context_length`. Never hardcode these. |
+| `Services/AgentBudget.swift` | `AgentBudget.forServerContext` + `AgentConfigs` — derives the context/output budget written into third-party agent CLI configs (pi `models.json`, opencode provider, Claude Code `CLAUDE_CODE_MAX_OUTPUT_TOKENS` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`) from the server's advertised `meta.context_length`. Never hardcode these. |
 | `Services/AgentEngine.swift` | Shared agent logic: history, tool exec, repetition tracking, overflow |
 | `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
 | `Services/DocumentIndex.swift` | Mini in-memory RAG for "attach a folder": chunker, hybrid retrieval (cosine + IDF lexical), `searchDocuments` tool. Embeds via `ServerEmbedding` only (server `/v1/embeddings`, GPU): `autoProvider` probes `/v1/models`, auto-downloads `bge-small-en-v1.5-8bit` (35 MB) when no encoder is known, and registers it via `/v1/load-model` by absolute path. Server down / provisioning failure → lexical-only retrieval (no NLEmbedding fallback) |
@@ -189,7 +189,7 @@ For Claude Code and Anthropic SDK clients with local models.
 - Stop reasons: `stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`
 - SSE events: `message_start`, `content_block_{start,delta,stop}` (with `text_delta`/`thinking_delta`/`signature_delta`/`input_json_delta`), `message_{delta,stop}` — explicit start/stop lifecycle per indexed block
 
-**Claude Code launcher**: app sets `ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`, `CLAUDE_CODE_SUBAGENT_MODEL=mlx-serve`.
+**Claude Code launcher**: app sets `ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`, `CLAUDE_CODE_SUBAGENT_MODEL=mlx-serve`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from the ADVERTISED `context_length` (Claude Code assumes 200k and auto-compacts there for any model outside its own catalog; the context export is omitted when the server advertises nothing). Zig `launch.scriptFor(.claude, …)` and Swift `AgentConfigs.claudeCodeExports` are twins.
 
 ## Ollama-compatible API (`/api/*`)
 
