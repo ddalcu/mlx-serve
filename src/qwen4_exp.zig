@@ -315,9 +315,9 @@ pub const NgramTable = struct {
         // Read path, so the output is byte-identical either way; the win (or
         // the wake-round loss at small kv) is timing only. Which is exactly
         // why the arm is a kv GATE and not a flag: the same pool that saves
-        // 200 ms per 1000 tokens at kv 355k costs 5-8% at kv 4-16k, where
-        // the mapping is still resident. `PREFILL_PREFETCH_MIN_KV` above
-        // carries both A/Bs; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm.
+        // 200 ms per 1000 tokens at kv 355k costs 2-7% at every rung up to
+        // 256k, where the mapping is still resident. `PREFILL_PREFETCH_MIN_KV`
+        // above carries both A/Bs; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len);
         // Announce the arm that actually RUNS, not the lever that permits it.
@@ -506,28 +506,36 @@ pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
 /// The kv length past which a prefill gather WIDER than one pool batch takes
-/// the pool. Not a tuning knob and not an opt-in: two A/Bs bracket it, and
-/// they disagree because they measured two different regimes of the SAME
-/// mapping.
+/// the pool. Not a tuning knob and not an opt-in: the pool measures as a COST
+/// at every rung anyone has driven, and as a large WIN in the one regime
+/// nobody could drive as an A/B — two facts about the same mapping.
 ///
-///  - WARM table, short prompts: the pool LOSES. M4 Max 13.4k prompt, 758
-///    tok/s serial vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill
-///    5.3-8.5% slower at 4k/8k/16k, 6/6 cells, same sign on fp16 and kv8.
-///    The rows are page-cache hits, so the 1024 wake rounds buy nothing.
-///  - EVICTED table, long prompts: the pool is why the gather stays flat.
-///    M5 Max 374k ladder (2026-09-04, chunk 4096): the serial gather went
-///    67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and kv 355k --
-///    31% of the whole prefill slowdown -- because the weights evict the
-///    32 GB mapping and each fault lands on the compressor.
+///  - RESIDENT table: the pool LOSES, everywhere it was measured. Both A/Bs
+///    were driven from the #363 BENCH RECORD, not from this tree -- the
+///    drivers are `ab_ple_prefetch.sh` and `ab_ple_prefetch_long.sh` under
+///    `~/claude-tmp/bench-qwen4-ladder`, beside their llmprobe JSON; nothing
+///    under `tests/` runs them. Short prompts (M4 Max 13.4k, 758 tok/s serial
+///    vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill 5.3-8.5% slower
+///    at 4k/8k/16k, 6/6 cells, fp16 and kv8 alike). Long prompts, same binary,
+///    cold boots, kv8, off-vs-default cold prefill: 4k +7.1%, 8k +5.9%, 16k
+///    +6.5% -- then 64k -0.7% and 128k -0.1%, inside the noise, and 256k +2.1%
+///    (n=1). The rows are page-cache hits, so the 1024 wake rounds buy nothing
+///    anywhere up to 256k.
+///  - EVICTED table: the pool is why the gather stays flat, and this is the
+///    ONLY measured win. M5 Max 374k ladder (2026-09-04, chunk 4096): the
+///    serial gather went 67.7 -> 267.9 ms per 1000 prompt tokens between
+///    kv 24k and kv 355k -- 31% of the whole prefill slowdown -- because the
+///    weights evict the 32 GB mapping and each fault lands on the
+///    compressor. It is not an A/B: the regime only exists once MLX active
+///    has climbed toward the ceiling, which a paired short run cannot stage.
 ///
-/// So the arm follows the kv length, per CHUNK: below the threshold the
-/// mapping is still resident and the serial walk is cheap; above it every
-/// row is a fault and the pool is what fans them out. A flat opt-in would
-/// have bought back the short-prompt loss by re-opening the long one.
-/// 65536 sits between the two measured regimes (highest losing rung 16k,
-/// lowest winning evidence past 300k) and is replaced by the 64k/128k/256k
-/// A/B now running; `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides it.
-pub const PREFILL_PREFETCH_MIN_KV: u64 = 65536;
+/// So the threshold is the TOP of the measured-cost range, not the middle of
+/// a bracket: 262144, past every rung the long A/B drove and below the 374k
+/// evidence. A lower number (65536 was the first guess) hands
+/// the pool three rungs it demonstrably loses on to buy a win nobody has
+/// isolated. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides it, and the 374k
+/// ladder re-driven as a paired A/B is what should move it next.
+pub const PREFILL_PREFETCH_MIN_KV: u64 = 262144;
 
 /// Three states, because the A/B needs both forced arms and the shipped one.
 pub const PrefillPrefetchMode = enum { off, kv_gated, on };
@@ -722,9 +730,15 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
     // flat opt-in nor a flat default is right — the kv length decides.
     const min = PREFILL_PREFETCH_MIN_KV;
     try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 16_384, min));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, min - 1, min));
+    // EVERY rung the long A/B drove is below the floor (bench record, not a
+    // tree script -- see PREFILL_PREFETCH_MIN_KV): the pool
+    // cost 7.1/5.9/6.5% at 4k/8k/16k, tied at 64k/128k and cost 2.1% at 256k.
+    // It never measurably paid, so the floor sits at the TOP of that range.
+    for ([_]u64{ 4096, 8192, 16_384, 65_536, 131_072, 262_143 }) |kv| {
+        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min));
+    }
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min));
+    // The one measured win, the 374k ladder's evicted table.
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min));
     // An injected threshold moves the boundary and nothing else.
     try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096));

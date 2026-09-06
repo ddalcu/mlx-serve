@@ -5734,28 +5734,44 @@ mmap is an SSD fault and faults on one mapping serialize on the VM map lock.
 
 Both measurements are right, and they are measurements of different mappings:
 
-| regime | evidence | verdict |
-|---|---|---|
-| resident (page-cache hits) | M4 Max 13.4k prompt, 758 tok/s serial vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill 5.3-8.5% slower at 4k/8k/16k, 6/6 cells, same sign on fp16 and kv8 | the 1024 wake rounds buy nothing |
-| evicted (weights took the pages) | M5 Max 374k ladder, chunk 4096: the SAME serial gather went 67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and kv 355k — 31% of the whole prefill slowdown, gathering the same rows per token at both ends | the pool is why the gather stays flat |
+| regime | driver | evidence | verdict |
+|---|---|---|---|
+| resident, short | `ab_ple_prefetch.sh` (bench record) | M4 Max 13.4k prompt, 758 tok/s serial vs 725 pooled, 6/6 cells at 8k/32k; M5 Max cold prefill 5.3-8.5% slower at 4k/8k/16k, 6/6 cells, same sign on fp16 and kv8 | the 1024 wake rounds buy nothing |
+| resident, LONG | `ab_ple_prefetch_long.sh` (bench record; kv8, same binary, cold boots, off-vs-default cold prefill) | 4k **+7.1%**, 8k **+5.9%**, 16k **+6.5%** — then 64k **-0.7%** and 128k **-0.1%** (inside the noise) and 256k **+2.1%** (n=1) | still nothing, all the way to 256k |
+| evicted (weights took the pages) | the 374k ladder, not an A/B | M5 Max, chunk 4096: the SAME serial gather went 67.7 -> 267.9 ms per 1000 prompt tokens between kv 24k and kv 355k — 31% of the whole prefill slowdown, gathering the same rows per token at both ends | the pool is why the gather stays flat |
 
 So the tester's opt-in would have bought the short-prompt loss back by
 re-opening the long-context one, on the exact ladder the feature was built
 for. The arm is a KV GATE instead, decided PER CHUNK:
 `plePrefillPrefetchWanted(mode, kv_len, min_kv)` is the pure predicate,
-`PREFILL_PREFETCH_MIN_KV` (65536) the constant, and `kv_len` is
+`PREFILL_PREFETCH_MIN_KV` (262144) the constant, and `kv_len` is
 `ctx.moe_seq_offset` read at the gather — the PRE-chunk position, because the
 layer loop has not advanced it yet. **`cache.step` cannot stand in**: a GDN
 trunk's layer 0 is linear, so it is 0 forever (the same trap that roped every
 batched qwen3_5 decode token at position 0). A 374k prompt therefore walks its
-first ~16 chunks and pools the rest, which is precisely the shape the ladder
+first ~64 chunks and pools the rest, which is precisely the shape the ladder
 measured.
 
-65536 is a PLACEHOLDER between the two regimes — highest losing rung 16k,
-lowest winning evidence past 300k — pending a 64k/128k/256k A/B; it is a named
-constant with both A/Bs in its doc comment so the number can be replaced
-without re-deriving why it exists. `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` moves
-it. `QWEN4_PLE_PREFETCH_PREFILL` is three-state and follows `diagEnvOn`
+**The threshold is the TOP of the measured-cost range, not the middle of a
+bracket.** 65536 was the first guess, placed between "highest losing rung 16k"
+and "lowest winning evidence past 300k". Then the long A/B drove
+64k/128k/256k and found no win there either — two ties and one 2.1% loss — so
+the honest floor is 262144: past every rung anyone has actually driven, below
+the only evidence of a win. Setting it lower hands the pool three more rungs
+it demonstrably loses on to buy a win nobody has isolated. It is a named
+constant with both A/Bs in its doc comment, so the number can be replaced
+without re-deriving why it exists; the 374k ladder re-driven as a paired A/B is
+what should move it next.
+
+**Both drivers live in the BENCH RECORD, not in `tests/`.**
+`ab_ple_prefetch.sh` and `ab_ple_prefetch_long.sh` sit under
+`~/claude-tmp/bench-qwen4-ladder/` beside the llmprobe JSON they produced
+(`llmprobe_ple_*`, `llmprobe_plelong_kv8L_*`, `report_ple_ab.md`). Nothing in
+the tree runs them, and a comment that spells them `tests/…` is read as a spec
+for a file that does not exist — the same class as "a contract COMMENT is read
+as a spec". Cite a bench driver by its record, or move it into `tests/` and
+make it runnable.
+`QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` moves it. `QWEN4_PLE_PREFETCH_PREFILL` is three-state and follows `diagEnvOn`
 discipline where it applies: absent = the gate, `0` = always serial, `1` =
 always pooled — an exported `=0` can only turn the pool OFF, never arm it.
 `QWEN4_PLE_PREFETCH=0` still kills the pool outright; a pool that was never
