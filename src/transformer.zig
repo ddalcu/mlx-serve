@@ -47898,6 +47898,29 @@ test "the qwen4 layer loop proves the PLE landed before the model is handed back
     try testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "pub fn " ++ helper) != null);
 }
 
+test "the qwen4 MTP head builds through the same layer loop with a DELIBERATE -1 PLE index" {
+    // The regression #363 ledger 29 shipped: `loadQwen4Mtp` copies the trunk
+    // config and sets `ple_layer_idx = -1` because the head's single QSA+MoE
+    // layer carries no PLE — then builds that layer through `initMoeLayers`,
+    // where the new placement check demanded an INSTALLED PLE and refused the
+    // load (`Qwen4PleNotInstalled`) on every real pack. The check belongs to
+    // configs that ASK for a PLE; a negative index is "no PLE by design".
+    //
+    // The load path itself needs a checkpoint (the fixture tests are
+    // `QWEN4_TEST_MODEL`-gated), so the hermetic bar is the pair: the head
+    // still declares -1, and the predicate the check calls accepts it.
+    const src = @embedFile("transformer.zig");
+    const decl = std.mem.indexOf(u8, src, "fn loadQwen4" ++ "Mtp(") orelse return error.HeadLoaderGone;
+    const end = std.mem.indexOfPos(u8, src, decl, "\n    }\n") orelse return error.HeadLoaderGone;
+    const body = src[decl..end];
+    try testing.expect(std.mem.indexOf(u8, body, "ple_layer_idx = " ++ "-1") != null);
+    // ...and it reaches the checked loop, so the two must agree.
+    try testing.expect(std.mem.indexOf(u8, body, "initMoe" ++ "Layers(") != null);
+    try testing.expect(model_mod.qwen4PleInstalledAt(&.{false}, -1));
+    // Two-sided: a head layer that DID carry PLE weights is still a bug.
+    try testing.expect(!model_mod.qwen4PleInstalledAt(&.{true}, -1));
+}
+
 // --- qwen4 diagnostics: the load line and the per-layer env reads (F6/F7) ---
 
 test "the qwen4 MTP head load line names the arm that runs, never a pending one" {

@@ -1606,8 +1606,16 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
 /// True when the layer loop installed the PLE on EXACTLY the layer the config
 /// names. `has_ple[i]` = layer i carries PLE weights. Pure so the check that
 /// runs after layer construction is testable without a checkpoint.
+///
+/// A NEGATIVE index means the build asks for no PLE at all — `loadQwen4Mtp`
+/// copies the trunk config and sets -1 because the MTP head's single QSA+MoE
+/// layer carries none — and is satisfied by a loop that installed none. A
+/// SHIPPED config missing `ple_layer_ids` never reaches here: the parse
+/// refuses it with `InvalidQwen4PleLayer`, and `validateQwen4Config` still
+/// demands an in-range index.
 pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
-    if (ple_layer_idx < 0 or ple_layer_idx >= has_ple.len) return false;
+    if (ple_layer_idx < 0) return std.mem.indexOfScalar(bool, has_ple, true) == null;
+    if (ple_layer_idx >= has_ple.len) return false;
     const want: usize = @intCast(ple_layer_idx);
     for (has_ple, 0..) |p, i| if (p != (i == want)) return false;
     return true;
@@ -7356,6 +7364,17 @@ test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the c
     try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 2));
-    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, -1));
     try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 4));
+    // A NEGATIVE index is a build that asks for no PLE at all, not a broken
+    // one: `Transformer.loadQwen4Mtp` copies the trunk config and sets
+    // `ple_layer_idx = -1` on purpose, because the MTP head's single QSA+MoE
+    // layer carries none. Refusing that is what took the real pack's load
+    // down. The invariant stays two-sided: with -1 no layer may carry PLE.
+    try testing.expect(qwen4PleInstalledAt(&.{false}, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{true}, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, -1));
+    try testing.expect(qwen4PleInstalledAt(&.{ false, false }, -1));
+    // ...while a config that DOES name a layer is unchanged.
+    try testing.expect(!qwen4PleInstalledAt(&.{false}, 0));
+    try testing.expect(qwen4PleInstalledAt(&.{true}, 0));
 }
