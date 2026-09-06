@@ -4121,6 +4121,15 @@ output.
 | 34 | `qsaMaskFromQk` + `pleGatherBf16`: `QWEN4_NO_POOLED`, `QWEN4_DEBUG_SCORES`, `QWEN4_PROFILE_QSA`, `QWEN4_PROFILE_FWD` through `envFlagCached` / the new `diagEnvOnCached` | **none.** Both functions are qwen4-only: `qsaMaskFromQk` is the serial body of `qsaMask` (QSA exists on no other arch) and `pleGatherBf16` is the n-gram PLE gather | **A — cached reads, identical answers** | `qsaMaskFromQk` runs once per full-attention layer per forward (12 per decode step on the 125B pack) and `pleGatherBf16` asked twice per gather; `getenv` is a libc scan of the whole environ block for an answer that is constant for the life of the process. The two readers keep DIFFERENT semantics on purpose: `envFlagCached` answers PRESENCE (`FOO=0` reads as ON) and `diagEnvOnCached` keeps `diagEnvOn`'s (absent or `0` = off), so a harness exporting `QWEN4_PROFILE_FWD=0` still cannot arm a sync profiler. The decision is now a pure `diagEnvValueOn(raw)` because std.c exposes no `setenv` to test the reader end-to-end. Guards: `diagEnvValueOn is the one diagnostic-switch decision: absent or 0 is off`, `diagEnvOnCached answers once and latches`, and the class scan `the qwen4 per-layer QSA and PLE paths read no env var per layer` (names both functions, red on 58ff92f) |
 | 35 | `qwen4_exp.NgramTable.startWarm` / `warmMain` — a start line, an 8 GB / 10 s progress cadence, a line on the OFF arm, `live_warm_bytes`/`live_warm_total`, `/props` `"ngram_warm"`, `mlx_serve:ngram_warm_bytes` | **none.** The table exists on no other arch; the two atomics are 0 whenever no table is warming, so the `/props` object is ABSENT and the gauge reads 0 off qwen4_exp (the zero-when-off invariant `--metrics` holds everywhere else) | **A — observability only** | The warm decides whether the first long prompt takes 55 s or 174 s (the file's own comment records the pair) and its only surface was ONE line at COMPLETION, ~3 minutes in, with `MLX_SERVE_NGRAM_WARM=0` saying nothing at all. So "is the first request slow because the table is cold?" was unanswerable in-process, and the kill switch was invisible. `warm_bytes` was already stored per chunk and read by nothing outside its own test. Cadence is a pure `WarmProgress.should(bytes, elapsed_ns)` — first chunk past each 8 GB step OR 10 s of silence, never twice for one step, no backlog after a jump — so it is testable without a thread or a 51 GB file. Guards: `WarmProgress emits on the byte step, on the silence timeout, and never twice for one step`, `ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got` (including the ANE + ngram fragments spliced at ONE slot), `ngram_warm_bytes is a zero-when-off gauge on both surfaces`, and the pre-existing `ngram table warm` unit test still passing |
 
+### Round 10 — the 0-token restore that still held its entry (row 36)
+
+The follow-up the LIEN story parked ("Follow-up, not fixed here"), plus the
+half of the lien test it turned up. One row, two sites, one function.
+
+| # | site | reach off qwen4_exp | class | gate / why not |
+|---|---|---|---|---|
+| 36 | `prefix_cache.lookupAndRestoreWithMedia`'s `effective_matched == 0` return (`used_before_restore`, the `last_restored_used` clear, the `ssd_first` LRU hand-back) and the new pure `HotPrefixCache.deliverableShare`, read by the lien decline | **split, and deliberately.** The MARKER clear is class A by REACH: `last_restored_used`'s one non-test reader is `evictLruToAdmit(…, protect_restored = true)`, called from exactly one place — `scheduler.runPrefill`'s admission pass, behind `admission_pass_armed = cfg.longCtxGated()` — so clearing it changes nothing any other arch can observe. The LRU HAND-BACK is class C: `Entry.last_used` orders `lruIndexExcluding` and the idle spill on every arch, so restoring the pre-restore stamp is a real ordering change off qwen4_exp and takes the `self.ssd_first` gate the lien decline three lines above already uses. `deliverableShare` is pure and its ONE caller is that same `ssd_first` decline | **A (marker) / C-gated (LRU + lien)** | `ssd_first` = `prefix_cache.ssdFirstActive` (`ModelConfig.ssdFirstCapable()` — qwen4_exp today — AND `MLX_SERVE_PREFIX_SSD_FIRST` AND a disk tier), mirrored into the field at wiring time; the marker's reader is `longCtxGated()`. Both are the predicates rows 30-32 already stand on |
+
 ### The rule this leaves
 
 A "qwen4_exp long-context" change that touches a shared function is a
@@ -4210,6 +4219,9 @@ the stream and dequant terms, the retained SSM checkpoints, the QSA mask and the
 no QSA history). Those arms `truncate(0, s)` and return `matched = 0` — a cold prefill —
 but leave the marker set, so the donor entry stays protected from the admission eviction
 pass for a request that shares nothing with it. Same class as the above, one arm along.
+
+**Fixed in row 36** — see "A 0-token outcome is not a restore" at the end of the
+checkout story below, which also corrects the share this very rule weighs.
 
 ## A write error is a COUNTER; the session it lost has a NAME (SSD-first spill durability, 2026-09-06)
 
@@ -4805,3 +4817,64 @@ to **11,490 MB** against 13,374 MB available: served, with 1.9 GB to spare.
   by exactly what it moves free RAM up by. No clear is owed on the refusal path,
   and `test "the MLX buffer pool is inside `available` by construction"` pins
   both the arithmetic and the one site that adds it.
+
+### A 0-token outcome is not a restore (row 36, the follow-up and its second half)
+
+The LIEN story parked one arm of this as a follow-up, and looking at it turned
+up a second defect in the very rule it was a follow-up to.
+
+**The marker.** `lookupAndRestoreWithMedia` bumps `e.last_used` and records
+`self.last_restored_used = e.last_used` immediately BEFORE
+`target_cache.restore` — it has to, because the hybrid clamp that follows needs
+the entry live. Two arms after that point still end in `matched = 0`: the
+QSA-history decline (`qsa_history_required and !entriesHaveQsaHistory`, which
+sets `effective_matched = 0`) and the `effective_matched == 0` hybrid miss it
+falls into. Both `truncate(0, s)` first, which hands back every handle the
+restore had shared — so the entry is fully reclaimable — and both then returned
+with the marker still set. The next thing the request does is
+`evictLruToAdmit(…, protect_restored = true)`, which SKIPS
+`last_restored_used`. An entry that delivered nothing shielded itself from the
+pass trying to admit the request its own miss had just condemned to a cold
+prefill: the same self-fulfilling shape `23fc888` removed at the pre-restore
+decline, one arm along, and the reason that decline is deliberately taken
+BEFORE the bump. The fix is the same shape: clear the marker, and hand back the
+LRU stamp (`used_before_restore`) so a miss cannot promote its own entry past
+the entries that would have been evicted first.
+
+The two halves are gated differently on purpose. The marker's only non-test
+reader is the admission pass, which is behind `ModelConfig.longCtxGated()`, so
+clearing it is unobservable off qwen4_exp and is unconditional. `last_used`
+orders eviction and the idle spill on EVERY arch, so the hand-back takes the
+`self.ssd_first` gate — the arm this was measured on, and the one where the
+single resident entry is a whole session.
+
+**The share.** `restoreWouldPinEntry` was reading `m.shared`, the RAW token
+match. `findBestRestorableMatch` RANKS a hybrid candidate by its highest SSM
+checkpoint at or below the match (`cp.pos`) but RETURNS `shared`, and the
+restore then clamps to that checkpoint — so the rows a hybrid entry hands over
+are `cp.pos`, which can sit orders of magnitude below the match. A
+2048-of-4096 match whose only usable checkpoint is at 8 delivers eight rows,
+pins all 4096, and passes the raw lien test comfortably (4096 < 2048 × 64)
+while being a lien by every measure the rule exists to name. At the live
+shape that is a 100k-token match of the 524,464-token session delivering
+1/512th of the 11,476 MB it holds. One pure helper,
+`HotPrefixCache.deliverableShare(cps, hybrid, shared)` — `shared` for pure
+attention, the checkpoint-bounded position for a hybrid, 0 for a hybrid with no
+usable checkpoint — and the decline now weighs it and names it in the log
+(`declined a 2048-token restore (8 deliverable) from a …`).
+
+Tests, red first on `f5a8721`:
+
+* `a 0-token outcome is not a restore: no LRU bump, no protection, and the entry
+  stays evictable` — a hybrid entry with a checkpoint but no QSA history, one
+  decoy entry committed before it. Red: `matched=0` yet
+  `last_restored_used = 3` and the entry's stamp bumped 2 → 3. Green: the
+  marker is null, the stamp is 2, `checked_out_by` is null (the checkout is
+  taken AFTER this return and a checked-out entry is never a candidate), and
+  the admission pass takes both entries instead of stopping with the useless
+  one held.
+* `the lien weighs the share a restore DELIVERS, not the one it matched` — the
+  pure decision at the live numbers, then the same shape live: 2048 of 4096
+  shared, one checkpoint at 8. Red: `matched=8`, `last_restored_used = 2`,
+  stamp bumped 1 → 2. Green: declined at the gate, the entry unbumped,
+  unprotected, and worth real bytes to the eviction pass.

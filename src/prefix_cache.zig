@@ -620,6 +620,26 @@ pub const HotPrefixCache = struct {
         return picked;
     }
 
+    /// THE ROWS A RESTORE WILL DELIVER, which is not the rows it matched.
+    ///
+    /// `findBestRestorableMatch` RANKS a hybrid candidate by its highest SSM
+    /// checkpoint at or below the match (`cp.pos`) but RETURNS the raw token
+    /// match, and `lookupAndRestoreWithMedia` then clamps the restore to that
+    /// checkpoint. So a hybrid entry hands over `cp.pos` rows and nothing
+    /// else, which can sit orders of magnitude below `shared` — and the lien
+    /// test (`restoreWouldPinEntry`) is a question about what the request GETS
+    /// against what it PINS, so it is this number the lien must weigh.
+    ///
+    /// A pure-attention restore delivers its whole match; a hybrid with no
+    /// usable checkpoint delivers nothing at all, which the lien test already
+    /// reads as the worst case.
+    pub fn deliverableShare(cps: ?[]const SSMCheckpoint, hybrid: bool, shared: usize) usize {
+        if (!hybrid) return shared;
+        const list = cps orelse return 0;
+        const cp = highestCheckpointAtOrBelow(list, shared) orelse return 0;
+        return cp.pos;
+    }
+
     /// Latest checkpoint that carries QSA aux, unless it IS `restored`
     /// (restoreSsmCheckpoint already installed that aux at full length).
     fn qsaHistorySource(cps: []const SSMCheckpoint, restored: *const SSMCheckpoint) ?*const SSMCheckpoint {
@@ -1244,17 +1264,31 @@ pub const HotPrefixCache = struct {
         // writes. SSD-first only — that is the steady state where the one
         // resident entry is a whole session and the next request shares its
         // preamble and nothing else, and it is the arm this was measured on.
-        if (self.ssd_first and restoreWouldPinEntry(e.kv_bytes, self.restore_pin_min_bytes, e.tokens.len, m.shared)) {
+        //
+        // Weighed on the DELIVERABLE share, never the raw one: a hybrid entry
+        // is clamped to its highest checkpoint at or below the match, so a
+        // 2048-of-4096 match whose only checkpoint sits at 8 hands over eight
+        // rows and pins all 4096 — a share that passes the raw test and is a
+        // lien by every measure the rule is about (audit F5).
+        const deliverable = deliverableShare(e.ssm_checkpoints, target_ssm_entries != null, m.shared);
+        if (self.ssd_first and restoreWouldPinEntry(e.kv_bytes, self.restore_pin_min_bytes, e.tokens.len, deliverable)) {
             try target_cache.truncate(0, s);
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
-            log.info("  [hot-cache] declined a {d}-token restore from a {d}-token entry ({d} MB): the share is a lien on the whole entry; cold prefill\n", .{
+            log.info("  [hot-cache] declined a {d}-token restore ({d} deliverable) from a {d}-token entry ({d} MB): the share is a lien on the whole entry; cold prefill\n", .{
                 m.shared,
+                deliverable,
                 e.tokens.len,
                 e.kv_bytes / (1024 * 1024),
             });
             return .{ .matched = 0, .full_match = false };
         }
+        // The stamp BEFORE the bump below. Two arms after the restore still
+        // end in `matched = 0` (the QSA-history decline and the
+        // `effective_matched == 0` hybrid miss it falls into), and an entry
+        // that delivered nothing was neither used nor restored from — see the
+        // hand-back at that return.
+        const used_before_restore = e.last_used;
         e.last_used = self.bumpCounter();
         // Identity of the entry THIS request is about to run on. `restore`
         // refcount-SHARES its buffers with the slot's cache, so evicting it
@@ -1304,9 +1338,29 @@ pub const HotPrefixCache = struct {
         }
         target_moe_seq_offset.* = effective_matched;
 
-        // Miss path (hybrid without a usable checkpoint): also reset KV.
+        // Miss path (hybrid without a usable checkpoint, and the QSA-history
+        // decline that funnels into it): also reset KV.
         if (effective_matched == 0) {
             try target_cache.truncate(0, s);
+            // A 0-TOKEN OUTCOME IS NOT A RESTORE. The bump and the marker were
+            // taken ABOVE, before `target_cache.restore`, because the hybrid
+            // clamp needs the entry live; the `truncate(0, s)` on the line
+            // above has just given every one of its handles back. Leaving the
+            // marker set was the same self-fulfilling shape 23fc888 removed at
+            // the pre-restore decline: `evictLruToAdmit(…, protect_restored)`
+            // skips `last_restored_used`, so an entry that delivered nothing
+            // and is fully reclaimable shielded itself from the pass trying to
+            // admit the request its own miss had just condemned to a cold
+            // prefill (audit F5).
+            //
+            // The marker is cleared unconditionally: its one non-test reader is
+            // the admission pass, which is behind `ModelConfig.longCtxGated()`,
+            // so this is inert on every other arch. The LRU hand-back is not —
+            // `last_used` orders eviction and the idle spill everywhere — so it
+            // takes the same `ssd_first` gate as the lien decline above, which
+            // is the arm where the one resident entry IS the whole session.
+            self.last_restored_used = null;
+            if (self.ssd_first) e.last_used = used_before_restore;
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
             return .{ .matched = 0, .full_match = false };
         }
@@ -4847,6 +4901,180 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     try t.expectEqual(@as(usize, 11), hit2.matched);
 }
 
+test "a 0-token outcome is not a restore: no LRU bump, no protection, and the entry stays evictable" {
+    // AUDIT F5, the same self-fulfilling shape 23fc888 removed one arm
+    // earlier. `lookupAndRestoreWithMedia` bumps `e.last_used` and records
+    // `self.last_restored_used` BEFORE `target_cache.restore`, because the
+    // hybrid clamp that follows needs the entry live. Two arms after it still
+    // return `matched = 0` — the QSA-history decline and the
+    // `effective_matched == 0` hybrid miss it falls into — and both used to
+    // leave the marker set. The request then ran `evictLruToAdmit(…, true)`,
+    // which SKIPS `last_restored_used`, so an entry that delivered nothing and
+    // is fully reclaimable (the arm's own `truncate(0, s)` released every
+    // handle) was shielded from the pass that was trying to admit the very
+    // request the miss had just condemned to a cold prefill.
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    // The qwen4_exp arm: the indexer history travels with the KV or the
+    // restore is a miss (`MtpHeadQsaHistoryGap`).
+    hc.qsa_history_required = true;
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+
+    // A DECOY, committed first so it is the LRU victim the pass should take.
+    var decoy_ids: [600]u32 = undefined;
+    for (&decoy_ids, 0..) |*x, i| x.* = @intCast(i + 900_007);
+    var decoy_cache = try KVCache.init(testing.allocator, 3);
+    defer decoy_cache.deinit();
+    try testFillCache(&decoy_cache, s, 3, 600);
+    try hc.commit(&decoy_cache, &decoy_ids, false);
+
+    // The hybrid entry: KV plus one SSM checkpoint, and NO QSA history on it.
+    var src = try KVCache.init(testing.allocator, 3);
+    defer src.deinit();
+    try testFillCache(&src, s, 3, 600);
+    var src512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src512);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
+    try t.expectEqual(@as(usize, 2), hc.entryCount());
+    const hybrid_idx: usize = 1;
+    const used_before = hc.entries.items[hybrid_idx].last_used;
+
+    var slot_cache = try KVCache.init(testing.allocator, 3);
+    defer slot_cache.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, null, null, 0xF5);
+
+    // The outcome: nothing delivered.
+    try t.expectEqual(@as(usize, 0), hit.matched);
+    try t.expect(!hit.full_match);
+    try t.expect(!hit.checked_out);
+    try t.expectEqual(@as(usize, 0), moe_off);
+    try t.expectEqual(@as(usize, 0), slot_cache.step);
+
+    // ...therefore nothing to protect, nothing to promote, and nothing
+    // checked out to another slot.
+    try t.expect(hc.last_restored_used == null);
+    try t.expectEqual(used_before, hc.entries.items[hybrid_idx].last_used);
+    try t.expectEqual(@as(?usize, null), hc.entries.items[hybrid_idx].checked_out_by);
+
+    // ...and an admission pass that protects the restored entry takes the
+    // DECOY first (the miss did not promote its entry past it) and then the
+    // entry that delivered nothing, rather than stopping with it held.
+    const Fits = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
+            return cache.entryCount() == 0;
+        }
+    };
+    const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
+    try t.expect(rep.admitted);
+    try t.expectEqual(@as(usize, 2), rep.entries);
+}
+
+test "the lien weighs the share a restore DELIVERS, not the one it matched" {
+    // AUDIT F5, second half. `findBestRestorableMatch` RANKS hybrid
+    // candidates by their highest SSM checkpoint (`cp.pos`) but RETURNS the
+    // raw token match, and the restore then clamps to that checkpoint. So the
+    // rows a hybrid entry actually hands over are `cp.pos`, which can be
+    // orders of magnitude below `shared` — and `restoreWouldPinEntry` was
+    // reading `shared`. A 100k-token match of a 524k-token session whose only
+    // usable checkpoint sits at 1,024 passes the raw lien test comfortably
+    // (524k < 100k × 64) and then pins 11.5 GB to deliver 1/512th of it,
+    // which is exactly the lien the rule exists to refuse.
+    const t = testing;
+
+    // The decision, pure. Pure attention delivers what it matched.
+    try t.expectEqual(@as(usize, 100_000), HotPrefixCache.deliverableShare(null, false, 100_000));
+    // A hybrid delivers its checkpoint, and nothing without one. (One
+    // null-handle layer: `highestCheckpointAtOrBelow` skips a zero-layer stub.)
+    var pure_layers = [_]transformer_mod.SSMCacheEntrySnapshot{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = false,
+    }};
+    var cps_pure = [_]SSMCheckpoint{.{ .pos = 1024, .layers = &pure_layers }};
+    try t.expectEqual(@as(usize, 1024), HotPrefixCache.deliverableShare(&cps_pure, true, 100_000));
+    try t.expectEqual(@as(usize, 0), HotPrefixCache.deliverableShare(&cps_pure, true, 512));
+    try t.expectEqual(@as(usize, 0), HotPrefixCache.deliverableShare(null, true, 100_000));
+
+    // ...and the lien test at the live numbers, both ways round.
+    const MB: u64 = 1 << 20;
+    const floor = HotPrefixCache.RESTORE_PIN_MIN_BYTES;
+    // The raw share alone acquits it...
+    try t.expect(!HotPrefixCache.restoreWouldPinEntry(11_476 * MB, floor, 524_464, 100_000));
+    // ...the deliverable share convicts it.
+    try t.expect(HotPrefixCache.restoreWouldPinEntry(11_476 * MB, floor, 524_464, HotPrefixCache.deliverableShare(&cps_pure, true, 100_000)));
+
+    // Live, in miniature: one hybrid session entry, a prompt that shares 400
+    // of its 600 tokens — a real match by any raw measure — whose only
+    // checkpoint is at 8, so the restore would deliver 8 rows and hold the
+    // whole entry.
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.ssd_first = true;
+    hc.restore_pin_min_bytes = 1 << 20; // a 2 MB entry stands in for 11.5 GB
+
+    var tokens: [4096]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+
+    var src = try KVCache.init(testing.allocator, 8);
+    defer src.deinit();
+    try testFillCache(&src, s, 8, 4096);
+    for (src.entries) |*e| {
+        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+    }
+    var src8 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src8);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src8, 8, s);
+    try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
+    try t.expectEqual(@as(usize, 1), hc.entryCount());
+    try t.expect(hc.entries.items[0].kv_bytes > hc.restore_pin_min_bytes);
+    const used_before = hc.entries.items[0].last_used;
+
+    // 2048 raw shared rows of a 4096-row entry — a ratio of 2, far inside
+    // RESTORE_PIN_RATIO — but the only checkpoint sits at 8.
+    var diverged: [4096]u32 = undefined;
+    for (&diverged, 0..) |*x, i| x.* = if (i < 2048) tokens[i] else @intCast(i + 800_000);
+
+    var slot_cache = try KVCache.init(testing.allocator, 8);
+    defer slot_cache.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&slot_cache, &moe_off, &ssm, s, &diverged, false, 0, null, null);
+
+    // Declined at the gate, before the bump — eight rows are not worth a lien
+    // on the session.
+    try t.expectEqual(@as(usize, 0), hit.matched);
+    try t.expectEqual(@as(usize, 0), moe_off);
+    try t.expectEqual(@as(usize, 0), slot_cache.step);
+    try t.expect(hc.last_restored_used == null);
+    try t.expectEqual(used_before, hc.entries.items[0].last_used);
+
+    // ...and the admission pass gets real bytes back for it.
+    const Fits = struct {
+        fn call(ctx: ?*anyopaque) bool {
+            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
+            return cache.entryCount() == 0;
+        }
+    };
+    const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
+    try t.expect(rep.admitted);
+    try t.expectEqual(@as(usize, 1), rep.entries);
+    try t.expect(rep.bytes > 0);
+}
 test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
     // The qwen4_exp in-checkpoint head's KV is meaningless without the raw
     // index-key history it was built beside — `qsaMaskFromQk` errors
