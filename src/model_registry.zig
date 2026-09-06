@@ -1118,6 +1118,29 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(null));
     }
 
+    test "a qwen4_exp config refusal keeps its own name in the 503 text" {
+        // #363 ledger 26-29: the load-time bound checks refuse by NAME, and
+        // the name is what the client sees ("Model load failed: <name>").
+        // Diagnosing a bad `heads_per_ngram` from a generic 500 is the whole
+        // reason these are typed errors and not asserts — so they must NOT be
+        // rewritten into a memory diagnosis, and they must not be swallowed.
+        for ([_][]const u8{
+            "InvalidQwen4ConfigField",
+            "InvalidQwen4NgramSize",
+            "InvalidQwen4NgramHeads",
+            "InvalidQwen4NgramVocab",
+            "InvalidQwen4Indexer",
+            "InvalidQwen4PleLayer",
+            "Qwen4PleNotInstalled",
+            "NgramTableHeader",
+            "NgramTableBits",
+            "NgramTableRegion",
+            "NgramTableTruncated",
+        }) |name| {
+            try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(name));
+        }
+    }
+
     /// Mark an entry as `.error_state` and store `error_name` (duped).
     /// Future `ensureLoaded` calls fail with `error.LoadFailed` until the
     /// entry is reset to `.unloaded` (Phase D may add a retry path).

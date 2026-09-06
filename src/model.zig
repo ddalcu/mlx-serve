@@ -3,6 +3,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const qwen4_exp = @import("qwen4_exp.zig");
 
 pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
 
@@ -1545,6 +1546,73 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
     return gd;
 }
 
+/// One qwen4_exp integer bound, read STRICTLY: a wrong-typed or negative value
+/// is a refusal, never the silently-kept default the `if (v == .integer)`
+/// reads used to leave behind. Absent stays absent (the field's default).
+fn qwen4ConfigU64(cfg_obj: std.json.ObjectMap, key: []const u8) !?u64 {
+    const v = cfg_obj.get(key) orelse return null;
+    if (v != .integer or v.integer < 0) return error.InvalidQwen4ConfigField;
+    return @intCast(v.integer);
+}
+
+fn qwen4ConfigU32(cfg_obj: std.json.ObjectMap, key: []const u8) !?u32 {
+    const v = try qwen4ConfigU64(cfg_obj, key) orelse return null;
+    if (v > std.math.maxInt(u32)) return error.InvalidQwen4ConfigField;
+    return @intCast(v);
+}
+
+/// Range-check every qwen4_exp bound that a forward pass indexes a FIXED
+/// array with or divides by. Called at the END of the qwen4_exp branch, once
+/// every field is parsed; the names travel to the client as
+/// "Model load failed: <name>" (#144).
+///
+/// Why load-time and not `@max(x, 1)` at the use site: the fallback would
+/// serve a model whose geometry does not match its own checkpoint, which is
+/// the failure this arch is least able to show (coherent-looking tokens from
+/// a trunk missing its n-gram term, or a block selector reading the wrong
+/// stride).
+fn validateQwen4Config(config: *const ModelConfig) !void {
+    // `NgramHash.multipliers` is [MAX_NGRAM_SIZE]i64, indexed 0..ngram_size-1,
+    // and `SSMCacheEntry.ple_prev` is written (ngram_size - 1) deep.
+    // ngram_size 1 is zero heads: a hash that writes no row ids at all.
+    if (config.ngram_size < 2 or config.ngram_size > qwen4_exp.MAX_NGRAM_SIZE) {
+        return error.InvalidQwen4NgramSize;
+    }
+    // `vocab`/`offsets` are [MAX_HEADS]i64, written n_heads deep.
+    if (config.heads_per_ngram == 0) return error.InvalidQwen4NgramHeads;
+    if ((config.ngram_size - 1) * config.heads_per_ngram > qwen4_exp.MAX_HEADS) {
+        return error.InvalidQwen4NgramHeads;
+    }
+    // total_rows rounds up THROUGH the divisor, and every per-head vocab is
+    // the (global+1)-th prime after vocab_base - 1.
+    if (config.ngram_vocab_divisor == 0 or config.ngram_vocab_base < 2) {
+        return error.InvalidQwen4NgramVocab;
+    }
+    // The QSA arm keys on `indexer_n_heads > 0` ALONE, and the forward then
+    // divides kv by the ratio (a zero divisor is illegal behaviour, not a
+    // trap, in ReleaseFast) and selects `budget / ratio` blocks.
+    if (config.indexer_n_heads > 0) {
+        if (config.indexer_head_dim == 0) return error.InvalidQwen4Indexer;
+        if (config.indexer_compress_ratio == 0) return error.InvalidQwen4Indexer;
+        if (config.indexer_budget < config.indexer_compress_ratio) return error.InvalidQwen4Indexer;
+    }
+    // Parsed in the branch, re-asserted here so the invariant sits in ONE
+    // readable place: 1-based id → 0-based ordinal inside the trunk.
+    if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i32, @intCast(config.num_hidden_layers))) {
+        return error.InvalidQwen4PleLayer;
+    }
+}
+
+/// True when the layer loop installed the PLE on EXACTLY the layer the config
+/// names. `has_ple[i]` = layer i carries PLE weights. Pure so the check that
+/// runs after layer construction is testable without a checkpoint.
+pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
+    if (ple_layer_idx < 0 or ple_layer_idx >= has_ple.len) return false;
+    const want: usize = @intCast(ple_layer_idx);
+    for (has_ple, 0..) |p, i| if (p != (i == want)) return false;
+    return true;
+}
+
 /// I/O-free variant for unit tests and for callers that already have the
 /// config.json bytes in memory. The full I/O-bound `parseConfig` delegates here.
 /// Qwen3-VL-family vision + M-RoPE fields, shared by the qwen3_5 and
@@ -2362,50 +2430,38 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // trunk: attention, the QSA indexer and the MTP head all read it, so
         // a scaled rotation cannot desync the block selector from attention.
         try parseYarnRopeParameters(&config, cfg_obj);
-        if (cfg_obj.get("hc_count")) |v| {
-            if (v == .integer) config.hc_count = @intCast(v.integer);
-        }
-        if (cfg_obj.get("hc_lowrank")) |v| {
-            if (v == .integer) config.hc_lowrank = @intCast(v.integer);
-        }
-        if (cfg_obj.get("ple_layer_ids")) |v| {
-            if (v == .array and v.array.items.len > 0 and v.array.items[0] == .integer) {
-                config.ple_layer_idx = @intCast(v.array.items[0].integer - 1);
+        // Every field below sizes a FIXED array, divides, or places the PLE.
+        // `if (v == .integer)` silently kept the DEFAULT for a wrong-typed
+        // value and `@intCast` swallowed a negative one, and the only bound
+        // check downstream was a `std.debug.assert` — compiled out of every
+        // ReleaseFast binary we ship (#363 ledger 26-29). Read strictly here,
+        // range-check in `validateQwen4Config` once every field is in.
+        if (try qwen4ConfigU32(cfg_obj, "hc_count")) |v| config.hc_count = v;
+        if (try qwen4ConfigU32(cfg_obj, "hc_lowrank")) |v| config.hc_lowrank = v;
+        {
+            // The config lists 1-based ids and we support exactly ONE
+            // injection point; placement downstream is by EXACT equality, so
+            // an absent or out-of-trunk id is a trunk with no n-gram term at
+            // all rather than a diagnosable failure.
+            const v = cfg_obj.get("ple_layer_ids") orelse return error.InvalidQwen4PleLayer;
+            if (v != .array or v.array.items.len != 1 or v.array.items[0] != .integer) {
+                return error.InvalidQwen4PleLayer;
             }
+            const id = v.array.items[0].integer;
+            if (id < 1 or id > @as(i64, config.num_hidden_layers)) return error.InvalidQwen4PleLayer;
+            config.ple_layer_idx = @intCast(id - 1);
         }
-        if (cfg_obj.get("ple_embed_dim")) |v| {
-            if (v == .integer) config.ple_embed_dim = @intCast(v.integer);
-        }
-        if (cfg_obj.get("ple_conv_kernel_size")) |v| {
-            if (v == .integer) config.ple_conv_kernel = @intCast(v.integer);
-        }
-        if (cfg_obj.get("ngram_size")) |v| {
-            if (v == .integer) config.ngram_size = @intCast(v.integer);
-        }
-        if (cfg_obj.get("heads_per_ngram")) |v| {
-            if (v == .integer) config.heads_per_ngram = @intCast(v.integer);
-        }
-        if (cfg_obj.get("ngram_vocab_size_base")) |v| {
-            if (v == .integer) config.ngram_vocab_base = @intCast(v.integer);
-        }
-        if (cfg_obj.get("make_ngram_vocab_size_divisible_by")) |v| {
-            if (v == .integer) config.ngram_vocab_divisor = @intCast(v.integer);
-        }
-        if (cfg_obj.get("seed")) |v| {
-            if (v == .integer) config.ngram_seed = @intCast(v.integer);
-        }
-        if (cfg_obj.get("indexer_n_heads")) |v| {
-            if (v == .integer) config.indexer_n_heads = @intCast(v.integer);
-        }
-        if (cfg_obj.get("indexer_head_dim")) |v| {
-            if (v == .integer) config.indexer_head_dim = @intCast(v.integer);
-        }
-        if (cfg_obj.get("indexer_budget")) |v| {
-            if (v == .integer) config.indexer_budget = @intCast(v.integer);
-        }
-        if (cfg_obj.get("indexer_compress_ratio")) |v| {
-            if (v == .integer) config.indexer_compress_ratio = @intCast(v.integer);
-        }
+        if (try qwen4ConfigU32(cfg_obj, "ple_embed_dim")) |v| config.ple_embed_dim = v;
+        if (try qwen4ConfigU32(cfg_obj, "ple_conv_kernel_size")) |v| config.ple_conv_kernel = v;
+        if (try qwen4ConfigU32(cfg_obj, "ngram_size")) |v| config.ngram_size = v;
+        if (try qwen4ConfigU32(cfg_obj, "heads_per_ngram")) |v| config.heads_per_ngram = v;
+        if (try qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
+        if (try qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
+        if (try qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_n_heads")) |v| config.indexer_n_heads = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_head_dim")) |v| config.indexer_head_dim = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_budget")) |v| config.indexer_budget = v;
+        if (try qwen4ConfigU32(cfg_obj, "indexer_compress_ratio")) |v| config.indexer_compress_ratio = v;
         if (cfg_obj.get("eos_token_id")) |v| {
             switch (v) {
                 .integer => |i| config.ngram_eos = @intCast(i),
@@ -2416,6 +2472,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             }
             if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
         }
+        try validateQwen4Config(&config);
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -6636,7 +6693,7 @@ test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower
         \\   "temporal_patch_size":2,"spatial_merge_size":2,"num_position_embeddings":2304,"out_hidden_size":2560,"model_type":"qwen4_exp_vision"},
         \\ "text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
         \\ "full_attention_interval":4,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,
-        \\ "indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
+        \\ "ple_layer_ids":[2],"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4,
         \\ "num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,
         \\ "eos_token_id":248044,"vocab_size":248320,"rms_norm_eps":1e-6,
         \\ "rope_parameters":{"rope_theta":10000000,"partial_rotary_factor":0.25,"mrope_section":[11,11,10],"mrope_interleaved":true}},
@@ -6680,6 +6737,7 @@ const QWEN4_SHIPPED =
     \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
     \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
     \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "ple_layer_ids": [2],
     \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 262144,
     \\    "rope_parameters": {
     \\      "rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
@@ -6701,6 +6759,7 @@ const QWEN4_YARN =
     \\    "hidden_size": 2560, "num_hidden_layers": 48, "full_attention_interval": 4,
     \\    "num_attention_heads": 24, "num_key_value_heads": 2, "head_dim": 256,
     \\    "num_experts": 512, "num_experts_per_tok": 10, "moe_intermediate_size": 640,
+    \\    "ple_layer_ids": [2],
     \\    "vocab_size": 248320, "eos_token_id": 248044, "max_position_embeddings": 1048576,
     \\    "rope_parameters": {
     \\      "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144,
@@ -7140,3 +7199,163 @@ const ProdLineScan = struct {
         return null;
     }
 };
+
+// ── qwen4_exp load-time bound validation (#363 ledger 26-29) ─────────────
+//
+// Every bound below sizes a FIXED array or divides in the forward, and the
+// only guard the arch shipped with was a `std.debug.assert` in
+// `qwen4_exp.NgramHash.init` — compiled OUT of every ReleaseFast binary, i.e.
+// out of every binary we ship. A config claiming `heads_per_ngram: 16` wrote
+// 64 i64s into two 32-element arrays inside `NgramHash` before the model had
+// produced a single token.
+
+/// One qwen4_exp config document with `extra` fields spliced in. Every field
+/// the arch needs is here so a case document differs from the good one in
+/// exactly the field under test.
+fn qwen4CaseJson(comptime extra: []const u8) []const u8 {
+    return "{\"model_type\":\"qwen4_exp\",\"hidden_size\":2560,\"num_hidden_layers\":48," ++
+        "\"full_attention_interval\":4,\"num_attention_heads\":24,\"num_key_value_heads\":2,\"head_dim\":256," ++
+        "\"hc_count\":4,\"hc_lowrank\":320,\"ple_embed_dim\":2560,\"ple_conv_kernel_size\":4," ++
+        "\"num_experts\":512,\"num_experts_per_tok\":10,\"moe_intermediate_size\":640," ++
+        "\"eos_token_id\":248044,\"vocab_size\":248320,\"rms_norm_eps\":1e-6," ++
+        extra ++ "}";
+}
+
+/// The shipped pack's own values for everything this section validates.
+const QWEN4_GOOD_FIELDS =
+    "\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8," ++
+    "\"ngram_vocab_size_base\":20000000,\"make_ngram_vocab_size_divisible_by\":128," ++
+    "\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048,\"indexer_compress_ratio\":4";
+
+test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
+    // The good pack still loads — a validator that refuses the shipped
+    // checkpoint is worse than no validator.
+    const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(@as(u32, 3), good.ngram_size);
+    try testing.expectEqual(@as(u32, 8), good.heads_per_ngram);
+
+    // multipliers[8] is indexed 0..ngram_size-1, and SSMCacheEntry.ple_prev
+    // is [MAX_NGRAM_SIZE]u32 written ngram_size-1 deep.
+    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":9,\"heads_per_ngram\":8"),
+    ));
+    // n_heads = (ngram_size-1)*heads_per_ngram, so ngram_size 1 is zero heads
+    // and a zero-length hash — the rowIds loop then reads self.multipliers[0]
+    // for a row it never writes.
+    try testing.expectError(error.InvalidQwen4NgramSize, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":1,\"heads_per_ngram\":8"),
+    ));
+    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":0"),
+    ));
+    // (5-1)*16 = 64 rows into vocab[32]/offsets[32].
+    try testing.expectError(error.InvalidQwen4NgramHeads, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":5,\"heads_per_ngram\":16"),
+    ));
+    // total_rows rounds up THROUGH the divisor.
+    try testing.expectError(error.InvalidQwen4NgramVocab, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"make_ngram_vocab_size_divisible_by\":0"),
+    ));
+}
+
+test "qwen4_exp config: a wrong-typed or negative bound is a refusal, never a silent default" {
+    // `if (v == .integer)` kept the DEFAULT for a string-spelled bound, so a
+    // converter typo produced a model that loaded and hashed with the wrong
+    // geometry; a negative one went straight into `@intCast` to u32.
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":-1"),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":\"3\""),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"heads_per_ngram\":3.5"),
+    ));
+    try testing.expectError(error.InvalidQwen4ConfigField, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_compress_ratio\":-4"),
+    ));
+}
+
+test "qwen4_exp config: an armed QSA indexer must carry a usable budget and ratio" {
+    // The QSA arm keys on `indexer_n_heads > 0` alone, and the forward then
+    // divides by `indexer_compress_ratio` (@divTrunc by 0 is illegal
+    // behaviour in ReleaseFast) and picks `budget / ratio` blocks.
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048"),
+    ));
+    // block_topk = budget / ratio must select at least one block.
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2,\"indexer_compress_ratio\":4"),
+    ));
+    try testing.expectError(error.InvalidQwen4Indexer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"indexer_n_heads\":4,\"indexer_budget\":2048,\"indexer_compress_ratio\":4"),
+    ));
+    // Dense attention (no indexer) leaves every indexer field at 0 and must
+    // still load: the zeros are never read.
+    const dense = try parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8"),
+    );
+    try testing.expectEqual(@as(u32, 0), dense.indexer_n_heads);
+    try testing.expectEqual(@as(u32, 0), dense.indexer_compress_ratio);
+}
+
+test "qwen4_exp config: the PLE layer id must name exactly one layer that exists" {
+    // Placement is by EXACT equality against `ple_layer_idx` in the layer
+    // loop, so an id past the trunk (or an absent list, which defaults the
+    // index to -1) built a qwen4 trunk with NO n-gram injection at all: the
+    // 32 GB table loads, the hash runs, and nothing is ever added.
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ngram_size\":3"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[0]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[49]"),
+    ));
+    // We support ONE injection point; two ids used to parse as "the first".
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[2,5]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":[]"),
+    ));
+    try testing.expectError(error.InvalidQwen4PleLayer, parseConfigFromJson(
+        testing.allocator,
+        qwen4CaseJson("\"ple_layer_ids\":2"),
+    ));
+    // The shipped 1-based id 2 is layer 1.
+    const c = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(@as(i32, 1), c.ple_layer_idx);
+}
+
+test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer" {
+    // A load error, not a log line: the config check above cannot see a
+    // layer loop that skipped the placement (a prefix change, a `continue`),
+    // and the failure mode is silent — coherent-looking tokens from a trunk
+    // missing its 51B-parameter n-gram term.
+    try testing.expect(qwen4PleInstalledAt(&.{ false, true, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, false, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ true, true, false, false }, 1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 2));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, -1));
+    try testing.expect(!qwen4PleInstalledAt(&.{ false, true, false, false }, 4));
+}

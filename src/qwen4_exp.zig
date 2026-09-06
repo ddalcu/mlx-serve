@@ -43,7 +43,13 @@ fn nthPrimeAfter(start: u64, count: u32) u64 {
     return p;
 }
 
+/// `NgramHash.vocab` / `.offsets` are [MAX_HEADS]i64 and `.multipliers` is
+/// [MAX_NGRAM_SIZE]i64; `SSMCacheEntry.ple_prev` is [MAX_NGRAM_SIZE]u32. Both
+/// bounds are CONFIG-driven, so `model.validateQwen4Config` refuses a
+/// checkpoint past them at load — the `std.debug.assert` that used to be the
+/// only guard is compiled out of every shipped ReleaseFast binary.
 pub const MAX_HEADS = 32;
+pub const MAX_NGRAM_SIZE = 8;
 
 /// Everything `Qwen4ExpTextNGramEmbedding.__init__` derives from the config.
 pub const NgramHash = struct {
@@ -56,7 +62,20 @@ pub const NgramHash = struct {
     offsets: [MAX_HEADS]i64,
     total_rows: u64,
 
-    pub fn init(unigram_vocab: u32, ngram_size: u32, heads_per_ngram: u32, vocab_base: u64, divisor: u64, seed: u64, ple_layer_index: u32, eos: u32) NgramHash {
+    /// `ple_layer_index` is the PLE's ORDINAL among the injection points the
+    /// config lists (the reference hashes with the ordinal, not the trunk
+    /// layer number), so it is 0 for the one PLE we support — pinned by the
+    /// oracle fixture below, whose config says `ple_layer_ids=[2]`.
+    ///
+    /// Fallible: every bound here writes a fixed array, and an assert is not
+    /// a guard in ReleaseFast. Same errors as `model.validateQwen4Config`, so
+    /// a hand-built config that skips the parser is refused too.
+    pub fn init(unigram_vocab: u32, ngram_size: u32, heads_per_ngram: u32, vocab_base: u64, divisor: u64, seed: u64, ple_layer_index: u32, eos: u32) !NgramHash {
+        if (ngram_size < 2 or ngram_size > MAX_NGRAM_SIZE) return error.InvalidQwen4NgramSize;
+        if (heads_per_ngram == 0 or (ngram_size - 1) * heads_per_ngram > MAX_HEADS) {
+            return error.InvalidQwen4NgramHeads;
+        }
+        if (divisor == 0 or vocab_base < 2) return error.InvalidQwen4NgramVocab;
         var h: NgramHash = .{
             .ngram_size = ngram_size,
             .heads_per_ngram = heads_per_ngram,
@@ -67,7 +86,6 @@ pub const NgramHash = struct {
             .offsets = @splat(0),
             .total_rows = 0,
         };
-        std.debug.assert(h.n_heads <= MAX_HEADS and ngram_size <= 8);
         const max_long: u64 = (1 << 63) - 1;
         const half_bound: u64 = @max(1, (max_long / @max(unigram_vocab, 1)) / 2);
         const base_seed: u64 = seed +% PRIME_1 *% ple_layer_index;
@@ -176,44 +194,136 @@ pub const NgramTable = struct {
         errdefer std.posix.munmap(map);
         if (size < 8) return error.NgramTableTruncated;
         const hlen: usize = @intCast(std.mem.readInt(u64, map[0..8], .little));
-        if (8 + hlen > size) return error.NgramTableTruncated;
+        if (hlen > size - 8) return error.NgramTableTruncated;
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
         if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
         return t;
     }
 
+    /// Widths `mx.quantize` actually packs and `dequantRow` unpacks. 32 makes
+    /// `(1 << bits) - 1` an illegal shift; 7 is not a width mlx emits, and the
+    /// `dim * bits == wcols * 32` tie alone accepts both.
+    fn bitsSupported(bits: u32) bool {
+        return switch (bits) {
+            2, 3, 4, 5, 6, 8 => true,
+            else => false,
+        };
+    }
+
+    const HeaderRegion = struct {
+        rows: u64,
+        cols: u64,
+        start: u64, // relative to the data section, as the header spells it
+        end: u64,
+
+        fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
+            return a.start < b.end and b.start < a.end;
+        }
+    };
+
+    /// One header entry (`weight` / `scales` / `biases`), every access checked
+    /// and the region proven to hold EXACTLY `rows x cols x elem` bytes inside
+    /// the mapping. Wrong type or missing ⇒ `NgramTableHeader`; a region that
+    /// lies about its own size ⇒ `NgramTableRegion`; one that runs off the end
+    /// ⇒ `NgramTableTruncated`.
+    fn headerRegion(
+        obj: std.json.ObjectMap,
+        key: []const u8,
+        dtype: []const u8,
+        elem: u64,
+        map_len: usize,
+        data_off: usize,
+    ) !HeaderRegion {
+        const v = obj.get(key) orelse return error.NgramTableHeader;
+        if (v != .object) return error.NgramTableHeader;
+        const o = v.object;
+        const dt = o.get("dtype") orelse return error.NgramTableHeader;
+        if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.NgramTableHeader;
+        const shape = o.get("shape") orelse return error.NgramTableHeader;
+        if (shape != .array or shape.array.items.len != 2) return error.NgramTableHeader;
+        if (shape.array.items[0] != .integer or shape.array.items[1] != .integer) return error.NgramTableHeader;
+        const dofs = o.get("data_offsets") orelse return error.NgramTableHeader;
+        if (dofs != .array or dofs.array.items.len != 2) return error.NgramTableHeader;
+        if (dofs.array.items[0] != .integer or dofs.array.items[1] != .integer) return error.NgramTableHeader;
+
+        const rows_i = shape.array.items[0].integer;
+        const cols_i = shape.array.items[1].integer;
+        const start_i = dofs.array.items[0].integer;
+        const end_i = dofs.array.items[1].integer;
+        if (rows_i <= 0 or cols_i <= 0 or start_i < 0 or end_i < start_i) return error.NgramTableRegion;
+        const r: HeaderRegion = .{
+            .rows = @intCast(rows_i),
+            .cols = @intCast(cols_i),
+            .start = @intCast(start_i),
+            .end = @intCast(end_i),
+        };
+        if (r.cols > std.math.maxInt(u32) or r.rows > std.math.maxInt(u32)) return error.NgramTableRegion;
+        const need = std.math.mul(u64, r.rows, r.cols * elem) catch return error.NgramTableRegion;
+        if (r.end - r.start != need) return error.NgramTableRegion;
+        const abs_end = std.math.add(u64, data_off, r.end) catch return error.NgramTableTruncated;
+        if (abs_end > map_len) return error.NgramTableTruncated;
+        return r;
+    }
+
+    /// The converter stamps `"format": "mlx-serve-ngram"` and the shipped pack
+    /// carries it; tables written before the stamp existed do not, so absence
+    /// is accepted (once, loudly) and a DIFFERENT format is a refusal.
+    var stamp_warned: bool = false;
+
     fn parse(map: []align(std.heap.page_size_min) const u8, header: []const u8, data_off: usize) !NgramTable {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, header, .{});
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, header, .{}) catch return error.NgramTableHeader;
+        if (parsed != .object) return error.NgramTableHeader;
         const obj = parsed.object;
-        const meta = obj.get("__metadata__") orelse return error.NgramTableHeader;
-        const bits: u32 = try std.fmt.parseInt(u32, meta.object.get("bits").?.string, 10);
-        const gs: u32 = try std.fmt.parseInt(u32, meta.object.get("group_size").?.string, 10);
-        const w = obj.get("weight") orelse return error.NgramTableHeader;
-        const s = obj.get("scales") orelse return error.NgramTableHeader;
-        const b = obj.get("biases") orelse return error.NgramTableHeader;
-        const rows: u64 = @intCast(w.object.get("shape").?.array.items[0].integer);
-        const wcols: u32 = @intCast(w.object.get("shape").?.array.items[1].integer);
-        const scols: u32 = @intCast(s.object.get("shape").?.array.items[1].integer);
-        const t: NgramTable = .{
+        // Every access below used to be a bare `.?` / `.string` / `.array` /
+        // `.integer` on a header read from a 32 GB file the engine then slices
+        // with: in ReleaseFast a missing field did not fail the load, it read
+        // whatever the unchecked unwrap produced (#363 ledger 28).
+        const meta_v = obj.get("__metadata__") orelse return error.NgramTableHeader;
+        if (meta_v != .object) return error.NgramTableHeader;
+        const meta = meta_v.object;
+        if (meta.get("format")) |f| {
+            if (f != .string or !std.mem.eql(u8, f.string, "mlx-serve-ngram")) return error.NgramTableHeader;
+        } else if (!stamp_warned) {
+            stamp_warned = true;
+            log.info("[qwen4] ngram table has no \"format\" stamp (written before the converter added it); accepting\n", .{});
+        }
+        const bits_v = meta.get("bits") orelse return error.NgramTableHeader;
+        const gs_v = meta.get("group_size") orelse return error.NgramTableHeader;
+        if (bits_v != .string or gs_v != .string) return error.NgramTableHeader;
+        const bits: u32 = std.fmt.parseInt(u32, bits_v.string, 10) catch return error.NgramTableHeader;
+        const gs: u32 = std.fmt.parseInt(u32, gs_v.string, 10) catch return error.NgramTableHeader;
+        if (!bitsSupported(bits)) return error.NgramTableBits;
+        if (gs == 0 or gs > 1024) return error.NgramTableBits;
+
+        const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
+        const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
+        const bi = try headerRegion(obj, "biases", "BF16", 2, map.len, data_off);
+        // One table: the three regions describe the SAME rows, the two
+        // parameter banks the same groups, and no region may lend its bytes
+        // to another (a self-consistent lie is still a lie).
+        if (sc.rows != w.rows or bi.rows != w.rows or sc.cols != bi.cols) return error.NgramTableRegion;
+        if (w.overlaps(sc) or w.overlaps(bi) or sc.overlaps(bi)) return error.NgramTableRegion;
+
+        const dim: u64 = sc.cols * gs;
+        if (dim > std.math.maxInt(u32)) return error.NgramTableRegion;
+        if (dim * bits != w.cols * 32) return error.NgramTableHeader;
+
+        return .{
             .map = map,
-            .rows = rows,
-            .dim = scols * gs,
+            .rows = w.rows,
+            .dim = @intCast(dim),
             .bits = bits,
             .group_size = gs,
-            .w_off = data_off + @as(usize, @intCast(w.object.get("data_offsets").?.array.items[0].integer)),
-            .s_off = data_off + @as(usize, @intCast(s.object.get("data_offsets").?.array.items[0].integer)),
-            .b_off = data_off + @as(usize, @intCast(b.object.get("data_offsets").?.array.items[0].integer)),
-            .wcols = wcols,
-            .scols = scols,
+            .w_off = data_off + @as(usize, @intCast(w.start)),
+            .s_off = data_off + @as(usize, @intCast(sc.start)),
+            .b_off = data_off + @as(usize, @intCast(bi.start)),
+            .wcols = @intCast(w.cols),
+            .scols = @intCast(sc.cols),
         };
-        if (t.dim * bits != wcols * 32) return error.NgramTableHeader;
-        const end = t.b_off + rows * scols * 2;
-        if (end > map.len) return error.NgramTableTruncated;
-        return t;
     }
 
     pub fn close(self: *NgramTable) void {
@@ -606,7 +716,7 @@ pub fn bf16ToF32(u: u16) f32 {
 const testing = std.testing;
 
 test "ngram hash reproduces the reference multipliers, primes and offsets" {
-    const h = NgramHash.init(248320, 3, 8, 20_000_000, 128, 1234, 0, 248044);
+    const h = try NgramHash.init(248320, 3, 8, 20_000_000, 128, 1234, 0, 248044);
     try testing.expectEqual(@as(i64, 23703573157769), h.multipliers[0]);
     try testing.expectEqual(@as(i64, 20109073645365), h.multipliers[1]);
     try testing.expectEqual(@as(i64, 8052911324071), h.multipliers[2]);
@@ -619,7 +729,7 @@ test "ngram hash reproduces the reference multipliers, primes and offsets" {
 test "ngram row ids match the reference on an eos-split history" {
     // Reference (modeling_qwen4_exp.py, run in python): history
     // [eos, eos | 5, 7, eos, 9, 11]; shifts reset across the eos.
-    const h = NgramHash.init(248320, 3, 8, 20_000_000, 128, 1234, 0, 248044);
+    const h = try NgramHash.init(248320, 3, 8, 20_000_000, 128, 1234, 0, 248044);
     const prev = [_]u32{ 248044, 248044 };
     const ids = [_]u32{ 5, 7, 248044, 9, 11 };
     var out: [5 * 16]i64 = undefined;
@@ -934,4 +1044,181 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     t3.startWarm();
     try testing.expect(t3.warm_thread == null);
     t3.close();
+}
+
+/// A whole `ngram_table.bin` image (length prefix + `header` + a data region
+/// big enough for `data_bytes`) in one page-aligned buffer, so a case document
+/// differs from the good one in exactly the header field under test.
+/// Caller frees with `std.heap.page_allocator.free`.
+fn ngramTestImage(header: []const u8, data_bytes: usize) ![]align(std.heap.page_size_min) u8 {
+    const hlen: usize = 512;
+    std.debug.assert(header.len <= hlen);
+    const buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 8 + hlen + data_bytes);
+    @memset(buf, ' ');
+    std.mem.writeInt(u64, buf[0..8], hlen, .little);
+    @memcpy(buf[8 .. 8 + header.len], header);
+    @memset(buf[8 + hlen ..], 0);
+    return buf;
+}
+
+fn ngramTestParse(header: []const u8, data_bytes: usize) !NgramTable {
+    const buf = try ngramTestImage(header, data_bytes);
+    // The map outlives the parse for the length of the test; freed by the
+    // caller's `defer` on the same allocator (`parse` never takes ownership).
+    return NgramTable.parse(buf, buf[8..520], 520);
+}
+
+/// rows 4, dim 64, 4-bit, group 32 ⇒ wcols 8, scols 2; w 128 B, s/b 16 B each.
+const NGRAM_GOOD_HEADER =
+    "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
+    "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+    "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+    "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}";
+const NGRAM_GOOD_BYTES = 160;
+
+test "ngram table header: a missing or wrong-typed field is a named error, never a trap" {
+    // `meta.object.get("bits").?.string` and `w.object.get("shape").?.array
+    // .items[1]` were unchecked on a 32 GB file the engine mmaps and then
+    // slices with: in ReleaseFast a truncated or hand-edited header did not
+    // fail the load, it read whatever followed the mapping.
+    const t = try ngramTestParse(NGRAM_GOOD_HEADER, NGRAM_GOOD_BYTES);
+    try testing.expectEqual(@as(u64, 4), t.rows);
+    try testing.expectEqual(@as(u32, 64), t.dim);
+    try testing.expectEqual(@as(u32, 4), t.bits);
+    std.heap.page_allocator.free(@constCast(t.map));
+
+    // No __metadata__ at all.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // Metadata present, `bits` missing.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"__metadata__\":{\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // `bits` spelled as a JSON number, not the safetensors metadata string.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":4,\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // A 1-D weight shape: `items[1]` used to index out of bounds.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // A dtype the reader cannot serve: the row math is u32 words + bf16 pairs.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"F32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // A file written by something else that reused the safetensors shape.
+    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+        "{\"__metadata__\":{\"format\":\"pt\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+}
+
+test "ngram table header: bits must be a width mx.quantize actually ships" {
+    // `(@as(u32, 1) << @intCast(self.bits)) - 1` in dequantRow is illegal at
+    // 32 and wrong at every width mlx does not pack — and `dim * bits ==
+    // wcols * 32` alone accepts 32 (dim 64, wcols 64).
+    try testing.expectError(error.NgramTableBits, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"32\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,64],\"data_offsets\":[0,1024]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[1024,1040]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[1040,1056]}}",
+        1056,
+    ));
+    try testing.expectError(error.NgramTableBits, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"7\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,14],\"data_offsets\":[0,224]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[224,240]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[240,256]}}",
+        256,
+    ));
+    try testing.expectError(error.NgramTableBits, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"0\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        160,
+    ));
+}
+
+test "ngram table header: every region is bounded, sized by its own shape and disjoint" {
+    // Only the biases' END was checked, so a weight region claiming rows it
+    // does not hold let `row()` and `preadSite` slice past the mapping —
+    // `row()` asserts `r < self.rows` and nothing else.
+    // Weight region too small for rows x wcols x 4.
+    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,64]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // Scales overlapping the weights: one of the two is reading the other's
+    // bytes as its own dtype.
+    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[120,136]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // A row count of zero divides by nothing but gathers from everything.
+    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[0,8],\"data_offsets\":[0,0]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[0,2],\"data_offsets\":[0,0]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[0,2],\"data_offsets\":[0,0]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // Scales and biases must describe the SAME rows as the weights.
+    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[128,136]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+    // Past the end of the mapping.
+    try testing.expectError(error.NgramTableTruncated, ngramTestParse(
+        "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+            "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
+            "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
+            "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[400,416]}}",
+        NGRAM_GOOD_BYTES,
+    ));
+}
+
+test "NgramHash.init refuses a config past its fixed arrays instead of asserting" {
+    // The assert this replaces was `std.debug.assert(h.n_heads <= MAX_HEADS
+    // and ngram_size <= 8)`: present in `zig build test`, absent from every
+    // ReleaseFast binary we ship, where the loop below it wrote 64 i64s into
+    // two 32-element arrays.
+    try testing.expectError(error.InvalidQwen4NgramSize, NgramHash.init(248320, 9, 8, 20_000_000, 128, 1234, 0, 248044));
+    try testing.expectError(error.InvalidQwen4NgramSize, NgramHash.init(248320, 1, 8, 20_000_000, 128, 1234, 0, 248044));
+    try testing.expectError(error.InvalidQwen4NgramHeads, NgramHash.init(248320, 5, 16, 20_000_000, 128, 1234, 0, 248044));
+    try testing.expectError(error.InvalidQwen4NgramHeads, NgramHash.init(248320, 3, 0, 20_000_000, 128, 1234, 0, 248044));
+    try testing.expectError(error.InvalidQwen4NgramVocab, NgramHash.init(248320, 3, 8, 20_000_000, 0, 1234, 0, 248044));
+    // The widest shape the arrays DO hold still builds.
+    const wide = try NgramHash.init(248320, 5, 8, 20_000_000, 128, 1234, 0, 248044);
+    try testing.expectEqual(@as(u32, 32), wide.n_heads);
 }

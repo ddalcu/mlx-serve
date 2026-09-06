@@ -6841,7 +6841,9 @@ pub const SSMCacheEntry = struct {
     /// copy it (attachQsaHistoryToLatest puts one copy on the latest snap).
     aux_state: mlx.mlx_array = .{ .ctx = null },
     /// PLE: the (ngram_size-1) tokens preceding the next forward.
-    ple_prev: [8]u32 = @splat(0),
+    /// The (ngram_size - 1) tokens preceding this entry. Sized by the
+    /// SAME bound `model.validateQwen4Config` refuses a checkpoint past.
+    ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
     ple_prev_valid: bool = false,
     /// Spec-verify capture for the PLE layer: the dilated-conv input
     /// `[B, state_len + T, hc*hidden]` and the token history (prev ++ ids)
@@ -7086,7 +7088,9 @@ pub const SSMCacheEntrySnapshot = struct {
     aux_state: mlx.mlx_array = .{ .ctx = null },
     qsa_pooled: mlx.mlx_array = .{ .ctx = null },
     qsa_ratio: c_int = 4,
-    ple_prev: [8]u32 = @splat(0),
+    /// The (ngram_size - 1) tokens preceding this entry. Sized by the
+    /// SAME bound `model.validateQwen4Config` refuses a checkpoint past.
+    ple_prev: [qwen4_mod.MAX_NGRAM_SIZE]u32 = @splat(0),
     ple_prev_valid: bool = false,
 };
 
@@ -10788,10 +10792,18 @@ pub const Transformer = struct {
                 moe_owned_bf16 = merged;
             }
             const eos: u32 = config.ngram_eos;
+            // The `0` below is the PLE's ORDINAL among the injection points
+            // the config lists, NOT `config.ple_layer_idx`: the reference
+            // seeds the per-head multipliers and primes from the ordinal, so
+            // the one PLE we support is always index 0 however high its
+            // `ple_layer_ids` entry is. Pinned by the oracle fixture, whose
+            // config says `ple_layer_ids=[2]` and whose row ids this
+            // reproduces with 0 here (`qwen4_exp.zig`, "ngram hash reproduces
+            // the reference multipliers, primes and offsets").
             const st = try allocator.create(qwen4_mod.Qwen4State);
             errdefer allocator.destroy(st);
             st.* = .{
-                .hash = qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
+                .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
                 .table = try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
             };
             if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
@@ -23700,6 +23712,21 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             .ssm_state = mlx.mlx_array_new(),
             .initialized = false,
         };
+    }
+
+    // #363 ledger 29: the PLE is placed by EXACT equality against
+    // `config.ple_layer_idx` inside the loop above, and nothing downstream
+    // notices its absence — the 32 GB n-gram table still opens, the hash
+    // still runs, and the trunk simply never receives the term. A load error
+    // rather than a log line: a silently PLE-less qwen4 emits plausible text.
+    if (config.isQwen4()) {
+        const has_ple = try allocator.alloc(bool, moe_layers.len);
+        defer allocator.free(has_ple);
+        for (moe_layers, 0..) |*lw, i| has_ple[i] = lw.ple != null;
+        if (!model_mod.qwen4PleInstalledAt(has_ple, config.ple_layer_idx)) {
+            log.err("[qwen4] the PLE was not installed at layer {d} ({d} layers carry PLE weights)\n", .{ config.ple_layer_idx, std.mem.count(bool, has_ple, &.{true}) });
+            return error.Qwen4PleNotInstalled;
+        }
     }
 
     return .{
@@ -47824,4 +47851,22 @@ test "residentCapacityTokens owns no arithmetic of its own (W-1 class pin)" {
     const decl = std.mem.indexOf(u8, src, "pub fn residentCapacity" ++ "Tokens(self: *const KVCache) usize {") orelse return error.CallSiteMoved;
     const end = std.mem.indexOfPos(u8, src, decl, "\n    }\n") orelse return error.CallSiteMoved;
     try t.expect(std.mem.indexOf(u8, src[decl..end], "return 0;") == null);
+}
+
+test "the qwen4 layer loop proves the PLE landed before the model is handed back" {
+    // #363 ledger 29. The config check (`model.validateQwen4Config`) proves
+    // the id names a layer that EXISTS; it cannot see a loop that skipped the
+    // placement — a prefix rename, an early `continue`, a weight-name change
+    // in a converter — and that failure is silent: the n-gram table opens,
+    // the hash runs, the trunk just never receives the term. Needles are
+    // assembled at comptime so this test's own source cannot satisfy the scan.
+    const src = @embedFile("transformer.zig");
+    const helper = "qwen4Ple" ++ "InstalledAt";
+    const call = "model_mod." ++ helper;
+    try testing.expect(std.mem.indexOf(u8, src, call) != null);
+    // ...and it must REFUSE the load, not log and continue.
+    try testing.expect(std.mem.indexOf(u8, src, "return error.Qwen4Ple" ++ "NotInstalled") != null);
+    // The predicate itself lives in model.zig, beside the config check whose
+    // invariant it completes.
+    try testing.expect(std.mem.indexOf(u8, @embedFile("model.zig"), "pub fn " ++ helper) != null);
 }
