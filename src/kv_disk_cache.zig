@@ -757,9 +757,13 @@ pub const DiskTier = struct {
             self.store_declined = true;
             // D4: the refusal is silent to the REQUEST, never to the log —
             // name the volume, what it has, and the floor it missed.
-            log.warn("[disk-cache] {s}: {d} MB free is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
+            // The number COMPARED is free less the reserve, not free: a
+            // 14 GB-free box read "13942 MB free is below the 1024 MB store
+            // floor" and filed it as a contradiction.
+            log.warn("[disk-cache] {s}: {d} MB free less the {d} MB reserve (min 64 GiB, 10% of the volume) is below the {d} MB store floor — no NEW entries persist (already-persisted entries stay restorable)\n", .{
                 self.root,
                 vs.free >> 20,
+                @min(DISK_RESERVE_CAP, vs.total / 10) >> 20,
                 DISK_STORE_FLOOR >> 20,
             });
         }
@@ -5737,6 +5741,7 @@ test "DiskTier chunk share: the legacy arm and the kill switch never link" {
         var tier = try DiskTier.init(testing.allocator, io, base, "fp-nolink", 0, 128);
         defer tier.deinit();
         tier.ssd_first = arm.ssd;
+        tier.armTestSpace(1024 * 1024 * 1024 * 1024, 4096 * 1024 * 1024 * 1024);
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, null, s);
         const before = tier.total_bytes;
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
