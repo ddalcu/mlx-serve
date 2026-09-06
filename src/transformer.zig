@@ -13983,8 +13983,7 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        // The slices already handed out are mlx handles, not just slice bytes —
-        // freeing `out` alone on the error path leaks every one of them.
+        // `out` holds mlx handles, so freeing the slice alone leaks every one.
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
@@ -14106,8 +14105,7 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        // The slices already handed out are mlx handles, not just slice bytes —
-        // freeing `out` alone on the error path leaks every one of them.
+        // `out` holds mlx handles, so freeing the slice alone leaks every one.
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
@@ -44621,7 +44619,7 @@ test "qwen4MtpForward owns its stream once: exactly one errdefer frees `h`" {
 
 /// Metal bytes held by LIVE arrays, with the allocator's free list flushed so
 /// the number is a function of ownership alone.
-fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
+pub fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
     var active: usize = 0;
@@ -44629,13 +44627,9 @@ fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     return active;
 }
 
-/// `mlx_metal_is_available` is true for a Metal-enabled build even when this
-/// process has no GPU (headless / sandboxed). A 2x2 zeros+eval is the real
-/// gate for the fault-injection tests below.
-fn mlxDeviceUsable() bool {
-    // `mlx_metal_is_available` is true for a Metal-enabled build even when
-    // this process cannot create a GPU stream (headless / sandboxed). Probe
-    // a real stream + a 1x1 zeros so leak tests skip instead of exit(-1).
+/// `mlx_metal_is_available` is true for a Metal-enabled build with no usable
+/// GPU, so this probes a real stream plus a 1x1 zeros+eval instead.
+pub fn mlxDeviceUsable() bool {
     mlx.installErrorHandler();
     var trash: [256]u8 = undefined;
     if (mlx.errorPending()) _ = mlx.takeError(&trash);
@@ -44901,12 +44895,9 @@ test "takeContig releases `view` exactly once on every faulted op (CPU stream, n
     try testing.expectEqual(@as(usize, 2), fired);
 }
 
-test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a CPU stream" {
-    // Negative control for the series. A CPU-stream 4 MiB eval is MlxError
-    // here and `mlxSettledActiveBytes` on a CPU stream is mlx-c `exit(-1)`, so
-    // the leak oracle is the GPU-gated shape already in this file (`mlx check
-    // fault injection`). A deliberate leak of one eval'd 4 MiB array must move
-    // settled active bytes by more than half the array.
+test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a GPU stream" {
+    // Calibrates the leak oracle: a deliberately leaked 4 MiB eval'd array
+    // must move settled active bytes by more than half the array.
     if (!mlxDeviceUsable()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const n_elem: usize = 1 << 20; // 4 MiB, well above allocator noise
@@ -44932,11 +44923,8 @@ test "errpath oracle: mlxSettledActiveBytes sees a leaked array on a CPU stream"
 }
 
 test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
-    // Source-order pin for the live double free: HEAD frees `buf.*` then
-    // `mlx_zeros`. A failed zeros (the most likely OOM in the tree) leaves
-    // the caller's handle holding a freed ctx; `freeKVEntry` frees it again.
-    // Bound the function by the next method so a short window cannot pick up
-    // `buildSliceView`'s else. The runtime abort test below is the other half.
+    // Source-order pin: the new buffer must exist before the old one is freed,
+    // bounded by the next method so the window cannot reach another `else`.
     const src = @embedFile("transformer.zig");
     const needle = "fn grow" ++ "QuantBuf(";
     const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
@@ -44951,11 +44939,8 @@ test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
 }
 
 test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
-    // Class B / L4: `built = i + 1` sat AFTER the six trimRowsOwned tries, so
-    // a faulted values trim leaked keys. Move the bump to immediately after
-    // newEmptyKVEntry so the function-scope errdefer covers the in-progress
-    // slot. Red on HEAD: the last `built = i + 1` in the loop is below the
-    // first trimRowsOwned.
+    // Source-order pin: the first `built = i + 1` must precede the first
+    // `trimRowsOwned`, so the errdefer covers the entry being filled.
     const src = @embedFile("transformer.zig");
     const needle = "pub fn trimmed" ++ "Copy(";
     const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
@@ -44968,11 +44953,8 @@ test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
 }
 
 test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no double free)" {
-    // HEAD frees `buf.*` THEN calls `mlx_zeros`. A latched OOM (or `arm(k)`)
-    // returns with the caller's handle holding a freed, non-null ctx;
-    // `freeKVEntry` then frees it again and the process aborts. That abort is
-    // the red half, matching `takeContig`. After the fix the old buffer stays
-    // owned across the fallible alloc, so the post-error free is legal.
+    // A faulted `mlx_zeros` must leave the caller's old buffer owned, so the
+    // free below is legal; freeing it first makes that free a double free.
     if (!mlxDeviceUsable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const B: c_int = 1;
@@ -45004,15 +44986,13 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
         if (r) |_| {
-            // Unreachable for k in 1..=n_ops: the un-faulted run counted those
-            // ops. Free the replacement so a silent success is not a leak.
+            // Unreachable for k in 1..=n_ops; free the replacement anyway.
             _ = mlx.mlx_array_free(buf);
         } else |err| {
             try testing.expectEqual(error.MlxError, err);
             try testing.expect(did);
             fired += 1;
-            // The load-bearing assertion: this free must be legal. On HEAD it
-            // is a double free and the test binary aborts here.
+            // The load-bearing assertion: this free must be legal.
             _ = mlx.mlx_array_free(buf);
         }
     }
