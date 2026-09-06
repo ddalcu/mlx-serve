@@ -24,6 +24,29 @@ final class ChatColumnMetricsTests: XCTestCase {
     /// The fallback only covers the single frame before `ChatDetailView`
     /// measures its own width — it should still sit in a sane reading-width
     /// range so that frame doesn't flash something absurd.
+    /// A wide column keeps prose off the edges; a narrow one (the desktop
+    /// pane's chat column) is used edge to edge minus the gutters, or the
+    /// composer's control row overflows the column on both sides.
+    func testANarrowColumnUsesItsFullWidth() {
+        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 1000), 800)
+        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 480), 480 - 2 * ChatMetrics.gutter)
+        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 0), ChatMetrics.contentFallbackWidth, "unmeasured → fallback")
+        // Continuous enough at the seam: no visible jump when dragging past it.
+        let below = ChatMetrics.contentWidth(forColumn: ChatMetrics.narrowColumnWidth - 1)
+        let above = ChatMetrics.contentWidth(forColumn: ChatMetrics.narrowColumnWidth)
+        XCTAssertLessThan(abs(below - above), 120)
+    }
+
+    /// A narrow column sheds the Start caption and the context pill; the
+    /// unmeasured first frame is never compact.
+    func testTheComposerCollapsesInANarrowColumn() {
+        XCTAssertFalse(ChatMetrics.composerIsCompact(columnWidth: 0))
+        XCTAssertFalse(ChatMetrics.composerIsCompact(columnWidth: 900))
+        XCTAssertTrue(ChatMetrics.composerIsCompact(columnWidth: 400))
+        XCTAssertLessThan(ChatMetrics.compactComposerWidth, ChatMetrics.narrowColumnWidth,
+                          "compact kicks in only after the full-width measure already applies")
+    }
+
     func testTheFallbackIsInTheReadableRange() {
         XCTAssertGreaterThanOrEqual(ChatMetrics.contentFallbackWidth, 640)
         XCTAssertLessThanOrEqual(ChatMetrics.contentFallbackWidth, 820)

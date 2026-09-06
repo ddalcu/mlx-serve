@@ -63,6 +63,34 @@ final class AgentRepetitionTests: XCTestCase {
         XCTAssertEqual(mcp.executeCount, 0, "a blocked call must never reach the MCP server")
     }
 
+    /// A 3B sends `shell {}` again and again. The first two get the schema
+    /// error; the third gets a LITERAL call built from the user's task words,
+    /// and the counter is per tracker (= per turn).
+    func testThirdEmptyShellCallGetsALiteralExampleFromTheTask() async {
+        let rep = AgentEngine.RepetitionTracker()
+        rep.task = "install doom and start it"
+        var wd: String? = nil
+        let mem = AgentMemory()
+        let tc = APIClient.ToolCall(id: "1", name: "shell", arguments: [:], rawArguments: "{}")
+        var outputs: [String] = []
+        for _ in 0..<3 {
+            outputs.append(await AgentEngine.executeToolCall(tc, workingDirectory: &wd, repetition: rep,
+                                                             iteration: 0, agentMemory: mem).output)
+        }
+        XCTAssertTrue(outputs[0].contains("missing required params"), outputs[0])
+        XCTAssertTrue(outputs[1].contains("missing required params"), outputs[1])
+        XCTAssertTrue(outputs[2].contains("{\"command\": \"apt-get install -y doom\"}"), outputs[2])
+        XCTAssertEqual(rep.emptyShellCalls, 3)
+    }
+
+    func testEmptyArgsNudgeBuildsFromTheTaskWords() {
+        XCTAssertTrue(AgentEngine.emptyArgsNudge(task: "please install openoffice and make a spreadsheet")
+            .contains("apt-get install -y openoffice"))
+        XCTAssertTrue(AgentEngine.emptyArgsNudge(task: "what is the raspberry pi 5 price")
+            .contains("apt-cache search raspberry pi 5"))
+        XCTAssertTrue(AgentEngine.emptyArgsNudge(task: "").contains("ls -la"))
+    }
+
     func testMCPCallRoutesThroughRouterWhenNotLooping() async {
         let mcp = FakeMCPRouter()
         let rep = AgentEngine.RepetitionTracker()

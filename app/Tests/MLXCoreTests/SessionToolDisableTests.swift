@@ -63,6 +63,32 @@ final class SessionToolDisableTests: XCTestCase {
         XCTAssertTrue(r.tools.contains(.searchDocuments))
     }
 
+    /// The "Computer only" preset keeps exactly the Computer + Shell groups
+    /// and disables every other toggleable tool — through the same resolver,
+    /// so a chat under the preset advertises those and nothing else.
+    func testComputerOnlyPresetKeepsComputerAndShellGroupsOnly() {
+        let disabled = AgentToolGroup.computerOnlyDisabledSet
+        let r = resolve(disabled: disabled)
+        let kept = Set(AgentToolGroup.computer.tools + AgentToolGroup.shell.tools)
+        XCTAssertEqual(r.tools.subtracting([.searchDocuments]), kept)
+        XCTAssertTrue(disabled.isDisjoint(with: kept))
+        XCTAssertFalse(disabled.contains(.searchDocuments), "never in a disable set (not toggleable)")
+    }
+
+    /// Opening the Desktop view puts the active chat on the preset (Tools on,
+    /// MCP off, Computer + Shell); a chat already there is left alone, so the
+    /// menu's later changes are not undone by a second visit.
+    func testTheDesktopViewAppliesThePresetOnce() {
+        let change = DesktopChatPreset.apply(mode: .chat, useMCP: true, disabledTools: [])
+        XCTAssertEqual(change?.mode, .agent)
+        XCTAssertEqual(change?.useMCP, false)
+        XCTAssertEqual(Set(change?.disabledTools ?? []), Set(AgentToolGroup.computerOnlyDisabledSet.map(\.rawValue)))
+        XCTAssertNil(DesktopChatPreset.apply(mode: .agent, useMCP: false, disabledTools: change!.disabledTools),
+                     "already on the preset → no change")
+        XCTAssertNotNil(DesktopChatPreset.apply(mode: .agent, useMCP: false, disabledTools: ["browse"]),
+                        "a different disable set is not the preset")
+    }
+
     func testMenuNeverOffersSearchDocuments() {
         XCTAssertFalse(AgentToolKind.chatToggleable.contains(.searchDocuments))
     }

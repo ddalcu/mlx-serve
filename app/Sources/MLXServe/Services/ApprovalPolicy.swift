@@ -63,8 +63,11 @@ enum ApprovalPolicy {
             // `createTask` only schedules a background run (itself governed by its
             // own autonomy when it executes) — benign like `saveMemory`, and the
             // whole point of unattended/Telegram agents, so it auto-allows here.
+            // `computer` drives the sandbox desktop: not read-only, not
+            // path-confinable — the shell bucket (issue: it must never fall
+            // into the "Unrecognized tool" ask under fullAuto).
             if readOnlyTools.contains(tool) || tool == "shell" || tool == "saveMemory"
-                || tool == "createTask" || isMCPTool(tool) {
+                || tool == "createTask" || tool == "computer" || isMCPTool(tool) {
                 return .allow
             }
             if pathWriteTools.contains(tool) {

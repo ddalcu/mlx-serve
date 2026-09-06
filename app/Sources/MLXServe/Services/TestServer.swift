@@ -462,6 +462,11 @@ class TestServer {
         }
 
         let enableThinking = json["thinking"] as? Bool ?? false
+        // Optional `tools`: raw tool names to advertise + allow, the harness's
+        // twin of the chat's Tools menu (a 3B model with 19 tools flails).
+        let allowed: Set<AgentToolKind>? = (json["tools"] as? [String]).map { names in
+            Set(names.compactMap { AgentToolKind(rawValue: $0) })
+        }
         var workDir: String? = json["working_directory"] as? String
             ?? NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
 
@@ -488,6 +493,7 @@ class TestServer {
         let maxPadRetries = 2
         var roundResults: [[String: Any]] = []
         let repetition = AgentEngine.RepetitionTracker()
+        repetition.task = message  // the empty-args nudge builds its example from the task
         var truncationRetries = 0
 
         for iteration in 0..<maxIterations {
@@ -505,7 +511,8 @@ class TestServer {
             let userContent = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userContent)
             var systemPrompt = AgentPrompt.systemPrompt
-                + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled)
+                + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled,
+                                                          desktop: AgentSandbox.shared.isDesktopEnabled)
                 + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             if let wd = workDir {
                 systemPrompt += AgentEngine.workingDirectoryContext(wd)
@@ -530,7 +537,7 @@ class TestServer {
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
                 enableThinking: enableThinking && iteration == 0,
-                toolsJSON: AgentPrompt.toolDefinitionsJSON
+                toolsJSON: allowed.map { AgentPrompt.toolDefinitionsJSON(allowing: $0) } ?? AgentPrompt.toolDefinitionsJSON
             )
 
             do {
@@ -617,7 +624,8 @@ class TestServer {
                             ?? "Error: media generation unavailable."
                     },
                     processRegistry: appState.processRegistry,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    allowedTools: allowed
                 )
 
                 var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")

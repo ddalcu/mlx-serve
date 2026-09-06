@@ -26,8 +26,9 @@ final class ProcessToolSchemaTests: XCTestCase {
         // 11 base (shell, cwd, writeFile, readFile, editFile, searchFiles,
         // listFiles, browse, webSearch, saveMemory, createTask) + 3 process
         // (killProcess, readProcessOutput, listProcesses) + 4 media
-        // (generate_image, generate_speech, generate_music, generate_video) = 18.
-        XCTAssertEqual(defs().count, 18)
+        // (generate_image, generate_speech, generate_music, generate_video)
+        // + 1 desktop (computer) = 19.
+        XCTAssertEqual(defs().count, 19)
     }
 
     /// The four media-generation tools, each with exactly one required argument

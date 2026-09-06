@@ -19,6 +19,38 @@ enum ChatMetrics {
     /// still shouldn't run edge to edge. Pinned by `ChatColumnMetricsTests`.
     static let contentWidthFraction: CGFloat = 0.8
 
+    /// Below this column width the fraction stops applying and the measure is
+    /// the column minus its gutters: the composer's control row needs ~440 pt,
+    /// and a capped measure narrower than that overflowed both edges of the
+    /// desktop pane's chat column (live 2026-09-06, "the bubble floats").
+    static let narrowColumnWidth: CGFloat = 640
+
+    /// Below this column width the composer row sheds what it can: the Start
+    /// control collapses to its icon, the voice toggle and the context pill
+    /// go, the model pill is capped (the desktop pane's chat column at a
+    /// small window; live 2026-09-06 the Start caption wrapped one letter
+    /// per line and Send was clipped). MUST exceed the full row's intrinsic
+    /// width (~565 pt with every control): the column measures the row when
+    /// the row overflows it, so a lower bar could never be reached.
+    static let compactComposerWidth: CGFloat = 600
+
+    /// Pure rules for the row (pinned by `ChatColumnMetricsTests`). Zero =
+    /// unmeasured, which is never compact (the first frame).
+    /// The model pill's NAME cap in the compact row (it truncates in the middle).
+    static let compactModelPillWidth: CGFloat = 96
+
+    static func composerIsCompact(columnWidth: CGFloat) -> Bool {
+        columnWidth > 0 && columnWidth < compactComposerWidth
+    }
+
+    /// The reading measure for a column of `columnWidth`. Pure; pinned by
+    /// `ChatColumnMetricsTests`.
+    static func contentWidth(forColumn columnWidth: CGFloat) -> CGFloat {
+        guard columnWidth > 0 else { return contentFallbackWidth }
+        if columnWidth < narrowColumnWidth { return max(0, columnWidth - 2 * gutter) }
+        return columnWidth * contentWidthFraction
+    }
+
     /// Reading width used for the single frame before `ChatDetailView` has
     /// measured its own column (`onGeometryChange` hasn't fired yet).
     static let contentFallbackWidth: CGFloat = 740

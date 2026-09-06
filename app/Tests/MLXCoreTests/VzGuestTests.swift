@@ -1,4 +1,5 @@
 import XCTest
+import Virtualization
 @testable import MLXCore
 
 /// Pure-logic tests for the Virtualization.framework guest: the generated
@@ -242,6 +243,94 @@ final class VzGuestTests: XCTestCase {
         let s = VzGuest.buildInitScript(config: c)
         XCTAssertFalse(s.contains("dropbear"), "ssh off → no sshd, no devpts requirement")
         XCTAssertFalse(s.contains("devpts"))
+    }
+
+    /// Root guest, but models write `sudo`: a pass-through shim, only where
+    /// no real sudo exists.
+    /// Debian installs games (chocolate-doom, …) into /usr/games, which is
+    /// on a login shell's PATH but not on ours; `which chocolate-doom` failed
+    /// right after a successful install (live 2026-09-05).
+    func testInitScriptPathIncludesUsrGames() {
+        XCTAssertTrue(VzGuest.buildInitScript(config: vsockConfig()).contains(":/usr/games HOME="))
+    }
+
+    func testInitScriptShimsSudoForModelsThatTypeIt() {
+        let s = VzGuest.buildInitScript(config: vsockConfig())
+        XCTAssertTrue(s.contains("[ -x /usr/bin/sudo ] ||"), s)
+        XCTAssertTrue(s.contains("/usr/local/bin/sudo"), s)
+        XCTAssertTrue(s.contains(#"exec "$@""#), "the shim runs the command as-is: \(s)")
+    }
+
+    // MARK: desktop (computer use)
+
+    /// Headless stays byte-for-byte what it was: no display → no graphics, no
+    /// keyboard, no pointing device, and no desktop arm in the init script.
+    func testNoDisplayMeansNoDisplayDevicesAndNoDesktopArm() {
+        let c = vsockConfig()
+        XCTAssertNil(c.display)
+        let vm = VZVirtualMachineConfiguration()
+        VzGuest.applyDisplay(c.display, to: vm)
+        XCTAssertTrue(vm.graphicsDevices.isEmpty)
+        XCTAssertTrue(vm.keyboards.isEmpty)
+        XCTAssertTrue(vm.pointingDevices.isEmpty)
+        XCTAssertEqual(VzGuest.displayDeviceSummary(for: c), [])
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertFalse(s.contains(VzGuest.desktopStartGuestPath), s)
+        XCTAssertFalse(s.contains("/dev/dri"), s)
+    }
+
+    /// With a display: ONE virtio-gpu scanout at the requested size, a USB
+    /// keyboard and a USB screen-coordinate pointing device (what the Linux
+    /// guest's xHCI + HID drivers serve; kernels-v5). The summary the tests
+    /// read is derived from the same spec the VM is built from.
+    func testDisplayAddsOneScanoutPlusUsbKeyboardAndPointer() {
+        var c = vsockConfig()
+        c.display = VzGuest.DisplaySpec(width: 1280, height: 800, pixelsPerInch: 80)
+        let vm = VZVirtualMachineConfiguration()
+        VzGuest.applyDisplay(c.display, to: vm)
+        XCTAssertEqual(vm.graphicsDevices.count, 1)
+        let gpu = vm.graphicsDevices.first as? VZVirtioGraphicsDeviceConfiguration
+        XCTAssertNotNil(gpu, "the graphics device is virtio-gpu (DRM_VIRTIO_GPU in the guest)")
+        XCTAssertEqual(gpu?.scanouts.count, 1)
+        XCTAssertEqual(gpu?.scanouts.first?.widthInPixels, 1280)
+        XCTAssertEqual(gpu?.scanouts.first?.heightInPixels, 800)
+        XCTAssertEqual(vm.keyboards.count, 1)
+        XCTAssertTrue(vm.keyboards.first is VZUSBKeyboardConfiguration)
+        XCTAssertEqual(vm.pointingDevices.count, 1)
+        XCTAssertTrue(vm.pointingDevices.first is VZUSBScreenCoordinatePointingDeviceConfiguration)
+        XCTAssertEqual(VzGuest.displayDeviceSummary(for: c),
+                       ["graphics virtio-gpu 1280x800", "keyboard usb", "pointing usb-screen-coordinate"])
+    }
+
+    func testDefaultDisplaySpecIs1280x800() {
+        let d = VzGuest.DisplaySpec()
+        XCTAssertEqual(d.width, 1280)
+        XCTAssertEqual(d.height, 800)
+        XCTAssertEqual(d.pixelsPerInch, 80)
+    }
+
+    /// The init script starts the desktop ONLY when the VM has a display, and
+    /// only when the kernel exposed a DRM node AND the start script was
+    /// injected — a headless kernel or an unprovisioned rootfs boots exactly
+    /// like before. Backgrounded: the agent transport must not wait on Xorg.
+    func testDisplayInitScriptStartsTheDesktopGatedOnDrmAndTheStartScript() {
+        var c = vsockConfig()
+        c.display = VzGuest.DisplaySpec()
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertTrue(s.contains("mkdir -p /tmp/.X11-unix"), s)
+        XCTAssertTrue(s.contains("mount -t tmpfs -o mode=755 tmpfs /run"), "dbus/at-spi sockets cannot bind on virtiofs")
+        XCTAssertTrue(s.contains("mount -t tmpfs -o mode=1777 tmpfs /tmp"),
+                      "LibreOffice's single-instance socket lives in /tmp; a stale one on virtiofs kills every later launch")
+        let tmpMount = s.range(of: "tmpfs /tmp")!.lowerBound
+        let x11 = s.range(of: "mkdir -p /tmp/.X11-unix")!.lowerBound
+        XCTAssertLessThan(tmpMount, x11, "the X socket dir is created INSIDE the tmpfs, after the mount")
+        XCTAssertTrue(s.contains("[ -e /dev/dri/card0 ]"), s)
+        XCTAssertTrue(s.contains("[ -x \(VzGuest.desktopStartGuestPath) ]"), s)
+        XCTAssertTrue(s.contains("\(VzGuest.desktopStartGuestPath) >"), "desktop output goes to a log, never the console")
+        XCTAssertTrue(s.contains("2>&1 &"), "the desktop must be backgrounded")
+        // The arm sits before the agent exec (which never returns).
+        XCTAssertLessThan(s.range(of: VzGuest.desktopStartGuestPath)!.lowerBound,
+                          s.range(of: VzGuest.agentGuestPath + "\n")!.lowerBound)
     }
 
     // MARK: shell quoting

@@ -34,6 +34,9 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     case generateSpeech = "generate_speech"
     case generateMusic = "generate_music"
     case generateVideo = "generate_video"
+    /// Drives the sandbox desktop (XFCE in the guest VM) by accessibility
+    /// tree + xdotool; screenshots only when the model has vision.
+    case computer
 
     var icon: String {
         switch self {
@@ -56,6 +59,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .generateSpeech: "waveform"
         case .generateMusic: "music.note"
         case .generateVideo: "film"
+        case .computer: "desktopcomputer"
         }
     }
 
@@ -80,6 +84,7 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .generateSpeech: "Generate Speech"
         case .generateMusic: "Generate Music"
         case .generateVideo: "Generate Video"
+        case .computer: "Computer"
         }
     }
 
@@ -108,6 +113,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
     case web
     case media
     case knowledge
+    case computer
 
     var title: String {
         switch self {
@@ -116,6 +122,7 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
         case .web: "Web"
         case .media: "Media"
         case .knowledge: "Memory & Tasks"
+        case .computer: "Computer"
         }
     }
 
@@ -126,7 +133,39 @@ enum AgentToolGroup: String, CaseIterable, Sendable {
         case .web: [.browse, .webSearch]
         case .media: [.generateImage, .generateSpeech, .generateMusic, .generateVideo]
         case .knowledge: [.saveMemory, .createTask]
+        case .computer: [.computer]
         }
+    }
+
+    /// The Tools menu's "Computer only" preset: every toggleable tool outside
+    /// the Computer and Shell groups, as the session's disabled set. A 3B
+    /// model given the full toolbox drifts to host tools (`webSearch`,
+    /// `readFile`) mid-task; with these two groups it finishes (live
+    /// 2026-09-05, LFM2.5-VL-3B). Pure, so the menu and the resolver agree.
+    static var computerOnlyDisabledSet: Set<AgentToolKind> {
+        let kept = Set(AgentToolGroup.computer.tools + AgentToolGroup.shell.tools)
+        return Set(AgentToolKind.chatToggleable).subtracting(kept)
+    }
+}
+
+/// What opening the Desktop view does to the chat beside the screen: Tools
+/// ON, MCP OFF, the Computer-only preset. Live 2026-09-06 a 9B with Tools
+/// off and an MCP shell curl'd the web from the Mac instead of driving the
+/// sandbox, because `computer` was never advertised. Applied ONCE on entry
+/// (`AppState.showDesktop`), so the Tools menu can still change it after;
+/// a session already on the preset is untouched. Pure.
+enum DesktopChatPreset {
+    struct Change: Equatable {
+        var mode: ChatMode
+        var useMCP: Bool
+        var disabledTools: [String]
+    }
+
+    static func apply(mode: ChatMode, useMCP: Bool, disabledTools: [String]) -> Change? {
+        let wanted = Change(mode: .agent, useMCP: false,
+                            disabledTools: AgentToolGroup.computerOnlyDisabledSet.map(\.rawValue).sorted())
+        let current = Change(mode: mode, useMCP: useMCP, disabledTools: disabledTools.sorted())
+        return current == wanted ? nil : wanted
     }
 }
 

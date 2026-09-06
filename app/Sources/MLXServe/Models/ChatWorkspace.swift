@@ -27,6 +27,9 @@ enum ChatWorkspace: Equatable {
     /// Chats section. A window until 2026-09-02 — and closing that window
     /// killed every live session, which is the whole reason it moved.
     case terminal(UUID)
+    /// The sandbox desktop's live screen (computer use), a destination row
+    /// like Tasks: you watch the agent work there, or take over.
+    case desktop
 
     var isModels: Bool {
         if case .models = self { return true }
@@ -45,6 +48,8 @@ enum ChatWorkspace: Equatable {
     var isSettings: Bool { self == .settings }
 
     var isTerminal: Bool { terminalId != nil }
+
+    var isDesktop: Bool { self == .desktop }
 
     /// The terminal being shown, or nil outside terminal mode.
     var terminalId: UUID? {

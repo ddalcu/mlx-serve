@@ -473,6 +473,11 @@ struct ServerOptions: Codable, Equatable {
         /// `localhost:N` on this Mac. Off → the guest has NO network device at
         /// all (fully isolated). Applies on the next guest boot.
         var network: Bool = true
+        /// A Linux desktop (XFCE on X11) inside the guest, shown live in the
+        /// chat window's Desktop pane and driven by the agent's `computer`
+        /// tool. Installed with apt into the writable rootfs on first enable
+        /// (~350 MB, needs `network`); implies `enabled`. Off by default.
+        var desktop: Bool = false
     }
 
     // MARK: Restart-detection helpers
@@ -920,6 +925,7 @@ extension ServerOptions.SandboxConfig {
         // baseImage is hardcoded now (see the static above) — a stored value,
         // legacy default or custom, is deliberately ignored.
         if let v = try c.decodeIfPresent(Bool.self, forKey: .network) { network = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .desktop) { desktop = v }
     }
 }
 

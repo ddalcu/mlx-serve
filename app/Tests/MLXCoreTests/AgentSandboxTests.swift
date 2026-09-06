@@ -246,6 +246,30 @@ final class AgentSandboxTests: XCTestCase {
         XCTAssertFalse(sandbox._testHasGuest, "guest must be detached so the next boot re-pulls fresh")
     }
 
+    // MARK: reset must detach the rootfs volume before deleting it
+
+    func testResetStopsTheGuestThenDetachesTheVolumeThenDeletes() {
+        // The images directory is a mounted sparse bundle: deleting the bundle
+        // while mounted leaves a dangling mount the next boot mistakes for an
+        // attached (empty) volume. Stop → detach → delete, strictly.
+        let sandbox = AgentSandbox.shared
+        sandbox._testInstallGuest(VzGuest())
+        let lock = NSLock()
+        var events: [String] = []
+        let done = expectation(description: "reset completed")
+        sandbox.resetAllData(
+            shutdownBlocking: { _ in
+                Thread.sleep(forTimeInterval: 0.2)
+                lock.lock(); events.append("stopped"); lock.unlock()
+            },
+            detachVolume: { _ in lock.lock(); events.append("detached"); lock.unlock() },
+            deleteData: { _ in lock.lock(); events.append("deleted"); lock.unlock() },
+            completion: { done.fulfill() })
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(events, ["stopped", "detached", "deleted"])
+        XCTAssertFalse(sandbox._testHasGuest)
+    }
+
     // MARK: CLI-session pinning (issue #89 follow-up: agent CLIs in the guest)
 
     func testRemountBlockMessageOnlyWhenPinnedAndRemountNeeded() {

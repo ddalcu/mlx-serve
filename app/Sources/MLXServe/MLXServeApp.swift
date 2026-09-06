@@ -301,6 +301,11 @@ struct MLXCoreApp: App {
                 Button("Scheduled Tasks…") { appState.showTasks() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
 
+                // The sandbox desktop (computer use). Always listed: with the
+                // feature off the pane offers the install, so this is the
+                // route in before the sidebar row exists.
+                Button("Sandbox Desktop…") { appState.showDesktop() }
+
                 Divider()
 
                 // The four generators are PAGES of the chat window now

@@ -1,4 +1,5 @@
 import Foundation
+import Virtualization
 
 /// Shared manager that routes the agent's shell commands into an isolated Linux
 /// guest (Apple Virtualization.framework — see `VzGuest`) instead of the host.
@@ -80,6 +81,30 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     private var baseImage = ServerOptions.SandboxConfig.baseImage
     /// Guest networking + live port mapping (see SandboxConfig.network).
     private var networkEnabled = ServerOptions.SandboxConfig().network
+    /// The sandbox desktop (SandboxConfig.desktop): the guest boots with a
+    /// display and XFCE is apt-installed on first use. Guarded by `lock`.
+    private var desktopEnabled = ServerOptions.SandboxConfig().desktop
+
+    /// Where the desktop stands. Boot/teardown/install cadence, so the tray and
+    /// the Desktop pane may observe it. `.installing` carries the last apt log
+    /// line (the pane's progress text).
+    enum DesktopSetupState: Equatable {
+        case idle
+        case installing(String)
+        case ready
+        case failed(String)
+    }
+    @Published private(set) var desktopSetupState: DesktopSetupState = .idle
+    /// Synchronous twin of `desktopSetupState` for non-UI readers (the tool
+    /// gate runs on a background thread; a main-queue publish lags, and under
+    /// a harness that blocks main it never lands). Guarded by `lock`.
+    private var desktopStateMirror: DesktopSetupState = .idle
+    var desktopState: DesktopSetupState { lock.lock(); defer { lock.unlock() }; return desktopStateMirror }
+    /// Why the live guest cannot show a desktop even if provisioned (a
+    /// pre-kernels-v5 kernel cache); nil when it can, or before boot.
+    private(set) var desktopKernelRefusal: String?
+    /// One provisioning run at a time (guarded by `lock`).
+    private var desktopProvisioning = false
 
     /// Append to the transcript on the main thread (@Published must mutate there).
     private func record(_ entry: Entry) {
@@ -98,6 +123,45 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     }
     private func setSshPort(_ v: UInt16?) {
         DispatchQueue.main.async { if self.sshPort != v { self.sshPort = v } }
+    }
+    private func setDesktopState(_ v: DesktopSetupState) {
+        lock.lock(); desktopStateMirror = v; lock.unlock()
+        DispatchQueue.main.async { if self.desktopSetupState != v { self.desktopSetupState = v } }
+    }
+
+    var isDesktopEnabled: Bool { lock.lock(); defer { lock.unlock() }; return desktopEnabled }
+
+    /// The live guest's machine for `VZVirtualMachineView`. nil while no guest
+    /// runs or it booted headless. Published on main at boot/teardown cadence
+    /// (NOT read through `bootLock`, which `ensureBooted` holds across a whole
+    /// boot — a main-thread read there would freeze the UI for seconds).
+    @Published private(set) var desktopVirtualMachine: VZVirtualMachine?
+    private func setDesktopVirtualMachine(_ v: VZVirtualMachine?) {
+        DispatchQueue.main.async { if self.desktopVirtualMachine !== v { self.desktopVirtualMachine = v } }
+    }
+
+    /// Enabled and not failed: a `computer` call may wait for provisioning.
+    var desktopPending: Bool {
+        guard isEnabled, isDesktopEnabled, desktopKernelRefusal == nil else { return false }
+        switch desktopState {
+        case .idle, .installing: return true
+        case .ready, .failed: return false
+        }
+    }
+
+    /// Why the `computer` tool cannot act right now (nil = it can). Ordered:
+    /// sandbox off, desktop off, kernel, then the install state. Every arm
+    /// names its fix.
+    var desktopRefusal: String? {
+        guard isEnabled else { return "the Agent Sandbox is off (Settings > Agent Sandbox)" }
+        guard isDesktopEnabled else { return "the sandbox desktop is off (Settings > Agent Sandbox > Desktop)" }
+        if let k = desktopKernelRefusal { return k }
+        switch desktopState {
+        case .ready: return nil
+        case .idle: return "the sandbox desktop is not set up yet — open the Desktop pane or wait for the install"
+        case .installing(let line): return "the sandbox desktop is still installing (\(line.isEmpty ? "starting" : line))"
+        case .failed(let why): return "the sandbox desktop failed to set up: \(why)"
+        }
     }
 
     /// Tray RAM readout: used (total − available) quantized to 16 MB so nearby
@@ -186,23 +250,38 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// image or the network mode, tears down any live guest so the next command
     /// re-provisions with the new configuration. `baseImage` is only overridden
     /// by tests/smoke — the app always runs the pinned image.
-    func configure(enabled: Bool, baseImage: String = ServerOptions.SandboxConfig.baseImage, network: Bool = ServerOptions.SandboxConfig().network) {
+    func configure(enabled: Bool, baseImage: String = ServerOptions.SandboxConfig.baseImage,
+                   network: Bool = ServerOptions.SandboxConfig().network,
+                   desktop: Bool = ServerOptions.SandboxConfig().desktop) {
         let effective = Self.resolveEnabled(requested: enabled)
         let trimmed = baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
         let imageChanged = trimmed != self.baseImage && !trimmed.isEmpty
         let networkChanged = network != self.networkEnabled
+        // A display is a boot-time device (no VZ graphics hotplug), so the
+        // desktop toggle is a guest-config change like the network one.
+        let desktopChanged = desktop != self.desktopEnabled
         let wasEnabled = self.enabled
         self.enabled = effective
         self.networkEnabled = network
+        self.desktopEnabled = desktop
         if !trimmed.isEmpty { self.baseImage = trimmed }
         lock.unlock()
-        if (!effective && wasEnabled) || (effective && (imageChanged || networkChanged)) {
+        let guestConfigChanged = imageChanged || networkChanged || desktopChanged
+        if (!effective && wasEnabled) || (effective && guestConfigChanged) {
             teardown()
         }
         if Self.mcpRestartNeeded(wasEnabled: wasEnabled, nowEnabled: effective,
-                                 guestConfigChanged: imageChanged || networkChanged) {
+                                 guestConfigChanged: guestConfigChanged) {
             NotificationCenter.default.post(name: Self.placementChanged, object: nil)
+        }
+        // Desktop just switched on: boot with the display and install in the
+        // background now, so the pane shows progress instead of a first
+        // `computer` call paying for a ~350 MB apt run.
+        if effective && desktop && (desktopChanged || !wasEnabled) {
+            Task.detached(priority: .utility) { [weak self] in
+                try? await self?.ensureDesktopProvisioned()
+            }
         }
     }
 
@@ -248,6 +327,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         sfwd?.stop()
         setGuestRunning(false)
         setSshPort(nil)
+        // The desktop dies with the guest; the marker makes the next check
+        // instant, so `.idle` costs one `cat`.
+        desktopKernelRefusal = nil
+        setDesktopState(.idle)
+        setDesktopVirtualMachine(nil)
         return g
     }
 
@@ -610,19 +694,34 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// VM risks a partial delete that a later boot mistakes for a valid
     /// cache. Guest detach is synchronous (same shape as `teardown`).
     func resetAllData(completion: (@Sendable () -> Void)? = nil) {
+        resetAllData(shutdownBlocking: { $0.shutdown() },
+                     detachVolume: { SandboxVolume.detach(root: $0) },
+                     deleteData: { try? FileManager.default.removeItem(at: $0) },
+                     completion: completion)
+    }
+
+    /// Seams (like `repullBaseImage`): the guest's blocking stop, then the
+    /// rootfs volume's detach, THEN the delete — a sparse bundle removed while
+    /// mounted leaves a dangling mount at `images` that the next boot treats
+    /// as an attached, empty volume.
+    func resetAllData(shutdownBlocking: @escaping (VzGuest) -> Void,
+                      detachVolume: @escaping (URL) -> Void,
+                      deleteData: @escaping (URL) -> Void,
+                      completion: (@Sendable () -> Void)? = nil) {
         let g = detachGuest()
         bootLock.lock()
         terminalCwd = "/workspace"
         bootLock.unlock()
         let dir = dataDirectory
         DispatchQueue.global(qos: .userInitiated).async {
-            g?.shutdown() // blocking, bounded — files closed before the delete
-            try? FileManager.default.removeItem(at: dir)
+            if let g { shutdownBlocking(g) } // blocking, bounded — files closed before the delete
+            detachVolume(dir)
+            deleteData(dir)
             DispatchQueue.main.async {
                 self.transcriptStore.reset()
                 self.transcriptStore.append(Entry(
                     source: .system, command: "",
-                    output: "sandbox reset — guest stopped; cached kernel, images (with all in-guest data) and the ssh identity deleted. Next use re-provisions from scratch.",
+                    output: "sandbox reset — guest stopped; cached kernel, the rootfs volume with its images (and all in-guest data) and the ssh identity deleted. Next use re-provisions from scratch.",
                     exitCode: 0, at: Date()))
                 completion?()
             }
@@ -658,6 +757,25 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         kernelData.range(of: Data("virtio_vsock".utf8)) != nil
     }
 
+    /// The sandbox desktop needs `CONFIG_DRM_VIRTIO_GPU` (`kernels-v5`): VZ's
+    /// graphics device is virtio-gpu, and without the driver there is no
+    /// /dev/dri/card0 for Xorg — a black pane with nothing to explain it. The
+    /// driver's name is a literal in the Image, same probe as the vsock gate.
+    static func kernelHasVirtioGpuSupport(_ kernelData: Data) -> Bool {
+        kernelData.range(of: Data("virtio_gpu".utf8)) != nil
+    }
+
+    /// Why the desktop cannot run on this kernel (nil = it can). Named, so a
+    /// cached pre-v5 kernel is a message with a fix, never a silent black
+    /// screen.
+    static func desktopKernelRefusal(kernelData: Data?) -> String? {
+        guard let kernelData else { return "the guest kernel could not be read" }
+        if !kernelHasVirtioGpuSupport(kernelData) {
+            return "the guest kernel predates \(kernelTag) (no virtio-gpu, so no display) — delete ~/.mlx-serve/sandbox to re-fetch"
+        }
+        return nil
+    }
+
     /// Where the `vz-agent` ELF lives, most-preferred first:
     ///  1. `VZ_AGENT_PATH` — dev override, and how the smoke test injects one.
     ///  2. `Contents/Resources/guest/vz-agent` — the shipped app bundle.
@@ -683,6 +801,51 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             return dev
         }
         return nil
+    }
+
+    /// The `computer` tool's guest half (`mlx-computer.py`), same lookup
+    /// ladder as the agent binary: env override, the bundle, then the repo
+    /// checkout for `swift run` builds.
+    static func computerScriptPath(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleResourceURL: URL? = Bundle.main.resourceURL,
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> String? {
+        let fm = FileManager.default
+        if let override = environment["MLX_COMPUTER_PATH"], fm.isReadableFile(atPath: override) {
+            return override
+        }
+        if let bundled = bundleResourceURL?.appendingPathComponent("guest/mlx-computer.py").path,
+           fm.isReadableFile(atPath: bundled) {
+            return bundled
+        }
+        if let dev = executableURL?
+            .deletingLastPathComponent()
+            .appendingPathComponent("../../../../app/Sources/MLXServe/Resources/guest/mlx-computer.py")
+            .standardizedFileURL.path,
+           fm.isReadableFile(atPath: dev) {
+            return dev
+        }
+        return nil
+    }
+
+    /// Where `mlx-computer.py` lands in the guest (on PATH, no extension).
+    static let computerGuestPath = "/usr/local/bin/mlx-computer"
+
+    /// Copy the script into the rootfs dir (host side of virtiofs). Runs
+    /// every desktop boot so a rebuilt app ships its current script; a stale
+    /// copy would be a silent behaviour skew between the tool schema and the
+    /// guest. Missing source = a named error, never a guest without the tool.
+    static func installComputerScript(rootfsDir: String, source: String?) throws {
+        guard let source else {
+            throw SandboxError(message: "mlx-computer.py is missing from the app bundle (reinstall or rebuild the app)")
+        }
+        let dest = rootfsDir + computerGuestPath
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: (dest as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? fm.removeItem(atPath: dest)
+        try fm.copyItem(atPath: source, toPath: dest)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dest)
     }
 
     /// vsock only when BOTH halves are present. Either missing → the legacy
@@ -1152,6 +1315,17 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         // guest either way — just a different source.
         let provisioner = makeProvisioner()
         let kernel = try provisioner.kernelPath()
+        // The images directory is a mounted case-sensitive volume (a Debian
+        // tree on the user's case-insensitive APFS is corrupted by the first
+        // case-colliding package — see SandboxVolume). Attached BEFORE the
+        // rootfs lookup, at the same path; a dev rootfs override never
+        // touches it.
+        if Self.rootfsOverride() == nil {
+            let outcome = SandboxVolume.ensureAttached(root: cacheDir)
+            if let line = SandboxVolume.transcriptLine(outcome) {
+                record(Entry(source: .system, command: "", output: line, exitCode: 0, at: Date()))
+            }
+        }
         let rootfs = try provisioner.rootfsDir(image: image)
         // `/workspace` is ALWAYS the Settings default (pi/hermes + chats on the
         // default live here); a chat's own folder is hot-mounted at /projects on
@@ -1190,6 +1364,19 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
         let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
         cfg.network = net
+        // Desktop: a virtio-gpu scanout + USB keyboard/pointer, and the
+        // launcher /.vz-init runs once /dev/dri/card0 exists. A pre-v5 kernel
+        // boots headless the way it always did; the refusal is kept by name
+        // for the tool and the pane (never a silent black screen).
+        let wantDesktop = { lock.lock(); defer { lock.unlock() }; return desktopEnabled }()
+        if wantDesktop {
+            cfg.display = SandboxDesktop.display
+            cfg.desktopStartScript = SandboxDesktop.startScript
+            desktopKernelRefusal = Self.desktopKernelRefusal(kernelData: kernelData)
+            try Self.installComputerScript(rootfsDir: rootfs, source: Self.computerScriptPath())
+        } else {
+            desktopKernelRefusal = nil
+        }
 
         // SSH: every networked boot gets dropbear (key-only) + a dedicated
         // loopback mirror — the embedded terminal, the copyable ssh command,
@@ -1286,9 +1473,116 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         currentSshPort = bootSshPort; rootfsPath = rootfs
         setGuestRunning(true)
         setSshPort(bootSshPort)
+        setDesktopVirtualMachine(cfg.display != nil ? g.virtualMachine : nil)
         record(Entry(source: .system, command: "", output: "sandbox ready — \(image), sharing \(root) at /workspace", exitCode: 0, at: Date()))
         return (g, root)
         #endif
+    }
+
+    // MARK: Desktop provisioning (computer use)
+
+    /// Make the sandbox desktop usable: boot the guest with a display (if it
+    /// isn't up), apt-install XFCE + the `mlx-computer` deps on first use
+    /// (version-marked in the writable rootfs, so a second call is one `cat`
+    /// and a base-image re-pull re-installs), then start X in place. Publishes
+    /// `desktopSetupState` throughout; throws with the same named reason it
+    /// publishes. One run at a time — concurrent callers wait on the first.
+    func ensureDesktopProvisioned() async throws {
+        guard isDesktopEnabled else {
+            throw SandboxError(message: "the sandbox desktop is off (Settings > Agent Sandbox > Desktop)")
+        }
+        // Coalesce: a second caller (the tool while the pane's install runs)
+        // polls the published state instead of starting a second apt.
+        lock.lock()
+        let alreadyRunning = desktopProvisioning
+        if !alreadyRunning { desktopProvisioning = true }
+        lock.unlock()
+        if alreadyRunning {
+            while true {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                let running = { lock.lock(); defer { lock.unlock() }; return desktopProvisioning }()
+                if !running { break }
+            }
+            if let why = desktopRefusal { throw SandboxError(message: why) }
+            return
+        }
+        defer { lock.lock(); desktopProvisioning = false; lock.unlock() }
+        let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    try self.provisionDesktopBlocking(image: image)
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Off the main thread. Every failure lands in `desktopSetupState` by name.
+    private func provisionDesktopBlocking(image: String) throws {
+        func fail(_ why: String) -> SandboxError {
+            setDesktopState(.failed(why))
+            record(Entry(source: .system, command: "", output: "desktop: \(why)", exitCode: 1, at: Date()))
+            return SandboxError(message: why)
+        }
+        let (g, _) = try ensureBooted(image: image, workingDirectory: nil)
+        guard g.display != nil else {
+            throw fail("the guest booted without a display — re-enable the desktop to reboot it")
+        }
+        func run(_ command: String, timeout: TimeInterval = 30) throws -> String {
+            try g.exec(Self.wrap(command: command, guestCwd: "/"), timeout: timeout).output
+        }
+        // Already installed (marker matches): start X and report ready.
+        if SandboxDesktop.isProvisioned(checkOutput: try run(SandboxDesktop.checkProvisionedCommand)) {
+            if let k = desktopKernelRefusal { throw fail(k) }
+            _ = try run(SandboxDesktop.startCommand)
+            setDesktopState(.ready)
+            return
+        }
+        let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
+        if let why = SandboxDesktop.installRefusal(networkEnabled: net, kernelRefusal: desktopKernelRefusal) {
+            throw fail(why)
+        }
+        // The installer is a generated file the host drops into the rootfs
+        // dir (virtiofs: visible in the live guest at once), then detaches
+        // in the guest and polls — there is no streaming exec.
+        guard let rootfs = { bootLock.lock(); defer { bootLock.unlock() }; return rootfsPath }() else {
+            throw fail("the guest rootfs path is unknown")
+        }
+        do {
+            let path = rootfs + SandboxDesktop.provisionGuestPath
+            try SandboxDesktop.provisionScript.write(toFile: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        } catch {
+            throw fail("could not write the desktop installer into the rootfs: \(error.localizedDescription)")
+        }
+        setDesktopState(.installing("starting apt-get (about 350 MB)"))
+        record(Entry(source: .system, command: "", output: "desktop: installing XFCE + tools with apt-get (first enable only)", exitCode: 0, at: Date()))
+        _ = try run(SandboxDesktop.launchProvisionCommand)
+        let deadline = Date().addingTimeInterval(900)
+        var lastLine = ""
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 2)
+            if g.isFinished { throw fail("the guest exited during the desktop install") }
+            switch SandboxDesktop.pollOutcome(pollOutput: try run(SandboxDesktop.pollCommand)) {
+            case .installing(let line):
+                if !line.isEmpty, line != lastLine {
+                    lastLine = line
+                    setDesktopState(.installing(line))
+                }
+            case .done(let rc):
+                guard rc == 0 else {
+                    throw fail("apt-get exited with code \(rc): \(lastLine) (full log: \(SandboxDesktop.installLogPath) in the guest)")
+                }
+                _ = try run(SandboxDesktop.startCommand)
+                setDesktopState(.ready)
+                record(Entry(source: .system, command: "", output: "desktop: ready on :0 (\(SandboxDesktop.display.width)x\(SandboxDesktop.display.height))", exitCode: 0, at: Date()))
+                return
+            }
+        }
+        throw fail("the desktop install did not finish within 15 minutes (last: \(lastLine))")
     }
 
     // MARK: Provisioning
@@ -1316,7 +1610,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     ///   (M4 has SME, no real SVE), and capability probes SIGILL'd — hermes
     ///   died on launch importing python-cryptography (OpenSSL's armcap
     ///   probe); Go binaries are the same class.
-    static let kernelTag = "kernels-v4"
+    ///
+    /// `kernels-v5` adds the display + input the sandbox desktop (computer
+    /// use) needs: virtio-gpu (DRM, fbdev emulation) and USB HID over xHCI
+    /// (VZ's keyboard + screen-coordinate pointing device), plus evdev. A
+    /// kernels-v4 cache still boots headless; the desktop refuses it by name
+    /// (`desktopKernelRefusal`).
+    static let kernelTag = "kernels-v5"
     static let kernelURL = URL(string:
         "https://github.com/ddalcu/mlx-serve/releases/download/\(kernelTag)/kernel-arm64.gz")!
 
@@ -1380,11 +1680,15 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     /// Pull (once) + cache the base image rootfs for the guest arch. Dev
     /// overrides: SANDBOX_ROOTFS (or legacy CONTAIN_ROOTFS).
-    private func provisionRootfs(image: String) throws -> String {
+    /// Dev override for the rootfs (SANDBOX_ROOTFS, legacy CONTAIN_ROOTFS).
+    static func rootfsOverride() -> String? {
         let env = ProcessInfo.processInfo.environment
-        if let override = env["SANDBOX_ROOTFS"] ?? env["CONTAIN_ROOTFS"], !override.isEmpty {
-            return override
-        }
+        if let override = env["SANDBOX_ROOTFS"] ?? env["CONTAIN_ROOTFS"], !override.isEmpty { return override }
+        return nil
+    }
+
+    private func provisionRootfs(image: String) throws -> String {
+        if let override = Self.rootfsOverride() { return override }
         let fm = FileManager.default
         let dir = cacheDir.appendingPathComponent("images/\(Self.imageDirName(image))", isDirectory: true)
         let marker = dir.appendingPathComponent(Self.archMarkerName())

@@ -214,6 +214,17 @@ enum AgentEngine {
                     "tool_call_id": callId,
                     "content": String(msg.content.prefix(limit)),
                 ])
+                // A screenshot (browse / computer) is VISION INPUT, and the
+                // server reads images from the last USER message only — a
+                // tool message never carries one. When the window ENDS on such
+                // a result, the nudge user message that follows every tool
+                // result (see the loop's "Continue." append) carries the
+                // picture instead. Older screenshots are not resent.
+                if msg.id == window.last?.id, let multimodal = buildMultimodalContent,
+                   let imgs = msg.images, !imgs.isEmpty {
+                    history.append(["role": "user",
+                                    "content": multimodal(Self.screenshotNudge, imgs)])
+                }
                 continue
             }
             if msg.role == .system { continue }
@@ -282,6 +293,13 @@ enum AgentEngine {
         return history
     }
 
+    /// The nudge after a tool result (some models cannot generate after a
+    /// bare tool message). ONE text, shared by every agent loop.
+    static let continueNudge = "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."
+    /// The same nudge when the last tool result was a screenshot the model
+    /// must look at.
+    static let screenshotNudge = "The screenshot from your last tool call is attached to this message. " + continueNudge
+
     // MARK: - Tool Validation
 
     /// Check which required params are missing for a tool call.
@@ -349,10 +367,35 @@ enum AgentEngine {
         return "{}"
     }
 
+    /// The third `shell {}` in one turn gets a LITERAL call with the user's
+    /// own task words in it (a schema example did not land twice): the
+    /// recipe for an install task when the task says so, else a search.
+    static func emptyArgsNudge(task: String) -> String {
+        let words = task.split(whereSeparator: { $0.isWhitespace || $0.isPunctuation })
+            .map { $0.lowercased() }
+        let stop: Set<String> = ["install", "and", "the", "a", "an", "then", "start", "run", "open", "it",
+                                 "please", "can", "you", "make", "me", "in", "on", "with", "to", "of",
+                                 "what", "is", "how", "do", "for", "my"]
+        let subject = words.filter { !stop.contains($0) && ($0.count > 1 || $0.first!.isNumber) }
+            .prefix(3).joined(separator: " ")
+        let cmd: String
+        if words.contains("install") || words.contains("apt") {
+            cmd = "apt-get install -y \(subject.isEmpty ? "<package>" : subject.replacingOccurrences(of: " ", with: "-"))"
+        } else if subject.isEmpty {
+            cmd = "ls -la"
+        } else {
+            cmd = "apt-cache search \(subject)"
+        }
+        let json = "{\"command\": \"\(cmd.replacingOccurrences(of: "\"", with: "\\\""))\"}"
+        return "Error: shell was called with NO command again. The arguments must be a JSON object with a \"command\" string. For your task, call shell with exactly these arguments: \(json)"
+    }
+
     // MARK: - Tool Repetition
 
     /// Write/control tools are never warned or blocked — they make forward progress.
-    static let exemptTools: Set<String> = ["writeFile", "editFile", "shell", "cwd"]
+    /// `computer` too: its observe-after-every-action loop is the same call
+    /// over and over by design, and a blocked observe leaves the agent blind.
+    static let exemptTools: Set<String> = ["writeFile", "editFile", "shell", "cwd", "computer"]
 
     /// Tracks tool repetition across agent loop iterations.
     ///
@@ -367,6 +410,13 @@ enum AgentEngine {
         var recentKeys: [String] = []       // sliding window of "name:arg" keys
         var warnings: Set<String> = []      // keys that have been warned
         var blockedUntil: [String: Int] = [:] // tool key → iteration when block expires
+        /// `shell {}` calls this turn (a 3B sends the tool with no command,
+        /// three, four times in a row). Past `emptyShellCap` the error stops
+        /// quoting the schema and shows a literal call built from the task.
+        var emptyShellCalls = 0
+        /// The user's task for this turn, for that literal example.
+        var task = ""
+        static let emptyShellCap = 3
 
         /// Record tool calls from this round into the sliding window.
         func track(toolCalls: [APIClient.ToolCall]) {
@@ -509,6 +559,33 @@ enum AgentEngine {
         return name
     }
 
+    /// The built-in tool a clipped or misspelled name most likely meant: a
+    /// prefix of exactly one tool, or within edit distance 2 of one (names of
+    /// 4+ characters only). nil when nothing is close — the caller keeps the
+    /// plain "Unknown tool" answer.
+    static func nearestToolName(_ raw: String) -> String? {
+        let name = raw.lowercased()
+        guard name.count >= 4 else { return nil }
+        let kinds = AgentToolKind.allCases.map(\.rawValue)
+        let prefixed = kinds.filter { $0.lowercased().hasPrefix(name) }
+        if prefixed.count == 1 { return prefixed[0] }
+        func distance(_ a: String, _ b: String) -> Int {
+            let a = Array(a), b = Array(b)
+            var prev = Array(0...b.count)
+            for i in 1...max(a.count, 1) where i <= a.count {
+                var cur = [i]
+                for j in 1...max(b.count, 1) where j <= b.count {
+                    cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)))
+                }
+                prev = cur
+            }
+            return prev[b.count]
+        }
+        let scored = kinds.map { ($0, distance(name, $0.lowercased())) }.filter { $0.1 <= 2 }.sorted { $0.1 < $1.1 }
+        if let best = scored.first, scored.filter({ $0.1 == best.1 }).count == 1 { return best.0 }
+        return nil
+    }
+
     /// Capability gate: nil when the call may proceed, a named refusal when the
     /// tool is outside the agent's allowed set.
     ///
@@ -628,6 +705,7 @@ enum AgentEngine {
             .browse: BrowseHandler(),
             .webSearch: WebSearchHandler(),
             .saveMemory: SaveMemoryHandler(),
+            .computer: ComputerHandler(),
         ]
     }
 
@@ -722,7 +800,7 @@ enum AgentEngine {
             output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory,
                                               agentMemory: agentMemory, documentIndex: documentIndex,
                                               processRegistry: processRegistry, sessionId: sessionId,
-                                              handleBox: handleBox)
+                                              handleBox: handleBox, repetition: repetition)
         }
 
         // Apply warning if near repetition threshold (raw name — see above).
@@ -742,7 +820,8 @@ enum AgentEngine {
         documentIndex: DocumentIndex? = nil,
         processRegistry: ProcessRegistry? = nil,
         sessionId: UUID? = nil,
-        handleBox: ProcessHandleBox? = nil
+        handleBox: ProcessHandleBox? = nil,
+        repetition: RepetitionTracker? = nil
     ) async -> String {
         let tool = AgentToolKind(rawValue: name)
 
@@ -792,6 +871,12 @@ enum AgentEngine {
                 // right field instead of falsely claiming its output was cut off.
                 return "Error: \(name) was called with no text in the `content` parameter, so nothing was written. Put the full file body in `content` — `append` is only a \"true\"/\"false\" flag and must never hold the text. For a long file, write the first part, then call again with `append`:\"true\" for each remaining chunk. Example: {\"path\": \"jfk.txt\", \"content\": \"<the text>\", \"append\": \"true\"}"
             }
+            if name == "shell", missing.contains("command"), let repetition {
+                repetition.emptyShellCalls += 1
+                if repetition.emptyShellCalls >= RepetitionTracker.emptyShellCap {
+                    return emptyArgsNudge(task: repetition.task)
+                }
+            }
             return "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
         }
 
@@ -837,6 +922,11 @@ enum AgentEngine {
         }
 
         guard let effectiveTool, let handler = toolHandlers[effectiveTool] else {
+            // A 3B model clips names (`compute` for `computer`): name the
+            // nearest real tool and its example, so the next call lands.
+            if let near = nearestToolName(name) {
+                return "Error: Unknown tool '\(name)'. Did you mean '\(near)'? Call it exactly as `\(near)`. Example: \(toolExample(for: near))"
+            }
             return "Error: Unknown tool '\(name)'"
         }
         do {

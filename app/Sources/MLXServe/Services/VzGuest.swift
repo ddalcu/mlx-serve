@@ -249,6 +249,22 @@ final class VzGuest {
         /// Host path to the `vz-agent` ELF, copied into the rootfs before boot.
         /// Required by `.vsock`; ignored by `.legacyConsole`.
         var agentBinaryPath: String? = nil
+        /// A framebuffer + keyboard + pointer for the sandbox desktop (computer
+        /// use). nil = today's headless VM, byte for byte. VZ has no graphics
+        /// hotplug, so flipping this means a reboot.
+        var display: DisplaySpec? = nil
+        /// The `/.vz-desktop-start` script body, written into the rootfs before
+        /// boot when `display` is set (`SandboxDesktop.startScript`). The init
+        /// script runs it in the background once /dev/dri/card0 exists.
+        var desktopStartScript: String? = nil
+    }
+
+    /// One virtio-gpu scanout. 1280x800 is the size the `computer` tool's
+    /// prompt names and what a 9B model's screenshot budget can afford.
+    struct DisplaySpec: Equatable {
+        var width: Int = 1280
+        var height: Int = 800
+        var pixelsPerInch: Int = 80
     }
 
     struct ExecResult {
@@ -292,6 +308,30 @@ final class VzGuest {
     /// Where the guest agent is injected, alongside `/.vz-init`. Host-injected
     /// rather than baked into the image, so ANY base image works.
     static let agentGuestPath = "/.vz-agent"
+    /// The desktop launcher, injected beside `/.vz-init` when the VM has a
+    /// display. Separate so init stays small and the desktop can be started in
+    /// place on a live guest right after provisioning (no reboot).
+    static let desktopStartGuestPath = "/.vz-desktop-start"
+
+    /// Attach the display devices `spec` describes (nothing for nil). Pure over
+    /// the configuration object, so the device list is unit-testable without a
+    /// boot. Keyboard + pointer are USB HID: that is what VZ offers a Linux
+    /// guest and what kernels-v5 compiles in (xHCI + usbhid + evdev).
+    static func applyDisplay(_ spec: DisplaySpec?, to vmConfig: VZVirtualMachineConfiguration) {
+        guard let spec else { return }
+        let gpu = VZVirtioGraphicsDeviceConfiguration()
+        gpu.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: spec.width,
+                                                            heightInPixels: spec.height)]
+        vmConfig.graphicsDevices = [gpu]
+        vmConfig.keyboards = [VZUSBKeyboardConfiguration()]
+        vmConfig.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+    }
+
+    /// Human-readable twin of `applyDisplay` for logs and tests.
+    static func displayDeviceSummary(for config: Config) -> [String] {
+        guard let d = config.display else { return [] }
+        return ["graphics virtio-gpu \(d.width)x\(d.height)", "keyboard usb", "pointing usb-screen-coordinate"]
+    }
 
     /// The guest console device the monitor loop writes its report to.
     ///
@@ -342,7 +382,7 @@ final class VzGuest {
     static func buildInitScript(config: Config) -> String {
         var s = """
         #!/bin/sh
-        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games HOME=/root TERM=linux
         mkdir -p /proc /sys /dev \(guestProjectsPath)\(config.workspacePath != nil ? " \(config.guestWorkspacePath)" : "") 2>/dev/null
         mount -t proc proc /proc 2>/dev/null
         mount -t sysfs sysfs /sys 2>/dev/null
@@ -352,6 +392,10 @@ final class VzGuest {
         if config.workspacePath != nil {
             s += "mount -t virtiofs \(workspaceTag) \(config.guestWorkspacePath) 2>/dev/null\n"
         }
+        // Everything in the guest runs as root, and small models still type
+        // `sudo apt-get …` (live 2026-09-05: "sudo: not found" twice, then the
+        // task died). A shim that just runs the command keeps them moving.
+        s += "[ -x /usr/bin/sudo ] || { printf '#!/bin/sh\\nexec \"$@\"\\n' > /usr/local/bin/sudo 2>/dev/null; chmod 755 /usr/local/bin/sudo 2>/dev/null; }\n"
         // The `projects` device is always configured (empty until a chat folder
         // is hot-mounted), so its mount point is always established at boot —
         // `setProjectShares` then makes subdirectories appear live under it.
@@ -407,6 +451,34 @@ final class VzGuest {
         s += "    printf '=EOS=\\n'\n"
         s += "    sleep 1\n"
         s += "  done ) >\(monitor) 2>/dev/null &\n\n"
+        if config.display != nil {
+            // Desktop (computer use): X needs its socket dir, GTK apps want
+            // /dev/shm, dbus wants /run. Start ONLY when the kernel exposed a
+            // DRM node (kernels-v5) and the launcher was injected; it checks
+            // for Xorg itself, so an unprovisioned rootfs boots headless with
+            // one log line, never a failed boot. Backgrounded and logged so
+            // Xorg's chatter never reaches the console or blocks the agent.
+            // /run AND /tmp on tmpfs: dbus, at-spi, X and LibreOffice bind unix
+            // sockets there, and the virtiofs rootfs refuses socket binds
+            // (EOPNOTSUPP, live 2026-09-05 — the a11y bus silently vanished on
+            // the second boot; 2026-09-06 — LibreOffice's stale
+            // /tmp/OSL_PIPE_* from the previous boot made every later
+            // `soffice` exit 1 with no window and no message). A tmpfs /tmp
+            // is also empty per boot, which is what /tmp means.
+            s += """
+            mkdir -p /dev/shm /run /tmp /var/log 2>/dev/null
+            mountpoint -q /run 2>/dev/null || mount -t tmpfs -o mode=755 tmpfs /run 2>/dev/null
+            mountpoint -q /tmp 2>/dev/null || mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null
+            mkdir -p /tmp/.X11-unix 2>/dev/null
+            mkdir -p /run/dbus /run/user/0 2>/dev/null
+            chmod 1777 /tmp/.X11-unix 2>/dev/null
+            mount -t tmpfs tmpfs /dev/shm 2>/dev/null
+            if [ -e /dev/dri/card0 ] && [ -x \(desktopStartGuestPath) ]; then
+              \(desktopStartGuestPath) >/var/log/mlx-desktop.log 2>&1 &
+            fi
+
+            """
+        }
         for entry in config.imageEnv {
             guard let eq = entry.firstIndex(of: "="), eq != entry.startIndex else { continue }
             let key = String(entry[..<eq])
@@ -445,6 +517,12 @@ final class VzGuest {
     private let shellConsole = ConsoleBuffer()
     private let vmQueue = DispatchQueue(label: "mlxserve.vzguest")
     private var vm: VZVirtualMachine?
+    /// The live machine for `VZVirtualMachineView` (the Desktop pane). nil
+    /// until `boot`. The view must be created and attached on the main thread;
+    /// the machine itself keeps operating on `vmQueue`.
+    var virtualMachine: VZVirtualMachine? { vm }
+    /// The display the guest booted with (nil = headless).
+    var display: DisplaySpec? { config.display }
     /// nil until `boot`; nil forever on `.legacyConsole`.
     private var socketDevice: VZVirtioSocketDevice?
     /// The config `boot` ran with. `.legacyConsole` before boot so a stray
@@ -561,6 +639,19 @@ final class VzGuest {
             }
         }
 
+        // 1c. The desktop launcher, when the VM has a display. Written every
+        // boot (it is generated, like /.vz-init) so a provisioned rootfs and a
+        // fresh one get the same launcher; it no-ops until Xorg is installed.
+        if cfg.display != nil, let body = cfg.desktopStartScript {
+            let path = cfg.rootfsDir + Self.desktopStartGuestPath
+            do {
+                try body.write(toFile: path, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+            } catch {
+                throw GuestError.bootFailed("could not write \(path): \(error)")
+            }
+        }
+
         // 2. Assemble the VM.
         let vmConfig = VZVirtualMachineConfiguration()
         vmConfig.cpuCount = max(VZVirtualMachineConfiguration.minimumAllowedCPUCount,
@@ -614,6 +705,9 @@ final class VzGuest {
 
         vmConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         vmConfig.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+        // Desktop (computer use): virtio-gpu scanout + USB keyboard/pointer.
+        // Nothing when `display` is nil — the headless VM is unchanged.
+        Self.applyDisplay(cfg.display, to: vmConfig)
         // NAT network — only when the user left sandbox networking on. With it
         // off there is NO network device at all: the guest is fully isolated.
         if cfg.network {

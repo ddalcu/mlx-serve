@@ -15,7 +15,7 @@
 #   scripts/fetch-guest-rootfs.sh                     — KERNEL_TAG + KERNEL_SHA256 (MAS bundle staging)
 #
 # Release: create a GitHub release on ddalcu/mlx-serve named after the tag the
-# consumers pin (e.g. kernels-v4) and upload artifacts/release/*.
+# consumers pin (e.g. kernels-v5) and upload artifacts/release/*.
 #
 # Patches in patches/*.patch are applied right after source extraction; a
 # cached tree under .kbuild/ is assumed already patched, so after adding or
@@ -95,10 +95,12 @@ m --enable  NF_TABLES --enable NF_TABLES_INET --enable NFT_CT --enable NFT_NAT -
 m --disable NETFILTER_XT_TARGET_TCPMSS   # the one xt object whose O= Kbuild rule breaks
 m --enable  SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE
 m --enable  BLK_DEV_INITRD
-# Trim defconfig hard for a headless virtio guest.
-for o in ACPI DRM SOUND MEDIA_SUPPORT WLAN WIRELESS USB_SUPPORT INFINIBAND \
+# Trim defconfig hard for a virtio guest. DRM, USB and HID stay OUT of this
+# list since kernels-v5: the sandbox desktop (computer use) needs a display
+# and input, re-enabled below.
+for o in ACPI SOUND MEDIA_SUPPORT WLAN WIRELESS INFINIBAND \
          SCSI ATA NVME_CORE MMC MTD MD BT NFC ETHERNET \
-         HID IIO STAGING COMEDI NEW_LEDS HWMON THERMAL WATCHDOG POWER_SUPPLY \
+         IIO STAGING COMEDI NEW_LEDS HWMON THERMAL WATCHDOG POWER_SUPPLY \
          SND REGULATOR MEDIA_SUPPORT_FILTER CRYPTO_HW KEXEC CRASH_DUMP PROFILING \
          XFS_FS BTRFS_FS F2FS_FS GFS2_FS OCFS2_FS NILFS2_FS JFS_FS REISERFS_FS \
          NFS_FS NFSD CIFS CEPH_FS FAT_FS NTFS_FS HFS_FS HFSPLUS_FS UBIFS_FS \
@@ -106,8 +108,30 @@ for o in ACPI DRM SOUND MEDIA_SUPPORT WLAN WIRELESS USB_SUPPORT INFINIBAND \
 # Re-assert the must-haves disabling a parent menu may have dropped.
 m --enable EXT4_FS --enable OVERLAY_FS --enable TMPFS
 m --enable NETDEVICES --enable VIRTIO_NET
+# kernels-v5: display + input for the sandbox desktop (computer use). VZ's
+# graphics device is virtio-gpu (one scanout, /dev/dri/card0, Xorg's
+# modesetting driver); its keyboard and pointing devices are USB HID over
+# xHCI (VZUSBKeyboardConfiguration + VZUSBScreenCoordinatePointingDevice).
+# fbdev emulation keeps /dev/fb0 as the fallback for xserver-xorg-video-fbdev.
+# Only the drivers named here; every other DRM/USB/HID driver stays off.
+m --enable DRM --enable DRM_VIRTIO_GPU --enable DRM_VIRTIO_GPU_KMS --enable DRM_FBDEV_EMULATION
+m --enable FB --enable FRAMEBUFFER_CONSOLE
+m --enable INPUT --enable INPUT_EVDEV --enable VIRTIO_INPUT
+m --enable USB_SUPPORT --enable USB --enable USB_PCI --enable USB_XHCI_HCD --enable USB_XHCI_PCI --enable USB_XHCI_PLATFORM
+m --enable HID_SUPPORT --enable HID --enable HID_GENERIC --enable USB_HID
+# Re-enabling DRM/USB/HID re-exposes every driver defconfig had under them
+# (nouveau, amdgpu, panfrost, a hundred USB gadgets), and with MODULES off
+# they would all be built IN. Trim them explicitly: everything under the
+# three menus goes off except the allowlist; olddefconfig re-selects the
+# helpers virtio-gpu / xHCI / usbhid depend on (DRM_KMS_HELPER, USB_COMMON…).
+make ARCH=arm64 O=build-arm64 olddefconfig   # materialize the menus' defaults first, then trim
+KEEP_RE='^CONFIG_(DRM|DRM_VIRTIO_GPU|DRM_VIRTIO_GPU_KMS|DRM_FBDEV_EMULATION|USB_SUPPORT|USB|USB_PCI|USB_XHCI_HCD|USB_XHCI_PCI|USB_XHCI_PLATFORM|USB_HID|HID_SUPPORT|HID|HID_GENERIC)='
+for sym in $(grep -E '^CONFIG_(DRM|USB|HID)_?[A-Z0-9_]*=(y|m)$' build-arm64/.config | grep -Ev "$KEEP_RE" | sed 's/^CONFIG_//; s/=.*//'); do
+  m --disable "$sym"
+done
 make ARCH=arm64 O=build-arm64 olddefconfig
-for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS CONFIG_OVERLAY_FS CONFIG_USER_NS CONFIG_MEMCG CONFIG_NF_TABLES CONFIG_VSOCKETS CONFIG_VIRTIO_VSOCKETS; do
+for s in CONFIG_FUSE_FS CONFIG_VIRTIO_FS CONFIG_OVERLAY_FS CONFIG_USER_NS CONFIG_MEMCG CONFIG_NF_TABLES CONFIG_VSOCKETS CONFIG_VIRTIO_VSOCKETS \
+         CONFIG_DRM_VIRTIO_GPU CONFIG_DRM_VIRTIO_GPU_KMS CONFIG_INPUT_EVDEV CONFIG_USB_XHCI_HCD CONFIG_USB_XHCI_PCI CONFIG_USB_HID CONFIG_HID_GENERIC; do
   grep -q "^$s=y" build-arm64/.config || { echo "ERROR: $s not =y (olddefconfig dropped it)"; exit 1; }
 done
 make ARCH=arm64 O=build-arm64 -j"$J" Image
@@ -119,7 +143,8 @@ INNER
 [ -f "$OUT/release/kernel-arm64.gz" ] || { echo "BUILD FAILED: release asset not produced"; exit 1; }
 
 # The app's cache-validation byte-gates must hold on the shipped kernel.
-for s in virtiofs virtio_vsock; do
+# `virtio_gpu` is the desktop gate (kernelHasVirtioGpuSupport, kernels-v5).
+for s in virtiofs virtio_vsock virtio_gpu; do
   LC_ALL=C grep -qa "$s" "$OUT/kernel-arm64" || { echo "ERROR: '$s' not found in Image — AgentSandbox's kernelHas*Support gate would reject it"; exit 1; }
 done
 

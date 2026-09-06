@@ -149,6 +149,16 @@ enum SandboxSmoke {
                 // Under real provisioning, verify the freshly-pulled image + config:
                 // image ENV reaches the guest, and the agent toolchain is present.
                 if realProvision {
+                    // The rootfs sits on the case-sensitive volume (SandboxVolume):
+                    // `images` is a mountpoint that tells `a` from `A`. A loose
+                    // directory here means the attach fell back — the transcript
+                    // says why.
+                    let images = AgentSandbox.shared.dataDirectory.appendingPathComponent("images", isDirectory: true)
+                    if SandboxVolume.isMountpoint(images.path), SandboxVolume.isCaseSensitive(images) {
+                        log("[smoke]   ✓ rootfs volume mounted at images/ and case-sensitive")
+                    } else {
+                        log("[smoke]   ✗ images/ is not a mounted case-sensitive volume (mount=\(SandboxVolume.isMountpoint(images.path)))"); ok = false
+                    }
                     func probe(_ label: String, _ cmd: String, _ needle: String) {
                         let out = syncAwait {
                             (try? await handler.execute(parameters: ["command": cmd], workingDirectory: share)) ?? "<threw>"
@@ -317,6 +327,111 @@ enum SandboxSmoke {
                 }
                 if let memText { log("[smoke]   ✓ guest RAM readout: \(memText)") }
                 else { log("[smoke]   ✗ guest RAM readout never arrived"); ok = false }
+
+                // Phase 6 (opt-in, SANDBOX_DESKTOP_SMOKE=1): the sandbox desktop.
+                // Reboots the guest WITH a display (a graphics device is a
+                // boot-time device), apt-installs XFCE on first run (slow,
+                // network-bound — hence opt-in), then drives it through the
+                // real ComputerHandler: observe lists the xfce panel, a click
+                // on the Applications menu changes the focused window.
+                if env["SANDBOX_DESKTOP_SMOKE"] == "1" {
+                    log("[smoke] phase 6: sandbox desktop (computer use)…")
+                    AgentSandbox.shared.configure(enabled: true, baseImage: image, network: true, desktop: true)
+                    let provisioned = syncAwait { () -> String? in
+                        do { try await AgentSandbox.shared.ensureDesktopProvisioned(); return nil }
+                        catch { return "\(error)" }
+                    }
+                    if let why = provisioned {
+                        log("[smoke]   ✗ desktop provisioning failed: \(why)"); ok = false
+                    } else {
+                        log("[smoke]   ✓ desktop provisioned + started (\(AgentSandbox.shared.desktopState))")
+                        var h = ComputerHandler()
+                        h.modelHasVision = { true }
+                        // X + the panel take a few seconds after the start.
+                        var observed = ""
+                        let deadline = Date().addingTimeInterval(60)
+                        while Date() < deadline {
+                            observed = syncAwait {
+                                (try? await h.execute(parameters: ["action": "observe", "window": "all"],
+                                                      workingDirectory: share)) ?? "<threw>"
+                            }
+                            if observed.contains("\"Applications\"") { break }
+                            Thread.sleep(forTimeInterval: 3)
+                        }
+                        log("[smoke]   observe:\n\(observed.prefix(1200))")
+                        // The panel frame carries no name; its Applications
+                        // menu button is the element every XFCE desktop has.
+                        if observed.contains("\"Applications\"") {
+                            log("[smoke]   ✓ observe lists the xfce panel's Applications button")
+                        } else {
+                            log("[smoke]   ✗ observe never listed the xfce panel (see /var/log/mlx-desktop.log in the guest)"); ok = false
+                        }
+                        // Click it: the menu opens, and the observe that rides
+                        // the click lists its menu items.
+                        let clickId = observed.split(separator: "\n")
+                            .first { $0.lowercased().contains("applications") }
+                            .flatMap { line -> String? in
+                                guard let open = line.firstIndex(of: "["), let close = line.firstIndex(of: "]") else { return nil }
+                                return String(line[line.index(after: open)..<close])
+                            }
+                        if let clickId {
+                            let after = syncAwait {
+                                (try? await h.execute(parameters: ["action": "click", "id": clickId],
+                                                      workingDirectory: share)) ?? "<threw>"
+                            }
+                            log("[smoke]   after click: \(after.prefix(300))")
+                            if after.contains("clicked") && after.contains("menu item") {
+                                log("[smoke]   ✓ click on Applications opened the menu (menu items observed)")
+                            } else {
+                                log("[smoke]   ✗ click did not open the Applications menu"); ok = false
+                            }
+                            _ = syncAwait { try? await h.execute(parameters: ["action": "key", "keys": "Escape"], workingDirectory: share) }
+                        } else {
+                            log("[smoke]   ✗ no Applications menu element in observe"); ok = false
+                        }
+                        let shot = syncAwait {
+                            (try? await h.execute(parameters: ["action": "screenshot"], workingDirectory: share)) ?? "<threw>"
+                        }
+                        if shot.contains(AgentMediaInline.jpegDataURIMarker) || shot.contains("data:image/png;base64,") {
+                            log("[smoke]   ✓ screenshot ships a data URI (\(shot.count) bytes)")
+                        } else {
+                            log("[smoke]   ✗ screenshot: \(shot.prefix(300))"); ok = false
+                        }
+                        // The high-level actions a small model lives on. Each is
+                        // one call: navigate + read a page, research N sites, open
+                        // a terminal and type into it (the typed text shows in
+                        // the terminal's a11y text).
+                        func act(_ p: [String: String]) -> String {
+                            syncAwait { (try? await h.execute(parameters: p, workingDirectory: share)) ?? "<threw>" }
+                        }
+                        let nav = act(["action": "navigate", "url": "https://www.wikipedia.org"])
+                        if nav.contains("navigated to") && nav.contains("Wikipedia") {
+                            log("[smoke]   ✓ navigate wikipedia.org reads the page (\(nav.count) chars)")
+                        } else {
+                            log("[smoke]   ✗ navigate/read: \(nav.prefix(400))"); ok = false
+                        }
+                        let research = act(["action": "research", "query": "raspberry pi 5", "sites": "2"])
+                        let sections = research.components(separatedBy: "\n## ").count - 1
+                        if sections == 2 {
+                            log("[smoke]   ✓ research visited 2 sites and returned 2 sections")
+                        } else {
+                            log("[smoke]   ✗ research returned \(sections) sections: \(research.prefix(500))"); ok = false
+                        }
+                        let opened = act(["action": "open", "command": "xfce4-terminal"])
+                        if opened.contains("launched") && !opened.contains("no window yet") {
+                            _ = act(["action": "type", "text": "echo SMOKE_TYPED_$((5*5))"])
+                            let typed = act(["action": "key", "keys": "Return"])
+                            if typed.contains("SMOKE_TYPED_25") {
+                                log("[smoke]   ✓ open xfce4-terminal + type + key: the terminal shows the command's output")
+                            } else {
+                                log("[smoke]   ✗ typed text not in the terminal: \(typed.prefix(400))"); ok = false
+                            }
+                            _ = act(["action": "key", "keys": "ctrl+shift+q"])
+                        } else {
+                            log("[smoke]   ✗ open xfce4-terminal: \(opened.prefix(300))"); ok = false
+                        }
+                    }
+                }
 
                 AgentSandbox.shared.teardown()
             }

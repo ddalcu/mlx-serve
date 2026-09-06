@@ -238,7 +238,8 @@ class AppState: ObservableObject {
             // Push the agent-sandbox setting to the shared manager so the next
             // shell command routes to the guest (or the host) accordingly.
             AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                          network: serverOptions.sandbox.network)
+                                          network: serverOptions.sandbox.network,
+                                          desktop: serverOptions.sandbox.desktop)
             // Turning LAN sharing/discovery ON means "the server runs" — boot
             // it (headless if no model is selected) on the transition only, so
             // unrelated settings edits never start anything.
@@ -353,6 +354,31 @@ class AppState: ObservableObject {
     func showTasks() {
         chatWorkspace = .tasks
         pendingChatOpenTick += 1
+    }
+
+    /// Show the sandbox desktop — the one way in, same shape as `showTasks()`.
+    func showDesktop() {
+        applyDesktopChatPreset()
+        chatWorkspace = .desktop
+        pendingChatOpenTick += 1
+    }
+
+    /// The chat beside the screen drives the sandbox: Tools on, MCP off,
+    /// Computer + Shell only (`DesktopChatPreset`). On the ACTIVE chat, before
+    /// the pane appears, so its ChatDetailView loads the toggles already set.
+    /// Bridge (Telegram) sessions keep their shared config.
+    func applyDesktopChatPreset() {
+        guard let id = activeChatId,
+              let idx = chatSessions.firstIndex(where: { $0.id == id }),
+              !chatSessions[idx].isExternalBridge,
+              let change = DesktopChatPreset.apply(mode: chatSessions[idx].mode,
+                                                   useMCP: chatSessions[idx].useMCP,
+                                                   disabledTools: chatSessions[idx].disabledTools)
+        else { return }
+        chatSessions[idx].mode = change.mode
+        chatSessions[idx].useMCP = change.useMCP
+        chatSessions[idx].disabledTools = change.disabledTools
+        saveChatHistory()
     }
 
     /// Show a sandbox terminal — the one way in, same shape as `showTasks()`.
@@ -573,7 +599,8 @@ class AppState: ObservableObject {
 
         // Same for the agent sandbox: apply the persisted setting once at launch.
         AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                      network: serverOptions.sandbox.network)
+                                      network: serverOptions.sandbox.network,
+                                      desktop: serverOptions.sandbox.desktop)
 
         // And the quick launcher's global ⌃Space hotkey.
         if quickLauncherEnabled { quickLauncher.setEnabled(true) }

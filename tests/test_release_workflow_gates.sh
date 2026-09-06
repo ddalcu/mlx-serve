@@ -354,5 +354,15 @@ bruns = " ".join(str(s.get("run", "")) for s in bsteps)
 for f in ("Formula/mlx-serve.rb", "Casks/mlx-core.rb"):
     check(f in bruns, f"homebrew.yml updates {f}")
 
+# ── Guest payload staging: the two guest-side files the app injects into the
+# rootfs at boot ride Resources/guest in EVERY build variant, in BOTH build
+# paths, each with a fail-when-missing check. vz-agent (issue #89: it was
+# MAS-only) and mlx-computer.py (the sandbox desktop's `computer` tool).
+for name in ("vz-agent", "mlx-computer.py"):
+    for label, text in (("release.yml", wf_text), ("app/build.sh", build_sh)):
+        check(f'Resources/guest/{name}"' in text, f"{label} stages {name} into Resources/guest")
+        check(f'if [ ! -f "$CONTENTS/Resources/guest/{name}" ]' in text,
+              f"{label} fails the build when {name} is missing")
+
 sys.exit(FAIL)
 EOF

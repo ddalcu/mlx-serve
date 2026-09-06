@@ -44,6 +44,24 @@ final class SandboxTransportTests: XCTestCase {
         XCTAssertFalse(AgentSandbox.kernelHasVirtiofsSupport(kernel(withVsock: true, withVirtiofs: false)))
     }
 
+    // MARK: kernels-v5: the desktop needs virtio-gpu
+
+    /// A kernels-v4 cache boots fine but has no DRM at all, so a desktop on it
+    /// is a black screen with nothing to explain it. The gate keys on the
+    /// `virtio_gpu` driver name the same way the vsock gate keys on
+    /// `virtio_vsock`, and the refusal names the tag + the fix.
+    func testVirtioGpuGateAndItsRefusalNameTheKernelTag() {
+        XCTAssertTrue(AgentSandbox.kernelHasVirtioGpuSupport(Data("...virtio_gpu...".utf8)))
+        XCTAssertFalse(AgentSandbox.kernelHasVirtioGpuSupport(kernel(withVsock: true)))
+        XCTAssertEqual(AgentSandbox.kernelTag, "kernels-v5")
+        let reason = AgentSandbox.desktopKernelRefusal(kernelData: kernel(withVsock: true))
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("kernels-v5"), reason!)
+        XCTAssertTrue(reason!.contains("~/.mlx-serve/sandbox"), reason!)
+        XCTAssertNil(AgentSandbox.desktopKernelRefusal(kernelData: Data("virtio_gpu".utf8)))
+        XCTAssertNotNil(AgentSandbox.desktopKernelRefusal(kernelData: nil))
+    }
+
     // MARK: fallback reason names the missing half
 
     /// Issue #89: every Developer ID build shipped WITHOUT the vz-agent in

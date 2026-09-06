@@ -17,7 +17,7 @@
 # tag/digest to upgrade; the App Store build re-stages automatically.
 set -euo pipefail
 
-KERNEL_TAG="${GUEST_KERNEL_TAG:-kernels-v4}"
+KERNEL_TAG="${GUEST_KERNEL_TAG:-kernels-v5}"
 KERNEL_REPO="${GUEST_KERNEL_REPO:-ddalcu/mlx-serve}"
 ROOTFS_IMAGE="${GUEST_ROOTFS_IMAGE:-ddalcu/agent-shell-mlxserve}"
 # Manifest-list digest of the pinned image (docker buildx imagetools inspect).
@@ -27,7 +27,11 @@ ROOTFS_DIGEST="${GUEST_ROOTFS_DIGEST:-sha256:72c09e9266d5a38478035fbc7a15b3726de
 
 # Expected kernel SHA256 (of the .gz release asset). The rootfs needs no
 # separate hash — the docker digest IS content-addressed.
-KERNEL_SHA256="${GUEST_KERNEL_SHA256:-cf3569bcda8d4c699c04581d16c3375e8fa86b00e81627a5a1421d837255c82f}"
+# kernels-v5 = kernels-v4 + virtio-gpu / USB HID for the sandbox desktop.
+# Hash of the kernels-v5 build (2026-09-05); refresh from
+# containers/guest-kernel/artifacts/release/SHA256SUMS whenever the asset is
+# rebuilt (a stale hash here fails the MAS staging by name).
+KERNEL_SHA256="${GUEST_KERNEL_SHA256:-7d23fd372067c0707d265831a3a6894de20e2be0b179d0867aee4d36a26a6ca3}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

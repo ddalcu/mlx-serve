@@ -104,6 +104,21 @@ struct SessionToolAllowList {
     mutating func rearm(_ id: UUID) { allowed.remove(id) }
 }
 
+/// What Send does while a turn may be running. Pure, so the routing is
+/// unit-tested without a view: an idle chat starts a turn; an AGENT turn takes
+/// the text as a mid-turn message for its next step; a plain turn refuses
+/// (its single request has no step to deliver into — Stop first).
+enum ComposerSend {
+    enum Decision: Equatable { case start, appendMidTurn, refuse }
+
+    static func decision(state: ChatTurnEngine.ComposerState, agentTurn: Bool) -> Decision {
+        switch state {
+        case .idle: return .start
+        case .generatingHere: return agentTurn ? .appendMidTurn : .refuse
+        }
+    }
+}
+
 @MainActor
 final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// Owning app state. `unowned` because the engine lives exactly as long as
@@ -121,6 +136,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// off this, and the voice controller scopes its end-of-turn detection to
     /// its own session with it.
     @Published private(set) var activeTurnSessionIds: Set<UUID> = []
+
+    /// Messages the user typed while an AGENT turn was running, per session.
+    /// Delivered on the loop's next step (`deliverMidTurnMessages`): appended
+    /// to the session between two rounds, so they land AFTER the round's tool
+    /// results and the model reads them as its latest user message. Not
+    /// appended at once: `updateLastMessage` writes the streaming reply into
+    /// whatever message is LAST, and a user bubble there would swallow it.
+    /// Published so the transcript can show the queued text right away.
+    @Published private(set) var midTurnQueue: [UUID: [ChatMessage]] = [:]
+    /// Sessions whose in-flight turn is an agent loop (the only kind that has
+    /// a "next step" to deliver into).
+    private var agentTurnSessionIds: Set<UUID> = []
 
     /// Live count of tokens each in-flight reply has produced — for the chat
     /// composer's live "gen:" readout and growing context bar. Counted by tallying
@@ -173,6 +200,34 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         Self.composerState(activeTurnSessionIds: activeTurnSessionIds, for: sessionId)
     }
 
+    /// Whether this session's in-flight turn is an agent loop — a plain turn
+    /// has no step to deliver a mid-turn message into.
+    func isAgentTurn(for sessionId: UUID) -> Bool {
+        activeTurnSessionIds.contains(sessionId) && agentTurnSessionIds.contains(sessionId)
+    }
+
+    /// Queue a message for the running agent turn ("I solved the captcha, go
+    /// on"). Returns false when the session has no agent turn in flight —
+    /// the caller then sends normally.
+    @discardableResult
+    func noteMidTurnMessage(sessionId: UUID, text: String, images: [ChatImage]? = nil) -> Bool {
+        guard isAgentTurn(for: sessionId) else { return false }
+        var msg = ChatMessage(role: .user, content: text)
+        msg.images = images
+        midTurnQueue[sessionId, default: []].append(msg)
+        return true
+    }
+
+    /// Move the queued messages into the session. Called by the agent loop at
+    /// the one point where the last message is a tool result (or the final
+    /// reply), never mid-stream. Returns how many landed.
+    @discardableResult
+    private func deliverMidTurnMessages(sessionId: UUID) -> Int {
+        guard let queued = midTurnQueue.removeValue(forKey: sessionId), !queued.isEmpty else { return 0 }
+        for m in queued { appState.appendMessage(to: sessionId, message: m) }
+        return queued.count
+    }
+
     /// Re-derive the published mirrors from the ledger. Called after every
     /// ledger mutation; cheap (set compare) and keeps view updates minimal.
     private func publishTurnState() {
@@ -201,6 +256,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     init(appState: AppState) {
         self.appState = appState
+        // The `computer` tool's screenshot gate reads the live chat model's
+        // vision capability through this one seam (the handler is a stateless
+        // static; this engine owns the server handle).
+        ComputerHandler.visionProbe = { [weak appState] in
+            appState?.server.chatModelInfo?.supportsVision ?? false
+        }
     }
 
     /// Per-turn configuration. Every field is DECIDED before it gets here —
@@ -416,6 +477,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         tasks[sessionId] = nil
         ledger.endAll(session: sessionId)
         liveTokensBySession.removeValue(forKey: sessionId)
+        agentTurnSessionIds.remove(sessionId)
+        // A stopped turn has no next step: the queued text goes to the
+        // transcript as an ordinary message the user can resend or edit.
+        deliverMidTurnMessages(sessionId: sessionId)
         // Belt and braces on the meter: the cancelled generation's own `defer`
         // clears it as it unwinds, but a card left behind on a stopped turn is a
         // permanent fake progress bar.
@@ -435,6 +500,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         guard ledger.end(session: sessionId, token: token) else { return }
         tasks[sessionId] = nil
         liveTokensBySession.removeValue(forKey: sessionId)
+        agentTurnSessionIds.remove(sessionId)
+        deliverMidTurnMessages(sessionId: sessionId)
         if mediaProgressSessionId == sessionId {
             mediaProgress = nil
             mediaProgressSessionId = nil
@@ -712,6 +779,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         userMsg.videos = videos
         userMsg.audio = audio
         appState.appendMessage(to: sessionId, message: userMsg)
+        agentTurnSessionIds.insert(sessionId)
 
         let api = APIClient()
         let workDir = config.workingDirectory
@@ -811,6 +879,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // against an empty history (see `stopIfOrphaned`).
             guard session(sessionId) != nil else { return }
 
+            // Anything the user typed during the last round lands here, after
+            // that round's tool results, as the newest user message.
+            deliverMidTurnMessages(sessionId: sessionId)
+
             // Build message history for API
             let turnMax = turnMaxTokens(config)
             let contextLength = AgentEngine.effectiveContextLength(
@@ -827,6 +899,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 }
             )
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
+            if repetition.task.isEmpty { repetition.task = userMsg }
             let mcpToolsJSON = config.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
             let mcpListing = config.mcpMode ? mcpManager.toolListingForPrompt() : ""
             var systemPrompt: String
@@ -844,7 +917,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // (it only changes when the user flips the Agent Sandbox
                 // setting — one KV re-prefill, then cached again).
                 systemPrompt = AgentPrompt.systemPrompt
-                    + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled)
+                    + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled,
+                                                              desktop: AgentSandbox.shared.isDesktopEnabled)
                     + AgentPrompt.memory
                 if !mcpListing.isEmpty {
                     systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
@@ -923,7 +997,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // asks explicitly for a short plain-text summary when finished so the user
             // never sees a conversation that ends on a bare tool-call echo.
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."])
+                history.append(["role": "user", "content": AgentEngine.continueNudge])
             }
             messages.append(contentsOf: history)
 
@@ -1132,6 +1206,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
                     appState.updateLastMessage(in: sessionId, truncation: .init(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
                 }
+                // A message typed while the final reply streamed is a follow-up
+                // the model has not seen: one more round, with it as the
+                // newest user message, instead of ending on a stale answer.
+                if deliverMidTurnMessages(sessionId: sessionId) > 0 { continue }
                 return
             }
 
@@ -1265,9 +1343,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // Produced tracks and clips ride a PATH, not bytes, for the same
                 // reason — see ChatMediaRef.
                 var pendingMediaRef: ChatMediaRef? = nil
-                if (result.name == "browse" || result.name == "generate_image")
+                // `computer` screenshots ride the same branch as `browse`:
+                // the JPEG becomes vision input, and the text around it (the
+                // observe that follows every action) stays the tool content.
+                if (result.name == "browse" || result.name == "generate_image" || result.name == "computer")
                     && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
-                    let (_, jpeg) = AgentMediaInline.splitInlineImage(result.output)
+                    let (caption, jpeg) = AgentMediaInline.splitInlineImage(result.output)
                     let chatImage = jpeg.map { ChatImage(data: $0) }
                     if result.name == "generate_image" {
                         // A generated image ships BOTH markers, so the caption
@@ -1283,7 +1364,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         pendingMediaRef = ref
                     } else if let chatImage {
                         toolMsg.images = [chatImage]
-                        toolMsg.content = "[screenshot captured]"
+                        toolMsg.content = (result.name == "computer" && !caption.isEmpty)
+                            ? "[screenshot captured]\n" + caption : "[screenshot captured]"
                     } else {
                         toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                     }

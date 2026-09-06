@@ -2381,6 +2381,17 @@ private struct SandboxSectionContent: View {
         }
 
         SettingsRow(
+            title: "Desktop (computer use)",
+            explainer: "ON = the sandbox boots with a screen and installs a small Linux desktop (XFCE, about 350 MB, needs the network toggle above) that the agent can operate with the `computer` tool: it reads the accessibility tree, clicks, types, and takes screenshots when the loaded model has vision. You watch and can take over in the chat window's Desktop pane. Turning it on also turns the sandbox on. Restarts the sandbox session."
+        ) {
+            Toggle("", isOn: Binding(
+                get: { appState.serverOptions.sandbox.desktop },
+                set: { appState.serverOptions.sandbox = SandboxDesktop.withDesktop($0, appState.serverOptions.sandbox) }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
             title: "Reset sandbox",
             explainer: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use."
         ) {

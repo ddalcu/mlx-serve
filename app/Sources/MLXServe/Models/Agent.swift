@@ -314,6 +314,10 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
         .shell, .cwd, .readFile, .writeFile, .editFile, .searchFiles, .listFiles,
         .saveMemory, .createTask, .listProcesses, .readProcessOutput, .killProcess,
         .generateImage, .generateSpeech, .generateMusic, .generateVideo,
+        // The sandbox desktop tool rides the coarse "Tools" flag like shell:
+        // it acts on the machine, and its own gates (sandbox + desktop on)
+        // decide whether it does anything.
+        .computer,
     ]
 
     static let webTools: Set<AgentToolKind> = [.browse, .webSearch]

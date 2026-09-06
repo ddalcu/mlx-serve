@@ -16,6 +16,10 @@ struct ChatModelPill: View {
     /// to send, not the window), and it carries the download affordances a
     /// toolbar pill had no room for.
     var compact: Bool = false
+    /// A narrower cap for the name than `compactNameWidth`, for a column too
+    /// tight for the whole composer row (the desktop pane's chat). The pill
+    /// truncates its own name, so the capsule stays whole.
+    var nameWidth: CGFloat? = nil
 
     @EnvironmentObject private var downloads: DownloadManager
 
@@ -138,7 +142,7 @@ struct ChatModelPill: View {
                         .font(compact ? .callout.weight(.semibold) : .callout.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth,
+                        .frame(maxWidth: nameWidth ?? (compact ? Self.compactNameWidth : Self.maxNameWidth),
                                alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                     Image(systemName: "chevron.up.chevron.down")
@@ -174,7 +178,7 @@ struct ChatModelPill: View {
                         .progressViewStyle(.linear)
                         .tint(.green)
                         .frame(height: 3)
-                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth)
+                        .frame(maxWidth: nameWidth ?? (compact ? Self.compactNameWidth : Self.maxNameWidth))
                 }
             }
             .padding(.horizontal, showsBackground ? 12 : 4)

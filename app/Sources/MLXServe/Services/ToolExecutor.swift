@@ -162,11 +162,104 @@ struct ShellHandler: ToolHandler {
             // rides through unchanged — the guest shell backgrounds it itself.
             // We do NOT fall back to the host on a sandbox error — the user
             // opted into isolation.
-            return try await AgentSandbox.shared.runForeground(
+            let out = try await AgentSandbox.shared.runForeground(
                 command: command, workingDirectory: workingDirectory, timeout: timeoutSeconds)
+            // apt could not find the package: hand back the real names. A 3B
+            // model retried `apt-get install doom` five times (live
+            // 2026-09-05); the fix it needs is one apt-cache search away.
+            if let missing = Self.missingAptPackage(in: out) {
+                let names = (try? await AgentSandbox.shared.runForeground(
+                    command: Self.aptSuggestCommand(missing), workingDirectory: workingDirectory, timeout: 30)) ?? ""
+                // First, not last: a long apt log is truncated from the END.
+                return Self.aptSuggestionNote(missing: missing, searchOutput: Self.stripShellFrame(names)) + "\n" + out
+            }
+            // An install went through: name the commands it brought, since the
+            // binary is rarely the package (`chocolate-doom`, not `doom`; the
+            // 9B looped on `which doom` eight times).
+            let installed = Self.aptInstalledPackages(inCommand: command)
+            if !installed.isEmpty, !out.contains("[exit code:") {
+                let bins = (try? await AgentSandbox.shared.runForeground(
+                    command: Self.aptCommandsCommand(installed), workingDirectory: workingDirectory, timeout: 30)) ?? ""
+                let note = Self.aptCommandsNote(packages: installed, listing: Self.stripShellFrame(bins))
+                return note.isEmpty ? out : note + "\n" + out
+            }
+            return out
         case .hostForeground:
             return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
         }
+    }
+
+    /// The package name apt refused ("E: Unable to locate package X"), or nil.
+    static func missingAptPackage(in output: String) -> String? {
+        guard let r = output.range(of: "E: Unable to locate package ") else { return nil }
+        let rest = output[r.upperBound...]
+        let name = rest.prefix { !$0.isWhitespace }
+        return name.isEmpty ? nil : String(name)
+    }
+
+    /// Guest command listing real packages whose NAME contains the missing one.
+    static func aptSuggestCommand(_ missing: String) -> String {
+        "apt-cache search --names-only " + VzGuest.shellQuote(missing) + " 2>/dev/null | head -8"
+    }
+
+    /// Drop `[cwd: …]` / `[exit code: N]` framing from a helper exec's output.
+    static func stripShellFrame(_ output: String) -> String {
+        output.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.hasPrefix("[cwd: ") && !$0.hasPrefix("[exit code: ") && $0 != "OK" }
+            .joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The note appended to a failed install: candidates, or a search hint.
+    static func aptSuggestionNote(missing: String, searchOutput: String) -> String {
+        if searchOutput.isEmpty {
+            return "[apt has no package named '\(missing)'. Find the real name with: apt-cache search <keyword>]"
+        }
+        return "[apt has no package named '\(missing)'. Packages with that word in the name (apt-cache search):\n\(searchOutput)\nInstall one of these with apt-get install -y <name>.]"
+    }
+
+    /// Package names in an `apt-get install …` / `apt install …` command (flags
+    /// and `sudo`/`&&` chains stripped). Empty when it is not an install.
+    static func aptInstalledPackages(inCommand command: String) -> [String] {
+        var pkgs: [String] = []
+        for segment in command.components(separatedBy: "&&") {
+            let words = segment.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            guard let i = words.firstIndex(of: "install"),
+                  i > 0, ["apt-get", "apt"].contains(words[i - 1].components(separatedBy: "/").last ?? "") else { continue }
+            for w in words[(i + 1)...] {
+                if w.hasPrefix("-") || w.hasPrefix("2>") || w.hasPrefix(">") || w == "|" { continue }
+                if w.contains("|") { break }
+                if w.contains(";") {
+                    let head = w.prefix { $0 != ";" }
+                    if !head.isEmpty { pkgs.append(String(head)) }
+                    break
+                }
+                pkgs.append(w)
+            }
+        }
+        return pkgs
+    }
+
+    /// Guest command listing the executables the packages installed.
+    static func aptCommandsCommand(_ packages: [String]) -> String {
+        "for p in " + packages.map(VzGuest.shellQuote).joined(separator: " ")
+            + "; do dpkg -L \"$p\" 2>/dev/null | grep -E '^/usr/(local/)?s?bin/|^/usr/games/' | head -4; done | head -12"
+    }
+
+    static func aptCommandsNote(packages: [String], listing: String) -> String {
+        guard !listing.isEmpty else { return "" }
+        let names = listing.split(separator: "\n").map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")
+        var note = "[installed \(packages.joined(separator: " ")); commands it provides: \(names). A desktop app is started with computer open <command>, not from the shell."
+        if let gtk = missingLibreOfficeGtk(packages: packages) { note += " " + gtk }
+        return note + "]"
+    }
+
+    /// LibreOffice without its GTK plugin has NO accessibility tree (the X11
+    /// plugin is mute), so read/observe show an empty window. Named at the
+    /// install, when the fix is one more package.
+    static func missingLibreOfficeGtk(packages: [String]) -> String? {
+        let lo = packages.filter { $0.hasPrefix("libreoffice") }
+        guard !lo.isEmpty, !lo.contains(where: { $0 == "libreoffice-gtk3" || $0 == "libreoffice-gtk4" }) else { return nil }
+        return "LibreOffice needs libreoffice-gtk3 for the computer tool to read its windows: apt-get install -y libreoffice-gtk3."
     }
 
     /// Where a shell command executes. Pure decision (unit-tested) so the
@@ -932,6 +1025,190 @@ private func resolveAndConfine(_ path: String, workingDirectory: String?) throws
     return normalizedResolved
 }
 
+// MARK: - Computer (sandbox desktop)
+
+/// The `computer` tool: every action is one `mlx-computer` invocation inside
+/// the guest (`AgentSandbox.runForeground`), which prints the result and a
+/// fresh observe. The argv mapping is pure; the gates are injectable seams so
+/// they are testable without a VM: sandbox off, desktop off / installing /
+/// failed (each named by `AgentSandbox.desktopRefusal`), and `screenshot` on
+/// a model without vision — a base64 blob a text model cannot read, so it is
+/// refused and the model is pointed back at observe.
+struct ComputerHandler: ToolHandler {
+    var sandboxEnabled: () -> Bool = { AgentSandbox.shared.isEnabled }
+    var desktopRefusal: () -> String? = { AgentSandbox.shared.desktopRefusal }
+    /// Whether a refusal is only "not up YET" (idle or installing), i.e.
+    /// worth one provisioning attempt before giving up.
+    var desktopPending: () -> Bool = { AgentSandbox.shared.desktopPending }
+    /// Whether the loaded chat model can see images (`ModelInfo.supportsVision`).
+    var modelHasVision: () async -> Bool = { await MainActor.run { ComputerHandler.visionProbe() } }
+    /// Installed once by `ChatTurnEngine` (which owns the server handle);
+    /// false until then, so a screenshot on an unknown model is refused.
+    @MainActor static var visionProbe: () -> Bool = { false }
+    /// Provision/start the desktop when the setting is on but it is not up
+    /// yet (a fresh app launch with the desktop enabled). Throws by name.
+    var ensureDesktop: () async throws -> Void = { try await AgentSandbox.shared.ensureDesktopProvisioned() }
+    var runInGuest: (String, Double) async throws -> String = { cmd, timeout in
+        try await AgentSandbox.shared.runForeground(command: cmd, workingDirectory: nil, timeout: timeout)
+    }
+
+    static let actions: Set<String> = ["observe", "read", "navigate", "research", "screenshot", "click",
+                                       "double_click", "right_click", "type", "key", "scroll", "drag", "open"]
+
+    /// Sites a `research` call may visit; the guest caps there too.
+    static let maxResearchSites = 40
+
+    /// A research call visits `sites` pages at ~10 s each; everything else is
+    /// sub-second. The guest timeout follows the argv.
+    static func timeout(for argv: [String]) -> Double {
+        guard argv.first == "research" else { return 60 }
+        let sites = argv.firstIndex(of: "--sites").flatMap { i in argv.indices.contains(i + 1) ? Int(argv[i + 1]) : nil } ?? 3
+        return 60 + 15 * Double(min(sites, maxResearchSites))
+    }
+
+    /// A malformed call, named for the model.
+    struct ArgError: Error, Equatable {
+        let message: String
+    }
+
+    /// The guest argv for a call. Lenient on how small models spell a target
+    /// (`id`/`element`, `#12`, float x/y); a call with no usable target is a
+    /// named failure, never a click at 0,0.
+    static func argv(for p: [String: String]) -> Result<[String], ArgError> {
+        guard let action = p["action"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !action.isEmpty else {
+            return .failure(ArgError(message: "computer needs an action: \(actions.sorted().joined(separator: ", "))"))
+        }
+        func target(idKeys: [String] = ["id", "element", "element_id", "target"],
+                    xKey: String = "x", yKey: String = "y") -> String? {
+            for k in idKeys {
+                if let v = p[k]?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+                    let digits = v.hasPrefix("#") ? String(v.dropFirst()) : v
+                    if digits.contains(",") { return digits }
+                    if Int(digits) != nil { return digits }
+                }
+            }
+            if let xs = p[xKey], let ys = p[yKey], let x = Double(xs.trimmingCharacters(in: .whitespaces)),
+               let y = Double(ys.trimmingCharacters(in: .whitespaces)) {
+                return "\(Int(x)),\(Int(y))"
+            }
+            return nil
+        }
+        let noTarget = "\(action) needs a target: an element \"id\" from observe, or \"x\" and \"y\""
+        switch action {
+        case "observe":
+            var a = ["observe"]
+            if let w = p["window"]?.lowercased(), w == "all" { a += ["--window", "all"] }
+            return .success(a)
+        case "read":
+            var a = ["read"]
+            if let m = p["max"].flatMap({ Int($0) }), m > 0 { a += ["--max", String(m)] }
+            return .success(a)
+        case "research":
+            guard let q = p["query"] ?? p["text"] ?? p["url"] ?? p["topic"], !q.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return .failure(ArgError(message: "research needs \"query\" (what to research)"))
+            }
+            let sites = p["sites"].flatMap { Int(Double($0) ?? .nan) }.map { max(1, min($0, maxResearchSites)) } ?? 3
+            var a = ["research", q, "--sites", String(sites)]
+            if let m = p["max"].flatMap({ Int($0) }), m > 0 { a += ["--max", String(m)] }
+            return .success(a)
+        case "navigate", "goto", "go_to", "browse", "search", "visit":
+            guard let target = p["url"] ?? p["query"] ?? p["text"] ?? p["command"] ?? p["target"],
+                  !target.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return .failure(ArgError(message: "navigate needs \"url\" (a web address) or \"query\" (words to search for)"))
+            }
+            return .success(["navigate", target])
+        case "screenshot":
+            return .success(["screenshot"])
+        case "click", "double_click", "right_click", "middle_click":
+            guard let t = target() else { return .failure(ArgError(message: noTarget)) }
+            var a = ["click", t]
+            if action == "double_click" { a.append("--double") }
+            if action == "right_click" { a += ["--button", "right"] }
+            if action == "middle_click" { a += ["--button", "middle"] }
+            return .success(a)
+        case "type":
+            // Small models put the line under `command` (they just opened a
+            // terminal); `text` is the schema's name.
+            guard let text = p["text"] ?? p["value"] ?? p["command"] ?? p["keys"], !text.isEmpty else {
+                return .failure(ArgError(message: "type needs \"text\""))
+            }
+            return .success(["type", text])
+        case "key", "keypress", "press":
+            guard let keys = p["keys"] ?? p["key"] ?? p["text"], !keys.isEmpty else {
+                return .failure(ArgError(message: "key needs \"keys\" (e.g. ctrl+l, Return)"))
+            }
+            return .success(["key", keys])
+        case "scroll":
+            guard let dir = p["direction"]?.lowercased(), dir == "up" || dir == "down" else {
+                return .failure(ArgError(message: "scroll needs \"direction\": up or down"))
+            }
+            let amount = p["amount"].flatMap { Int(Double($0) ?? .nan) }.map { max(1, $0) } ?? 3
+            var a = ["scroll", dir, String(amount)]
+            if let t = target() { a += ["--at", t] }
+            return .success(a)
+        case "drag":
+            guard let from = target(idKeys: ["from", "from_id", "id"]),
+                  let to = target(idKeys: ["to", "to_id"], xKey: "to_x", yKey: "to_y") else {
+                return .failure(ArgError(message: "drag needs \"from\" and \"to\" ids (or x,y and to_x,to_y)"))
+            }
+            return .success(["drag", from, to])
+        case "open", "launch":
+            guard let cmd = p["command"] ?? p["app"] ?? p["text"], !cmd.isEmpty else {
+                return .failure(ArgError(message: "open needs \"command\" (e.g. xfce4-terminal)"))
+            }
+            return .success(["open", cmd])
+        case "install", "apt", "apt-get", "apt_get", "download":
+            // Invented by small models; the real recipe is one shell call.
+            let pkg = p["command"] ?? p["package"] ?? p["query"] ?? p["text"] ?? "<package>"
+            return .failure(ArgError(message: "the computer tool cannot install software; use the shell tool: {\"command\": \"apt-get install -y \(pkg)\"} (doom = chocolate-doom freedoom; spreadsheet = libreoffice-calc libreoffice-gtk3), then computer open"))
+        default:
+            return .failure(ArgError(message: "unknown computer action \"\(action)\"; use one of \(actions.sorted().joined(separator: ", "))"))
+        }
+    }
+
+    /// One guest shell line, every argument single-quoted.
+    static func guestCommand(_ argv: [String]) -> String {
+        "DISPLAY=:0 mlx-computer " + argv.map(VzGuest.shellQuote).joined(separator: " ")
+    }
+
+    /// `runForeground` frames output like the shell tool (`[cwd: …]` header,
+    /// `[exit code: N]` trailer). Neither means anything for a desktop action,
+    /// and the header made a 9B model read the desktop as a shell (live
+    /// 2026-09-05): hand the model the helper's own text.
+    static func stripShellFraming(_ output: String) -> String {
+        var lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if let first = lines.first, first.hasPrefix("[cwd: ") { lines.removeFirst() }
+        if let last = lines.last, last.hasPrefix("[exit code: ") { lines.removeLast() }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        guard sandboxEnabled() else {
+            throw ToolError.executionFailed("the computer tool needs the Agent Sandbox (Settings > Agent Sandbox), and its Desktop toggle")
+        }
+        let argv: [String]
+        switch Self.argv(for: parameters) {
+        case .success(let a): argv = a
+        case .failure(let why): throw ToolError.executionFailed(why.message)
+        }
+        if let why = desktopRefusal() {
+            // The setting may be on with nothing up yet (fresh launch): give
+            // provisioning one chance before refusing by name.
+            if desktopPending() {
+                do { try await ensureDesktop() } catch { throw ToolError.executionFailed("\(error.localizedDescription)") }
+                if let still = desktopRefusal() { throw ToolError.executionFailed(still) }
+            } else {
+                throw ToolError.executionFailed(why)
+            }
+        }
+        if argv.first == "screenshot", !(await modelHasVision()) {
+            throw ToolError.executionFailed("screenshot needs a model with vision, and the loaded model has none — use observe (the accessibility tree) instead")
+        }
+        return Self.stripShellFraming(try await runInGuest(Self.guestCommand(argv), Self.timeout(for: argv)))
+    }
+}
+
 // MARK: - Executor
 
 @MainActor
@@ -950,6 +1227,7 @@ class ToolExecutor: ObservableObject {
         .browse: BrowseHandler(),
         .webSearch: WebSearchHandler(),
         .saveMemory: SaveMemoryHandler(),
+        .computer: ComputerHandler(),
     ]
 
     func executePlan(_ plan: AgentPlan, workingDirectory: String?) async -> [StepResult] {

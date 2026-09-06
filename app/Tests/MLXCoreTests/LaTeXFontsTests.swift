@@ -22,6 +22,18 @@ final class LaTeXFontsTests: XCTestCase {
         XCTAssertEqual(located, bundle)
     }
 
+    /// The Xcode 26 toolchain builds the resource bundle in the macOS shape
+    /// (Contents/Resources/Fonts) rather than flat; both must be a hit.
+    func testTheContentsResourcesBundleShapeIsAHit() {
+        let base = URL(fileURLWithPath: "/b/out/Products/Debug")
+        let bundle = base.appendingPathComponent(LaTeXFonts.bundleName)
+        let located = LaTeXFonts.locate(
+            searching: [base],
+            fileExists: present([bundle.appendingPathComponent("Contents/Resources/" + LaTeXFonts.probeFont).path])
+        )
+        XCTAssertEqual(located, bundle)
+    }
+
     func testAFontBundleWithoutItsFontsIsNotAHit() {
         let resources = URL(fileURLWithPath: "/Applications/MLX Core.app/Contents/Resources")
         XCTAssertNil(

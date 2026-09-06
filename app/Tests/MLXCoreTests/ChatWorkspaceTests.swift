@@ -159,7 +159,8 @@ final class ChatWorkspaceTests: XCTestCase {
                       // trap the Tasks columns hit, invisible to this audit for
                       // exactly as long as the file was missing from this list.
                       "Sources/MLXServe/Views/AgentsWindow.swift",
-                      "Sources/MLXServe/Views/TerminalPane.swift"]
+                      "Sources/MLXServe/Views/TerminalPane.swift",
+                      "Sources/MLXServe/Views/DesktopPane.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()
         for path in hosted {
@@ -541,6 +542,30 @@ final class ChatWorkspaceTests: XCTestCase {
         XCTAssertTrue(chat.contains("appState.showTasks()"))
         // The switcher these replaced is gone, not left as a second route.
         XCTAssertFalse(chat.contains("SidebarModeSwitcher"))
+    }
+
+    /// The sandbox desktop (computer use) is a mode with one door and two
+    /// routes in: a sidebar row while the feature is on, and a Tools menu
+    /// entry always (it opens the pane's install call to action when off).
+    /// One route is a feature nobody finds; a second `chatWorkspace = .desktop`
+    /// outside AppState is how the doors drift.
+    func testTheDesktopPaneHasOneDoorAndTwoRoutes() throws {
+        let chat = try source("Sources/MLXServe/Views/ChatView.swift")
+        XCTAssertTrue(chat.contains("destinationRow(\"Desktop\""), "the sidebar row")
+        XCTAssertTrue(chat.contains("appState.showDesktop()"), "the row goes through the door")
+        XCTAssertTrue(chat.contains("DesktopPane()"), "the detail column hosts the pane")
+        let app = try source("Sources/MLXServe/MLXServeApp.swift")
+        XCTAssertTrue(app.contains("Button(\"Sandbox Desktop…\") { appState.showDesktop() }"), "the Tools menu entry")
+        let state = try source("Sources/MLXServe/AppState.swift")
+        XCTAssertTrue(state.contains("func showDesktop() {\n        applyDesktopChatPreset()"),
+                      "the door applies the Computer-only preset to the active chat before the pane appears")
+        for path in ["Sources/MLXServe/Views/ChatView.swift", "Sources/MLXServe/Views/DesktopPane.swift",
+                     "Sources/MLXServe/MLXServeApp.swift", "Sources/MLXServe/Views/SettingsView.swift"] {
+            XCTAssertFalse(try source(path).contains("chatWorkspace = .desktop"),
+                           "\(path) must go through showDesktop()")
+        }
+        XCTAssertTrue(ChatWorkspace.desktop.isDesktop)
+        XCTAssertFalse(ChatWorkspace.desktop.isThreeColumn)
     }
 
     /// A HOSTED pane must not demand a window-sized minimum: the gen views kept

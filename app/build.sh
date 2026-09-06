@@ -286,6 +286,13 @@ if [ ! -f "$CONTENTS/Resources/guest/vz-agent" ]; then
     echo "ERROR: vz-agent missing from the bundle — sandboxed MCP would be broken (issue #89)"
     exit 1
 fi
+# The `computer` tool's guest half (sandbox desktop). Injected into the rootfs
+# at boot like vz-agent; a bundle without it makes every computer call fail.
+cp "$SCRIPT_DIR/Sources/MLXServe/Resources/guest/mlx-computer.py" "$CONTENTS/Resources/guest/mlx-computer.py"
+if [ ! -f "$CONTENTS/Resources/guest/mlx-computer.py" ]; then
+    echo "ERROR: mlx-computer.py missing from the bundle — the sandbox desktop's computer tool would be broken"
+    exit 1
+fi
 
 if [ "$MAS" = "1" ]; then
     echo "→ Staging bundled guest (kernel + rootfs)..."

@@ -477,6 +477,8 @@ struct ChatView: View {
                 SettingsView()
             } else if case .terminal(let id) = appState.chatWorkspace {
                 TerminalPane(sessionId: id)
+            } else if appState.chatWorkspace.isDesktop {
+                DesktopPane()
             } else if case .create(let experiment) = appState.chatWorkspace {
                 // The four generators were four Window scenes; they are pages
                 // of this window now. Each keeps its own view untouched — only
@@ -1183,6 +1185,15 @@ struct ChatSidebar: View {
                                selected: appState.chatWorkspace.isTasks) {
                     appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
                 }
+                // The sandbox desktop's live screen: a row only while the
+                // feature is on (off, the Tools menu's entry opens the pane
+                // with its install call to action — the second route).
+                if appState.serverOptions.sandbox.desktop {
+                    destinationRow("Desktop", icon: "desktopcomputer",
+                                   selected: appState.chatWorkspace.isDesktop) {
+                        appState.chatWorkspace.isDesktop ? appState.showConversation() : appState.showDesktop()
+                    }
+                }
                 // No "Chats" heading here: the list carries its own section
                 // headers ("Agents", "Sessions"), and one of them appears only
                 // when it has rows. A heading pinned in this inset could not
@@ -1851,7 +1862,7 @@ struct ChatDetailView: View {
     /// The shared reading measure all three capped sites (transcript,
     /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
     private var contentWidth: CGFloat {
-        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+        ChatMetrics.contentWidth(forColumn: columnWidth)
     }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
@@ -1990,8 +2001,10 @@ struct ChatDetailView: View {
                     } else {
                         Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
                     }
-                    Text(control.title)
-                        .font(.caption.weight(.semibold))
+                    if !ChatMetrics.composerIsCompact(columnWidth: columnWidth) {
+                        Text(control.title)
+                            .font(.caption.weight(.semibold))
+                    }
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
                 .padding(.horizontal, 8)
@@ -2230,24 +2243,41 @@ struct ChatDetailView: View {
     /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
+        // The one preset: a small model with the sandbox desktop does best
+        // with the Computer + Shell groups alone. A second click restores
+        // every tool (the per-session disabled set is the only state).
+        // Toggles, not Buttons with a checkmark Label: macOS 26+ hides a
+        // Label's image inside a Menu, so the state was invisible (live
+        // 2026-09-06); a Toggle in a Menu draws the native checkmark.
+        let computerOnly = disabledToolSet == AgentToolGroup.computerOnlyDisabledSet
+        Toggle("Computer only", isOn: Binding(
+            get: { computerOnly },
+            set: { on in
+                guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                let next = on ? AgentToolGroup.computerOnlyDisabledSet : []
+                appState.chatSessions[idx].disabledTools = next.map(\.rawValue).sorted()
+                appState.saveChatHistory()
+            }))
+        .disabled(isExternalBridgeSession)
+        Text(appState.chatWorkspace.isDesktop
+             ? "Set when the Desktop view opens (Tools on, MCP off). Change it here for this chat."
+             : "Computer and Shell tools only. Best for small (3B) models driving the sandbox desktop.")
+        Divider()
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
             Section(group.title) {
                 ForEach(group.tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
-                    Button {
-                        setTool(tool, enabled: !isToolEnabled(tool))
-                    } label: {
-                        if isToolEnabled(tool) {
-                            Label(tool.displayName, systemImage: "checkmark")
-                        } else if allowed {
-                            Text(tool.displayName)
-                        } else {
-                            // The agent forbids it — say so rather than showing
-                            // an off switch the user can't turn on.
-                            Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
-                        }
+                    if allowed {
+                        Toggle(tool.displayName, isOn: Binding(
+                            get: { isToolEnabled(tool) },
+                            set: { setTool(tool, enabled: $0) }))
+                        .disabled(isExternalBridgeSession)
+                    } else {
+                        // The agent forbids it — say so rather than showing
+                        // an off switch the user can't turn on.
+                        Button("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities") {}
+                            .disabled(true)
                     }
-                    .disabled(!allowed || isExternalBridgeSession)
                 }
             }
         }
@@ -2474,6 +2504,11 @@ struct ChatDetailView: View {
                            let progress = chatEngine.mediaProgress {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
+                        }
+                        // Typed while the agent works: shown at once, delivered
+                        // to the loop on its next step (`ChatTurnEngine.midTurnQueue`).
+                        ForEach(chatEngine.midTurnQueue[sessionId] ?? []) { queued in
+                            MidTurnQueuedRow(message: queued).id(queued.id)
                         }
                     }
                     // New identity when the text size or density changes, so
@@ -2888,11 +2923,18 @@ struct ChatDetailView: View {
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
     private var composerPlaceholder: String { "Ask me anything…" }
 
+    /// Return submits when a turn can take the text: an idle chat, or an
+    /// agent turn that reads it on its next step (`ComposerSend`).
+    private var composerCanSubmit: Bool {
+        ComposerSend.decision(state: composerState,
+                              agentTurn: chatEngine.isAgentTurn(for: sessionId)) != .refuse
+    }
+
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
-                          isIdle: composerState == .idle,
+                          isIdle: composerCanSubmit,
                           onSend: { sendMessage() },
                           // Escape stops the reply being written. Handled here
                           // rather than as a hidden `.cancelAction` button so
@@ -2959,7 +3001,11 @@ struct ChatDetailView: View {
         // belongs to the MESSAGE — which model writes the reply — the same
         // reason Think/Tools/MCP moved down here, and it has room for the
         // download affordances the toolbar never did.
-        ChatModelPill(compact: true)
+        // Compact (a narrow column): the pill is capped so the row keeps Send
+        // on screen; the voice toggle goes (voice mode stays reachable from
+        // the tray) and the context pill hides (`showsContextPill`).
+        let compact = ChatMetrics.composerIsCompact(columnWidth: columnWidth)
+        ChatModelPill(compact: true, nameWidth: compact ? ChatMetrics.compactModelPillWidth : nil)
         // The recovery goes where the problem is DISCOVERED: the pill's dot
         // going grey is the only thing that says the server is down, so the fix
         // sits next to it. Transient by construction (`ChatServerStartControl`
@@ -2984,8 +3030,13 @@ struct ChatDetailView: View {
         // hands-free with this chat's toggles/agent, off ends it. Its own
         // observing view (see `VoiceComposerToggle`) so the tint follows the
         // app-level controller when voice starts from the tray.
-        voiceToggle
+        if !compact {
+            voiceToggle
+        }
 
+        // Mid agent turn the button is Stop, and Return in the composer sends
+        // the text to the agent's next step (`proceedSend`); a plain turn
+        // keeps refusing input until it ends.
         Button {
             if composerState == .generatingHere {
                 stopGeneration()
@@ -3437,7 +3488,8 @@ struct ChatDetailView: View {
     /// Hidden until there's something true to report — a pill reading 0.0%
     /// before the first reply is noise, not information.
     private var showsContextPill: Bool {
-        contextUsage != nil || composerState == .generatingHere || lastOverflowNotice != nil
+        (contextUsage != nil || composerState == .generatingHere || lastOverflowNotice != nil)
+            && !ChatMetrics.composerIsCompact(columnWidth: columnWidth)
     }
 
     private var workingDirectoryBinding: Binding<String?> {
@@ -3565,16 +3617,26 @@ struct ChatDetailView: View {
     }
 
     private func proceedSend() {
+        let decision = ComposerSend.decision(state: composerState,
+                                             agentTurn: chatEngine.isAgentTurn(for: sessionId))
+        guard decision != .refuse, server.status == .running else { return }
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
         let attachedVideos = consumePendingVideos()
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+        guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty
+        else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
+        }
+        // Typed while the agent works ("I solved the captcha, go on"): the
+        // engine hands it to the loop on its next step. No new turn.
+        if decision == .appendMidTurn {
+            chatEngine.noteMidTurnMessage(sessionId: sessionId, text: text, images: attachedImages)
+            applyScroll(.userSentMessage)
+            return
         }
 
         chatEngine.runTurn(sessionId: sessionId, userText: text,
@@ -5640,5 +5702,27 @@ fileprivate final class ComposerTextView: NSTextView {
         let ok = super.resignFirstResponder()
         if ok { onResignFocus?() }
         return ok
+    }
+}
+
+
+// MARK: - Mid-turn queued message
+
+/// A user message waiting for the agent's next step. Rendered in the user's
+/// bubble style with one caption, so it is visibly "sent" before the loop
+/// appends it to the session (`ChatTurnEngine.deliverMidTurnMessages`).
+struct MidTurnQueuedRow: View {
+    let message: ChatMessage
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Text(message.content)
+                .textSelection(.enabled)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+            Text("for the agent's next step")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }

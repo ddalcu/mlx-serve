@@ -16,6 +16,12 @@ enum LaTeXFonts {
     /// One font that must be inside the bundle: an empty directory of the right
     /// name is a half-finished copy, not a hit.
     static let probeFont = "Fonts/KaTeX_Main-Regular.ttf"
+    /// The same font in the bundle shapes SwiftPM ships: flat (`swift build`
+    /// on the classic build system) and Contents/Resources (the Xcode-style
+    /// build system the Xcode 26 toolchain uses, `.build/out/Products`).
+    /// `Bundle.url(forResource:)` reads both; the probe must too, or every
+    /// formula renders as source text on the newer toolchain.
+    static let probePaths = [probeFont, "Contents/Resources/" + probeFont]
 
     /// Contents/Resources for a real .app; the bundle URL covers the
     /// `swift build` layout, where the resource bundle sits beside the binary;
@@ -31,7 +37,7 @@ enum LaTeXFonts {
     ) -> URL? {
         for base in candidates {
             let bundle = base.appendingPathComponent(bundleName)
-            if fileExists(bundle.appendingPathComponent(probeFont)) { return bundle }
+            if probePaths.contains(where: { fileExists(bundle.appendingPathComponent($0)) }) { return bundle }
         }
         return nil
     }
