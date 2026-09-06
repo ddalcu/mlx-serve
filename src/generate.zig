@@ -16023,17 +16023,18 @@ test "L27 characterization: a sidecar (legacy-layout) boot plans EXACTLY as a93e
     );
 }
 
-test "L27 characterization: a sidecar boot's width-trial SCHEDULE is a93e2c0's too (ledger row 20)" {
+test "L27 characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4 (ledger row 20)" {
     // `mtpWidthTrialTarget` above answers WHICH width; this answers WHICH
     // ROUND, and a trial block costs the request carrying it 3-4%. The M4 Max
     // stall (a cold bucket inheriting its `<2k` neighbour's 124-round date)
-    // reproduces on a93e2c0, but the re-read that fixes it is qwen4-only:
-    // a legacy-layout table gets a93e2c0's arm-once schedule, transcribed
-    // from `git show a93e2c0:src/round_cost.zig`.
+    // reproduces on a93e2c0 and on main d9e1ceb (27B, 4k: 66.9 tok/s vs
+    // 73.9 on 26.9.1), so the re-read is every layout's; the arm-once
+    // schedule below is a93e2c0's, transcribed from
+    // `git show a93e2c0:src/round_cost.zig`, kept as the characterization.
     const G = Generator;
     const legacy = round_cost.Table{ .layout = .legacy };
     const long = round_cost.Table{ .layout = .long };
-    try testing.expect(!round_cost.schedulePeriodReread(legacy.layout));
+    try testing.expect(round_cost.schedulePeriodReread(legacy.layout));
     try testing.expect(round_cost.schedulePeriodReread(long.layout));
 
     // Same trace shape on both arms: armed at 12 from a 124-round neighbour,

@@ -564,12 +564,18 @@ pub const TrialSchedule = struct {
     }
 };
 
-/// Which archs re-read the trial period every round (PR #363 blast radius,
-/// ledger row 20). `.long` is `layoutFor`'s qwen4_exp answer and nothing
-/// else's, so this is the qwen4-only predicate this module can spell without
-/// importing ModelConfig — the same reason `layoutFor` takes an `anytype`.
+/// Which layouts re-read the trial period every round: all of them. It
+/// shipped qwen4-only (ledger row 20, "archs nobody measured"); the sidecar
+/// arch was then measured on Qwen3.8-27B/M4 Max, 2 boots per arm, 4k/32k:
+/// gated 71.4/55.0, ungated 75.1/53.1, 26.9.1 73.9/53.7, main d9e1ceb
+/// 68.6/54.8. The cross-request EV seed (#350, on main since 26.9.1) hands
+/// a short low-acceptance request's a[m_lo] to the next one, and the
+/// arm-once schedule never re-widens it: 1.44 tok/round on the same short
+/// requests 26.9.1 runs at 3.57. Kept as a predicate so a layout can opt
+/// out with a measurement, never a literal.
 pub fn schedulePeriodReread(layout: Layout) bool {
-    return layout == .long;
+    _ = layout;
+    return true;
 }
 
 /// Period from the measured ms/tok gap between two widths (a width G worse,
@@ -1119,14 +1125,16 @@ test "round_cost: a shorter period pulls an armed TrialSchedule in (cold own buc
     try testing.expectEqual(@as(u32, 13), u.next_trial);
 }
 
-test "round_cost: the trial-period re-read is qwen4-only; a legacy-layout schedule keeps a93e2c0's date (L27, ledger row 20)" {
-    // The gate. `schedulePeriodReread` is the ONE predicate, and it answers
-    // for the layout `layoutFor` resolves: `.long` is qwen4_exp and nothing
-    // else, `.legacy` is every sidecar-MTP pack and every DFlash drafter.
+test "round_cost: the trial-period re-read is EVERY layout's; the arm-once schedule below is what a93e2c0 shipped (L27, ledger row 20)" {
+    // The ONE predicate answers yes for both layouts: on a sidecar-MTP pack
+    // (Qwen3.8-27B, M4 Max, `MLX_SERVE_ROUND_COST_PERSIST=0`) the arm-once
+    // schedule plus the cross-request EV seed left short requests at w1
+    // (1.44 tok/round on main d9e1ceb and the gated arm vs 3.57 on 26.9.1),
+    // 4k decode 71.4 gated / 66.9 main vs 73.9 shipped; ungated 75.1.
     try testing.expect(schedulePeriodReread(.long));
-    try testing.expect(!schedulePeriodReread(.legacy));
+    try testing.expect(schedulePeriodReread(.legacy));
 
-    // The tester's own M4 Max trace shape, run on the UNGATED arm: armed at
+    // The tester's own M4 Max trace shape, run on the ARM-ONCE arm: armed at
     // round 12 from the `<2k` neighbour's 124, the own bucket activates at
     // 18 with the cold period 8, and the date does not move. Transcribed from
     // `git show a93e2c0:src/round_cost.zig` — that tree has no `armed_at` and

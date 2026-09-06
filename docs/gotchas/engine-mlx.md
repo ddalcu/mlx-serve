@@ -5707,6 +5707,28 @@ but read only on the gated one — an ungated schedule is a93e2c0 byte for byte.
 Ledger row 20. The lesson generalises: **"it is broken on main too" argues that
 a fix is owed, never that it is safe to ship unmeasured.**
 
+**Then it was measured, and ungated (2026-09-06, M4 Max, 26.9.2 qualification).**
+Qwen3.8-27B 4-bit (sidecar MTP, `.legacy`), `MLX_SERVE_ROUND_COST_PERSIST=0`,
+llmprobe 4k/32k rungs, decode tok/s per boot:
+
+| arm | 4k | 32k |
+|---|---|---|
+| 26.9.1 shipped (2 boots) | 73.3, 74.5 | 55.1, 52.3 |
+| main d9e1ceb (2 boots) | 66.9, 70.3 | 53.3, 56.3 |
+| PR gated (3 boots) | 70.5, 67.5, 76.2 | 54.2, 55.7, 55.0 |
+| PR ungated (2 boots) | 75.1, 75.1 | 52.5, 53.7 |
+
+The mechanism on the sidecar arch is the cross-request EV seed (#350, on main
+since 26.9.1 shipped, `MLX_SERVE_MTP_EV_SEED`): a short low-acceptance request
+seeds the next request's `a[m_lo]` narrow, and the arm-once schedule never
+re-widens it. Same short conformance requests, tokens per round: 26.9.1 3.57,
+main and the gated arm 1.44 (34 rounds where 26.9.1 runs 14), ungated 4.73. The
+gated PR's 4k boot B sat 57 rounds at m_lo=2 with `wt=175 tgt=3`. So main
+regresses 27B short context against 26.9.1, the gate preserves that, and the
+re-read is the fix at hand: 4k +5% vs gated, ties shipped at 32k (−1%, inside
+the per-boot swing). `schedulePeriodReread` now answers yes for every layout
+and stays a predicate so an arch can opt out with a measurement.
+
 **Not the cause** (checked and acquitted): the planner (`mtpRoundPlan`,
 `mtpEvPlanSrc`, `MtpCostSource`, the regime gate, `mtpWidthTrialTarget`) is
 byte-identical between base and PR; the table (`observe`, `foldInto`,
