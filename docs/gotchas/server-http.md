@@ -4094,14 +4094,26 @@ assert is unguarded in every shipped binary".
 | 28 | `qwen4_exp.NgramTable.parse` | **none.** `ngram_table.bin` is opened at one site, inside `if (config.isQwen4())` | **A — qwen4-only by construction** | The header of a 32 GB file the engine mmaps and then SLICES with was read through bare `.?` / `.string` / `.array` / `.integer`, and only the biases' END was bounds-checked: a lying `weight` region let `row()` and `preadSite` read past the mapping, and `bits` was tied only by `dim*bits == wcols*32`, which accepts 32 — where `(@as(u32,1) << @intCast(bits)) - 1` is an illegal shift. Now every access is checked (`NgramTableHeader`), `bits ∈ {2,3,4,5,6,8}` and `group_size` sane (`NgramTableBits`), and each of the three regions is proven to hold exactly `rows × cols × dtype` bytes, to describe the same rows, to be pairwise disjoint and to end inside the mapping (`NgramTableRegion` / `NgramTableTruncated`). The converter's `"format": "mlx-serve-ngram"` stamp is now enforced WHEN PRESENT — the shipped `…-mixed-4-8bit` pack carries it; a table without one is accepted and logged once, so pre-stamp tables still load. Tests: the three `ngram table header:` cases |
 | 29 | `model.qwen4PleInstalledAt` + the `initMoeLayers` check; `ple_layer_ids` parsed strictly | **none.** `ple_layer_idx` is set only in the qwen4 branch and the check is behind `config.isQwen4()` | **A — qwen4-only by construction** | Only `ple_layer_ids[0]` was read, a non-integer or absent list left the default `-1`, and placement is by EXACT equality inside the layer loop — so a config naming a layer outside the trunk (or an extra id, which we do not support) built a qwen4 with NO n-gram injection: the 32 GB table still opens, the hash still runs, and the trunk silently never receives the 51B-parameter term. Load now requires exactly one id in `1..=num_hidden_layers` (`InvalidQwen4PleLayer`) AND proves after layer construction that exactly one layer carries PLE weights, at that index (`Qwen4PleNotInstalled`) — a load error, not a log line, because a PLE-less qwen4 emits plausible text. `NgramHash.init(..., ple_layer_index = 0)` stays the ORDINAL among the injection points (the reference seeds multipliers from the ordinal), now commented at the call site and pinned by the oracle fixture, whose config says `ple_layer_ids=[2]`. Tests: `qwen4_exp config: the PLE layer id must name exactly one layer that exists`, `qwen4 PLE placement: the layer loop must install exactly one PLE, at the configured layer`, `the qwen4 layer loop proves the PLE landed before the model is handed back` (scan) |
 
-### Round 8 — three LOW observability findings (rows 33-35)
+### Round 8 — the refused warm turn that destroyed its own session (rows 30-32)
+
+One live incident, three defects, one round. Deployed head `58ff92f`,
+`--ctx-size 786432 --kv-quant 8 --mtp --prefix-cache-mem 10GB
+--prefix-cache-entries 4 --prefix-cache-disk 100GB`, M5 Max 128 GB,
+`iogpu.wired_limit_mb=120000`; log `~/.mlx-serve/logs/mlx-serve-11234.log`,
+lines ~9150-9222. Full story below.
+
+| # | site | reach off qwen4_exp | class | gate / why not |
+|---|---|---|---|---|
+| 30 | `prefix_cache.Entry.checkout_donated`, `HotPrefixCache.donateCheckout`, the two-outcome `releaseCheckout`, and the one `donateCheckout` call in `scheduler.runPrefill` | **none.** The whole checkout mechanism is behind `checkoutEligible`, whose first conjunct is `HotPrefixCache.ssd_first` = `prefix_cache.ssdFirstActive` (`ModelConfig.ssdFirstCapable()` — qwen4_exp today — AND `MLX_SERVE_PREFIX_SSD_FIRST` AND a disk tier). Off that arm no entry is ever marked, so `donateCheckout` and both arms of `releaseCheckout` are no-ops over an empty predicate | **A — inside the existing gate** | The fix does not widen the checkout, it SPLITS it in two: mark at restore, release the handles immediately before `Generator.initWithOptions`. Every arch that never takes a checkout is byte-identical, and on the arch that does, the only behaviour change is that a slot ending before the first forward hands the entry back instead of dropping it. Guards: `restore by move: a refusal BEFORE the append hands the entry back INTACT` (prefix_cache.zig, red on 58ff92f), the updated `... a slot that ends without committing DROPS its checked-out entry` (now donates first), and the ordering scan inside `every slot-end path releases a checked-out hot-cache entry` (restore < refuse < donate < `initWithOptions`) |
+| 31 | `server.AdmissionBill.evictionCredit()`, read by `fitsAfterEviction`, `logAdmissionDecision` and `logPrefillRefusal` | **every arch reaches the helper**, and none changes behaviour: `evictionCredit()` returns `reclaimable`, which is what `fitsAfterEviction` already compared. Off `longCtxGated` `prefillAdmissionBill` zeroes both credits, so the helper returns 0 there exactly as before | **A — a rename plus a message, no arithmetic** | The only observable change is the refusal's wording, which now quotes the comparison it made (`available + evictionCredit()`) and reports `evictable` / `pinnedResidentBytes` as context rather than as the post-eviction number. Guard: `a refusal names the credit it COMPARED, never the residency it cannot take` — arithmetic on the live bill plus a scan pinning all three readers |
+| 32 | `server.retainedSsmCheckpointBytes` gains a `matched` argument; `prefillRequestTerms` passes `warm.matched_tokens` | **the helper is called from one place, and that place is already gated**: `prefillRequestTerms` returns `.{}` for every arch outside `longCtxGated()`, so `checkpoint_bytes` is 0 there and the new argument cannot move it. On qwen4_exp a COLD bill (`matched = 0`) reduces to `seq / stride` — the old expression — plus the always-on end-of-prompt snapshot, which saturates against `--ssm-checkpoint-max` at every length this arch prefills at | **A — inside the existing gate** | Guards: `a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's` (the term, the whole decomposition, and the verdict flipping from refuse to admit) and `the live 364k session's admission numbers reproduce, to the megabyte` (16,233 MB / 13,664 MB, the incident's own figures) |
+
+### Round 9 — three LOW observability findings (rows 33-35)
 
 An audit round with no behaviour change in it: three lines that lie, a hot
 path that asks libc a constant question, and a 51 GB background read with no
 surface. All three are qwen4_exp-only, and none of them moves a byte of
-output. Rows 26-29 are the round above; rows 30-32 are reserved for a parallel
-fix-round of the same audit that has not landed yet, so the numbering
-skips them here.
+output.
 
 | # | site | reach off qwen4_exp | class | gate / why not |
 |---|---|---|---|---|
@@ -4635,3 +4647,161 @@ literal and the app always launches the headless one, which is exactly how
 `--pld*` was eaten. Guards: `every text surface resolves an omitted max_tokens
 through ONE helper`, `every serve path passes the --max-tokens default (the
 flag-eater class)`, `tests/test_headless_spec_flags.sh` [5].
+
+## The refused turn that destroyed its own session: a checkout is a PROMISE, not a transfer (2026-09-06)
+
+Deployed head `58ff92f`, `--ctx-size 786432 --kv-quant 8 --mtp
+--prefix-cache-mem 10GB --prefix-cache-entries 4 --prefix-cache-disk 100GB`,
+M5 Max 128 GB, `iogpu.wired_limit_mb=120000`. An agent session at 364k tokens,
+one tool-call turn every few seconds, each turn ~3.7k tokens longer than the
+last. `~/.mlx-serve/logs/mlx-serve-11234.log`, lines ~9150-9222.
+
+Turn A (prompt 364,509) restores 362,240 rows and is served:
+
+```
+[admission] needed=16233 MB available=16973 MB reclaimable=0 MB width=2048 verdict=admit
+  [hot-cache] checked out 362776-token entry to the slot (restore by move; the append donates in place)
+  <- 364509+157 tokens streamed [prefill: 755.7 tok/s (362240 cached / 364509 total), decode: 61.0 tok/s]
+```
+
+Turn B (prompt 368,208) restores 364,478 rows from the entry Turn A committed,
+and then:
+
+```
+  [hot-cache] checked out 364667-token entry to the slot (restore by move; the append donates in place)
+[scheduler] prefill refused: 368208 tokens do not fit even with an empty hot cache
+  prompt 368208 tokens needs ~13664MB at prefill chunk 512 (the narrowest width tried),
+  ~13374MB available after evicting ~7802MB of hot cache — refused before prefill
+[scheduler] prefill failed for slot: PrefillDoesNotFit
+  [hot-cache] evicted LRU entry (checked-out entry dropped; was 364667 tokens, 7802.08 MB; ssm 3135.88 MB)
+  [hot-cache] checked-out entry dropped: slot cleanup (364667 tokens; its KV died with the slot)
+```
+
+The turn was refused by **290 MB**. What it cost was the session: 7.8 GB and
+364,667 tokens of prefix, thrown away for a request that never ran a single
+forward. The next turn is cold at 368k, which on this box takes minutes and
+which the memory guard will refuse for the same reason. The session is over.
+
+Three separate defects, and each of them is enough on its own.
+
+### 1. A checkout is a promise. Releasing the handles at RESTORE made it a transfer
+
+`checkoutIfEligible` used to do two things at once: mark the entry as the
+slot's (`Entry.checked_out_by`) **and** `releaseHandles()` on its snapshot.
+The release is what makes the trick work — mlx donates a `slice_update`'s
+input only when `array::is_donatable()` holds (`use_count() == 1`), so the
+entry's second reference is exactly what makes the turn's first
+`writeAtOffset` privatise the whole prefix instead of appending in place.
+
+But the release happens at RESTORE, and everything between the restore and the
+first forward can still end the slot:
+
+* the inference-thread admission pass (`prefill_admission_fits` → the eviction
+  loop → `error.PrefillDoesNotFit`) — this incident;
+* a client disconnect while the eviction pass runs;
+* any error out of the spec-cache adoption below it.
+
+On every one of those paths the entry's snapshot is EMPTY while the buffers are
+untouched, so `releaseCheckout` — correctly, given what it could see — dropped
+the record: a record with no bytes behind it would hand the next matching
+request an uninitialized cache.
+
+The fix is to stop conflating the two halves. `checkoutIfEligible` only MARKS.
+`HotPrefixCache.donateCheckout(slot_id)` releases the handles and sets
+`Entry.checkout_donated`, and the scheduler calls it at the LAST point where
+nothing has written to `slot.cache` — immediately before
+`Generator.initWithOptions`, and therefore below every arm that can refuse.
+`releaseCheckout` then has two outcomes, chosen by a fact rather than a guess:
+
+* **not donated** — hand the entry back, unchanged. Same tokens, same handles,
+  same SSM checkpoints, QSA history and spec snaps, same byte bill, and
+  deliberately the same `last_used`: this slot did not use the entry, and a
+  bump would reorder the LRU for a request that never ran.
+* **donated** — drop it, exactly as before.
+
+Placing the donate before `initWithOptions` is load-bearing in the other
+direction too: the generator's `reserve_tokens` grow frees the old KV buffer,
+and a grow that runs while the entry still holds a reference frees nothing.
+
+Scan-pinned in `scheduler.zig` (`every slot-end path releases a checked-out
+hot-cache entry`): the restore, the `PrefillDoesNotFit` return, the donate and
+`Generator.initWithOptions(` appear in that order in `runPrefill`, and
+`donateCheckout` appears exactly once.
+
+### 2. The refusal quoted the one number the decision was forbidden to use
+
+"~13374MB available after evicting ~7802MB of hot cache". Nothing was evicted.
+The 7,802 MB was ONE entry (`1/4`), and it was the slot's own checked-out
+prefix — invisible to eviction by construction, which the SAME request's
+admission line had already said: `reclaimable=0 MB`.
+
+`fitsAfterEviction` credits `reclaimable`; the refusal printed `evictable`.
+Two numbers for one decision, in two lines about one request. Now there is one
+helper, `AdmissionBill.evictionCredit()`, read by the decision
+(`fitsAfterEviction`), by the `[admission]` line and by the refusal — and the
+refusal names the comparison it made before it reports the residency it could
+not have:
+
+```
+  prompt 368208 tokens needs ~13664MB at prefill chunk 512 (the narrowest width tried),
+  ~13374MB available + ~0MB the hot cache can give back
+  (~7802MB resident, ~7802MB of it pinned by this request's own prefix) — refused before prefill
+```
+
+### 3. The bill charged a 3,730-token append for 32 SSM checkpoints it makes one of
+
+Fed the deployed pack's config (`indexer_budget` 2048, four indexer heads,
+affine-4, `--ctx-size 786432`) the estimator reproduces the incident to the
+megabyte — 16,233 MB for Turn A at width 2048, 13,664 MB for Turn B at width
+512. Turn B, term by term, before the ×5/4 margin:
+
+| term | MB | real for a warm append? |
+|---|---|---|
+| `seq * kv_per_tok` | 4,584.6 | **yes.** The reservation (376,912 rows) exceeds the restored buffer's capacity, so the cache GROWS, and a grow allocates the whole new capacity beside the old one. `available` is already net of the old buffer, so the new one is the honest charge. |
+| `reserved_kv_bytes` (headroom past the prompt) | 108.4 | yes |
+| `state_bytes` (QSA key history + block-score bank, at the reserved length) | 1,932.4 | **yes**, and for a subtler reason than audit W-2 states: `applyQsaHistoryAt` restores a VIEW of the entry's array, and `seedCapBuf` privatises it at the first `qsaAppendKeys` — i.e. during the prefill, after admission. Either way the slot allocates its own copy while the entry keeps its own, so the term is a future allocation and belongs in the bill. |
+| `checkpoint_bytes` | 1,795.5 | **NO.** See below. |
+| KV dequant transient | 719.2 | yes |
+| prefill envelope (the STREAM arm: 36 GDN layers + MoE gather-sort) | 665.0 | yes |
+| `PREFILL_RUNTIME_FLOOR_BYTES` | 512.0 | yes |
+| warm KV credit | −0.0 | correctly zero — see the first row |
+| `qsaMaskBytes` (added outside the margin) | +767.9 | yes |
+
+`retainedSsmCheckpointBytes` billed `min(seq / stride, --ssm-checkpoint-max)` =
+32 checkpoints × 56.1 MiB. But a warm prefill **forwards only the tail**: 3,730
+tokens, at stride 8192 (`effectiveSsmCheckpointStride` never sub-divides the
+uncapped base chunk). It crosses no stride boundary at all, so the only capture
+it makes is the always-on end-of-prompt snapshot — which is exactly what the
+log shows (`8 ssm-cp` → `12 ssm-cp` over four turns, one per turn). The twelve
+the entry already holds are its own arrays, already resident, already net of
+`available`, and MERGED at commit (`mergeCheckpointLists`), not allocated.
+
+So the term now takes the matched prefix: the stride-aligned positions in
+`(matched, seq]`, plus the end snapshot, capped as before. `matched = 0` is the
+old expression, so no cold bill on any arch moves. Turn B goes from 13,664 MB
+to **11,490 MB** against 13,374 MB available: served, with 1.9 GB to spare.
+
+### What is a design limit, and stays
+
+* **The warm KV credit is all-or-nothing on capacity, and this session never
+  earns it.** `WarmPrefix.creditedRows` returns 0 whenever
+  `reserved > residentCapacityTokens`, because past the buffer's capacity the
+  prefill grows and a grow allocates the whole new capacity. That is honest.
+  What makes it bite is that `RESERVE_GEN_HEADROOM` is a flat 8,192 tokens: a
+  chain adding ~3.7k tokens a turn at 364k crosses its reservation every second
+  or third turn, and the turn that does pays a full 4.6 GB of KV. The growth
+  policy's +25% (`nextCapacityPolicy`) is what keeps that from being every turn.
+  A proportional reservation at long context would fix it; it is a measurement,
+  not a patch.
+* **The MLX buffer pool is not a missing term.** `/props` showed 8,268 MB
+  parked in the reclaimable pool at the moment of the refusal, which reads like
+  8 GB one `mlx_clear_cache()` could buy back. It is already credited:
+  `currentGpuMemoryCeiling` adds `mlx_get_cache_memory` to the MLX footprint
+  BEFORE taking the physical minimum, and `available` is `ceiling -
+  active_memory` with `active` excluding the pool — so on the physical arm
+  `available` **is** `cache_bytes + free_system`. The live numbers agree: active
+  71,310 MB + available 20,814 MB = 92,124 MB, nowhere near the 120 GB wired
+  limit, so the ceiling was physical. Clearing the pool moves the ceiling down
+  by exactly what it moves free RAM up by. No clear is owed on the refusal path,
+  and `test "the MLX buffer pool is inside `available` by construction"` pins
+  both the arithmetic and the one site that adds it.

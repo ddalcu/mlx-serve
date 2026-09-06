@@ -204,6 +204,13 @@ const Entry = struct {
     /// replaces it with the grown buffers; an entry still holding it at slot
     /// end is DROPPED (`releaseCheckout`).
     checked_out_by: ?usize = null,
+    /// RESTORE BY MOVE, second half: has the slot's append actually DONATED
+    /// these buffers in place? Set by `donateCheckout`, which the scheduler
+    /// calls at the last point where nothing has written to the slot's cache
+    /// yet. Until it is set the entry's handles are still live and its record
+    /// still describes bytes nobody has touched, so a slot that ends before
+    /// that point HANDS THE ENTRY BACK; only a donated checkout is dropped.
+    checkout_donated: bool = false,
 };
 
 /// What a spec-snap adoption may do, decided BEFORE any mlx call so the whole
@@ -1378,10 +1385,9 @@ pub const HotPrefixCache = struct {
         return prompt_len > shared;
     }
 
-    /// Take the checkout: hand the entry's KV buffers to the slot outright by
-    /// RELEASING the entry's own handles. The slot already holds refcount-
-    /// shared handles from `restore`, so this drops the buffers' use_count to
-    /// one and the slot's first `writeAtOffset` donates instead of copying.
+    /// Take the checkout: MARK the entry as this slot's. The handles are
+    /// released later, by `donateCheckout`, at the last moment before the
+    /// slot's first write — see the two-step contract on `Entry.checkout_donated`.
     ///
     /// Returns whether the checkout was TAKEN — the one answer the admission
     /// bill needs, because only a checked-out prefix is one the request will
@@ -1398,20 +1404,54 @@ pub const HotPrefixCache = struct {
             prompt_len,
             slot_id != null,
         )) return false;
-        e.snapshot.releaseHandles();
         e.checked_out_by = slot_id;
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
         return true;
     }
 
-    /// End of a slot's life: any entry that slot still holds is DROPPED.
+    /// RESTORE BY MOVE, the transfer. Give up the entry's own array handles so
+    /// the slot is the SOLE owner and its first `writeAtOffset` donates in
+    /// place instead of privatising the whole prefix (`releaseHandles` carries
+    /// the mlx `is_donatable()` story).
     ///
-    /// The bytes are the slot's KV buffers and die with them, so the record
-    /// describes a prefix nothing can restore — leaving it in the cache would
-    /// hand the next matching request an empty snapshot. The commit path
-    /// clears the mark first when it replaces the entry with the grown
-    /// buffers, so reaching here with a mark set means this slot ended
-    /// WITHOUT committing: cancelled, errored, or refused.
+    /// Called by the scheduler at the LAST point where nothing has written to
+    /// the slot's cache — immediately before `Generator.initWithOptions`, and
+    /// therefore AFTER the admission/eviction pass that can still refuse the
+    /// request by name. That ordering is the whole fix: the release used to
+    /// happen at restore, so a refusal (or any other pre-prefill failure) left
+    /// a record with no bytes behind it and `releaseCheckout` had nothing to do
+    /// but drop it — 7.8 GB and a 364k-token session, thrown away for a request
+    /// that never ran (live 2026-09-06).
+    ///
+    /// Idempotent, and a no-op for a slot that holds no checkout.
+    pub fn donateCheckout(self: *HotPrefixCache, slot_id: usize) void {
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by != slot_id) continue;
+            if (e.checkout_donated) continue;
+            e.snapshot.releaseHandles();
+            e.checkout_donated = true;
+        }
+    }
+
+    /// End of a slot's life: whatever that slot still holds is settled here.
+    ///
+    /// TWO OUTCOMES, and which one applies is a fact about the SLOT, never a
+    /// guess about what ran (`Entry.checkout_donated`):
+    ///
+    ///   * NOT donated — the slot ended before `donateCheckout`, so the entry
+    ///     never gave its handles up and nothing has written to those buffers.
+    ///     HAND IT BACK, unchanged: same tokens, same handles, same SSM
+    ///     checkpoints, QSA history and spec snaps, same byte bill, same LRU
+    ///     position. This is the refused / cancelled-early / errored-early
+    ///     path, and dropping there cost a live 364k session its whole 7.8 GB
+    ///     prefix for a request that was refused before its first forward.
+    ///   * DONATED — the bytes are the slot's KV buffers and die with them, so
+    ///     the record describes a prefix nothing can restore. DROP it; leaving
+    ///     it resident would hand the next matching request an empty snapshot.
+    ///
+    /// The commit path clears the mark first when it replaces the entry with
+    /// the grown buffers, so reaching here with a mark set means this slot
+    /// ended WITHOUT committing.
     ///
     /// Idempotent, and safe when the entry was already removed by an
     /// invalidate.
@@ -1422,10 +1462,20 @@ pub const HotPrefixCache = struct {
             const e = &self.entries.items[i];
             if (e.checked_out_by != slot_id) continue;
             const tokens_len = e.tokens.len;
+            if (!e.checkout_donated) {
+                // Nothing was ever handed over. The mark is the ONLY state to
+                // undo — `last_used` is deliberately not bumped: this slot did
+                // not use the entry, and a bump would reorder the LRU for a
+                // request that never ran.
+                e.checked_out_by = null;
+                log.info("  [hot-cache] checked-out entry returned intact: {s} ({d} tokens; the append never ran)\n", .{ reason, tokens_len });
+                continue;
+            }
             // Clear the mark BEFORE `evictAt` so its LRU bookkeeping (and any
             // log it emits) sees an ordinary entry; the snapshot is already
             // empty, so the free returns nothing and bills nothing.
             e.checked_out_by = null;
+            e.checkout_donated = false;
             self.evictAt(i, "checked-out entry dropped");
             log.info("  [hot-cache] checked-out entry dropped: {s} ({d} tokens; its KV died with the slot)\n", .{ reason, tokens_len });
         }
@@ -1843,6 +1893,7 @@ pub const HotPrefixCache = struct {
             // been overwritten with the GROWN ones — the same allocation, now
             // longer — so the entry is whole again and visible to everyone.
             e.checked_out_by = null;
+            e.checkout_donated = false;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
             // Inherited SSM checkpoints can make a replacement larger than
@@ -6281,6 +6332,9 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         var moe_off: usize = 0;
         const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 0xA11CE);
         try testing.expectEqual(@as(usize, 600), res.matched);
+        // The transfer is the scheduler's second step, taken at the last point
+        // before the first write (see `donateCheckout`).
+        hc.donateCheckout(0xA11CE);
 
         // The entry gave the buffers up: its handles are EMPTY and it names
         // the slot that holds them. This is the OWNERSHIP half of the bar, and
@@ -6378,6 +6432,66 @@ test "restore by move: a partial-prefix hit keeps the refcount-share" {
     try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
 }
 
+test "restore by move: a refusal BEFORE the append hands the entry back INTACT" {
+    // LIVE 2026-09-06, the 364k agent session. Turn B restored a 364,667-token
+    // entry BY MOVE, the inference-thread admission pass then refused the
+    // prefill (`error.PrefillDoesNotFit`) — before a single forward, so nothing
+    // was ever appended — and `finishSlot` DROPPED the checked-out entry: 7.8 GB
+    // and the whole session's prefix, thrown away to serve a request that was
+    // never served. The next turn was cold at 368k and could not be served at
+    // all.
+    //
+    // The checkout is a PROMISE, not a transfer: until the append has donated
+    // in place, the entry's record still describes bytes nobody has touched, so
+    // a slot that ends before that point must hand it back exactly as it was.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+    const billed_before = hc.current_kv_bytes;
+    try testing.expect(billed_before > 0);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
+    try testing.expect(res.checked_out);
+    const lru_before = hc.entries.items[0].last_used;
+
+    // The refusal: `runPrefill` returns before `Generator.initWithOptions`, so
+    // `donateCheckout` never ran and the entry never gave its handles up.
+    try testing.expect(!hc.entries.items[0].checkout_donated);
+    hc.releaseCheckout(42, "prefill refused");
+
+    // The entry is WHOLE: same tokens, live handles, same bill, same LRU
+    // position — and restorable, which is the only claim that matters to the
+    // next turn.
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    const e = &hc.entries.items[0];
+    try testing.expectEqual(@as(usize, 600), e.tokens.len);
+    try testing.expectEqual(@as(?usize, null), e.checked_out_by);
+    try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+    try testing.expect(e.snapshot.entries[0].values.ctx != null);
+    try testing.expectEqual(billed_before, hc.current_kv_bytes);
+    try testing.expectEqual(lru_before, e.last_used);
+
+    // ...and the proof: a second slot restores the same prefix from it.
+    var slot2 = try KVCache.init(testing.allocator, 1);
+    defer slot2.deinit();
+    var moe_off2: usize = 0;
+    const again = try hc.lookupAndRestoreForSlot(&slot2, &moe_off2, null, s, &prompt, false, 0, null, null, null, 43);
+    try testing.expectEqual(@as(usize, 600), again.matched);
+    hc.releaseCheckout(43, "second slot ended");
+}
+
 test "restore by move: a slot that ends without committing DROPS its checked-out entry" {
     // The bytes are the slot's KV buffers and die with them. Leaving the record
     // resident would hand the next matching request an EMPTY snapshot — which
@@ -6402,6 +6516,12 @@ test "restore by move: a slot that ends without committing DROPS its checked-out
     var moe_off: usize = 0;
     _ = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 42);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+
+    // The prefill was admitted and is about to write: the handles go over and
+    // the entry's record now describes bytes only the slot owns.
+    hc.donateCheckout(42);
+    try testing.expect(hc.entries.items[0].checkout_donated);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx == null);
 
     // The slot is cancelled: no commit, so the record has no bytes behind it.
     hc.releaseCheckout(42, "cancelled");

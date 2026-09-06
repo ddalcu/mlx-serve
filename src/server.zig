@@ -5125,7 +5125,16 @@ test "the refusal names the width it tried, and one rule picks it everywhere" {
     // `chooser` was already split correctly, so the mitigation was known here
     // and missed.
     try t.expect(std.mem.indexOf(u8, src, "at prefill chunk {d} " ++ "({s})") != null);
-    try t.expect(std.mem.indexOf(u8, src, "prompt_len, bill.needed / mb, bill.chunk, width_note, bill." ++ "available / mb") != null);
+    // The refusal's arguments, off the bill it was refused on. Asserted piece
+    // by piece against `logPrefillRefusal`'s own body rather than as one
+    // flattened argument line: the message gained the eviction credit and the
+    // pinned residency, so a single needle would only pin the formatting.
+    {
+        const refusal = declBody(src, "pub fn logPrefillRefusal(") orelse return error.CallSiteMoved;
+        inline for (.{ "bill.needed / mb", "bill.chunk,", "width_note,", "bill.available / mb", "bill.evictionCredit() / mb" }) |piece| {
+            try t.expect(std.mem.indexOf(u8, refusal, piece) != null);
+        }
+    }
     // The label is qualified by the arch, not asserted as a bare claim (N1).
     try t.expect(std.mem.indexOf(u8, src, "perRequestPrefillChunkEnabled(config)) \"the narrowest width " ++ "tried\"") != null);
     try t.expect(std.mem.indexOf(u8, src, "(KV+working+margin) at prefill " ++ "chunk {d}") != null);
@@ -5300,11 +5309,23 @@ test "the admission line and the refusal quote the SAME bill, field for field" {
     try t.expect(std.mem.indexOf(u8, guard, "logAdmission" ++ "Decision(bill);") != null);
     try t.expectEqual(@as(usize, 0), std.mem.count(u8, emitter, "prefillAdmission" ++ "Bill("));
 
-    // The same four fields, off the same struct, on both sides.
-    inline for (.{ "needed", "available", "reclaimable", "chunk" }) |field| {
+    // The same four fields, off the same struct, on both sides — with the
+    // reclaimable one reached through `evictionCredit()`, the ONE helper the
+    // decision and both sentences read (a refusal that quotes `evictable`
+    // there names a number `fitsAfterEviction` was forbidden to use).
+    inline for (.{ "needed", "available", "chunk" }) |field| {
         try t.expect(std.mem.indexOf(u8, emitter, "bill." ++ field) != null);
         try t.expect(std.mem.indexOf(u8, guard, "bill." ++ field) != null);
     }
+    try t.expect(std.mem.indexOf(u8, emitter, "bill.eviction" ++ "Credit()") != null);
+    try t.expect(std.mem.indexOf(u8, guard, "bill.eviction" ++ "Credit()") != null);
+    // ...and NOTHING outside the struct reads the raw field: one accessor is
+    // what stops a message and a decision naming different credits.
+    const decl = declBody(src, "pub const AdmissionBill = struct {") orelse return error.CallSiteMoved;
+    try t.expectEqual(
+        std.mem.count(u8, decl, "self.reclaim" ++ "able"),
+        std.mem.count(u8, src, ".reclaim" ++ "able;"),
+    );
     // And the refusal's own numbers are aliases of the bill's, not fresh reads.
     try t.expect(std.mem.indexOf(u8, guard, "const needed = bill." ++ "needed;") != null);
     try t.expect(std.mem.indexOf(u8, guard, "const available = bill." ++ "available;") != null);
@@ -5897,8 +5918,8 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
     return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
 }
 
-/// Bytes of SSM checkpoints a prefill of `seq` tokens is still HOLDING when it
-/// reaches its last chunk. The prefill captures one every
+/// Bytes of SSM checkpoints a prefill is still HOLDING when it reaches its
+/// last chunk. The prefill captures one every
 /// `generate.effectiveSsmCheckpointStride` tokens and keeps at most
 /// `--ssm-checkpoint-max` of them, so this saturates — but until it does it is
 /// proportional, and on a 36-layer GatedDeltaNet trunk it is ~1.9 GB the guard
@@ -5907,7 +5928,16 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 /// Mirrors the stride the prefill loop resolves, against the same uncapped
 /// base chunk `runPrefill` uses, so the bill and the captures cannot disagree
 /// about how many land.
-pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+///
+/// `matched` is the prefix the hot cache RESTORED. A warm prefill forwards
+/// only `seq - matched`, so those are the only positions at which it can
+/// capture anything: the entry's own checkpoints are its own arrays, already
+/// resident (and therefore already net of `available`), and the commit MERGES
+/// them (`mergeCheckpointLists`) rather than allocating them again. Billing
+/// the whole prompt charged a 3,730-token warm append for 32 fresh captures it
+/// makes 8 of — 1,346 MB, on the request that was then refused by 290 MB
+/// (live 2026-09-06). Cold callers pass 0 and get exactly the old expression.
+pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
     const per_cp = config.ssmCheckpointBytes();
     if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
     const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
@@ -5915,7 +5945,15 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
         @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
     );
     if (stride == 0) return 0;
-    var n: u64 = seq / stride;
+    // Stride-aligned capture positions in `(matched, seq]` — the span the
+    // prefill forwards — plus the always-on end-of-prompt snapshot, which
+    // `generate.ssmSnapshotBackoff` takes for every span past
+    // SSM_SNAPSHOT_BACKOFF tokens and which is the ONLY capture a warm append
+    // shorter than one stride makes at all (the live 364k session added
+    // exactly one checkpoint per turn at stride 8192).
+    const span: u64 = seq -| @min(matched, seq);
+    var n: u64 = seq / stride -| @min(matched, seq) / stride;
+    if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
     if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
     return n * per_cp;
 }
@@ -5974,7 +6012,12 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         // The indexer history at the width `statePerTokenBilled` decides
         // (one copy + the score bank; two copies with a lever off).
         .state_bytes = reserved * statePerTokenBilled(config),
-        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, chunk),
+        // The WARM span, not the prompt: `warm.matched_tokens` is what the
+        // restore handed over and therefore what the prefill does NOT forward.
+        // Read unconditionally — unlike the KV credit this has nothing to do
+        // with `will_donate`, because a refcount-shared restore skips exactly
+        // the same rows and captures exactly the same checkpoints.
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
     };
 }
@@ -6035,7 +6078,7 @@ fn memoryRefusalMessage(
     if (!carries_cache) {
         return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
     }
-    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.reclaimable / (1024 * 1024) });
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
 }
 
 /// The message `error.PrefillDoesNotFit` sends (`mapGenerationError`, the one
@@ -6231,6 +6274,23 @@ pub const AdmissionBill = struct {
         return self.needed <= self.available;
     }
 
+    /// THE credit, and the ONE place it is named. What an eviction pass can
+    /// PROVE it will hand back — `reclaimable`, never `evictable`.
+    ///
+    /// Both readers matter and they are different kinds of reader: the
+    /// DECISION (`fitsAfterEviction`) and the two SENTENCES that report it
+    /// (the `[admission]` line and the pre-prefill refusal). The refusal used
+    /// to quote `evictable` instead — "~13374MB available after evicting
+    /// ~7802MB of hot cache", printed for a request whose entire residency was
+    /// its own checked-out prefix, which eviction refuses to take by
+    /// construction and which the SAME request's admission line had already
+    /// reported as `reclaimable=0 MB` (live 2026-09-06). A message that names
+    /// a number the decision was forbidden to use is a message that sends the
+    /// operator after a cache that was never the problem.
+    pub fn evictionCredit(self: AdmissionBill) u64 {
+        return self.reclaimable;
+    }
+
     /// Fits once the cache has given back what it PROVABLY can. The guard
     /// admits on THIS and the inference thread then evicts only as much as it
     /// has to — a cached prefix is an optimization, the request is the work.
@@ -6241,9 +6301,68 @@ pub const AdmissionBill = struct {
     /// nothing (guards run 2026-09-05, #353 follow-up). A guard that admits on
     /// memory it cannot get back is a 503 with extra steps.
     pub fn fitsAfterEviction(self: AdmissionBill) bool {
-        return self.needed <= self.available +| self.reclaimable;
+        return self.needed <= self.available +| self.evictionCredit();
     }
 };
+
+test "a refusal names the credit it COMPARED, never the residency it cannot take" {
+    // LIVE 2026-09-06, the 364k agent session. The refusal read:
+    //   "~13374MB available after evicting ~7802MB of hot cache"
+    // The 7,802 MB was ONE entry, and it was the slot's OWN checked-out
+    // prefix — invisible to eviction by construction, which the SAME request's
+    // `[admission]` line had already said (`reclaimable=0 MB`). Nothing was
+    // evicted, nothing could be; the sentence described a pass that never
+    // happened, using the one number the decision was forbidden to use.
+    //
+    // `fitsAfterEviction` credits `reclaimable`. So must the message: ONE
+    // helper, read by the decision and by the sentence that reports it.
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+
+    // The live shape: the whole residency is the checked-out entry.
+    const pinned_only = AdmissionBill{
+        .needed = 13_664 * mb,
+        .available = 13_374 * mb,
+        .evictable = 7_802 * mb,
+        .reclaimable = 0,
+        .chunk = 512,
+    };
+    try t.expectEqual(@as(u64, 0), pinned_only.evictionCredit());
+    try t.expectEqual(7_802 * mb, pinnedResidentBytes(pinned_only));
+    try t.expect(!pinned_only.fits());
+    try t.expect(!pinned_only.fitsAfterEviction());
+    // The decision and the credit are the same comparison.
+    try t.expectEqual(
+        pinned_only.needed <= pinned_only.available +| pinned_only.evictionCredit(),
+        pinned_only.fitsAfterEviction(),
+    );
+
+    // The same residency, genuinely reclaimable: now the credit is real and
+    // the request is admitted to evict. Nothing else about the bill moved.
+    var reclaimable = pinned_only;
+    reclaimable.reclaimable = 7_802 * mb;
+    try t.expectEqual(7_802 * mb, reclaimable.evictionCredit());
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(reclaimable));
+    try t.expect(reclaimable.fitsAfterEviction());
+
+    // ONE helper, scan-pinned. The decision, the `[admission]` line and the
+    // refusal all read it; nothing formats `evictable` as a post-eviction
+    // available, which is the sentence the live log printed.
+    const src = @embedFile("server.zig");
+    const fits = declBody(src, "    pub fn fitsAfterEviction(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, fits, "self.eviction" ++ "Credit()") != null);
+    try t.expect(std.mem.indexOf(u8, fits, "self.reclaim" ++ "able") == null);
+    const refusal = declBody(src, "pub fn logPrefillRefusal(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, refusal, "bill.eviction" ++ "Credit()") != null);
+    try t.expect(std.mem.indexOf(u8, refusal, "after evict" ++ "ing") == null);
+    // It still REPORTS the residency and the part of it that is pinned — the
+    // operator's first question is "why didn't it just drop a cache entry?" —
+    // but as context, never as the number it compared.
+    try t.expect(std.mem.indexOf(u8, refusal, "bill.evict" ++ "able") != null);
+    try t.expect(std.mem.indexOf(u8, refusal, "pinnedResident" ++ "Bytes(bill)") != null);
+    const admission = declBody(src, "fn logAdmissionDecision(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, admission, "bill.eviction" ++ "Credit()") != null);
+}
 
 /// PURE: everything the admission guard bills for ONE request at ONE prefill
 /// width. Factored out of `prefillAdmissionBill` so the per-request chunk
@@ -6746,7 +6865,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
 /// The gate that runs before the estimator that knows better IS the estimator
 /// (#126); here the honest form of that rule is not to decide.
 pub fn pinnedResidentBytes(bill: AdmissionBill) u64 {
-    return bill.evictable -| bill.reclaimable;
+    return bill.evictable -| bill.evictionCredit();
 }
 
 /// What the admission guard decided, derived from ONE bill so the log line and
@@ -6831,7 +6950,7 @@ fn logAdmissionDecision(bill: AdmissionBill) void {
     log.atLevel(level, "[admission] needed={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
         bill.needed / mb,
         bill.available / mb,
-        bill.reclaimable / mb,
+        bill.evictionCredit() / mb,
         bill.chunk,
         admissionVerdict(bill).name(),
     });
@@ -6875,8 +6994,21 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     // (audit N1), so the label is qualified rather than claiming a search that
     // did not happen.
     const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
-    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available after evicting ~{d}MB of hot cache — refused before prefill\n", .{
-        prompt_len, bill.needed / mb, bill.chunk, width_note, bill.available / mb, bill.evictable / mb,
+    // The COMPARISON first (`needed` against `available + evictionCredit()`,
+    // which is `fitsAfterEviction` spelled out), then the residency as
+    // CONTEXT — with the part of it eviction cannot take named, because on a
+    // warm turn that part is this request's own checked-out prefix and the
+    // operator's next move otherwise is to go hunting a cache that was never
+    // holding anything it could have had.
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) — refused before prefill\n", .{
+        prompt_len,
+        bill.needed / mb,
+        bill.chunk,
+        width_note,
+        bill.available / mb,
+        bill.evictionCredit() / mb,
+        bill.evictable / mb,
+        pinnedResidentBytes(bill) / mb,
     });
 }
 
@@ -6901,7 +7033,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     // a request the machine can serve for a cache hit nobody asked for.
     if (needed > available and bill.fitsAfterEviction()) {
         log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
-            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024),
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024),
         });
         return true;
     }
@@ -6932,7 +7064,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.reclaimable / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it COMPARED — including the hot cache,
         // because the operator's first question is "why didn't it just drop a
         // cache entry?" and the honest answer here is that there was nothing
@@ -22907,19 +23039,19 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     // 58.83 MB. Stated in BYTES: the same number is 56.1 MiB, and the two
     // spellings are 5% apart.
     try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
-    const held = retainedSsmCheckpointBytes(&cfg, seq, chunk);
+    const held = retainedSsmCheckpointBytes(&cfg, seq, 0, chunk);
     try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, held);
     try t.expect(held > 1_800_000_000);
     // It saturates: 393k holds the same 32 as 458k, which is why the term is
     // not what separates the two runs.
-    try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, chunk));
+    try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, 0, chunk));
     // An arch with no linear layers has nothing to checkpoint and is billed
     // nothing — no plain-attention arch's admission tightens.
     var dense = model_mod.ModelConfig{};
     dense.num_hidden_layers = 32;
     dense.num_attention_heads = 32;
     try t.expectEqual(@as(u64, 0), dense.ssmCheckpointBytes());
-    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&dense, seq, chunk));
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&dense, seq, 0, chunk));
 
     // 2. RESERVED CAPACITY. The request reserves prompt + max_tokens + one
     //    chunk up front so the prefill never grows a buffer beside its
@@ -24113,7 +24245,13 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     try t.expectEqual(@as(u64, 786_676 * 13_056), credit);
     try t.expect(credit < matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken()));
     const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix);
-    try t.expectEqual(cold - credit * 5 / 4, warm);
+    // Isolated against a SHARED restore of the same span, not against the cold
+    // bill: `checkpoint_bytes` follows `matched` too (a warm prefill forwards
+    // only the tail and captures only that span's checkpoints), and that term
+    // is not the KV credit and must not be confused with it.
+    const shared_same_span = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = capacity });
+    try t.expect(shared_same_span < cold);
+    try t.expectEqual(shared_same_span - credit * 5 / 4, warm);
 
     // And the verdict flips: ~11.9 GB against 19,032 MB free, so the request
     // is ADMITTED outright — no eviction pass, and the other session's
@@ -24124,7 +24262,7 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // is the same; the 3.0 GB difference is history this turn really does
     // allocate.
     try t.expect(warm < available);
-    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
+    try t.expect(warm / mb > 9_500 and warm / mb < 11_000);
 
     // A COLD 786,707-token prompt on the same box keeps the old refusal: the
     // credit is a property of what is resident, never of the prompt length.
@@ -24241,8 +24379,12 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     try t.expect(donating.will_donate);
     try t.expectEqual(matched, donating.creditedRows(reserved));
     const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, donating);
-    try t.expectEqual(cold - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
-    try t.expect(warm / mb > 11_500 and warm / mb < 13_000);
+    // The BASELINE for the KV credit is a shared restore of the SAME span:
+    // `checkpoint_bytes` follows `matched` regardless of the checkout, so a
+    // cold bill would fold two independent credits into one comparison.
+    const shared_same_span = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = capacity });
+    try t.expectEqual(shared_same_span - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
+    try t.expect(warm / mb > 9_500 and warm / mb < 11_000);
 
     // Every arm below is the SAME restore minus one conjunct of the checkout,
     // and every one of them SHARES — so every one of them is billed cold.
@@ -24268,8 +24410,11 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
         errdefer std.debug.print("shared arm {d} credited\n", .{i});
         try t.expect(!arm.will_donate);
         try t.expectEqual(@as(u64, 0), arm.creditedRows(reserved));
-        try t.expectEqual(cold, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, arm));
+        try t.expectEqual(shared_same_span, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, arm));
     }
+    // ...and `cold` is still the number a prompt with NO resident prefix pays,
+    // which is what the `.{}` arm above is for.
+    try t.expect(cold > shared_same_span);
 
     // The capacity gate still binds ON TOP of the checkout: a checked-out
     // entry whose buffer cannot cover the reservation grows, and a grow
@@ -24474,7 +24619,7 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     var q35 = qwen4ExpOomConfig();
     q35.model_type = "qwen3_5_moe";
     try t.expect(q35.ssmCheckpointBytes() > 0);
-    try t.expect(retainedSsmCheckpointBytes(&q35, seq, chunk) > 0);
+    try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
     // `will_donate` is warm-bill-b3's B-A3 field (audit): the KV credit fires
     // ONLY where the restore CHECKS OUT its entry, so a WarmPrefix that leaves
@@ -24775,4 +24920,179 @@ test "pinPrefillChunk: the explicit width and the hot-cache ask are both gated" 
     const gate_at = std.mem.indexOf(u8, chooser, "perRequestPrefillChunkEnabled(config)) return load_time_pin;") orelse return error.CallSiteMoved;
     const ovr_at = std.mem.indexOf(u8, chooser, "if (chunk_override > 0) return chunk_override;") orelse return error.CallSiteMoved;
     try t.expect(gate_at < ovr_at);
+}
+
+
+/// The live 2026-09-06 364k agent session, as `qwen4ExpOomConfig` plus the
+/// fields that separate the deployed pack from the #353 one: `indexer_budget`
+/// 2048 (not 512), four indexer heads, affine-4 weights, and the boot's
+/// `--ctx-size 786432`. With them the estimator reproduces the incident's own
+/// numbers to the megabyte — 16,233 MB at width 2048 and 13,664 MB at width
+/// 512 — which is what makes the decomposition below a measurement rather than
+/// an arithmetic exercise.
+fn qwen4ExpLive364kConfig() model_mod.ModelConfig {
+    var cfg = qwen4ExpOomConfig();
+    cfg.pinned_context = 786_432;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.quant_bits = 4;
+    cfg.quant_mode = .affine;
+    cfg.max_position_embeddings = 1_048_576;
+    return cfg;
+}
+
+test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
+    // LIVE 2026-09-06. Turn B: prompt 368,208, restored 364,478 by move from a
+    // 364,667-token entry, kv8, ctx 786,432. The narrowest width tried was 512
+    // and the bill came to 13,664 MB against 13,374 MB available — short by
+    // 290 MB, refused, and the refusal then cost the session its whole prefix.
+    //
+    // 1,795 MB of that bill was SSM checkpoints: `--ssm-checkpoint-max` (32) of
+    // them, billed because `seq / stride` saturates at 368k. But a warm prefill
+    // FORWARDS ONLY THE TAIL — 3,730 tokens — so it can capture at most eight,
+    // and the twelve the entry already holds are its own arrays, already
+    // resident, already inside `available`, and MERGED at commit rather than
+    // allocated (`mergeCheckpointLists`). The term billed 32 fresh captures for
+    // a prefill that makes 8.
+    const t = std.testing;
+    const cfg = qwen4ExpLive364kConfig();
+    const mb: u64 = 1024 * 1024;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const seq: u64 = 368_208;
+    const matched: u64 = 364_478;
+    const chunk: u64 = 512;
+    // Checkpointing never sub-divides the UNCAPPED base chunk, so the stride
+    // is `generate.prefill_chunk_override` (8192, the boot default and the
+    // live one) and not the adaptive per-chunk width. Stated explicitly: this
+    // decomposition is about a mutable global, and reading it out of the
+    // ambient test process is how a pinned number becomes a coin flip.
+    const saved_override = generate_mod.prefill_chunk_override;
+    defer generate_mod.prefill_chunk_override = saved_override;
+    generate_mod.prefill_chunk_override = 8192;
+    const stride: u64 = 8192;
+    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(ssm_checkpoint_stride, 8192));
+
+    // COLD is what it was: `matched = 0` is `seq / stride` (+ the always-on
+    // end snapshot), and at this length it saturates at --ssm-checkpoint-max
+    // exactly as before.
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
+    // WARM bills the aligned positions inside the span the prefill forwards,
+    // plus the end-of-prompt snapshot. A 3,730-token append at stride 8192
+    // crosses no stride boundary at all, so the end snapshot is the whole of
+    // it — which is what the live log shows (11 checkpoints -> 12 per turn).
+    try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
+    // A chain extension long enough to fill the ring still bills the cap: the
+    // credit is proportional to the SPAN, not a blanket warm discount.
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
+    // A span shorter than the backoff window snapshots nothing.
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
+
+    // THE BILL, TERM BY TERM, for the exact shape that was refused. Every term
+    // is reconstructed here from the same inputs `prefillMemoryNeeded` reads,
+    // so the sum below is the decomposition and not a second opinion.
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 418_224;
+    // The buffer the restore handed over: SMALLER than the reservation, so it
+    // GROWS, and a grow allocates the whole new capacity beside the old one.
+    // The warm KV credit is correctly ZERO here — a design limit of the
+    // reservation, not a bug in the credit (see the story).
+    const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
+    // Spelled without the production call's own shape: `warm.creditedRows(
+    // reserved)` is a scan needle pinning the ONE producer of the KV credit
+    // ("the shared prefix is subtracted EXACTLY once"), and a test that
+    // reproduces it makes that count read 2.
+    const reserve_rows = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(seq + transformer_mod.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
+    try t.expect(reserve_rows > turn_b.capacity_tokens);
+    try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
+
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
+    // On a GatedDeltaNet MoE the envelope is the STREAM arm, not 3 x MLP: 36
+    // linear layers hold a chunk-wide q/k/v stream and the MoE gather-sort
+    // replicates the hidden stream top_k times (`prefillStreamBytesPerToken`).
+    const mlp: u64 = 8 * chunk * @max(cfg.hidden_size, prefillFfnWidth(&cfg)) * 2;
+    const envelope: u64 = @max(3 * mlp, mlp + chunk * prefillStreamBytesPerToken(&cfg));
+    try t.expect(envelope > 3 * mlp);
+    const gross =
+        seq * kv_per_tok + // 4,584.6 MB  the prompt's own KV rows
+        terms.reserved_kv_bytes + //   108.4 MB  reservation headroom past the prompt
+        terms.state_bytes + // 1,932.4 MB  QSA key history + block-score bank
+        terms.checkpoint_bytes + //    56.1 MB  ONE new SSM checkpoint (was 1,795.5)
+        2 * seq * cfg.num_key_value_heads * cfg.head_dim * 2 + //   719.2 MB  KV dequant transient
+        envelope + //   665.0 MB  MLP envelope + the arch's own prefill streams
+        PREFILL_RUNTIME_FLOOR_BYTES; //   512.0 MB
+    // No score scratch (hd 256 is fused) and no dequant-GEMM weights (fwd 512
+    // is below PREFILL_DQ_GEMM_MIN_M) at this width.
+    try t.expect(transformer_mod.prefillHeadDimFused(@intCast(cfg.prefillScoreHeadDim())));
+    try t.expect(chunk < transformer_mod.PREFILL_DQ_GEMM_MIN_M);
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
+    try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
+
+    // AND THE VERDICT MOVES. 13,664 MB refused against 13,374 MB available;
+    // the honest checkpoint term brings it under, so the turn is served.
+    const available: u64 = 13_374 * mb;
+    try t.expect(needed < available);
+    try t.expectEqual(@as(u64, 11_490), needed / mb);
+    const before = gross - terms.checkpoint_bytes + @as(u64, ssm_checkpoint_max) * per_cp;
+    try t.expectEqual(@as(u64, 13_664), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
+}
+
+test "the live 364k session's admission numbers reproduce, to the megabyte" {
+    // The anchor for everything above: the estimator, fed the deployed pack's
+    // config and the incident's own prompt lengths, prints the incident's own
+    // numbers. Turn A was ADMITTED at 16,233 MB (the `[admission]` line is the
+    // connection thread's COLD bill, `warm = .{}`); Turn B's refusal quoted
+    // 13,664 MB at width 512.
+    const t = std.testing;
+    const cfg = qwen4ExpLive364kConfig();
+    const mb: u64 = 1024 * 1024;
+    const kv_bits: u64 = 8;
+    // Turn A, width 2048, prompt 364,509, max_gen 421,923.
+    try t.expectEqual(
+        @as(u64, 16_233),
+        prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
+    );
+    // Turn B, width 512, prompt 368,208, max_gen 418,224 — the refusal's own
+    // number, and it survives the warm checkpoint fix because a COLD bill has
+    // no matched prefix to credit.
+    try t.expectEqual(
+        @as(u64, 13_664),
+        prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
+    );
+}
+
+test "the MLX buffer pool is inside `available` by construction, so a refusal cannot buy it back" {
+    // The other candidate for the 290 MB Turn B was short by: `/props` reported
+    // 8,268 MB parked in MLX's reclaimable pool at the moment of the refusal,
+    // and a pool that `available` treated as spent would be 8 GB the refusal
+    // could have had for one `mlx_clear_cache()`.
+    //
+    // It does not. `currentGpuMemoryCeiling` adds `mlx_get_cache_memory` to the
+    // MLX footprint BEFORE taking the physical minimum, and `available` is then
+    // `ceiling - active_memory` — with `active` excluding the pool. So on the
+    // physical arm `available` IS `cache_bytes + free_system`: the pool is
+    // already fully credited, and clearing it moves the number by zero. The
+    // live readings agree — active 71,310 MB + available 20,814 MB = 92,124 MB,
+    // which is nowhere near the 120 GB wired limit, so the ceiling was
+    // physical. No clear is owed on the refusal path.
+    const t = std.testing;
+    const wired: u64 = 120 << 30;
+    const active: u64 = 71_310 << 20;
+    const pool: u64 = 8_268 << 20;
+    const free_system: u64 = 12_546 << 20;
+    const ceiling = physicalMemoryCeiling(wired, active + pool, free_system);
+    try t.expect(ceiling < wired); // the physical arm, as on the box
+    try t.expectEqual(pool + free_system, ceiling - active);
+    // Clearing the pool moves `free_system` up by exactly what it moves the
+    // footprint down by, so the ceiling — and `available` — do not move.
+    const cleared = physicalMemoryCeiling(wired, active, free_system + pool);
+    try t.expectEqual(ceiling, cleared);
+
+    // Scan-pinned: the pool is added to the footprint at the ONE site.
+    const src = @embedFile("server.zig");
+    const body = declBody(src, "fn currentGpuMemoryCeiling(") orelse return error.CallSiteMoved;
+    try t.expect(std.mem.indexOf(u8, body, "mlx.mlx_get_cache_" ++ "memory(&cache_mem)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "active_mem +| @as(u64, cache_" ++ "mem)") != null);
 }

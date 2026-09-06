@@ -6742,7 +6742,9 @@ pub const KVCacheSnapshot = struct {
     ///
     /// The price is ownership: the snapshot no longer holds the prefix, so
     /// whoever owns it must be replaced by the grown buffers or dropped.
-    /// `HotPrefixCache`'s checkout does both — see `Entry.checked_out_by`.
+    /// `HotPrefixCache` does both — and calls this only from `donateCheckout`,
+    /// at the last point before the slot's first write, so a request refused
+    /// before then still has an intact entry to hand back (`checkout_donated`).
     pub fn releaseHandles(self: *KVCacheSnapshot) void {
         for (self.entries) |*e| {
             freeKVEntry(e);

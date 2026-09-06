@@ -6287,6 +6287,16 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     dflash_restored = null;
     const mtp_pass = mtp_restored;
     mtp_restored = null;
+    // RESTORE BY MOVE, the transfer — and the LAST point at which nothing has
+    // written to `slot.cache`. Everything above (the restore, the admission
+    // pass, the eviction, the width re-ask) can still end this slot without a
+    // single forward, and `error.PrefillDoesNotFit` above does exactly that;
+    // until this line the entry keeps its own handles and `releaseCheckout`
+    // hands it back whole. Below it the buffers are the slot's and the record
+    // must be replaced by the commit or dropped. Placed AFTER the errdefer
+    // clears above for the same reason they are: nothing between here and
+    // `initWithOptions` may fail.
+    if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -7048,6 +7058,30 @@ test "every slot-end path releases a checked-out hot-cache entry" {
         @as(usize, 1),
         std.mem.count(u8, source, "hc.lookupAndRestoreForSlot("),
     );
+
+    // ...and it is DONATED in exactly one place, below every arm that can end
+    // the slot without a forward and above the first thing that writes to the
+    // cache. A donate that drifts above the admission pass restores the defect
+    // this ordering fixes: a refused prefill dropping the whole session.
+    try testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, source, "hc.donateCheckout(@intFromPtr("),
+    );
+    {
+        const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
+        const body = source[start..];
+        const restore = std.mem.indexOf(u8, body, "hc.lookupAndRestoreForSlot(") orelse
+            return error.RunPrefillDoesNotRestore;
+        const refuse = std.mem.indexOf(u8, body, "return error.PrefillDoesNot" ++ "Fit;") orelse
+            return error.RunPrefillDoesNotRefuse;
+        const donate = std.mem.indexOf(u8, body, "hc.donateCheckout(@intFromPtr(slot)") orelse
+            return error.RunPrefillDoesNotDonate;
+        const init_gen = std.mem.indexOf(u8, body, "Generator.initWithOptions(") orelse
+            return error.RunPrefillDoesNotInitGenerator;
+        try testing.expect(restore < refuse);
+        try testing.expect(refuse < donate);
+        try testing.expect(donate < init_gen);
+    }
 }
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
