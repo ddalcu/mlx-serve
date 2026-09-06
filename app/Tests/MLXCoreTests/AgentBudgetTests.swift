@@ -167,10 +167,31 @@ final class AgentBudgetTests: XCTestCase {
 
         XCTAssertTrue(script.contains("export ANTHROPIC_BASE_URL='http://localhost:11234'"))
         // Claude Code exposes CLAUDE_CODE_MAX_OUTPUT_TOKENS (verified present in
-        // the 2.1.x binary); it has NO context-window override, so that is the
-        // only budget lever we have on this CLI.
+        // the 2.1.x binary).
         XCTAssertTrue(script.contains("export CLAUDE_CODE_MAX_OUTPUT_TOKENS=\(b.output)"),
                       "missing output cap in:\n\(script)")
         XCTAssertTrue(script.contains("ANTHROPIC_DEFAULT_SONNET_MODEL=mlx-serve"))
+    }
+
+    /// Twin of the Zig launcher's "claude script declares the advertised
+    /// context window" test. Claude Code 2.1.x assumes 200k for any model
+    /// outside its own catalog and auto-compacts there;
+    /// CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented override, and like
+    /// every other agent's context field it is declared VERBATIM.
+    func testClaudeCodeExportsDeclareAdvertisedContext() {
+        let b = AgentBudget.forServerContext(786_432)
+        let script = AgentConfigs.claudeCodeExports(
+            baseURL: "http://localhost:11234", model: "mlx-serve", budget: b)
+        XCTAssertTrue(script.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432"),
+                      "missing context window in:\n\(script)")
+        XCTAssertTrue(script.hasSuffix("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432"),
+                      "context export must be the last line (no trailing newline)")
+
+        // An unknown context is not a claim: omit the export.
+        let unknown = AgentConfigs.claudeCodeExports(
+            baseURL: "http://localhost:11234", model: "mlx-serve",
+            budget: AgentBudget.Budget(context: 0, output: 8192))
+        XCTAssertFalse(unknown.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+        XCTAssertTrue(unknown.contains("export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192"))
     }
 }

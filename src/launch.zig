@@ -293,8 +293,13 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export ANTHROPIC_DEFAULT_HAIKU_MODEL={s}
                 \\export CLAUDE_CODE_SUBAGENT_MODEL={s}
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
-                \\claude --model {s}
-            , .{ base_url, model, model, model, model, budget.output, model });
+                \\
+            , .{ base_url, model, model, model, model, budget.output });
+            // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
+            if (budget.context > 0) {
+                try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
+            }
+            try out.print(allocator, "claude --model {s}", .{model});
         },
         .pi => {
             try out.print(allocator,
@@ -799,4 +804,20 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
     // Never exec an empty resolution — refuse with the install hint.
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "\n\"$CODEX_BIN\"") != null);
+}
+
+test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {
+    // Claude Code assumes 200k outside its catalog; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the override.
+    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432") != null);
+    try t.expect(std.mem.indexOf(u8, script, "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=65536") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\nclaude --model m1") != null);
+
+    // An unknown context is not a claim: omit the export rather than pin a
+    // number the server never advertised.
+    const unknown = try scriptFor(t.allocator, .claude, "http://x:1", "m1", .{ .context = 0, .output = 8192 }, null, &.{});
+    defer t.allocator.free(unknown);
+    try t.expect(std.mem.indexOf(u8, unknown, "CLAUDE_CODE_MAX_CONTEXT_TOKENS") == null);
+    try t.expect(std.mem.indexOf(u8, unknown, "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192") != null);
 }

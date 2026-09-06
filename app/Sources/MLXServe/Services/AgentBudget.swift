@@ -466,8 +466,15 @@ enum AgentConfigs {
     }
 
     /// Env exports for the Claude Code launch script (no trailing newline).
+    /// Twin of Zig `launch.scriptFor(.claude, …)` — change both together.
     static func claudeCodeExports(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
-        """
+        // A model outside Claude Code's own catalog is assumed to hold 200k and
+        // auto-compacted there; CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented
+        // override. Declared VERBATIM like every other agent's context field —
+        // and omitted entirely when the server advertised nothing.
+        let contextExport = budget.context > 0
+            ? "\nexport CLAUDE_CODE_MAX_CONTEXT_TOKENS=\(budget.context)" : ""
+        return """
         export ANTHROPIC_BASE_URL='\(baseURL)'
         export ANTHROPIC_API_KEY=
         export ANTHROPIC_AUTH_TOKEN=mlx-serve
@@ -476,7 +483,7 @@ enum AgentConfigs {
         export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
         export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
         export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
-        export CLAUDE_CODE_MAX_OUTPUT_TOKENS=\(budget.output)
+        export CLAUDE_CODE_MAX_OUTPUT_TOKENS=\(budget.output)\(contextExport)
         """
     }
 }

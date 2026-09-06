@@ -33,6 +33,9 @@ const gen_mod = @import("gen.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
 
+/// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
+pub var load_generation = std.atomic.Value(u64).init(0);
+
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -974,6 +977,7 @@ pub const ModelRegistry = struct {
     /// populated weights/transformer/etc on `entry`; this just updates
     /// the bookkeeping + state field.
     pub fn markReadyLocked(self: *ModelRegistry, entry: *LoadedModel, bytes_resident: u64) void {
+        _ = load_generation.fetchAdd(1, .monotonic);
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
@@ -1104,6 +1108,25 @@ pub const ModelRegistry = struct {
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(null));
+    }
+
+    test "a qwen4_exp config refusal keeps its own name in the 503 text" {
+        // Load-time bound checks refuse by NAME; never rewrite them into a memory diagnosis.
+        for ([_][]const u8{
+            "InvalidQwen4ConfigField",
+            "InvalidQwen4NgramSize",
+            "InvalidQwen4NgramHeads",
+            "InvalidQwen4NgramVocab",
+            "InvalidQwen4Indexer",
+            "InvalidQwen4PleLayer",
+            "Qwen4PleNotInstalled",
+            "NgramTableHeader",
+            "NgramTableBits",
+            "NgramTableRegion",
+            "NgramTableTruncated",
+        }) |name| {
+            try std.testing.expectEqual(error.LoadFailed, loadErrorFromName(name));
+        }
     }
 
     /// Mark an entry as `.error_state` and store `error_name` (duped).

@@ -10,8 +10,10 @@
 #       carries the server's ADVERTISED context (never a hardcoded one)
 #   [4] launch codex --print: config.toml targets our /v1/responses
 #       (wire_api = "responses") with the advertised context
-#   [5] launch claude --print: env-only script, no config file, output budget
-#       derived from the advertised context
+#   [5] launch claude --print: env-only script, no config file, ADVERTISED
+#       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
+#       Claude Code assumes 200k and auto-compacts there) + the derived output
+#       budget
 #   [6] extra args after -- ride the agent invocation line
 #
 # The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
@@ -111,11 +113,14 @@ EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 4)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
 echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$EXPECT_OUT" || OK=0
+# Without this, Claude Code assumes 200k for an off-catalog model and
+# auto-compacts there — a 786k server driven as a 200k one.
+echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$ADV_CTX" || OK=0
 echo "$OUT" | grep -q "claude --model $MODEL_ID" || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "claude script is env-only with the derived output budget" PASS
+    run_test "claude script is env-only with the advertised context + derived output budget" PASS
 else
-    run_test "claude script is env-only with the derived output budget" FAIL "$OUT"
+    run_test "claude script is env-only with the advertised context + derived output budget" FAIL "$OUT"
 fi
 
 # ── [6] passthrough args ──

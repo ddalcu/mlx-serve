@@ -39,6 +39,7 @@ test {
     _ = @import("status.zig");
     _ = @import("sleep_inhibit.zig");
     _ = @import("kv_disk_cache.zig");
+    _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");

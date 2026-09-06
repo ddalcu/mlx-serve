@@ -1691,3 +1691,20 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+
+## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
+
+`NgramHash.init` wrote `[MAX_HEADS]` and `[MAX_NGRAM_SIZE]` arrays from
+`heads_per_ngram` and `ngram_size` behind a `std.debug.assert`, which is
+compiled out of every ReleaseFast binary we ship: a config claiming 16 heads
+wrote 64 i64s into two 32-element arrays. The indexer's `compress_ratio` was
+never checked (a zero divisor is illegal behaviour, not a trap), the n-gram
+table header was read with bare `.?`/`.string`/`.array` unwraps on a 32 GB
+mmap the engine then slices with, and nothing proved the PLE was ever
+installed (placement is by exact equality against `ple_layer_idx`; an absent
+or out-of-trunk id built a trunk with no n-gram term that emitted plausible
+text). `model.validateQwen4Config` reads every bound strictly and refuses by
+NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
+reaching the client as `Model load failed: <name>`), `NgramTable.parse`
+checks every header field and proves every region sits inside the mapping,
+and a PLE the layer loop never installed is a load error.

@@ -42,6 +42,30 @@ pub var prefill_chunk_override: usize = 8192;
 pub var prefill_chunk_explicit: bool = false;
 pub var prefill_trace_force: bool = false;
 
+/// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
+pub fn envPrefillChunk() usize {
+    return readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
+}
+
+/// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
+/// `server.adaptivePrefillWidth`.
+/// The one place a chosen width becomes the running width.
+pub fn commitAdaptiveWidth(cur: *usize, st: *AdaptiveWidthState, w: u32) void {
+    cur.* = w;
+    st.transitions +|= 1;
+    st.width_min = @min(st.width_min, w);
+    st.width_max = @max(st.width_max, w);
+}
+
+pub const AdaptiveWidthState = struct {
+    supporting: u8 = 0,
+    /// One-way ratchet: a prefill that has stepped down never widens again.
+    ratcheted: bool = false,
+    transitions: u32 = 0,
+    width_min: u32 = 0,
+    width_max: u32 = 0,
+};
+
 /// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 /// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
@@ -49,6 +73,19 @@ pub var prefill_trace_force: bool = false;
 /// 54.0%) and 4.2 decode tok/s for ZERO prefill benefit (184.7 vs 185.1
 /// tok/s); at 32K it was a wash. Qwen's stock head drafts from deep history.
 pub var mtp_history_window_override: usize = 0;
+
+/// `--max-mtp-ctx N`: MTP stays off past N context tokens (0 = unlimited). Read by the HTTP
+/// admission gate and by `nextMtp` per round (`mtp.mtpCtxWithinLimit`).
+pub var max_mtp_ctx: u32 = 0;
+
+/// Why a request left speculative decoding for the rest of its generation.
+pub const SpecDisableReason = enum {
+    none,
+    acceptance,
+    max_ctx,
+    /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
+    adaptive,
+};
 
 /// Effective MTP history window for a prefill forwarding `prefix_len`
 /// positions: 0 (capture everything) unless windowing is on AND the tail is
@@ -178,6 +215,16 @@ fn readEnvUsize(name: [:0]const u8, default: usize) usize {
     return std.fmt.parseInt(usize, slice, 10) catch default;
 }
 
+/// Read a finite, non-negative float from an environment variable, else `default`.
+fn readEnvFloat(name: [:0]const u8, default: f32) f32 {
+    const raw = std.c.getenv(name.ptr);
+    if (raw == null) return default;
+    const slice = std.mem.sliceTo(raw.?, 0);
+    if (slice.len == 0) return default;
+    const v = std.fmt.parseFloat(f32, slice) catch return default;
+    return if (std.math.isFinite(v) and v >= 0) v else default;
+}
+
 /// Truthy if the env var is exactly "1". Anything else (unset, "0", "true",
 /// "yes") is false — keep matching surface tight to avoid surprises.
 fn readEnvBool(name: [:0]const u8) bool {
@@ -202,6 +249,15 @@ pub const MtpHeadRef = union(enum) {
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Transformer,
+
+    /// Is this head's decode state module-owned (one per model, `Qwen4Mtp.cache`) rather
+    /// than per-request? Both the scheduler and the sticky-serial arm ask this.
+    pub fn moduleOwned(self: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen => false,
+            .qwen4 => true,
+        };
+    }
 
     pub fn makeCache(self: MtpHeadRef, allocator: std.mem.Allocator) !MtpCacheRef {
         return switch (self) {
@@ -350,6 +406,22 @@ pub const MtpHeadRef = union(enum) {
     }
 };
 
+/// `MLX_SERVE_MTP_HEAD_PERSIST=0`: the qwen4_exp head's committed history is neither
+/// snapshotted into a prefix-cache entry nor restored from one.
+var mtp_head_persist_env: ?bool = null;
+/// Only a literal "0" turns persistence off.
+pub fn mtpHeadPersistFromEnv(raw: ?[]const u8) bool {
+    const v = raw orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
+pub fn mtpHeadPersistEnabled() bool {
+    if (mtp_head_persist_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MTP_HEAD_PERSIST");
+    const on = mtpHeadPersistFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+    mtp_head_persist_env = on;
+    return on;
+}
+
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
@@ -363,14 +435,20 @@ pub const MtpCacheRef = union(enum) {
     }
 
     /// The underlying KVCache — what the prefix cache's spec-snap machinery
-    /// snapshots and restores. Null when the head's state is NOT KV-only:
-    /// the qwen4 head also owns QSA key history + pooled blocks + its own
-    /// row count, so a KV-only restore would leave stale rows under a fresh
-    /// aux state — it is neither committed nor restored.
+    /// snapshots and restores. The qwen4 head's state is not KV-only, so a caller taking this
+    /// pointer must also carry `head()`. Null when head persistence is off.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
-            .qwen4 => null,
+            .qwen4 => |t| if (mtpHeadPersistEnabled()) &t.qwen4_mtp.?.cache else null,
+        };
+    }
+
+    /// The Transformer owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
+    pub fn head(self: *MtpCacheRef) ?*Transformer {
+        return switch (self.*) {
+            .qwen => null,
+            .qwen4 => |t| if (mtpHeadPersistEnabled()) t else null,
         };
     }
 
@@ -680,6 +758,19 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// score-budget slack `boundedPrefillChunk` already carries.
 pub const TAIL_MERGE_MAX: usize = 512;
 
+/// The tail a chunk of `default_chunk` tokens may absorb where the width is chosen per chunk:
+/// an eighth of the width keeps the flat 512's ~6% bound at every rung (at the ladder floor
+/// 512 is +100% of the transient a step-down just bought). Reach it through `tailMergeMaxFor`.
+pub fn tailMergeMax(default_chunk: usize) usize {
+    return @min(TAIL_MERGE_MAX, @max(default_chunk / 8, 1));
+}
+
+/// The tail bound the chunk loop uses: scaled only under the per-chunk adaptive width, the
+/// flat constant everywhere else (chunk boundaries are not byte-stable).
+pub fn tailMergeMaxFor(default_chunk: usize, adaptive_width: bool) usize {
+    return if (adaptive_width) tailMergeMax(default_chunk) else TAIL_MERGE_MAX;
+}
+
 pub fn nextChunkEnd(
     pos: usize,
     prefix_len: usize,
@@ -687,6 +778,8 @@ pub fn nextChunkEnd(
     want_ssm_cp: bool,
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
+    // Is the per-chunk adaptive width live for this prefill? Only then does the merge bound scale.
+    adaptive_width: bool,
 ) usize {
     var end = @min(pos + default_chunk, prefix_len);
     if (want_ssm_cp and ssm_cp_stride > 0) {
@@ -699,7 +792,7 @@ pub fn nextChunkEnd(
             return next_boundary_abs - ssm_cp_offset;
         }
     }
-    if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
+    if (end < prefix_len and prefix_len - end < tailMergeMaxFor(default_chunk, adaptive_width)) {
         // Absorb a tiny tail instead of paying a full graph build + eval
         // barrier for a few tokens. With checkpointing active this can only
         // extend within a boundary-free span (the boundary case returned
@@ -764,6 +857,25 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     return @max(base, prefill_chunk);
 }
 
+/// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
+/// long prefill pays, at the price of allocating generation headroom early. Gated on
+/// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
+/// `MLX_SERVE_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+pub fn reservedPrefillTokens(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u64,
+    chunk: u64,
+) u64 {
+    if (!config.longCtxGated()) return 0;
+    return transformer_mod.KVCache.reservedTokens(
+        seq,
+        max_tokens,
+        chunk,
+        config.max_position_embeddings,
+    );
+}
+
 /// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
 /// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
 /// equal images) — so vision prefills skip checkpointing even now that they
@@ -820,11 +932,12 @@ pub fn prefillChunkCount(
     want_ssm_cp: bool,
     ssm_cp_stride: usize,
     ssm_cp_offset: usize,
+    adaptive_width: bool,
 ) usize {
     var pos: usize = 0;
     var n: usize = 0;
     while (pos < prefix_len) {
-        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+        const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
         pos = end;
         n += 1;
     }
@@ -1048,6 +1161,8 @@ pub const Generator = struct {
     // KV cache — OWNED by the Generator (built during prefill, freed in
     // `deinit`).
     mtp: ?MtpHeadRef = null,
+    /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
+    model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
     /// Absolute target position represented by MTP-cache position 0. Usually
     /// zero; nonzero when the head keeps only a suffix of a restored/long
@@ -1178,6 +1293,24 @@ pub const Generator = struct {
     // per-step verify overhead. The flag is sticky for the rest of the
     // generation; we never re-enable speculation within a single request.
     spec_disabled_runtime: bool = false,
+    /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
+    spec_disable_reason: SpecDisableReason = .none,
+    /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
+    mtp_adaptive: MtpAdaptive = .{},
+    /// This request has released the module-owned MTP head (sticky serial arm reached a serial
+    /// block boundary). Per request: one slow request must not turn MTP off process-wide.
+    mtp_head_released: bool = false,
+    /// This request's realized MTP price (ms per emitted token) over a trailing window.
+    mtp_price: MtpPriceWindow = .{},
+    /// Ticks left in a bounded serial block (the serial probe); the slot stays an MTP slot.
+    mtp_serial_left: u32 = 0,
+    /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
+    mtp_serial_exit: MtpSerialExit = .none,
+    /// Ticks of the current serial block spent warming (the previous round's tail).
+    mtp_serial_warm: u32 = 0,
+    mtp_serial_giveup_logged: bool = false,
+    /// Inter-tick wall clock feeding the table's serial cell. Null = the next read seeds.
+    mtp_serial_clock: ?io_util.Stopwatch = null,
     /// Yield-gate counters: enabled-mode `nextPld` steps and drafted tokens
     /// accepted since the last (re-)enable. Reset on mid-request re-enable so
     /// a fresh workload region (e.g. file echo after a novel preamble) gets a
@@ -1382,7 +1515,7 @@ pub const Generator = struct {
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
-        const table_bucket = round_cost.bucketFor(self.mtpKvLen());
+        const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dspark_attempted));
@@ -1407,7 +1540,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1417,6 +1550,9 @@ pub const Generator = struct {
                     self.mtp_drafted_tokens,
                     self.mtp_ext_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
+                    @tagName(self.spec_disable_reason),
+                    @tagName(self.mtp_adaptive.arm),
+                    self.xfm.round_cost.serialMsPerTok(table_bucket) orelse 0.0,
                     self.mtp_ev_sync_ms,
                     self.mtp_ev_round_ms,
                     if (self.mtp_regime.two_tok > 0) self.mtp_regime.two_ms / self.mtp_regime.two_tok else 0.0,
@@ -1424,11 +1560,14 @@ pub const Generator = struct {
                     self.mtp_regime.verdict_round,
                     self.mtp_regime.trials,
                     self.mtp_width_trial.trials,
-                    round_cost.BUCKET_NAMES[table_bucket],
+                    round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
+                    self.xfm.round_cost.serial_dropped_transition,
+                    self.xfm.round_cost.serial_dropped_contended,
+                    self.xfm.round_cost.serial_dropped_bad,
                 },
             );
             return;
@@ -1455,7 +1594,7 @@ pub const Generator = struct {
                     per_draft_pct,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
                     if (self.spec_disabled_runtime) "true" else "false",
-                    round_cost.BUCKET_NAMES[table_bucket],
+                    round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
                     self.xfm.round_cost.dropped_transition,
                     self.xfm.round_cost.dropped_contended,
@@ -1604,6 +1743,8 @@ pub const Generator = struct {
         mtp_enabled: bool = false,
         /// Non-owning pointer to the loaded MTP head.
         mtp: ?MtpHeadRef = null,
+        /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
+        model_has_mtp: bool = false,
         /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-depth` not
         /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_NAX_CAP
         /// for the measured M5 target+sidecar profile, otherwise
@@ -1642,10 +1783,8 @@ pub const Generator = struct {
         /// Chunked prefill aligns chunk ends to stride positions so each
         /// snapshot reflects a coherent state.
         ssm_checkpoint_stride: u32 = 0,
-        /// Cap on the number of checkpoints retained. The first stride-aligned
-        /// position is always captured; if more would land than `ssm_checkpoint_max`,
-        /// the oldest checkpoints are dropped to keep the latest run of
-        /// positions. 0 = unlimited (rely on the hot-cache byte budget to bound).
+        /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
+        /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
@@ -1707,11 +1846,36 @@ pub const Generator = struct {
         /// runs atomically (pre-interleave behavior, and the
         /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch).
         interleave_hook: ?InterleaveHook = null,
+        /// SSD-first write-through (qwen4_exp only; see `WriteThroughHook`).
+        write_through_hook: ?WriteThroughHook = null,
+        /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
+        /// `mlx_clear_cache` and before the interleave tick. Null keeps the admitted width.
+        /// Presence is NOT the arch gate (`serve` installs it process-wide); read `adaptive_chunk_width`.
+        chunk_width_hook: ?ChunkWidthHook = null,
+        /// Is the per-chunk adaptive width live for this request (`server.adaptivePrefillChunkEnabled`)?
+        /// The only thing that may widen `tailMergeMaxFor`'s bound.
+        adaptive_chunk_width: bool = false,
     };
 
     pub const InterleaveHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque) void,
+    };
+
+    /// SSD-first write-through: called at every completed prefill chunk with the absolute KV
+    /// position and the SSM checkpoints so far, so a cancelled prefill leaves a restorable prefix.
+    pub const WriteThroughHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
+    };
+
+    /// Returns the width the next chunk should run at (`cur` unchanged = no change).
+    pub const ChunkWidthHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *AdaptiveWidthState) u32,
+        /// Re-price a widen after the interleave tick has allocated for co-tenant slots. A
+        /// step-down needs no confirmation: it is the safe direction.
+        confirm: *const fn (ctx: *anyopaque, pos: usize, want: u32) bool,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -2012,6 +2176,10 @@ pub const Generator = struct {
         // so that path is byte-identical to the old whole-prompt behavior.
         const vision_chunked = has_vision and visionChunkedPrefillEnabled();
         var vision_rows_consumed: usize = options.vision_rows_before;
+        var adapt_state: AdaptiveWidthState = .{
+            .width_min = @intCast(PREFILL_CHUNK),
+            .width_max = @intCast(PREFILL_CHUNK),
+        };
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
@@ -2022,10 +2190,46 @@ pub const Generator = struct {
             // below keeps the row scatter chunk-exact. Kill switch restores
             // the whole-prompt forward.
             const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
+            // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
+            // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
+            // for this prompt, never wider than `ssm_cp_stride`.
+            const adapt_chunked = !(has_vision and !vision_chunked);
+            // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
+            // (installed process-wide).
+            const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
+            const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
+                xfm.config.prefillScoreHeadDim(),
+                xfm.config.num_attention_heads,
+                total_ctx_for_chunk,
+                xfm.config.has_sliding_window,
+                xfm.config.isMoe(),
+                0,
+            ));
+            adapt_state.width_min = @intCast(default_chunk);
+            adapt_state.width_max = @intCast(default_chunk);
+            var cur_chunk: usize = default_chunk;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
             const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
+
+            // Reserve the whole request's cache capacity before the first chunk writes: a grow
+            // is not in place, so a long prefill's peak carried a second copy of everything so
+            // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
+            // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
+            // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
+            const cp_thin: transformer_mod.ThinPolicy =
+                if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
+
+            const reserved_tokens = reservedPrefillTokens(
+                &xfm.config,
+                total_ctx_for_chunk,
+                max_tokens,
+                default_chunk,
+            );
+            ctx.cache.reserve(@intCast(reserved_tokens));
+            // The arch's own per-request buffers reserve at the same length.
+            transformer_mod.reserveQsaHistory(ctx.ssm_entries, @intCast(reserved_tokens));
 
             var pos: usize = 0;
             while (pos < loop_end) {
@@ -2047,7 +2251,7 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    transformer_mod.attachQsaHistoryOnHandoff(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
@@ -2058,6 +2262,9 @@ pub const Generator = struct {
                         return error.Cancelled;
                     }
                 }
+                // An MLX failure in a previous chunk latched instead of killing the process (#353);
+                // abandon this request, keep the server. No checkpoint salvage: the state failed.
+                try mlx.checkError();
                 // Pick this chunk's end. Normal path: hit the configured chunk
                 // size. Phase 1 path: if a checkpoint stride boundary lands
                 // inside the would-be chunk, shrink the chunk so it ends
@@ -2068,7 +2275,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
@@ -2195,6 +2402,11 @@ pub const Generator = struct {
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
 
+                // This chunk's latch, read before anything persists it, snapshots it or yields
+                // the thread: Metal returns zeros before it aborts, so a later read let the
+                // write-through index garbage and a co-tenant decode eat the latch.
+                try mlx.checkError();
+
                 // Phase 1: snapshot SSM state at stride-aligned boundaries.
                 // We snapshot AFTER the eval above so the underlying buffers
                 // are realized; the snapshot is just a refcount-share of the
@@ -2203,17 +2415,15 @@ pub const Generator = struct {
                 if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
                     const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     try ssm_checkpoints.append(allocator, cp);
-                    // Keep the buffer bounded — drop the oldest if we've
-                    // accumulated more than the configured max. Front-removal
-                    // is O(n) but `n` is tiny (≤ ssm_checkpoint_max). We keep
-                    // the latest positions because they're closer to the
-                    // end-of-prompt, which is where most multi-turn warm
-                    // requests match.
+                    // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
+                    // the last `max * stride` tokens and left no affordable trim point.
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
-                        oldest.deinit(allocator);
+                        var dropped = ssm_checkpoints.orderedRemove(
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
+                        );
+                        dropped.deinit(allocator);
                     }
                 }
 
@@ -2230,11 +2440,55 @@ pub const Generator = struct {
                 // Publish progress once per chunk — same cadence discipline as
                 // `inflight_generated_tokens` (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+                // Persist this chunk now: the KV bytes for [0, pos) are final.
+                if (options.write_through_hook) |wt| {
+                    wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
+                }
+                // The next chunk's width, re-priced at this boundary: after the `mlx_clear_cache`
+                // (steady state) and before the interleave tick (a co-tenant's decode is not this
+                // prefill's pressure). A step-down commits here; a widen is re-priced after the tick.
+                var pending_widen: u32 = 0;
+                var widen_confirm: ?*const fn (*anyopaque, usize, u32) bool = null;
+                var widen_ctx: ?*anyopaque = null;
+                if (adapt_chunked and pos < loop_end) {
+                    if (options.chunk_width_hook) |hk| {
+                        const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
+                        if (next_w != 0 and next_w != cur_chunk) {
+                            if (next_w < cur_chunk) {
+                                commitAdaptiveWidth(&cur_chunk, &adapt_state, next_w);
+                            } else {
+                                pending_widen = next_w;
+                                widen_confirm = hk.confirm;
+                                widen_ctx = hk.ctx;
+                            }
+                        }
+                    }
+                }
                 // Yield to the scheduler between chunks — never after the
                 // last (the post-prefill decode tick covers that boundary).
                 if (pos < loop_end) {
                     if (options.interleave_hook) |hk| hk.call(hk.ctx);
                 }
+                // The tick allocated for co-tenant slots; re-price the widen against what is left.
+                if (pending_widen != 0) {
+                    if (widen_confirm) |cf| {
+                        if (cf(widen_ctx.?, ssm_cp_offset + pos, pending_widen)) {
+                            commitAdaptiveWidth(&cur_chunk, &adapt_state, pending_widen);
+                        } else {
+                            adapt_state.supporting = 0;
+                        }
+                    }
+                }
+            }
+            try mlx.checkError();
+            // One line per request when the width moved.
+            if (adapt_state.transitions > 0) {
+                log.info("[prefill] adaptive: {d} chunks, width {d}..{d}, {d} change(s)\n", .{
+                    n_chunks,
+                    adapt_state.width_min,
+                    adapt_state.width_max,
+                    adapt_state.transitions,
+                });
             }
 
             // Phase 1: always-on snapshot at the post-prefill position
@@ -2271,14 +2525,17 @@ pub const Generator = struct {
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
-                        var oldest = ssm_checkpoints.orderedRemove(0);
-                        oldest.deinit(allocator);
+                        var dropped = ssm_checkpoints.orderedRemove(
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
+                        );
+                        dropped.deinit(allocator);
                     }
                 }
                 // One copy of the QSA key history on the latest snap. Stride
                 // captures skipped it so a 400k prefill is not 32× the
-                // indexer buffer.
-                if (ssm_checkpoints.items.len > 0) {
+                // indexer buffer. With the share switch on nothing is attached here: the newest
+                // snap takes a view of the live buffer at commit (`handoffQsaHistoryToLatest`).
+                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) {
                     try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s);
                 }
             }
@@ -2387,11 +2644,13 @@ pub const Generator = struct {
             const total_ns = prefill_sw.read();
             const ms = std.time.ns_per_ms;
             std.debug.print(
-                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
+                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunk_widths={d}..{d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
                 .{
                     prompt_ids.len,
                     n_chunks,
                     PREFILL_CHUNK,
+                    adapt_state.width_min,
+                    adapt_state.width_max,
                     chunked_ns / ms,
                     eval_ns / ms,
                     last_ns / ms,
@@ -2433,6 +2692,7 @@ pub const Generator = struct {
             }
             var gen = Generator{
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = 0,
@@ -2484,6 +2744,7 @@ pub const Generator = struct {
                 0;
             var gen = Generator{
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = @intCast(first_val),
@@ -2560,6 +2821,7 @@ pub const Generator = struct {
             var gen = Generator{
                 .pending_logprob = first_lp,
                 .xfm = xfm,
+                .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
                 .next_token_id = @intCast(first_val),
@@ -2616,6 +2878,7 @@ pub const Generator = struct {
         var gen = Generator{
             .pending_logprob = first_lp,
             .xfm = xfm,
+            .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
             .tok = tok,
             .next_token_id = @intCast(val),
@@ -2852,12 +3115,16 @@ pub const Generator = struct {
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
-        const lazy = self.sampleLazy(step_logits);
-        _ = mlx.mlx_array_free(step_logits);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        // With the latch these checks return instead of ending the process, so the handle needs an owner.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(step_logits);
+            _ = mlx.mlx_array_free(step_logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
         self.next_token_id = @intCast(val);
         return .{ .drained = token };
     }
@@ -3997,7 +4264,7 @@ pub const Generator = struct {
                         log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
                             ch.current,
                             if (ch.current == 0) "serial" else "block",
-                            round_cost.BUCKET_NAMES[b],
+                            round_cost.bucketName(self.xfm.round_cost.layout, b),
                             self.xfm.round_cost.formatBucket(b, &buf),
                         });
                     }
@@ -4995,11 +5262,206 @@ pub const Generator = struct {
         if (self.spec_disabled_runtime) return;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
+        // The plan itself can end speculation or park the request on a serial probe.
+        if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return;
         var chain = try self.mtpChainInit(allocator, plan, self.next_token_id);
         errdefer chain.deinit(allocator);
         try self.mtpChainBuild(&chain, 0, plan.m_lo);
         try mtpChainDispatch(&chain, 0, plan.m_lo);
         self.mtp_pre_draft = chain;
+    }
+
+    // Serial blocks inside nextMtp. Leaving MTP is cheap; coming back needs `t1 NOT in cache`
+    // and an `h_prev` for that position: `drainPipelineForSpec` lands the first, the capture
+    // tick the second. The head's committed history does not grow across a serial block
+    // (a content gap that costs acceptance for a while); M-RoPE turns never come back.
+
+    /// Will this serial block be left behind? Only then is applying the deferred history stash worth a head forward.
+    fn mtpSerialMayResume(self: *const Generator) bool {
+        if (self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) return true;
+        return self.spec_disable_reason == .adaptive and self.mtpAdaptiveHeadMayResume();
+    }
+
+    /// Leave the head cleanly for a serial block; `apply_stash` applies the deferred history
+    /// stash so the head history is complete up to the block. Idempotent.
+    fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
+        if (self.mtp_pre_draft) |*pd| {
+            pd.deinit(allocator);
+            self.mtp_pre_draft = null;
+        }
+        if (!apply_stash) return;
+        var st = self.mtp_hist_stash orelse return;
+        self.mtp_hist_stash = null;
+        defer st.deinit();
+        const mc = &self.mtp_cache.?;
+        try mc.truncate(st.off0, self.xfm.s);
+        // A committed-history append: the mixer and the vocab projection are dead work.
+        const out = try self.mtp.?.forward(
+            self.xfm,
+            mc,
+            st.ids,
+            st.hidden,
+            @intCast(st.off0),
+            .none,
+            self.mtpMropeContext(),
+        );
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
+        if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
+        if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+    }
+
+    fn mtpSerialOneToken(allocator: std.mem.Allocator, tok: u32) !DrafterStepResult {
+        const tokens = try allocator.alloc(u32, 1);
+        tokens[0] = tok;
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+    }
+
+    /// Inter-tick wall clock for the table's serial cell (twin of `mtpRegimeWallMs`). Null on the first read of a block.
+    fn mtpSerialWallMs(self: *Generator) ?f32 {
+        if (self.mtp_serial_clock) |*c| {
+            const ns = c.read();
+            c.reset();
+            return @as(f32, @floatFromInt(ns)) / @as(f32, std.time.ns_per_ms);
+        }
+        self.mtp_serial_clock = io_util.Stopwatch.init(self.timer.io);
+        return null;
+    }
+
+    /// Model-level twin of `mtpAdaptiveArchEligible`: only the in-checkpoint qwen4 head was
+    /// calibrated. `model_has_mtp` alone let every sidecar pack fold a cell nothing reads.
+    pub fn mtpAdaptiveModelEligible(model_has_mtp: bool, module_head_loaded: bool) bool {
+        return model_has_mtp and module_head_loaded;
+    }
+
+    fn mtpAdaptiveModelOk(self: *const Generator) bool {
+        return mtpAdaptiveModelEligible(self.model_has_mtp, self.xfm.qwen4_mtp != null);
+    }
+
+    /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
+    /// per-request `enable_mtp:false` on a calibrated checkpoint is the cleanest serial sample.
+    pub fn serialCellWanted(self: *const Generator) bool {
+        if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
+        if (!self.mtpAdaptiveModelOk()) return false;
+        // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
+        if (!self.model_has_mtp) return false;
+        return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
+    }
+
+    /// Drop the serial cell's pending interval: something ran between two decode ticks that
+    /// was not decode (a prefill chunk under `interleaveDecodeTick`).
+    pub fn invalidateSerialClock(self: *Generator) void {
+        self.mtp_serial_clock = null;
+        self.mtp_serial_warm = 0;
+    }
+
+    /// Fold one plain serial decode token into the model's serial cell. The first
+    /// `MTP_ADAPTIVE_PROBE_WARM` ticks of a block are transitions; contention restarts the clock.
+    pub fn observeSerialTick(self: *Generator) void {
+        if (!self.serialCellWanted()) {
+            self.mtp_serial_clock = null;
+            self.mtp_serial_warm = 0;
+            return;
+        }
+        if (!self.spec_cost_solo) {
+            self.mtp_serial_clock = null;
+            self.mtp_serial_warm = 0;
+            return;
+        }
+        const ms = self.mtpSerialWallMs() orelse return;
+        const warm = self.mtp_serial_warm < MTP_ADAPTIVE_PROBE_WARM;
+        if (warm) self.mtp_serial_warm += 1;
+        _ = self.xfm.round_cost.observeSerial(self.mtpKvLen(), ms, true, warm);
+    }
+
+    /// May `mtpSerialCaptureTick` run? It forwards the one pending token with capture, so
+    /// pipelined logits or a pipelined token would publish a hidden for an uncommitted row.
+    /// A runtime check: `std.debug.assert` compiles to nothing in ReleaseFast.
+    pub fn mtpSerialCaptureReady(has_pending_logits: bool, has_pending_token: bool) bool {
+        return !has_pending_logits and !has_pending_token;
+    }
+
+    /// Abandon the ramp back to MTP and finish this request on the serial arm. Logged once per request.
+    fn mtpSerialGiveUp(self: *Generator, allocator: std.mem.Allocator, why: []const u8) !?DrafterStepResult {
+        if (!self.mtp_serial_giveup_logged) {
+            self.mtp_serial_giveup_logged = true;
+            log.info("  [mtp] adaptive: {s} at the serial exit -> serial for the rest of the request\n", .{why});
+        }
+        self.mtp_serial_exit = .none;
+        self.mtp_serial_left = 0;
+        self.spec_disabled_runtime = true;
+        self.spec_disable_reason = .adaptive;
+        const tok = try self.next(allocator) orelse return null;
+        return try mtpSerialOneToken(allocator, tok);
+    }
+
+    /// One tick of a serial block. `.none` is the real serial arm; `.drain` and `.capture` are the exit ramp.
+    fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.mtp_serial_exit == .capture) return try self.mtpSerialCaptureTick(allocator);
+        if (self.mtp_serial_exit == .drain) {
+            switch (try self.drainPipelineForSpec(allocator)) {
+                .stopped => return null,
+                .stay_disabled => return try self.mtpSerialGiveUp(allocator, "unexpected pipeline state"),
+                .already_clean => {
+                    self.mtp_serial_exit = .capture;
+                    return try self.mtpSerialCaptureTick(allocator);
+                },
+                .drained => |tok| {
+                    self.mtp_serial_exit = .capture;
+                    return try mtpSerialOneToken(allocator, tok);
+                },
+            }
+        }
+        const tok = try self.next(allocator) orelse return null;
+        self.observeSerialTick();
+        if (self.mtp_serial_left > 0) {
+            self.mtp_serial_left -= 1;
+            if (self.mtp_serial_left == 0) self.mtp_serial_exit = .drain;
+        }
+        return try mtpSerialOneToken(allocator, tok);
+    }
+
+    /// The one synchronous step that ends a serial block: forward the pending token with
+    /// capture and sample its successor without forwarding it (`nextMtp`'s entry invariant).
+    fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (!mtpSerialCaptureReady(self.has_pending_logits, self.has_pending_token)) {
+            return try self.mtpSerialGiveUp(allocator, "pipeline not drained");
+        }
+        if (try self.checkStop()) return null;
+        const token = self.next_token_id;
+        const tok_i32: i32 = @intCast(token);
+        const tok_shape = [_]c_int{ 1, 1 };
+        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tok_input);
+
+        var hidden = mlx.mlx_array_new();
+        const logits = self.xfm.forwardWithCapture(&self.ctx, tok_input, &hidden) catch |e| {
+            _ = mlx.mlx_array_free(hidden);
+            return e;
+        };
+        defer _ = mlx.mlx_array_free(logits);
+        if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
+        self.last_hidden = hidden;
+        self.has_last_hidden = true;
+        self.advanceStep(1);
+        try self.generated_ids.append(allocator, token);
+
+        // Both checks below return on a Metal abort instead of ending the process, so the
+        // handle needs an owner on the error path; a scoped `defer`, not errdefer + manual free.
+        const val: i32 = blk: {
+            const lazy = self.sampleLazy(logits);
+            defer _ = mlx.mlx_array_free(lazy);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+            break :blk v;
+        };
+        self.next_token_id = @intCast(val);
+
+        self.mtp_serial_exit = .none;
+        self.mtp_serial_clock = null;
+        self.mtp_serial_warm = 0;
+        self.mtp_regime_clock = null;
+        return try mtpSerialOneToken(allocator, token);
     }
 
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -5011,24 +5473,60 @@ pub const Generator = struct {
         // grammar constraint or logprobs (compiled-out asserts before).
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
-        // Runtime acceptance gate: same hand-off contract as the drafter
-        // (`next()`'s transition shim seeds pending_logits).
-        if (self.spec_disabled_runtime) {
-            // Defensive: a pre-draft is never built once the gate trips
-            // (mtpMaybePreDraft checks), but free any live one before the
-            // AR fallback so its handles can't outlive the round state.
-            if (self.mtp_pre_draft) |*pd| {
-                pd.deinit(allocator);
-                self.mtp_pre_draft = null;
+        // `--max-mtp-ctx`, checked at the top of the round against prompt + generated. Sticky
+        // (context only grows), routed through the same `spec_disabled_runtime` fallback.
+        if (!self.spec_disabled_runtime and
+            !mtp_mod.mtpCtxWithinLimit(max_mtp_ctx, self.mtpKvLen()))
+        {
+            log.info(
+                "  mtp=off (ctx {d} > --max-mtp-ctx {d})\n",
+                .{ self.mtpKvLen(), max_mtp_ctx },
+            );
+            self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .max_ctx;
+        }
+
+        // Adaptive serial re-entry: sticky, except when the request crossed into a different KV
+        // bucket. `--max-mtp-ctx` (`.max_ctx`) never re-enters.
+        if (self.spec_disabled_runtime and self.spec_disable_reason == .adaptive and
+            mtpAdaptiveSerialEnabled() and self.mtpAdaptiveHeadMayResume())
+        {
+            const b = self.mtpAdaptiveBucket(self.mtpKvLen());
+            const prev_bucket = self.mtp_adaptive.bucket;
+            const prev_arm = self.mtp_adaptive.arm;
+            const action = self.mtp_adaptive.serialTick(b, mtpAdaptiveReentryTokens());
+            self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
+            // Re-entry only when the head can prove it is in sync (else `qwen4MtpForward` returns
+            // `error.MtpPositionGap`). A decline latches: the drift cannot shrink on its own.
+            var may_reenter = action == .to_mtp;
+            if (may_reenter) {
+                if (self.mtpHeadDriftNow()) |drift| {
+                    if (drift != 0) {
+                        log.info(
+                            "  [mtp] adaptive: re-entry declined (head out of sync by {d}) -> serial for the rest of the request\n",
+                            .{drift},
+                        );
+                        self.mtp_adaptive.declineReentry();
+                        may_reenter = false;
+                    }
+                }
             }
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return DrafterStepResult{
-                .tokens = tokens,
-                .accepted_tokens = 0,
-            };
+            if (may_reenter) {
+                log.info(
+                    "  [mtp] adaptive: kv {d} crossed into bucket {s} -> mtp\n",
+                    .{ self.mtpKvLen(), round_cost.bucketName(self.xfm.round_cost.layout, b) },
+                );
+                self.spec_disabled_runtime = false;
+                self.spec_disable_reason = .none;
+                self.mtp_serial_exit = .drain;
+            }
+        }
+
+        // Serial block: the runtime-disabled fallback, the bounded probe, or the ramp back.
+        if (self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) {
+            try self.mtpDetachHead(allocator, self.mtpSerialMayResume());
+            self.mtpMaybeReleaseModuleHead();
+            return try self.mtpSerialTick(allocator);
         }
 
         const xfm = self.xfm;
@@ -5838,14 +6336,16 @@ pub const Generator = struct {
                 .{ rate, MTP_DISABLE_BELOW },
             );
             self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .acceptance;
             return;
         }
         log.debug("  [mtp-depth] {d} -> {d} (windowed per-draft rate {d:.2})\n", .{ self.mtp_depth_current, next_depth, rate });
         if (next_depth < self.mtp_depth_current) self.mtp_promote_cooldown = MTP_PROMOTE_COOLDOWN;
         self.mtp_depth_current = next_depth;
         self.mtp_rounds_since_switch = 0;
-        // Reset the window so the new depth is judged on its own rounds.
+        // Reset both windows so the new depth is judged on its own rounds.
         self.mtp_window_idx = 0;
+        self.mtp_price.reset();
     }
 
     // ── MTP EV (expected-value) adaptive controller ──
@@ -6127,6 +6627,9 @@ pub const Generator = struct {
     /// inter-round wall clock (tok/s is measured between round ends, so
     /// per-round work outside the round stopwatch belongs to the width).
     fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool, m_lo: u32, width_trial: bool, round_ms: f32) void {
+        // An interval spanning a speculative round is neither arm's number.
+        self.mtp_serial_clock = null;
+        self.mtp_serial_warm = 0;
         const post_warmup = self.mtp_ev_rounds >= MTP_EV_WARMUP_ROUNDS;
         // The table wants rounds the EV controller PLANNED: the round that
         // ends warmup was still the legacy controller's (a w2 sample there
@@ -6147,6 +6650,9 @@ pub const Generator = struct {
         const shape_changed = self.spec_round_prev_two_chunk != two_chunk or self.spec_round_prev_two_chunk2 != two_chunk;
         self.spec_round_prev_two_chunk2 = self.spec_round_prev_two_chunk;
         self.spec_round_prev_two_chunk = two_chunk;
+        // The realized price of speculation for this request (every non-trial round, extension
+        // included). Gated with its one consumer, `mtpAdaptiveVoteFor`.
+        if (post_warmup and self.spec_cost_solo and self.mtpAdaptiveModelOk()) self.mtp_price.observe(wall, tok, width_trial);
         self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
     }
 
@@ -6174,9 +6680,10 @@ pub const Generator = struct {
     /// new samples (request end; inference thread, so no lock).
     pub fn persistRoundCost(self: *Generator) void {
         const t = &self.xfm.round_cost;
-        if (t.folded == t.stored_at) return;
+        const folded = round_cost.totalFolded(t);
+        if (folded == t.stored_at) return;
         round_cost.storeCached(self.timer.io, self.xfm.round_cost_key_buf[0..self.xfm.round_cost_key_len], t);
-        t.stored_at = t.folded;
+        t.stored_at = folded;
     }
 
     /// Round-cost table kill switch — MLX_SERVE_MTP_COST_TABLE=0 keeps the
@@ -7182,7 +7689,465 @@ pub const Generator = struct {
         return v;
     }
 
+    // Adaptive serial: the EV controller picks the best depth but never compares a round with
+    // the serial step it replaces, and the acceptance floor is a model fitted where a verify
+    // row costs ~0.1 of a forward. On qwen4_exp a verify row is bytes (62.7k prose: 47-58 tok/s
+    // speculative vs 55 serial). So the two measured prices are compared per KV bucket:
+    //     planned ms/token = roundMs(m_lo) / E[tokens per round at m_lo]
+    //     serial  ms/token = the bucket's measured plain-decode token
+    // Any missing input is `.undecided`. The only cost a request may pay is a bounded serial
+    // probe for a bucket that has never seen a serial token.
+
+    /// A round worse than serial by less than this is a tie.
+    pub const MTP_ADAPTIVE_MARGIN: f32 = 0.05;
+    /// Consecutive rounds that must vote serial.
+    pub const MTP_ADAPTIVE_CONFIRM: u32 = 3;
+    /// Serial ticks one probe runs; `MTP_ADAPTIVE_PROBE_WARM` of them are discarded.
+    pub const MTP_ADAPTIVE_PROBE_TOKENS: u32 = 8;
+    pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
+    /// KV below which the switch does not exist: no vote, no probe. Rounds lose to serial from
+    /// the 32-64k bucket up; below that the probes cost more than a switch could buy.
+    pub const MTP_ADAPTIVE_MIN_KV: u32 = 32768;
+
+    /// May the adaptive switch run at this context at all? Read before the vote and the probe.
+    pub fn mtpAdaptiveKvEligible(kv_len: u32, min_kv: u32) bool {
+        return kv_len >= min_kv;
+    }
+
+    /// The bucket the adaptive switch speaks in. Every site resolves it the same way (the
+    /// decision and the re-entry once disagreed and oscillated); the fallback is the table's
+    /// own grid, never the free `bucketFor`.
+    pub fn mtpAdaptiveBucketOf(read: ?usize, kv_len: u32, layout: round_cost.Layout) usize {
+        return read orelse round_cost.bucketForLayout(kv_len, layout);
+    }
+
+    fn mtpAdaptiveBucket(self: *const Generator, kv_len: u32) usize {
+        const t = &self.xfm.round_cost;
+        return mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout);
+    }
+
+    /// Must the realized price window be dropped? It prices one arm in one bucket.
+    pub fn mtpAdaptiveRegimeMoved(
+        prev_bucket: ?usize,
+        prev_arm: MtpAdaptiveArm,
+        bucket: ?usize,
+        arm: MtpAdaptiveArm,
+    ) bool {
+        if (prev_arm != arm) return true;
+        if (prev_bucket == null and bucket == null) return false;
+        if (prev_bucket == null or bucket == null) return true;
+        return prev_bucket.? != bucket.?;
+    }
+
+    /// Apply the rule above around a `MtpAdaptive` transition (both call sites).
+    fn mtpAdaptiveSyncWindow(self: *Generator, prev_bucket: ?usize, prev_arm: MtpAdaptiveArm) void {
+        if (mtpAdaptiveRegimeMoved(prev_bucket, prev_arm, self.mtp_adaptive.bucket, self.mtp_adaptive.arm)) {
+            self.mtp_price.reset();
+        }
+    }
+
+    /// Rounds in the realized price window. Full-window-only: a restore's warmup rounds must not vote.
+    pub const MTP_PRICE_WINDOW: u32 = 16;
+
+    /// This request's realized ms per emitted token over a trailing window of speculative
+    /// rounds. Width trials are skipped, extension rounds kept. A new request starts empty.
+    pub const MtpPriceWindow = struct {
+        ms: [MTP_PRICE_WINDOW]f32 = @splat(0),
+        tok: [MTP_PRICE_WINDOW]f32 = @splat(0),
+        idx: u32 = 0,
+        filled: u32 = 0,
+
+        pub fn reset(self: *MtpPriceWindow) void {
+            self.idx = 0;
+            self.filled = 0;
+        }
+
+        pub fn observe(self: *MtpPriceWindow, round_ms: f32, emitted: f32, width_trial: bool) void {
+            if (width_trial) return;
+            if (!std.math.isFinite(round_ms) or !(round_ms > 0)) return;
+            if (!std.math.isFinite(emitted) or !(emitted > 0)) return;
+            const i = self.idx % MTP_PRICE_WINDOW;
+            self.ms[i] = round_ms;
+            self.tok[i] = emitted;
+            self.idx +%= 1;
+            if (self.filled < MTP_PRICE_WINDOW) self.filled += 1;
+        }
+
+        /// Realized ms per emitted token, or null until the window is full. Summed, not averaged per round.
+        pub fn msPerTok(self: *const MtpPriceWindow) ?f32 {
+            if (self.filled < MTP_PRICE_WINDOW) return null;
+            var ms: f32 = 0;
+            var tok: f32 = 0;
+            for (self.ms, self.tok) |m, t| {
+                ms += m;
+                tok += t;
+            }
+            if (!(ms > 0) or !(tok > 0)) return null;
+            const v = ms / tok;
+            return if (std.math.isFinite(v)) v else null;
+        }
+    };
+
+    pub const MtpAdaptiveVote = enum { undecided, mtp, serial };
+    pub const MtpAdaptiveArm = enum { undecided, mtp, serial };
+    pub const MtpAdaptiveAction = enum { none, to_serial, to_mtp };
+    /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
+    pub const MtpSerialExit = enum { none, drain, capture };
+
+    /// One round's vote. Both prices must be measured: the table's cell (cross-request, but
+    /// its `tok` column is a workload mixture) and this request's window (per-request, empty
+    /// until full). A modeled denominator under-predicted committed tokens by 12-31% and
+    /// switched where MTP was ~10% faster. `serial` needs BOTH; anything missing = `.undecided`.
+    pub fn mtpAdaptiveVoteFor(
+        table_ms_tok: ?f32,
+        window_ms_tok: ?f32,
+        serial_ms_tok: ?f32,
+        margin: f32,
+    ) MtpAdaptiveVote {
+        const tbl = table_ms_tok orelse return .undecided;
+        const win = window_ms_tok orelse return .undecided;
+        const ser = serial_ms_tok orelse return .undecided;
+        if (!std.math.isFinite(tbl) or !(tbl > 0)) return .undecided;
+        if (!std.math.isFinite(win) or !(win > 0)) return .undecided;
+        if (!std.math.isFinite(ser) or !(ser > 0)) return .undecided;
+        if (!std.math.isFinite(margin) or margin < 0) return .undecided;
+        const bar = ser * (1.0 + margin);
+        return if (tbl > bar and win > bar) .serial else .mtp;
+    }
+
+    /// Arm a bounded serial probe, returning the bucket it will measure. One bucket parameter
+    /// (the flag and the "already measured?" check once keyed on different buckets). The
+    /// sample lands in the bucket the request is IN.
+    /// A probe buys the LAST missing input: a request that cannot fill its price window can
+    /// never use what the probe teaches it and just pays 8 serial tokens.
+    pub fn mtpSerialProbeUseful(window_ms_tok: ?f32) bool {
+        return window_ms_tok != null;
+    }
+
+    pub fn mtpSerialProbeArm(
+        t: *round_cost.Table,
+        bucket: usize,
+        solo: bool,
+        idle: bool,
+        may_resume: bool,
+        useful: bool,
+    ) ?usize {
+        if (!solo or !idle or !may_resume or !useful) return null;
+        if (bucket >= round_cost.N_BUCKETS) return null;
+        if (t.serialMsPerTok(bucket) != null) return null;
+        // Bounded retries, not a one-shot flag: an interrupted probe must not burn the bucket's only chance.
+        if (t.serial_probes[bucket] >= round_cost.MAX_SERIAL_PROBES) return null;
+        t.serial_probes[bucket] += 1;
+        return bucket;
+    }
+
+    /// The standing choice and the streak behind it. Pure.
+    pub const MtpAdaptive = struct {
+        arm: MtpAdaptiveArm = .undecided,
+        confirm: u32 = 0,
+        bucket: ?usize = null,
+        /// Serial ticks since the arm went serial (or the last re-decision).
+        serial_ticks: u32 = 0,
+        /// A re-entry was refused because the head's position bookkeeping is out of sync; latched.
+        reentry_declined: bool = false,
+        /// The switch left MTP on a module-owned head, so the arm is sticky: no re-entry, probe
+        /// or round for the rest of the request. That is what buys the head's release.
+        sticky_serial: bool = false,
+        /// Round index of the last `round()`: `mtpRoundPlan` has two call sites per round.
+        last_round: ?u32 = null,
+        switches: u32 = 0,
+
+        pub fn round(self: *MtpAdaptive, round_idx: u32, bucket: usize, vote: MtpAdaptiveVote, need: u32) MtpAdaptiveAction {
+            if (self.sticky_serial) return .none;
+            if (self.last_round) |r| {
+                if (r == round_idx) return .none;
+            }
+            self.last_round = round_idx;
+            // A crossing invalidates the streak.
+            if (self.bucket == null or self.bucket.? != bucket) {
+                self.bucket = bucket;
+                self.confirm = 0;
+            }
+            switch (vote) {
+                .undecided => {
+                    self.confirm = 0;
+                    return .none;
+                },
+                .mtp => {
+                    self.confirm = 0;
+                    self.arm = .mtp;
+                    return .none;
+                },
+                .serial => {
+                    self.confirm += 1;
+                    if (self.confirm < @max(@as(u32, 1), need)) return .none;
+                    self.confirm = 0;
+                    self.arm = .serial;
+                    self.serial_ticks = 0;
+                    self.switches += 1;
+                    return .to_serial;
+                },
+            }
+        }
+
+        /// Serial tokens after which the decision is re-opened inside the same bucket. Default
+        /// OFF: a re-entry resumes a head whose history did not grow across the block.
+        /// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS` turns it on.
+        pub const REDECIDE_SERIAL_TOKENS_DEFAULT: u32 = 0;
+        /// The value the lever selects when it is enabled without a number.
+        pub const REDECIDE_SERIAL_TOKENS_ON: u32 = 512;
+
+        /// Latch a refused re-entry: back to the serial arm, never ask again for this request.
+        pub fn declineReentry(self: *MtpAdaptive) void {
+            self.arm = .serial;
+            self.serial_ticks = 0;
+            self.reentry_declined = true;
+        }
+
+        /// Make the serial arm permanent for this request (a `to_serial` on a module-owned head).
+        pub fn stickSerial(self: *MtpAdaptive) void {
+            self.arm = .serial;
+            self.serial_ticks = 0;
+            self.sticky_serial = true;
+        }
+
+        pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
+            // Sticky outranks both re-entry triggers, the bucket crossing included.
+            if (self.sticky_serial) return .none;
+            if (self.reentry_declined) return .none;
+            if (self.arm != .serial) return .none;
+            if (self.bucket) |b| {
+                if (b == bucket) {
+                    if (redecide_tokens == 0) return .none; // crossing-only
+                    self.serial_ticks +|= 1;
+                    if (self.serial_ticks < redecide_tokens) return .none;
+                    return self.reopen(bucket);
+                }
+            }
+            return self.reopen(bucket);
+        }
+
+        fn reopen(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
+            self.bucket = bucket;
+            self.confirm = 0;
+            self.serial_ticks = 0;
+            self.arm = .undecided;
+            self.switches += 1;
+            return .to_mtp;
+        }
+    };
+
+    /// Whole-mechanism kill switch (`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`): no vote, no probe, no
+    /// serial fold. Independent of `MLX_SERVE_MTP_ADAPTIVE` (the depth controller's lever).
+    var mtp_adaptive_serial_cache: ?bool = null;
+    /// Default on; only an exact "0" turns it off.
+    pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return !std.mem.eql(u8, value, "0");
+    }
+
+    fn mtpAdaptiveSerialEnabled() bool {
+        if (mtp_adaptive_serial_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_ADAPTIVE_SERIAL")) |p| std.mem.span(p) else null;
+        const on = mtpAdaptiveSerialEnabledFromEnv(raw);
+        mtp_adaptive_serial_cache = on;
+        return on;
+    }
+
+    var mtp_adaptive_margin_cache: ?f32 = null;
+    fn mtpAdaptiveMargin() f32 {
+        if (mtp_adaptive_margin_cache) |v| return v;
+        const v = readEnvFloat("MLX_SERVE_MTP_ADAPTIVE_MARGIN", MTP_ADAPTIVE_MARGIN);
+        mtp_adaptive_margin_cache = v;
+        return v;
+    }
+
+    var mtp_reentry_tokens_cache: ?u32 = null;
+    /// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only; a bare `1` selects 512.
+    fn mtpAdaptiveReentryTokens() u32 {
+        if (mtp_reentry_tokens_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS", MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
+        const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
+        mtp_reentry_tokens_cache = v;
+        return v;
+    }
+
+    var mtp_adaptive_min_kv_cache: ?u32 = null;
+    fn mtpAdaptiveMinKv() u32 {
+        if (mtp_adaptive_min_kv_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
+        const v: u32 = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
+        mtp_adaptive_min_kv_cache = v;
+        return v;
+    }
+
+    var mtp_adaptive_confirm_cache: ?u32 = null;
+    fn mtpAdaptiveConfirm() u32 {
+        if (mtp_adaptive_confirm_cache) |v| return v;
+        const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_CONFIRM", MTP_ADAPTIVE_CONFIRM);
+        const v: u32 = @intCast(@max(@as(usize, 1), @min(n, 64)));
+        mtp_adaptive_confirm_cache = v;
+        return v;
+    }
+
+    /// Drift between the head's position bookkeeping and what its next forward demands
+    /// (`pos_offset == pos_base + seq_offset`; `seq_offset == 0` re-seeds). 0 = in sync.
+    pub fn mtpHeadPositionDrift(pos_base: i64, seq_offset: usize, next_pos_offset: i64) i64 {
+        if (seq_offset == 0) return 0;
+        return next_pos_offset - (pos_base + @as(i64, @intCast(seq_offset)));
+    }
+
+    /// The drift the next round would hit. A serial block advances the trunk while the head's
+    /// `seq_offset` stays put. Null = no head state.
+    fn mtpHeadDriftNow(self: *const Generator) ?i64 {
+        if (self.mtp_cache == null) return null;
+        const mc = &self.mtp_cache.?;
+        return switch (mc.*) {
+            .qwen => 0,
+            .qwen4 => |t| blk: {
+                const m = &(t.qwen4_mtp orelse break :blk 0);
+                const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
+                break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
+            },
+        };
+    }
+
+    /// May this request resume MTP after a serial block? An M-RoPE turn ropes the head at an
+    /// absolute position where the content gap is a wrong answer, so vision turns never come back.
+    fn mtpAdaptiveHeadMayResume(self: *const Generator) bool {
+        // The one predicate all three round-start doors ask (re-entry, `apply_stash`, the probe).
+        if (self.mtp_adaptive.sticky_serial) return false;
+        return self.ctx.mrope_pos == null;
+    }
+
+    /// Does a `to_serial` on this head make the arm sticky? Only a module-owned head.
+    pub fn stickyOnSerialSwitch(head: ?MtpHeadRef) bool {
+        const h = head orelse return false;
+        return h.moduleOwned();
+    }
+
+    /// Does this tick newly release the module head? True exactly once per request.
+    pub fn stickyReleaseNow(sticky: bool, already_released: bool) bool {
+        return sticky and !already_released;
+    }
+
+    /// Has this request released the module-owned MTP head?
+    pub fn mtpModuleHeadReleased(self: *const Generator) bool {
+        return self.mtp_head_released;
+    }
+
+    /// Armed but not landed. The release lives in `nextMtp`'s serial branch and the batched
+    /// tick never calls `nextMtp`, so `scheduler.batchable` keeps the slot out of a group for the
+    /// one tick the release needs.
+    pub fn mtpReleasePending(self: *const Generator) bool {
+        return self.mtp_adaptive.sticky_serial and !self.mtp_head_released;
+    }
+
+    /// Release the module-owned head at a serial block boundary, after `mtpDetachHead`; never
+    /// where the switch is decided (that round still runs).
+    fn mtpMaybeReleaseModuleHead(self: *Generator) void {
+        if (!stickyReleaseNow(self.mtp_adaptive.sticky_serial, self.mtp_head_released)) return;
+        self.mtp_head_released = true;
+        log.info(
+            "  [mtp] sticky-serial: module head released for the rest of the request (kv {d}) — other slots may claim it\n",
+            .{self.mtpKvLen()},
+        );
+    }
+
+    /// Only the in-checkpoint qwen4 head was calibrated for the adaptive serial switch; a
+    /// sidecar pack has a different verify surface. Not `moduleOwned()`: different question.
+    fn mtpAdaptiveArchEligible(self: *const Generator) bool {
+        const head = self.mtp orelse return false;
+        return head == .qwen4;
+    }
+
+    fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
+        // Read after the plan (m_lo is the width it prices) and before the width trial.
+        if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
+            self.mtpAdaptiveArchEligible() and
+            mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
+        {
+            const t = &self.xfm.round_cost;
+            const b = self.mtpAdaptiveBucket(kv_len);
+            const table_ms_tok = t.msPerTok(m_lo, b);
+            const window_ms_tok = self.mtp_price.msPerTok();
+            const serial_ms = t.serialMsPerTok(b);
+            const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, mtpAdaptiveMargin());
+            const prev_bucket = self.mtp_adaptive.bucket;
+            const prev_arm = self.mtp_adaptive.arm;
+            const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm());
+            self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
+            if (action == .to_serial) {
+                // The round under construction still runs; the switch takes effect next tick.
+                log.info(
+                    "  [mtp] adaptive: bucket {s} mtp table {d:.2} / window {d:.2} ms/tok (w{d}) vs serial {d:.2} ms/tok -> serial (from the next round)\n",
+                    .{ round_cost.bucketName(self.xfm.round_cost.layout, b), table_ms_tok.?, window_ms_tok.?, m_lo, serial_ms.? },
+                );
+                self.spec_disabled_runtime = true;
+                self.spec_disable_reason = .adaptive;
+                // On a module-owned head the switch is one-way; the latch is consumed at the block boundary.
+                if (stickyOnSerialSwitch(self.mtp)) self.mtp_adaptive.stickSerial();
+                return true;
+            }
+            // Nothing to decide with: teach the bucket a serial token, once.
+            const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
+            if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), mtpSerialProbeUseful(window_ms_tok))) |own| {
+                self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
+                log.info(
+                    "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
+                    .{ round_cost.bucketName(self.xfm.round_cost.layout, own), MTP_ADAPTIVE_PROBE_TOKENS },
+                );
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// One debug line per planned round with every input the planner read.
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        if (!log.isDebug()) return self.mtpRoundPlanInner();
+        const disabled_before = self.spec_disabled_runtime;
+        const serial_left_before = self.mtp_serial_left;
+        const plan = self.mtpRoundPlanInner();
+        const kv_len = self.mtpKvLen();
+        const t = &self.xfm.round_cost;
+        const b = self.mtpAdaptiveBucket(kv_len);
+        const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, if (mtpCostTableEnabled()) t else null);
+        const serial_step: []const u8 = if (!disabled_before and self.spec_disabled_runtime)
+            "switch"
+        else if (self.mtp_serial_left > serial_left_before)
+            "probe"
+        else
+            "none";
+        var cells: [256]u8 = undefined;
+        const a = self.mtp_ev_accept;
+        const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
+        const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
+        const target = mtpWidthTrialTarget(t, kv_len, plan, cap_free, self.mtp_m_lo_streak >= 2);
+        log.debug(
+            "  [mtp-plan] r={d} kv={d} bucket={s} m_lo={d} m_hi={d} tau={d:.3} a=[{d:.2},{d:.2},{d:.2},{d:.2},{d:.2},{d:.2}] src={s} trial={s}{d} serial_step={s} streak={d} serial_left={d} drops=t{d}/c{d}/b{d} cap={d}/{d} solo={} rte={d} wt={d}/{d} tgt={?d} cells={s}\n",
+            .{
+                self.mtp_ev_rounds,                        kv_len,
+                round_cost.bucketName(t.layout, b),        plan.m_lo,
+                plan.m_hi,                                 plan.tau_ln,
+                a[0],                                      a[1],
+                a[2],                                      a[3],
+                a[4],                                      a[5],
+                if (src.fromTable()) "table" else "prior", if (plan.width_trial) "w" else "-",
+                if (plan.width_trial) plan.m_lo else 0,    serial_step,
+                self.mtp_m_lo_streak,                      self.mtp_serial_left,
+                t.dropped_transition,                      t.dropped_contended,
+                t.dropped_bad,                             cap_row,
+                cap_free,                                  self.spec_cost_solo,
+                self.mtp_regime.trial_end,                 self.mtp_width_trial.next_trial,
+                self.mtp_width_trial.trial_end,            target,
+                t.formatBucket(b, &cells),
+            },
+        );
+        return plan;
+    }
+
+    fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
         if (mtpForcedDepth()) |d| {
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
@@ -7190,18 +8155,20 @@ pub const Generator = struct {
         const cap_row: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
         const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), mtp_mod.MAX_DEPTH);
         var cap: u32 = cap_row;
+        const kv_len = self.mtpKvLen();
         if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
             const d = @min(@max(@as(u32, 1), self.mtp_depth_current), cap);
             self.mtp_ev_m_lo_prev = d;
+            // Independent of the depth controller's kill switch and warmup.
+            _ = self.mtpAdaptiveSerialStep(d, kv_len);
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
-        const kv_len = self.mtpKvLen();
         const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
         if (src.fromTable() and !self.xfm.round_cost.first_use_logged) {
             self.xfm.round_cost.first_use_logged = true;
             var buf: [256]u8 = undefined;
             log.info("[mtp] cost table: bucket {s} measured {s} (ms/tok) replaces the fitted surface (scale {d:.4} at w{d})\n", .{
-                round_cost.BUCKET_NAMES[src.bucket],
+                round_cost.bucketName(self.xfm.round_cost.layout, src.bucket),
                 self.xfm.round_cost.formatBucket(src.bucket, &buf),
                 src.scale,
                 self.xfm.round_cost.narrowestMeasured(src.bucket) orelse 0,
@@ -7240,6 +8207,7 @@ pub const Generator = struct {
                 plan.tau_ln = 0.0;
             }
         }
+        if (self.mtpAdaptiveSerialStep(plan.m_lo, kv_len)) return plan;
         // Width trial: a single-chunk round at the width the table needs
         // next (`mtpWidthTrialTarget`), one 2-round block per period. Never
         // inside a regime trial block (that block is the regime's own
@@ -7248,7 +8216,8 @@ pub const Generator = struct {
             const base_settled = self.mtp_m_lo_streak >= 2;
             if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
                 const period = mtpWidthTrialPeriod(&self.xfm.round_cost, kv_len, plan.m_lo);
-                if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period)) {
+                const reread = round_cost.schedulePeriodReread(self.xfm.round_cost.layout);
+                if (mtpWidthTrialForce(&self.mtp_width_trial, self.mtp_ev_rounds, period, reread)) {
                     plan = mtpWidthTrialPlan(target);
                 }
             }
@@ -7269,7 +8238,7 @@ pub const Generator = struct {
     /// any shape, else a periodic m_lo+1 on single-chunk plans. Null =
     /// nothing to try.
     pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRoundPlan, cap: u32, base_settled: bool) ?u32 {
-        const b = t.bucketToRead(kv_len) orelse round_cost.bucketFor(kv_len);
+        const b = t.bucketToRead(kv_len) orelse t.bucketOf(kv_len);
         // A single-chunk plan feeds its own base every round; only a
         // two-chunk plan (extensions and syncs never feed) owes a trial of
         // it — and only once the base has stopped climbing, or the first EV
@@ -7299,8 +8268,10 @@ pub const Generator = struct {
     /// idempotent per round because `mtpRoundPlan` has two call sites.
     pub const MtpWidthTrial = round_cost.TrialSchedule;
 
-    pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32) bool {
-        return t.force(round_idx, period);
+    /// `reread` is the layout's answer (`round_cost.schedulePeriodReread`): every layout re-reads
+    /// the period so a cold bucket cannot inherit a neighbour's date.
+    pub fn mtpWidthTrialForce(t: *MtpWidthTrial, round_idx: u32, period: u32, reread: bool) bool {
+        return t.force(round_idx, period, reread);
     }
 
     /// Rounds between width trials: the regime's drag rule on the measured
@@ -7380,6 +8351,7 @@ pub const Generator = struct {
                 .{ rate, MTP_DISABLE_BELOW },
             );
             self.spec_disabled_runtime = true;
+            self.spec_disable_reason = .acceptance;
         }
     }
 
@@ -10499,45 +11471,180 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
 }
 
+/// Walk a chunked prefill as `runPrefill` does, taking the width from `widths` at each boundary (the last entry repeats).
+fn walkChunkEnds(
+    out: []usize,
+    prefix_len: usize,
+    widths: []const usize,
+    want_ssm_cp: bool,
+    stride: usize,
+    offset: usize,
+) []usize {
+    var pos: usize = 0;
+    var n: usize = 0;
+    while (pos < prefix_len and n < out.len) {
+        const w = widths[@min(n, widths.len - 1)];
+        const end = nextChunkEnd(pos, prefix_len, w, want_ssm_cp, stride, offset, true);
+        out[n] = end;
+        n += 1;
+        pos = end;
+    }
+    return out[0..n];
+}
+
+test "a width that changes at every boundary never moves a checkpoint" {
+    // `ssm_cp_stride` derives from the launch width and every ladder rung divides it, so a
+    // mixed-width prefill hits the same checkpoint positions as a fixed-width one.
+    const t = testing;
+    const mixed = [_]usize{ 4096, 4096, 2048, 1024, 512, 512, 1024, 2048, 4096, 512, 2048, 1024, 4096, 512 };
+    const fixed = [_]usize{4096};
+
+    for ([_]usize{ 8192, 4096 }) |stride| {
+        for ([_]usize{ 0, 1000 }) |offset| {
+            for ([_]usize{ 40960, 40000 }) |prefix_len| {
+                var fb: [512]usize = undefined;
+                var mb: [512]usize = undefined;
+                const f = walkChunkEnds(&fb, prefix_len, &fixed, true, stride, offset);
+                const m = walkChunkEnds(&mb, prefix_len, &mixed, true, stride, offset);
+
+                for ([_][]usize{ f, m }) |ends| {
+                    var pos: usize = 0;
+                    for (ends) |end| {
+                        try t.expect(end > pos);
+                        try t.expect(end <= prefix_len);
+                        // No chunk straddles a stride boundary.
+                        const abs_pos = pos + offset;
+                        const abs_end = end + offset;
+                        const next_b = ((abs_pos / stride) + 1) * stride;
+                        if (end != prefix_len) try t.expect(!(next_b > abs_pos and next_b < abs_end));
+                        pos = end;
+                    }
+                    try t.expectEqual(prefix_len, pos);
+                }
+
+                var fi: usize = 0;
+                var mi: usize = 0;
+                while (true) {
+                    while (fi < f.len and (f[fi] + offset) % stride != 0) fi += 1;
+                    while (mi < m.len and (m[mi] + offset) % stride != 0) mi += 1;
+                    if (fi >= f.len or mi >= m.len) break;
+                    try t.expectEqual(f[fi], m[mi]);
+                    fi += 1;
+                    mi += 1;
+                }
+                while (fi < f.len and (f[fi] + offset) % stride != 0) fi += 1;
+                while (mi < m.len and (m[mi] + offset) % stride != 0) mi += 1;
+                try t.expectEqual(fi >= f.len, mi >= m.len);
+            }
+        }
+    }
+}
+
+test "every ladder rung the adaptive width can take divides the checkpoint stride" {
+    const t = testing;
+    const stride = effectiveSsmCheckpointStride(256, prefill_chunk_override);
+    try t.expect(stride > 0);
+    for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |rung| {
+        try t.expect(rung <= stride);
+        try t.expectEqual(@as(usize, 0), stride % rung);
+    }
+}
+
+test "commitAdaptiveWidth: the summary follows the running width from both commit sites" {
+    const t = testing;
+    var cur: usize = 2048;
+    var st: AdaptiveWidthState = .{ .width_min = 2048, .width_max = 2048 };
+    commitAdaptiveWidth(&cur, &st, 1024);
+    try t.expectEqual(@as(usize, 1024), cur);
+    try t.expectEqual(@as(u32, 1), st.transitions);
+    try t.expectEqual(@as(u32, 1024), st.width_min);
+    try t.expectEqual(@as(u32, 2048), st.width_max);
+    commitAdaptiveWidth(&cur, &st, 4096);
+    try t.expectEqual(@as(usize, 4096), cur);
+    try t.expectEqual(@as(u32, 2), st.transitions);
+    try t.expectEqual(@as(u32, 1024), st.width_min);
+    try t.expectEqual(@as(u32, 4096), st.width_max);
+}
+
+test "tailMergeMax: the tail a chunk may absorb scales with the width" {
+    const t = testing;
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMax(8192)); // no-op where it was justified
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMax(4096));
+    try t.expectEqual(@as(usize, 256), tailMergeMax(2048));
+    try t.expectEqual(@as(usize, 128), tailMergeMax(1024));
+    try t.expectEqual(@as(usize, 64), tailMergeMax(PREFILL_CHUNK_FLOOR));
+    try t.expectEqual(@as(usize, 1), tailMergeMax(1));
+    for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |w| {
+        try t.expect(tailMergeMax(w) * 8 <= w);
+    }
+
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+}
+
+test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
+    // The scaled bound is gated: every arch whose resolved chunk is under 4096 would otherwise
+    // merge a smaller tail and run an extra chunk.
+    const t = testing;
+
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(PREFILL_CHUNK_FLOOR, false));
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(1024, false));
+    try t.expectEqual(TAIL_MERGE_MAX, tailMergeMaxFor(2048, false));
+    try t.expectEqual(@as(usize, 64), tailMergeMaxFor(PREFILL_CHUNK_FLOOR, true));
+    try t.expectEqual(@as(usize, 256), tailMergeMaxFor(2048, true));
+    try t.expectEqual(tailMergeMaxFor(4096, false), tailMergeMaxFor(4096, true));
+    try t.expectEqual(tailMergeMaxFor(8192, false), tailMergeMaxFor(8192, true));
+
+    try t.expectEqual(@as(usize, 812), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 512), nextChunkEnd(0, 812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 1324), nextChunkEnd(0, 1324, 1024, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 1024), nextChunkEnd(0, 1324, 1024, false, 0, 0, true));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 8492), nextChunkEnd(0, 8492, 8192, false, 0, 0, true));
+
+    try t.expectEqual(@as(usize, 1), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, false));
+    try t.expectEqual(@as(usize, 2), prefillChunkCount(812, PREFILL_CHUNK_FLOOR, false, 0, 0, true));
+}
+
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // A chat-templated prompt often lands a token or two past the chunk size
     // (8192-target prompts tokenize to 8193). A 1-token trailing chunk pays a
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
     // Without checkpoint alignment, remainders under the merge floor extend
     // the current chunk instead.
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0, false));
     // A substantial remainder stays its own chunk.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0, false));
     // Mid-prompt chunks are untouched.
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0));
-    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0, false));
     // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
     // 1-token trailing chunk existed only to lay a snapshot one token before
     // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
     // INSIDE the chunk still wins over merging (next case).
-    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
-    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0));
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0, false));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0, false));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0));
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0, false));
     // Tail merge: one token past a chunk boundary is still ONE chunk.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0));
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0, false));
     // Mechanically, a raw fine stride still splits an 851-token prefill into 4
     // chunks (851 spans boundaries 256/512/768) — which is why
     // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
     // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
     // fixed overhead everywhere) taxed cold prefill 17-25%.
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0));
+    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0, false));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000, false));
 }
 
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
@@ -10707,10 +11814,10 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
     // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
     // on dense hybrids — the llm_context_benchmarks small-prompt regression).
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
     // An 8K prefill splits only at the (memory-bound) chunk size, never
     // finer: 2 chunks at chunk 4096, not 33.
-    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false));
 }
 
 test "vision prefill checkpoints SSM state only when it chunks like text" {
@@ -10728,14 +11835,14 @@ test "vision prefill checkpoints SSM state only when it chunks like text" {
     try testing.expect(!vision_checkpoints);
     try testing.expectEqual(
         prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0),
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false),
     );
 
     const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
     try testing.expect(text_checkpoints);
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false),
     );
 }
 
@@ -11650,8 +12757,8 @@ test "mtpWidthTrial: blocks per period, idempotent per round, period grows with 
     var forced: u32 = 0;
     var i: u32 = 10;
     while (i < 210) : (i += 1) {
-        const f = Generator.mtpWidthTrialForce(&wt, i, 8);
-        try testing.expectEqual(f, Generator.mtpWidthTrialForce(&wt, i, 8)); // asked twice, same answer
+        const f = Generator.mtpWidthTrialForce(&wt, i, 8, true);
+        try testing.expectEqual(f, Generator.mtpWidthTrialForce(&wt, i, 8, true)); // asked twice, same answer
         if (f) forced += 1;
     }
     // Identity checkable from the log: forced rounds == block * trials.
@@ -11710,7 +12817,8 @@ test "round_cost: a simulated round loop measures every width the chooser picks 
         var plan = Generator.mtpEvPlanSrc(&a, 8, src, m_lo_prev + 1);
         if (plan.m_lo == m_lo_prev) streak += 1 else streak = 0;
         if (Generator.mtpWidthTrialTarget(&t, 1000, plan, 8, streak >= 2)) |target| {
-            if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo))) plan = Generator.mtpWidthTrialPlan(target);
+            // `t` is a default (`.legacy`) table, so this loop runs the arm-once schedule it was fitted on.
+            if (Generator.mtpWidthTrialForce(&wt, i, Generator.mtpWidthTrialPeriod(&t, 1000, plan.m_lo), round_cost.schedulePeriodReread(t.layout))) plan = Generator.mtpWidthTrialPlan(target);
         }
         // Run it: a two-chunk plan extends (confidence is high), so the
         // realized width is m_hi — and, as in mtpRoundEndObserve, only a
@@ -13018,4 +14126,565 @@ test "every request-finalize seam that logs [spec-stats] also logs [qsa-arms]" {
         }
         try std.testing.expect(seams > 0);
     }
+}
+
+test "mtpAdaptiveVoteFor: a switch needs BOTH measured prices past the margin" {
+    const G = Generator;
+    const margin = G.MTP_ADAPTIVE_MARGIN;
+    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(12.0, 12.0, 10.0, margin));
+    // Either price inside the bar keeps speculation.
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 9.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(9.0, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(9.0, 9.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 12.0, 11.5, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.serial, G.mtpAdaptiveVoteFor(12.0, 12.0, 11.4, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.mtp, G.mtpAdaptiveVoteFor(12.0, 12.0, 12.0, 0.0));
+
+    const nan = std.math.nan(f32);
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(null, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, null, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, null, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(0.0, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 0.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, 0.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(nan, 12.0, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, nan, 10.0, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, nan, margin));
+    try testing.expectEqual(G.MtpAdaptiveVote.undecided, G.mtpAdaptiveVoteFor(12.0, 12.0, 10.0, nan));
+}
+
+test "mtpAdaptiveVoteFor: four real switch events of the qwen4 A/B" {
+    // Four switches the v1 controller made on a 62.7k prose prompt where MTP was the faster
+    // arm (56.8 vs 51.6 tok/s): the modeled token count ran 12-31% under the cell's own `tok`.
+    const G = Generator;
+    const margin = G.MTP_ADAPTIVE_MARGIN;
+    const Event = struct {
+        name: []const u8,
+        table_ms_tok: f32, // Table.msPerTok(m_lo, bucket), from `table=` in [spec-stats]
+        serial_ms_tok: f32, // serial_cell= at the moment of the switch
+        window_ms_tok: f32, // round_ms EMA / (avg_per_round + 1)
+        window_full: bool, // rounds run before the vote >= MTP_PRICE_WINDOW
+    };
+    const events = [_]Event{
+        .{ .name = "b1 long1", .table_ms_tok = 16.12, .serial_ms_tok = 19.20, .window_ms_tok = 15.40, .window_full = true },
+        // Voted at round ~3 on prefix-cache-restore warmup rounds; the full-window gate saves it.
+        .{ .name = "b1 long2", .table_ms_tok = 15.85, .serial_ms_tok = 18.16, .window_ms_tok = 24.17, .window_full = false },
+        .{ .name = "b4 long1", .table_ms_tok = 17.28, .serial_ms_tok = 19.53, .window_ms_tok = 16.63, .window_full = true },
+        .{ .name = "b4 long2", .table_ms_tok = 17.91, .serial_ms_tok = 17.08, .window_ms_tok = 15.97, .window_full = true },
+    };
+    for (events) |e| {
+        try testing.expectEqual(
+            G.MtpAdaptiveVote.mtp,
+            G.mtpAdaptiveVoteFor(e.table_ms_tok, e.table_ms_tok, e.serial_ms_tok, margin),
+        );
+        // Must not vote serial on any row; an unfilled window is `.undecided`.
+        const win: ?f32 = if (e.window_full) e.window_ms_tok else null;
+        const got = G.mtpAdaptiveVoteFor(e.table_ms_tok, win, e.serial_ms_tok, margin);
+        try testing.expect(got != .serial);
+        try testing.expectEqual(
+            if (e.window_full) G.MtpAdaptiveVote.mtp else G.MtpAdaptiveVote.undecided,
+            got,
+        );
+    }
+    // Rule B ungated reproduces the b1-long2 mistake.
+    const b1l2 = events[1];
+    try testing.expectEqual(
+        G.MtpAdaptiveVote.serial,
+        G.mtpAdaptiveVoteFor(30.0, b1l2.window_ms_tok, b1l2.serial_ms_tok, margin),
+    );
+}
+
+test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 oscillation)" {
+    const G = Generator;
+    const kv: u32 = 40_000;
+    const own = round_cost.bucketFor(kv);
+
+    try testing.expectEqual(own, G.mtpAdaptiveBucketOf(null, kv, .long));
+    try testing.expectEqual(@as(usize, own + 1), G.mtpAdaptiveBucketOf(own + 1, kv, .long));
+    try testing.expect(G.mtpAdaptiveBucketOf(own + 1, kv, .long) != round_cost.bucketFor(kv));
+
+    // Two resolvers oscillated: switch, crossing, re-enter, switch again.
+    var osc = G.MtpAdaptive{};
+    _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv, .long), .serial, 1);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
+
+    var ok = G.MtpAdaptive{};
+    const b = G.mtpAdaptiveBucketOf(own + 1, kv, .long);
+    _ = ok.round(0, b, .serial, 1);
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long), 0));
+    }
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
+}
+
+test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the price window" {
+    const G = Generator;
+    const A = G.MtpAdaptiveArm;
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(null, .undecided, null, .undecided));
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(3, .mtp, 3, .mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, 3, A.serial));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.serial, 3, A.undecided));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.undecided, 3, A.mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, 4, A.mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(null, A.mtp, 4, A.mtp));
+    try testing.expect(G.mtpAdaptiveRegimeMoved(3, A.mtp, null, A.mtp));
+
+    var a = G.MtpAdaptive{};
+    var pb = a.bucket;
+    var pa = a.arm;
+    _ = a.round(0, 5, .serial, 1); // first vote: bucket null -> 5, arm -> serial
+    try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+    pb = a.bucket;
+    pa = a.arm;
+    _ = a.serialTick(6, 0); // crossing: re-opens the decision
+    try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+    // A tick that changes nothing must not drop the window, or it can never fill.
+    pb = a.bucket;
+    pa = a.arm;
+    _ = a.serialTick(6, 0);
+    try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
+}
+
+test "mtpAdaptiveKvEligible: short context is below the floor, and the floor is the default" {
+    const G = Generator;
+    const floor = G.MTP_ADAPTIVE_MIN_KV;
+    try testing.expectEqual(@as(u32, 32768), floor);
+
+    var reached: u32 = 0;
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) {
+        const kv: u32 = 60 + i * 7 + 200;
+        if (G.mtpAdaptiveKvEligible(kv, floor)) reached += 1;
+    }
+    try testing.expectEqual(@as(u32, 0), reached);
+
+    try testing.expect(!G.mtpAdaptiveKvEligible(0, floor));
+    try testing.expect(!G.mtpAdaptiveKvEligible(floor - 1, floor));
+    try testing.expect(!G.mtpAdaptiveKvEligible(8_200, floor));
+    try testing.expect(!G.mtpAdaptiveKvEligible(16_400, floor));
+    try testing.expect(G.mtpAdaptiveKvEligible(floor, floor));
+    try testing.expect(G.mtpAdaptiveKvEligible(62_755, floor)); // the A/B prose prompt
+    try testing.expect(G.mtpAdaptiveKvEligible(374_000, floor)); // the ladder's top rung
+
+    try testing.expect(G.mtpAdaptiveKvEligible(1, 0));
+    try testing.expect(!G.mtpAdaptiveKvEligible(62_755, 131_072));
+}
+
+test "MtpPriceWindow: reads nothing until FULL, skips width trials, prices per TOKEN" {
+    const G = Generator;
+    const N = G.MTP_PRICE_WINDOW;
+    var w = G.MtpPriceWindow{};
+    try testing.expect(w.msPerTok() == null);
+
+    var i: u32 = 0;
+    while (i < N - 1) : (i += 1) {
+        w.observe(20.0, 2.0, false);
+        try testing.expect(w.msPerTok() == null); // still not full
+    }
+    w.observe(20.0, 2.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), w.msPerTok().?, 1e-4);
+
+    var t = G.MtpPriceWindow{};
+    i = 0;
+    while (i < N * 2) : (i += 1) t.observe(999.0, 1.0, true);
+    try testing.expect(t.msPerTok() == null);
+    try testing.expectEqual(@as(u32, 0), t.filled);
+
+    var d = G.MtpPriceWindow{};
+    d.observe(std.math.nan(f32), 2.0, false);
+    d.observe(20.0, 0.0, false);
+    d.observe(-1.0, 2.0, false);
+    try testing.expectEqual(@as(u32, 0), d.filled);
+
+    // Summed over the window: 8 rounds at 1 tok/30 ms + 8 at 4 tok/60 ms = 18.0 ms/tok, not 22.5.
+    var m = G.MtpPriceWindow{};
+    i = 0;
+    while (i < N / 2) : (i += 1) m.observe(30.0, 1.0, false);
+    while (i < N) : (i += 1) m.observe(60.0, 4.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 18.0), m.msPerTok().?, 1e-4);
+
+    i = 0;
+    while (i < N) : (i += 1) m.observe(10.0, 2.0, false);
+    try testing.expectApproxEqAbs(@as(f32, 5.0), m.msPerTok().?, 1e-4);
+    m.reset();
+    try testing.expect(m.msPerTok() == null);
+}
+
+test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per round" {
+    const G = Generator;
+    const need = G.MTP_ADAPTIVE_CONFIRM;
+    var a = G.MtpAdaptive{};
+    var r: u32 = 0;
+    while (r < need - 1) : (r += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(r, 3, .serial, need));
+    }
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(need - 1, 3, .serial, need));
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+    try testing.expectEqual(@as(u32, 1), a.switches);
+
+    // `mtpRoundPlan` has two call sites per round: the second call at the same index must not advance the streak.
+    var b = G.MtpAdaptive{};
+    var i: u32 = 0;
+    while (i < need - 1) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, b.round(i, 3, .serial, need));
+    }
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(need - 1, 3, .serial, need));
+
+    var c = G.MtpAdaptive{};
+    _ = c.round(0, 3, .serial, need);
+    _ = c.round(1, 3, .serial, need);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(2, 3, .mtp, need));
+    try testing.expectEqual(G.MtpAdaptiveArm.mtp, c.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(3, 3, .serial, need));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, c.round(4, 3, .serial, need));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, c.round(5, 3, .serial, need));
+
+    var d = G.MtpAdaptive{};
+    _ = d.round(0, 3, .serial, need);
+    _ = d.round(1, 3, .serial, need);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, d.round(2, 3, .undecided, need));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, d.round(3, 3, .serial, need));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, d.arm);
+
+    var e = G.MtpAdaptive{};
+    _ = e.round(0, 3, .serial, need);
+    _ = e.round(1, 3, .serial, need);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, e.round(2, 4, .serial, need));
+    try testing.expectEqual(@as(u32, 1), e.confirm);
+
+    var f = G.MtpAdaptive{};
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
+}
+
+test "MtpAdaptive: crossing always re-opens; the periodic re-open is OFF by default" {
+    const G = Generator;
+    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    try testing.expectEqual(@as(u32, 0), G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
+
+    var off = G.MtpAdaptive{};
+    _ = off.round(0, 3, .serial, 1);
+    var i: u32 = 0;
+    while (i < N * 2) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3, 0));
+    }
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4, 0));
+
+    var a = G.MtpAdaptive{};
+    _ = a.round(0, 3, .serial, 1);
+    i = 0;
+    while (i < N - 1) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3, N));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N)); // not twice
+
+    var top = G.MtpAdaptive{};
+    const b_top = round_cost.bucketFor(300_000);
+    try testing.expectEqual(b_top, round_cost.bucketFor(900_000));
+    _ = top.round(0, b_top, .serial, 1);
+    var fired: u32 = 0;
+    i = 0;
+    while (i < N * 3) : (i += 1) {
+        if (top.serialTick(b_top, N) == .to_mtp) {
+            fired += 1;
+            _ = top.round(i, b_top, .serial, 1);
+        }
+    }
+    try testing.expectEqual(@as(u32, 3), fired);
+
+    var d = G.MtpAdaptive{};
+    _ = d.round(0, 3, .serial, 1);
+    i = 0;
+    while (i < N / 2) : (i += 1) _ = d.serialTick(3, N);
+    _ = d.round(1, 3, .mtp, 1);
+    _ = d.round(2, 3, .serial, 1);
+    try testing.expectEqual(@as(u32, 0), d.serial_ticks);
+}
+
+test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in sync" {
+    const G = Generator;
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(100, 20, 120));
+    try testing.expectEqual(@as(i64, 7), G.mtpHeadPositionDrift(100, 20, 127));
+    try testing.expectEqual(@as(i64, -3), G.mtpHeadPositionDrift(100, 20, 117));
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(100, 0, 999));
+    try testing.expectEqual(@as(i64, 0), G.mtpHeadPositionDrift(0, 0, 0));
+
+    var a = G.MtpAdaptive{};
+    _ = a.round(0, 3, .serial, 1);
+    a.declineReentry();
+    try testing.expect(a.reentry_declined);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 512)); // crossing
+    var i: u32 = 0;
+    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, 512));
+}
+
+test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted" {
+    const G = Generator;
+    var t = round_cost.Table{};
+    const b = round_cost.bucketFor(20_000);
+
+    var fired: u32 = 0;
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        if (G.mtpSerialProbeArm(&t, b, true, true, true, true) != null) fired += 1;
+    }
+    try testing.expectEqual(@as(u32, round_cost.MAX_SERIAL_PROBES), fired);
+    try testing.expect(round_cost.MAX_SERIAL_PROBES > 1); // else it is the old flag
+
+    var u = round_cost.Table{};
+    const kv: u32 = 20_000;
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true, true) != null);
+    var k: u32 = 0;
+    while (k < round_cost.MIN_SAMPLES) : (k += 1) _ = u.observeSerial(kv, 16.0, true, false);
+    try testing.expect(u.serialMsPerTok(b) != null);
+    try testing.expect(G.mtpSerialProbeArm(&u, b, true, true, true, true) == null);
+
+    var v = round_cost.Table{};
+    try testing.expect(G.mtpSerialProbeArm(&v, round_cost.bucketFor(1000), true, true, true, true) != null);
+    try testing.expect(G.mtpSerialProbeArm(&v, b, true, true, true, true) != null);
+
+    var w = round_cost.Table{};
+    try testing.expect(G.mtpSerialProbeArm(&w, b, false, true, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, false, true, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, b, true, true, false, true) == null);
+    try testing.expect(G.mtpSerialProbeArm(&w, round_cost.N_BUCKETS, true, true, true, true) == null);
+    try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
+}
+
+test "S21: a to_serial on a MODULE-OWNED head is sticky, and the release is a one-shot" {
+    const G = Generator;
+    try testing.expect(G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+
+    var a = G.MtpAdaptive{};
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(0, 3, .serial, 1));
+    a.stickSerial();
+    try testing.expect(a.sticky_serial);
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5, 0));
+    const on = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    var i: u32 = 0;
+    while (i < on * 2) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, on));
+    }
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(1, 3, .mtp, 1));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(2, 4, .serial, 1));
+    try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
+
+    try testing.expect(G.stickyReleaseNow(true, false));
+    try testing.expect(!G.stickyReleaseNow(true, true));
+    try testing.expect(!G.stickyReleaseNow(false, false));
+    try testing.expect(!G.stickyReleaseNow(false, true));
+}
+
+test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes" {
+    const G = Generator;
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen = undefined }));
+    try testing.expect(!G.stickyOnSerialSwitch(null));
+
+    var b = G.MtpAdaptive{};
+    try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(0, 3, .serial, 1));
+    try testing.expect(!b.sticky_serial);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
+
+    try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
+}
+
+test "mtpAdaptiveSerialEnabledFromEnv: the mechanism is on unless the lever says 0" {
+    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(null));
+    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(""));
+    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv("1"));
+    try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
+}
+
+test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME check, not an assert" {
+    const G = Generator;
+    try testing.expect(G.mtpSerialCaptureReady(false, false));
+    try testing.expect(!G.mtpSerialCaptureReady(true, false));
+    try testing.expect(!G.mtpSerialCaptureReady(false, true));
+    try testing.expect(!G.mtpSerialCaptureReady(true, true));
+}
+
+test "MTP head persistence kill switch: only a literal 0 turns it off" {
+    try testing.expect(mtpHeadPersistFromEnv(null));
+    try testing.expect(mtpHeadPersistFromEnv(""));
+    try testing.expect(mtpHeadPersistFromEnv("1"));
+    try testing.expect(!mtpHeadPersistFromEnv("0"));
+}
+
+test "characterization: a sidecar (legacy-layout) boot plans exactly as 26.9.1 did" {
+    // A sidecar (legacy-layout) boot must plan exactly as before: a store-version bump made
+    // every boot cold and a cold table runs every round as a two-chunk round (-25% decode on
+    // the 27B). Every expectation below was recorded by running the 26.9.1 planner.
+    const G = Generator;
+    const a = [_]f32{ 0.85, 0.78, 0.70, 0.60, 0.50, 0.42, 0.35, 0.30 };
+    const kv: u32 = 8192; // one 27B rung; ~3.0-3.5 tok/round at m_lo 2-3
+    const costs = G.MTP_EV_DEFAULT_COSTS;
+    const cap: u32 = 6;
+
+    const legacy_empty = round_cost.Table{ .layout = .legacy };
+    try testing.expectEqual(@as(usize, 3), legacy_empty.bucketOf(kv));
+    try testing.expectEqual(@as(usize, 3), round_cost.bucketFor(kv));
+
+    // The warm table, restored from the file 26.9.1 wrote.
+    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 88.0000 3.0500 3\n4 3 140.0000 3.2000 3\n";
+    const warm = round_cost.parse(rc1_body, .legacy) orelse return error.TestUnexpectedResult;
+    const warm_src = G.MtpCostSource.init(costs, kv, &warm);
+    try testing.expect(warm_src.fromTable());
+
+    // Warm: a measured marginal the position cannot repay closes the valve; every round is single-chunk.
+    var prev: u32 = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, warm_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 2), p.m_hi); // no extension
+        try testing.expectEqual(@as(f32, 0.0), p.tau_ln);
+        prev = p.m_lo;
+    }
+
+    // The same request on a cold table: every round extends.
+    const cold_src = G.MtpCostSource.init(costs, kv, null);
+    try testing.expect(!cold_src.fromTable());
+    const cold0 = G.mtpEvPlanSrc(&a, cap, cold_src, 2);
+    try testing.expectEqual(@as(u32, 2), cold0.m_lo);
+    try testing.expectEqual(@as(u32, 4), cold0.m_hi);
+    try testing.expectApproxEqAbs(@as(f32, -0.444614), cold0.tau_ln, 1e-5);
+    prev = cold0.m_lo;
+    for (0..7) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, cold_src, prev + 1);
+        try testing.expectEqual(@as(u32, 3), p.m_lo);
+        try testing.expectEqual(@as(u32, 4), p.m_hi); // two-chunk, every round
+        try testing.expectApproxEqAbs(@as(f32, -0.477666), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+
+    // A warm table whose cells make one extension position pay: extend by exactly one.
+    var shallow = round_cost.Table{ .layout = .legacy };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = shallow.observe(2, kv, 44.0, 2.70, true, false);
+        _ = shallow.observe(3, kv, 51.0, 3.20, true, false);
+        _ = shallow.observe(4, kv, 62.0, 3.50, true, false);
+    }
+    const shallow_src = G.MtpCostSource.init(costs, kv, &shallow);
+    prev = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, shallow_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 3), p.m_hi);
+        try testing.expectApproxEqAbs(@as(f32, -0.488353), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+
+    // The width is a table-state property too: warm holds the base at 2, cold climbs to 3.
+    var wide = round_cost.Table{ .layout = .legacy };
+    for (0..round_cost.MIN_SAMPLES) |_| {
+        _ = wide.observe(2, kv, 44.0, 2.70, true, false);
+        _ = wide.observe(3, kv, 51.0, 3.20, true, false);
+        _ = wide.observe(4, kv, 55.0, 4.00, true, false);
+        _ = wide.observe(5, kv, 75.0, 4.20, true, false);
+    }
+    const wide_src = G.MtpCostSource.init(costs, kv, &wide);
+    prev = 1;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, wide_src, prev + 1);
+        try testing.expectEqual(@as(u32, 2), p.m_lo);
+        try testing.expectEqual(@as(u32, 4), p.m_hi);
+        try testing.expectApproxEqAbs(@as(f32, -0.506371), p.tau_ln, 1e-5);
+        prev = p.m_lo;
+    }
+    prev = 1;
+    var cold_final: u32 = 0;
+    for (0..8) |_| {
+        const p = G.mtpEvPlanSrc(&a, cap, cold_src, prev + 1);
+        cold_final = p.m_lo;
+        prev = p.m_lo;
+    }
+    try testing.expectEqual(@as(u32, 3), cold_final);
+    try testing.expect(cold_final != G.mtpEvPlanSrc(&a, cap, wide_src, 8).m_lo);
+
+    try testing.expectEqual(
+        @as(?u32, 3),
+        G.mtpWidthTrialTarget(&warm, kv, .{ .m_lo = 2, .m_hi = 2, .tau_ln = 0 }, cap, true),
+    );
+}
+
+test "characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4" {
+    // Which ROUND carries a trial: the previous arm-once schedule kept a
+    // neighbour bucket's date; the re-read is every layout's.
+    const G = Generator;
+    const legacy = round_cost.Table{ .layout = .legacy };
+    const long = round_cost.Table{ .layout = .long };
+    try testing.expect(round_cost.schedulePeriodReread(legacy.layout));
+    try testing.expect(round_cost.schedulePeriodReread(long.layout));
+
+    const run = struct {
+        fn f(reread: bool) ?u32 {
+            var wt = G.MtpWidthTrial{};
+            var i: u32 = 12;
+            while (i < 200) : (i += 1) {
+                const period: u32 = if (i < 18) 124 else round_cost.EXPLORE_PERIOD_COLD;
+                if (G.mtpWidthTrialForce(&wt, i, period, reread)) return i;
+            }
+            return null;
+        }
+    }.f;
+    try testing.expectEqual(@as(?u32, 136), run(false)); // the arm-once schedule
+    try testing.expectEqual(@as(?u32, 20), run(true)); // shipped: every layout
+}
+
+test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's" {
+    const G = Generator;
+    try testing.expect(!G.mtpAdaptiveModelEligible(true, false));
+    try testing.expect(G.mtpAdaptiveModelEligible(true, true));
+    // `--no-mtp` on the calibrated arch still declines: the head's weights load with the trunk.
+    try testing.expect(!G.mtpAdaptiveModelEligible(false, true));
+    try testing.expect(!G.mtpAdaptiveModelEligible(false, false));
+}
+
+test "mtpSerialProbeUseful: a probe buys the LAST missing input, never the first" {
+    const G = Generator;
+    try testing.expect(!G.mtpSerialProbeUseful(null));
+    try testing.expect(G.mtpSerialProbeUseful(12.5));
+
+    var t = round_cost.Table{ .layout = .long };
+    const b = round_cost.bucketFor(20_000);
+    try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(null)) == null);
+    try testing.expectEqual(@as(u8, 0), t.serial_probes[b]);
+    try testing.expectEqual(@as(?usize, b), G.mtpSerialProbeArm(&t, b, true, true, true, G.mtpSerialProbeUseful(12.5)));
+    try testing.expectEqual(@as(u8, 1), t.serial_probes[b]);
+}
+
+test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; every other arch keeps proportional growth" {
+    // The reservation pre-buys prompt + generation headroom + slack past 32k; a pure cost on an
+    // arch nobody measured, so it is gated.
+    const t = std.testing;
+    const chunk: u64 = 4096;
+    const seq: u64 = 200_000;
+    const max_tokens: u64 = 2048;
+
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
+    const KVC = transformer_mod.KVCache;
+    try t.expectEqual(
+        KVC.reservedTokens(seq, max_tokens, chunk, 1_048_576),
+        reservedPrefillTokens(&qwen4, seq, max_tokens, chunk),
+    );
+    try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
+
+    // Every other arch: zero, which leaves `nextCapacityReserved` == `nextCapacity`.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama" }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+    }
+
+    var cache = try KVC.init(t.allocator, 4);
+    defer cache.deinit();
+    cache.reserve(0);
+    try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
 }

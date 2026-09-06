@@ -149,6 +149,22 @@ The standing min-M sweep was also width-specific. Relative to the plain lane, q4
 
 **A GPU-kernel parity test asserts NO-WORSE-THAN-REFERENCE against fp32 dequant ground truth — never AGREEMENT with another kernel (green-here/red-on-CI class).** Both paths accumulate fp32 in a DIFFERENT ORDER and round to bf16, so two CORRECT kernels can differ from EACH OTHER by more than a tight tolerance — a kernel-vs-kernel bound (`max_rel<=0.02`) passed 10/10 on the dev Mac and RED on the first CI GPU (different rounding) on a provably-correct kernel. Fix: `transformer.expectVerifyQmmNoWorseThanStock` measures BOTH against the same 4-bit weights dequantized to fp32 (quant error cancels; only the arithmetic is under test) and requires the new kernel ≤ stock's error — machine-independent, and STRICTLY STRONGER (catches a 1% scale error, a dropped partial sum, a single zeroed output). Rule: never bound a new kernel against another kernel's rounding; bound both against ground truth.
 
+**DFlash outranks the MTP head (2026-09-03)** — a pack can ship both (Qwen3.8-27B: in-checkpoint `mtp.*` + an in-dir `drafter/`), and every dispatch site used to pick MTP first, so the drafter silently never ran. Now a loaded DFlash sidecar wins (it is the explicit choice: `--drafter` or the pack's own `drafter/`; the head ships with every checkpoint) and `--no-drafter` / `enable_drafter:false` hand the round back to MTP; the gemma cross-attention drafter stays below MTP. The eight server sites (four surfaces x stream/non-stream) that each hand-rolled `use_mtp`/`use_drafter`/`use_pld` now read ONE `server.requestSpecModes`, twinned by `scheduler.specInitWiring` + `specTickMode`.
+
+**Wide verify does not pay on an M4 Max (2026-09-04, round 2)** — NOTE: the ladder below was measured with an experimental `sg8` simdgroup-matrix lane serving M 8..16 off-NAX, which has since been REVERTED. Without it those widths fall to stock qmm (S=8 is 89.6 ms, not 61.3), so every conclusion here holds a fortiori. The block that actually serves is 5, whose verify input is `[t1, 4 drafts]` = 5 rows, which routes to split-K either way. Verify-forward ladder for the pack (fwd_ubench, one boot per rung, `--no-drafter --no-mtp`, M4 Max): S=1 33.7 | 4 39.4 | 6 49.1 | 8 61.3 | 12 90.9 | 16 89.4 ms. Round 1's S=8 66.6 does not reproduce (61.3 here); S=12 costs MORE than S=16 because a 12-row call wastes four rows of the same two row-tiles. The round model `emitted / (verify(S) + draft)` with draft ~9 ms predicts the live block sweep to within 3%, which is what makes the widths decidable on paper: at 100% acceptance the CEILING is 94 tok/s at block 5, 103 at 6, 113 at 8, 160 at 16 — so code past 100 needs block >= 6 AND near-perfect acceptance, and no linear block draft here comes close.
+
+Live block sweep, incoai/Qwen3.8-27B-DFlash2 against the 4-bit pack (greedy, 400 tokens, code/prose tok/s, accepted-per-round): b4 77.9/47.4 (2.60), **b5 82.0/50.4 (3.21)**, b6 81.3/45.8 (3.71), b7 77.4/40.3 (4.26), b8 79.8/38.5 (4.71). Acceptance climbs monotonically with width and throughput still peaks at 5 — the extra verify rows cost more than the extra tokens are worth. llmprobe at the 8k rung says the same thing per traffic shape: MTP depth 6 = 93.5 predictable / 39.6 novel / 69.7 decode; DFlash2 b5 = 92.4 / 40.2 / 69.9; b8 = 101.2 / **26.7** / 59.6. So wide blocks clear the 100 tok/s predictable bar and pay for it with a novel rung below SERIAL (30.3).
+
+Two things this refutes, both by measurement, so do not re-derive them:
+- **`dflash.wideVerifyLaneAvailable()` stays NAX-only.** Making it true off-NAX uncaps `resolveBlockSize` to the sidecar's config block (8), which is worse on every rung but predictable. `blockCapForMachine`'s M4 row stays 5.
+- **`round_cost.WidthChooser` stays OPT-IN.** At block 8 it takes predictable to 116.7 tok/s (its best number anywhere) and leaves novel at 27.8; started narrow (block 5, max 7) it gives 94.3 / 33.1 — worse novel than no chooser at all. It can only trial `current +/- 1` against unmeasured cells, so inside one 192-token generation it neither climbs to 7 on echo nor falls to 2 on novel. A chooser that can move more than one width per decision is the prerequisite, not the default flip.
+
+Two methodology notes. The persisted round-cost table is keyed on (chip, model, quant, OS build) and NOT the engine build, so every cell past w4 was still carrying a price from the previous kernel build: clear `~/.mlx-serve/round-cost/` (or `MLX_SERVE_ROUND_COST_PERSIST=0`) on BOTH arms of any width A/B. And the `verifyQmm µbench` evaluated one launch per `mlx_array_eval`, i.e. ~0.14 ms of sync per call — more than the whole `out` projection, so every small shape was a sync measurement and `out` at M=16 read 2.5x its M=12 time. It now batches 12 independent launches per eval like `vw-ubench`, prints TFLOP/s, and sums the shapes over the real layer inventory.
+
+**The wide verify is NOT at the roofline, but the slack is not where a plan would put it (2026-09-04)** — decomposing the S=16 marginal (89.4 - 33.7 = 55.7 ms) with the batched µbench summed over the pack's inventory (48 GDN `in_proj` 5120x16384 + `out` 6144x5120, 16 attention q/k/v/o, 64 x gate_up 5120x34816 + down 17408x5120, lm_head 5120x248320): whole-forward qmm is 35.5 ms at M=1 (which is the entire serial forward, as a bandwidth-bound decode should be) and 73.8 ms at M=16, so **qmm is 69% of the marginal at 11.1 TFLOP/s** — about 70% of the M4 Max fp32 peak, which is a good but not final number for a dequant+fp32-mma kernel. Both Phase-0 gate conditions (>= 80% of the marginal, >= 12 TFLOP/s) therefore fail, but the ~1.4x of theoretical qmm headroom applies to two thirds of a marginal that only matters at widths the acceptance data says never to run. The remaining 19 ms of non-qmm marginal is NOT the GDN recurrence (its own µbench costs 12.3 ms per model at T=1 and 8.7 at T=16 — the marginal is negative).
+
+**The GDN fused row cap stays at 9 (2026-09-04, investigated and reverted)** — `gdnPreworkFused` and the fused norm-gate decline `seq > 9` while `GDN_FUSED_MAX_ROWS` is 16, so S 10..16 runs the composed chain; that de-fusing is most of the 8.4 ms by which the in-situ S=8->12 jump (+29.6) exceeds the qmm jump (+21.2). Lifting the cap measures S=12 90.9 -> 85.3 and S=16 89.4 -> 87.9, and both hermetic tests extended to S 1..16 pass. It was still reverted, for three reasons in order: the widths it serves lose on this pack at every rung; the win is zero at the block that actually ships (5); and a 300-token greedy A/B at block 12 with `MLX_SERVE_GDN_PREWORK`/`MLX_SERVE_GDN_DECODE_FUSED` on vs off changed the output bytes, which a fusion sold on bit-identity may not do. The cause is worth knowing before anyone retries: the fused `beta` differs from `mlx_sigmoid` by ONE bf16 ulp on rare inputs, data-dependent and not width-dependent (seed 1 hits it at S=10; seeds 2, 3 and 1745 are clean through S=16; eight seeds are clean at S <= 9, which is why the sweep it was written against never sampled one). The kernel already mirrors MLX's `unary_ops.h` structure — both "fixes" tried made it worse by two orders of magnitude (`exp(-|x|)` with the ternary flipped: 0.002; a float intermediate rounded once at the store, i.e. reading MLX's `auto y` as a float: 0.002-0.03). So MLX's `auto y` really is `bfloat16_t` and the divergence is somewhere else in the rounding, still unexplained. The practical consequence: **the "bit-identical at S 1..9" claim on these two kernels is a sampling result, not a proof.**
+
 ### Hot prefix cache on hybrid SSM models retains far more than it reports
 Measured live (2026-06-19, Qwen3.5-4B = 8 attention + 24 GatedDeltaNet layers, 16 GB Mac): with the cache ON, MLX `active_memory` climbed ~2.2 GB **per agent turn** and never released (model 2.2 GB → 6.8 GB after 3 turns); with `--prefix-cache-entries 0` it stayed flat at the model size and only `peak` rose (the transient prefill spike, released after). Two facts: (1) each commit `captureSsmCheckpoint`-snapshots the per-position conv/SSM state of all 24 linear-attention layers AND refcount-SHARES the arrays, so the real retained allocation (~4.5 GB at 3 entries) is ~3.4× the reported `[hot-cache] resident` (1.3 GB) — the byte cap is checked against the under-count, so it never evicts enough. (2) `--kv-quant` does NOT help: it compresses only the 8 attention layers' K/V, not the dominant SSM/conv state. Reliable lever is the ENTRY count, not the byte cap. **Swift-launcher gotcha**: the server's `prefix_cache_capacity` default is **32** (raised from 1 to stop llama eviction thrash), but `ServerOptions.toCLIArgs` historically only emitted `--prefix-cache-entries` when `!= 1` (assuming server default 1) — so the app silently launched 32 entries and filled 16 GB Macs. Fixed: the flag is ALWAYS emitted, RAM-clamped via `ServerOptions.ramCappedPrefixCacheEntries` (≤18 GB → 1, ≤36 GB → 8, else uncapped) and surfaced in SettingsView. The under-counting accounting bug itself is still open — fix `snapshotBytes`/`ssmCheckpointBytes` to reflect true retained allocation (materialize snapshots with `mlx_contiguous`, or measure parent-buffer footprint) so the byte cap actually bounds memory.
 
@@ -4632,3 +4648,116 @@ predictable probe (`user=368b`, "Repeat the following passage exactly"), with th
   own two boots differ by 30% on predictable, which is larger than any effect
   measured here. The persisted table must be restored before EVERY boot (not
   disabled — the live table IS the subject) or the arms teach each other.
+
+## Speculation never compared itself with the serial token it replaces (`MtpAdaptive`, PR #363)
+
+The EV controller picks the best depth; nothing in it compared a round with
+the serial step it replaces, and the acceptance floor is a model fitted where
+a verify row costs ~0.1 of a forward. On qwen4_exp a verify row is bytes:
+62.7k prose ran 47-58 tok/s speculative against 55 serial, 374k ran 30
+against 47, acceptance far above the floor. The switch compares two MEASURED
+prices per KV bucket with no model at all: the table's `msPerTok(m_lo)` (ms
+and tokens folded from the same rounds) AND this request's trailing
+`MtpPriceWindow` (full-window only, width trials skipped) must both lose to
+the bucket's measured plain-decode token (a new `serial` row beside the width
+grid, deliberately not width 0; a bounded probe of 8 serial tokens teaches an
+unmeasured bucket, retried up to 3 times). v1 priced MTP as a measured
+numerator over the modeled `mtpEvExpectedTokens` denominator, which
+under-predicted committed tokens by 12-31% and switched where MTP was ~10%
+faster. The kv floor is 32768: below it a wrong switch costs ~2x and 11 of
+the A/B's 14 switches were short llmprobe requests. Re-entry only on a bucket
+crossing (one bucket resolver at both sites, or the two oscillated), only
+when the head proves its position bookkeeping (`mtpHeadPositionDrift`), never
+on an M-RoPE turn. On a module-owned head the switch is STICKY and the head
+is RELEASED at the serial block boundary (`slotExclusiveDecode` drops), so
+other slots batch; a KV-only sidecar head is untouched. Calibrated on the
+qwen4 in-checkpoint head only (`mtpAdaptiveArchEligible`); a sidecar pack
+folds no serial cell at all. Levers: `MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`
+(independent of `MLX_SERVE_MTP_ADAPTIVE`, the depth controller's), `_MIN_KV`,
+`_REENTRY_TOKENS`. `--max-mtp-ctx N` is the operator ceiling (inclusive,
+outranks `enable_mtp:true`). Guard: `tests/test_mtp_adaptive.sh`.
+
+## The round-cost table's grid and store version belong to the arch (PR #363)
+
+The long-context split (nine buckets, 64k/128k/256k edges, the serial row,
+store version 3) shipped for every arch, so every sidecar-MTP pack booted on
+a cold table. `MtpCostSource.fromTable()` is the one term deciding whether
+the EV plan prices extension from measurements or the prior, and the prior's
+extension valve is always open: cold meant every round was a two-chunk round
+(37 of 40 extension rounds at 77 ms against a warm table's 1 of 52 at 51 ms,
+−25% decode on the 27B at 8k). `round_cost.Layout` (`.legacy` = the
+six-bucket `rc1` file 26.9.1 wrote, `.long` = `rc3`) is resolved once per
+model by `layoutFor`, and the long grid warm-starts from a legacy file
+(`migrateLegacy`; the `32k+` cell is dropped, not mis-assigned). The width
+trial schedule kept a neighbour bucket's period: a cold bucket read its `<2k`
+neighbour first, armed at period 124-256, and never moved the date when its
+own bucket activated, so short 27B requests ran w1 for 45-91 rounds (main's
+bug too: 68.6 vs 73.9 tok/s at 4k). `TrialSchedule.force` re-reads the period
+every round on every layout and a shorter one pulls the date in (4k 75.1 vs
+71.4 gated, 32k inside the per-boot swing). The EV seed was acquitted
+(`MLX_SERVE_MTP_EV_SEED=0`: 71.4/51.3, no better).
+
+## The qwen4 MTP head's state is not KV-only, and its row count is its step (PR #363)
+
+Head persistence commits the head's KV without its QSA key history; a
+restored head then errored `QsaHistoryGap` on its first forward, so it was
+declined and drafted blind on every hot-cache hit. Both halves travel
+together (`specAdoptPlan`, `qwen4MtpAdopt`, manifest v5, `MLX_SERVE_MTP_HEAD_PERSIST=0`)
+or neither. Then the persisted head shipped its history with a step of 0:
+`KVCache.update` advances `step` at layer 0 only and the head's layer is
+`num_hidden_layers`, so `qwen4MtpAdvance` sets it and the commit refuses a
+snapshot whose step disagrees.
+
+## QSA at long context: split-K, an exact select, one history copy (PR #363, qwen4_exp)
+
+- **Verify widths** (2 <= S < 16) spent ~50 dependent ops per layer and
+  attended a fixed union of the S rows' selections under a mask (6x the MACs
+  at S=6, a 12.6 MB slab). `msv_attn_qsa256_q` is one dispatch with an
+  in-kernel affine unpack; the un-split grid (12 threadgroups at S=6) ran
+  +15.6%, split-K (`QSA_ATTN_NSPLIT_DEFAULT` 16, measured; every count 8..64
+  wins 5-13%) is what pays. Quantized KV only: the "dense arm" was
+  `gatherQsa256`, the PREFILL kernel, whose grid starves at a verify width
+  (16k fp16 decoded 77.7 vs 93.6 tok/s); a dense cache takes the union
+  gather. Per-arm width floors (`MLX_SERVE_QSA_ATTN_MIN_S=6` once dropped
+  S=2..5 onto the dense mask). Configs are LRU-cached (`QsaCfgCache`) and
+  keyed without kv/kb (runtime shapes; a kv-keyed slot rebuilt every round).
+- **Selection**: the argpartition chain's `b * 1e-7` bias only approximates
+  torch.topk's lower-index-wins and vanishes above |score| ~0.84, the
+  production magnitude. `msv_qsa_select` is one exact MSD radix-select
+  dispatch per row, used on both arms so two slots with identical scores
+  attend the same blocks.
+- **The all-visible identity skip** passed a null sheet to `mlx_logical_and`
+  in the `nb > block_topk` arm and aborted the process on the first generated
+  token past kv 2052 (decode is always all-visible, so the skip is gated by
+  `nb > block_topk` alone). Test the arm at kv 2049..2052.
+- **Indexer history**: the prefill-end attach materialized a second copy
+  that lived beside the live buffer for the whole decode (3,840 B/tok, 3.0 GB
+  at 786k) and the bill was honest about it. The newest checkpoint now takes
+  a slice VIEW of the slot's capacity buffer at commit
+  (`handoffQsaHistoryToLatest`; the slot dies next), the append accelerator
+  seeds at the reservation (`seedCapBuf`; a tight seed grew again one line
+  later, ~81 ms at 384k), and the f32 score bank the two-copy slack hid is
+  billed (`statePerTokenBilled`). Per-forward tables (`QsaBlockConsts`,
+  `QsaPooledRope`, `qsaScoreBank`) are built once instead of once per layer.
+- **The score sheet budget** (`MLX_SERVE_QSA_SCORE_SHEET_MB`, default 256) is
+  what binds past ~100k blocks (a 4096-token chunk is 24 indexer passes at
+  383k), and a wider sheet is billed to the admission guard, never just spent.
+
+## The pad-waste cap priced every hybrid slot at kv_len 0 (PR #363)
+
+`cache.step` advances on global layer 0 only, so on every linear-layer-0
+trunk (GDN, gated-conv, Mamba2, KDA) it is 0 forever; fed from it the waste
+ratio was 1.0 for any group and `MAX_PAD_WASTE` never capped anything: a 1k
+slot beside a 60k one padded 59k rows per tick. `KVCache.kvLenForBatching`
+reads the first attention layer's own offset. Gated: the 27B's batched
++12%/+8% were measured with the cap dead, and un-batching those streams is
+unmeasured.
+
+## The PLE prefill prefetch is a kv gate, not a flag (PR #363)
+
+The pool served decode widths only. On the 374k ladder the serial gather went
+67.7 -> 267.9 ms per 1000 prompt tokens as the weights evicted the 32 GB
+mapping (31% of the prefill slowdown); on a resident table the pool LOSES
+2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
+of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
+and both arms announce which one ran.

@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
+const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
@@ -55,6 +56,8 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// Serve-mode default for requests that omit max_tokens (0 = flag not given).
+var serve_default_max_tokens: u32 = 0;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -110,7 +113,8 @@ fn printUsage(io: std.Io) void {
         \\                      inputs get a 400 naming index/count/limit, never truncation)
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
-        \\  --max-tokens <n>    Max tokens to generate (default: 100)
+        \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
+        \\                      mode, the default for requests that omit the field
         \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
         \\                      Serve: default for requests that omit `temperature`
         \\                      (otherwise the model's generation_config.json, then 1.0)
@@ -198,6 +202,17 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
+        \\                        context tokens (default: 0 = no ceiling).
+        \\                        A verify row is BYTES, so on a long-context
+        \\                        trunk a round can cost more than the serial
+        \\                        steps it replaces. A request whose prompt is
+        \\                        past <n> decodes serially, and one that
+        \\                        GENERATES past it switches mid-flight. The
+        \\                        bound is inclusive (<n> itself still drafts)
+        \\                        and it outranks `enable_mtp:true` in the
+        \\                        request body. MTP only — PLD, the drafter
+        \\                        and DFlash/DSpark are unaffected.
         \\  --mtp-history-window <n>
         \\                      MTP prefill-history window: prompts forwarding
         \\                        more than 16384 tokens only build head history
@@ -359,6 +374,12 @@ pub fn main(init: std.process.Init) !void {
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
+    // Resolve lazily-cached env reads on the main thread before other threads exist.
+    @import("transformer.zig").warmQsaEnvCaches();
+    @import("prefix_cache.zig").warmEnvCaches();
+
+    // mlx-c's default handler exits the process; latch MLX failures instead (#353).
+    mlx.installErrorHandler();
 
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -552,6 +573,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
             i += 1;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+            serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
             temperature = try std.fmt.parseFloat(f32, args[i]);
@@ -685,6 +707,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
+            i += 1;
+            generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
             // 0 = full history; otherwise the last-N-token window applied
@@ -1345,6 +1370,7 @@ pub fn main(init: std.process.Init) !void {
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
+            .default_max_tokens = serve_default_max_tokens,
             .default_temperature = if (temp_explicit) temperature else null,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
@@ -1367,6 +1393,8 @@ pub fn main(init: std.process.Init) !void {
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
+
+        xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
         generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
@@ -1753,6 +1781,7 @@ fn runGenServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -1883,6 +1912,7 @@ fn runHeadlessServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -2097,6 +2127,7 @@ fn runDs4Serve(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
@@ -2371,6 +2402,7 @@ fn runLlamaServe(
         .max_context_size = effective_ctx,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,

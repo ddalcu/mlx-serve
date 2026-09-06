@@ -57,7 +57,7 @@ Sampling defaults for request fields the client OMITS resolve as: request body >
 | `Models/{ChatModels,AgentModels}.swift` | `ChatMessage`, `ChatImage`, `SerializedToolCall`, `AgentPlan` |
 | `Services/APIClient.swift` | HTTP + SSE streaming client |
 | `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager` |
-| `Services/AgentBudget.swift` | `AgentBudget.forServerContext` + `AgentConfigs` — derives the context/output budget written into third-party agent CLI configs (pi `models.json`, opencode provider, Claude Code `CLAUDE_CODE_MAX_OUTPUT_TOKENS`) from the server's advertised `meta.context_length`. Never hardcode these. |
+| `Services/AgentBudget.swift` | `AgentBudget.forServerContext` + `AgentConfigs` — derives the context/output budget written into third-party agent CLI configs (pi `models.json`, opencode provider, Claude Code `CLAUDE_CODE_MAX_OUTPUT_TOKENS` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS`) from the server's advertised `meta.context_length`. Never hardcode these. |
 | `Services/AgentEngine.swift` | Shared agent logic: history, tool exec, repetition tracking, overflow |
 | `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
 | `Services/DocumentIndex.swift` | Mini in-memory RAG for "attach a folder": chunker, hybrid retrieval (cosine + IDF lexical), `searchDocuments` tool. Embeds via `ServerEmbedding` only (server `/v1/embeddings`, GPU): `autoProvider` probes `/v1/models`, auto-downloads `bge-small-en-v1.5-8bit` (35 MB) when no encoder is known, and registers it via `/v1/load-model` by absolute path. Server down / provisioning failure → lexical-only retrieval (no NLEmbedding fallback) |
@@ -189,7 +189,7 @@ For Claude Code and Anthropic SDK clients with local models.
 - Stop reasons: `stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`
 - SSE events: `message_start`, `content_block_{start,delta,stop}` (with `text_delta`/`thinking_delta`/`signature_delta`/`input_json_delta`), `message_{delta,stop}` — explicit start/stop lifecycle per indexed block
 
-**Claude Code launcher**: app sets `ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`, `CLAUDE_CODE_SUBAGENT_MODEL=mlx-serve`.
+**Claude Code launcher**: app sets `ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`, `CLAUDE_CODE_SUBAGENT_MODEL=mlx-serve`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from the ADVERTISED `context_length` (Claude Code assumes 200k and auto-compacts there for any model outside its own catalog; the context export is omitted when the server advertises nothing). Zig `launch.scriptFor(.claude, …)` and Swift `AgentConfigs.claudeCodeExports` are twins.
 
 ## Ollama-compatible API (`/api/*`)
 
@@ -311,6 +311,7 @@ App-side (Swift). The Sandbox window's Terminal tab runs agent CLIs INSIDE the A
 - **Session lifecycle** (`SandboxSessionTabs` + per-tab runtimes): MULTIPLE concurrent sessions, one tab each (N sessions = N ssh connections into the same dropbear/mirror; stable display names "pi"/"pi 2"); per tab preparing (`AgentSandbox.startCliSession`: boot → dropbear preflight → materialize → mirror wait) → live → exited. Live terminals are NEVER unmounted (ZStack + opacity — unmount terminates the ssh). Each live session PINS the shared guest (`pinCliSession`; remount-needing workspace switch throws `remountBlockMessage`); Stop guest / app quit end it. Preflight gates (`SandboxCliPreflight`, each a distinct alert with the fix named): sandbox on, guest networking on (offer to enable), server running, server bound `0.0.0.0`, dropbear present (stale cached image → `staleImageMessage` + `repullBaseImage`, which stops the guest BLOCKING before deleting the cached image dir — same ordering rule as the factory reset, pinned by `testRepullStopsTheGuestBeforeDeletingTheImageCache`).
 - **Factory reset** (Settings → Agent Sandbox → Reset Sandbox, red + confirmation): `AgentSandbox.resetAllData` stops the guest (blocking, off-main — deleting a rootfs under a still-stopping VM risks a partial cache), deletes `~/.mlx-serve/sandbox` (kernel, images incl. ALL in-guest state, ssh identity — scope pinned by AgentSandboxTests) and clears the transcript; next use re-provisions from scratch.
 - **Smoke**: `SANDBOX_SMOKE=1` phase 5 proves boot → mirror → `ssh 'echo SSH_OK'` (SKIPs on a pre-dropbear image); `SANDBOX_SMOKE_AGENT=pi` adds the in-guest install + `--version`.
+- **Images and the guest kernel are two pinned artifacts that bump TOGETHER**: `containers/agent-shell-mlxserve/` builds the guest OCI image (`make push` publishes, `make export` writes a tarball) and bakes dropbear in (pinned by `SandboxSSHTests`); `containers/guest-kernel/` builds kernel 6.6 with the fuse owner-read clamp (#150) via `build.sh` → `kernel-arm64.gz`, tag pinned by `AgentSandbox.kernelTag` + `scripts/fetch-guest-rootfs.sh`.
 - **Out of scope (v1)**: PTY-over-vsock (networking-off sessions), vsock reverse tunnel, VM surviving app quit, multi-session manager, opencode/claude rows (add as registry rows later).
 
 ## Sandbox desktop / computer use (app-side, Swift + one guest script)
@@ -401,6 +402,35 @@ Assistant shape (no embed table, no lm_head — borrows the trunk's): `encoder.f
 **Draft-only lm_head** (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, `dflash.DEFAULT_DRAFT_HEAD_BITS` = 0, i.e. DEFAULT OFF): the block's draft argmax otherwise reads the full trunk head (202048×6656) on top of the verify's own read of it. `bind` re-encodes it once through `mtp.requantizeRows` — the SAME chunked requantizer the MTP head uses, extended to accept a dense source — and only when that shrinks the read (a bf16 head counts as 16 bits/weight). Verification never routes through it, so the emitted distribution is untouched. It defaults OFF because at the resolved block the head is under 2 ms of a ~60 ms round and the acceptance it costs exceeds the bytes it saves: 3-bit 55.4 tok/s / 2.19 accepted per round vs trunk head 57.8 / 2.37. The lever was a win at block 16 (10 ms of a 175 ms round) — a draft-side lossy default is a ratio between a byte saving and an acceptance cost, and both sides move when the block does.
 
 **Sampled requests** draft greedily and accept through the one-hot rule, and that is the MEASURED choice, not a v1 shortcut: on Muse 4-bit there is no temperature penalty (temp 0 → 1.98x / 55.1% per-draft; temp 0.7 → 1.98x / 57.7%, 3 reps x 4 prompts, same-boot serial reference). `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the request's own filtered distribution (`filteredProbsBlock`, one filter pass + one categorical over all m rows) and accepts through the full Leviathan ratio with the residual taken against the true q — exact, and a LOSS (1.87x / 54.5%): expected acceptance is `p(argmax q)` greedy vs `1 − TV(p,q)` sampled, and this assistant's argmax tracks the trunk while its distribution shape does not. Per-request spec cells swing ~10% run to run at temperature; 3+ reps before believing a temperature claim.
+
+### SSD-first prefix cache (qwen4_exp)
+
+At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's
+entry ~24 GB (~24 KB/token: 12.3 KB of 8-bit KV, 3.8 KB of QSA indexer history,
+SSM checkpoints, pooled banks) + transients 3-7 GB against a ~107.5 GB ceiling.
+RAM therefore holds the model and ONE session; the SSD is the capacity tier and
+`--prefix-cache-disk` is the real limit (~100 GB ≈ four 1M sessions). A disk hit
+streams the entry back in seconds against ~25 minutes of re-prefill.
+
+One predicate, `prefix_cache.ssdFirstActive` (`ModelConfig.ssdFirstCapable()` AND
+`MLX_SERVE_PREFIX_SSD_FIRST` AND a disk tier), is read at the scheduler's
+disk-tier attach into `HotPrefixCache.ssd_first` and mirrored onto
+`DiskTier.ssd_first`; every mechanism reads that field, never a model_type.
+
+| mechanism | what it does |
+|---|---|
+| 1 flush the LIVE cache | `capturePendingDisk` records the live snapshot, full token record, checkpoints and spec snaps at commit, BEFORE the RAM byte-budget trim; the flush prefers that record. Refcount-shared, consumed once. |
+| 2 background writer | `src/kv_disk_writer.zig`: one thread, FIFO, ~1 GiB host-byte permit, prefix-scoped epoch fence at the tier's one directory-removal site, failures attributed to their entry. The inference thread keeps the device→host readback and hands over bytes; `meta.json` is submitted after its chunks so the index lands LAST; every file is tmp+rename. |
+| 3 per-chunk write-through | `Generator.WriteThroughHook` at each completed prefill chunk (one chunk per boundary, only for a new span of at least one chunk; `MLX_SERVE_SSD_WRITE_THROUGH=0`): a killed prefill leaves a restorable chunk-aligned prefix. |
+| 4 checkpoint-bearing chunks | SSM checkpoints ride OUTSIDE the per-flush byte budget, beside the chunk that closes their position, so a hybrid entry restores from its first flush. |
+| 5 budget semantics | `server.ssdFirstPrefixCacheMem` floors RAM at one session at the working context (the entry IS the live KV) and `--prefix-cache-mem` becomes the IDLE allowance (0 = none idle), logged once at load. Disk budget = `min(operator cap, free − min(64 GiB, 10% of volume))`, 1 GiB store floor, re-read via `volumeSpace` before every store. |
+| 6 evict-on-idle + root-wide LRU | `HotPrefixCache.spillIdleEntries` at end of request: every idle entry is written; past the allowance the durable ones are shed first, then the rest (naming why). `DiskTier.sweepSiblings` walks the other fingerprints under `<base>`: aged strays go, LRU past one budget's worth. |
+| 7 chunk sharing + restore by move | A prefix-diverging turn hard-links the donor's LANDED chunks (manifest v6, `MLX_SERVE_SSD_CHUNK_SHARE=0`); a full-prefix hit checks the entry out so the first append donates in place (`MLX_SERVE_RESTORE_MOVE=0`). |
+
+The prefill width is not part of this: it is a per-request decision
+(`chooseRequestPrefillChunk`, gated on `ModelConfig.perRequestPrefillChunk()`).
+`volumeSpace` hand-declares darwin's `struct statfs` (std has no binding in this
+Zig) with a plausibility guard so a wrong layout fails SAFE to the operator cap.
 
 **Assistant context survives the prefix cache** (`prefix_cache.DflashSnap` / `DflashCommit` / `DflashTarget`). A restore forwards no trunk layers, so it produces no captures and the context would start EMPTY on every reused prefix — measured 92.6% → 66.5% per-draft acceptance and 80.2 → 60.9 tok/s on a full-prefix hit, i.e. the multi-turn case paid for the cache twice. The context snapshot rides `Entry` beside the KV, its bytes folded into `kv_bytes` so `--prefix-cache-mem` and eviction cover it (~20.5 KB/token here vs the trunk's ~53.2). Every failure path degrades rather than errors — no payload, SSD tier, snapshot failure, or a base past the trunk cursor all return `LookupResult.dflash_base = null` and leave the caller's cache untouched (start blind) — which is safe precisely because the state is DRAFT-side. The scheduler adopts only when `base + step == matched` EXACTLY, since `nextDflash` asserts `dctx.absLen() == anchor_pos`.
 

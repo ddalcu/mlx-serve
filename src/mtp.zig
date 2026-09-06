@@ -55,6 +55,13 @@ const Weights = model_mod.Weights;
 pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
 
+/// `--max-mtp-ctx`: MTP stays off past this many prompt tokens (inclusive; 0 = unlimited).
+/// A machine limit: `enable_mtp:true` in the body does not lift it. MTP only.
+pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
+    if (max == 0) return true;
+    return ctx_tokens <= @as(usize, max);
+}
+
 /// Per-silicon adaptive depth cap for machines on the `.generic` cost
 /// surface. The cap is a MACHINE measurement, so each row is one, never
 /// interpolated between chips; an unmeasured chip keeps the default row.
@@ -5107,4 +5114,17 @@ test "adaptiveDepthCapForMachine: base M5 caps at 4, Pro/Max/Ultra keep the defa
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Max", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M5 Ultra", 6).cap);
+}
+
+test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
+    try testing.expect(mtpCtxWithinLimit(0, 0));
+    try testing.expect(mtpCtxWithinLimit(0, 1_000_000));
+
+    try testing.expect(mtpCtxWithinLimit(4096, 4095));
+    try testing.expect(mtpCtxWithinLimit(4096, 4096));
+    try testing.expect(!mtpCtxWithinLimit(4096, 4097));
+    try testing.expect(!mtpCtxWithinLimit(4096, 1_000_000));
+
+    try testing.expect(mtpCtxWithinLimit(1, 1));
+    try testing.expect(!mtpCtxWithinLimit(1, 2));
 }
