@@ -4103,3 +4103,58 @@ the stream and dequant terms, the retained SSM checkpoints, the QSA mask and the
 no QSA history). Those arms `truncate(0, s)` and return `matched = 0` — a cold prefill —
 but leave the marker set, so the donor entry stays protected from the admission eviction
 pass for a request that shares nothing with it. Same class as the above, one arm along.
+
+## A write error is a COUNTER; the session it lost has a NAME (SSD-first spill durability, 2026-09-06)
+
+Reviewing PR #363: the durability bar in `spillIdleEntries` — the thing that
+licenses discarding the only copy of a session — detected a background write
+failure only when it landed inside the same pass (`d.writeErrors() !=
+errs_before`). A counter can only be read as a DELTA across some window, and
+the failure that costs a session falls outside every window.
+
+**The interleaving.** Pass N stages entry E's chunks and its `meta.json` and
+skips E for the right reason (`entryWritesPending`). The writer then fails
+`c000003.safetensors` — ENOSPC, EIO — logs it, counts it (`write_errors += 1`)
+and DROPS the blob; FIFO, it still lands `meta.json` afterwards. Nothing
+connects that blob to E: neither the writer nor the index records which entry a
+failed path belonged to. Pass N+1 then samples `errs_before` AFTER the error,
+so the delta is 0; the in-memory `IndexEntry` — appended by `writeMeta` before a
+byte reached the disk — still carries a non-zero `chunk_bytes[3]`;
+`appendCommitWithSpec` takes the superseded branch and answers `.persisted`
+without touching the disk; `fullPrefixEntryId` passes on the stale sizes;
+`entryWritesPending` is false. `spill_durable` goes true, `evictAt` drops the
+RAM copy, and the next turn restores from an entry missing a chunk. The
+lost-session class, arrived at through four bars that were each individually
+right.
+
+**Half 1 — the failure POISONS the entry.** The writer now records each failed
+blob's path beside the error count (`Writer.Failure`, `takeFailures`, capped at
+`MAX_RECORDED_FAILURES` with an `unattributed_failure` fallback), and the tier
+attributes it: `<root>/e<id>/…` names the entry, and `harvestWriteFailures`
+marks that `IndexEntry` `poisoned`, zeroes its `chunk_bytes` and logs
+`[disk-cache] e<id> write failed (<errno>) — entry invalidated`. A poisoned
+entry is dead in every direction — `bestMatch` skips it (a restore from it is a
+MISS), `fullPrefixEntryId`/`holdsFullPrefix` never report it whole, the commit's
+supersede/extend scan never adopts it, `chunkShareDonor` never links from it,
+and the `e<id> complete on disk` marker cannot print for it (that commit returns
+`.partial`, not `.persisted`). The next commit reclaims its directory
+(`dropPoisonedEntries`, at the top of `appendCommitWithSpecBounded` where a
+removal may already block — never on the spill's non-blocking path) and rebuilds
+under a fresh id.
+
+**Half 2 — belt and braces: ask the filesystem.** Every other bar is an
+in-memory claim. Before `evictAt` the spill now calls
+`DiskTier.entryWholeOnDisk`, which stats each chunk file the index names against
+its recorded size. One stat per chunk is nothing next to what it guards, and it
+catches what no error counter can: a byte that went missing with no failed write
+at all — an external delete, a kill -9 between a chunk and its manifest, a
+volume that simply lost it.
+
+**The harness this needed.** Injected writer failures, in two phases:
+`Writer.injectFailure(substr, .write)` fails the blob when the writer picks it
+up (paused → unpaused, this is the cross-pass interleaving above, deterministic),
+`.submit` fails it on the spot (the same-pass arm, also deterministic). Both take
+the same count-record-drop path a real ENOSPC takes. The bar the tests read is
+the VERDICT (`Entry.spill_durable`), not the eviction it licenses: the idle
+allowance is a HARD cap, so tier 3 sheds a non-durable entry too — deliberately,
+knowing that loses only work.

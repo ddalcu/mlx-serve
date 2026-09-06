@@ -232,6 +232,15 @@ pub const IndexEntry = struct {
     /// acceptance on the first reused turn, never a token.
     spec_dflash: ?SpecMeta = null,
     spec_mtp: ?SpecMeta = null,
+    /// A background write for this entry FAILED: the writer counted an error
+    /// and dropped the blob, so a file the manifest names is not on disk. The
+    /// entry is dead — never matched, never superseded, never a chunk-share
+    /// donor, never reported complete — and the next commit reclaims its
+    /// directory. Not persisted: after a restart `scan` re-validates every
+    /// chunk against the manifest and salvages what is really there. This
+    /// flag is about the window in which the in-memory index is AHEAD of the
+    /// disk, which is exactly where the eviction bar reads.
+    poisoned: bool = false,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
@@ -562,6 +571,127 @@ pub const DiskTier = struct {
         return w.pendingPrefix(pre);
     }
 
+    /// Attribute the background writer's failed blobs to the entries that
+    /// staged them and INVALIDATE those entries. Returns how many entries this
+    /// call poisoned.
+    ///
+    /// A counter can only be read as a DELTA across some window, and the
+    /// failure that costs a session falls outside every window: pass N stages
+    /// the entry's chunks and its meta.json and skips the entry (writes
+    /// pending); the writer then loses one chunk and — FIFO — still lands the
+    /// manifest; pass N+1 samples the counter AFTER that error, finds the
+    /// index (appended by `writeMeta` before a byte reached the disk) claiming
+    /// every chunk, and licenses the eviction of the only good copy. The blob's
+    /// PATH names its entry, so the loss is attributable, and the entry it
+    /// belonged to is the one thing that must never be trusted again.
+    pub fn harvestWriteFailures(self: *DiskTier) usize {
+        const w = self.writer orelse return 0;
+        const fails = w.takeFailures();
+        defer {
+            for (fails) |f| self.allocator.free(f.path);
+            self.allocator.free(fails);
+        }
+        var poisoned: usize = 0;
+        for (fails) |f| {
+            const id = self.entryIdFromPath(f.path) orelse {
+                // A loss we cannot attribute may belong to ANY entry.
+                poisoned += self.poisonAll(f.err_name);
+                continue;
+            };
+            for (self.entries.items) |*e| {
+                if (e.id != id or e.poisoned) continue;
+                self.poisonEntry(e, f.err_name);
+                poisoned += 1;
+            }
+        }
+        // The writer ran out of room to name names: same conclusion, no id.
+        if (w.takeUnattributed()) poisoned += self.poisonAll("unrecorded");
+        return poisoned;
+    }
+
+    /// The `e<id>` this absolute path belongs to, or null if it names no entry
+    /// of this tier.
+    fn entryIdFromPath(self: *const DiskTier, path: []const u8) ?u64 {
+        if (!std.mem.startsWith(u8, path, self.root)) return null;
+        var rest = path[self.root.len..];
+        if (rest.len == 0 or rest[0] != '/') return null;
+        rest = rest[1..];
+        if (rest.len < 2 or rest[0] != 'e') return null;
+        rest = rest[1..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        return std.fmt.parseInt(u64, rest[0..slash], 10) catch null;
+    }
+
+    /// Mark one entry dead: never matched, never superseded, never a
+    /// chunk-share donor, never reported complete, and reclaimed by the next
+    /// commit. `chunk_bytes` is zeroed so every "is this whole?" reader
+    /// (`fullPrefixEntryId`, a future scan of this index) answers no even if it
+    /// never learns about the flag.
+    fn poisonEntry(self: *DiskTier, e: *IndexEntry, err_name: []const u8) void {
+        _ = self;
+        e.poisoned = true;
+        @memset(e.chunk_bytes, 0);
+        log.warn("  [disk-cache] e{d} write failed ({s}) — entry invalidated\n", .{ e.id, err_name });
+    }
+
+    fn poisonAll(self: *DiskTier, err_name: []const u8) usize {
+        var n: usize = 0;
+        for (self.entries.items) |*e| {
+            if (e.poisoned) continue;
+            self.poisonEntry(e, err_name);
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Reclaim the directories of entries a failed write killed. Runs where a
+    /// removal may already block (the commit path, which evicts to budget
+    /// anyway) — never on the spill's non-blocking durability check.
+    fn dropPoisonedEntries(self: *DiskTier) void {
+        var i: usize = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (!self.entries.items[i].poisoned) continue;
+            log.info("  [disk-cache] dropping invalidated entry e{d}\n", .{self.entries.items[i].id});
+            // `removeAt` swap-removes, and everything above `i` has already
+            // been checked and is not poisoned — so the element moved into `i`
+            // needs no second look.
+            self.removeAt(i);
+        }
+    }
+
+    /// Belt and braces for the eviction bar: does the FILESYSTEM agree with
+    /// the index about entry `id`? Every chunk the index names must exist at
+    /// the size it records. One stat per chunk — cheap next to what it
+    /// guards, which is discarding the only copy of a session — and it catches
+    /// what no error counter can: a byte that went missing with no failed
+    /// write at all (an external delete, a kill -9 between a chunk and its
+    /// manifest, a volume that lost it).
+    pub fn entryWholeOnDisk(self: *DiskTier, id: u64) bool {
+        for (self.entries.items) |*e| {
+            if (e.id != id) continue;
+            if (e.poisoned) return false;
+            for (e.chunk_bytes, 0..) |want, i| {
+                if (want == 0) return false;
+                const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, id, i }) catch return false;
+                defer self.allocator.free(cp);
+                const st = statFile(self.io, cp) orelse return false;
+                if (st.size != want) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// Is entry `id` poisoned — or gone, which is the same answer to every
+    /// question a caller asks this before making a durability claim.
+    pub fn entryPoisoned(self: *const DiskTier, id: u64) bool {
+        for (self.entries.items) |*e| {
+            if (e.id == id) return e.poisoned;
+        }
+        return true;
+    }
+
     /// Wait only for the files of entry `id` (audit S12): a restore needs ITS
     /// chunks on disk, not the previous turn's tail.
     fn drainEntry(self: *DiskTier, id: u64) void {
@@ -667,6 +797,7 @@ pub const DiskTier = struct {
         var best_idx: ?usize = null;
         var best_usable: u32 = 0;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
             const max_shared = @min(e.tokens.len, prompt_ids.len);
@@ -1097,6 +1228,13 @@ pub const DiskTier = struct {
         // while the full-attention layers carry offset == prompt position.
         // `max(step, max initialized offset)` is correct for both — equal on
         // pure attention, and the layer offset on hybrid.
+        // Anything the background writer lost since the last commit is
+        // attributed and reclaimed BEFORE the index is read: a poisoned entry
+        // must not be superseded ("the tier already holds this prefix"), must
+        // not be extended into, and must not donate a chunk.
+        _ = self.harvestWriteFailures();
+        self.dropPoisonedEntries();
+
         const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
         const kv_target: u32 = @intCast(kv_target_u);
@@ -1141,6 +1279,7 @@ pub const DiskTier = struct {
         var extend_idx: ?usize = null;
         var ssm_only_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len >= tokens.len) {
@@ -1364,10 +1503,17 @@ pub const DiskTier = struct {
         // the next request finishes) extends the entry until it appears.
         // Harnesses assert on THIS line, not on `persisted N/M` — a bounded
         // flush prints N < M and is not a defect.
-        if (complete) {
+        // ...and a background write that has ALREADY failed for this entry
+        // makes the marker a lie and `.persisted` a promise nothing can keep.
+        var whole = complete;
+        if (whole) {
+            _ = self.harvestWriteFailures();
+            if (self.entryPoisoned(id)) whole = false;
+        }
+        if (whole) {
             log.info("  [disk-cache] e{d} complete on disk: {d} tokens, {d} chunks, {d} ssm-cp\n", .{ id, kv_len, new_entry.chunk_bytes.len, new_entry.ssm_positions.len });
         }
-        return if (complete) .persisted else .partial;
+        return if (whole) .persisted else .partial;
     }
 
     /// Does the INDEX agree that this tier holds a complete, restorable copy
@@ -1410,6 +1556,7 @@ pub const DiskTier = struct {
         const target = persistTargetLen(kv_entries, step, tokens.len);
         if (target == 0) return null;
         for (self.entries.items) |*e| {
+            if (e.poisoned) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len < tokens.len) continue;
@@ -2249,6 +2396,7 @@ pub const DiskTier = struct {
         if (!self.ssd_first or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
@@ -5742,4 +5890,122 @@ test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps a93e2
     // reverse) is a shape nobody measured.
     const sch = @embedFile("scheduler.zig");
     try t.expect(std.mem.indexOf(u8, sch, "disk.?.ssm_max_per_entry = if (params.config.longCtx" ++ "Gated())") != null);
+}
+
+test "DiskTier: a failed background write INVALIDATES the entry it belonged to (no completion claim, restore misses)" {
+    // The writer counts an error and DROPS the blob — and nothing else ever
+    // learned WHICH entry lost a file. The in-memory `IndexEntry` is appended
+    // by `writeMeta` before a byte reaches the disk, so an entry whose chunk 3
+    // died kept a non-zero `chunk_bytes[3]`, `fullPrefixEntryId` passed it,
+    // and the RAM copy was evicted against a hole. Attribution is the fix:
+    // the failed path names the entry, and that entry is poisoned.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-poison", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Hold the writer so the failure lands strictly AFTER the commit — the
+    // interleaving a per-pass error delta cannot see.
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    tier.writer.?.injectFailure("c000003", .write);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const dead_id = tier.entries.items[0].id;
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expect(tier.writeErrors() > 0);
+    // meta.json rides the same FIFO queue and DID land: the index on disk and
+    // in memory both still describe five whole chunks.
+    try testing.expectEqual(@as(usize, 5), tier.entries.items[0].chunk_bytes.len);
+
+    // Attribution: one failure, one entry.
+    try testing.expectEqual(@as(usize, 1), tier.harvestWriteFailures());
+    try testing.expect(tier.entries.items[0].poisoned);
+    for (tier.entries.items[0].chunk_bytes) |b| try testing.expectEqual(@as(u64, 0), b);
+    // Nothing may report it whole, and a restore from it is a MISS.
+    try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+    try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config) == null);
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
+    try testing.expect(!tier.entryWholeOnDisk(dead_id));
+    // Attribution happens ONCE: a second harvest cannot re-poison a rebuilt
+    // entry.
+    try testing.expectEqual(@as(usize, 0), tier.harvestWriteFailures());
+
+    // The next commit reclaims the dead directory and rebuilds from scratch —
+    // a NEW id, and this time whole.
+    tier.writer.?.injectFailure(null, .write);
+    const out = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    try testing.expectEqual(PersistOutcome.persisted, out);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const live = &tier.entries.items[0];
+    try testing.expect(live.id != dead_id);
+    try testing.expect(!live.poisoned);
+    try testing.expect(tier.entryWholeOnDisk(live.id));
+    try testing.expect(tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
+
+    // And the rebuilt entry restores.
+    var back = try KVCache.init(testing.allocator, 2);
+    defer back.deinit();
+    try testing.expectEqual(@as(u32, 600), try tier.restoreInto(&back, 0, s));
+}
+
+test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk fails it with a clean writer)" {
+    // Belt and braces for the attribution above: a byte can go missing with no
+    // write error at all (an SSD that lost it, an external delete, a kill -9
+    // between the chunk and the manifest). One stat per chunk against the
+    // recorded size is cheap and catches every one of them.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-stat", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const id = tier.entries.items[0].id;
+    try testing.expect(tier.entryWholeOnDisk(id));
+
+    // Truncate one chunk behind the tier's back; the index is untouched.
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stat/e1/c000002.safetensors", .data = "short" });
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    // ...and a missing file fails it too.
+    try tmp.dir.deleteFile(io, "fp-stat/e1/c000002.safetensors");
+    try testing.expect(!tier.entryWholeOnDisk(id));
+    // An id nobody holds is never whole.
+    try testing.expect(!tier.entryWholeOnDisk(id + 999));
+}
+
+test "DiskTier: the completion marker never prints for an entry a write failure killed" {
+    // The `e<id> complete on disk` line is what harnesses assert on. It is a
+    // claim of durability, so it must be behind the SAME poison state the
+    // eviction bar reads — and the commit that would have printed it returns
+    // `.partial`, never `.persisted`.
+    const src = @embedFile("kv_disk_cache.zig");
+    const at = std.mem.indexOf(u8, src, "complete on disk: {d} tokens") orelse return error.MarkerMoved;
+    const window = src[at -| 900 .. at];
+    try testing.expect(std.mem.indexOf(u8, window, "harvestWrite" ++ "Failures(") != null);
+    try testing.expect(std.mem.indexOf(u8, window, "entry" ++ "Poisoned(") != null);
 }

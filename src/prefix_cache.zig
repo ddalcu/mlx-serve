@@ -2037,6 +2037,12 @@ pub const HotPrefixCache = struct {
         // whose files were staged during a pass that saw ANY error is treated
         // as not-yet-durable and re-checked next pass. Conservative on
         // purpose: the cost of being wrong here is a lost session.
+        // Attribute anything the writer lost since the last pass to the entry
+        // that staged it, BEFORE the error counter is sampled: a failure that
+        // landed between two passes is invisible to the delta below (this pass
+        // reads the counter after it) and is exactly the shape that dropped
+        // the only good copy of a session.
+        _ = d.harvestWriteFailures();
         const errs_before = d.writeErrors();
         var spilled: usize = 0;
         var idle_bytes: u64 = 0;
@@ -2106,6 +2112,15 @@ pub const HotPrefixCache = struct {
             if (d.entryWritesPending(disk_id)) continue;
             if (d.writeErrors() != errs_before) {
                 log.warn("  [hot-cache] idle spill: background write failed — entry stays resident\n", .{});
+                continue;
+            }
+            // ...and belt and braces: every claim so far is an in-memory one
+            // (a commit outcome, the index it wrote, an error counter). Ask the
+            // FILESYSTEM whether the chunks the index names are there at the
+            // sizes it records — one stat per chunk, against the eviction of a
+            // whole session.
+            if (!d.entryWholeOnDisk(disk_id)) {
+                log.warn("  [hot-cache] idle spill: the persisted chunks do not match the index — entry stays resident\n", .{});
                 continue;
             }
             // Proven durable for THIS pass. The flag is reset at the top of
@@ -6523,4 +6538,242 @@ test "restore by move: the policy is off outside the SSD-first arm and under the
     try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 600, true));
     // An empty record is never checked out.
     try testing.expect(!HotPrefixCache.checkoutEligible(true, true, false, 0, 0, 608, true));
+}
+
+/// The resident entry whose token record is exactly `toks`. The spill's
+/// verdict is a per-entry flag (`spill_durable`), so a test that wants to
+/// read the verdict rather than its consequence has to find the entry.
+fn testEntryFor(hc: *HotPrefixCache, toks: []const u32) !*Entry {
+    for (hc.entries.items) |*e| {
+        if (std.mem.eql(u32, e.tokens, toks)) return e;
+    }
+    return error.EntryGone;
+}
+
+test "SSD-first: a chunk write that fails AFTER the pass invalidates the entry — RAM is never dropped against it" {
+    // The review's scenario, end to end. Pass N stages entry A's chunks and
+    // its meta.json and correctly skips A (writes pending). The writer then
+    // loses `c000003` — error counted, blob dropped — but, FIFO, still lands
+    // meta.json, so the in-memory index (appended by `writeMeta` before a byte
+    // reached the disk) keeps a non-zero `chunk_bytes[3]`. Pass N+1 samples
+    // the error counter AFTER that error, `appendCommitWithSpec` takes the
+    // superseded branch and answers `.persisted` without touching the disk,
+    // `fullPrefixEntryId` passes on the stale sizes, nothing is pending, and
+    // the delta is 0 — so `spill_durable` went true and `evictAt` dropped the
+    // only good copy. The next turn restored from an entry missing a chunk:
+    // the lost-session class.
+    //
+    // The bar is the VERDICT (`spill_durable`), not the eviction it licenses:
+    // the allowance is a hard cap, so tier 3 sheds a non-durable entry too —
+    // deliberately, and knowing it loses only work.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-poison", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    hc.disk.?.enableBackgroundWriter();
+    // Generous allowance: this test is about the durability VERDICT, not the
+    // cap (tier 3 would otherwise shed the entry for a different, named
+    // reason).
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    try hc.commit(&cache, &tok_a, false);
+    try hc.commit(&cache, &tok_b, false);
+
+    // ── Pass N: the writer is held, so A's files stay staged and the pass
+    // skips A for the RIGHT reason (pending).
+    hc.disk.?.writer.?.setPaused(true);
+    // A failed assertion below must not hang the SUITE (scan-pinned rule).
+    defer hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.writer.?.injectFailure("c000003", .write);
+    hc.spillIdleEntries(s);
+    try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    const dead_id = hc.disk.?.entries.items[0].id;
+
+    // ── Between the passes: chunk 3 dies, meta.json lands.
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter(); // test-side only: the engine never waits here
+    try testing.expect(hc.disk.?.writeErrors() > 0);
+    try testing.expectEqual(@as(usize, 5), hc.disk.?.entries.items[0].chunk_bytes.len);
+
+    // The failure names its entry, so the entry is invalidated: a restore from
+    // it MISSES rather than reading a hole.
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.harvestWriteFailures());
+    try testing.expect(hc.disk.?.entries.items[0].poisoned);
+    try testing.expect(hc.disk.?.bestMatch(&tok_a, false, cache.config) == null);
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+
+    // ── Pass N+1: A is NOT durable. The dead directory is reclaimed and the
+    // entry rebuilt under a NEW id; that rebuild is staged (the writer is held
+    // again), so it is not a durable copy yet either.
+    hc.disk.?.writer.?.setPaused(true);
+    // Same rule as the first hold: released at the FAILURE point, not at
+    // teardown (the release below is the control arm's, not a safety net).
+    defer hc.disk.?.writer.?.setPaused(false);
+    hc.spillIdleEntries(s);
+    try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expect(hc.disk.?.entries.items[0].id != dead_id);
+
+    // ── Control: with the writer healthy the very same entry IS durable, and
+    // shedding it under a zero allowance leaves a copy that restores whole.
+    hc.disk.?.writer.?.injectFailure(null, .write);
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter();
+    hc.spillIdleEntries(s);
+    try testing.expect((try testEntryFor(&hc, &tok_a)).spill_durable);
+
+    hc.ssd_idle_mem = 0;
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqualSlices(u32, &tok_b, hc.entries.items[0].tokens);
+
+    var back = try KVCache.init(testing.allocator, 1);
+    defer back.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&back, &moe_off, null, s, &tok_a, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 599), res.matched);
+}
+
+test "SSD-first: a write failure inside the SAME pass still keeps the entry resident" {
+    // The pre-existing arm (`writeErrors() != errs_before`) covers the
+    // interleaving where the failure lands while the pass runs, and the
+    // attribution added for the cross-pass case must not replace it. A
+    // submit-time injection is the volume refusing on the spot, which is the
+    // deterministic form of that timing.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-samepass", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    hc.disk.?.enableBackgroundWriter();
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    try hc.commit(&cache, &tok_a, false);
+    try hc.commit(&cache, &tok_b, false);
+    hc.disk.?.writer.?.injectFailure("c000002", .submit);
+    hc.spillIdleEntries(s);
+    hc.disk.?.drainWriter();
+    try testing.expect(hc.disk.?.writeErrors() > 0);
+    // Not durable, still resident, and the tier claims nothing.
+    try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+    try testing.expect(!hc.disk.?.holdsFullPrefix(cache.entries, cache.step, &tok_a, false, cache.config));
+}
+
+test "SSD-first: the durability check STATS the chunks — a truncated file is never durable" {
+    // Half 2. A byte can go missing with no write error at all: an SSD that
+    // lost it, an external delete, a kill -9 between a chunk and its manifest.
+    // The index still names five whole chunks and the writer is clean, so
+    // every other bar passes — one stat per chunk against the recorded size is
+    // what stands between that and a dropped session.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+
+    var tok_a: [600]u32 = undefined;
+    for (&tok_a, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tok_b: [600]u32 = undefined;
+    for (&tok_b, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 8, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-stat", 0, 128);
+    defer hc.deinit();
+    hc.disk.?.ssd_first = true;
+    hc.disk.?.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    hc.disk.?.enableBackgroundWriter();
+    hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
+
+    try hc.commit(&cache, &tok_a, false);
+    try hc.commit(&cache, &tok_b, false);
+
+    // Pass 1 stages A with the writer held; pass 2, after the files land, is
+    // the healthy control — the entry IS durable.
+    hc.disk.?.writer.?.setPaused(true);
+    defer hc.disk.?.writer.?.setPaused(false);
+    hc.spillIdleEntries(s);
+    try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter();
+    hc.spillIdleEntries(s);
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+    try testing.expect((try testEntryFor(&hc, &tok_a)).spill_durable);
+
+    // One chunk loses its bytes behind the tier's back. Every in-memory bar
+    // still passes: `.persisted` (superseded), five whole chunks in the index,
+    // nothing pending, no write errors.
+    const id = hc.disk.?.entries.items[0].id;
+    var sub: [64]u8 = undefined;
+    const rel = try std.fmt.bufPrint(&sub, "fp-stat/e{d}/c000002.safetensors", .{id});
+    try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = "short" });
+
+    hc.spillIdleEntries(s);
+    try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
+    try testing.expectEqual(@as(usize, 2), hc.entryCount());
+}
+
+test "the spill's durability bar reads BOTH the poison state and the file sizes" {
+    // Scan pin. `spill_durable` licenses discarding the only copy of a
+    // session, and three of its four bars are in-memory claims: the commit's
+    // outcome, the index it wrote, and a per-pass error delta. The two bars
+    // that consult reality — attribution of a failed write to its entry, and
+    // the chunk files themselves — must both be in that function.
+    const src = @embedFile("prefix_cache.zig");
+    const at = std.mem.indexOf(u8, src, "pub fn spillIdleEntries(") orelse return error.CallSiteMoved;
+    const body = src[at..];
+    const end = std.mem.indexOf(u8, body, "\n    }\n") orelse body.len;
+    const pass = body[0..end];
+    try testing.expect(std.mem.indexOf(u8, pass, "harvestWrite" ++ "Failures(") != null);
+    try testing.expect(std.mem.indexOf(u8, pass, "entryWhole" ++ "OnDisk(") != null);
+    // ...and the flag they gate is still assigned true in exactly one place.
+    var seen: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, pass, i, "spill_durable = true")) |p| : (i = p + 1) seen += 1;
+    try testing.expectEqual(@as(usize, 1), seen);
 }
