@@ -1889,3 +1889,79 @@ reads `cache.step` (0 forever on a linear-layer-0 trunk, so the cap is dead
 there; the 27B's batched wins were measured with it dead), the chunk sizer
 still reads the hot-cache ask, and `--prefill-chunk` still outranks the pin
 only at forward time.
+
+## The ceiling read Metal's RECOMMENDATION where the operator had raised the ENFORCED wired limit (2026-09-07)
+
+A live agent session on an M5 Max 128 GB (`sysctl iogpu.wired_limit_mb` = 120000, flags
+`--ctx-size 786432 --kv-quant 8 --mtp --prefix-cache-mem 10GB --prefix-cache-entries 4
+--prefix-cache-disk 100GB`) sat at 448k tokens. Warm turns appending 200-500 tokens were
+admitted at `needed=21640 MB available=23118 MB width=4096` and `needed=18284 MB
+available=19529 MB width=2048`, and then one 73-token append was REFUSED:
+
+```
+prompt 448604 tokens needs ~13450MB at prefill chunk 512 (the narrowest width tried),
+~12934MB available + ~0MB the hot cache can give back
+(~9032MB resident, ~9032MB of it pinned by this request's own prefix)
+```
+
+`/props` seconds later: active 80,367 MB, available 20,289 MB, peak 94,941 MB, cache 713 MB —
+a live ceiling of ~100,656 MB on a box whose `iogpu.wired_limit_mb` is 120,000 MB and whose
+deepest SURVIVED allocation was `peak_bytes` 111.2 GiB = 113,869 MB (the 512k rung of
+`~/claude-tmp/bench-qwen4-ladder/FINAL_TABLE_head.md`; `combine_final.py` divides by 2^30).
+
+**The first hypothesis was wrong, and measuring it was the whole fix.** The obvious story is
+"`getGpuWorkingSetLimit()` returns `hw.memsize x 75%` = 98,304 MB and never sees the raised
+sysctl". It does not. Measured on the box, 2026-09-07, with a five-line Metal program:
+
+```
+recommendedMaxWorkingSetSize = 125829120000 bytes = 120000 MiB
+hw.memsize                   = 137438953472       = 131072 MiB ; 75% = 98304 MiB
+iogpu.wired_limit_mb         = 120000
+```
+
+Metal's `recommendedMaxWorkingSetSize` TRACKS `iogpu.wired_limit_mb` on macOS 26 — the two are
+the same number — so `staticGpuMemoryCeiling()` was already 120,000 MB and a cap on the static
+term would have been a no-op that shipped as a fix. The term that actually collapsed the ceiling
+is the PHYSICAL one inside `physicalMemoryCeiling`: `mlx_footprint + free_system`. `vm_stat` at
+the same moment: wired 4,177 MB (so MLX's buffers are NOT wired — the residency-set capacity
+`mlx_set_wired_limit` sets is not `wire_count`), and `status.computeAvailableBytes` counts
+`wired + compressor + (internal - purgeable)`, i.e. every other process's resident anonymous
+page. ~26 GB of them (an editor, a browser, a second build) put the physical arm at
+80,367 + 713 + 19,576 = 100,656 MB, and the guard refused a request that needed 516 MB more.
+
+**Why the free-RAM term is a proxy and the wired limit is not.** The free-RAM arm exists for
+#64: a docker-compose stack held tens of GB, the static max was blind to it, and Metal threw
+`Insufficient Memory` from a command-buffer completion handler — an uncatchable async throw that
+terminates the process. But what that arm measures is "the machine will start swapping", not
+"the allocation will fail": inactive and compressible anonymous pages are counted as gone even
+though the VM will reclaim them. `iogpu.wired_limit_mb` is the other kind of number — Metal
+ENFORCES it, and past it the failure is not graceful: at the working-set edge Metal returns
+ZEROS from a command buffer before it aborts (`### Engine` rule; all-zero logits from healthy
+inputs is a MEMORY symptom, not a math one). So an operator who raises the enforced limit to
+120 GB on a 128 GB box has made a declaration — the GPU may claim that much and the OS may swap
+the rest — and the soft proxy may no longer refuse below it.
+
+**The fix** (`wiredLimitFloor` / `gpuCeilingWithWiredFloor`, gated on `ModelConfig.longCtxGated`):
+read `iogpu.wired_limit_mb` ONCE per process (`wiredLimitBytes`, test seam
+`wired_limit_mb_override`); when it is above the macOS default of 75% of `hw.memsize` — i.e.
+when the operator said something — it becomes a FLOOR under the ceiling at
+`min(wired_limit, hw.memsize) - WIRED_LIMIT_MARGIN_BYTES`. A floor, not a cap: on this box
+the static term already equals the wired limit, so only lifting the physical arm changes
+anything. `wired_floor == 0` — every arch outside the gate, and every box whose operator left
+the sysctl alone — makes `gpuCeilingWithWiredFloor` the old `physicalMemoryCeiling` expression
+byte for byte (characterization test with the sysctl INJECTED at 120000).
+
+**The margin is measured, not chosen.** 8 GiB puts the plan ceiling at 111,808 MB, which is
+2,061 MB BELOW the deepest peak this box has actually survived under this limit (113,869 MB).
+That is what the margin buys: it is priced at a number the machine has already demonstrated,
+and it leaves a real transient's worth of room under the wall where Metal starts returning
+zeros. At the incident's instant it turns 12,934 MB available into 24,086 MB, and the 13,450 MB
+bill is admitted at width 512 (regression test: "the refused 448k warm append is admitted at
+width 512 once the ceiling honours the wired limit").
+
+**One helper, scan-pinned.** `available`, `/props` `available_bytes` and `max_safe_context`,
+the hot-cache clamp, the auto-context pin and the admission bill all read
+`currentGpuMemoryCeiling(config, active)`, which is the only caller of the floor-aware wrapper;
+the wrapper is the only caller of `physicalMemoryCeiling`. A floor that reached the admission
+bill but not the auto-context pin would advertise a context the guard then refuses, so the
+test counts the call sites ("every GPU-ceiling consumer reads ONE helper").

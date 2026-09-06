@@ -2738,6 +2738,97 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
     return @min(working_set_limit, mlx_footprint +| free_system);
 }
 
+/// How far under the ENFORCED wired limit a plan is allowed to reach.
+///
+/// MEASURED, on the incident box (M5 Max 128 GB, `iogpu.wired_limit_mb 120000`): the deepest
+/// allocation that ran to completion under that limit was `/props` `peak_bytes` 111.2 GiB =
+/// 113,869 MB on the 512k rung of `~/claude-tmp/bench-qwen4-ladder/FINAL_TABLE_head.md`
+/// (`combine_final.py` divides `peak_bytes` by 2^30), with 104-111 GiB across the ladder. 8 GiB
+/// puts the plan ceiling at 111,808 MB — 2,061 MB BELOW the deepest peak the box actually
+/// survived, so the margin is bought at a number the machine has already demonstrated.
+///
+/// What the margin buys off: past the wired limit Metal does not fail cleanly. It returns ZEROS
+/// from a command buffer at the working-set edge before it aborts (`### Engine` rule), and the
+/// abort is an uncatchable async throw. The limit is a hard wall, so the plan must stop short
+/// of it by a real transient's worth.
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 8 << 30;
+
+/// PURE (unit-testable): the floor an EXPLICITLY RAISED `iogpu.wired_limit_mb` puts under the
+/// ceiling. 0 (no floor, today's expression exactly) when the sysctl is absent/unreadable, or
+/// when it is not above the macOS default of 75% of physical RAM — i.e. when the operator has
+/// said nothing.
+///
+/// Why a FLOOR and not a cap on the static term: on this box the two are already the same
+/// number. `getGpuWorkingSetLimit()` returns Metal's `recommendedMaxWorkingSetSize`, which
+/// TRACKS `iogpu.wired_limit_mb` (measured 2026-09-07: sysctl 120000, recommended 125,829,120,000
+/// bytes = 120,000 MB, against hw.memsize x 75% = 98,304 MB). The term that collapsed the live
+/// ceiling to ~100,656 MB was the PHYSICAL one — `mlx_footprint + free_system` — because ~26 GB
+/// of other processes' anonymous pages are counted non-reclaimable by `computeAvailableBytes`.
+/// That term is a proxy for "the machine will thrash"; the wired limit is what Metal ENFORCES.
+/// An operator who raises the enforced limit to 120 GB on a 128 GB box has declared that the GPU
+/// may claim that much and the OS may swap the rest, so their number is the floor and the soft
+/// free-RAM proxy may no longer refuse below it.
+pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64) u64 {
+    if (wired_limit == 0 or total_ram == 0) return 0;
+    if (wired_limit <= total_ram * 75 / 100) return 0; // the macOS default: no declaration
+    return @min(wired_limit -| WIRED_LIMIT_MARGIN_BYTES, total_ram -| WIRED_LIMIT_MARGIN_BYTES);
+}
+
+/// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
+/// `physicalMemoryCeiling` byte for byte, which is every arch outside `longCtxGated` and every
+/// box whose operator left `iogpu.wired_limit_mb` alone.
+pub fn gpuCeilingWithWiredFloor(
+    working_set_limit: u64,
+    mlx_footprint: u64,
+    free_system: u64,
+    wired_floor: u64,
+) u64 {
+    const physical = physicalMemoryCeiling(working_set_limit, mlx_footprint, free_system);
+    return @max(physical, wired_floor);
+}
+
+/// Test seam: `iogpu.wired_limit_mb` in MB. Set it to drive `wiredCeilingFloorFor` off a
+/// value instead of the live sysctl; `null` reads the machine.
+pub var wired_limit_mb_override: ?u64 = null;
+
+var wired_limit_bytes_cached: u64 = 0;
+var wired_limit_read: bool = false;
+
+/// `iogpu.wired_limit_mb` in bytes, read ONCE per process (the sysctl is a boot-time operator
+/// setting; re-reading it per admission would let the ceiling move under a live request).
+/// 0 when the OID is absent (every non-macOS host, and macOS before the OID existed).
+pub fn wiredLimitBytes() u64 {
+    if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
+    if (wired_limit_read) return wired_limit_bytes_cached;
+    var v: u32 = 0;
+    var len: usize = @sizeOf(u32);
+    wired_limit_bytes_cached = if (sysctlbyname("iogpu.wired_limit_mb", @ptrCast(&v), &len, null, 0) == 0)
+        @as(u64, v) * 1024 * 1024
+    else
+        0;
+    wired_limit_read = true;
+    return wired_limit_bytes_cached;
+}
+
+var wired_floor_logged = std.atomic.Value(bool).init(false);
+
+/// The floor for THIS model: gated on `ModelConfig.longCtxGated()`, so every other arch keeps
+/// today's ceiling byte for byte. `null` config (no model resolved yet) takes no floor.
+fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
+    const c = config orelse return 0;
+    if (!c.longCtxGated()) return 0;
+    const floor = wiredLimitFloor(wiredLimitBytes(), metrics.getTotalMemBytes());
+    if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
+        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
+            floor >> 20,
+            wiredLimitBytes() >> 20,
+            getGpuWorkingSetLimit() >> 20,
+            WIRED_LIMIT_MARGIN_BYTES >> 20,
+        });
+    }
+    return floor;
+}
+
 /// PURE (unit-testable): the cap to put on MLX's reclaimable buffer pool for a
 /// machine with `total_ram` bytes of physical memory. 0 when the RAM query
 /// failed — never clamp on bad data.
@@ -2809,7 +2900,11 @@ pub fn staticGpuMemoryCeiling() u64 {
     return getGpuWorkingSetLimit();
 }
 
-fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+/// THE ceiling helper. Every consumer — `available`, `/props` `available_bytes` and
+/// `max_safe_context`, the hot-cache clamp, the auto-context pin, the admission bill — reads
+/// this one function, so the wired-limit floor cannot reach some of them and not others
+/// (scan-pinned: "every GPU-ceiling consumer reads ONE helper").
+fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
     // the noisy free-RAM term they made auto-context swing across boots of the
@@ -2819,10 +2914,11 @@ fn currentGpuMemoryCeiling(active_mem: u64) u64 {
     const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
-    return physicalMemoryCeiling(
+    return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
         metrics.getAvailableMemBytes() +| ane_bytes,
+        wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
 
@@ -3130,7 +3226,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         config.pinned_prefill_chunk = billedPrefillChunk(
             config,
             kv_bits,
-            currentGpuMemoryCeiling(active_mem),
+            currentGpuMemoryCeiling(config, active_mem),
             active_mem,
             sizerCtxKvBytes(config, kv_bits),
             hot_cache_ask,
@@ -3138,7 +3234,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         );
         // Say when the ctx bar is the binding one.
         if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
-            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(active_mem), active_mem, 0, hot_cache_ask);
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
                 log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
             }
@@ -3348,7 +3444,7 @@ fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, ac
     return resolvedContextForLoad(
         server_config.max_context_size,
         config.pinned_context,
-        currentGpuMemoryCeiling(active_mem),
+        currentGpuMemoryCeiling(config, active_mem),
         active_mem,
         ctxSizingCacheReserve(config),
         prefillTransientReserve(config, kv_bits, chunk),
@@ -3373,7 +3469,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
             getEffectiveContextLength(config);
         const clamped = clampedPrefixCacheMem(
             requested,
-            currentGpuMemoryCeiling(active_mem),
+            currentGpuMemoryCeiling(config, active_mem),
             active_mem,
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
@@ -3412,7 +3508,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, idl
     );
     publishResolvedPrefixCacheMem(plan.budget);
     // Say so when the box is under external pressure right now, but do not shrink the budget for it.
-    const live_ceiling: u64 = currentGpuMemoryCeiling(active_mem);
+    const live_ceiling: u64 = currentGpuMemoryCeiling(config, active_mem);
     if (live_ceiling < staticGpuMemoryCeiling()) {
         const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
         log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
@@ -4253,7 +4349,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 
     return safeContextForBudget(
         // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
-        currentGpuMemoryCeiling(active_mem),
+        currentGpuMemoryCeiling(config, active_mem),
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill has to land on
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
@@ -4889,7 +4985,7 @@ pub fn requestPrefillChunkNow(
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    const available: u64 = currentGpuMemoryCeiling(active_mem) -| active_mem;
+    const available: u64 = currentGpuMemoryCeiling(config, active_mem) -| active_mem;
     const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate };
     const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
     if (chosen != pin) {
@@ -4990,13 +5086,13 @@ pub fn adaptivePrefillWidth(
 /// The live headroom one prefill chunk has to fit in: the GPU ceiling less what MLX's
 /// allocator holds, read once per chunk boundary after its `mlx_clear_cache`. The same
 /// expression `prefillAdmissionBill` compares against.
-pub fn prefillHeadroomNow(staged_host: u64) u64 {
+pub fn prefillHeadroomNow(config: *const model_mod.ModelConfig, staged_host: u64) u64 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     // The SSD write-through stages chunk blobs as host bytes behind a ~1 GiB permit that
     // `mlx_get_active_memory` does not count; on unified memory they are the same pool. Read at
     // the hook site (inference thread) and passed in.
-    return prefillHeadroomFrom(currentGpuMemoryCeiling(active_mem), active_mem, staged_host);
+    return prefillHeadroomFrom(currentGpuMemoryCeiling(config, active_mem), active_mem, staged_host);
 }
 
 /// Pure half of `prefillHeadroomNow`.
@@ -5014,7 +5110,7 @@ pub fn adaptivePrefillWidenStillFits(
     staged_host: u64,
 ) bool {
     if (!adaptivePrefillChunkEnabled(config)) return false;
-    const headroom = prefillHeadroomNow(staged_host);
+    const headroom = prefillHeadroomNow(config, staged_host);
     const asked: u64 = prefillChunkCost(config, kv_bits, want, pos) *| 5 / 4;
     if (asked <= headroom) return true;
     log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
@@ -5038,7 +5134,7 @@ pub fn adaptivePrefillWidthNow(
     staged_host: u64,
 ) u32 {
     if (!adaptivePrefillChunkEnabled(config)) return current;
-    const headroom = prefillHeadroomNow(staged_host);
+    const headroom = prefillHeadroomNow(config, staged_host);
     // `pos` is the live KV this chunk will attend to (see `prefillTransientReserveAtKv`).
     const next = adaptivePrefillWidth(config, kv_bits, pos, headroom, current, cap, st);
     if (next != current) {
@@ -5065,7 +5161,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
+    const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
 
     // A vision prefill chunks like text since issue #197 (the splice resumes
@@ -17753,6 +17849,155 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve < without_reserve);
     // Still usable, never floored to nothing.
     try testing.expect(with_reserve > 1024);
+}
+
+test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
+    // MEASURED on the incident box, 2026-09-07: `sysctl iogpu.wired_limit_mb` = 120000 and
+    // Metal's `recommendedMaxWorkingSetSize` = 125,829,120,000 bytes = 120,000 MB. They are the
+    // SAME number — `getGpuWorkingSetLimit()` already honours the wired limit, so a cap on the
+    // static term would be a no-op. What collapsed the live ceiling to ~100,656 MB was the
+    // PHYSICAL term (`mlx_footprint + free_system`): ~26 GB of other processes' anonymous pages
+    // that `computeAvailableBytes` counts as non-reclaimable. The operator's raised limit is the
+    // floor that term may no longer refuse below.
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+    const total_ram: u64 = 131_072 * mb; // hw.memsize 137,438,953,472
+    const working_set: u64 = 120_000 * mb;
+
+    // 8 GiB under the operator's 120,000 MB.
+    try t.expectEqual(@as(u64, 111_808), wiredLimitFloor(120_000 * mb, total_ram) / mb);
+
+    // Said nothing: the macOS default (75% of RAM) and anything at or below it declares nothing.
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(98_304 * mb, total_ram));
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(0, total_ram));
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(120_000 * mb, 0));
+    // Never plan within the margin of physical RAM either, however absurd the sysctl.
+    try t.expectEqual(total_ram - WIRED_LIMIT_MARGIN_BYTES, wiredLimitFloor(400 * (1 << 30), total_ram));
+
+    // The floor lifts the physical arm and nothing else: with it zero the expression is
+    // `physicalMemoryCeiling`, byte for byte.
+    const footprint: u64 = 81_080 * mb;
+    const free_system: u64 = 19_576 * mb;
+    try t.expectEqual(@as(u64, 100_656), physicalMemoryCeiling(working_set, footprint, free_system) / mb);
+    try t.expectEqual(
+        physicalMemoryCeiling(working_set, footprint, free_system),
+        gpuCeilingWithWiredFloor(working_set, footprint, free_system, 0),
+    );
+    try t.expectEqual(
+        @as(u64, 111_808),
+        gpuCeilingWithWiredFloor(working_set, footprint, free_system, 111_808 * mb) / mb,
+    );
+    // An idle box is already above the floor: the floor never LOWERS a ceiling.
+    try t.expectEqual(
+        working_set,
+        gpuCeilingWithWiredFloor(working_set, footprint, 400 * (1 << 30), 111_808 * mb),
+    );
+}
+
+test "the refused 448k warm append is admitted at width 512 once the ceiling honours the wired limit" {
+    // The live incident (M5 Max 128 GB, iogpu.wired_limit_mb 120000, --ctx-size 786432
+    // --kv-quant 8): a 448,604-token agent turn appending ~73 tokens was refused with
+    // "needs ~13450MB at prefill chunk 512 (the narrowest width tried), ~12934MB available
+    // + ~0MB the hot cache can give back". `/props` seconds later: active 80,367 MB,
+    // available 20,289 MB, cache 713 MB -> a ceiling of ~100,656 MB against a 120,000 MB
+    // enforced wired limit, on a box whose deepest SURVIVED peak was 113,869 MB.
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+    const cfg = qwen4ExpLive364kConfig(); // the deployed flags: --ctx-size 786432, kv8
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const matched: u64 = 448_531;
+    // No max_tokens on the wire reserves ctx - prompt.
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const warm = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = true };
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, warm);
+
+    // The ceiling at the refusal: `available` was 12,934 MB under a ~100,656 MB ceiling, so the
+    // footprint was ~87,722 MB (the request's own prefix was resident and pinned).
+    const ceiling_then: u64 = 100_656 * mb;
+    const footprint: u64 = ceiling_then - 12_934 * mb;
+    const working_set: u64 = 120_000 * mb;
+    const total_ram: u64 = 131_072 * mb;
+    // As shipped: refused.
+    const old_ceiling = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, 0);
+    try t.expectEqual(ceiling_then, old_ceiling);
+    try t.expect(needed > old_ceiling -| footprint);
+
+    // With the floor: 111,808 MB, so 24,086 MB available at the same instant.
+    const floor = wiredLimitFloor(120_000 * mb, total_ram);
+    const new_ceiling = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, floor);
+    try t.expectEqual(@as(u64, 111_808), new_ceiling / mb);
+    try t.expectEqual(@as(u64, 24_086), (new_ceiling -| footprint) / mb);
+    try t.expect(needed <= new_ceiling -| footprint);
+    // And the ladder now returns the width that runs rather than falling through to the floor.
+    try t.expect(chooseRequestPrefillChunk(&cfg, seq, max_tokens, kv_bits, new_ceiling -| footprint, 512, 0, warm) >= 512);
+}
+
+test "an ungated arch's ceiling ignores iogpu.wired_limit_mb, byte for byte" {
+    // Characterization: the wired-limit floor is `longCtxGated` blast radius. With the sysctl
+    // INJECTED at the incident's 120000 every other arch still takes floor 0, which makes
+    // `gpuCeilingWithWiredFloor` the old `physicalMemoryCeiling` expression exactly.
+    const t = std.testing;
+    const saved = wired_limit_mb_override;
+    defer wired_limit_mb_override = saved;
+    wired_limit_mb_override = 120_000;
+
+    var gated = qwen4ExpLive364kConfig();
+    try t.expect(gated.longCtxGated());
+    try t.expect(wiredCeilingFloorFor(&gated) > 0);
+
+    // No model resolved yet: no floor.
+    try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(null));
+
+    for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "lfm2", "nemotron_h", "bailing_hybrid" }) |mt| {
+        var cfg = gated;
+        cfg.model_type = mt;
+        try t.expect(!cfg.longCtxGated());
+        try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(&cfg));
+    }
+
+    // ...and floor 0 is the pre-change expression at every input.
+    const mb: u64 = 1024 * 1024;
+    for ([_]u64{ 0, 12_934 * mb, 19_576 * mb, 400 * mb * 1024 }) |free| {
+        for ([_]u64{ 0, 81_080 * mb }) |fp| {
+            try t.expectEqual(
+                physicalMemoryCeiling(120_000 * mb, fp, free),
+                gpuCeilingWithWiredFloor(120_000 * mb, fp, free, 0),
+            );
+        }
+    }
+}
+
+test "every GPU-ceiling consumer reads ONE helper" {
+    // `available`, `/props` available_bytes + max_safe_context, the hot-cache clamp, the
+    // auto-context pin and the admission bill must all move together: a floor that reached the
+    // admission bill but not the auto-context pin would advertise a context the guard refuses.
+    // So the device query is reachable from exactly two expressions (the static term and the
+    // live helper, plus the boot log that quotes it), and the raw min-expression from exactly
+    // one (the floor-aware wrapper).
+    const src = @embedFile("server.zig");
+    const ws = "getGpuWorking" ++ "SetLimit()";
+    const raw = "physicalMemory" ++ "Ceiling(";
+    var ws_calls: usize = 0;
+    var raw_calls: usize = 0;
+    var in_test = false;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        // A top-level `}` closes whatever declaration we were in.
+        if (std.mem.eql(u8, line, "}")) in_test = false;
+        if (std.mem.startsWith(u8, line, "test \"")) in_test = true;
+        if (in_test) continue; // a test may price the pure halves directly
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        if (std.mem.startsWith(u8, trimmed, "//")) continue; // prose, not a call
+        if (std.mem.startsWith(u8, trimmed, "fn ") or std.mem.startsWith(u8, trimmed, "pub fn ")) continue; // the declaration
+        if (std.mem.indexOf(u8, line, ws) != null) ws_calls += 1;
+        if (std.mem.indexOf(u8, line, raw) != null) raw_calls += 1;
+    }
+    // staticGpuMemoryCeiling, currentGpuMemoryCeiling, and the one boot log line.
+    try std.testing.expectEqual(@as(usize, 3), ws_calls);
+    // Only gpuCeilingWithWiredFloor: nothing else may take the ceiling without the floor.
+    try std.testing.expectEqual(@as(usize, 1), raw_calls);
+    try std.testing.expect(std.mem.indexOf(u8, src, "fn gpuCeilingWithWired" ++ "Floor(") != null);
 }
 
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {

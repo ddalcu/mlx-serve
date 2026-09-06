@@ -272,6 +272,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A header PARAMETER lookup keys on the parameter at a boundary** (`name=` also matches inside `filename=`). **A body log fine for JSON is not fine for BINARY** (`bodyIsText`).
 - **Auto-context bills KV at the CONFIGURED width and activations ONCE** (`kvBytesPerTokenAtBits` + `prefillTransientReserve`, shared with the admission guard, scan-pinned): the prefill transient is flat in prompt length, keyed on `--prefill-chunk`. `prefillMemoryNeeded` UNDER-bills quantized prefill ~22% (known).
 - **Auto-context is PINNED at load** (`pinAutoContext`); 85% margin on the MEMORY ceiling only; ask `getEffectiveContextLength`, never `server_config.max_context_size`.
+- **A raised `iogpu.wired_limit_mb` is a FLOOR under the ceiling, not a cap** (`wiredLimitFloor`, 8 GiB margin, `longCtxGated`): free RAM is a thrash proxy, the wired limit enforced.
 - **GPU memory ceiling must see EXTERNAL pressure** (`currentGpuMemoryCeiling`); Metal OOM is UNCATCHABLE (libllama frames are a red herring); embedded-engine requests are EXEMPT from MLX guards (`mlxMemoryGuardApplies`).
 - **The prefill guard bills what the ARCH reads**: `prefillAttnKeys(seq)`, `prefillFfnWidth` from the DECLARED config (MoE = top_k × moe_intermediate + shared), chunk term arch-owned (`server.dsv4PrefillMemoryNeeded`); all scan-pinned.
 - **Metal at the working-set edge returns ZEROS before it aborts**: all-zero logits from healthy inputs = MEMORY symptom, not math.
