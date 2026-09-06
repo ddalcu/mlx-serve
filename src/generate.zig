@@ -2233,7 +2233,11 @@ pub const Generator = struct {
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's own per-request buffers reserve at the same length.
-            transformer_mod.reserveQsaHistory(ctx.ssm_entries, @intCast(reserved_tokens));
+            transformer_mod.reserveQsaHistoryWithHead(
+                ctx.ssm_entries,
+                if (xfm.qwen4_mtp) |*m| &m.entry else null,
+                @intCast(reserved_tokens),
+            );
 
             var pos: usize = 0;
             while (pos < loop_end) {
@@ -2959,6 +2963,7 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
+        self.xfm.markQsaPooledRopeStale();
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;

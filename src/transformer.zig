@@ -6546,6 +6546,11 @@ pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
     }
 }
 
+pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntry, tokens: usize) void {
+    reserveQsaHistory(entries, tokens);
+    if (head) |h| reserveQsaHistory(h[0..1], tokens);
+}
+
 /// Append `chunk` into a pre-grown capacity buffer along `axis` and republish `view` as the
 /// tight `count`-long prefix. The published view is dropped first: while it lives mlx copies
 /// the buffer instead of donating it.
@@ -8778,10 +8783,14 @@ const QsaPooledRope = struct {
     n: c_int = 0,
     dtype: mlx.mlx_dtype = .float32,
     mrope: bool = false,
+    mrope_pos: ?[]const i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
     cos: mlx.mlx_array = .{ .ctx = null },
     sin: mlx.mlx_array = .{ .ctx = null },
     /// Rebuild counter.
     builds: usize = 0,
+    stale: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *QsaPooledRope) void {
         if (self.cos.ctx != null) _ = mlx.mlx_array_free(self.cos);
@@ -8789,8 +8798,36 @@ const QsaPooledRope = struct {
         self.cos = .{ .ctx = null };
         self.sin = .{ .ctx = null };
         self.ctx = null;
+        self.mrope_pos = null;
+        self.stale.store(false, .monotonic);
     }
 };
+
+fn qsaPooledTableEq(a: ?[]const i32, b: ?[]const i32) bool {
+    const aa = a orelse return b == null;
+    const bb = b orelse return false;
+    return aa.ptr == bb.ptr and aa.len == bb.len;
+}
+
+test "markQsaPooledRopeStale is an atomic flag and does not write the cache key" {
+    const source = @embedFile("transformer.zig");
+    const struct_start = std.mem.indexOf(u8, source, "const QsaPooledRope = struct {") orelse return error.MissingStruct;
+    const struct_end = std.mem.indexOfPos(u8, source, struct_start + 1, "\nfn qsaPooledTableEq") orelse return error.MissingStructEnd;
+    const body = source[struct_start..struct_end];
+    if (std.mem.indexOf(u8, body, "stale: bool") != null) return error.StaleIsNotAtomic;
+    if (std.mem.indexOf(u8, body, "std.atomic.Value(bool)") == null) return error.StaleIsNotAtomic;
+
+    const mark_start = std.mem.indexOf(u8, source, "pub fn markQsa" ++ "PooledRopeStale") orelse return error.MissingMark;
+    const mark_end = std.mem.indexOfPos(u8, source, mark_start + 1, "\n    pub fn ") orelse return error.MissingMarkEnd;
+    const mark = source[mark_start..mark_end];
+    if (std.mem.indexOf(u8, mark, "mrope_pos") != null) return error.MarkWritesMropePos;
+    if (std.mem.indexOf(u8, mark, ".store(") == null) return error.MarkNotAtomic;
+
+    const q_start = std.mem.indexOf(u8, source, "fn qsaPooled" ++ "CosSin(") orelse return error.MissingQsaPooledCosSin;
+    const q_end = std.mem.indexOfPos(u8, source, q_start + 1, "\n    fn ") orelse return error.MissingQsaPooledCosSinEnd;
+    const q = source[q_start..q_end];
+    if (std.mem.indexOf(u8, q, ".load(.acquire)") == null) return error.ConsumeNotAcquire;
+}
 
 /// Does every complete-block visibility check pass for every query row of a call starting at
 /// cache position `offset`? Block `b` is complete at `p` iff `b*ratio + ratio - 1 <= p`, so
@@ -11399,6 +11436,14 @@ pub const Transformer = struct {
         _ = mlx.mlx_stream_free(self.s);
         // The free above is a no-op on the default stream's wrapper but we keep it for symmetry
         // with the Zig copy of the mlx_stream struct that init handed us.
+    }
+
+    pub fn resetQsaPooledRope(self: *Transformer) void {
+        self.qsa_pooled_rope.deinit();
+    }
+
+    pub fn markQsaPooledRopeStale(self: *Transformer) void {
+        self.qsa_pooled_rope.stale.store(true, .release);
     }
 
     /// Re-bind `self.s` to the *current* thread's default GPU stream. Must be called from any
@@ -15296,9 +15341,13 @@ pub const Transformer = struct {
     fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, base: c_int, step: c_int, n: c_int, dt: mlx.mlx_dtype) !MropeCosSin {
         const is_mrope = ctx.mrope_pos != null;
         const c = &self.qsa_pooled_rope;
-        if (c.cos.ctx != null and c.gen == self.fwd_gen and c.ctx == ctx and
+        if (c.stale.load(.acquire)) c.deinit();
+        if (c.cos.ctx != null and
             c.base == base and c.step == step and c.n == n and
-            c.dtype == dt and c.mrope == is_mrope) return .{ .cos = c.cos, .sin = c.sin };
+            c.dtype == dt and c.mrope == is_mrope and
+            qsaPooledTableEq(c.mrope_pos, ctx.mrope_pos) and
+            c.mrope_total == ctx.mrope_total and c.mrope_delta == ctx.mrope_delta)
+            return .{ .cos = c.cos, .sin = c.sin };
         c.deinit();
         const cs = if (is_mrope)
             try self.mropeCosSinAt(mropeContext(ctx), @intCast(base), @intCast(step), @intCast(n), dt)
@@ -15313,6 +15362,9 @@ pub const Transformer = struct {
         c.n = n;
         c.dtype = dt;
         c.mrope = is_mrope;
+        c.mrope_pos = ctx.mrope_pos;
+        c.mrope_total = ctx.mrope_total;
+        c.mrope_delta = ctx.mrope_delta;
         c.builds += 1;
         return cs;
     }
@@ -45229,6 +45281,15 @@ test "qsa key append plan: rows advance by S, capacity grows only when it must" 
     try testing.expectEqual(@as(usize, 4596), p4.new_rows);
 }
 
+test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
+    var slot = [_]SSMCacheEntry{.{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false }};
+    var head: SSMCacheEntry = .{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false };
+    const tokens: usize = 8192;
+    reserveQsaHistoryWithHead(slot[0..], &head, tokens);
+    try testing.expectEqual(tokens, slot[0].qsa_reserve_rows);
+    try testing.expectEqual(tokens, head.qsa_reserve_rows);
+}
+
 test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#353 follow-up)" {
     // These buffers walked the +25% ladder beside a KV cache that had been sized once; the loop
     // below allocated ~30 times before `qsa_reserve_rows`.
@@ -45553,9 +45614,9 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     // A new forward rebuilds (the M-RoPE arm's position table is not in the key).
     t.fwd_gen += 1;
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 
     // The M-RoPE arm is a different table at the same (base, step, n).
     const pos = try testing.allocator.alloc(i32, 3 * 256);
@@ -45564,14 +45625,227 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     ctx.mrope_pos = pos;
     ctx.mrope_total = 256;
     const m = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
     const direct = try t.mropeCosSinAt(.{ .pos = pos, .total = 256, .delta = 0 }, @intCast(base + step), @intCast(step), @intCast(n), .bfloat16);
     defer _ = mlx.mlx_array_free(direct.cos);
     defer _ = mlx.mlx_array_free(direct.sin);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.cos, direct.cos, s));
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
     for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+}
+
+test "qsa pooled rope: the cache key is block position and the table, not the ForwardCtx pointer" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx_a: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var ctx_b: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+
+    const cs = try t.qsaPooledCosSin(&ctx_a, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    t.fwd_gen += 1;
+    const again = try t.qsaPooledCosSin(&ctx_b, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    try testing.expect(again.cos.ctx == cs.cos.ctx and again.sin.ctx == cs.sin.ctx);
+
+    const pos = try testing.allocator.alloc(i32, 3 * 256);
+    defer testing.allocator.free(pos);
+    for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
+    ctx_b.mrope_pos = pos;
+    ctx_b.mrope_total = 256;
+    const m = try t.qsaPooledCosSin(&ctx_b, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    var ctx_c: ForwardCtx = ctx_b;
+    t.fwd_gen += 1;
+    const m2 = try t.qsaPooledCosSin(&ctx_c, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    try testing.expect(m2.cos.ctx == m.cos.ctx and m2.sin.ctx == m.sin.ctx);
+
+    _ = try t.qsaPooledCosSin(&ctx_c, rope_dims, base + step, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+}
+
+test "qsa pooled rope: a new M-RoPE table at the same pointer does not reuse cos/sin" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+    const total: usize = 256;
+
+    const pos = try testing.allocator.alloc(i32, 3 * total);
+    defer testing.allocator.free(pos);
+    for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
+    ctx.mrope_pos = pos;
+    ctx.mrope_total = total;
+    ctx.mrope_delta = 0;
+
+    const cs_a = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+    const direct_a = try t.mropeCosSinAt(.{ .pos = pos, .total = total, .delta = 0 }, @intCast(base), @intCast(step), @intCast(n), .bfloat16);
+    defer _ = mlx.mlx_array_free(direct_a.cos);
+    defer _ = mlx.mlx_array_free(direct_a.sin);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cs_a.cos, direct_a.cos, s));
+
+    for (pos, 0..) |*p, i| p.* = @intCast((i * 7 + 13) % 256);
+    const direct_b = try t.mropeCosSinAt(.{ .pos = pos, .total = total, .delta = 0 }, @intCast(base), @intCast(step), @intCast(n), .bfloat16);
+    defer _ = mlx.mlx_array_free(direct_b.cos);
+    defer _ = mlx.mlx_array_free(direct_b.sin);
+    try testing.expect(try attn256MaxDiff(direct_a.cos, direct_b.cos, s) != 0);
+
+    t.resetQsaPooledRope();
+    var ctx2: ForwardCtx = ctx;
+    const cs_b = try t.qsaPooledCosSin(&ctx2, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cs_b.cos, direct_b.cos, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cs_b.sin, direct_b.sin, s));
+}
+
+test "qsa pooled rope: markQsaPooledRopeStale forces a rebuild on the next ask" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+    const total: usize = 256;
+
+    const pos = try testing.allocator.alloc(i32, 3 * total);
+    defer testing.allocator.free(pos);
+    for (pos, 0..) |*p, i| p.* = @intCast(i % 256);
+    ctx.mrope_pos = pos;
+    ctx.mrope_total = total;
+    ctx.mrope_delta = 0;
+
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    for (pos, 0..) |*p, i| p.* = @intCast((i * 7 + 13) % 256);
+    t.markQsaPooledRopeStale();
+    var ctx2: ForwardCtx = ctx;
+    const cs_b = try t.qsaPooledCosSin(&ctx2, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    const direct_b = try t.mropeCosSinAt(.{ .pos = pos, .total = total, .delta = 0 }, @intCast(base), @intCast(step), @intCast(n), .bfloat16);
+    defer _ = mlx.mlx_array_free(direct_b.cos);
+    defer _ = mlx.mlx_array_free(direct_b.sin);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cs_b.cos, direct_b.cos, s));
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cs_b.sin, direct_b.sin, s));
+
+    ctx.mrope_pos = null;
+    ctx.mrope_total = 0;
+    ctx.mrope_delta = 0;
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    const scalar_builds = t.qsa_pooled_rope.builds;
+    t.markQsaPooledRopeStale();
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(scalar_builds + 1, t.qsa_pooled_rope.builds);
+}
+
+test "qsa pooled rope: a mark from another thread is observed by the next lookup" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    const Worker = struct {
+        fn run(xfm: *Transformer) void {
+            xfm.markQsaPooledRopeStale();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Worker.run, .{&t});
+    th.join();
+    try testing.expect(t.qsa_pooled_rope.stale.load(.acquire));
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 }
 
 // ── The QSA all-visible identity skip at the engagement boundary ──
