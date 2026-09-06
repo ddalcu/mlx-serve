@@ -12,6 +12,7 @@
 - **Speculative decoding on Flash Next switches itself off where a plain step is faster, and back on when it is not.** Past some conversation length a speculative round costs more than the steps it replaces; the switch compares two measured prices per context bucket and only acts when both agree. `--max-mtp-ctx <n>` keeps speculation off past a context length you choose.
 - **A prefix-cache hit no longer leaves Flash Next's draft head guessing.** The head's own history is saved with the cached prefix and restored with it.
 - **A partly-accepted speculative round is cheaper on Flash Next.** When verification keeps only some of the drafted tokens, the sparse-attention key history for the tokens that survived is now re-used where it already sits instead of being copied out and re-seeded on the next token. The saving grows with the conversation length, and the generated text is byte-identical.
+- **Flash Next's sparse-attention block scores are extended, not rebuilt.** Every four decoded tokens the model used to re-transpose and re-convert its whole block-score table; it now writes only the new columns into a table sized once for the request. The scores are byte-identical, and the saving grows with the conversation.
 
 ### Fixes
 
