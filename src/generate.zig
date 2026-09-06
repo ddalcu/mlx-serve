@@ -3996,20 +3996,22 @@ pub const Generator = struct {
         // and (on partial accept) build the residual. Greedy path skips
         // slicing entirely. `per_pos_logits` is null in greedy mode.
         var per_pos_logits: ?[]mlx.mlx_array = null;
+        var per_pos_logits_n: usize = 0;
         defer if (per_pos_logits) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         if (stochastic) {
             const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
+            per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_logits_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
-            per_pos_logits = slots;
         }
 
         // Build the greedy argmax tensor lazily; it'll be eval'd alongside
@@ -4582,20 +4584,22 @@ pub const Generator = struct {
         // ── Phase 3: decide the longest accepted prefix ──
         const vl_shape = mlx.getShape(verify_logits);
         var per_pos_logits: ?[]mlx.mlx_array = null;
+        var per_pos_logits_n: usize = 0;
         defer if (per_pos_logits) |slots| {
-            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            for (slots[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
         if (stochastic) {
             const slots = try allocator.alloc(mlx.mlx_array, bs);
+            per_pos_logits = slots;
             const slice_strides = [_]c_int{ 1, 1, 1 };
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
+                per_pos_logits_n = idx + 1;
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
-            per_pos_logits = slots;
         }
         var verify_argmax = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_argmax);
@@ -14778,88 +14782,174 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
 }
 
-test "errpath: spec-decode mlx_array fill loops free only the built prefix" {
-    // Review §5.1: `allocator.alloc(mlx_array, n)` + defer over the WHOLE
-    // slice + `try` in the fill. A mid-loop throw leaves later slots uninit
-    // (0xaa… / heap junk) and the defer `delete`s them. The counter shape
-    // (`for (buf[0..n])`) is what `mtpChainBuild` already uses. Needles are
-    // split so this test cannot satisfy itself.
+test "errpath: a fallible mlx_array fill loop frees only the built prefix" {
+    // `allocator.alloc(mlx_array, n)` + a defer over the WHOLE slice + a `try`
+    // inside the fill: a mid-loop throw leaves the later slots uninitialised
+    // and the defer frees heap junk. The guard is a counter the fill bumps
+    // after `mlx_array_new()` and before the first fallible call, so the defer
+    // sees only handles that exist. Needles are assembled at comptime so this
+    // test's own source cannot satisfy the scan.
     const src = @embedFile("generate.zig");
-    const sites = [_]struct { tag: []const u8, needle: []const u8 }{
-        .{ .tag = "nextPld.per_pos_logits", .needle = "const per_pos_" ++ "logits = try allocator.alloc(mlx.mlx_array, 1 + m);" },
-        .{ .tag = "nextDrafter.draft_arrs", .needle = "const draft_" ++ "arrs = try allocator.alloc(mlx.mlx_array, m);" },
-        .{ .tag = "nextDrafter.drafts_2d", .needle = "const drafts_" ++ "2d = try allocator.alloc(mlx.mlx_array, m);" },
-        .{ .tag = "nextDflash.sliced", .needle = "const sliced = try allocator.alloc(mlx.mlx_array, cap_" ++ "out.len);" },
-        .{ .tag = "nextMtp.drafts_2d", .needle = "for (draft_arrs[0..m], drafts_" ++ "2d) |dlazy, *out|" },
-        .{ .tag = "nextMtp.slots", .needle = "per_pos_" ++ "probs = slots;" },
-        .{ .tag = "nextMtp.taken", .needle = "try mlx.check(mlx.mlx_take_" ++ "axis(&taken[k], slots[k], draft_arrs[k], -1, s));" },
-        .{ .tag = "nextMtp.corrs", .needle = "corr_" ++ "samples = corrs;" },
+    const free_stmt = "_ = mlx.mlx_array" ++ "_free(";
+    const new_stmt = "mlx.mlx_array" ++ "_new()";
+    const ppl = "per_pos_" ++ "logits";
+    const ppp = "per_pos_" ++ "probs";
+    const dar = "draft_" ++ "arrs";
+    const d2d = "drafts_" ++ "2d";
+    const slc = "sli" ++ "ced";
+    const tkn = "tak" ++ "en";
+    const crs = "corr_" ++ "samples";
+
+    // Part 1: the ten sites of the family. Each is keyed on its OWN counter,
+    // so a neighbouring site's guard cannot stand in for a missing one, and
+    // the counter bump must appear in the loop below the guard.
+    const sites = [_]struct { tag: []const u8, guard: []const u8, bump: []const u8, count: usize }{
+        .{ .tag = "nextPld." ++ ppl, .guard = ppl ++ "[0.." ++ ppl ++ "_n]", .bump = ppl ++ "_n = idx + 1;", .count = 1 },
+        .{ .tag = "nextDrafter." ++ dar, .guard = dar ++ "[0.." ++ dar ++ "_n]", .bump = dar ++ "_n = i + 1;", .count = 1 },
+        .{ .tag = "nextDrafter/nextMtp." ++ d2d, .guard = d2d ++ "[0.." ++ d2d ++ "_n]", .bump = d2d ++ "_n += 1;", .count = 2 },
+        .{ .tag = "nextDrafter/nextDflash.slots", .guard = "slots[0.." ++ ppl ++ "_n]", .bump = ppl ++ "_n = idx + 1;", .count = 2 },
+        .{ .tag = "nextDflash." ++ slc, .guard = slc ++ "[0.." ++ slc ++ "_n]", .bump = slc ++ "_n += 1;", .count = 1 },
+        .{ .tag = "nextMtp.slots", .guard = "slots[0.." ++ ppp ++ "_n]", .bump = ppp ++ "_n = idx + 1;", .count = 1 },
+        .{ .tag = "nextMtp." ++ tkn, .guard = tkn ++ "[0.." ++ tkn ++ "_n]", .bump = tkn ++ "_n = k + 1;", .count = 2 },
+        .{ .tag = "nextMtp." ++ crs, .guard = "slots[0.." ++ crs ++ "_n]", .bump = crs ++ "_n = a + 1;", .count = 1 },
     };
     var missing: usize = 0;
-    var unguarded: usize = 0;
+    var unbumped: usize = 0;
     for (sites) |site| {
-        const at = std.mem.indexOf(u8, src, site.needle) orelse {
-            std.debug.print("[errpath-uninit] missing site {s}\n", .{site.tag});
+        const seen = std.mem.count(u8, src, site.guard);
+        if (seen != site.count) {
+            std.debug.print("[errpath-uninit] {s}: guard seen {d}x, expected {d}x\n", .{ site.tag, seen, site.count });
             missing += 1;
             continue;
-        };
-        const lo = if (at > 2500) at - 2500 else 0;
-        const hi = @min(src.len, at + 900);
-        const win = src[lo..hi];
-        if (std.mem.indexOf(u8, win, "[0..") == null) {
-            std.debug.print("[errpath-uninit] {s} still frees the whole slice\n", .{site.tag});
-            unguarded += 1;
+        }
+        // The bump belongs to the fill loop BELOW this guard: the window opens
+        // at the guard and only looks forward, so an earlier site's bump can
+        // never stand in for a missing one here.
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, src, from, site.guard)) |at| : (from = at + site.guard.len) {
+            const win = src[at..@min(src.len, at + 8000)];
+            if (std.mem.indexOf(u8, win, site.bump) == null) {
+                std.debug.print("[errpath-uninit] {s}: guard at {d} has no counter bump below it\n", .{ site.tag, at });
+                unbumped += 1;
+            }
         }
     }
     try testing.expectEqual(@as(usize, 0), missing);
-    try testing.expectEqual(@as(usize, 0), unguarded);
+    try testing.expectEqual(@as(usize, 0), unbumped);
+
+    // Part 2: the class ratchet. Every whole-slice free loop in this file is
+    // either bounded by a counter, or the slice is filled by an INFALLIBLE
+    // pre-init loop before anything can throw (`dfl_out_buf`, `cap_out`,
+    // `q_rows`). A new unbounded free over a fallibly-filled slice fails here.
+    var bounded: usize = 0;
+    var preinit_exempt: usize = 0;
+    var unproven: usize = 0;
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, t, "for (")) continue;
+        if (std.mem.indexOf(u8, t, free_stmt) == null) continue;
+        const close = std.mem.indexOf(u8, t, ") |") orelse continue;
+        const expr = t["for (".len..close];
+        if (std.mem.indexOf(u8, expr, "[0..") != null) {
+            bounded += 1;
+            continue;
+        }
+        var found = false;
+        var it2 = std.mem.splitScalar(u8, src, '\n');
+        while (it2.next()) |raw2| {
+            const t2 = std.mem.trim(u8, raw2, " \t\r");
+            if (!std.mem.startsWith(u8, t2, "for (")) continue;
+            const c2 = std.mem.indexOf(u8, t2, ") |*") orelse continue;
+            if (!std.mem.eql(u8, t2["for (".len..c2], expr)) continue;
+            if (std.mem.indexOf(u8, t2, new_stmt) != null or std.mem.indexOf(u8, t2, ".ctx = null") != null) found = true;
+        }
+        if (found) {
+            preinit_exempt += 1;
+        } else {
+            std.debug.print("[errpath-uninit] unbounded free over `{s}` with no infallible pre-init\n", .{expr});
+            unproven += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), unproven);
+    // Both arms must have matched, or the line shape drifted and this scan is
+    // asserting nothing.
+    try testing.expect(bounded >= 12);
+    try testing.expect(preinit_exempt >= 3);
 }
 
-test "errpath: a 2-slot fill loop frees only built handles on every faulted op" {
-    // Class pin for §5.1. HEAD's whole-slice defer `delete`s slot 1 while it
-    // is still uninitialised; the abort is the red half under a GPU stream.
-    // The guarded arm is the counter shape the 8 sites now use.
+test "errpath: a faulted KVCache.snapshot frees only the entries it built" {
+    // The production instance of the counter shape, and the only one in the
+    // family that is constructible without a loaded model. `snapshot` fills
+    // `entries.len` KV entries with fallible `mlx_array_set` calls; before the
+    // fix its errdefer ran `freeKVEntry` over the WHOLE slice, so a throw in
+    // entry 1 freed uninitialised memory. The red half is an abort, not an
+    // assertion failure — a double free is not catchable.
+    //
+    // Handles only, no kernels: this runs wherever the suite runs.
     mlx.installErrorHandler();
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    if (s.ctx == null) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    var host = [_]f32{ 1.5, 2.5, 3.5, 4.5 };
-    const shape = [_]c_int{ 2, 2 };
-    const seed = mlx.mlx_array_new_data(&host, &shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(seed);
-    try mlx.check(mlx.mlx_array_eval(seed));
-
-    const H = struct {
-        fn guarded(alloc: std.mem.Allocator, st: mlx.mlx_stream, src: mlx.mlx_array) !void {
-            const out = try alloc.alloc(mlx.mlx_array, 2);
-            var built: usize = 0;
-            defer {
-                for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
-                alloc.free(out);
-            }
-            for (out, 0..) |*slot, i| {
-                slot.* = mlx.mlx_array_new();
-                built = i + 1;
-                try mlx.check(mlx.mlx_multiply(slot, src, src, st));
-                try mlx.check(mlx.mlx_array_eval(slot.*));
-            }
+    // The un-built tail is only junk if the allocator makes it junk: in
+    // ReleaseFast `undefined` is whatever the heap held, and a zeroed page
+    // makes `mlx_array_free(null)` a silent no-op. Poison every allocation so
+    // the un-built tail is a non-null garbage handle and the pre-fix shape
+    // aborts deterministically.
+    const Poison = struct {
+        inner: std.mem.Allocator,
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const p = self.inner.rawAlloc(len, a, ra) orelse return null;
+            @memset(p[0..len], 0xAA);
+            return p;
         }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.rawFree(m, a, ra);
+        }
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
     };
+    var poison = Poison{ .inner = testing.allocator };
+    const allocator = std.mem.Allocator{ .ptr = &poison, .vtable = &Poison.vtable };
+    var cache = try transformer_mod.KVCache.init(allocator, 2);
+    defer cache.deinit();
+    var host = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]c_int{ 1, 1, 2, 2 };
+    for (cache.entries) |*e| {
+        _ = mlx.mlx_array_free(e.keys);
+        _ = mlx.mlx_array_free(e.values);
+        e.keys = mlx.mlx_array_new_data(&host, &shape, 4, .float32);
+        e.values = mlx.mlx_array_new_data(&host, &shape, 4, .float32);
+        e.offset = 2;
+        e.initialized = true;
+    }
 
+    // Un-faulted run: counts the checked ops (one `mlx_array_set` per stored
+    // array per entry) and proves the happy path still works.
     const c0 = mlx.op_count.load(.monotonic);
-    try H.guarded(allocator, s, seed);
+    var warm = try cache.snapshot();
     const n_ops = mlx.op_count.load(.monotonic) - c0;
-    try testing.expect(n_ops >= 2);
+    try testing.expectEqual(@as(usize, 2), warm.entries.len);
+    warm.deinit();
+    try testing.expectEqual(@as(u64, 4), n_ops);
 
     var fired: usize = 0;
     var k: u64 = 1;
     while (k <= n_ops) : (k += 1) {
         mlx.fault.arm(k);
-        const r = H.guarded(allocator, s, seed);
+        const r = cache.snapshot();
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
-        if (r) |_| {} else |err| {
+        if (r) |ok| {
+            var snap = ok;
+            snap.deinit();
+        } else |err| {
             try testing.expectEqual(error.MlxError, err);
             try testing.expect(did);
             fired += 1;
@@ -14868,31 +14958,45 @@ test "errpath: a 2-slot fill loop frees only built handles on every faulted op" 
     try testing.expectEqual(n_ops, fired);
 }
 
-test "errpath: probsAllPositions releases current on every faulted op" {
-    // Rows 11–14: fill `current`, then a later try. GPU-gated; skip when this
-    // process cannot create a stream.
-    mlx.installErrorHandler();
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+test "errpath: a faulted probsAllPositions holds no reference to its input" {
+    // `current` starts as a refcount-share of the caller's logits and is
+    // replaced at each filter stage; a throw below any of them used to leak
+    // whichever handle was live. The oracle is residency, not the error:
+    // the test drops its OWN reference to the 4 MiB input after each faulted
+    // call, so the input's buffer is released only if the helper released
+    // every handle it took. A leaked `current` (or `scaled`) keeps that
+    // buffer alive and the settled byte count does not fall.
+    if (!transformer_mod.mlxDeviceUsable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    if (s.ctx == null) return error.SkipZigTest;
-    var host = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
-    const shape = [_]c_int{ 1, 1, 4 };
-    const logits = mlx.mlx_array_new_data(&host, &shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(logits);
-    try mlx.check(mlx.mlx_array_eval(logits));
-    const sampling = SamplingParams{};
+    const allocator = testing.allocator;
+    const n_elems = 1 << 20; // 4 MiB of f32 — well clear of allocator noise
+    const host = try allocator.alloc(f32, n_elems);
+    defer allocator.free(host);
+    for (host, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+    const shape = [_]c_int{ 1, 1, @as(c_int, n_elems) };
+    const bytes: usize = n_elems * @sizeOf(f32);
+    // Temperature != 1 so the divide arm (and its `scaled` handle) is on the
+    // swept path; top-k / top-p stay off because those two arms swallow their
+    // own errors and would break the fired == n_ops invariant.
+    const sampling = SamplingParams{ .temperature = 0.7 };
 
+    const warm_seed = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    try mlx.check(mlx.mlx_array_eval(warm_seed));
     const c0 = mlx.op_count.load(.monotonic);
-    const warm = try probsAllPositions(logits, sampling, s);
+    const warm = try probsAllPositions(warm_seed, sampling, s);
     const n_ops = mlx.op_count.load(.monotonic) - c0;
     _ = mlx.mlx_array_free(warm);
-    try testing.expect(n_ops >= 1);
+    _ = mlx.mlx_array_free(warm_seed);
+    try testing.expectEqual(@as(u64, 3), n_ops);
 
     var fired: usize = 0;
     var k: u64 = 1;
     while (k <= n_ops) : (k += 1) {
+        const seed = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+        try mlx.check(mlx.mlx_array_eval(seed));
+        const base = transformer_mod.mlxSettledActiveBytes(s);
         mlx.fault.arm(k);
-        const r = probsAllPositions(logits, sampling, s);
+        const r = probsAllPositions(seed, sampling, s);
         const did = mlx.fault.didFire();
         mlx.fault.disarm();
         if (r) |ok| {
@@ -14902,6 +15006,12 @@ test "errpath: probsAllPositions releases current on every faulted op" {
             try testing.expect(did);
             fired += 1;
         }
+        _ = mlx.mlx_array_free(seed);
+        const after = transformer_mod.mlxSettledActiveBytes(s);
+        if (after + bytes / 2 > base) {
+            std.debug.print("[errpath-oracle] fault {d}: base={d} after={d} (input's {d} bytes were not released)\n", .{ k, base, after, bytes });
+        }
+        try testing.expect(after + bytes / 2 <= base);
     }
     try testing.expectEqual(n_ops, fired);
 }
