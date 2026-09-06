@@ -39,6 +39,21 @@ pub const Blob = struct {
 
 pub const DEFAULT_PERMIT_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// One blob the writer could not write. The writer counts errors AND drops
+/// the blob, so the only party that can repair the damage is the tier that
+/// staged it — and it can only do that if it knows WHICH entry lost a file.
+/// `path` is owned by whoever takes it out of `takeFailures`; `err_name` is a
+/// static `@errorName` string.
+pub const Failure = struct { path: []u8, err_name: []const u8 };
+
+/// Where an injected failure strikes. See `Writer.fail_at`.
+pub const FailAt = enum { write, submit };
+
+/// How many failed paths are kept for attribution. Past this the writer stops
+/// naming names and raises `unattributed_failure`, which the tier must read as
+/// "anything may be short".
+pub const MAX_RECORDED_FAILURES: usize = 256;
+
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -64,6 +79,25 @@ pub const Writer = struct {
     /// `deinit` ran. Makes its "safe to call twice" doc claim true.
     deinited: bool = false,
     thread: ?std.Thread = null,
+    /// Failed blobs since the last `takeFailures`, so the tier can invalidate
+    /// the entry each one belonged to. A counter alone can only say THAT a
+    /// write failed, never whose file it was — which is why a failure landing
+    /// between two spill passes was invisible to both.
+    failures: std.ArrayList(Failure) = .empty,
+    /// A failure that could NOT be recorded (over the cap, or the dupe OOM'd).
+    /// Read-and-clear via `takeUnattributed`; a tier that sees it may trust no
+    /// entry's completeness.
+    unattributed_failure: bool = false,
+    /// Test-only: every blob whose path contains this substring fails the way
+    /// a full or dying volume does — error counted, failure recorded, blob
+    /// dropped, nothing written. Owned.
+    fail_substr: ?[]u8 = null,
+    /// WHERE the injected failure strikes. `.write` is the interleaving that
+    /// hides from a per-pass error delta (the blob is accepted, the pass ends,
+    /// the write fails later); `.submit` is the volume refusing on the spot,
+    /// which a same-pass delta must still catch. Both take the same
+    /// count-record-drop path a real ENOSPC takes.
+    fail_at: FailAt = .write,
     /// Diagnostics / test bars. Written under the mutex.
     files_written: u64 = 0,
     bytes_written: u64 = 0,
@@ -125,6 +159,10 @@ pub const Writer = struct {
         self.queue.clearRetainingCapacity();
         self.pending_bytes = 0;
         self.queue.deinit(self.allocator);
+        for (self.failures.items) |f| self.allocator.free(f.path);
+        self.failures.deinit(self.allocator);
+        if (self.fail_substr) |fs| self.allocator.free(fs);
+        self.fail_substr = null;
         self.mutex.unlock(self.io);
     }
 
@@ -154,6 +192,14 @@ pub const Writer = struct {
         if (!self.running) {
             // No writer: dropping is correct — the index file rides the same
             // queue, so nothing half-indexed can result.
+            self.allocator.free(path);
+            self.allocator.free(bytes);
+            self.files_dropped += 1;
+            return;
+        }
+        if (self.injectedLocked(path, .submit)) {
+            log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ "InjectedSubmitFailure", path });
+            self.noteFailureLocked(path, "InjectedSubmitFailure");
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -313,6 +359,73 @@ pub const Writer = struct {
         return self.pending_bytes + self.inflight_bytes;
     }
 
+    /// Hand over every failure recorded since the last call; the caller owns
+    /// the slice AND each `path` (free both with the writer's allocator).
+    /// Emptying the list here is deliberate: attribution happens once, and a
+    /// second reader must not re-poison an entry the tier already rebuilt.
+    pub fn takeFailures(self: *Writer) []Failure {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.failures.toOwnedSlice(self.allocator) catch blk: {
+            // Could not hand them over — so they are unattributable, which is
+            // strictly safer than reporting none.
+            self.unattributed_failure = true;
+            break :blk &[_]Failure{};
+        };
+    }
+
+    /// Read-and-clear: did a failure go unrecorded since the last call?
+    pub fn takeUnattributed(self: *Writer) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const v = self.unattributed_failure;
+        self.unattributed_failure = false;
+        return v;
+    }
+
+    /// Test-only: fail every blob whose path contains `substr` (null clears).
+    /// The failure path — count, record, drop — is the SAME one an ENOSPC
+    /// takes, so a test can produce the interleaving that matters (a chunk
+    /// that dies AFTER the pass that staged it) without a full volume.
+    pub fn injectFailure(self: *Writer, substr: ?[]const u8, at: FailAt) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.fail_substr) |fs| self.allocator.free(fs);
+        self.fail_substr = if (substr) |sub| (self.allocator.dupe(u8, sub) catch null) else null;
+        self.fail_at = at;
+    }
+
+    /// Does `path` match the armed injection for phase `at`? Caller holds the
+    /// mutex.
+    fn injectedLocked(self: *Writer, path: []const u8, at: FailAt) bool {
+        if (self.fail_at != at) return false;
+        const fs = self.fail_substr orelse return false;
+        return std.mem.indexOf(u8, path, fs) != null;
+    }
+
+    /// Count + record one failed blob. Caller must NOT hold the mutex.
+    fn noteFailure(self: *Writer, path: []const u8, err_name: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.noteFailureLocked(path, err_name);
+    }
+
+    fn noteFailureLocked(self: *Writer, path: []const u8, err_name: []const u8) void {
+        self.write_errors += 1;
+        if (self.failures.items.len >= MAX_RECORDED_FAILURES) {
+            self.unattributed_failure = true;
+            return;
+        }
+        const p = self.allocator.dupe(u8, path) catch {
+            self.unattributed_failure = true;
+            return;
+        };
+        self.failures.append(self.allocator, .{ .path = p, .err_name = err_name }) catch {
+            self.allocator.free(p);
+            self.unattributed_failure = true;
+        };
+    }
+
     pub fn writeErrorCount(self: *Writer) u64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -347,16 +460,19 @@ pub const Writer = struct {
             // the interleaving the fence exists for. (audit S14)
             self.mutex.lockUncancelable(self.io);
             const live_epoch = self.epoch;
+            const inject = self.injectedLocked(blob.path, .write);
             self.mutex.unlock(self.io);
 
             var dropped = false;
             if (blob.epoch != live_epoch) {
                 dropped = true;
+            } else if (inject) {
+                log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ "InjectedWriteFailure", blob.path });
+                self.noteFailure(blob.path, "InjectedWriteFailure");
+                dropped = true;
             } else if (writeAtomic(blob.path, blob.bytes)) |_| {} else |err| {
                 log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ @errorName(err), blob.path });
-                self.mutex.lockUncancelable(self.io);
-                self.write_errors += 1;
-                self.mutex.unlock(self.io);
+                self.noteFailure(blob.path, @errorName(err));
                 dropped = true;
             }
 
