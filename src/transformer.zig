@@ -5192,6 +5192,11 @@ fn fusedSdpa256Impl(
             var m_new = mlx.mlx_array_new();
             var l_new = mlx.mlx_array_new();
             var o_new = mlx.mlx_array_new();
+            errdefer {
+                if (m_new.ctx != null) _ = mlx.mlx_array_free(m_new);
+                if (l_new.ctx != null) _ = mlx.mlx_array_free(l_new);
+                if (o_new.ctx != null) _ = mlx.mlx_array_free(o_new);
+            }
             try mlx.check(mlx.mlx_vector_array_get(&m_new, outputs_vec, 1));
             try mlx.check(mlx.mlx_vector_array_get(&l_new, outputs_vec, 2));
             try mlx.check(mlx.mlx_vector_array_get(&o_new, outputs_vec, 3));
@@ -5201,6 +5206,9 @@ fn fusedSdpa256Impl(
             m_prev = m_new;
             l_prev = l_new;
             o_prev = o_new;
+            m_new = .{ .ctx = null };
+            l_new = .{ .ctx = null };
+            o_new = .{ .ctx = null };
         }
     }
     fused256_last_dispatch_count = dispatches;
@@ -5692,8 +5700,14 @@ pub const KVCache = struct {
     /// call.
     pub fn snapshot(self: *const KVCache) !KVCacheSnapshot {
         const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*e| freeKVEntry(e);
+            self.allocator.free(out);
+        }
         for (self.entries, 0..) |src, i| {
             out[i] = newEmptyKVEntry();
+            built = i + 1;
             out[i].offset = src.offset;
             out[i].initialized = src.initialized;
             if (src.initialized) {
@@ -6397,6 +6411,7 @@ pub const KVCacheSnapshot = struct {
         }
         for (self.entries, 0..) |src, i| {
             out[i] = newEmptyKVEntry();
+            built = i + 1;
             out[i].initialized = src.initialized;
             out[i].offset = @min(src.offset, len);
             if (src.initialized) {
@@ -6410,7 +6425,6 @@ pub const KVCacheSnapshot = struct {
                     out[i].values_biases = try trimRowsOwned(src.values_biases, keep, s);
                 }
             }
-            built = i + 1;
         }
         // One batched eval, like `captureSsmCheckpoint`: without it the lazy
         // copy nodes pin the parent buffers — the capacity the trim exists
@@ -7007,6 +7021,7 @@ pub fn captureSsmCheckpoint(
             .ssm_state = mlx.mlx_array_new(),
             .initialized = src.initialized,
         };
+        errdefer ssmSnapshotDeinit(&out);
         // Per-field null guards mirror `ssmSnapshot` — either state may
         // legitimately be null (LFM2 gated_conv never sets ssm_state).
         if (src.conv_state.ctx != null) {
@@ -14091,13 +14106,20 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        errdefer self.allocator.free(out);
+        // The slices already handed out are mlx handles, not just slice bytes —
+        // freeing `out` alone on the error path leaks every one of them.
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(out);
+        }
         for (out, 0..) |*slot, i| {
             const i_c: c_int = @intCast(i);
             const start = [_]c_int{ i_c, 0, 0 };
             const stop = [_]c_int{ i_c + 1, 1, vocab };
             const strides = [_]c_int{ 1, 1, 1 };
             slot.* = mlx.mlx_array_new();
+            built = i + 1;
             try mlx.check(mlx.mlx_slice(slot, logits, &start, 3, &stop, 3, &strides, 3, self.s));
         }
         return out;
@@ -25743,6 +25765,11 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         .g = mlx.mlx_array_new(),
         .beta = mlx.mlx_array_new(),
     };
+    errdefer {
+        inline for (.{ &out.q, &out.k, &out.v, &out.conv_state, &out.g, &out.beta }) |p| {
+            if (p.*.ctx != null) _ = mlx.mlx_array_free(p.*);
+        }
+    }
     try mlx.check(mlx.mlx_vector_array_get(&out.q, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&out.k, outputs_vec, 1));
     try mlx.check(mlx.mlx_vector_array_get(&out.v, outputs_vec, 2));
@@ -27878,8 +27905,13 @@ pub fn hcReadFused(
             defer _ = mlx.mlx_vector_array_free(res);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(which), vec, hc_fused_cfgs[which].?, st));
             if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
+            var got: usize = 0;
+            errdefer {
+                for (outs[0..got]) |a| _ = mlx.mlx_array_free(a);
+            }
             for (0..n_out) |i| {
                 outs[i] = mlx.mlx_array_new();
+                got = i + 1;
                 try mlx.check(mlx.mlx_vector_array_get(&outs[i], res, i));
             }
         }
@@ -44916,6 +44948,23 @@ test "growQuantBuf else-arm builds the new buffer before freeing the old one" {
     const free_at = std.mem.indexOf(u8, arm, "mlx_array_free(buf.*)") orelse return error.FreeMoved;
     if (zeros_at >= free_at) std.debug.print("[growQuantBuf] else-arm order: zeros@{d} free@{d}\n", .{ zeros_at, free_at });
     try testing.expect(zeros_at < free_at);
+}
+
+test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
+    // Class B / L4: `built = i + 1` sat AFTER the six trimRowsOwned tries, so
+    // a faulted values trim leaked keys. Move the bump to immediately after
+    // newEmptyKVEntry so the function-scope errdefer covers the in-progress
+    // slot. Red on HEAD: the last `built = i + 1` in the loop is below the
+    // first trimRowsOwned.
+    const src = @embedFile("transformer.zig");
+    const needle = "pub fn trimmed" ++ "Copy(";
+    const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
+    const end = std.mem.indexOfPos(u8, src, start + needle.len, "pub fn ") orelse src.len;
+    const body = src[start..end];
+    const trim_at = std.mem.indexOf(u8, body, "trimRows" ++ "Owned(") orelse return error.TrimMoved;
+    const built_at = std.mem.indexOf(u8, body, "built = i + 1;") orelse return error.BuiltMoved;
+    if (built_at > trim_at) std.debug.print("[trimmedCopy] built@{d} after trim@{d}\n", .{ built_at, trim_at });
+    try testing.expect(built_at < trim_at);
 }
 
 test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no double free)" {
