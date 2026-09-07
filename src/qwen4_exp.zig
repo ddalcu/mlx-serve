@@ -444,7 +444,54 @@ pub const NgramTable = struct {
             }
             if (start >= row_ids.len) return;
         };
+        const nthr = parThreads();
+        if (nthr > 1 and row_ids.len >= 1024) {
+            var pctx: ParCtx = .{ .table = self, .rows = row_ids, .out = out, .next = std.atomic.Value(usize).init(0) };
+            var th: [64]std.Thread = undefined;
+            const want = @min(nthr, 64);
+            var started: usize = 0;
+            while (started < want) : (started += 1) {
+                th[started] = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parWorker, .{&pctx}) catch break;
+            }
+            if (started > 0) {
+                parWorker(&pctx);
+                for (th[0..started]) |t| t.join();
+                return;
+            }
+        }
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
+    }
+
+    /// EXPERIMENT (QWEN4_PLE_PAR, default 1 = today's serial path). A prefill
+    /// chunk gathers 65k rows x 3 sites; the serial loop takes every fault by
+    /// itself. Spreading the same faults over threads overlaps them.
+    fn parThreads() u32 {
+        const S = struct {
+            var v: ?u32 = null;
+        };
+        if (S.v) |v| return v;
+        var v: u32 = 1;
+        if (std.c.getenv("QWEN4_PLE_PAR")) |raw| v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch 1;
+        S.v = v;
+        return v;
+    }
+
+    const ParCtx = struct {
+        table: *const NgramTable,
+        rows: []const i64,
+        out: []f32,
+        next: std.atomic.Value(usize),
+    };
+
+    fn parWorker(ctx: *ParCtx) void {
+        const dim = ctx.table.dim;
+        const BLK: usize = 256;
+        while (true) {
+            const start = ctx.next.fetchAdd(BLK, .acq_rel);
+            if (start >= ctx.rows.len) return;
+            const end = @min(start + BLK, ctx.rows.len);
+            for (start..end) |i| ctx.table.row(@intCast(ctx.rows[i]), ctx.out[i * dim ..][0..dim]);
+        }
     }
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
