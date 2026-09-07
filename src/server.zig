@@ -91,6 +91,11 @@ pub var g_lan_share_spec: ?[]const u8 = null;
 pub var g_lan_name: ?[]const u8 = null;
 pub var g_lan_discover: bool = false;
 
+/// Upstream chat providers (src/providers.zig): `~/.mlx-serve/providers.json`,
+/// rows mirrored into /v1/models as `<id>@<name>`, `/v1/chat/completions`
+/// proxied with the provider's key. Started by `serve()` beside the LAN.
+pub var g_providers: ?*providers_mod.Providers = null;
+
 /// Should boot print the open-bind warning? True only when serve mode is about
 /// to listen on a non-loopback address the user never chose: no explicit
 /// `--host` (the default is still 0.0.0.0) and no `--lan-share` (which needs
@@ -119,6 +124,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
@@ -696,6 +702,8 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/messages",
     "/v1/models",
     "/v1/models/rescan",
+    "/v1/providers",
+    "/v1/providers/reload",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -1474,6 +1482,21 @@ pub fn serve(
         g_lan = null;
         l.shutdown();
     };
+    // The App Store build cannot exec curl (the providers transport), so it
+    // never starts them — same limit as `mlx-serve pull`.
+    if (!build_options.mas) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.mlx-serve/providers.json", .{home}) catch "";
+        g_providers = providers_mod.Providers.start(allocator, io, path, port) catch |err| blk: {
+            log.warn("[providers] failed to start ({s}); providers disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    defer if (g_providers) |p| {
+        g_providers = null;
+        p.shutdown();
+    };
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
@@ -1899,6 +1922,16 @@ fn handleConnection(
         try handleUnloadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/providers/reload")) {
+        try handleProvidersReload(allocator, stream);
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/providers")) {
+        const body = if (g_providers) |p| try p.statusJson(allocator) else try allocator.dupe(u8, "{\"providers\":[]}");
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
@@ -1953,6 +1986,15 @@ fn handleConnection(
     //    that marker, not loopback-ness, is the multi-hop bound. A
     //    registered LOCAL id containing '@' keeps winning via the peek; an
     //    offline peer is an honest 404, never a silent local-default answer.
+    // ── Configured provider (`<id>@<provider>`) → proxied to its
+    //    /v1/chat/completions with the provider's key. Checked before the LAN
+    //    table: a provider is a URL the user typed, a peer is discovered.
+    if (g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
+        !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
+    {
+        try handleProviderProxy(allocator, stream, prov, path, request_body, requested_model_id);
+        return;
+    };
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
@@ -2738,20 +2780,15 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
     return @min(working_set_limit, mlx_footprint +| free_system);
 }
 
-/// How far under the ENFORCED wired limit a plan may reach. MEASURED: on the incident box
-/// (M5 Max 128 GB, `iogpu.wired_limit_mb` 120000) the deepest allocation that ran to completion
-/// was 113,869 MB, so 8 GiB puts the plan ceiling at 111,808 MB — under a peak the machine has
-/// already survived. Past the limit Metal returns zeros before an uncatchable abort.
+/// How far under the enforced wired limit a plan may reach: past the limit Metal returns
+/// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
 pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 8 << 30;
 
-/// PURE: the floor an EXPLICITLY RAISED `iogpu.wired_limit_mb` puts under the ceiling. 0 — the
-/// pre-change expression exactly — when the sysctl is absent, unreadable, or not above the
-/// macOS default of 75% of physical RAM, i.e. when the operator has said nothing.
-///
-/// A floor and not a cap on the static term: `getGpuWorkingSetLimit()` already TRACKS the
-/// sysctl (measured 2026-09-07: both 120,000 MB). The term that collapses the live ceiling is
-/// the PHYSICAL one, which counts other processes' anonymous pages as non-reclaimable — a proxy
-/// for "the machine will thrash", where the wired limit is what Metal enforces.
+/// PURE: the floor an explicitly raised `iogpu.wired_limit_mb` puts under the ceiling; 0 when
+/// the sysctl is absent or at the macOS default (75% of RAM), which leaves the ceiling as is.
+/// A floor, not a cap: the working-set term already tracks the sysctl. The term it lifts is
+/// the free-RAM one, which counts other processes' pages as gone; the operator who raised the
+/// enforced limit has said the GPU may claim that much.
 pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64) u64 {
     if (wired_limit == 0 or total_ram == 0) return 0;
     if (wired_limit <= total_ram * 75 / 100) return 0; // the macOS default: no declaration
@@ -4427,12 +4464,10 @@ pub const WarmPrefix = struct {
     /// is copied whole by the first append, so crediting it is an under-bill.
     will_donate: bool = false,
 
-    /// Rows of KV this request will not allocate: the rows the restored buffer already HOLDS.
-    /// Capacity is a CEILING on the credit, never a switch that turns it off — the
-    /// all-or-nothing `reserved > capacity_tokens` gate was true on every warm turn of a
-    /// growing chain, so a 448k append was billed its whole KV as if it were cold. What the
-    /// grow costs on top is `reserved - credited` plus `PrefillRequestTerms.grow_coexist_bytes`.
-    /// `will_donate` still gates the whole credit: a shared restore is copied whole.
+    /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
+    /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
+    /// on nearly every turn. The grow's own cost is `reserved - credited` plus
+    /// `PrefillRequestTerms.grow_coexist_bytes`. `will_donate` gates the whole credit.
     pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
         if (!self.will_donate) return 0;
         if (self.matched_tokens == 0) return 0;
@@ -5934,8 +5969,10 @@ fn handleModels(
         }
     }
 
-    // Discovered LAN models ride the same list for local clients.
+    // Discovered LAN models and configured providers ride the same list for
+    // local clients; neither is re-exported to the LAN.
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
+    if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
@@ -6024,15 +6061,17 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // mirrored entry so client flows (load → generate → unload) work
     // unchanged on network models. Unknown peer/model falls through to
     // ensureLoaded's honest 404.
-    if (g_lan) |l| if (lan_mod.splitRemoteId(requested_id) != null) {
-        if (l.remoteEntryFor(allocator, requested_id)) |entry| {
+    if (lan_mod.splitRemoteId(requested_id) != null) {
+        const remote_entry: ?[]u8 = if (g_providers) |p| p.entryFor(allocator, requested_id) else null;
+        const entry_opt = remote_entry orelse if (g_lan) |l| l.remoteEntryFor(allocator, requested_id) else null;
+        if (entry_opt) |entry| {
             defer allocator.free(entry);
             const body = try std.fmt.allocPrint(allocator, "{{\"model\":{s}}}", .{entry});
             defer allocator.free(body);
             try sendResponse(stream, "200 OK", "application/json", body);
             return;
         }
-    };
+    }
     // Register-by-path: an absolute path to a model directory OUTSIDE the
     // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
     // The dir is validated exactly like discovery (config.json, supported
@@ -6266,7 +6305,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
     // the load-model no-op (the peer's owner controls its memory).
-    if (g_lan != null and lan_mod.splitRemoteId(requested_id) != null and
+    if ((g_lan != null or g_providers != null) and lan_mod.splitRemoteId(requested_id) != null and
         (global_registry == null or global_registry.?.peek(requested_id) == null))
     {
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
@@ -7626,7 +7665,8 @@ fn handleChatCompletions(
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
     // sidecar only loads when it binds to this trunk; MoE mirrors the
-    // drafter caution). Priority MTP > drafter > PLD at dispatch. NOT
+    // drafter caution). Priority DFlash > MTP > gemma drafter > PLD at
+    // dispatch (`requestSpecModes`). NOT
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -7776,8 +7816,8 @@ fn handleChatCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -8044,8 +8084,8 @@ fn handleCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -8099,12 +8139,13 @@ fn handleNonStreamingCompletion(
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
+    // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
     var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream);
@@ -8190,8 +8231,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -8565,9 +8605,10 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Transfer vision ownership into the slot via the scheduler.
     const slot_ve: ?mlx.mlx_array = blk: {
@@ -9089,23 +9130,78 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
+pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
+
+/// The ONE request-level spec dispatch, shared by every surface x stream /
+/// non-stream. Priority: DFlash > MTP > gemma drafter > PLD, mirroring
+/// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
+/// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
+/// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
+/// false` hand the round back to MTP. The gemma cross-attention drafter
+/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
+/// already applied at every surface's parse site.
+pub fn requestSpecModes(
+    enable_pld: bool,
+    enable_drafter: bool,
+    enable_mtp: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
+    mtp_loaded: bool,
+    has_constraint: bool,
+    logprobs_n: u32,
+) RequestSpec {
+    const spec_ok = logprobs_n == 0 and !has_constraint;
+    const sidecar = spec_ok and enable_drafter and (gemma_drafter_loaded or dflash_loaded);
+    const use_dflash = sidecar and dflash_loaded;
+    const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
+    const use_drafter = use_dflash or (!use_mtp and sidecar);
+    return .{
+        .use_mtp = use_mtp,
+        .use_drafter = use_drafter,
+        .use_pld = !use_mtp and !use_drafter and spec_ok and enable_pld,
+    };
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
-    drafter_loaded: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
     mtp_loaded: bool,
-    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
-    // Priority: MTP > drafter > PLD. The MTP head only loads when it binds
-    // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
-    // it needs is the same one PLD uses.
-    if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
-    if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
+    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    if (r.use_mtp) return .mtp;
+    if (r.use_drafter) return .drafter;
+    if (r.use_pld) return .pld;
     return .regular;
+}
+
+test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
+    // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
+    var r = requestSpecModes(true, true, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, true, false, 0));
+    // gemma drafter + mtp -> MTP keeps its rank.
+    r = requestSpecModes(true, true, true, true, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, false, true, false, 0));
+    // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
+    r = requestSpecModes(true, false, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    // logprobs / grammar disable every spec mode, dflash included.
+    r = requestSpecModes(true, true, true, false, true, true, false, 3);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    r = requestSpecModes(true, true, true, false, true, true, true, 0);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    // No sidecar loaded -> MTP; nothing loaded -> PLD.
+    r = requestSpecModes(true, true, true, false, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    r = requestSpecModes(true, true, true, false, false, false, false, 0);
+    try std.testing.expect(r.use_pld and !r.use_mtp and !r.use_drafter);
 }
 
 fn handleStreamingGeneration(
@@ -9172,7 +9268,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10562,6 +10658,10 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         &mid_buf,
         parseModelFromRequest(body, content_type) orelse "",
     );
+    if (lan_mod.splitRemoteId(mid)) |rid| if (registry.peek(mid) == null) {
+        // A provider is the host owner's paid key: never reachable from the LAN.
+        if (g_providers) |p| if (p.isProvider(rid.peer)) return "Provider models are host-local";
+    };
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -10636,6 +10736,45 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
+}
+
+/// Proxy `<bare>@<provider>` to the provider's /v1/chat/completions. Only that
+/// surface exists upstream, so every other model-gated route is a named 400
+/// rather than a request the provider would reject in its own words.
+fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, full_id: []const u8) !void {
+    if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
+        return;
+    }
+    var canon_buf: [512]u8 = undefined;
+    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
+    var up = prov.lookup(allocator, canon) orelse {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No such provider", 404);
+        return;
+    };
+    defer up.deinit(allocator);
+    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, up.bare);
+    defer allocator.free(rewritten);
+    log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
+    providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
+        try sendErrorResponse(allocator, stream, "502 Bad Gateway", "provider_unreachable", "Provider did not answer", 502);
+    };
+}
+
+fn handleProvidersReload(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const p = g_providers orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "providers_unavailable", "Providers are disabled on this server", 503);
+        return;
+    };
+    const n = p.reload() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "providers.json could not be read: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{{\"providers\":{d}}}", .{n});
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
 }
 
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
@@ -14131,8 +14270,8 @@ fn handleAnthropicMessages(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -14253,12 +14392,12 @@ fn handleAnthropicNonStreaming(
 
     var timer = Stopwatch.init(stream.io);
 
-    // Speculative decoding dispatch — same priority as chat-completions
-    // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
-    const config = lm.config.?;
-    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-    const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
+    // Speculative decoding dispatch — same `requestSpecModes` as
+    // chat-completions (DFlash > MTP > drafter > PLD).
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -14493,7 +14632,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -15951,7 +16090,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -16254,11 +16393,12 @@ fn handleResponsesInner(
             .decode_tps = 0.0,
         };
     } else {
-        // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
-        // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-        const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
+        // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
+        // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
+        const use_mtp = spec.use_mtp;
+        const use_drafter = spec.use_drafter;
+        const use_pld = spec.use_pld;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
             const v = local_ve;
@@ -17885,14 +18025,8 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
 }
 
 test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
-    // The live refusal (M5 Max 128 GB, `iogpu.wired_limit_mb` 120000, `--ctx-size 786432
-    // --kv-quant 8`): a 448,604-token turn appending 73 tokens needed ~13,450 MB at width 512
-    // against ~12,934 MB available. The static term already honours the sysctl (measured
-    // 2026-09-07: `recommendedMaxWorkingSetSize` 120,000 MB, the same number); what collapsed
-    // the live ceiling to ~100,656 MB is the PHYSICAL term, which counts every other process's
-    // resident anonymous page as gone. That term is a proxy for "the machine will swap"; the
-    // wired limit is what Metal ENFORCES, so an operator who raised it puts a floor under the
-    // ceiling that the proxy may no longer refuse below.
+    // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
+    // default sysctl keep the old expression byte for byte.
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
     const total_ram: u64 = 131_072 * mb;
@@ -17909,8 +18043,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     try t.expectEqual(@as(u64, 0), wiredLimitFloor(120_000 * mb, 0));
     try t.expectEqual(total_ram - WIRED_LIMIT_MARGIN_BYTES, wiredLimitFloor(400 * (1 << 30), total_ram));
 
-    // Gated: with the sysctl injected at the incident's value every other arch still takes
-    // floor 0, and floor 0 is the pre-change `physicalMemoryCeiling` expression byte for byte.
+    // Gated: every other arch takes floor 0, which is `physicalMemoryCeiling` exactly.
     var cfg = qwen4ExpLive364kConfig();
     try t.expect(wiredCeilingFloorFor(&cfg) > 0);
     try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(null));
@@ -17920,7 +18053,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
         try t.expect(!other.longCtxGated());
         try t.expectEqual(@as(u64, 0), wiredCeilingFloorFor(&other));
     }
-    const footprint: u64 = 87_722 * mb; // the 100,656 MB ceiling less the 12,934 MB it quoted
+    const footprint: u64 = 87_722 * mb;
     for ([_]u64{ 0, 12_934 * mb, 400 * (1 << 30) }) |free| {
         try t.expectEqual(
             physicalMemoryCeiling(working_set, footprint, free),
@@ -17928,7 +18061,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
         );
     }
 
-    // The refusal's own instant: 12,934 MB available becomes 24,086 MB and the bill fits.
+    // A 448k warm append that the free-RAM term refused fits under the floor.
     const kv_bits: u64 = 8;
     const seq: u64 = 448_604;
     const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
@@ -17942,12 +18075,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
 }
 
 test "a warm append is billed the rows it ALLOCATES, not the rows it already holds" {
-    // The same incident's third turn. `creditedRows` was all-or-nothing on `reserved >
-    // capacity_tokens`, and `reserved` is `prompt + RESERVE_GEN_HEADROOM + chunk` — above the
-    // capacity the previous turn sized as soon as the prompt grows by one token. On a chain
-    // adding a few hundred tokens a turn the credit therefore never applied, and three
-    // consecutive warm turns were billed 21,640 / 18,284 / 13,450 MB, whole-KV bills on turns
-    // where 448,531 of 448,604 rows were already resident.
+    // Bar: a checked-out restore credits the rows it holds even when the append outgrows the
+    // buffer; the grow bills the new capacity plus one eval window of old buffers.
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
     const cfg = qwen4ExpLive364kConfig();
@@ -17965,13 +18094,10 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     const g = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, grows);
     try t.expectEqual(matched *| kv_per_tok, g.shared_resident_bytes);
     try t.expectEqual((reserved - matched) *| kv_per_tok, g.reserved_kv_bytes +| (seq - matched) *| kv_per_tok);
-    // ...plus the old buffers alive inside one eval window while it grows. qwen4_exp caches 12
-    // of 48 layers, so exactly one lands in a 4-layer window: 465 MB against the 5,584 MB the
-    // all-or-nothing gate re-billed.
+    // ...plus one eval window of old buffers: qwen4_exp caches 12 of 48 layers, one per window.
     try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS));
     try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
-    // 13,450 -> 7,051 MB: inside the 12,934 MB the refusal quoted, with room for a wider width
-    // (2,048 bills 9,711 MB), so the ladder no longer narrows to the floor.
+    // The bill at the narrowest and a wider width.
     try t.expectEqual(@as(u64, 7_051), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
     try t.expectEqual(@as(u64, 9_711), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
 
@@ -21870,10 +21996,8 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
 
 test "a chain extension that OUTGROWS the resident entry is credited the rows it holds" {
     const t = std.testing;
-    // The 1M rung: 1,047,556 tokens over the same resident 786,707-token entry. Past the
-    // restored buffer's capacity the cache grows, but per layer, and the prefill loop's eval
-    // cadence releases each old buffer at the next boundary — so the resident rows are still
-    // credited and the grow is billed the new capacity beyond the old plus ONE eval window.
+    // Past the restored capacity the cache grows per layer: the resident rows stay credited and
+    // the grow bills the new capacity beyond the old plus one eval window of old buffers.
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 1_047_556;
     const chunk: u64 = 512;

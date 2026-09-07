@@ -102,6 +102,12 @@ struct SettingsView: View {
                     ) {
                         LanSharingSectionContent()
                     }
+                    SettingsSection(
+                        category: .providers,
+                        subtitle: "Add OpenAI-compatible chat endpoints — a cloud API, another machine, a local runtime. Their models join the picker as <model>@<name> while the provider answers. Applies on save — no restart needed."
+                    ) {
+                        ProvidersSectionContent()
+                    }
                     // Engine-aware sections. Each panel is hidden when its
                     // controls don't apply to the active engine — flipping
                     // `--kv-quant` on a GGUF model silently no-ops, so we'd
@@ -890,6 +896,147 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+// MARK: - Providers section
+
+/// Rows of `~/.mlx-serve/providers.json`. Every edit saves the file and asks
+/// the running server to reload; the health dot is the server's own probe
+/// (`GET /v1/providers`), never a guess made here.
+private struct ProvidersSectionContent: View {
+    @EnvironmentObject var server: ServerManager
+    @State private var entries: [ProviderEntry] = ProvidersFile.load()
+    @State private var status: [ProviderStatus] = []
+    @State private var saveError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if entries.isEmpty {
+                Text("No providers yet.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach($entries) { $entry in
+                ProviderRow(entry: $entry,
+                            serverPort: server.port,
+                            status: status.first { $0.name == entry.name },
+                            duplicate: ProvidersFile.duplicateNames(entries).contains(entry.name),
+                            onDelete: { entries.removeAll { $0.id == entry.id }; save() },
+                            onCommit: save)
+            }
+            HStack {
+                Button { entries.append(ProviderEntry()) } label: { Label("Add Provider", systemImage: "plus") }
+                Spacer()
+                // Fields also save on Enter, but an edit followed by a click
+                // elsewhere never submits — this is the button that always writes.
+                Button("Save") { save() }
+                .keyboardShortcut("s", modifiers: .command)
+                .help("Write providers.json and ask the server to re-probe now")
+            }
+            if let saveError {
+                Text(saveError).font(.caption).foregroundStyle(.red)
+            }
+            Text("Keys are stored in plain text in ~/.mlx-serve/providers.json. Prefer an environment variable name for a shared machine. Provider models are never shared over the LAN.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .task { await refreshStatus() }
+        .onChange(of: server.status) { _, s in
+            if s == .running { Task { await refreshStatus() } }
+        }
+    }
+
+    private func save() {
+        do {
+            try ProvidersFile.save(entries)
+            saveError = nil
+        } catch {
+            saveError = "Could not save providers.json: \(error.localizedDescription)"
+            return
+        }
+        Task {
+            await server.reloadProviders()
+            // The probe runs on the server's own thread right after reload.
+            try? await Task.sleep(for: .seconds(2))
+            await refreshStatus()
+        }
+    }
+
+    private func refreshStatus() async {
+        guard server.status == .running else { return }
+        status = await server.providerStatus()
+    }
+}
+
+private struct ProviderRow: View {
+    @Binding var entry: ProviderEntry
+    let serverPort: UInt16
+    let status: ProviderStatus?
+    let duplicate: Bool
+    let onDelete: () -> Void
+    let onCommit: () -> Void
+    @State private var modelsText: String = ""
+
+    private var problem: String? {
+        if duplicate { return "Another provider already uses this name" }
+        return entry.problem(serverPort: serverPort)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                healthDot
+                TextField("name", text: $entry.name, prompt: Text("name"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                    .onSubmit(onCommit)
+                TextField("url", text: $entry.url, prompt: Text("https://api.openai.com/v1"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+                Toggle("", isOn: $entry.enabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .onChange(of: entry.enabled) { _, _ in onCommit() }
+                Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .help("Remove this provider")
+            }
+            HStack(spacing: 8) {
+                SecureField("api key", text: $entry.apiKey, prompt: Text("API key"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+                TextField("env", text: $entry.apiKeyEnv, prompt: Text("or env var, e.g. OPENAI_API_KEY"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+            }
+            TextField("models", text: $modelsText, prompt: Text("Models, comma-separated — only needed if the provider has no /v1/models (a bare host:port URL is probed at /v1 too)"))
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .onAppear { modelsText = entry.models.joined(separator: ", ") }
+                .onChange(of: modelsText) { _, t in entry.models = ProviderEntry.parseModelList(t) }
+                .onSubmit(onCommit)
+            if let problem {
+                Text(problem).font(.caption2).foregroundStyle(.orange)
+            } else if let status {
+                Text(statusLine(status)).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private var healthDot: some View {
+        Circle()
+            .fill(status.map { $0.up ? Color.green : ($0.probed ? Color.red : Color.gray) } ?? Color.gray)
+            .frame(width: 8, height: 8)
+            .help(status.map(statusLine) ?? "Not reported by the server yet")
+    }
+
+    private func statusLine(_ s: ProviderStatus) -> String {
+        if !s.probed { return "Checking…" }
+        return s.up ? "Up — \(s.models) model\(s.models == 1 ? "" : "s")" : "Unreachable"
     }
 }
 

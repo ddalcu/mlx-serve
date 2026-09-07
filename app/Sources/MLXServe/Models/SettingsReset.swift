@@ -37,7 +37,8 @@ enum SettingsReset {
         // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
         // each of its rows (appearance/accent/text size/compact/shortcut)
         // carries its own control default or Reset (the shortcut row's).
-        case .modelFolders, .updates, .about, .interface:
+        // Providers live in providers.json, edited row by row in their own pane.
+        case .modelFolders, .updates, .about, .interface, .providers:
             return []
 
         case .server:

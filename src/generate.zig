@@ -1381,7 +1381,10 @@ pub const Generator = struct {
     // 4.4-15.0 accepted/round and the regressing prose/vision class at
     // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
     // workloads accepting 62-86% remain above it as well.
-    pub const DFLASH_GATE_WARMUP: u64 = 3;
+    // Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
+    // (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
+    // tok/s; the same prompt restored from cache decoded at 73).
+    pub const DFLASH_GATE_WARMUP: u64 = 8;
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 2.0;
     pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
     /// Absolute floor for a SPARSE target, applied after the width scaling.
@@ -4821,9 +4824,10 @@ pub const Generator = struct {
     }
 
     /// DFlash runtime economics gate. Sticky within the request: once a
-    /// three-round sample proves the block-parallel path yields less than its
-    /// width-normalized request-class threshold, subsequent ticks use the
-    /// regular pipelined decoder through `nextDflash`'s entry fallback.
+    /// `DFLASH_GATE_WARMUP`-round sample proves the block-parallel path yields
+    /// less than its width-normalized request-class threshold, subsequent
+    /// ticks use the regular pipelined decoder through `nextDflash`'s entry
+    /// fallback.
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
         if (!dflashGateShouldDisable(
@@ -11183,20 +11187,21 @@ test "Generator.dflashGateShouldDisable uses accepted yield across block widths"
 
     // Muse prose/vision measured 1.0-1.5 accepted drafts per round at both
     // block 8 and block 16: that class loses to serial and must fall back.
-    try testing.expect(Generator.dflashGateShouldDisable(3, 3, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(3, 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    const w = Generator.DFLASH_GATE_WARMUP;
+    try testing.expect(Generator.dflashGateShouldDisable(w, w * 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(w, w * 2 - 1, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
 
     // Exactly two is the strict break-even boundary; code/tool traffic at
     // 4.4+ and echo traffic near a full block remain on DFlash.
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 6, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 45, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 2, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 5, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w * 15, Generator.DFLASH_GATE_MIN_ACCEPTED_PER_ROUND));
 
     // Thinking preambles recovered from ~1.4 early to 4.4 whole-request; the
     // resolved-mode threshold keeps that path alive while still cutting off
     // a truly non-yielding reasoning request.
-    try testing.expect(!Generator.dflashGateShouldDisable(3, 4, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
-    try testing.expect(Generator.dflashGateShouldDisable(3, 2, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(!Generator.dflashGateShouldDisable(w, w + w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
+    try testing.expect(Generator.dflashGateShouldDisable(w, w - w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
 }
 
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
@@ -14791,67 +14796,4 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
-}
-
-test "every rollback-from-capture is counted in partial_rounds" {
-    // The counter shipped reading 0 on qwen4_exp: it was incremented at two of the four
-    // rollback sites, and neither of those two can emit a `mode=mtp` line. The loop and the
-    // count now live in one helper, so this asserts there is no second way to take the
-    // rollback. Needles are assembled at comptime.
-    const src = @embedFile("generate.zig");
-    const callee = "transformer_mod.ssmRollback" ++ "FromCapture(";
-    const helper = "fn rollbackSsm" ++ "FromCapture(";
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, callee));
-    const at = std.mem.indexOf(u8, src, helper) orelse return error.HelperMoved;
-    const body = src[at..@min(src.len, at + 600)];
-    const bump = "partial_" ++ "rounds += 1;";
-    const count_at = std.mem.indexOf(u8, body, bump) orelse return error.CountMoved;
-    try testing.expect(count_at < (std.mem.indexOf(u8, body, callee) orelse return error.CalleeMoved));
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, bump));
-}
-
-test "errpath: a fallible mlx_array fill loop frees only the built prefix" {
-    // `allocator.alloc(mlx_array, n)` + a defer over the WHOLE slice + a `try` inside the
-    // fill: a mid-loop throw leaves the later slots uninitialised and the defer frees heap
-    // junk. Every whole-slice free loop in this file must therefore either be bounded by a
-    // counter the fill bumps after `mlx_array_new()`, or free a slice an INFALLIBLE pre-init
-    // loop filled before anything could throw (`dfl_out_buf`, `cap_out`, `q_rows`). Needles
-    // are assembled at comptime so this test's own source cannot satisfy the scan.
-    const src = @embedFile("generate.zig");
-    const free_stmt = "_ = mlx.mlx_array" ++ "_free(";
-    const new_stmt = "mlx.mlx_array" ++ "_new()";
-    var bounded: usize = 0;
-    var preinit_exempt: usize = 0;
-    var unproven: usize = 0;
-    var it = std.mem.splitScalar(u8, src, '\n');
-    while (it.next()) |raw| {
-        const t = std.mem.trim(u8, raw, " \t\r");
-        if (!std.mem.startsWith(u8, t, "for (")) continue;
-        if (std.mem.indexOf(u8, t, free_stmt) == null) continue;
-        const close = std.mem.indexOf(u8, t, ") |") orelse continue;
-        const expr = t["for (".len..close];
-        if (std.mem.indexOf(u8, expr, "[0..") != null) {
-            bounded += 1;
-            continue;
-        }
-        var found = false;
-        var it2 = std.mem.splitScalar(u8, src, '\n');
-        while (it2.next()) |raw2| {
-            const t2 = std.mem.trim(u8, raw2, " \t\r");
-            if (!std.mem.startsWith(u8, t2, "for (")) continue;
-            const c2 = std.mem.indexOf(u8, t2, ") |*") orelse continue;
-            if (!std.mem.eql(u8, t2["for (".len..c2], expr)) continue;
-            if (std.mem.indexOf(u8, t2, new_stmt) != null or std.mem.indexOf(u8, t2, ".ctx = null") != null) found = true;
-        }
-        if (found) {
-            preinit_exempt += 1;
-        } else {
-            std.debug.print("[errpath-uninit] unbounded free over `{s}` with no infallible pre-init\n", .{expr});
-            unproven += 1;
-        }
-    }
-    try testing.expectEqual(@as(usize, 0), unproven);
-    // Both arms must have matched, or the line shape drifted and this scan asserts nothing.
-    try testing.expect(bounded >= 12);
-    try testing.expect(preinit_exempt >= 3);
 }

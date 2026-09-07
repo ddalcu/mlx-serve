@@ -458,6 +458,11 @@ struct ModelInfo {
     /// (the server badges remote entries with `lan_peer`; their ids are
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
+    /// Set when this entry is a configured upstream provider (`provider`
+    /// badge, `src/providers.zig`). Routing is identical to a LAN peer — the
+    /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
+    /// too; this field only decides the picker heading and the label.
+    var provider: String? = nil
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not

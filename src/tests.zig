@@ -85,5 +85,6 @@ test {
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");
+    _ = @import("providers.zig");
     _ = @import("mlx.zig");
 }

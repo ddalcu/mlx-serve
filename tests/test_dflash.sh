@@ -32,9 +32,9 @@ BASE="http://127.0.0.1:$PORT"
 BIN="$(dirname "$0")/../zig-out/bin/mlx-serve"
 LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 
-# --no-mtp: spec priority is MTP > dflash, and a trunk shipping an
-# in-checkpoint MTP head (Qwen3.8 packs) would silently win every round —
-# the whole script would then measure MTP with green dflash boot lines.
+# --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head
+# (Qwen3.8 packs) since 26.9.2, so this is belt and braces — it keeps the
+# MTP head out of the boot lines and pins the arm on older builds too.
 "$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }

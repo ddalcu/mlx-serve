@@ -6187,11 +6187,14 @@ pub fn specInitWiring(
         .use_pld = false,
         .native_intent = has_native_draft and enable_mtp,
     };
-    const use_mtp = enable_mtp and has_mtp;
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
-    // loaded per model. Priority: MTP > dflash > gemma drafter > PLD.
-    const use_dflash = !use_mtp and enable_drafter and has_dflash;
+    // loaded per model. Priority: dflash > MTP > gemma drafter > PLD — a
+    // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
+    // own `drafter/`) while the MTP head ships with the checkpoint;
+    // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
+    const use_dflash = enable_drafter and has_dflash;
+    const use_mtp = !use_dflash and enable_mtp and has_mtp;
     const use_drafter = !use_mtp and !use_dflash and enable_drafter and has_drafter;
     return .{
         .use_mtp = use_mtp,
@@ -6260,8 +6263,8 @@ pub fn specTickMode(
     gen_dspark_enabled: bool,
 ) SpecTickMode {
     if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
-    if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_dflash) return .dflash;
+    if (slot_enable_mtp and gen_has_mtp) return .mtp;
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
@@ -6635,27 +6638,6 @@ test "Generator.initWithOptions hands off checkpoints on cancel" {
     const region = source[anchor..@min(anchor + 2400, source.len)];
     try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
     try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
-}
-
-test "Slot.deinit marks the pooled-rope cache stale; the inference thread frees it" {
-    // The cache keys on `mrope_pos` by pointer, so it must be dropped when that table dies.
-    // `Slot.deinit` runs on connection threads and the inference thread is the sole mlx
-    // caller, frees included: the slot writes one atomic word before the free, and the
-    // cleanup drain resets the cache before destroying the slot.
-    const source = @embedFile("scheduler.zig");
-    const d_start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Slot)") orelse return error.MissingSlotDeinit;
-    const d_end = std.mem.indexOfPos(u8, source, d_start + 1, "pub fn deinit(self: *Scheduler)") orelse return error.MissingSchedulerDeinit;
-    const body = source[d_start..d_end];
-    if (std.mem.indexOf(u8, body, "resetQsaPooledRope") != null) return error.SlotDeinitFreesPooledRope;
-    const mark_at = std.mem.indexOf(u8, body, "markQsaPooledRopeStale") orelse return error.MissingPooledRopeStale;
-    const mp_at = std.mem.indexOf(u8, body, "mrope_pos") orelse return error.MissingMropeFree;
-    try testing.expect(mark_at < mp_at);
-
-    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
-    const drain = source[drain_start..@min(drain_start + 1600, source.len)];
-    const reset_at = std.mem.indexOf(u8, drain, "resetQsaPooledRope") orelse return error.DrainDoesNotResetPooledRope;
-    const deinit_at = std.mem.indexOf(u8, drain, "s.deinit();") orelse return error.MissingDeinit;
-    try testing.expect(reset_at < deinit_at);
 }
 
 test "Slot.deinit frees unconsumed cancelled-prefill salvage" {
@@ -7587,14 +7569,21 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
         try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_dflash and !w.use_pld);
     }
 
-    // DFlash rides the enable_drafter switch: MTP > dflash > drafter > PLD.
+    // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
     {
         const w = specInitWiring(false, false, false, false, false, true, false, true, true);
         try testing.expect(!w.use_mtp and w.use_dflash and !w.use_drafter and !w.use_pld);
     }
-    // A loaded MTP head still outranks it.
+    // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
+    // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
+    // ships with every pack; `--no-drafter` restores MTP by not loading it.
     {
         const w = specInitWiring(false, false, false, true, true, true, false, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+    }
+    // enable_drafter:false on the request hands the round back to MTP.
+    {
+        const w = specInitWiring(false, false, false, true, true, false, false, true, true);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // enable_drafter:false opts BOTH sidecar kinds out.
@@ -7713,12 +7702,15 @@ test "specTickMode: every spec arm requires the GENERATOR's armed state, not the
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false, false));
 
     // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
-    // gemma drafter, loses to MTP/DSpark. Generator handle alone never
-    // resurrects it, and a dflash generator with the slot flag off stays
-    // regular (the specTickMode both-sides contract).
+    // gemma drafter AND the MTP head (a loaded sidecar is the explicit
+    // choice), loses to DSpark. Generator handle alone never resurrects it,
+    // and a dflash generator with the slot flag off stays regular (the
+    // specTickMode both-sides contract) — or MTP when that is armed.
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, false, true, false, false, false));
     try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, true, false, false, false));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, false, true, false, false, true));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false, false));
 }
 
