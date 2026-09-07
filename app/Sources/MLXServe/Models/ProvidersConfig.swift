@@ -12,7 +12,8 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
     /// Env var read by the server; wins over `apiKey` when set and non-empty.
     var apiKeyEnv: String = ""
     var enabled: Bool = true
-    /// Declared model ids, used when the provider lists none of its own.
+    /// Model ids to expose. Filters the provider's own `/v1/models` list;
+    /// the whole list for a provider that has none. Empty = everything.
     var models: [String] = []
 
     enum CodingKeys: String, CodingKey {
@@ -74,6 +75,24 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
     static func isLoopback(url: String, port: UInt16) -> Bool {
         guard let parsed = URL(string: url), let host = parsed.host, parsed.port == Int(port) else { return false }
         return host == "localhost" || host == "::1" || host == "0.0.0.0" || host.hasPrefix("127.")
+    }
+
+    /// Ids out of an OpenAI `/v1/models` body, in listed order; nil when the
+    /// body is not that shape.
+    static func modelIds(fromModelsBody data: Data) -> [String]? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let list = obj["data"] as? [[String: Any]] else { return nil }
+        return list.compactMap { ($0["id"] as? String).flatMap { $0.isEmpty ? nil : $0 } }
+    }
+
+    /// `<url>/models` URLs to try, in order: the URL as written, then the
+    /// `/v1` sibling the server also probes for a bare `host:port`.
+    static func modelsURLs(for base: String) -> [URL] {
+        var b = base.trimmingCharacters(in: .whitespaces)
+        while b.hasSuffix("/") { b.removeLast() }
+        var candidates = [b + "/models"]
+        if !b.hasSuffix("/v1") { candidates.append(b + "/v1/models") }
+        return candidates.compactMap(URL.init(string:))
     }
 
     /// Model ids typed one per line or comma-separated.

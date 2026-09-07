@@ -1785,6 +1785,7 @@ struct ChatSidebar: View {
 struct ChatDetailView: View {
     let sessionId: UUID
     @EnvironmentObject var appState: AppState
+    @State private var modelSettings: ModelSettingsRequest?
     /// Observed directly (AppState does not forward download publishes) — the
     /// create banner's "not downloaded" pill and the held-prompt readiness
     /// checks must repaint when the bytes land.
@@ -2408,7 +2409,14 @@ struct ChatDetailView: View {
                                     message: m,
                                     sources: sourcesFor(m),
                                     onIncreaseContext: {
-                                        appState.showSettings()
+                                        let path = appState.selectedModelPath
+                                        let has = ModelSettingsFile.load().override(for: path)?.hasSettings ?? false
+                                        switch ContextIncreaseTarget.resolve(hasOverride: has) {
+                                        case .modelSettings:
+                                            modelSettings = ModelSettingsRequest(path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
+                                        case .appSettings:
+                                            appState.showSettings()
+                                        }
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
@@ -2489,6 +2497,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
                 }
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what

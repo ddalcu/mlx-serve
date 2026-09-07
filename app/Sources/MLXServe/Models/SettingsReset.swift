@@ -79,7 +79,7 @@ enum SettingsReset {
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
+                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 

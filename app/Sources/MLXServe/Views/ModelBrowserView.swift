@@ -1766,6 +1766,12 @@ private struct LocalModelRow: View {
     /// old dead badge was not worth anything.
     @State private var unlocked = false
     @State private var card: ModelCardRequest?
+    @State private var settings: ModelSettingsRequest?
+    @State private var hasOverrides = false
+
+    private var settingsRequest: ModelSettingsRequest {
+        ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
+    }
 
     /// nil for a bare folder that maps to no Hugging Face repo.
     private var cardRequest: ModelCardRequest? {
@@ -1785,6 +1791,10 @@ private struct LocalModelRow: View {
     /// safetensors checkpoint and the FILE for one GGUF quant, and
     /// `activateFileViewerSelecting` selects either — which is the behaviour
     /// you want: a quant row reveals its own file, not its repo folder.
+    private func refreshOverrides() {
+        hasOverrides = ModelSettingsFile.load().override(for: model.path)?.hasSettings ?? false
+    }
+
     private func revealInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
     }
@@ -1906,6 +1916,15 @@ private struct LocalModelRow: View {
                     // pane load it the way it always has.
                     UseMediaModelButton(modality: modality, name: model.name)
                 }
+                if model.isChatPickable {
+                    Button { settings = settingsRequest } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundStyle(hasOverrides ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
+                }
                 if ModelRowActions.showsLock(model, unlocked: unlocked) {
                     // Locked, not read-only. This slot used to hold an `Image`
                     // of an external-drive/cloud glyph nobody could read, which
@@ -1961,6 +1980,8 @@ private struct LocalModelRow: View {
             Text(ModelRowActions.deleteMessage(model))
         }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
+        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+        .onAppear(perform: refreshOverrides)
         .contextMenu {
             if model.isChatPickable, useState == .idle {
                 Button("Use This Model") {
@@ -1969,6 +1990,9 @@ private struct LocalModelRow: View {
             }
             if cardRequest != nil {
                 Button("Model Details\u{2026}") { card = cardRequest }
+            }
+            if model.isChatPickable {
+                Button("Model Settings\u{2026}") { settings = settingsRequest }
             }
             Button("Show in Finder", action: revealInFinder)
             Button("Copy Path") {

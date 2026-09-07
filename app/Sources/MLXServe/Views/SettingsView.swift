@@ -978,6 +978,7 @@ private struct ProviderRow: View {
     let onDelete: () -> Void
     let onCommit: () -> Void
     @State private var modelsText: String = ""
+    @State private var picking = false
 
     private var problem: String? {
         if duplicate { return "Another provider already uses this name" }
@@ -1011,12 +1012,24 @@ private struct ProviderRow: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(onCommit)
             }
-            TextField("models", text: $modelsText, prompt: Text("Models, comma-separated — only needed if the provider has no /v1/models (a bare host:port URL is probed at /v1 too)"))
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .onAppear { modelsText = entry.models.joined(separator: ", ") }
-                .onChange(of: modelsText) { _, t in entry.models = ProviderEntry.parseModelList(t) }
-                .onSubmit(onCommit)
+            HStack(spacing: 8) {
+                TextField("models", text: $modelsText, prompt: Text("Models, comma-separated — only these are exposed; empty = all the provider lists"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onAppear { modelsText = entry.models.joined(separator: ", ") }
+                    .onChange(of: modelsText) { _, t in entry.models = ProviderEntry.parseModelList(t) }
+                    .onSubmit(onCommit)
+                Button("Pick…") { picking = true }
+                    .disabled(entry.problem() != nil)
+                    .help("Fetch the provider's model list and tick the ones to expose")
+            }
+            .sheet(isPresented: $picking) {
+                ProviderModelPickerSheet(entry: entry) { chosen in
+                    modelsText = chosen.joined(separator: ", ")
+                    entry.models = chosen
+                    onCommit()
+                }
+            }
             if let problem {
                 Text(problem).font(.caption2).foregroundStyle(.orange)
             } else if let status {
@@ -1037,6 +1050,83 @@ private struct ProviderRow: View {
     private func statusLine(_ s: ProviderStatus) -> String {
         if !s.probed { return "Checking…" }
         return s.up ? "Up — \(s.models) model\(s.models == 1 ? "" : "s")" : "Unreachable"
+    }
+}
+
+/// Fetches `<url>/models` with the row's key and lets the user tick the ids
+/// to expose. Done writes the list back as the comma-separated field.
+private struct ProviderModelPickerSheet: View {
+    let entry: ProviderEntry
+    let onDone: ([String]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var ids: [String] = []
+    @State private var chosen: Set<String> = []
+    @State private var filter = ""
+    @State private var error: String?
+    @State private var loading = true
+
+    private var shown: [String] {
+        filter.isEmpty ? ids : ids.filter { $0.localizedCaseInsensitiveContains(filter) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Models at \(entry.name)").font(.headline)
+            TextField("Filter", text: $filter).textFieldStyle(.roundedBorder)
+            if loading {
+                ProgressView().frame(maxWidth: .infinity)
+            } else if let error {
+                Text(error).foregroundStyle(.red).font(.caption)
+            } else {
+                List(shown, id: \.self) { id in
+                    Toggle(id, isOn: Binding(
+                        get: { chosen.contains(id) },
+                        set: { on in if on { chosen.insert(id) } else { chosen.remove(id) } }
+                    ))
+                }
+                .listStyle(.plain)
+            }
+            HStack {
+                Text("\(chosen.count) of \(ids.count) selected").font(.caption).foregroundStyle(.secondary)
+                Button("Clear") { chosen = [] }.disabled(chosen.isEmpty)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Done") {
+                    onDone(ids.filter { chosen.contains($0) })
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(loading)
+            }
+        }
+        .padding()
+        .frame(width: 460, height: 520)
+        .task { await load() }
+    }
+
+    private func load() async {
+        chosen = Set(entry.models)
+        var key = entry.apiKey
+        if !entry.apiKeyEnv.isEmpty, let v = LoginShellEnv.values(of: [entry.apiKeyEnv])[entry.apiKeyEnv], !v.isEmpty { key = v }
+        var lastError = "No model list at \(entry.url)"
+        for url in ProviderEntry.modelsURLs(for: entry.url) {
+            var req = URLRequest(url: url, timeoutInterval: 15)
+            if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200, let list = ProviderEntry.modelIds(fromModelsBody: data) {
+                    ids = list.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+                    loading = false
+                    return
+                }
+                lastError = "HTTP \(code) from \(url.absoluteString)"
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        self.error = lastError
+        loading = false
     }
 }
 
@@ -1247,11 +1337,7 @@ private struct ContextSizeRow: View {
     // Powers of two plus 1.5× midpoints (issue #188: 32K→64K→128K jumps are
     // too coarse on a memory-limited Mac). Every value is a multiple of 1024
     // so formatTokens renders it exactly.
-    private static let allPresets: [Int] = [
-        0, 4_096, 6_144, 8_192, 12_288, 16_384, 24_576, 32_768,
-        49_152, 65_536, 98_304, 131_072, 196_608, 262_144,
-        393_216, 524_288, 786_432, 1_048_576,
-    ]
+    private static let allPresets = ContextSizeDisplay.presets
 
     /// Drop any preset larger than the model's `max_position_embeddings` so
     /// the slider can't pick a value the model would refuse. Auto (0) always
@@ -1493,13 +1579,13 @@ private struct SpecDecodeSectionContent: View {
                 .disabled(!appState.serverOptions.enableMTP)
             }
         }
-        if let m = meta["forceMTPOnMoE"] {
+        if let m = meta["mtpOnMoE"] {
             SettingsRow(
                 title: m.title,
                 explainer: m.explainer,
-                isDirty: dirty.dirty(\.forceMTPOnMoE)
+                isDirty: dirty.dirty(\.mtpOnMoE)
             ) {
-                Toggle("", isOn: opts.forceMTPOnMoE)
+                Toggle("", isOn: opts.mtpOnMoE)
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .disabled(!appState.serverOptions.enableMTP)

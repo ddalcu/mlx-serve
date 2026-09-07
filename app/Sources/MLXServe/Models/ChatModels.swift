@@ -430,6 +430,8 @@ struct ModelInfo {
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
     var mtpLoaded: Bool = false
+    /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
+    var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
     /// servers (single-model) still decode without these.
     /// Whether this entry currently holds resident weights.

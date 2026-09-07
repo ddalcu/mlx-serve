@@ -79,4 +79,14 @@ final class ProvidersConfigTests: XCTestCase {
         XCTAssertEqual(rows.first { $0.tag.hasSuffix("gpt-5@openai") }?.section, ModelPalette.providersSection)
         XCTAssertEqual(rows.first { $0.tag.hasSuffix("gemma@Studio") }?.section, ModelPalette.networkSection)
     }
+
+    func testModelPickerReadsTheProvidersOwnList() {
+        let body = Data(#"{"data":[{"id":"gpt-5"},{"id":""},{"object":"model"},{"id":"o3"}]}"#.utf8)
+        XCTAssertEqual(ProviderEntry.modelIds(fromModelsBody: body), ["gpt-5", "o3"])
+        XCTAssertNil(ProviderEntry.modelIds(fromModelsBody: Data("<html>".utf8)))
+        XCTAssertEqual(ProviderEntry.modelsURLs(for: "https://openrouter.ai/api/v1/").map(\.absoluteString),
+                       ["https://openrouter.ai/api/v1/models"])
+        XCTAssertEqual(ProviderEntry.modelsURLs(for: "http://box:1234").map(\.absoluteString),
+                       ["http://box:1234/models", "http://box:1234/v1/models"])
+    }
 }

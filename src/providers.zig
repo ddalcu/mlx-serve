@@ -3,8 +3,9 @@
 //! A provider is any server speaking `POST /v1/chat/completions` — a cloud
 //! API, another box on the LAN, a local runtime — named by a `@<name>` suffix
 //! exactly like a LAN peer. Its `/v1/models` is probed in the background and
-//! the rows ride our own `/v1/models` while the provider answers; a provider
-//! that exposes no model list declares one in the config (`models`).
+//! the rows ride our own `/v1/models` while the provider answers. A config
+//! `models` list filters that list to the ids named (and is the whole list
+//! for a provider that exposes none).
 //! Transport is the system `curl` (TLS, HTTP/2, proxies for free — the same
 //! choice `cli.zig` made for Hugging Face).
 const std = @import("std");
@@ -246,15 +247,35 @@ pub const ProbeAnswer = ?struct { status: u16, body: []const u8 };
 /// Rows a probe outcome earns. Reachable + a usable list wins; reachable
 /// with anything else (404, empty list, non-JSON) falls back to the declared
 /// models — a server with no `/v1/models` is still up; unreachable = no rows.
+/// A declared list FILTERS a listed provider: only those ids ride, with the
+/// listed row's metadata where the provider knows the id.
 pub fn rowsFor(alloc: std.mem.Allocator, answer: ProbeAnswer, cfg: Config) ![]Model {
     const a = answer orelse return alloc.alloc(Model, 0);
     if (a.status == 200) {
         if (parseModels(alloc, a.body, cfg.name)) |rows| {
-            if (rows.len > 0) return rows;
-            freeModels(alloc, rows);
+            if (rows.len > 0 and cfg.models.len == 0) return rows;
+            defer freeModels(alloc, rows);
+            if (rows.len > 0) return filterDeclared(alloc, rows, cfg);
         } else |_| {}
     }
     return declaredModels(alloc, cfg.models, cfg.name);
+}
+
+fn filterDeclared(alloc: std.mem.Allocator, listed: []Model, cfg: Config) ![]Model {
+    var out: std.ArrayList(Model) = .empty;
+    errdefer freeModels(alloc, out.items);
+    for (cfg.models) |id| {
+        const hit = for (listed) |m| {
+            if (std.mem.eql(u8, m.id, id)) break m;
+        } else null;
+        if (hit) |m| {
+            const bare = try alloc.dupe(u8, m.id);
+            errdefer alloc.free(bare);
+            const entry = try alloc.dupe(u8, m.entry_json);
+            try out.append(alloc, .{ .id = bare, .entry_json = entry });
+        } else try appendEntry(alloc, &out, id, cfg.name, null);
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 pub const UpstreamHead = struct { status: u16, reason: []const u8, content_type: []const u8 };
@@ -791,7 +812,7 @@ test "providers: parseModels suffixes ids, badges the provider, twins context_le
     try t.expectError(error.BadModelsJson, parseModels(a, "<html>", "x"));
 }
 
-test "providers: rowsFor — listed wins, reachable-but-listless falls back, unreachable is empty" {
+test "providers: rowsFor — listed rides undeclared, reachable-but-listless falls back, unreachable is empty" {
     const a = t.allocator;
     var declared = [_][]u8{ try a.dupe(u8, "llama"), try a.dupe(u8, "phi") };
     var cfg = Config{ .name = try a.dupe(u8, "local"), .url = try a.dupe(u8, "http://l/v1"), .api_key = null, .models = &declared };
@@ -800,10 +821,13 @@ test "providers: rowsFor — listed wins, reachable-but-listless falls back, unr
         a.free(cfg.url);
         for (declared) |m| a.free(m);
     }
+    // Nothing declared: the provider's own list rides as-is.
+    cfg.models = &.{};
     const listed = try rowsFor(a, .{ .status = 200, .body = "{\"data\":[{\"id\":\"real\"}]}" }, cfg);
     defer freeModels(a, listed);
     try t.expectEqual(@as(usize, 1), listed.len);
     try t.expectEqualStrings("real", listed[0].id);
+    cfg.models = &declared;
 
     // 404 (no /v1/models), an empty list, and non-JSON at 200 all mean "up": declared rows.
     for ([_]struct { s: u16, b: []const u8 }{
@@ -827,6 +851,26 @@ test "providers: rowsFor — listed wins, reachable-but-listless falls back, unr
     const bare = try rowsFor(a, .{ .status = 404, .body = "" }, cfg);
     defer freeModels(a, bare);
     try t.expectEqual(@as(usize, 0), bare.len);
+}
+
+test "providers: rowsFor — a declared list FILTERS a listed provider, keeping listed metadata" {
+    const a = t.allocator;
+    var declared = [_][]u8{ try a.dupe(u8, "gpt-5"), try a.dupe(u8, "phi") };
+    const cfg = Config{ .name = try a.dupe(u8, "or"), .url = try a.dupe(u8, "http://o/v1"), .api_key = null, .models = &declared };
+    defer {
+        a.free(cfg.name);
+        a.free(cfg.url);
+        for (declared) |m| a.free(m);
+    }
+    const body = "{\"data\":[{\"id\":\"junk\"},{\"id\":\"gpt-5\",\"context_length\":200000},{\"id\":\"other\"}]}";
+    const rows = try rowsFor(a, .{ .status = 200, .body = body }, cfg);
+    defer freeModels(a, rows);
+    try t.expectEqual(@as(usize, 2), rows.len);
+    try t.expectEqualStrings("gpt-5", rows[0].id);
+    try t.expect(std.mem.indexOf(u8, rows[0].entry_json, "\"context_length\":200000") != null);
+    // Declared but not listed still rides, bare.
+    try t.expectEqualStrings("phi", rows[1].id);
+    try t.expect(std.mem.indexOf(u8, rows[1].entry_json, "context_length") == null);
 }
 
 test "providers: isSelfUrl names only loopback + our own port; v1Candidate appends once" {

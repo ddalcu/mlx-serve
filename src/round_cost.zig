@@ -118,7 +118,15 @@ pub const Cell = struct {
     }
 };
 
-pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, out_of_range };
+pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, out_of_range, implausible };
+
+/// A width-w round is one forward of w+1 rows; it cannot cost more than this
+/// times the width-(w-1) round (measured steps run under 1.25x). Anything past
+/// it carried foreign work between round ends and would poison the planner.
+pub const IMPLAUSIBLE_STEP: f32 = 1.5;
+/// A sample past this multiple of a mature cell's own value is the machine, not the round
+/// (another process on the GPU, #369). A stale cell is a regime change and reseeds instead.
+pub const SELF_SPIKE: f32 = 3.0;
 
 pub const Table = struct {
     /// Set once at load from the arch, never from a request.
@@ -137,6 +145,7 @@ pub const Table = struct {
     dropped_transition: u32 = 0,
     dropped_contended: u32 = 0,
     dropped_bad: u32 = 0,
+    dropped_implausible: u32 = 0,
     /// The serial row's own fold/drop counters, for the same reason.
     serial_folded: u32 = 0,
     serial_dropped_transition: u32 = 0,
@@ -150,6 +159,8 @@ pub const Table = struct {
     restored: u32 = 0,
     /// Serial cells restored from disk at load (diagnostics).
     restored_serial: u32 = 0,
+    /// Persisted width cells dropped at load for failing the step bound.
+    restored_dropped: u32 = 0,
 
     /// Folded width cells; never counts the serial row.
     pub fn foldedCells(self: *const Table) u32 {
@@ -191,8 +202,41 @@ pub const Table = struct {
             self.dropped_transition += 1;
             return .transition;
         }
+        const bucket = self.bucketOf(kv_len);
+        if (self.stepImplausible(width, bucket, ms) or selfSpike(self.cells[width][bucket], ms, self.seq)) {
+            self.dropped_implausible += 1;
+            return .implausible;
+        }
         self.folded += 1;
-        return foldInto(&self.cells[width][self.bucketOf(kv_len)], ms, tokens, self.seq);
+        return foldInto(&self.cells[width][bucket], ms, tokens, self.seq);
+    }
+
+    /// `ms` at `width` exceeds IMPLAUSIBLE_STEP per step over the nearest trusted narrower cell.
+    fn stepImplausible(self: *const Table, width: u32, bucket: usize, ms: f32) bool {
+        var w = width;
+        while (w > 1) {
+            w -= 1;
+            const below = self.cells[w][bucket];
+            if (below.n < MIN_SAMPLES) continue;
+            return ms > below.ms * std.math.pow(f32, IMPLAUSIBLE_STEP, @floatFromInt(width - w));
+        }
+        return false;
+    }
+
+    /// Clear every width cell that fails the step bound against its narrower neighbour
+    /// (the persisted-table sweep); returns the count cleared.
+    fn dropImplausibleCells(self: *Table) u32 {
+        var dropped: u32 = 0;
+        for (0..N_BUCKETS) |b| {
+            var w: u32 = 2;
+            while (w <= MAX_WIDTH) : (w += 1) {
+                const c = self.cells[w][b];
+                if (c.n == 0 or !self.stepImplausible(w, b, c.ms)) continue;
+                self.cells[w][b] = .{};
+                dropped += 1;
+            }
+        }
+        return dropped;
     }
 
     /// Feed one realized plain serial decode token into `serial[bucket]`. Same drop rules as
@@ -211,8 +255,18 @@ pub const Table = struct {
             self.serial_dropped_transition += 1;
             return .transition;
         }
+        const bucket = self.bucketOf(kv_len);
+        if (selfSpike(self.serial[bucket], ms, self.serial_seq)) {
+            self.dropped_implausible += 1;
+            return .implausible;
+        }
         self.serial_folded += 1;
-        return foldInto(&self.serial[self.bucketOf(kv_len)], ms, 1.0, self.serial_seq);
+        return foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
+    }
+
+    fn selfSpike(cell: Cell, ms: f32, clock: u32) bool {
+        if (cell.n < MIN_SAMPLES or clock -% cell.last_seen > RESEED_GAP) return false;
+        return ms > cell.ms * SELF_SPIKE;
     }
 
     fn foldInto(cell: *Cell, ms: f32, tokens: f32, clock: u32) Verdict {
@@ -258,8 +312,27 @@ pub const Table = struct {
         return if (self.trusted(width, bucket)) self.cells[width][bucket].tok else null;
     }
 
+    /// Tokens per round for PLANNING: the cell's own `tok` or any trusted narrower cell's,
+    /// whichever is larger. `tok` is a workload mixture (w2 learned on echo, w3 on prose read
+    /// w3 at 2x per token and the plan never widened), and a wider draft never accepts fewer.
+    fn planTok(self: *const Table, width: u32, bucket: usize) f32 {
+        var best: f32 = self.cells[width][bucket].tok;
+        var w: u32 = 1;
+        while (w < width) : (w += 1) {
+            if (self.trusted(w, bucket)) best = @max(best, self.cells[w][bucket].tok);
+        }
+        return best;
+    }
+
+    fn planMsPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
+        const c = self.cells[width][bucket];
+        const tok = self.planTok(width, bucket);
+        if (c.n == 0 or tok <= 0) return null;
+        return c.ms / tok;
+    }
+
     pub fn msPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
-        return if (self.trusted(width, bucket)) self.cells[width][bucket].msPerTok() else null;
+        return if (self.trusted(width, bucket)) self.planMsPerTok(width, bucket) else null;
     }
 
     /// Round ms / ms per token from ANY folded cell (n >= 1): evidence for
@@ -271,7 +344,7 @@ pub const Table = struct {
 
     pub fn rawMsPerTok(self: *const Table, width: u32, bucket: usize) ?f32 {
         if (width > MAX_WIDTH) return null;
-        return self.cells[width][bucket].msPerTok();
+        return self.planMsPerTok(width, bucket);
     }
 
     /// `width` has at least one sample and reads CLEARLY_WORSE per token
@@ -733,6 +806,7 @@ pub fn parse(text: []const u8, layout: Layout) ?Table {
         const cell = Cell{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
         if (is_serial) t.serial[b] = cell else t.cells[wi][b] = cell;
     }
+    t.restored_dropped = t.dropImplausibleCells();
     t.seq = RESEED_GAP + 1;
     t.serial_seq = RESEED_GAP + 1;
     t.restored = t.foldedCells();
@@ -853,8 +927,8 @@ test "round_cost: EMA folds, first sample seeds, a cell counts at MIN_SAMPLES, a
     const before = t.cells[4][0].ms;
     var i: u32 = 0;
     while (i <= RESEED_GAP) : (i += 1) _ = t.observe(3, 1000, 40.0, 3.0, true, false);
-    try testing.expectEqual(Verdict.reseeded, t.observe(4, 1000, 90.0, 4.0, true, false));
-    try testing.expectApproxEqAbs(before + RESEED_WEIGHT * (90.0 - before), t.cells[4][0].ms, 1e-3);
+    try testing.expectEqual(Verdict.reseeded, t.observe(4, 1000, 58.0, 4.0, true, false));
+    try testing.expectApproxEqAbs(before + RESEED_WEIGHT * (58.0 - before), t.cells[4][0].ms, 1e-3);
     try testing.expect(t.measuredMs(4, 0) != null);
 }
 
@@ -891,9 +965,9 @@ test "round_cost: one width anchors, two interpolate, nothing extrapolates" {
     try testing.expectEqual(@as(u32, 5), t.widestMeasured(0).?);
     try testing.expectApproxEqAbs(10.0, t.lastSlope(0).?, 1e-4);
     // A measured cliff is read as measured, and the slope past it is the cliff's.
-    feed(&t, 6, 1000, 200.0, 6.0);
-    try testing.expectApproxEqAbs(200.0, t.roundMs(6, 0).?, 1e-4);
-    try testing.expectApproxEqAbs(150.0, t.lastSlope(0).?, 1e-4);
+    feed(&t, 6, 1000, 70.0, 6.0);
+    try testing.expectApproxEqAbs(70.0, t.roundMs(6, 0).?, 1e-4);
+    try testing.expectApproxEqAbs(20.0, t.lastSlope(0).?, 1e-4);
 }
 
 test "round_cost: an unmeasured bucket reads the nearest active one, lower side first" {
@@ -1022,13 +1096,13 @@ fn simChooser(p: f32, serial_ms: f32, per_pos_ms: f32, cliff: u32, cliff_ms: f32
 
 test "round_cost: WidthChooser settles at the best block and re-tries its neighbours" {
     // 2.6B-like: high acceptance, cost flat-ish to 6 then a cliff.
-    const c = simChooser(0.9, 20.0, 1.0, 6, 30.0, 4, 8, 400, true);
+    const c = simChooser(0.9, 20.0, 1.0, 6, 8.0, 4, 8, 400, true);
     try testing.expectEqual(@as(u32, 6), c.current);
     try testing.expect(c.hist[6] > 200);
     try testing.expect(c.hist[7] + c.hist[8] <= 2 * EXPLORE_BLOCK); // widest+1 found the cliff, re-tried rarely
     try testing.expectEqual(@as(u32, 0), c.hist[0]); // serial is never trialled
     // Without a serial measurement the same loop settles the same.
-    const d = simChooser(0.9, 20.0, 1.0, 6, 30.0, 4, 8, 400, false);
+    const d = simChooser(0.9, 20.0, 1.0, 6, 8.0, 4, 8, 400, false);
     try testing.expectEqual(@as(u32, 6), d.current);
 }
 
@@ -1164,10 +1238,10 @@ test "round_cost: a clearly worse first sample settles a width" {
     var t = Table{};
     feed(&t, 4, 1000, 70.0, 5.0);
     try testing.expect(!t.clearlyWorse(5, 4, 0)); // unsampled: unknown
-    _ = t.observe(5, 1000, 110.0, 6.0, true, false); // 18.3 vs 14.0 ms/tok = +31%
+    _ = t.observe(5, 1000, 102.0, 6.0, true, false); // 17.0 vs 14.0 ms/tok = +21%
     try testing.expect(t.clearlyWorse(5, 4, 0));
     try testing.expect(t.measuredMs(5, 0) == null); // still not trusted for the plan's cost
-    try testing.expectApproxEqAbs(110.0, t.rawMs(5, 0).?, 1e-4);
+    try testing.expectApproxEqAbs(102.0, t.rawMs(5, 0).?, 1e-4);
     var u = Table{};
     feed(&u, 4, 1000, 70.0, 5.0);
     _ = u.observe(5, 1000, 86.0, 6.0, true, false); // 14.3 vs 14.0: noise, keep trialling
@@ -1199,14 +1273,14 @@ test "round_cost: the legacy layout is the six-bucket grid, writes rc1 and reads
     try testing.expectEqual(@as(usize, 8), bucketFor(400_000));
 
     // The file 26.9.1 wrote loads with its cells intact.
-    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 88.0000 3.0500 3\n4 3 140.0000 3.2000 3\n";
+    const rc1_body = "rc1\n2 3 44.0000 2.7000 3\n3 3 60.0000 3.0500 3\n4 3 80.0000 3.2000 3\n";
     const back = parse(rc1_body, .legacy) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(Layout.legacy, back.layout);
     try testing.expectEqual(@as(u32, 3), back.restored);
     try testing.expectEqual(@as(u32, 0), back.restored_serial);
     try testing.expectApproxEqAbs(44.0, back.measuredMs(2, 3).?, 1e-3);
     try testing.expectApproxEqAbs(3.05, back.measuredTok(3, 3).?, 1e-3);
-    try testing.expectApproxEqAbs(140.0, back.measuredMs(4, 3).?, 1e-3);
+    try testing.expectApproxEqAbs(80.0, back.measuredMs(4, 3).?, 1e-3);
     try testing.expect(back.active(3));
     try testing.expect(parse(rc1_body, .long) == null);
 
@@ -1285,4 +1359,61 @@ test "bucketName: the legacy grid's top bucket is 32k+, not 32-64k" {
 
     try t.expectEqual(@as(usize, 5), bucketForLayout(374_000, .legacy));
     try t.expectEqualStrings("32k+", bucketName(.legacy, bucketForLayout(374_000, .legacy)));
+}
+
+test "round_cost: a width sample beyond IMPLAUSIBLE_STEP of its trusted narrower neighbour is rejected" {
+    var t = Table{};
+    feed(&t, 1, 1000, 41.0, 1.8);
+    try testing.expectEqual(Verdict.implausible, t.observe(2, 1000, 120.0, 2.0, true, false));
+    try testing.expectEqual(@as(u32, 1), t.dropped_implausible);
+    try testing.expectEqual(@as(u32, 0), t.cells[2][0].n);
+    try testing.expectEqual(Verdict.reseeded, t.observe(2, 1000, 60.0, 2.0, true, false));
+    // Width 1 has no narrower cell; an untrusted neighbour bounds nothing.
+    try testing.expectEqual(Verdict.reseeded, t.observe(1, 20000, 500.0, 1.8, true, false));
+    try testing.expectEqual(Verdict.reseeded, t.observe(2, 20000, 5000.0, 2.0, true, false));
+}
+
+test "round_cost: parse drops a persisted cell that fails the step bound" {
+    const bad = parse("rc1\n1 0 41 1.8 3444\n2 0 119.7 2.0 2466\n", .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), bad.cells[2][0].n);
+    try testing.expect(bad.measuredMs(1, 0) != null);
+    try testing.expectEqual(@as(u32, 1), bad.restored_dropped);
+    try testing.expectEqual(@as(u32, 1), bad.restored);
+    const ok = parse("rc1\n1 0 41 1.8 3444\n2 0 46 2.0 100\n", .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 2), ok.restored);
+    try testing.expectEqual(@as(u32, 0), ok.restored_dropped);
+}
+
+test "round_cost: a sample past SELF_SPIKE of the cell's own mature value is rejected, serial row included" {
+    var t = Table{};
+    feed(&t, 1, 1000, 41.0, 1.8);
+    try testing.expectEqual(Verdict.implausible, t.observe(1, 1000, 150.0, 1.8, true, false));
+    try testing.expectApproxEqAbs(41.0, t.measuredMs(1, 0).?, 1e-3);
+    try testing.expectEqual(Verdict.folded, t.observe(1, 1000, 55.0, 1.8, true, false));
+    for (0..MIN_SAMPLES) |_| _ = t.observeSerial(1000, 16.0, true, false);
+    try testing.expectEqual(Verdict.implausible, t.observeSerial(1000, 60.0, true, false));
+    try testing.expectApproxEqAbs(16.0, t.serialMsPerTok(0).?, 1e-3);
+    // An immature cell has nothing to compare against.
+    var u = Table{};
+    _ = u.observe(1, 1000, 41.0, 1.8, true, false);
+    try testing.expectEqual(Verdict.folded, u.observe(1, 1000, 150.0, 1.8, true, false));
+}
+
+test "round_cost: the load sweep bounds against the nearest TRUSTED narrower cell, so a chain of bad cells all drop" {
+    const t = parse("rc1\n1 0 30 1.5 100\n2 0 134 2.0 100\n3 0 290 2.5 100\n4 0 44 3.0 100\n", .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), t.cells[2][0].n);
+    try testing.expectEqual(@as(u32, 0), t.cells[3][0].n);
+    try testing.expectApproxEqAbs(44.0, t.measuredMs(4, 0).?, 1e-3);
+    try testing.expectEqual(@as(u32, 2), t.restored_dropped);
+}
+
+test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft never accepts fewer)" {
+    var t = Table{};
+    feed(&t, 2, 1000, 41.0, 3.0);
+    feed(&t, 3, 1000, 49.0, 1.66); // prose-era samples: fewer tokens than w2's echo-era ones
+    try testing.expectApproxEqAbs(49.0 / 3.0, t.msPerTok(3, 0).?, 1e-3);
+    try testing.expectApproxEqAbs(1.66, t.measuredTok(3, 0).?, 1e-3); // the raw cell is untouched
+    try testing.expect(!t.clearlyWorse(3, 2, 0));
+    _ = t.observe(4, 1000, 56.0, 1.6, true, false);
+    try testing.expectApproxEqAbs(56.0 / 3.0, t.rawMsPerTok(4, 0).?, 1e-3);
 }

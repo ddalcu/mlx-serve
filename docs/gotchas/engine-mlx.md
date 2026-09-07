@@ -1398,7 +1398,6 @@ theoretical 16.2) puts the 8K roofline at ~30.9s and both engines within 3-6% of
 Nobody beats anybody by 5% on a dense-27B prefill on this hardware; the winnable margins
 live at short contexts (fixed overheads) and on MoE/small models.
 
-<<<<<<< HEAD
 ### A changed image invalidates state from its media row, not token zero (2026-08-30)
 
 A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
@@ -1420,7 +1419,7 @@ The hermetic regression includes a tempting later checkpoint and requires restor
 boundary. `tests/test_vision_prefix_cache.sh` changes images after a >2K shared text prefix;
 the real Uncensored Qwen3.8 run restored exactly 2,048 tokens after the swap while the short
 foreign-image arm remained cold, 10/10 checks green.
-=======
+
 ### Hybrid cache lookup must rank the checkpoint it can restore, not the raw token match (2026-08-30)
 
 A 135K-token Qwen3.8 vision-agent session alternated healthy ~2K-token tail prefills with
@@ -1436,7 +1435,6 @@ longest raw prefix. A real Qwen3.8 four-turn reproduction changed cached-token c
 `0, 2048, 0, 2048` to `0, 2048, 2048, 2048`; turn three fell from 4.79 s to 2.17 s. The
 hermetic regression uses the same shape: a 7-token raw match with its first checkpoint at 8
 must lose to a 5-token raw match that can restore at 4.
->>>>>>> main
 
 ### A synthetic-dtype reference probe nearly shipped a 2x-bandwidth Inkling forward (2026-07-30)
 Porting Inkling Small, the dtype question was "does the residual stream run bf16 or f32?" — the reference multiplies every dense-MLP output by a `[1]` `global_scale` tensor, and an early python probe (reference modules, MY casts: global_scale → f32 like the "keep_hi" converter comment implied) showed bf16 × f32-array promoting the whole stream to f32 from layer 0. Plan accordingly: f32 KV, f32 experts, 2x bandwidth. WRONG: the REAP25 checkpoint STORES the dense `mlp.global_scale` tensors as BF16 (the base model's were bf16, so the converter's f32-keep condition never fired); only the ROUTER's `gate.bias`/`gate.global_scale` are f32. The real stream is bf16 end-to-end. The probe proved the reference's promotion SEMANTICS while saying nothing about the checkpoint — same family as "read the CHECKPOINT, not the reference source" (Kokoro AdaIN, laguna YaRN), one level up: read the checkpoint's DTYPES, not the converter's intent.
@@ -4761,3 +4759,43 @@ mapping (31% of the prefill slowdown); on a resident table the pool LOSES
 2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
 of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
 and both arms announce which one ran.
+
+## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
+
+The 27B MTP pack benched 51 tok/s twice on a day it did 66-67 on the same
+binary. Its persisted table held `w2 <2k = 119.7 ms` beside `w1 = 41.2 ms`
+(60 vs 21 ms/tok), so the EV plan priced width 2 at 3x width 1 and never
+left width 1; the request decoded at 0.94 accepted/round, serial minus the
+head's overhead, and every `[spec-stats]` line read `trials=0` because a
+MEASURED cell is never a trial target. Cause: `spec_cost_solo` counts
+DECODING slots, and in a 4-stream scenario the MTP slot decodes alone while
+the others prefill; `interleaveDecodeTick` runs its rounds between their
+prefill chunks, and `mtpRegimeWallMs` is the interval between round ENDS,
+so every interleaved round carried a ~100 ms chunk. The interleaver already
+dropped the serial clock for this reason, not the round clock. Fix, three
+parts, no lever: `Generator.invalidateRoundClock` beside
+`invalidateSerialClock` (the next round times itself and is dropped as a
+transition); `Table.observe` rejects a width-w sample past
+`IMPLAUSIBLE_STEP` (1.5x, measured steps on the 27B run under 1.25x and the
+M1 Pro w4->w5 cliff is 1.33x) of a trusted width-(w-1) cell as
+`.implausible`, counted as the `i` letter of `table_drops`; `parse` sweeps
+the same bound and clears the cell (`restored_dropped`, one `[spec-cost]
+dropped N implausible persisted cell(s)` line), so it is unmeasured and the
+cold-period trial re-learns it. Booted against the poisoned file: the cell
+dropped, w2 re-measured at 47 ms (19 ms/tok), 65 / 64 tok/s on two
+back-to-back runs. Guards: `round_cost.zig` fold and parse tests.
+Follow-up, same day: the fix above compares round MS, and the next table
+was poisoned in TOK. The ddalcu 27B pack's `<2k` row read w2 at 41 ms /
+3.0 tok (echo-era samples) and w3 at 49 ms / 1.66 tok (prose-era), so per
+token w3 was 2x w2, `clearlyWorse` floored the horizon and every echo round
+ran width 2 (63.5 vs 71.5 tok/s on a fresh table). A wider draft never
+accepts fewer tokens than a narrower one on the same workload, so
+`msPerTok`/`rawMsPerTok` divide by the monotone envelope `planTok` (the
+raw cell keeps its own number). Two holes from #369 closed at the same
+time: the step bound walks down to the nearest TRUSTED narrower cell
+(clearing w2 must not exempt w3), and a sample past `SELF_SPIKE` (3x) of
+a mature, non-stale cell's own value is rejected, serial row included, so
+width 1 and the serial cell are covered too. The "predictable" collapse
+that started this was NOT the engine: the 27B refuses llmprobe's "repeat
+this passage" prompt on about half of its random cache-bust tags, and a
+refusal is novel text.

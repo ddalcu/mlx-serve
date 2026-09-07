@@ -49,6 +49,7 @@ const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
+const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
@@ -155,7 +156,7 @@ pub const LoadParams = struct {
     /// Clamp the hot-cache byte budget against live post-load headroom
     /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
     /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
@@ -274,6 +275,8 @@ pub const SubmitParams = struct {
     vision_embeddings: ?mlx.mlx_array = null,
     /// Prefix-cache key for the media under the placeholder tokens (0 = none).
     vision_key: u64 = 0,
+    /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
+    cache_key: u64 = 0,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -421,6 +424,7 @@ pub const Slot = struct {
     cancelled_prefill: Generator.CancelledCheckpointSink = .{},
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64 = 0,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
     media_start: ?usize,
@@ -635,6 +639,7 @@ pub const Slot = struct {
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
+            .cache_key = params.cache_key,
             .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
@@ -744,6 +749,7 @@ pub const Slot = struct {
             self.allocator.destroy(runner);
             self.diffusion = null;
         }
+        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -1113,7 +1119,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64 = null,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1237,7 +1243,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_mem_bytes: u64,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, *u64) u64,
+    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
@@ -1295,6 +1301,9 @@ pub const Scheduler = struct {
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats
+    /// before each prefill batch while this is armed and settles as the ceiling recovers.
+    budget_revise_sw: ?io_util.Stopwatch = null,
 
     /// Per-entry digest snapshot the connection-thread guard reads instead of the cache.
     /// Replaced under `digest_mu` by the inference thread; readers copy under the lock.
@@ -1633,7 +1642,6 @@ pub const Scheduler = struct {
         // Construct the slot up front so we don't hold the queue mutex
         // through any allocation. Per-request `kv_quant_config` override (Wave
         // 1.A) wins over the process-level default carried on the scheduler.
-        const eff_kv_quant = params.kv_quant_config orelse self.kv_quant_config;
         // Phase D fix: use the slot's target-model config (not the
         // scheduler's startup-model config) so per-slot state allocation
         // (KVCache shape, SSM entries) matches the model that will
@@ -1641,6 +1649,7 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
         const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
         errdefer slot.deinit();
 
@@ -1812,7 +1821,8 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
-        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, self.gguf_ctx_size) catch |err| {
+        const settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
@@ -1824,6 +1834,7 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
+        applyModelSettings(owned.config, settings);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2381,6 +2392,14 @@ const GgufRoute = struct {
     path: []u8,
     engine: gguf_meta.Engine,
 };
+
+/// Both load construction sites (here and main.zig's startup load) stamp the
+/// per-model settings onto the config the bills and defaults read.
+pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
+    config.ctx_override = o.ctx_size orelse 0;
+    config.kv_quant_override = o.kv_quant;
+    config.mtp_override = o.mtp;
+}
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
@@ -3400,8 +3419,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // caches in serve mode honor this independently in `Slot.init`; this
     // call covers any path that still touches `xfm.cache` directly (legacy
     // single-slot fallbacks, prompt-cache reuse).
-    if (params.kv_quant_config.scheme != .off) {
-        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, params.kv_quant_config, params.config.kvCacheKeyHeadDim());
+    // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
+    const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
+    const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
+    if (kv_quant_config.scheme != .off) {
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config, params.config.kvCacheKeyHeadDim());
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
@@ -3617,6 +3639,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
             xfm_ptr.round_cost = t;
             log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
+            if (t.restored_dropped > 0) log.info("[spec-cost] dropped {d} implausible persisted cell(s)\n", .{t.restored_dropped});
         }
     }
 
@@ -3755,7 +3778,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
-    if (params.mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
+    if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
@@ -3785,7 +3808,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 sch.allocator.destroy(h);
             }
         } else |_| {}
-    } else if (params.mtp_enabled) {
+    } else if (mtp_enabled) {
         // A quiet fallback to mode=pld cost a tester a day: nothing logged
         // when the probe finds no head. Debug-level — most checkpoints have
         // no MTP head and an info line per load would be noise.
@@ -3808,7 +3831,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_ptr == null and params.mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
 
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
@@ -3884,7 +3907,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
-    else if (params.mtp_enabled and xfm_ptr.qwen4_mtp != null)
+    else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
     else
         null;
@@ -3923,7 +3946,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM allowance for idle entries on the SSD-first arm; 0 elsewhere.
         var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
-            resolve(params.config, params.prefix_cache_mem_bytes, &ssd_idle_mem)
+            resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
@@ -4043,6 +4066,38 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
 /// Republish the hot cache's residency for the connection thread's admission guard.
 /// Called from the inference thread after a commit, eviction, invalidation or model switch.
+const BUDGET_REVISE_WINDOW_NS: u64 = 10 * std.time.ns_per_s;
+
+/// How a budget resolve differs from the load-time one: the cache's own resident bytes
+/// are excluded from the machine read, and the resolver keeps quiet (`setBudget` logs).
+pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+
+/// Re-clamp every resident model's hot-cache budget after residency changed (#364): the
+/// load-time clamp read the machine with the other models on it and was never revisited, so
+/// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
+/// entries are excluded from the read so a full cache cannot ratchet itself down.
+fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    const resolve = sch.prefix_cache_mem_resolver orelse return;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    // The resolver publishes the process-global budget the admission guard reads, so the
+    // current model goes last.
+    for ([_]bool{ false, true }) |current_pass| {
+        var it = sch.registry.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if ((entry == sch.current_model) != current_pass) continue;
+            if (entry.state != .ready) continue;
+            const hc = if (entry.prefix_cache) |*h| h else continue;
+            const config = entry.config orelse continue;
+            var idle: u64 = 0;
+            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            hc.ssd_idle_mem = idle;
+            if (current_pass) publishHotCacheResidency(sch);
+        }
+    }
+}
+
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
     const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
@@ -4199,6 +4254,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
@@ -4207,6 +4263,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         }
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_req) |req| runGenRequest(sch, req);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
@@ -4264,6 +4322,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 r -= 1;
                 _ = sch.pending.orderedRemove(admit_idx[r]);
             }
+        }
+
+        if (sch.budget_revise_sw) |sw| {
+            if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
+            if (n_prefill > 0) reviseHotCacheBudgets(sch);
         }
 
         // 2. Prefill each pending slot (heavy; mlx ops on this thread).
@@ -4836,13 +4899,17 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
         };
     };
-    hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        return;
     };
     publishHotCacheResidency(sch);
+    // The decline paths already log their reason inside the cache; a silent
+    // `_ =` here is fine — this caller has no commit-shaped log to lie about.
+    _ = finish_st;
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
@@ -4876,22 +4943,40 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // Hybrid restore requires SSM checkpoints; a checkpoint-less hybrid
     // entry restores as a cold miss ("hybrid miss") while occupying an LRU
     // slot. Non-hybrids commit KV-only.
-    if (slot.ssm_entries != null and salvage.checkpoints.len == 0) return;
+    if (slot.ssm_entries != null and salvage.checkpoints.len == 0) {
+        log.debug("[hot-cache] cancelled prefill carried no stride checkpoints — a hybrid entry would restore as a miss; not committed\n", .{});
+        return;
+    }
     // The sink's `forwarded` is the authoritative length — `cache.step`
     // only advances when Generator init completes, so it reads 0 on every
     // aborted prefill.
-    const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse return;
+    const len = cancelledPrefillCommitLen(salvage.forwarded, slot.full_prompt.len) orelse {
+        log.debug("[hot-cache] cancelled prefill forwarded < {d} tokens — below the commit floor; not committed\n", .{prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS});
+        return;
+    };
     const cps: ?[]transformer_mod.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
-    const media_start = if (slot.media_start) |start| if (start < len) start else null else null;
+    // Pass the media boundary RAW: when the cancelled prefill forwarded less
+    // than the media position, the cache re-keys the pure-text entry to the
+    // null vision key (a kept pixel key with no boundary is the
+    // conservative-rejection poison shape; live 2026-09-07).
+    const media_start = slot.media_start;
     // Ownership of the checkpoints transfers to the cache unconditionally —
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, media_start, cps, null, null) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
-    log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ len, slot.full_prompt.len });
+    // Truthful outcome only: a budget decline must never print as a commit
+    // (live 2026-09-07: "skipped oversized" + "committed N/M" were the SAME
+    // event and the cache looked healthy while a 122k session re-prefilled
+    // ~95k tokens per retry).
+    switch (st) {
+        .ok => |n| log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
+        .kept_resident => |n| log.info("[hot-cache] kept resident {d}-token entry; oversized candidate declined\n", .{n}),
+        .declined => {},
+    }
 }
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
@@ -5569,7 +5654,10 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
     // The interval since these slots' previous tick contains a prefill chunk; the serial
     // cell must not fold it as a token's wall time. Drop it; the next tick seeds afresh.
     for (buf[0..n]) |s| {
-        if (s.legacy_gen) |*g| g.invalidateSerialClock();
+        if (s.legacy_gen) |*g| {
+            g.invalidateSerialClock();
+            g.invalidateRoundClock();
+        }
     }
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
@@ -5983,6 +6071,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it
+    // parks in MLX's pool up to the cap and the first decode tick allocates on top of
+    // it. Returned once here, at the handover — long-context gate only.
+    if (slot.legacy_gen) |*g| g.clearPoolBeforeDecode();
     // The conn thread's `cached_tokens` counted against `xfm.cache` (legacy
     // global cache) which the slot doesn't use. The slot's `cached_tokens`
     // is the hot-cache match (or 0 if the hot cache missed / isn't
@@ -7752,7 +7844,7 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
     // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
     // it must never pay for the coarse head.
-    const gate = std.mem.lastIndexOf(u8, body[0..build], "params.mtp_enabled") orelse return error.EagerRerankBuildUngated;
+    const gate = std.mem.lastIndexOf(u8, body[0..build], "mtp_enabled") orelse return error.EagerRerankBuildUngated;
     try testing.expect(build - gate < 200);
 
     // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
