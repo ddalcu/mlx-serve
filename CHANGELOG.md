@@ -11,6 +11,9 @@
 - **A cached conversation survives on SSD instead of being rebuilt, on Flash Next.** With `--prefix-cache-disk`, memory keeps the model plus the active conversation and every other conversation lives on disk, written in the background as the prompt is processed; a disk hit streams back in seconds against minutes of re-prefill. On that model `--prefix-cache-mem` is now the allowance for conversations other than the one being served (`0` keeps none idle).
 - **Speculative decoding on Flash Next switches itself off where a plain step is faster, and back on when it is not.** Past some conversation length a speculative round costs more than the steps it replaces; the switch compares two measured prices per context bucket and only acts when both agree. `--max-mtp-ctx <n>` keeps speculation off past a context length you choose.
 - **A prefix-cache hit no longer leaves Flash Next's draft head guessing.** The head's own history is saved with the cached prefix and restored with it.
+- **A partly-accepted speculative round is cheaper on Flash Next.** The sparse-attention key history for the tokens that survived is re-used where it already sits instead of being copied out and re-seeded on the next token. The saving grows with the conversation; the generated text is byte-identical.
+- **Flash Next's sparse-attention block scores are extended, not rebuilt.** Every four decoded tokens the model re-transposed and re-converted its whole block-score table; it now writes only the new columns into a table sized once per request. Byte-identical scores.
+- **Speculative drafting on Flash Next stopped re-deriving position tables it already had.** The draft head builds a fresh context per draft step, so the sparse-attention rope tables missed their cache every step and the head's own key history never got the space the trunk reserved for it. `[spec-stats] partial_rounds=` also reads the number of partial accepts again, instead of always 0.
 
 ### Fixes
 

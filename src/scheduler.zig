@@ -744,6 +744,7 @@ pub const Slot = struct {
             self.allocator.destroy(runner);
             self.diffusion = null;
         }
+        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -4199,6 +4200,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
@@ -6633,6 +6635,27 @@ test "Generator.initWithOptions hands off checkpoints on cancel" {
     const region = source[anchor..@min(anchor + 2400, source.len)];
     try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
     try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
+}
+
+test "Slot.deinit marks the pooled-rope cache stale; the inference thread frees it" {
+    // The cache keys on `mrope_pos` by pointer, so it must be dropped when that table dies.
+    // `Slot.deinit` runs on connection threads and the inference thread is the sole mlx
+    // caller, frees included: the slot writes one atomic word before the free, and the
+    // cleanup drain resets the cache before destroying the slot.
+    const source = @embedFile("scheduler.zig");
+    const d_start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Slot)") orelse return error.MissingSlotDeinit;
+    const d_end = std.mem.indexOfPos(u8, source, d_start + 1, "pub fn deinit(self: *Scheduler)") orelse return error.MissingSchedulerDeinit;
+    const body = source[d_start..d_end];
+    if (std.mem.indexOf(u8, body, "resetQsaPooledRope") != null) return error.SlotDeinitFreesPooledRope;
+    const mark_at = std.mem.indexOf(u8, body, "markQsaPooledRopeStale") orelse return error.MissingPooledRopeStale;
+    const mp_at = std.mem.indexOf(u8, body, "mrope_pos") orelse return error.MissingMropeFree;
+    try testing.expect(mark_at < mp_at);
+
+    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
+    const drain = source[drain_start..@min(drain_start + 1600, source.len)];
+    const reset_at = std.mem.indexOf(u8, drain, "resetQsaPooledRope") orelse return error.DrainDoesNotResetPooledRope;
+    const deinit_at = std.mem.indexOf(u8, drain, "s.deinit();") orelse return error.MissingDeinit;
+    try testing.expect(reset_at < deinit_at);
 }
 
 test "Slot.deinit frees unconsumed cancelled-prefill salvage" {

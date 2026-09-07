@@ -6507,10 +6507,11 @@ pub const SSMCacheEntry = struct {
     qsa_key_rows: c_int = 0,
     /// Pooled-bank accelerators, same discipline: `qsa_pooled_buf` is the capacity buffer
     /// `qsa_pooled` views; `qsa_score_bank` is the f32 `[B, 1, hd, nb]` score operand,
-    /// rebuilt only when a block completes.
+    /// a view of `qsa_score_buf`, which grows by appended columns as blocks complete.
     qsa_pooled_buf: mlx.mlx_array = .{ .ctx = null },
     qsa_pooled_blocks: c_int = 0,
     qsa_score_bank: mlx.mlx_array = .{ .ctx = null },
+    qsa_score_buf: mlx.mlx_array = .{ .ctx = null },
     qsa_score_blocks: c_int = 0,
     /// Rows this entry's QSA history is asked to hold up front (the counterpart of
     /// `KVCache.reserve_tokens`); the pooled bank derives its own by `ratio`. 0 = none.
@@ -6524,6 +6525,7 @@ pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
     if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
     if (e.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled_buf);
     if (e.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(e.qsa_score_bank);
+    if (e.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_score_buf);
     e.aux_state = .{ .ctx = null };
     e.qsa_key_buf = .{ .ctx = null };
     e.qsa_key_rows = 0;
@@ -6531,6 +6533,7 @@ pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
     e.qsa_pooled_buf = .{ .ctx = null };
     e.qsa_pooled_blocks = 0;
     e.qsa_score_bank = .{ .ctx = null };
+    e.qsa_score_buf = .{ .ctx = null };
     e.qsa_score_blocks = 0;
 }
 
@@ -6554,6 +6557,8 @@ pub var qsa_cap_buf_allocs: usize = 0;
 /// How many times a QSA history accelerator was re-seeded from its authority (`seedCapBuf`).
 pub var qsa_history_seeds: usize = 0;
 
+pub var qsa_score_incremental_appends: usize = 0;
+
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
 pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
     if (!KVCache.kvReserveEnabled()) return;
@@ -6561,6 +6566,11 @@ pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
     for (es) |*e| {
         if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;
     }
+}
+
+pub fn reserveQsaHistoryWithHead(entries: ?[]SSMCacheEntry, head: ?*SSMCacheEntry, tokens: usize) void {
+    reserveQsaHistory(entries, tokens);
+    if (head) |h| reserveQsaHistory(h[0..1], tokens);
 }
 
 /// Append `chunk` into a pre-grown capacity buffer along `axis` and republish `view` as the
@@ -6655,6 +6665,57 @@ fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, co
         view.* = .{ .ctx = null };
     }
     try mlx.check(mlx.mlx_slice(view, buf.*, &start, nd, &stop, nd, &strides, nd, s));
+}
+
+/// Re-publish an entry's QSA views over the first `keep` rows of the capacity buffers it
+/// already owns, instead of copying the history out and re-seeding it. False (the caller
+/// falls back to the copy) when there is no capacity buffer: a restore, a cold entry, a
+/// post-adopt head.
+fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !bool {
+    const buf_ok = entry.qsa_key_buf.ctx != null and
+        keep <= entry.qsa_key_rows and
+        mlx.getShape(entry.qsa_key_buf)[1] >= keep;
+    if (!buf_ok) return false;
+    try capBufReslice(s, entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, 1, keep);
+    const keep_blocks: c_int = @divTrunc(keep, @max(entry.qsa_ratio, 1));
+    if (entry.qsa_pooled_buf.ctx != null) {
+        if (keep_blocks > 0 and mlx.getShape(entry.qsa_pooled_buf)[1] >= keep_blocks) {
+            try capBufReslice(s, entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, 1, keep_blocks);
+        } else {
+            if (entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled);
+            entry.qsa_pooled = .{ .ctx = null };
+            entry.qsa_pooled_blocks = 0;
+        }
+    } else {
+        try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s, false);
+    }
+    if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+    entry.qsa_score_bank = .{ .ctx = null };
+    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_blocks = 0;
+    return true;
+}
+
+fn capBufReslice(s: mlx.mlx_stream, buf: mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, axis: usize, new_count: c_int) !void {
+    const sh = mlx.getShape(buf);
+    const nd: usize = sh.len;
+    if (view.ctx != null) _ = mlx.mlx_array_free(view.*);
+    view.* = .{ .ctx = null };
+    count.* = 0;
+    if (new_count <= 0) return;
+    var start = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ 0, 0, 0, 0 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    for (sh, 0..) |d, i| stop[i] = d;
+    stop[axis] = new_count;
+    view.* = mlx.mlx_array_new();
+    errdefer {
+        _ = mlx.mlx_array_free(view.*);
+        view.* = .{ .ctx = null };
+    }
+    try mlx.check(mlx.mlx_slice(view, buf, &start, nd, &stop, nd, &strides, nd, s));
+    count.* = new_count;
 }
 
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
@@ -6828,20 +6889,22 @@ pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, verify_len: 
     } else if (entry.aux_state.ctx != null and entry.conv_state.ctx == null) {
         const ks = mlx.getShape(entry.aux_state); // [B, rows, hd]
         const keep: c_int = ks[1] - @as(c_int, @intCast(verify_len)) + @as(c_int, @intCast(1 + accepted));
-        const start = [_]c_int{ 0, 0, 0 };
-        const stop = [_]c_int{ ks[0], keep, ks[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        var view = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(view);
-        try mlx.check(mlx.mlx_slice(&view, entry.aux_state, &start, 3, &stop, 3, &strides, 3, s));
-        const owned = try materializedOwnedCopy(s, view);
-        // The pooled bank survives (truncated); only the history and its buffer are replaced.
-        const pooled = entry.qsa_pooled;
-        entry.qsa_pooled = .{ .ctx = null };
-        ssmFreeQsaState(entry);
-        entry.qsa_pooled = pooled;
-        entry.aux_state = owned;
-        try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s, true);
+        if (!try qsaResliceToKeep(entry, keep, s)) {
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ ks[0], keep, ks[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, entry.aux_state, &start, 3, &stop, 3, &strides, 3, s));
+            const owned = try materializedOwnedCopy(s, view);
+            // The pooled bank survives (truncated); only the history and its buffer are replaced.
+            const pooled = entry.qsa_pooled;
+            entry.qsa_pooled = .{ .ctx = null };
+            ssmFreeQsaState(entry);
+            entry.qsa_pooled = pooled;
+            entry.aux_state = owned;
+            try truncatePooled(&entry.qsa_pooled, keep, entry.qsa_ratio, s, true);
+        }
     }
     if (entry.spec_state_seq.ctx == null and entry.spec_conv_input.ctx == null) return;
 
@@ -6925,8 +6988,122 @@ test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
     try t.expect(e.qsa_key_buf.ctx == null);
     try t.expect(e.qsa_pooled_buf.ctx == null);
     try t.expect(e.qsa_score_bank.ctx == null);
+    try t.expect(e.qsa_score_buf.ctx == null);
     try t.expectEqual(@as(c_int, 0), e.qsa_key_rows);
     try t.expectEqual(@as(c_int, 0), e.qsa_pooled_blocks);
+}
+
+test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to keep" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = t.allocator;
+    xfm.qsa_score_bank_builds = 0;
+
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    entry.qsa_reserve_rows = 64;
+
+    var prng = std.Random.DefaultPrng.init(0x51A0_B0FF);
+    const rnd = prng.random();
+    const hd: c_int = 16;
+    const prefix: c_int = 8;
+    const verify_len: c_int = 4;
+    const accepted: u32 = 1;
+    const keep: c_int = prefix + @as(c_int, @intCast(1 + accepted));
+    const keep_blocks: c_int = @divTrunc(keep, entry.qsa_ratio);
+
+    {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, prefix, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try xfm.qsaAppendKeys(&entry, chunk, 0);
+        const blocks = try attn256RandBf16(rnd, &[_]c_int{ 1, @divTrunc(prefix, entry.qsa_ratio), hd }, s);
+        defer _ = mlx.mlx_array_free(blocks);
+        try xfm.qsaAppendPooled(&entry, blocks, 0);
+    }
+    {
+        const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, verify_len, hd }, s);
+        defer _ = mlx.mlx_array_free(chunk);
+        try xfm.qsaAppendKeys(&entry, chunk, prefix);
+        const blocks = try attn256RandBf16(rnd, &[_]c_int{ 1, @divTrunc(verify_len, entry.qsa_ratio), hd }, s);
+        defer _ = mlx.mlx_array_free(blocks);
+        try xfm.qsaAppendPooled(&entry, blocks, @divTrunc(prefix, entry.qsa_ratio));
+    }
+    try t.expectEqual(prefix + verify_len, entry.qsa_key_rows);
+    try t.expect(entry.qsa_key_buf.ctx != null);
+    _ = try xfm.qsaScoreBank(&entry, 1, @divTrunc(prefix + verify_len, entry.qsa_ratio), hd);
+
+    const kept_ref = blk: {
+        const ks = mlx.getShape(entry.aux_state);
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(
+            &view,
+            entry.aux_state,
+            &[_]c_int{ 0, 0, 0 },
+            3,
+            &[_]c_int{ ks[0], keep, ks[2] },
+            3,
+            &[_]c_int{ 1, 1, 1 },
+            3,
+            s,
+        ));
+        break :blk try materializedOwnedCopy(s, view);
+    };
+    defer _ = mlx.mlx_array_free(kept_ref);
+
+    const kept_pooled = blk: {
+        const ps = mlx.getShape(entry.qsa_pooled);
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(
+            &view,
+            entry.qsa_pooled,
+            &[_]c_int{ 0, 0, 0 },
+            3,
+            &[_]c_int{ ps[0], keep_blocks, ps[2] },
+            3,
+            &[_]c_int{ 1, 1, 1 },
+            3,
+            s,
+        ));
+        break :blk try materializedOwnedCopy(s, view);
+    };
+    defer _ = mlx.mlx_array_free(kept_pooled);
+
+    const buf_before = entry.qsa_key_buf.ctx;
+    const pooled_buf_before = entry.qsa_pooled_buf.ctx;
+    try ssmRollbackFromCapture(&entry, accepted, @intCast(verify_len), s);
+
+    try t.expect(entry.qsa_key_buf.ctx == buf_before);
+    try t.expectEqual(keep, entry.qsa_key_rows);
+    try t.expectEqual(keep, mlx.getShape(entry.aux_state)[1]);
+    try t.expect(entry.qsa_pooled_buf.ctx == pooled_buf_before);
+    try t.expectEqual(keep_blocks, entry.qsa_pooled_blocks);
+    try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_pooled, kept_pooled, s));
+    // The score bank is invalidated rather than truncated: its columns are a function of
+    // the pooled bank and the next completed block rebuilds them.
+    try t.expect(entry.qsa_score_bank.ctx == null);
+    try t.expectEqual(@as(c_int, 0), entry.qsa_score_blocks);
+
+    const tail = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, hd }, s);
+    defer _ = mlx.mlx_array_free(tail);
+    var reference = mlx.mlx_array_new();
+    {
+        const parts = [_]mlx.mlx_array{ kept_ref, tail };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&reference, vec, 1, s));
+    }
+    defer _ = mlx.mlx_array_free(reference);
+
+    try xfm.qsaAppendKeys(&entry, tail, keep);
+    try t.expectEqual(keep + 2, mlx.getShape(entry.aux_state)[1]);
+    try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, reference, s));
+
 }
 
 /// Keep the pooled-key rows that are still complete blocks of a key history
@@ -8514,31 +8691,42 @@ pub const PlePending = struct {
     capture: bool,
 };
 
-/// The QSA pooled-block RoPE tables for one forward: every full-attention layer ropes the
-/// same blocks at the same positions, so they are a property of the forward (qwen4_exp
-/// rebuilt them 12 times). The key carries `gen` and the `ForwardCtx` pointer because the
-/// M-RoPE arm also reads the ctx's position table.
+/// The QSA pooled-block RoPE tables, shared by every full-attention layer and across
+/// forwards while the key holds. The key is the block position (`base`, `step`, `n`, dtype)
+/// plus, on the M-RoPE arm, the position table compared by pointer and length; the pointer
+/// is never dereferenced. The owner slot frees that table only after
+/// `markQsaPooledRopeStale` (one free site, scan-pinned), so a same-address table cannot
+/// hit. Connection threads write only the atomic `stale`; the inference thread frees.
 const QsaPooledRope = struct {
-    gen: u64 = 0,
-    ctx: ?*const ForwardCtx = null,
     base: c_int = 0,
     step: c_int = 0,
     n: c_int = 0,
     dtype: mlx.mlx_dtype = .float32,
     mrope: bool = false,
+    mrope_pos: ?[]const i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
     cos: mlx.mlx_array = .{ .ctx = null },
     sin: mlx.mlx_array = .{ .ctx = null },
     /// Rebuild counter.
     builds: usize = 0,
+    stale: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *QsaPooledRope) void {
         if (self.cos.ctx != null) _ = mlx.mlx_array_free(self.cos);
         if (self.sin.ctx != null) _ = mlx.mlx_array_free(self.sin);
         self.cos = .{ .ctx = null };
         self.sin = .{ .ctx = null };
-        self.ctx = null;
+        self.mrope_pos = null;
+        self.stale.store(false, .monotonic);
     }
 };
+
+fn qsaPooledTableEq(a: ?[]const i32, b: ?[]const i32) bool {
+    const aa = a orelse return b == null;
+    const bb = b orelse return false;
+    return aa.ptr == bb.ptr and aa.len == bb.len;
+}
 
 /// Does every complete-block visibility check pass for every query row of a call starting at
 /// cache position `offset`? Block `b` is complete at `p` iff `b*ratio + ratio - 1 <= p`, so
@@ -9593,9 +9781,9 @@ pub const Transformer = struct {
     qsa_consts: QsaBlockConsts = .{},
     /// QSA pooled-block cos/sin, built once per forward (`QsaPooledRope`).
     qsa_pooled_rope: QsaPooledRope = .{},
-    /// Bumped by every forward entry that can reach QSA; part of the `qsa_pooled_rope` key.
+    /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
     fwd_gen: u64 = 0,
-    /// Test meter: how many times `qsaScoreBank` rebuilt the transposed f32 operand.
+    /// Test meter: how many times `qsaScoreBank` built or extended the transposed f32 operand.
     qsa_score_bank_builds: usize = 0,
     /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
     /// pre-mixer stream + next-token embedding). Loaded when the pack carries
@@ -11147,6 +11335,14 @@ pub const Transformer = struct {
         _ = mlx.mlx_stream_free(self.s);
         // The free above is a no-op on the default stream's wrapper but we keep it for symmetry
         // with the Zig copy of the mlx_stream struct that init handed us.
+    }
+
+    pub fn resetQsaPooledRope(self: *Transformer) void {
+        self.qsa_pooled_rope.deinit();
+    }
+
+    pub fn markQsaPooledRopeStale(self: *Transformer) void {
+        self.qsa_pooled_rope.stale.store(true, .release);
     }
 
     /// Re-bind `self.s` to the *current* thread's default GPU stream. Must be called from any
@@ -14992,26 +15188,63 @@ pub const Transformer = struct {
         try capBufAppend(s, &entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, new3, 1, entry.qsa_reserve_rows / ratio);
     }
 
-    /// The block-score matmul's key operand: `[B, 1, hd, nb]` f32, the pooled bank transposed
-    /// and up-cast, rebuilt only when a block completes (it used to be a strided copy of the
-    /// whole bank on every layer of every forward). Borrowed; bit-identical to the per-forward build.
-    fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
-        if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
-        if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
-        entry.qsa_score_bank = .{ .ctx = null };
-        entry.qsa_score_blocks = 0;
+    /// `n` columns of the block-score matmul's key operand: `[B, 1, hd, n]` f32, the pooled
+    /// bank transposed and up-cast.
+    fn qsaScoreCols(self: *Transformer, pooled: mlx.mlx_array, batch: c_int, n: c_int, idx_hd: c_int) !mlx.mlx_array {
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_reshape(&k_rope, entry.qsa_pooled, &[_]c_int{ batch, 1, nb, idx_hd }, 4, self.s)); // [B,1,nb,hd]
+        try mlx.check(mlx.mlx_reshape(&k_rope, pooled, &[_]c_int{ batch, 1, n, idx_hd }, 4, self.s));
         const kperm = [_]c_int{ 0, 1, 3, 2 };
         var kt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kt);
-        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &kperm, 4, self.s)); // [B,1,hd,nb]
+        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &kperm, 4, self.s));
         var k32 = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(k32);
         try mlx.check(mlx.mlx_astype(&k32, kt, .float32, self.s));
-        entry.qsa_score_bank = k32;
-        entry.qsa_score_blocks = nb;
+        return k32;
+    }
+
+    /// The score operand for `nb` blocks, borrowed. A completed block appends its own columns
+    /// into `qsa_score_buf`; the from-scratch arm serves a restore, a cold entry and a
+    /// rollback. Bit-identical to rebuilding the whole bank.
+    fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
+        if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
+        const old_nb = entry.qsa_score_blocks;
+        const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
+        const reserve = entry.qsa_reserve_rows / ratio;
+        if (entry.qsa_score_buf.ctx != null and old_nb > 0 and nb > old_nb and entry.qsa_pooled.ctx != null) {
+            const psh = mlx.getShape(entry.qsa_pooled);
+            if (psh[1] >= nb) {
+                const n_new = nb - old_nb;
+                var new_pooled = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(new_pooled);
+                try mlx.check(mlx.mlx_slice(
+                    &new_pooled,
+                    entry.qsa_pooled,
+                    &[_]c_int{ 0, old_nb, 0 },
+                    3,
+                    &[_]c_int{ psh[0], nb, psh[2] },
+                    3,
+                    &[_]c_int{ 1, 1, 1 },
+                    3,
+                    self.s,
+                ));
+                const cols = try self.qsaScoreCols(new_pooled, batch, n_new, idx_hd);
+                defer _ = mlx.mlx_array_free(cols);
+                try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
+                self.qsa_score_bank_builds += 1;
+                qsa_score_incremental_appends += 1;
+                return entry.qsa_score_bank;
+            }
+        }
+        if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+        if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+        entry.qsa_score_bank = .{ .ctx = null };
+        entry.qsa_score_buf = .{ .ctx = null };
+        entry.qsa_score_blocks = 0;
+        const cols = try self.qsaScoreCols(entry.qsa_pooled, batch, nb, idx_hd);
+        defer _ = mlx.mlx_array_free(cols);
+        try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
         self.qsa_score_bank_builds += 1;
         return entry.qsa_score_bank;
     }
@@ -15020,9 +15253,13 @@ pub const Transformer = struct {
     fn qsaPooledCosSin(self: *Transformer, ctx: *ForwardCtx, rope_dims: c_int, base: c_int, step: c_int, n: c_int, dt: mlx.mlx_dtype) !MropeCosSin {
         const is_mrope = ctx.mrope_pos != null;
         const c = &self.qsa_pooled_rope;
-        if (c.cos.ctx != null and c.gen == self.fwd_gen and c.ctx == ctx and
+        if (c.stale.load(.acquire)) c.deinit();
+        if (c.cos.ctx != null and
             c.base == base and c.step == step and c.n == n and
-            c.dtype == dt and c.mrope == is_mrope) return .{ .cos = c.cos, .sin = c.sin };
+            c.dtype == dt and c.mrope == is_mrope and
+            qsaPooledTableEq(c.mrope_pos, ctx.mrope_pos) and
+            c.mrope_total == ctx.mrope_total and c.mrope_delta == ctx.mrope_delta)
+            return .{ .cos = c.cos, .sin = c.sin };
         c.deinit();
         const cs = if (is_mrope)
             try self.mropeCosSinAt(mropeContext(ctx), @intCast(base), @intCast(step), @intCast(n), dt)
@@ -15030,13 +15267,14 @@ pub const Transformer = struct {
             try self.ropeCosSinFromFreqs(rope_dims, try self.ropeInvFreq(rope_dims, self.config.rope_theta), @floatFromInt(base), @floatFromInt(step), n, dt);
         c.cos = cs.cos;
         c.sin = cs.sin;
-        c.gen = self.fwd_gen;
-        c.ctx = ctx;
         c.base = base;
         c.step = step;
         c.n = n;
         c.dtype = dt;
         c.mrope = is_mrope;
+        c.mrope_pos = ctx.mrope_pos;
+        c.mrope_total = ctx.mrope_total;
+        c.mrope_delta = ctx.mrope_delta;
         c.builds += 1;
         return cs;
     }
@@ -15647,20 +15885,23 @@ pub const Transformer = struct {
             if (len == 0) {
                 ssmFreeQsaState(&m.entry);
             } else {
-                const ks = mlx.getShape(m.entry.aux_state);
-                const start = [_]c_int{ 0, 0, 0 };
-                const stop = [_]c_int{ ks[0], @intCast(len), ks[2] };
-                const strides = [_]c_int{ 1, 1, 1 };
-                var view = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(view);
-                try mlx.check(mlx.mlx_slice(&view, m.entry.aux_state, &start, 3, &stop, 3, &strides, 3, self.s));
-                const owned = try materializedOwnedCopy(self.s, view);
-                const pooled = m.entry.qsa_pooled; // survives, truncated below
-                m.entry.qsa_pooled = .{ .ctx = null };
-                ssmFreeQsaState(&m.entry);
-                m.entry.qsa_pooled = pooled;
-                m.entry.aux_state = owned;
-                try truncatePooled(&m.entry.qsa_pooled, @intCast(len), m.entry.qsa_ratio, self.s, true);
+                const keep: c_int = @intCast(len);
+                if (!try qsaResliceToKeep(&m.entry, keep, self.s)) {
+                    const ks = mlx.getShape(m.entry.aux_state);
+                    const start = [_]c_int{ 0, 0, 0 };
+                    const stop = [_]c_int{ ks[0], @intCast(len), ks[2] };
+                    const strides = [_]c_int{ 1, 1, 1 };
+                    var view = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(view);
+                    try mlx.check(mlx.mlx_slice(&view, m.entry.aux_state, &start, 3, &stop, 3, &strides, 3, self.s));
+                    const owned = try materializedOwnedCopy(self.s, view);
+                    const pooled = m.entry.qsa_pooled; // survives, truncated below
+                    m.entry.qsa_pooled = .{ .ctx = null };
+                    ssmFreeQsaState(&m.entry);
+                    m.entry.qsa_pooled = pooled;
+                    m.entry.aux_state = owned;
+                    try truncatePooled(&m.entry.qsa_pooled, @intCast(len), m.entry.qsa_ratio, self.s, true);
+                }
             }
         }
         m.seq_offset = len;
@@ -45236,6 +45477,15 @@ test "qsa key append plan: rows advance by S, capacity grows only when it must" 
     try testing.expectEqual(@as(usize, 4596), p4.new_rows);
 }
 
+test "reserveQsaHistory: the MTP head entry is reserved at the same length" {
+    var slot = [_]SSMCacheEntry{.{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false }};
+    var head: SSMCacheEntry = .{ .ssm_state = .{ .ctx = null }, .conv_state = .{ .ctx = null }, .initialized = false };
+    const tokens: usize = 8192;
+    reserveQsaHistoryWithHead(slot[0..], &head, tokens);
+    try testing.expectEqual(tokens, slot[0].qsa_reserve_rows);
+    try testing.expectEqual(tokens, head.qsa_reserve_rows);
+}
+
 test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#353 follow-up)" {
     // These buffers walked the +25% ladder beside a KV cache that had been sized once; the loop
     // below allocated ~30 times before `qsa_reserve_rows`.
@@ -45453,6 +45703,59 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     try testing.expectEqual(nb + 1, mlx.getShape(entry.qsa_score_bank)[3]);
 }
 
+test "qsa score bank: incremental column append matches a from-scratch rebuild" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.qsa_score_bank_builds = 0;
+
+    const hd: c_int = 16;
+    const batch: c_int = 1;
+    var prng = std.Random.DefaultPrng.init(0x5C0E_BA11);
+    const rnd = prng.random();
+
+    var scratch: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&scratch);
+    var incr: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&incr);
+
+    const before = qsa_score_incremental_appends;
+    var nb: c_int = 0;
+    var step_i: usize = 0;
+    while (step_i < 24) : (step_i += 1) {
+        const add: c_int = if (step_i == 0) 5 else 1;
+        const new3 = try attn256RandBf16(rnd, &[_]c_int{ batch, add, hd }, s);
+        defer _ = mlx.mlx_array_free(new3);
+        try t.qsaAppendPooled(&scratch, new3, nb);
+        try t.qsaAppendPooled(&incr, new3, nb);
+        nb += add;
+        _ = try t.qsaScoreBank(&incr, batch, nb, hd);
+    }
+    try testing.expectEqual(before + 23, qsa_score_incremental_appends);
+    try testing.expect(mlx.getShape(incr.qsa_score_buf)[3] > nb);
+    const bank_inc = try t.qsaScoreBank(&incr, batch, nb, hd);
+    const bank_scratch = try t.qsaScoreBank(&scratch, batch, nb, hd);
+    try testing.expectEqual(@as(c_int, hd), mlx.getShape(bank_inc)[2]);
+    try testing.expectEqual(nb, mlx.getShape(bank_inc)[3]);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(bank_inc, bank_scratch, s));
+    {
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_reshape(&k_rope, scratch.qsa_pooled, &[_]c_int{ batch, 1, nb, hd }, 4, s));
+        var kt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kt);
+        try mlx.check(mlx.mlx_transpose_axes(&kt, k_rope, &[_]c_int{ 0, 1, 3, 2 }, 4, s));
+        var k32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k32);
+        try mlx.check(mlx.mlx_astype(&k32, kt, .float32, s));
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(bank_inc, k32, s));
+    }
+    try testing.expect(qsa_score_incremental_appends > before);
+}
+
 test "qsa pooled rope: one cos/sin build per forward, not one per full-attention layer" {
     // The tables are a property of the forward, not of the layer.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -45504,12 +45807,12 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     defer _ = mlx.mlx_array_free(per_layer);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(hoisted, per_layer, s));
 
-    // A new forward rebuilds (the M-RoPE arm's position table is not in the key).
+    // A new forward at the same position hits: the forward counter is not in the key.
     t.fwd_gen += 1;
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
     _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 
     // The M-RoPE arm is a different table at the same (base, step, n).
     const pos = try testing.allocator.alloc(i32, 3 * 256);
@@ -45518,14 +45821,57 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     ctx.mrope_pos = pos;
     ctx.mrope_total = 256;
     const m = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
     const direct = try t.mropeCosSinAt(.{ .pos = pos, .total = 256, .delta = 0 }, @intCast(base + step), @intCast(step), @intCast(n), .bfloat16);
     defer _ = mlx.mlx_array_free(direct.cos);
     defer _ = mlx.mlx_array_free(direct.sin);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.cos, direct.cos, s));
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.sin, direct.sin, s));
     for (0..11) |_| _ = try t.qsaPooledCosSin(&ctx, rope_dims, base + step, step, n, .bfloat16);
-    try testing.expectEqual(@as(usize, 4), t.qsa_pooled_rope.builds);
+    try testing.expectEqual(@as(usize, 3), t.qsa_pooled_rope.builds);
+}
+
+test "qsa pooled rope: a mark from another thread is observed by the next lookup" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.config.head_dim = 256;
+    t.config.partial_rotary_factor = 0.5;
+    t.config.rope_theta = 10_000_000.0;
+    t.config.mrope_section = .{ 11, 11, 10 };
+    t.rope_freqs_yarn = null;
+    t.yarn_inv_freq = null;
+    t.fwd_gen = 0;
+    t.qsa_pooled_rope = .{};
+    defer t.qsa_pooled_rope.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    var seq_off: usize = 0;
+    var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &seq_off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+
+    const rope_dims: c_int = 128;
+    const base: c_int = 96;
+    const step: c_int = 4;
+    const n: c_int = 5;
+
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
+
+    const Worker = struct {
+        fn run(xfm: *Transformer) void {
+            xfm.markQsaPooledRopeStale();
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Worker.run, .{&t});
+    th.join();
+    try testing.expect(t.qsa_pooled_rope.stale.load(.acquire));
+    _ = try t.qsaPooledCosSin(&ctx, rope_dims, base, step, n, .bfloat16);
+    try testing.expectEqual(@as(usize, 2), t.qsa_pooled_rope.builds);
 }
 
 // ── The QSA all-visible identity skip at the engagement boundary ──

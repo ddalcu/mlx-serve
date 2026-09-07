@@ -1196,6 +1196,8 @@ pub const Generator = struct {
     mtp_drafted_tokens: u64 = 0,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
+    /// Speculative rounds that rolled recurrent state back on a partial accept.
+    partial_rounds: u64 = 0,
     /// Extension dry-spell gate: consecutive extension-CONSIDERED rounds
     /// whose confidence gate did not clear, and the single-chunk cooldown
     /// that a full dry streak triggers (see mtpExtDryAllows).
@@ -1540,7 +1542,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d} serial_drops=t{d}/c{d}/b{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1549,6 +1551,7 @@ pub const Generator = struct {
                     self.mtp_depth,
                     self.mtp_drafted_tokens,
                     self.mtp_ext_rounds,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     @tagName(self.spec_disable_reason),
                     @tagName(self.mtp_adaptive.arm),
@@ -1585,7 +1588,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
@@ -1593,6 +1596,7 @@ pub const Generator = struct {
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
                     if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                    self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                     self.xfm.round_cost.formatBucket(table_bucket, &table_buf),
@@ -2229,7 +2233,11 @@ pub const Generator = struct {
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's own per-request buffers reserve at the same length.
-            transformer_mod.reserveQsaHistory(ctx.ssm_entries, @intCast(reserved_tokens));
+            transformer_mod.reserveQsaHistoryWithHead(
+                ctx.ssm_entries,
+                if (xfm.qwen4_mtp) |*m| &m.entry else null,
+                @intCast(reserved_tokens),
+            );
 
             var pos: usize = 0;
             while (pos < loop_end) {
@@ -2975,6 +2983,7 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
+        self.xfm.markQsaPooledRopeStale();
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;
@@ -3314,6 +3323,16 @@ pub const Generator = struct {
         const round = try dsv4_mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
         dsv4_mod.dsparkObserve(mdl, round.phases);
         return round;
+    }
+
+    /// The ONE place a partial accept rolls recurrent state back from the verify capture:
+    /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
+    /// rollback without being counted.
+    fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+        self.partial_rounds += 1;
+        for (entries) |*entry| {
+            try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
+        }
     }
 
     pub fn nextPld(
@@ -3707,9 +3726,7 @@ pub const Generator = struct {
                 const step_keep = kv_snap.step;
                 try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
                 self.ctx.cache.step = step_keep;
-                for (self.ctx.ssm_entries.?) |*entry| {
-                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-                }
+                try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
                 self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
             } else {
                 try self.ctx.cache.restore(&kv_snap);
@@ -4717,9 +4734,7 @@ pub const Generator = struct {
                 if (self.ctx.ssm_entries) |entries| {
                     const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
                     if (!gdn_captured) return error.SpecRollbackUnavailable;
-                    for (entries) |*entry| {
-                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-                    }
+                    try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             } else if (hybrid_path) {
@@ -4735,9 +4750,7 @@ pub const Generator = struct {
                         }
                     }
                     if (!captured) return error.SpecRollbackUnavailable;
-                    for (entries) |*entry| {
-                        try transformer_mod.ssmRollbackFromCapture(entry, accepted, bs, s);
-                    }
+                    try self.rollbackSsmFromCapture(entries, accepted, bs, s);
                 }
                 self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
             }
@@ -6192,9 +6205,7 @@ pub const Generator = struct {
             // the restore-based fallback (same rule as nextPld).
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
-            for (self.ctx.ssm_entries.?) |*entry| {
-                try transformer_mod.ssmRollbackFromCapture(entry, accepted, 1 + m, s);
-            }
+            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -14780,6 +14791,23 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "every rollback-from-capture is counted in partial_rounds" {
+    // The counter shipped reading 0 on qwen4_exp: it was incremented at two of the four
+    // rollback sites, and neither of those two can emit a `mode=mtp` line. The loop and the
+    // count now live in one helper, so this asserts there is no second way to take the
+    // rollback. Needles are assembled at comptime.
+    const src = @embedFile("generate.zig");
+    const callee = "transformer_mod.ssmRollback" ++ "FromCapture(";
+    const helper = "fn rollbackSsm" ++ "FromCapture(";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, callee));
+    const at = std.mem.indexOf(u8, src, helper) orelse return error.HelperMoved;
+    const body = src[at..@min(src.len, at + 600)];
+    const bump = "partial_" ++ "rounds += 1;";
+    const count_at = std.mem.indexOf(u8, body, bump) orelse return error.CountMoved;
+    try testing.expect(count_at < (std.mem.indexOf(u8, body, callee) orelse return error.CalleeMoved));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, bump));
 }
 
 test "errpath: a fallible mlx_array fill loop frees only the built prefix" {
