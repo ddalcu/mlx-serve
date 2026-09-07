@@ -17,6 +17,7 @@
 //! broadcasts on `state_cond` so blocked callers wake.
 
 const std = @import("std");
+const media_cache = @import("media_cache.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -179,6 +180,10 @@ pub const LoadedModel = struct {
     /// across model families.
     chat_config: ?*ChatConfig,
     vision_encoder: ?*VisionEncoder,
+    /// CPU pixels are accessed on connection threads; projected arrays only on inference.
+    media_pixels: media_cache.Cache(media_cache.Pixels) = .{},
+    media_pixels_mu: std.Io.Mutex = .init,
+    media_embeddings: media_cache.Cache(media_cache.Embedding) = .{},
     drafter: ?*DrafterModel,
     /// DFlash block-drafter sidecar. Mutually exclusive with `drafter` by the
     /// loader's config-contract probe; `drafter_path`/`drafter_block_size`
@@ -375,6 +380,8 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
+        self.media_pixels.deinit(self.allocator);
+        self.media_embeddings.deinit(self.allocator);
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.deinit(self.allocator);
         self.session_busy = false;
@@ -545,6 +552,8 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
+        self.media_pixels.deinit(self.allocator);
+        self.media_embeddings.deinit(self.allocator);
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.clearRetainingCapacity();
         self.session_busy = false;

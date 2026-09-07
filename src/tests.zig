@@ -2,6 +2,8 @@
 // Run with: zig build test
 
 test {
+    _ = @import("media_prefix.zig");
+    _ = @import("media_cache.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
