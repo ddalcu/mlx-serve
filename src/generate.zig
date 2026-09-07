@@ -960,6 +960,17 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
     return step -| last_clear >= interval;
 }
 
+/// PURE: does this request return MLX's allocator pool once, between its last
+/// prefill chunk and its first decode tick?
+///
+/// The per-chunk clear runs before the last chunks' transient is freed, so that
+/// transient parks in the pool up to the cap and the first decode tick allocates
+/// on top of it (8.1 GB parked at the first tick of a 393k prefill). Gated on
+/// `longCtxGated`: every other arch keeps its previous call pattern exactly.
+pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
+    return config.longCtxGated();
+}
+
 /// Number of accepted draft tokens that may accompany the always-committed
 /// anchor token without crossing the request's output-token ceiling.
 pub fn capAcceptedForTokenBudget(accepted: u32, completion: u32, max_tokens: u32) u32 {
@@ -2942,6 +2953,15 @@ pub const Generator = struct {
 
         attachCp(&gen, &ssm_checkpoints, allocator);
         return gen;
+    }
+
+    /// Return the prefill's parked transients once, at the handover to decode.
+    /// Shares `advanceStep`'s clock: a clear here is a clear, so the decode
+    /// cadence measures its next interval from this point.
+    pub fn clearPoolBeforeDecode(self: *Generator) void {
+        if (!clearsPoolAtPrefillEnd(&self.xfm.config)) return;
+        _ = mlx.mlx_clear_cache();
+        self.last_cache_clear_step = self.step;
     }
 
     /// The ONE place `step` and `completion_tokens` advance — every decode path
@@ -13410,6 +13430,32 @@ test "clear cadence survives variable spec strides" {
     }
 }
 
+test "the allocator pool is returned at the prefill/decode handover, long-context gate only" {
+    // The per-chunk clear runs BEFORE the last chunks' transient is freed, so it
+    // parks in MLX's pool up to the cap and the first decode tick allocates on top
+    // of it (measured 8.1 GB parked at the first tick of a 393k prefill; a cold
+    // 524k died 0.5 GB over the plan ceiling on exactly that tick). One clear at the
+    // handover returns it. Every other arch keeps its previous call pattern.
+    const t = testing;
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    try t.expect(clearsPoolAtPrefillEnd(&qwen4));
+    for ([_][]const u8{
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_next",
+        "lfm2",
+        "nemotron_h",
+        "bailing_hybrid",
+        "llama",
+        "gemma4",
+        "deepseek_v4",
+        "muse_glimmer",
+    }) |mt| {
+        var cfg = model_mod.ModelConfig{ .model_type = mt };
+        try t.expect(!clearsPoolAtPrefillEnd(&cfg));
+    }
+}
+
 test "no decode path advances `step` outside advanceStep" {
     // Class guard for #110. `Generator.step` is the clear cadence's clock, so a
     // path that bumps it by hand is a path that strands its round's transients
@@ -13447,6 +13493,19 @@ test "no decode path advances `step` outside advanceStep" {
     // Exactly one: the assignment inside `advanceStep`. Zero means the field was
     // renamed and this guard went vacuous — update it with the rename.
     try testing.expectEqual(@as(usize, 1), total);
+
+    // Same discipline for the clock itself: every clear the Generator makes records
+    // it, so the decode cadence measures from the last ACTUAL clear. Two writers —
+    // `advanceStep` and the prefill/decode handover — and a third that forgot the
+    // write would leave the cadence firing against a stale clock.
+    const clock = "last_cache_clear_step" ++ " =";
+    var writers: usize = 0;
+    var clock_it = std.mem.splitScalar(u8, sources[0].src, '\n');
+    while (clock_it.next()) |raw| {
+        const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
+        if (std.mem.indexOf(u8, line, clock) != null) writers += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), writers);
 }
 
 test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {

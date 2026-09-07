@@ -5989,6 +5989,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
+    // The last chunks' transient is freed AFTER the loop's own per-chunk clear, so it
+    // parks in MLX's pool up to the cap and the first decode tick allocates on top of
+    // it. Returned once here, at the handover — long-context gate only.
+    if (slot.legacy_gen) |*g| g.clearPoolBeforeDecode();
     // The conn thread's `cached_tokens` counted against `xfm.cache` (legacy
     // global cache) which the slot doesn't use. The slot's `cached_tokens`
     // is the hot-cache match (or 0 if the hot cache missed / isn't
