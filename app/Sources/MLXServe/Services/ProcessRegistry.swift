@@ -304,14 +304,9 @@ final class ProcessRegistry: ObservableObject {
         processes.first { $0.handle == handle }?.status.isAlive ?? false
     }
 
-    /// Alive AND started by this chat.
-    ///
-    /// The counter is app-wide and restarts at `bg1` every launch, so a handle
-    /// is only an identity WITHIN one conversation: asked globally, a card in
-    /// an old chat reported a process another chat started today as its own,
-    /// and offered a ✕ that would have killed it. A nil `sessionId` (a surface
-    /// with no session of its own, such as a task run's transcript) keeps the
-    /// global answer rather than losing its badge.
+    /// Alive AND started by this chat: the counter is app-wide and restarts at
+    /// `bg1` every launch, so a handle is only an identity within one chat.
+    /// A nil `sessionId` (a task run's transcript) keeps the global answer.
     func isAlive(handle: String, sessionId: UUID?) -> Bool {
         guard let sessionId else { return isAlive(handle: handle) }
         return processes.first { $0.handle == handle && $0.sessionId == sessionId }?
@@ -435,24 +430,16 @@ enum ProcessCardControls {
         (handles ?? []).filter(isAlive)
     }
 
-    /// Live handles split by whether some call on the card claimed one, which
-    /// decides where its pill goes: a claimed handle's pill sits beside the tool
-    /// that started it (inside the panel), an unclaimed one has nowhere to go
-    /// but the header.
+    /// Claimed handles show beside their call inside the panel, unclaimed ones
+    /// in the header.
     static func split(live: [String],
                       claimedBy callHandles: [String?]) -> (claimed: [String], unclaimed: [String]) {
         let claims = Set(callHandles.compactMap { $0 })
         return (live.filter { claims.contains($0) }, live.filter { !claims.contains($0) })
     }
 
-    /// Which card may still speak for each handle, given the announcements in
-    /// transcript order.
-    ///
-    /// `killable` alone was not enough: numbering restarts at `bg1` on every
-    /// launch and the registry knows only the name, so an old card asking
-    /// "is bg1 alive?" was told yes about a process started today and offered
-    /// to kill it. The LAST announcement of a handle wins; earlier cards drop
-    /// it and show nothing.
+    /// Handle names are reused across launches: the last announcement of a
+    /// handle owns it, earlier cards drop it.
     static func handleOwnership<ID: Hashable>(_ announcements: [(ID, [String])]) -> [ID: [String]] {
         var owner: [String: ID] = [:]
         for (id, handles) in announcements {

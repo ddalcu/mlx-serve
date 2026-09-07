@@ -213,22 +213,6 @@ final class TranscriptTypographyTests: XCTestCase {
         XCTAssertEqual(Set(keys).count, ChatColumnWidth.allCases.count)
     }
 
-    /// The menu and the Settings row are two doors onto ONE setting. Reading a
-    /// different key in either place gives the app two states that disagree,
-    /// and the one you can see is not always the one that draws.
-    func testTheMenuAndSettingsWriteTheSameKey() throws {
-        for path in ["Sources/MLXServe/MLXServeApp.swift",
-                     "Sources/MLXServe/Views/SettingsView.swift"] {
-            let url = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent().deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent(path)
-            let source = try String(contentsOf: url, encoding: .utf8)
-            XCTAssertTrue(source.contains("InterfacePrefKey.chatColumn"),
-                          "\(path) must go through the shared key, never a literal")
-        }
-    }
-
     func testAnUnknownStoredColumnFallsBackToWide() {
         UserDefaults.standard.set("gigantic", forKey: InterfacePrefKey.chatColumn)
         defer { UserDefaults.standard.removeObject(forKey: InterfacePrefKey.chatColumn) }

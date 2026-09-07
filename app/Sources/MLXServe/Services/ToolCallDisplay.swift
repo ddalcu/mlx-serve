@@ -1,35 +1,20 @@
 import Foundation
 
-/// What a tool-call card shows, derived from the STRUCTURED record rather than
-/// from the summary text.
-///
-/// The transcript used to render `call.content`, which the engine had just
-/// built as `**name**(key: value, key: value)` with each value truncated at 80
-/// characters — so the card stripped the bold markers off a string that had
-/// been assembled purely to be read back. `SerializedToolCall` carries the name
-/// and the arguments as JSON, and the result rides its own message, so nothing
-/// here has to be parsed out of prose.
+/// What a tool-call card shows, derived from `SerializedToolCall` rather than
+/// the engine's `**name**(key: value…)` summary text (values cut at 80 chars).
 enum ToolCallDisplay {
 
-    /// One argument, ready to draw.
     struct Argument: Equatable, Identifiable {
         let name: String
         let value: String
         var id: String { name }
     }
 
-    /// Longest value shown. A `writeFile` carries an entire file in `content`,
-    /// and the panel is a summary of what was asked, not a second copy of the
-    /// document — the file itself is one `readFile` away.
+    /// Longest value shown: a `writeFile` carries the whole file in `content`.
     static let valueLimit = 1200
 
-    /// Arguments in the order the model sent them.
-    ///
-    /// `JSONSerialization` hands back a dictionary, which has no order, so the
-    /// keys are recovered from the raw JSON by where they appear in it. A model
-    /// writes `path` before `content` for a reason, and re-sorting them
-    /// alphabetically would put a 4 KB file body above the path it was written
-    /// to.
+    /// Arguments in the order the model sent them, recovered from the raw JSON
+    /// (a dictionary has none; alphabetical puts a file body above its path).
     static func arguments(fromJSON json: String) -> [Argument] {
         guard let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -40,20 +25,13 @@ enum ToolCallDisplay {
         }
     }
 
-    /// A value as one line: every kind of line break becomes a space, runs of
-    /// whitespace collapse, and a long one is cut with an ellipsis.
-    ///
-    /// Newlines are what make an argument panel unreadable — a file body turns
-    /// a two-line card into a two-screen one — and the panel's job is to let
-    /// you see WHAT was passed at a glance.
+    /// A value as one line: whitespace collapsed, cut at `valueLimit`.
     static func flatten(_ value: Any?) -> String {
         let text: String
         switch value {
         case let s as String: text = s
         case let n as NSNumber:
-            // JSON's `true` arrives as an NSNumber whose `stringValue` is "1".
-            // Only its CoreFoundation type tells a boolean from the number one,
-            // and `run_in_background: 1` is not what the model sent.
+            // JSON `true` arrives as an NSNumber with `stringValue` "1".
             text = CFGetTypeID(n) == CFBooleanGetTypeID()
                 ? (n.boolValue ? "true" : "false")
                 : n.stringValue
@@ -63,11 +41,6 @@ enum ToolCallDisplay {
                 .flatMap { String(data: $0, encoding: .utf8) } ?? String(describing: value ?? "")
         }
 
-        // Split on whitespace rather than matching it: `CharacterSet.newlines`
-        // already covers CR, LF, CRLF and the two Unicode separators, and an
-        // ICU pattern spelling them out needs ` `, not Swift's `\u{2028}` —
-        // which makes the whole pattern invalid, so nothing is replaced at all
-        // and a file body reaches the panel with its newlines intact.
         let collapsed = text
             .components(separatedBy: CharacterSet.newlines.union(.whitespaces))
             .filter { !$0.isEmpty }
@@ -77,11 +50,8 @@ enum ToolCallDisplay {
             : collapsed
     }
 
-    /// The result, without the `**name** → ` the summary was built with.
-    ///
-    /// Kept tolerant: a summary that does not carry the marker (an older
-    /// history, a shape that changes upstream) is shown as it is rather than
-    /// silently emptied.
+    /// The result without the `**name** → ` prefix; a summary without the
+    /// marker is shown as is.
     static func resultBody(_ summary: String) -> String {
         guard let range = summary.range(of: "** → ") else {
             return summary.replacingOccurrences(of: "**", with: "")
@@ -89,17 +59,8 @@ enum ToolCallDisplay {
         return String(summary[range.upperBound...])
     }
 
-    /// The argument each tool is ABOUT, shown beside its name in the header so
-    /// a settled call says what it did without being opened.
-    ///
-    /// One entry per tool rather than a rule ("show the first argument"): the
-    /// interesting one is not always first, and for several tools it is not the
-    /// one a rule would pick — `searchFiles` is about its `pattern`, not the
-    /// `path` it searched, and `editFile` is about the file, not the text.
-    ///
-    /// A tool that is not listed shows nothing extra, which is what every tool
-    /// did before this existed. So a new tool degrades to the old behaviour
-    /// rather than to a wrong guess.
+    /// The argument each tool is about, shown in the header. A list, not a
+    /// rule: an unlisted tool shows nothing extra rather than a wrong guess.
     static let headlineArgument: [String: String] = [
         "shell": "command",
         "cwd": "path",
@@ -121,18 +82,12 @@ enum ToolCallDisplay {
         "generate_video": "prompt",
     ]
 
-    /// Tools whose behaviour is really chosen by ONE argument, so that argument
-    /// reads as part of the name: `browse:click` rather than `browse` with a
-    /// `click` buried in the panel.
-    ///
-    /// `browse` is the whole list today. Its seven actions (navigate, readText,
-    /// extractText, readHTML, click, executeJS, screenshot) share nothing but a
-    /// browser — they could each have been a tool of their own.
+    /// Tools whose behaviour is chosen by one argument, shown as part of the
+    /// name (`browse:click`).
     static let variantArgument: [String: String] = [
         "browse": "action",
     ]
 
-    /// The variant part of a call's name, or nil for a tool that has none.
     static func variant(toolName: String, arguments: [Argument]) -> String? {
         let bare = toolName.components(separatedBy: "__").last ?? toolName
         guard let key = variantArgument[toolName] ?? variantArgument[bare],
@@ -142,23 +97,13 @@ enum ToolCallDisplay {
         return value
     }
 
-    /// Longest headline. Short, because it shares a line with the tool's name
-    /// and a chevron: it is a reminder of what the call was about, and the
-    /// panel below holds the rest.
     static let headlineLimit = 90
 
-    /// What follows the tool's name in the header, or nil when this tool has no
-    /// headline argument or the call did not carry it.
-    ///
-    /// An MCP tool (`<server>__<tool>`) is looked up under its bare name too,
-    /// so a server exposing `readFile` gets the same treatment as the built-in.
+    /// What follows the tool's name in the header. An MCP tool is looked up
+    /// under its bare name too.
     static func headline(toolName: String, arguments: [Argument]) -> String? {
         let bare = MCPManager.parseNamespacedName(toolName)?.tool ?? toolName
-        // `browse` has no single interesting argument: its action decides which
-        // one matters (a selector for click, a script for executeJS, a URL only
-        // for navigate). Take whichever is present, in that order of interest —
-        // `url` is last because the browser keeps its page between calls, so
-        // most actions carry none.
+        // `browse`: the action decides which argument matters.
         if bare == "browse" {
             for key in ["selector", "script", "url"] {
                 if let value = arguments.first(where: { $0.name == key })?.value, !value.isEmpty {
@@ -178,18 +123,9 @@ enum ToolCallDisplay {
             : value
     }
 
-    /// A second headline piece, taken from what the call RETURNED.
-    ///
-    /// Separate from `headline` because it answers a different question: the
-    /// argument says what the call was about, this says what came of it. For
-    /// `writeFile` that is the size actually written — which is the number
-    /// worth seeing without opening the panel, and is not knowable from the
-    /// arguments (the value shown there is truncated, and an append writes only
-    /// its own chunk).
-    ///
-    /// Nil while the call is still running, for a tool with no rule, or when
-    /// the output does not match — a changed message must go quiet rather than
-    /// show a wrong number.
+    /// What came of the call, from its result text. Nil for a tool with no
+    /// rule or when the output does not match: a changed message goes quiet
+    /// rather than showing a wrong number.
     static func resultHeadline(toolName: String, result: String) -> String? {
         let bare = toolName.components(separatedBy: "__").last ?? toolName
         switch bare {
@@ -199,27 +135,16 @@ enum ToolCallDisplay {
             else { return nil }
             return "\(result[match]) chars"
         case "readFile":
-            // Lines, not characters: the tool numbers every line it returns
-            // (`42| let x = 1`) precisely because the model works in lines —
-            // `editFile` takes a startLine/endLine — so that is the unit the
-            // call is measured in. Counted off the result rather than the file,
-            // so a partial read (startLine/endLine, or a long file truncated on
-            // its way to the model) reports what was actually handed over.
-            //
-            // The metadata header a large file carries is one of those lines,
-            // so it is dropped rather than counted.
+            // Counted off the result (a partial read reports what was handed
+            // over); the `[File: …]` metadata header is not a line.
             let lines = result
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .filter { !$0.hasPrefix("[File: ") }
             guard !lines.isEmpty, !result.isEmpty else { return nil }
             return "\(lines.count) line\(lines.count == 1 ? "" : "s")"
         case "editFile":
-            // Two modes, and only one of them can be counted. Line mode
-            // returns "Edited x (replaced lines 4-9)" — the range AFTER it was
-            // clamped to the file, so a model asking for 4-999 in a 50-line
-            // file reports what it really replaced. Text mode (find/replace)
-            // returns "Edited x" and nothing else: `find` can be part of one
-            // line, so there is no line count to give.
+            // Line mode returns "replaced lines 4-9" (clamped to the file);
+            // text mode has no count to give.
             guard let range = result.range(of: "replaced lines \\d+-\\d+",
                                            options: .regularExpression) else { return nil }
             let bounds = result[range]
@@ -230,19 +155,11 @@ enum ToolCallDisplay {
             let count = bounds[1] - bounds[0] + 1
             return "\(count) line\(count == 1 ? "" : "s")"
         case "searchFiles":
-            // The output is one line per hit, `path:line:text`, with context
-            // lines around it spelled `path-line-text` — the separator is what
-            // tells a match from its context, so only the colon form is
-            // counted. Both numbers matter and mean different things: forty
-            // hits in one file is a busy file, forty across twenty is a
-            // codebase-wide name.
+            // Hits are `path:line:text`; context lines are `path-line-text`.
             if result.hasPrefix("No matches found") { return "nothing found" }
             var files = Set<String>()
             var hits = 0
             for line in result.split(separator: "\n") {
-                // The FIRST `:<digits>:` ends the path. A path may contain a
-                // colon, so the search is for the whole separator, not for a
-                // colon on its own.
                 guard let sep = line.range(of: ":\\d+:", options: .regularExpression)
                 else { continue }
                 hits += 1
@@ -252,9 +169,6 @@ enum ToolCallDisplay {
             return "\(hits) occurrence\(hits == 1 ? "" : "s") in "
                 + "\(files.count) file\(files.count == 1 ? "" : "s")"
         case "listFiles":
-            // One entry per line, or "No files found in x". The listing stops
-            // at 200 and says so on its own line, which is not an entry — and
-            // the count then reads "200+", because the real number is unknown.
             if result.hasPrefix("No files found") { return "nothing found" }
             let truncated = result.contains("[... truncated at 200 entries]")
             let entries = result
@@ -269,14 +183,8 @@ enum ToolCallDisplay {
         }
     }
 
-    /// The background handle a `shell` result announced, if it announced one.
-    ///
-    /// `processHandles` is collected across the whole ROUND and pinned to the
-    /// one summary message, so nothing in the model records which call started
-    /// which process — with two parallel `shell` calls there were two kill
-    /// buttons and no way to tell which was which. The handle IS in the result
-    /// text, in all three spellings the tool produces (host, sandbox, and a
-    /// foreground command that outlived its timeout): `… as bg1 (pid 123)`.
+    /// The handle a `shell` result announced (`… as bg1 (pid 123)`).
+    /// `processHandles` is per round, so this is the only per-call association.
     static func backgroundHandle(inResult result: String) -> String? {
         guard let range = result.range(of: " as bg\\d+ \\(", options: .regularExpression)
         else { return nil }
@@ -285,23 +193,13 @@ enum ToolCallDisplay {
             .replacingOccurrences(of: "as ", with: "")
     }
 
-    /// The name as a reader should see it: an MCP tool's `<server>__<tool>` is
-    /// a wire format, and `perry-memory/get_context` says the same thing in the
-    /// notation people already read as "this thing, over there".
-    ///
-    /// Split by `MCPManager.parseNamespacedName`, the function dispatch itself
-    /// uses, so the card can never disagree with where the call went: the
-    /// server half cannot contain `__` (`namespacedName` collapses it), and
-    /// everything after the first separator is the tool's own name, `__`
-    /// included. A name that is not of that shape is shown untouched.
+    /// `server__tool` shown as `server/tool`, split the way dispatch splits it.
     static func displayName(_ toolName: String) -> String {
         guard let (server, tool) = MCPManager.parseNamespacedName(toolName) else { return toolName }
         return "\(server)/\(tool)"
     }
 
-    /// The tool's name for the header, from the structured record when there is
-    /// one and from the summary text otherwise (a history written before the
-    /// calls were recorded still has `**name**(args)` to read).
+    /// From the structured record, else from the `**name**(args)` summary.
     static func title(calls: [SerializedToolCall], summary: String) -> String {
         if let first = calls.first, !first.name.isEmpty {
             return calls.count > 1 ? "\(first.name) +\(calls.count - 1)" : first.name
@@ -316,8 +214,7 @@ enum ToolCallDisplay {
     private static func orderedKeys(in json: String, among keys: Set<String>) -> [String] {
         var found: [(offset: Int, key: String)] = []
         for key in keys {
-            // The key as JSON writes it: quoted, followed by a colon. Searching
-            // for the bare word would match it inside a VALUE.
+            // Quoted and followed by a colon, or it matches inside a value.
             guard let range = json.range(of: "\"\(key)\"\\s*:", options: .regularExpression) else {
                 found.append((Int.max, key))
                 continue

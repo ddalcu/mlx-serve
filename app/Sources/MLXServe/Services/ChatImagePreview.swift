@@ -8,15 +8,8 @@ import AppKit
 /// the system.
 enum ChatImagePreview {
 
-    /// How wide an attachment draws, given that every attachment in a message
-    /// is the same HEIGHT: its own aspect ratio, so a landscape shot takes
-    /// twice the room of a portrait one and a row of them still lines up.
-    ///
-    /// Clamped at both ends. A panorama would otherwise be wider than the
-    /// message it sits in and could never share a row with anything; a picture
-    /// one pixel wide would vanish. A picture with no size at all (a decode
-    /// that produced an empty representation) falls back to square rather than
-    /// dividing by zero.
+    /// Attachment width at the shared height, from its own ratio, clamped so a
+    /// panorama can share a row and a sliver stays visible. No size = square.
     static func displayWidth(for image: NSImage,
                              height: CGFloat = ChatMetrics.attachmentHeight,
                              maxWidth: CGFloat = ChatMetrics.userBubbleMaxWidth) -> CGFloat {
@@ -26,18 +19,8 @@ enum ChatImagePreview {
         return min(max(width, height * 0.35), maxWidth)
     }
 
-    /// The exact box a GENERATED picture draws in: its own ratio, fitted under
-    /// both caps.
-    ///
-    /// Exact, not `maxWidth`/`maxHeight` with `.fit`: a frame bigger than what
-    /// it holds is what the rounded corners clip, so a square picture in a
-    /// 420x300 frame had its corners rounded on the empty space beside it and
-    /// stayed square itself. Attachments avoid this by filling their frame,
-    /// which CROPS — acceptable for a photo in a row of thumbnails, not for the
-    /// picture the model was asked to make.
-    ///
-    /// Width can run out first (a panorama), and then the height comes down
-    /// with it rather than the picture stretching.
+    /// Exact box for a generated picture under both caps: the rounded corners
+    /// clip the frame, so the frame must be the picture (no crop, no fit).
     static func displaySize(for image: NSImage,
                             maxHeight: CGFloat,
                             maxWidth: CGFloat) -> CGSize {

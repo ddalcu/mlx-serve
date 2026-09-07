@@ -213,15 +213,9 @@ struct ChatImage: Identifiable, Codable, Equatable {
     }
 }
 
-/// How a reasoning block's duration reads once it is over.
 enum ThinkingDuration {
 
-    /// "Thinking" while it is still happening or was never measured, and
-    /// "Thinking took 4 seconds" once it is done.
-    ///
-    /// Whole seconds, and minutes once there are any: a tenth of a second is
-    /// below what anyone waiting can perceive, and "127 seconds" is a number
-    /// you have to do arithmetic on to understand.
+    /// "Thinking" until measured, then "Thinking took 2 minutes 7 seconds".
     static func label(seconds: Double?) -> String {
         guard let seconds, seconds >= 1 else { return "Thinking" }
         let total = Int(seconds.rounded())
@@ -304,12 +298,8 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var promptTokens: Int?
     var completionTokens: Int?
     var tokensPerSecond: Double?
-    /// How long the model spent reasoning before it started answering, in
-    /// seconds. Measured from the message's own timestamp, so it includes the
-    /// prefill — which is time you waited, whatever it was spent on.
-    ///
-    /// Optional, and absent from every history written before it existed: a
-    /// reply from last week simply says "Thinking" with no duration.
+    /// Seconds from the message's timestamp to the first content delta
+    /// (includes prefill). Absent in older histories.
     var thinkingSeconds: Double?
     var toolCallId: String?   // For tool response messages
     var toolName: String?     // For tool response messages

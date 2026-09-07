@@ -84,8 +84,7 @@ private struct ChatImageAttachment: View {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    // The picture's own box, so the rounded corners round the
-                    // PICTURE — see `displaySize`.
+                    // The picture's own box, so the corners round the picture.
                     .frame(width: box.width, height: box.height)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .onTapGesture(count: 2) {
@@ -93,16 +92,10 @@ private struct ChatImageAttachment: View {
                     }
                     .help("Double-click to open")
             }
-            // Same shape as the clip below it: the prompt is what makes a
-            // timestamped filename mean anything months later, so compact
-            // tightens it to one line rather than dropping it. A button laid
-            // over the picture read poorly on a light image and was a pattern
-            // this app uses nowhere else.
+            // Compact tightens the caption to one line rather than dropping it.
             ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
         }
-        // Leading, not the default centre: without it a picture narrower than
-        // the cap sat centred in the cap and read as indented from a left edge
-        // every other row in the transcript shares.
+        // Leading: `maxWidth` alone centres.
         .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         .onAppear {
             if image == nil { image = NSImage(contentsOfFile: ref.path) }
@@ -110,9 +103,7 @@ private struct ChatImageAttachment: View {
     }
 }
 
-/// Reveal the generated file in Finder. Its own type because it appears both
-/// under a row and beside a track's play button, and they must be the same
-/// control.
+/// Reveal the generated file in Finder.
 private struct RevealInFinderButton: View {
     let path: String
 
@@ -134,8 +125,6 @@ private struct RevealInFinderButton: View {
 /// prompt is what makes a bare timestamped filename mean something months later.
 private struct ChatMediaCaption: View {
     let ref: ChatMediaRef
-    /// One line in compact mode, where the caption survives only because a
-    /// video player has no free corner to put the button in.
     var lines: Int = 2
 
     var body: some View {
@@ -193,8 +182,7 @@ private struct ChatAudioAttachment: View {
                     }
                 }
                 Spacer(minLength: 4)
-                // Compact drops the caption, so the button joins the play row
-                // rather than leaving the track with no way to its file.
+                // Compact drops the caption, so the button joins the play row.
                 if ChatMetrics.compactMode { RevealInFinderButton(path: ref.path) }
             }
             if !ChatMetrics.compactMode { ChatMediaCaption(ref: ref) }
@@ -231,17 +219,12 @@ private struct ChatVideoAttachment: View {
                     Color.black.opacity(0.15)
                 }
             }
-            // A fixed box: the clip's own ratio isn't known until the asset
-            // loads, and a player resizing under the reply as it loads is worse
-            // than letterboxing inside a steady frame.
+            // Fixed box: the clip's ratio is unknown until the asset loads.
             .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth,
                    minHeight: ChatMetrics.generatedVideoHeight,
                    maxHeight: ChatMetrics.generatedVideoHeight)
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            // Every corner of an AVPlayerView belongs to its own controls
-            // (AirPlay and volume on top, transport below), so the button
-            // stays under the player and the caption tightens to one line
-            // instead.
+            // An AVPlayerView's own controls own all four corners.
             ChatMediaCaption(ref: ref, lines: ChatMetrics.compactMode ? 1 : 2)
                 .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
         }

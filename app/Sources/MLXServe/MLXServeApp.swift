@@ -290,44 +290,28 @@ struct MLXCoreApp: App {
             // the tray popover, reachable from the menu bar and Help-menu
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
-            // The reading width, reachable without a trip through Settings —
-            // it is the one interface preference you change WHILE reading, and
-            // judging it means seeing the conversation change under you.
-            //
-            // The same `@AppStorage` key the Settings row writes, so the two
-            // controls are one setting with two doors rather than two states
-            // that can disagree. The transcript's identity carries the value
-            // (see `ChatDetailView`), so an open chat redraws at once.
-            // `CommandGroup`, NOT `CommandMenu("View")` — the latter builds a
-            // SECOND View menu beside the system one instead of adding to it.
-            // Placed after the sidebar item, so it lands among the other
-            // "what does this window look like" commands.
+            // View ▸ Interface: the same `@AppStorage` keys the Settings rows
+            // write. `CommandGroup`, not `CommandMenu("View")`, which would
+            // build a second View menu beside the system one.
             CommandGroup(after: .sidebar) {
                 Menu {
                     ForEach(ChatColumnWidth.allCases) { width in
                         Toggle(isOn: Binding(
                             get: { chatColumnRaw == width.rawValue },
-                            // Radio behaviour: switching one ON is the whole
-                            // interaction, and turning the current one off
-                            // would leave the chat with no width at all.
                             set: { if $0 { chatColumnRaw = width.rawValue } }
                         )) {
                             Text("\(width.label) chat column")
                         }
-                        .keyboardShortcut(width.menuShortcut, modifiers: [])
+                        .keyboardShortcut(width.menuShortcut, modifiers: [.command, .option])
                     }
 
                     Divider()
 
-                    // The other half of the reading rhythm, and the other thing
-                    // you judge while looking at a conversation rather than at
-                    // a settings pane. Same key the Settings toggle writes.
-                    // Control, not Option: holding Option over a transcript puts
-                    // NSTextView into rectangular-selection mode (the cursor
-                    // turns into a crosshair), and once the text view has taken
-                    // that on, the key equivalent never arrives.
+                    // Never a bare Control combo: menu key equivalents run
+                    // before keyDown, so ⌃C would be stolen from the embedded
+                    // terminal.
                     Toggle("Compact mode", isOn: $compactMode)
-                        .keyboardShortcut("c", modifiers: [.control])
+                        .keyboardShortcut("c", modifiers: [.command, .option])
                 } label: {
                     Label("Interface", systemImage: "paintbrush")
                 }

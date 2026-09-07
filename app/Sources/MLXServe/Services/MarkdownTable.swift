@@ -144,23 +144,9 @@ enum MarkdownTable {
     /// `NSTextTable` has no "tight to content" mode — a table always fills the
     /// width it is given — so these are relative weights, not point widths.
     ///
-    /// Two things decide a column's share, and they are not the same thing.
-    ///
-    /// **How much text it holds** is what it would LIKE, and it is compressed
-    /// (`sqrt`) rather than taken at face value: a column with ten times the
-    /// text does not need ten times the width, because prose wraps onto more
-    /// lines and reads perfectly well. Weighting it linearly is what put
-    /// "Lifespan" beside a column of sentences and left it 3% of the table.
-    ///
-    /// **Its longest WORD** is what it NEEDS, and it is a floor. A word cannot
-    /// wrap, so a column narrower than its longest word breaks mid-word - a
-    /// header rendered as "Life spa n" is the tell.
-    ///
-    /// That floor is capped (`maxWordFloor`), because the floor is only worth
-    /// honouring while it leaves room for everything else. One snake_case
-    /// identifier, URL or hash would otherwise claim the table and squeeze four
-    /// readable columns into slivers. Past the cap the monster is on its own
-    /// and gets broken mid-word, which is the better of two bad outcomes.
+    /// Share = max(sqrt-compressed content length, longest word). Prose wraps,
+    /// a word does not; the word floor is capped so one URL or hash cannot
+    /// claim the table.
     static func columnFractions(headers: [String], rows: [[String]]) -> [CGFloat] {
         let cols = headers.count
         guard cols > 0 else { return [] }
@@ -174,11 +160,7 @@ enum MarkdownTable {
             }
         }
 
-        /// Characters a column may demand for one unbreakable word. Beyond
-        /// this it competes on content like everything else.
         let maxWordFloor: CGFloat = 18
-        /// Turns a compressed length back into something comparable to a
-        /// character count: 135 characters of prose asks for about 35.
         let compressionScale: CGFloat = 3
         /// An empty column still gets a visible sliver rather than collapsing.
         let floor: CGFloat = 3
@@ -193,7 +175,6 @@ enum MarkdownTable {
         return weighted.map { $0 / total }
     }
 
-    /// Longest run with no space in it — what the column cannot wrap out of.
     private static func longestWordLength(_ text: String) -> Int {
         text.split(separator: " ").map(\.count).max() ?? 0
     }
