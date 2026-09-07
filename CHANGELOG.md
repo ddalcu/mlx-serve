@@ -15,6 +15,7 @@
 ### Fixes
 
 - A failure inside Flash Next's draft head could free the same buffer twice and take the server down instead of returning an error. Latent — the path had never failed in practice.
+- More of the same class: an out-of-memory while growing the attention cache, or inside a speculative round, could free a buffer twice or free memory that was never built, taking the server down instead of failing one request. Latent until #353 made these paths reachable.
 - Models whose output layer is padded past the end of their tokenizer (Qwen 3.8 Flash Next has 243 such rows) could draw one of those rows: the token decoded to nothing, so a reply lost a step and the wasted token stayed in the context. Those rows are now never sampled; reported log-probabilities are unchanged.
 - A long hybrid-model session could suddenly re-prefill its entire prompt from scratch (nine minutes at 390k tokens) with nothing in the log. A cache entry committed after restoring an earlier entry never inherited that entry's restore points, so once the original was evicted nothing usable remained; such entries now inherit them, and a miss that had a matching prompt is always logged.
 - A pack that ships both a drafter and an MTP head now uses the drafter. Before, the MTP head always won and the drafter silently never ran, even when you passed `--drafter`. `--no-drafter` hands the round back to MTP.

@@ -5192,6 +5192,11 @@ fn fusedSdpa256Impl(
             var m_new = mlx.mlx_array_new();
             var l_new = mlx.mlx_array_new();
             var o_new = mlx.mlx_array_new();
+            errdefer {
+                if (m_new.ctx != null) _ = mlx.mlx_array_free(m_new);
+                if (l_new.ctx != null) _ = mlx.mlx_array_free(l_new);
+                if (o_new.ctx != null) _ = mlx.mlx_array_free(o_new);
+            }
             try mlx.check(mlx.mlx_vector_array_get(&m_new, outputs_vec, 1));
             try mlx.check(mlx.mlx_vector_array_get(&l_new, outputs_vec, 2));
             try mlx.check(mlx.mlx_vector_array_get(&o_new, outputs_vec, 3));
@@ -5201,6 +5206,9 @@ fn fusedSdpa256Impl(
             m_prev = m_new;
             l_prev = l_new;
             o_prev = o_new;
+            m_new = .{ .ctx = null };
+            l_new = .{ .ctx = null };
+            o_new = .{ .ctx = null };
         }
     }
     fused256_last_dispatch_count = dispatches;
@@ -5692,8 +5700,14 @@ pub const KVCache = struct {
     /// call.
     pub fn snapshot(self: *const KVCache) !KVCacheSnapshot {
         const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |*e| freeKVEntry(e);
+            self.allocator.free(out);
+        }
         for (self.entries, 0..) |src, i| {
             out[i] = newEmptyKVEntry();
+            built = i + 1;
             out[i].offset = src.offset;
             out[i].initialized = src.initialized;
             if (src.initialized) {
@@ -6181,24 +6195,32 @@ pub const KVCache = struct {
         const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
         if (initialized and offset > 0) {
             var new_buf = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(new_buf);
             try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
             const off_c: c_int = @intCast(offset);
             const su_start = [_]c_int{ 0, 0, 0, 0 };
             const su_stop = [_]c_int{ B, heads, off_c, last_dim };
             const su_strides = [_]c_int{ 1, 1, 1, 1 };
             var old_data = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(old_data);
             try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
             var updated = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(updated);
             try mlx.check(mlx.mlx_slice_update(&updated, new_buf, old_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
             _ = mlx.mlx_array_free(old_data);
+            old_data = .{ .ctx = null };
             _ = mlx.mlx_array_free(new_buf);
+            new_buf = .{ .ctx = null };
             _ = mlx.mlx_array_free(buf.*);
             buf.* = updated;
+            updated = .{ .ctx = null };
         } else {
-            _ = mlx.mlx_array_free(buf.*);
             var new_buf = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(new_buf);
             try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
+            _ = mlx.mlx_array_free(buf.*);
             buf.* = new_buf;
+            new_buf = .{ .ctx = null };
         }
     }
 
@@ -6389,6 +6411,7 @@ pub const KVCacheSnapshot = struct {
         }
         for (self.entries, 0..) |src, i| {
             out[i] = newEmptyKVEntry();
+            built = i + 1;
             out[i].initialized = src.initialized;
             out[i].offset = @min(src.offset, len);
             if (src.initialized) {
@@ -6402,7 +6425,6 @@ pub const KVCacheSnapshot = struct {
                     out[i].values_biases = try trimRowsOwned(src.values_biases, keep, s);
                 }
             }
-            built = i + 1;
         }
         // One batched eval, like `captureSsmCheckpoint`: without it the lazy
         // copy nodes pin the parent buffers — the capacity the trim exists
@@ -6999,6 +7021,7 @@ pub fn captureSsmCheckpoint(
             .ssm_state = mlx.mlx_array_new(),
             .initialized = src.initialized,
         };
+        errdefer ssmSnapshotDeinit(&out);
         // Per-field null guards mirror `ssmSnapshot` — either state may
         // legitimately be null (LFM2 gated_conv never sets ssm_state).
         if (src.conv_state.ctx != null) {
@@ -13960,8 +13983,7 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        // The slices already handed out are mlx handles, not just slice bytes —
-        // freeing `out` alone on the error path leaks every one of them.
+        // Each slot holds an mlx handle; free the handles before the slice.
         var built: usize = 0;
         errdefer {
             for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
@@ -14083,13 +14105,19 @@ pub const Transformer = struct {
         const lshape = mlx.getShape(logits);
         const vocab: c_int = lshape[2];
         const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
-        errdefer self.allocator.free(out);
+        // Each slot holds an mlx handle; free the handles before the slice.
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(out);
+        }
         for (out, 0..) |*slot, i| {
             const i_c: c_int = @intCast(i);
             const start = [_]c_int{ i_c, 0, 0 };
             const stop = [_]c_int{ i_c + 1, 1, vocab };
             const strides = [_]c_int{ 1, 1, 1 };
             slot.* = mlx.mlx_array_new();
+            built = i + 1;
             try mlx.check(mlx.mlx_slice(slot, logits, &start, 3, &stop, 3, &strides, 3, self.s));
         }
         return out;
@@ -14351,6 +14379,7 @@ pub const Transformer = struct {
         const strides = [_]c_int{ 1, 1, 1 };
         var mixed = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&mixed, h, &start, 3, &stop, 3, &strides, 3, self.s));
+        errdefer _ = mlx.mlx_array_free(mixed);
         const inj_shape = [_]c_int{ batch, seq_len, hc, 1 };
         return .{ .mixed = mixed, .inj = try standinOnes(&inj_shape, self.s) };
     }
@@ -14386,8 +14415,10 @@ pub const Transformer = struct {
         if (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled() and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
             var pd: HcPending = undefined;
             pd.out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(pd.out);
             try mlx.check(mlx.mlx_array_set(&pd.out, out));
             pd.inj = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(pd.inj);
             try mlx.check(mlx.mlx_array_set(&pd.inj, inj));
             pending.* = pd;
             return;
@@ -14550,9 +14581,12 @@ pub const Transformer = struct {
             std.debug.assert(ctx.ple_pending == null);
             @memset(pk, 0);
             const emb = mlx.mlx_array_new_data(pk.ptr, &shape, 3, .bfloat16);
+            errdefer _ = mlx.mlx_array_free(emb);
             var emb_ref = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(emb_ref);
             try mlx.check(mlx.mlx_array_set(&emb_ref, emb));
             var ids_ref = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(ids_ref);
             try mlx.check(mlx.mlx_array_set(&ids_ref, token_ids));
             ctx.ple_pending = .{ .emb = emb_ref, .token_ids = ids_ref, .entry = entry, .layer = layer, .seq_len = seq_len, .capture = capture };
             return emb;
@@ -15871,7 +15905,10 @@ pub const Transformer = struct {
         // Vision rows splice into the `hidden`-wide embeddings BEFORE the
         // hyper-connection tile (the reference masked_scatters, then repeats).
         var emb = try self.embedding(token_ids);
-        emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        {
+            errdefer _ = mlx.mlx_array_free(emb);
+            emb = try self.applyVisionEmbeddingsWith(ctx, emb, token_ids);
+        }
         defer _ = mlx.mlx_array_free(emb);
         const x_shape = mlx.getShape(emb);
         const batch: c_int = x_shape[0];
@@ -16035,18 +16072,21 @@ pub const Transformer = struct {
         var pclk: ProfClock = if (prof_on) ProfClock.init() else undefined;
 
         var h = try self.embedding(token_ids);
+        {
+            errdefer _ = mlx.mlx_array_free(h);
 
-        // Inkling: RMS norm on the embeddings (model.llm.embed_norm).
-        if (is_inkling) {
-            if (self.embedding_norm) |en| {
-                const normed_emb = try self.rmsNorm(h, en);
-                _ = mlx.mlx_array_free(h);
-                h = normed_emb;
+            // Inkling: RMS norm on the embeddings (model.llm.embed_norm).
+            if (is_inkling) {
+                if (self.embedding_norm) |en| {
+                    const normed_emb = try self.rmsNorm(h, en);
+                    _ = mlx.mlx_array_free(h);
+                    h = normed_emb;
+                }
             }
-        }
 
-        // Splice vision embeddings at image_token_id positions (prefill only)
-        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+            // Splice vision embeddings at image_token_id positions (prefill only)
+            h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+        }
 
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
@@ -17588,7 +17628,9 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sf);
         var cos = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&cos, cf, dtype, self.s));
+        errdefer _ = mlx.mlx_array_free(cos);
         var sin = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(sin);
         try mlx.check(mlx.mlx_astype(&sin, sf, dtype, self.s));
         return .{ .cos = cos, .sin = sin };
     }
@@ -25721,6 +25763,11 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         .g = mlx.mlx_array_new(),
         .beta = mlx.mlx_array_new(),
     };
+    errdefer {
+        inline for (.{ &out.q, &out.k, &out.v, &out.conv_state, &out.g, &out.beta }) |p| {
+            if (p.*.ctx != null) _ = mlx.mlx_array_free(p.*);
+        }
+    }
     try mlx.check(mlx.mlx_vector_array_get(&out.q, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&out.k, outputs_vec, 1));
     try mlx.check(mlx.mlx_vector_array_get(&out.v, outputs_vec, 2));
@@ -27856,8 +27903,13 @@ pub fn hcReadFused(
             defer _ = mlx.mlx_vector_array_free(res);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(which), vec, hc_fused_cfgs[which].?, st));
             if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
+            var got: usize = 0;
+            errdefer {
+                for (outs[0..got]) |a| _ = mlx.mlx_array_free(a);
+            }
             for (0..n_out) |i| {
                 outs[i] = mlx.mlx_array_new();
+                got = i + 1;
                 try mlx.check(mlx.mlx_vector_array_get(&outs[i], res, i));
             }
         }
@@ -27872,19 +27924,20 @@ pub fn hcReadFused(
     const ipart = n_out[1];
     defer _ = mlx.mlx_array_free(ipart);
     var stream_out = n_out[2];
+    errdefer if (stream_out.ctx != null) {
+        _ = mlx.mlx_array_free(stream_out);
+    };
     if (wr == 0) {
         _ = mlx.mlx_array_free(stream_out);
         stream_out = .{ .ctx = null };
     } else {
         const xsh = mlx.getShape(x);
         var shaped = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(shaped);
         try mlx.check(mlx.mlx_reshape(&shaped, stream_out, xsh.ptr, @intCast(xsh.len), s));
         _ = mlx.mlx_array_free(stream_out);
         stream_out = shaped;
     }
-    errdefer if (stream_out.ctx != null) {
-        _ = mlx.mlx_array_free(stream_out);
-    };
     var d_out: [2]mlx.mlx_array = undefined;
     try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
     const act = d_out[0];
@@ -44491,6 +44544,212 @@ fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     return active;
 }
 
+/// `mlx_metal_is_available` is true for a Metal-enabled build with no usable
+/// GPU, so this probes a real stream plus a 1x1 zeros+eval instead.
+fn mlxDeviceUsable() bool {
+    mlx.installErrorHandler();
+    var trash: [256]u8 = undefined;
+    if (mlx.errorPending()) _ = mlx.takeError(&trash);
+    if (mlx.noGpuBackend()) return false;
+    const s = mlx.gpuStream();
+    if (s.ctx == null) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    const shape = [_]c_int{ 1, 1 };
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    if (mlx.mlx_zeros(&a, &shape, 2, .float32, s) != 0) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    if (mlx.mlx_array_eval(a) != 0) {
+        _ = mlx.takeError(&trash);
+        return false;
+    }
+    return true;
+}
+
+// ── Handle-ownership class scans ────────────────────────────────────────────
+//
+// `installErrorHandler` (#353) turned every `try` below an mlx handle from dead
+// code into a live unwind. These two scans pin the shapes that are DOUBLE FREES
+// rather than leaks, which a byte-based residency oracle cannot see when the
+// handle is a view that never materialized a buffer. Indentation is the scope
+// proxy: `zig fmt` makes it exact and Metal kernel source literals are full of
+// braces.
+const HandleScan = struct {
+    const Live = struct { ident: []const u8, indent: usize, line: usize };
+
+    fn indentOf(line: []const u8) usize {
+        var i: usize = 0;
+        while (i < line.len and line[i] == ' ') i += 1;
+        return i;
+    }
+
+    /// The identifier inside the first `mlx_array_free(...)` on the line.
+    fn freeArg(line: []const u8) ?[]const u8 {
+        const needle = "mlx_array" ++ "_free(";
+        const p = std.mem.indexOf(u8, line, needle) orelse return null;
+        const rest = line[p + needle.len ..];
+        const e = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        const arg = std.mem.trim(u8, rest[0..e], " ");
+        if (arg.len == 0) return null;
+        for (arg) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.' and c != '[' and c != ']') return null;
+        }
+        return arg;
+    }
+
+    /// Does `line` assign `ident` (`x = …` or `x.ctx = …`)?
+    fn assigns(line: []const u8, ident: []const u8) bool {
+        if (!std.mem.startsWith(u8, line, ident)) return false;
+        const rest = std.mem.trimStart(u8, line[ident.len..], " ");
+        if (std.mem.startsWith(u8, rest, "= ")) return true;
+        if (std.mem.startsWith(u8, rest, ".ctx")) {
+            return std.mem.indexOfScalar(u8, rest, '=') != null;
+        }
+        return false;
+    }
+
+    fn split(allocator: std.mem.Allocator, src: []const u8) !std.ArrayList([]const u8) {
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |l| try out.append(allocator, l);
+        return out;
+    }
+};
+
+test "no scope arms an errdefer AND a defer over the same mlx handle" {
+    // `takeContig` did exactly this: an `errdefer free(view)` and a `defer
+    // free(view)` in one scope, so the first failure below them freed `view`
+    // twice. An errdefer in an INNER scope is not the bug — Zig cancels it when
+    // the block exits normally — and the indentation rule acquits it. Needles
+    // are assembled at comptime so this test's own source cannot satisfy it.
+    const allocator = testing.allocator;
+    const files = [_][]const u8{ @embedFile("transformer.zig"), @embedFile("generate.zig") };
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    var violations: usize = 0;
+    var armed: usize = 0;
+    for (files) |src| {
+        var lines = try HandleScan.split(allocator, src);
+        defer lines.deinit(allocator);
+
+        var live: [64]HandleScan.Live = undefined;
+        var n_live: usize = 0;
+        for (lines.items, 1..) |raw, lineno| {
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (t.len == 0) continue;
+            const ind = HandleScan.indentOf(raw);
+            // A line at indent `ind` closes every scope deeper than it.
+            var k: usize = 0;
+            var w: usize = 0;
+            while (k < n_live) : (k += 1) {
+                if (live[k].indent <= ind) {
+                    live[w] = live[k];
+                    w += 1;
+                }
+            }
+            n_live = w;
+            if (std.mem.startsWith(u8, t, err_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    if (n_live < live.len) {
+                        live[n_live] = .{ .ident = id, .indent = ind, .line = lineno };
+                        n_live += 1;
+                        armed += 1;
+                    }
+                }
+            } else if (std.mem.startsWith(u8, t, def_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    for (live[0..n_live]) |e| {
+                        if (std.mem.eql(u8, e.ident, id)) {
+                            std.debug.print("[scan] double-free pair: errdefer line {d} + defer line {d} both free `{s}`\n", .{ e.line, lineno, id });
+                            violations += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The scan must have seen the shape it polices, else it asserts nothing.
+    try testing.expect(armed > 50);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
+test "a bare free of a handle whose errdefer is still armed surrenders it before the next fallible call" {
+    // The other half of the class, which a defer-vs-errdefer scan cannot see:
+    // `forwardQwen4With` freed `h` and then called the fallible `lmHeadProject`
+    // with the function-scope errdefer still reading `h` at unwind time. The
+    // rule: past a bare free of an errdefer-armed handle, either the next
+    // statement re-binds it or no fallible call runs before that scope closes.
+    const allocator = testing.allocator;
+    const files = [_][]const u8{ @embedFile("transformer.zig"), @embedFile("generate.zig") };
+    const err_kw = "err" ++ "defer ";
+    const def_kw = "de" ++ "fer ";
+    const free_stmt = "_ = mlx.mlx_array" ++ "_free(";
+    const try_kw = "tr" ++ "y ";
+    var violations: usize = 0;
+    var checked: usize = 0;
+    for (files) |src| {
+        var lines = try HandleScan.split(allocator, src);
+        defer lines.deinit(allocator);
+
+        var live: [64]HandleScan.Live = undefined;
+        var n_live: usize = 0;
+        for (lines.items, 0..) |raw, idx| {
+            const t = std.mem.trim(u8, raw, " \t\r");
+            if (t.len == 0) continue;
+            const ind = HandleScan.indentOf(raw);
+            var k: usize = 0;
+            var w: usize = 0;
+            while (k < n_live) : (k += 1) {
+                if (live[k].indent <= ind) {
+                    live[w] = live[k];
+                    w += 1;
+                }
+            }
+            n_live = w;
+            if (std.mem.startsWith(u8, t, err_kw)) {
+                if (HandleScan.freeArg(t)) |id| {
+                    if (n_live < live.len) {
+                        live[n_live] = .{ .ident = id, .indent = ind, .line = idx + 1 };
+                        n_live += 1;
+                    }
+                }
+                continue;
+            }
+            if (std.mem.startsWith(u8, t, def_kw)) continue;
+            if (!std.mem.startsWith(u8, t, free_stmt)) continue;
+            const id = HandleScan.freeArg(t) orelse continue;
+            var arm_indent: ?usize = null;
+            for (live[0..n_live]) |e| {
+                if (std.mem.eql(u8, e.ident, id)) arm_indent = e.indent;
+            }
+            const e_ind = arm_indent orelse continue;
+            checked += 1;
+            // Next non-blank statement re-binds it?
+            var j = idx + 1;
+            while (j < lines.items.len and std.mem.trim(u8, lines.items[j], " \t\r").len == 0) j += 1;
+            if (j < lines.items.len and HandleScan.assigns(std.mem.trim(u8, lines.items[j], " \t\r"), id)) continue;
+            // Else: no fallible call may run while that errdefer is still armed.
+            while (j < lines.items.len) : (j += 1) {
+                const l2 = lines.items[j];
+                const t2 = std.mem.trim(u8, l2, " \t\r");
+                if (t2.len == 0) continue;
+                if (HandleScan.indentOf(l2) < e_ind) break; // errdefer scope closed
+                if (std.mem.startsWith(u8, t2, try_kw) or std.mem.indexOf(u8, t2, " " ++ try_kw) != null) {
+                    std.debug.print("[scan] dangling errdefer: line {d} frees `{s}`, line {d} can still throw under it\n", .{ idx + 1, id, j + 1 });
+                    violations += 1;
+                    break;
+                }
+            }
+        }
+    }
+    try testing.expect(checked > 0);
+    try testing.expectEqual(@as(usize, 0), violations);
+}
+
 test "takeContig releases `view` exactly once on every faulted op (CPU stream, no GPU)" {
     // Driven with the fault injector at `mlx.check`: `arm(k)` fails the k-th checked call, so
     // the sweep walks every error path. On the pre-fix shape k = 2 double-frees and aborts.
@@ -44531,6 +44790,67 @@ test "takeContig releases `view` exactly once on every faulted op (CPU stream, n
         }
     }
     try testing.expectEqual(@as(usize, 2), fired);
+}
+
+test "trimmedCopy marks an entry built before its trimRowsOwned tries" {
+    // Pins the order: the counter advances before the first fallible call,
+    // so the errdefer covers the entry being filled.
+    const src = @embedFile("transformer.zig");
+    const needle = "pub fn trimmed" ++ "Copy(";
+    const start = std.mem.indexOf(u8, src, needle) orelse return error.HelperMoved;
+    const end = std.mem.indexOfPos(u8, src, start + needle.len, "pub fn ") orelse src.len;
+    const body = src[start..end];
+    const trim_at = std.mem.indexOf(u8, body, "trimRows" ++ "Owned(") orelse return error.TrimMoved;
+    const built_at = std.mem.indexOf(u8, body, "built = i + 1;") orelse return error.BuiltMoved;
+    if (built_at > trim_at) std.debug.print("[trimmedCopy] built@{d} after trim@{d}\n", .{ built_at, trim_at });
+    try testing.expect(built_at < trim_at);
+}
+
+test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no double free)" {
+    // A failed mlx_zeros leaves the caller's old buffer owned. The free below
+    // is then legal; freeing it first would free it twice.
+    if (!mlxDeviceUsable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const heads: c_int = 1;
+    const last_dim: c_int = 4;
+    const old_cap: c_int = 2;
+    const new_cap: c_int = 8;
+    const old_shape = [_]c_int{ B, heads, old_cap, last_dim };
+
+    var warm = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&warm, &old_shape, 4, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(warm));
+    const c0 = mlx.op_count.load(.monotonic);
+    try KVCache.growQuantBuf(s, &warm, false, 0, new_cap, B, heads, last_dim, .float32);
+    const n_ops = mlx.op_count.load(.monotonic) - c0;
+    try mlx.check(mlx.mlx_array_eval(warm));
+    try testing.expectEqual(@as(c_int, new_cap), mlx.getShape(warm)[2]);
+    _ = mlx.mlx_array_free(warm);
+    try testing.expect(n_ops >= 1);
+
+    var fired: usize = 0;
+    var k: u64 = 1;
+    while (k <= n_ops) : (k += 1) {
+        var buf = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&buf, &old_shape, 4, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(buf));
+        mlx.fault.arm(k);
+        const r = KVCache.growQuantBuf(s, &buf, false, 0, new_cap, B, heads, last_dim, .float32);
+        const did = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (r) |_| {
+            // Not reached for k in 1..=n_ops; free the replacement in case.
+            _ = mlx.mlx_array_free(buf);
+        } else |err| {
+            try testing.expectEqual(error.MlxError, err);
+            try testing.expect(did);
+            fired += 1;
+            // This free must be legal; it is the assertion.
+            _ = mlx.mlx_array_free(buf);
+        }
+    }
+    try testing.expectEqual(n_ops, fired);
 }
 
 test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
