@@ -12302,7 +12302,7 @@ pub const Transformer = struct {
     // ── Forward dispatch ──
 
     const EVAL_EVERY_N_LAYERS: u32 = 48;
-    const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
+    pub const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
     /// Per-layer prefill transient (bytes) above which the layer loop eval()s
