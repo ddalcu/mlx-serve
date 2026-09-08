@@ -4810,3 +4810,15 @@ tables reach 1.08x (M4 Max rc3 w4/w5 and w1/w2), poisoned width-1 cells
 see every narrower sample refused against a stale wider cell. Uniform
 contamination across a bucket is invisible to any ratio; that table wants
 deleting. Guard: the #382 parse test in `round_cost.zig`.
+
+## QSA cooperative NAX prefill
+
+`gatherQsa256` can use cooperative input tensors on G17 with macOS 26.3+;
+ordinary NAX availability (26.2) is insufficient for this API. The old gather
+path serves older systems and unhandled geometries.
+
+Relaxed float32-by-bf16 MMA rounds softmax weights. Split each weight into
+three bf16 terms and accumulate all three products in float32. Sparse block
+selection and causal tails stay unchanged. Guards: `gatherQsa256 NAX` tests,
+`tests/qsa_nax_precision.cpp` (CPU float64 oracle), and
+`tests/test_qsa_nax_prefill.py` (HTTP answers plus arm engagement).

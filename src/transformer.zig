@@ -2931,6 +2931,51 @@ fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+// Experimental opt-in until whole-model validation completes. Hardware probe
+// must run BEFORE constructing a Metal 4 cooperative-tensor kernel.
+var qsa_nax_platform_cached: ?bool = null;
+var qsa_nax_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+pub var qsa_nax_override: ?bool = null;
+
+fn qsaNaxEnabled() bool {
+    const enabled = qsa_nax_override orelse blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_NAX") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.span(raw), "1");
+    };
+    if (!enabled or !verifyQmmNaxAvailable()) return false;
+    if (qsa_nax_platform_cached) |v| return v;
+    var version_buf: [64]u8 = undefined;
+    const supported = qsaNaxOsSupported(macosProductVersion(&version_buf) orelse "");
+    qsa_nax_platform_cached = supported;
+    return supported;
+}
+
+fn qsaNaxOsSupported(version: []const u8) bool {
+    return macosVersionAtLeast(version, 26, 3);
+}
+
+fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_nax_kernel_cached) |kernel| return kernel;
+    const names = [_][*:0]const u8{ "q", "k", "v", "scl", "blocks" };
+    const outputs = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&names, names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outputs, outputs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_nax_precise",
+        in_vec,
+        out_vec,
+        @embedFile("kernels/qsa_nax.metal"),
+        @embedFile("kernels/qsa_nax_header.metal"),
+        false,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_nax_kernel_cached = kernel;
+    return kernel;
+}
+
 /// Block-gathered QSA attention (qwen4_exp prefill): `blocks` is the
 /// [B, S, KB] int32 selection, each row ascending with INT_MAX past its
 /// count; `ratio` tokens per block. Same envelope as the p256 kernel (hd
@@ -2961,13 +3006,14 @@ pub fn gatherQsa256(
     if (ratio <= 0) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
 
-    const kernel = getAttnQsa256Kernel() catch return null;
+    const use_nax = gqa == 12 and qs[2] >= 16 and qsaNaxEnabled();
+    const kernel = (if (use_nax) getQsaNaxKernel() else getAttnQsa256Kernel()) catch return null;
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const bk = qsaGatherBk();
+    const bk: c_int = if (use_nax) 32 else qsaGatherBk();
 
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
@@ -2990,7 +3036,7 @@ pub fn gatherQsa256(
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_engaged_bits.take(qsaEngagedBit(.prefill_gather, qs[2]))) {
-        log.info("[qsa-gather] engaged: msv_attn_qsa256 S={d} kv={d} blocks={d} bk={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk });
+        log.info("[qsa-gather] engaged: {s} S={d} kv={d} blocks={d} bk={d} (MLX_SERVE_QSA_NAX=0 restores stock gather)\n", .{ if (use_nax) "msv_qsa_nax_precise" else "msv_attn_qsa256", qs[2], ks[2], bs[2], bk });
     }
     return out;
 }
@@ -40582,6 +40628,52 @@ const QsaBlockFixture = struct {
         _ = mlx.mlx_array_free(self.mask);
     }
 };
+
+test "qsaNaxOsSupported: cooperative input tensors require macOS 26.3" {
+    try std.testing.expect(!qsaNaxOsSupported("26.2"));
+    try std.testing.expect(qsaNaxOsSupported("26.3"));
+    try std.testing.expect(qsaNaxOsSupported("26.5"));
+    try std.testing.expect(!qsaNaxOsSupported(""));
+}
+
+test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    qsa_nax_override = true;
+    defer qsa_nax_override = null;
+    if (!qsaNaxEnabled()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    defer qsa_gather_bk_override = null;
+    var prng = std.Random.DefaultPrng.init(0x9a7e);
+    const rnd = prng.random();
+
+    // qwen4_exp geometry (24/2 heads, hd 256, ratio 4) with a tiny block
+    // budget so the chunk's rows cross from "every block fits" to top-k.
+    const qL: c_int = 40;
+    const kL: c_int = 101;
+    const kb: c_int = 6;
+    const q_shape = [_]c_int{ 1, 24, qL, 256 };
+    const kv_shape = [_]c_int{ 1, 2, kL, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+
+    const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    for ([_]bool{ false, true }) |enabled| {
+        qsa_nax_override = enabled;
+        const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(out);
+        try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
+    }
+}
 
 test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows, 16/32 key tiles)" {
     const s = mlx.gpuStream();
