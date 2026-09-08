@@ -86,6 +86,19 @@ pub const LoadState = enum {
 /// (weights/transformer/vision_encoder/drafter) are optional so a stub
 /// entry can exist for `unloaded`/`error_state`/`loading` without faking
 /// half-built mlx state.
+/// Reasoning-protocol opener candidate index payload (see
+/// `LoadedModel.reasoningOpenerCandidates`).
+pub const OpenerCandidates = struct {
+    opener: [32]u8,
+    opener_len: u8,
+    ids: []const u32,
+    arena: std.heap.ArenaAllocator,
+
+    fn matches(self: *const OpenerCandidates, opener: []const u8) bool {
+        return self.opener_len == opener.len and std.mem.eql(u8, self.opener[0..self.opener_len], opener);
+    }
+};
+
 pub const LoadedModel = struct {
     allocator: std.mem.Allocator,
 
@@ -165,6 +178,12 @@ pub const LoadedModel = struct {
     /// lock that serializes its lazy build. See `grammarTokenBytes`.
     token_bytes: ?token_mask_mod.TokenBytes = null,
     token_bytes_mutex: std.Io.Mutex = .init,
+
+    /// Reasoning-protocol opener candidate index: ordinary token ids whose
+    /// bytes are a prefix of `opener_text` or complete it, built once per
+    /// model under the same lock as the token-byte table. See
+    /// `reasoningOpenerCandidates`.
+    opener_candidates: ?OpenerCandidates = null,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -270,6 +289,55 @@ pub const LoadedModel = struct {
         return &self.token_bytes.?;
     }
 
+    /// Ordinary token ids whose bytes are a prefix of `opener` or complete it
+    /// — the candidate set the choice-phase union mask admits alongside the
+    /// schema-legal tokens. Built once per model (the opener is a property of
+    /// the chat template, not the request); EOS is never a candidate.
+    pub fn reasoningOpenerCandidates(
+        self: *LoadedModel,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        opener: []const u8,
+    ) ![]const u32 {
+        if (opener.len == 0 or opener.len > 32) return &.{};
+        self.token_bytes_mutex.lockUncancelable(io);
+        defer self.token_bytes_mutex.unlock(io);
+        if (self.opener_candidates) |*c| {
+            if (c.matches(opener)) return c.ids;
+        }
+        const tb = blk: {
+            if (self.token_bytes) |*t| break :blk t;
+            const tok = self.tokenizer orelse return error.NoTokenizer;
+            self.token_bytes = try token_mask_mod.build(gpa, tok);
+            break :blk &self.token_bytes.?;
+        };
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(arena.allocator());
+        for (tb.bytes, 0..) |maybe, id| {
+            const b = maybe orelse continue;
+            if (tb.eos_id) |eos| {
+                if (id == eos) continue;
+            }
+            if ((b.len <= opener.len and std.mem.startsWith(u8, opener, b)) or
+                (b.len >= opener.len and std.mem.startsWith(u8, b, opener)))
+            {
+                try ids.append(arena.allocator(), @intCast(id));
+            }
+        }
+        const owned = try arena.allocator().dupe(u32, ids.items);
+        var buf: [32]u8 = undefined;
+        @memcpy(buf[0..opener.len], opener);
+        self.opener_candidates = .{
+            .opener = buf,
+            .opener_len = @intCast(opener.len),
+            .ids = owned,
+            .arena = arena,
+        };
+        return owned;
+    }
+
     /// Free all owned state. Safe to call regardless of `state` — null
     /// model fields are skipped. Mlx-allocating fields are freed in
     /// drafter → vision → transformer → weights order to mirror the
@@ -349,6 +417,10 @@ pub const LoadedModel = struct {
             // first so the table never outlives the ids it describes.
             tb.deinit();
             self.token_bytes = null;
+        }
+        if (self.opener_candidates) |*c| {
+            c.arena.deinit();
+            self.opener_candidates = null;
         }
         if (self.tokenizer) |tok| {
             tok.deinit();

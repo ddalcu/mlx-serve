@@ -1761,6 +1761,9 @@ const MUSE_MSG_TAG = "<|message|>";
 const MUSE_EOM_TAG = "<|eom|>";
 const MUSE_EOT_TAG = "<|eot|>";
 
+pub const BARE_THINK_OPENER = "<think>";
+pub const BARE_THINK_CLOSER = "</think>";
+
 // ── gpt_oss / harmony channels ──
 //
 // After the generation prompt's bare `<|start|>assistant`, the model emits
@@ -2242,6 +2245,28 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 pub fn promptTailOpensBareThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
     return std.mem.endsWith(u8, trimmed, "<think>");
+}
+
+/// Which reasoning opener a rendered generation prompt ENDS with (trailing
+/// whitespace ignored): a bare `<think>`, a complete suffixed `<think:S>`, or
+/// nothing. Generation-side protocol resolution consumes this — the suffix is
+/// carried into the close delimiter (`</think:S>`) so a close with a different
+/// suffix is never treated as the boundary. The returned suffix borrows the
+/// caller's buffer.
+pub const ThinkTailClass = union(enum) {
+    bare,
+    suffixed: []const u8,
+    none,
+};
+
+pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
+    const trimmed_tail = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    if (endsWithThinkOpenTag(trimmed_tail)) |l| {
+        const tag = trimmed_tail[trimmed_tail.len - l ..];
+        if (std.mem.eql(u8, tag, BARE_THINK_OPENER)) return .bare;
+        return .{ .suffixed = tag["<think:".len .. tag.len - 1] };
+    }
+    return .none;
 }
 
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
@@ -6950,6 +6975,17 @@ test "promptTailOpensThink detects template-injected opener" {
     // Gemma 4 prompt tail (no injected opener)
     try testing.expect(!promptTailOpensThink("<|turn>model\n"));
     try testing.expect(!promptTailOpensThink(""));
+}
+
+test "promptThinkTailClass resolves bare, suffixed, and plain tails" {
+    try testing.expectEqual(ThinkTailClass.bare, promptThinkTailClass("<|im_start|>assistant\n<think>\n"));
+    const s = promptThinkTailClass("<think:opensource>");
+    try testing.expectEqualStrings("opensource", s.suffixed);
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|im_start|>assistant\n"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|start|>assistant"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass(""));
+    // A PARTIAL opener is not an opener.
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think:open"));
 }
 
 test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
