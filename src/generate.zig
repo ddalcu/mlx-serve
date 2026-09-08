@@ -2449,6 +2449,11 @@ pub const Generator = struct {
                         doomed.deinit(allocator);
                         return e;
                     };
+                    // The head's own QSA leftover at this position: its ring is 32 rows and
+                    // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
+                        log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
+                    };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
                     if (options.ssm_checkpoint_max > 0 and
@@ -2559,6 +2564,11 @@ pub const Generator = struct {
                         var doomed = cp;
                         doomed.deinit(allocator);
                         return e;
+                    };
+                    // The head's own QSA leftover at this position: its ring is 32 rows and
+                    // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
+                        log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)

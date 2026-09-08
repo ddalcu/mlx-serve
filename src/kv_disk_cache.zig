@@ -219,6 +219,12 @@ pub const SpecHeadMeta = struct {
     pos_base: i32,
     ratio: i32,
     pooled: bool,
+    rows: i32 = 0,
+    /// v8: head rows the sidecar carries a QSA leftover for, ascending — the trunk's
+    /// checkpoint positions. Tensor `<prefix>h.lv<i>` holds the i-th. Inline: an IndexEntry
+    /// is scanned and copied by value.
+    marks: [transformer_mod.QSA_HEAD_MARKS_MAX]i32 = @splat(0),
+    mark_count: u8 = 0,
 };
 
 /// What `appendCommitWithSpec` reads to persist one spec snapshot — the same
@@ -231,6 +237,7 @@ pub const SpecCommit = struct {
     /// qwen4_exp MTP head: the QSA aux half, persisted alongside the KV.
     head_aux: ?*const transformer_mod.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
+    head_marks: []const transformer_mod.QsaHeadMark = &.{},
 };
 
 /// What a commit actually achieved on disk. The old bool meant "nothing more to write", and
@@ -721,25 +728,25 @@ pub const DiskTier = struct {
         var cp = try self.loadSsmFile(e.id, cp_pos, ssm_entries.len);
         defer cp.deinit(self.allocator);
         const want_rows = DiskTier.qsaHistoryRowsOf(&cp);
-        const snap_has_qsa = transformer_mod.checkpointHasQsaHistory(&cp);
+        // The overlay is owed unless the pooled bank is on THIS checkpoint: every checkpoint
+        // carries its own raw leftover, and a mid-block one (backoff 30) is not the bank's home.
+        const snap_has_pooled = transformer_mod.checkpointHasQsaPooled(&cp);
         var qsa_overlay: ?transformer_mod.SSMCheckpoint = null;
         defer if (qsa_overlay) |*q| q.deinit(self.allocator);
-        if ((want_rows > 0 or e.qsa_history_rows > 0) and !snap_has_qsa) {
+        if ((want_rows > 0 or e.qsa_history_rows > 0) and !snap_has_pooled) {
             var hist = self.loadQsaHistoryFile(e.id, ssm_entries.len) catch return error.DiskCacheQsaHistoryGap;
-            const have = transformer_mod.checkpointQsaAuxRows(&hist);
-            if (have < @as(c_int, @intCast(cp_pos))) {
+            if (!transformer_mod.checkpointQsaCoversPos(&cp, &hist, cp_pos)) {
                 hist.deinit(self.allocator);
                 return error.DiskCacheQsaHistoryGap;
             }
             qsa_overlay = hist;
-        } else if (!snap_has_qsa and e.ssm_positions.len > 0) {
+        } else if (!snap_has_pooled and e.ssm_positions.len > 0) {
             const latest = e.ssm_positions[e.ssm_positions.len - 1];
             if (latest != cp_pos) {
                 if (self.loadSsmFile(e.id, latest, ssm_entries.len)) |latest_cp_val| {
                     var latest_cp = latest_cp_val;
-                    if (transformer_mod.checkpointHasQsaHistory(&latest_cp)) {
-                        const have = transformer_mod.checkpointQsaAuxRows(&latest_cp);
-                        if (have < @as(c_int, @intCast(cp_pos))) {
+                    if (transformer_mod.checkpointHasQsaPooled(&latest_cp)) {
+                        if (!transformer_mod.checkpointQsaCoversPos(&cp, &latest_cp, cp_pos)) {
                             latest_cp.deinit(self.allocator);
                             return error.DiskCacheQsaHistoryGap;
                         }
@@ -1588,16 +1595,33 @@ pub const DiskTier = struct {
         var head: ?SpecHeadMeta = null;
         if (sc.head_aux) |a| {
             // A history that is not exactly `limit` rows is not persistable: drop the head half, keep the KV.
-            const rows_ok = a.aux_state.ctx != null and mlx.getShape(a.aux_state).len == 3 and
-                mlx.getShape(a.aux_state)[1] == @as(c_int, @intCast(limit));
+            const hist: c_int = if (a.qsa_rows > 0) a.qsa_rows else blk: {
+                if (a.aux_state.ctx == null) break :blk 0;
+                const sh = mlx.getShape(a.aux_state);
+                break :blk if (sh.len >= 2) sh[1] else 0;
+            };
+            const rows_ok = hist == @as(c_int, @intCast(limit)) and
+                (a.aux_state.ctx != null or a.qsa_pooled.ctx != null);
             if (rows_ok) {
                 try self.insertSpecArray(map, prefix, "h.aux", a.aux_state);
                 if (a.qsa_pooled.ctx != null) try self.insertSpecArray(map, prefix, "h.pooled", a.qsa_pooled);
-                head = .{
+                var hm: SpecHeadMeta = .{
                     .pos_base = sc.head_pos_base,
                     .ratio = a.qsa_ratio,
                     .pooled = a.qsa_pooled.ctx != null,
+                    .rows = hist,
                 };
+                // v8: the leftovers a warm clamp reads, one tensor each (at most ratio-1 rows).
+                for (sc.head_marks) |mk| {
+                    if (mk.rows.ctx == null or mk.pos > hist) continue;
+                    if (hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
+                    var kind_buf: [16]u8 = undefined;
+                    const kind = try std.fmt.bufPrint(&kind_buf, "h.lv{d}", .{hm.mark_count});
+                    try self.insertSpecArray(map, prefix, kind, mk.rows);
+                    hm.marks[hm.mark_count] = mk.pos;
+                    hm.mark_count += 1;
+                }
+                head = hm;
             }
         }
         return .{
@@ -1648,6 +1672,9 @@ pub const DiskTier = struct {
         /// v5 qwen4_exp head half; null on every other entry.
         head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
         head_pos_base: c_int = 0,
+        /// v8: the head's checkpoint-position leftovers. Empty on a v5..v7 sidecar, which
+        /// clamps as it does today (a mid-block warm clamp declines, head starts blind).
+        head_marks: transformer_mod.QsaHeadMarkSet = .{},
     } {
         const e = &self.entries.items[idx];
         const meta = (switch (which) {
@@ -1763,6 +1790,7 @@ pub const DiskTier = struct {
         // v5 head half, best-effort: a pre-v5 sidecar returns none and the head declines the adoption.
         var head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null;
         var head_pos_base: c_int = 0;
+        var head_marks: transformer_mod.QsaHeadMarkSet = .{};
         if (meta.head) |hm| head: {
             const aux = getSpecArray(tensor_map, self.allocator, prefix, "h.aux") orelse break :head;
             var snap_aux: transformer_mod.SSMCacheEntrySnapshot = .{
@@ -1786,10 +1814,24 @@ pub const DiskTier = struct {
                 transformer_mod.ssmSnapshotDeinit(&snap_aux);
                 break :head;
             };
+            snap_aux.qsa_rows = hm.rows;
             head_aux = snap_aux;
             head_pos_base = hm.pos_base;
+            for (hm.marks[0..hm.mark_count], 0..) |pos, mi| {
+                var kind_buf: [16]u8 = undefined;
+                const kind = std.fmt.bufPrint(&kind_buf, "h.lv{d}", .{mi}) catch break;
+                const arr = getSpecArray(tensor_map, self.allocator, prefix, kind) orelse break;
+                const one = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(one);
+                _ = mlx.mlx_vector_array_append_value(one, arr);
+                mlx.check(mlx.mlx_eval(one)) catch {
+                    _ = mlx.mlx_array_free(arr);
+                    break;
+                };
+                head_marks.put(pos, arr);
+            }
         }
-        return .{ .snap = snap, .base = meta.base, .head_aux = head_aux, .head_pos_base = head_pos_base };
+        return .{ .snap = snap, .base = meta.base, .head_aux = head_aux, .head_pos_base = head_pos_base, .head_marks = head_marks };
     }
 
     /// One optional non-layer tensor out of the loaded sidecar map (+1 handle), or null.
@@ -2167,7 +2209,7 @@ pub const DiskTier = struct {
             const names = .{ "conv", "ssm", "aux", "pooled" };
             const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
             inline for (names, arrs) |name, arr| {
-                const skip_qsa = qsa_hist and !test_ssm_write_qsa_aux and (comptime (std.mem.eql(u8, name, "aux") or std.mem.eql(u8, name, "pooled")));
+                const skip_qsa = qsa_hist and !test_ssm_write_qsa_aux and (comptime std.mem.eql(u8, name, "pooled"));
                 if (arr.ctx != null and !skip_qsa) {
                     const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name, .{li});
                     errdefer self.allocator.free(key);
@@ -2251,7 +2293,7 @@ pub const DiskTier = struct {
         var i = cps.len;
         while (i > 0) {
             i -= 1;
-            if (transformer_mod.checkpointHasQsaHistory(&cps[i])) return &cps[i];
+            if (transformer_mod.checkpointHasQsaPooled(&cps[i])) return &cps[i];
         }
         return null;
     }
@@ -2392,6 +2434,13 @@ pub const DiskTier = struct {
                 }
             }
             if (count > 0) try mlx.check(mlx.mlx_eval(vec));
+        }
+        if (cp.pos == 0) cp.pos = @intCast(DiskTier.qsaHistoryRowsOf(&cp));
+        // A v7 file holds the WHOLE raw history, and a mid-block checkpoint's leftover is
+        // interior to it: the ring truncation belongs to the live entry the restore seeds,
+        // not to the file it slices that ring out of.
+        for (layers) |*l| {
+            if (l.qsa_rows == 0) l.qsa_rows = @intCast(cp.pos);
         }
         if (!transformer_mod.checkpointHasQsaHistory(&cp)) return error.DiskCacheNoCheckpoint;
         return cp;
@@ -2662,9 +2711,9 @@ pub const DiskTier = struct {
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
-        if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 7;
+        if (e.qsa_history_rows > 0 or e.qsa_history_bytes > 0) return 8;
         if (e.inherited_chunks > 0) return 6;
-        if (e.spec_mtp) |m| if (m.head != null) return 5;
+        if (e.spec_mtp) |m| if (m.head) |h| return if (h.mark_count > 0) 8 else 5;
         return 4;
     }
 
@@ -2839,7 +2888,7 @@ pub const DiskTier = struct {
         // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints; v4
         // adds optional spec snapshots; v5 the qwen4_exp MTP head's QSA half; v6 inherited
         // chunks. All restore; a lower-version entry just carries none of the newer state.
-        if (version < 2 or version > 7) return null;
+        if (version < 2 or version > 8) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -3312,9 +3361,20 @@ fn writeSpecMetaJson(a: std.mem.Allocator, w: *std.ArrayList(u8), name: []const 
     try w.print(a, ",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}", .{
         name, sm.base, sm.step, sm.layers, @tagName(sm.quant.scheme), sm.quant.bits, sm.quant.group_size,
     });
-    if (sm.head) |h| try w.print(a, ",\"head\":{{\"pos_base\":{d},\"ratio\":{d},\"pooled\":{s}}}", .{
-        h.pos_base, h.ratio, if (h.pooled) "true" else "false",
-    });
+    if (sm.head) |h| {
+        try w.print(a, ",\"head\":{{\"pos_base\":{d},\"ratio\":{d},\"pooled\":{s},\"rows\":{d}", .{
+            h.pos_base, h.ratio, if (h.pooled) "true" else "false", h.rows,
+        });
+        if (h.mark_count > 0) {
+            try w.appendSlice(a, ",\"marks\":[");
+            for (h.marks[0..h.mark_count], 0..) |pos, i| {
+                if (i > 0) try w.appendSlice(a, ",");
+                try w.print(a, "{d}", .{pos});
+            }
+            try w.appendSlice(a, "]");
+        }
+        try w.appendSlice(a, "}");
+    }
     try w.appendSlice(a, "}");
 }
 
@@ -3352,7 +3412,19 @@ fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
         if (ratio == 0) break :head_blk;
         const pooled_v = ho.get("pooled") orelse break :head_blk;
         if (pooled_v != .bool) break :head_blk;
-        head = .{ .pos_base = @intCast(pb.integer), .ratio = @intCast(ratio), .pooled = pooled_v.bool };
+        const rows = jsonU64(ho, "rows") orelse 0;
+        var hm: SpecHeadMeta = .{ .pos_base = @intCast(pb.integer), .ratio = @intCast(ratio), .pooled = pooled_v.bool, .rows = @intCast(rows) };
+        // v8 leftovers; absent on every earlier manifest.
+        if (ho.get("marks")) |mv| {
+            if (mv == .array) {
+                for (mv.array.items) |iv| {
+                    if (iv != .integer or hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
+                    hm.marks[hm.mark_count] = @intCast(iv.integer);
+                    hm.mark_count += 1;
+                }
+            }
+        }
+        head = hm;
     }
     return .{ .base = base, .step = @intCast(step), .layers = @intCast(layers), .quant = quant, .head = head };
 }
@@ -3977,7 +4049,8 @@ test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     try testing.expect(!dst[2].initialized);
     try testing.expect(dst[2].conv_state.ctx == null);
     try testing.expect(dst[2].ssm_state.ctx == null);
-    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
     try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
     try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
@@ -4093,7 +4166,7 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     try testing.expectEqual(@as(u64, 0), a128.aux + a128.pooled);
     try testing.expectEqual(@as(u64, 0), a256.aux + a256.pooled);
     const hq = try stAuxPooledBytes(testing.allocator, io, qsa_path);
-    const one: u64 = 256 * 8 * 4 + 64 * 8 * 4;
+    const one: u64 = 64 * 8 * 4;
     try testing.expectEqual(one, hq.aux + hq.pooled);
 
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-once", 0, 128);
@@ -4107,9 +4180,64 @@ test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
     };
     defer freeHybridEntries(&dst);
     try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
-    try testing.expectEqual(@as(c_int, 128), mlx.getShape(dst[2].aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(c_int, 32), mlx.getShape(dst[2].qsa_pooled)[1]);
-    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+}
+
+test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its own leftover" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    // 46 is not a multiple of the ratio, so this checkpoint carries a 2-row leftover — the
+    // shape `SSM_SNAPSHOT_BACKOFF` puts the always-on snapshot at.
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 46, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 46), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 46, s));
+    try testing.expect(transformer_mod.entriesHaveQsaHistory(&dst));
+    try testing.expectEqual(@as(c_int, 46), dst[2].qsa_hist_rows);
+    // Pooled blocks 0..46/4 come from the history file; the leftover is the checkpoint's own.
+    try testing.expect(dst[2].qsa_pooled.ctx != null);
+    try testing.expectEqual(@as(c_int, 11), mlx.getShape(dst[2].qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    try testing.expectEqual(@as(f32, 880.0), ssmArrVal(dst[2].qsa_pooled, 80, s));
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(dst[2].aux_state)[1]);
+    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, 0, s));
 }
 
 test "DiskTier: a GDN-layer aux window is persisted in the checkpoint file" {
@@ -4237,8 +4365,7 @@ test "DiskTier: a pre-v7 interior restore overlays QSA history from the latest s
     defer freeHybridEntries(&dst);
     try testing.expectEqual(@as(u32, 128), try tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
     try testing.expect(transformer_mod.entriesHaveQsaHistory(&dst));
-    try testing.expectEqual(@as(c_int, 128), mlx.getShape(dst[2].aux_state)[1]);
-    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
 }
 
 test "DiskTier: a pre-v7 interior restore misses when the latest s* file is gone" {
@@ -4466,7 +4593,7 @@ test "DiskTier: a history tensor shorter than cp_pos is a miss, not a short hit"
     try testing.expectEqual(@as(c_int, 16), cps[0].layers[2].qsa_rows);
     try testing.expectEqual(@as(c_int, 64), cps[1].layers[2].qsa_rows);
     try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
-    try testing.expectEqual(@as(c_int, 8), mlx.getShape(cps[1].layers[2].aux_state)[1]);
+    try testing.expect(cps[1].layers[2].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 64), cps[1].layers[2].qsa_rows);
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
@@ -4571,7 +4698,7 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     const heir = &tier.entries.items[1];
     try testing.expect(heir.inherited_qsa);
-    try testing.expectEqual(@as(u8, 7), DiskTier.metaVersionFor(heir.*));
+    try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(heir.*));
 
     var pbuf: [1024]u8 = undefined;
     const dp = try std.fmt.bufPrint(&pbuf, "{s}/fp-qsa-share/e{d}/qsa.safetensors", .{ base, donor_id });
@@ -4592,8 +4719,8 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors"
     defer freeHybridEntries(&dst);
     const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(u32, 256), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 256, s));
-    try testing.expectEqual(@as(c_int, 256), mlx.getShape(dst[2].aux_state)[1]);
-    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
 }
 
 test "DiskTier: an inherited QSA history is dropped on extend past the common prefix" {
@@ -4672,8 +4799,8 @@ test "DiskTier: an inherited QSA history is dropped on extend past the common pr
     defer freeHybridEntries(&dst);
     const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(u32, 560), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 560, s));
-    try testing.expectEqual(@as(c_int, 560), mlx.getShape(dst[2].aux_state)[1]);
-    try testing.expectEqual(@as(f32, 900.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 560), dst[2].qsa_hist_rows);
 }
 
 test "DiskTier: SSM retention thins the interior, keeping both ends" {
@@ -5171,6 +5298,182 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     try testing.expect(kv_only.head_aux == null);
 }
 
+test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-ring", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 64, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, transformer_mod.QSA_RING_ROWS, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 64;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+    try testing.expectEqual(@as(c_int, 64), head_snap.qsa_rows);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    var loaded = tier.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    try testing.expectEqual(@as(c_int, 64), back.qsa_rows);
+    try testing.expectEqual(transformer_mod.QSA_RING_ROWS, mlx.getShape(back.aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 16), mlx.getShape(back.qsa_pooled)[1]);
+}
+
+test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without them loads blind" {
+    // The ring on disk is 32 rows and a warm clamp lands a whole generated tail below it, so
+    // the leftovers the trunk's checkpoints marked have to survive the round trip — including
+    // the meta.json parse a restart reads them back through.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 64, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, transformer_mod.QSA_RING_ROWS, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 64;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+
+    // Two trunk checkpoint positions, both mid-block.
+    var marks: transformer_mod.QsaHeadMarkSet = .{};
+    defer marks.deinit();
+    marks.put(26, try filledArray(&[_]c_int{ 1, 2, 8 }, 7.5, s));
+    marks.put(46, try filledArray(&[_]c_int{ 1, 2, 8 }, -3.25, s));
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+            .head_marks = marks.slice(),
+        },
+        s,
+    );
+
+    // A restart: the positions come back through meta.json, the rows through the sidecar.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(tier2.entries.items[m.idx]));
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    var back_marks = loaded.head_marks;
+    defer back_marks.deinit();
+    try testing.expectEqual(@as(usize, 2), back_marks.len);
+    const lv26 = back_marks.find(26) orelse return error.TestExpectedHeadMark;
+    const lv46 = back_marks.find(46) orelse return error.TestExpectedHeadMark;
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(lv26)[1]);
+    try testing.expectEqual(@as(f32, 7.5), ssmArrVal(lv26, 0, s));
+    try testing.expectEqual(@as(f32, -3.25), ssmArrVal(lv46, 0, s));
+
+    // A v5..v7 sidecar carries none: the head still restores, and clamps as it does today.
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 700_000);
+    _ = try tier2.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens_b,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(tier2.entries.items[mb.idx]));
+    var no_marks = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer no_marks.snap.deinit();
+    var nb = no_marks.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&nb);
+    try testing.expectEqual(@as(usize, 0), no_marks.head_marks.len);
+}
+
 test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
     // Checkpoints ride outside the per-flush byte budget, so the first flush of a long hybrid
     // entry already restores; without it (arm B) the entry carries KV with no recurrent state.
@@ -5325,7 +5628,8 @@ test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem wr
     try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
     try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst[0].conv_state, 0, s));
     try testing.expectEqual(@as(f32, 500.0), ssmArrVal(dst[0].ssm_state, 0, s));
-    try testing.expectEqual(@as(f32, 700.0 + 5.0), ssmArrVal(dst[2].aux_state, 5, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
     try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
     try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
     try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
@@ -6326,7 +6630,97 @@ test "DiskTier: the manifest stamps the LOWEST version that describes the entry"
 
     e.qsa_history_rows = 256;
     e.qsa_history_bytes = 4096;
-    try t.expectEqual(@as(u8, 7), DiskTier.metaVersionFor(e));
+    try t.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(e));
+}
+
+test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING_ROWS ring; v>8 is refused" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const hd: c_int = 8;
+    const aux_shape = [_]c_int{ 1, 256, hd };
+    const pooled_shape = [_]c_int{ 1, 64, hd };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 46, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    // A v7 entry: its snaps carry recurrent state and `qsa_rows` only, and the whole raw
+    // indexer history — every checkpoint's leftover included — is the entry-level file.
+    for (&cps) |*cp| for (cp.layers) |*l| {
+        if (l.aux_state.ctx == null) continue;
+        _ = mlx.mlx_array_free(l.aux_state);
+        l.aux_state = .{ .ctx = null };
+    };
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    const id = tier.entries.items[0].id;
+    const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, id });
+    defer testing.allocator.free(dir_rel);
+    const full_layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 3);
+    for (full_layers) |*l| l.* = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    };
+    full_layers[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    full_layers[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    full_layers[2].qsa_ratio = 4;
+    full_layers[2].qsa_rows = 256;
+    var full_cp: transformer_mod.SSMCheckpoint = .{ .pos = 256, .layers = full_layers };
+    defer full_cp.deinit(testing.allocator);
+    _ = try tier.writeQsaHistoryFile(dir_rel, &full_cp, s);
+
+    // The file keeps every row it was written with; the ring truncation is the live entry's.
+    var loaded = try tier.loadQsaHistoryFile(id, 3);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 256), loaded.layers[2].qsa_rows);
+    try testing.expectEqual(@as(c_int, 256), mlx.getShape(loaded.layers[2].aux_state)[1]);
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 46), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 46, s));
+    try testing.expectEqual(@as(c_int, 46), dst[2].qsa_hist_rows);
+    try testing.expectEqual(@as(c_int, 11), mlx.getShape(dst[2].qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    // The live ring is RING_ROWS rows ending at 46, so its last two rows are the checkpoint's
+    // own leftover — source rows 44 and 45.
+    const ring = mlx.getShape(dst[2].aux_state)[1];
+    try testing.expectEqual(transformer_mod.QSA_RING_ROWS, ring);
+    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, @intCast((ring - 2) * hd), s));
+    try testing.expectEqual(@as(f32, 1060.0), ssmArrVal(dst[2].aux_state, @intCast((ring - 1) * hd), s));
+
+    try tmp.dir.createDirPath(io, "fp-qsa-v8/e9");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fp-qsa-v8/e9/meta.json",
+        .data = "{\"v\":9,\"kv_len\":1,\"tokens\":0,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0,\"chunk_tokens\":128,\"inherited_chunks\":0,\"bytes\":0,\"chunk_bytes\":[],\"ssm\":[]}",
+    });
+    try testing.expect(tier.loadEntry(9) == null);
 }
 
 test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {

@@ -29,7 +29,7 @@ const SSMCacheEntry = transformer_mod.SSMCacheEntry;
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
 const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
-const checkpointHasQsaHistory = transformer_mod.checkpointHasQsaHistory;
+const checkpointHasQsaPooled = transformer_mod.checkpointHasQsaPooled;
 const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
 const keepOnlyLatestQsaHistory = transformer_mod.keepOnlyLatestQsaHistory;
 const entriesHaveQsaHistory = transformer_mod.entriesHaveQsaHistory;
@@ -311,11 +311,16 @@ pub const DflashSnap = struct {
     /// row 0. A snap with one half and not the other is declined.
     head_aux: ?transformer_mod.SSMCacheEntrySnapshot = null,
     head_pos_base: c_int = 0,
+    /// qwen4_exp MTP head only: the head's QSA leftovers at the trunk's checkpoint positions.
+    /// A clamp to a restored trunk position lands far below the head's raw-key ring; this is
+    /// what makes it exact there.
+    head_marks: transformer_mod.QsaHeadMarkSet = .{},
 
     pub fn deinit(self: *DflashSnap) void {
         self.snapshot.deinit();
         if (self.head_aux) |*a| transformer_mod.ssmSnapshotDeinit(a);
         self.head_aux = null;
+        self.head_marks.deinit();
     }
 };
 
@@ -325,6 +330,7 @@ pub const DflashCommit = struct {
     base_pos: usize,
     head: ?*const SSMCacheEntry = null,
     head_pos_base: c_int = 0,
+    head_marks: []const transformer_mod.QsaHeadMark = &.{},
 };
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
@@ -470,7 +476,7 @@ pub const HotPrefixCache = struct {
         // qwen4_exp in-checkpoint head: KV + QSA aux adopt together or not at all.
         if (t.head) |xfm| {
             const aux = &snap.head_aux.?;
-            xfm.qwen4MtpAdopt(&snap.snapshot, aux, snap.head_pos_base, want) catch |err| {
+            xfm.qwen4MtpAdopt(&snap.snapshot, aux, snap.head_marks.slice(), snap.head_pos_base, want) catch |err| {
                 log.warn("  [qwen4] MTP head restore declined ({s}) — head starts blind\n", .{@errorName(err)});
                 return null;
             };
@@ -522,6 +528,7 @@ pub const HotPrefixCache = struct {
             .base_pos = loaded.base,
             .head_aux = loaded.head_aux,
             .head_pos_base = loaded.head_pos_base,
+            .head_marks = loaded.head_marks,
         };
         defer snap.deinit();
         return restoreSpecSnap(&snap, target, matched, s, switch (which) {
@@ -556,13 +563,14 @@ pub const HotPrefixCache = struct {
         return cp.pos;
     }
 
-    /// Latest checkpoint that carries QSA aux, unless it IS `restored`
-    /// (restoreSsmCheckpoint already installed that aux at full length).
+    /// Latest checkpoint that carries the pooled indexer bank, unless it IS `restored`
+    /// (restoreSsmCheckpoint already installed that bank at full length). Every checkpoint
+    /// carries its own leftover; only one carries the bank.
     fn qsaHistorySource(cps: []const SSMCheckpoint, restored: *const SSMCheckpoint) ?*const SSMCheckpoint {
         var i = cps.len;
         while (i > 0) {
             i -= 1;
-            if (!checkpointHasQsaHistory(&cps[i])) continue;
+            if (!checkpointHasQsaPooled(&cps[i])) continue;
             if (&cps[i] == restored) return null;
             return &cps[i];
         }
@@ -646,6 +654,7 @@ pub const HotPrefixCache = struct {
             inline for (.{ a.aux_state, a.qsa_pooled }) |arr| {
                 if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
             }
+            total += snap.head_marks.bytes();
         }
         return total;
     }
@@ -1165,8 +1174,7 @@ pub const HotPrefixCache = struct {
         if (e.ssm_checkpoints) |cps| {
             if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
                 const src_cp = qsaHistorySource(cps, cp) orelse cp;
-                const have = transformer_mod.checkpointQsaAuxRows(src_cp);
-                if (have > 0 and have < @as(c_int, @intCast(cp.pos))) {
+                if (!transformer_mod.checkpointQsaCoversPos(cp, src_cp, cp.pos)) {
                     return error.QsaHistoryGap;
                 }
             }
@@ -1467,6 +1475,7 @@ pub const HotPrefixCache = struct {
                     .base_pos = m2.base_pos,
                     .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
                     .head_pos_base = m2.head_pos_base,
+                    .head_marks = transformer_mod.QsaHeadMarkSet.share(m2.head_marks),
                 };
                 new_mtp_bytes = specSnapBytes(&new_mtp.?);
             } else |err| {
@@ -1562,10 +1571,10 @@ pub const HotPrefixCache = struct {
                     var kept: usize = 0;
                     while (kept < cps.len and cps[kept].pos <= tl) kept += 1;
                     if (kept < cps.len) {
-                        // QSA history lives only on the latest snap. Slicing
-                        // it onto the last KEPT snap before dropping the tail
-                        // is what keeps a trimmed 122k entry restorable.
-                        if (kept > 0 and checkpointHasQsaHistory(&cps[cps.len - 1])) {
+                        // The pooled indexer bank lives only on the latest snap (every snap
+                        // carries its own leftover), so it is sliced onto the last KEPT snap
+                        // before the tail is dropped.
+                        if (kept > 0 and checkpointHasQsaPooled(&cps[cps.len - 1])) {
                             sliceQsaHistoryOntoCheckpoint(&cps[kept - 1], &cps[cps.len - 1], cps[kept - 1].pos, mlx.gpuStream()) catch {};
                         }
                         const shrunk = self.allocator.dupe(SSMCheckpoint, cps[0..kept]) catch |err| {
@@ -1919,6 +1928,7 @@ pub const HotPrefixCache = struct {
                     .base_pos = m2.base_pos,
                     .head_aux = if (m2.head) |h| transformer_mod.ssmSnapshot(h) else null,
                     .head_pos_base = m2.head_pos_base,
+                    .head_marks = transformer_mod.QsaHeadMarkSet.share(m2.head_marks),
                 };
             } else |_| {}
         }
@@ -1946,6 +1956,7 @@ pub const HotPrefixCache = struct {
                 .base_pos = mm.base_pos,
                 .head_aux = if (mm.head_aux) |*a| a else null,
                 .head_pos_base = mm.head_pos_base,
+                .head_marks = mm.head_marks.slice(),
             } else null,
         };
     }
@@ -2106,6 +2117,7 @@ pub const HotPrefixCache = struct {
                 .base_pos = mm.base_pos,
                 .head_aux = if (mm.head_aux) |*a| a else null,
                 .head_pos_base = mm.head_pos_base,
+                .head_marks = mm.head_marks.slice(),
             } else null;
             const ok = d.appendCommitWithSpec(
                 pending.snapshot.entries,
@@ -2356,7 +2368,7 @@ pub const HotPrefixCache = struct {
             const drop = transformer_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin);
             const freed = ssmCheckpointBytes(&cps[drop]);
             // Defensive: the shared selection never picks the last.
-            if (drop + 1 == n and drop > 0 and checkpointHasQsaHistory(&cps[drop])) {
+            if (drop + 1 == n and drop > 0 and checkpointHasQsaPooled(&cps[drop])) {
                 sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch {};
             }
             cps[drop].deinit(self.allocator);
@@ -4317,8 +4329,9 @@ test "HotPrefixCache: oversized hybrid entry with no checkpoint under budget dec
 /// `aux_state` = `[1, rows, 8]` indexer key history), layer 1 GDN, layer 2 idle.
 fn pcBuildQsaHybrid(s: mlx.mlx_stream, rows: c_int, conv_base: f64) [3]SSMCacheEntry {
     const aux_shape = [_]c_int{ 1, rows, 8 };
+    const pooled_shape = [_]c_int{ 1, @divTrunc(rows, 4), 8 };
     return .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_ratio = 4 },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_pooled = pcArange(s, &pooled_shape, 1000.0), .qsa_ratio = 4 },
         .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = mlx.mlx_array_new(), .initialized = true },
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
     };
@@ -4363,8 +4376,8 @@ test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, neve
         const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
         if (with_history) {
             try testing.expectEqual(@as(usize, 4), r.matched);
-            // Sliced to the snap's position, not the live length.
-            try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
+            try testing.expect(target[0].aux_state.ctx == null);
+            try testing.expectEqual(@as(c_int, 4), target[0].qsa_hist_rows);
         } else {
             try testing.expectEqual(@as(usize, 0), r.matched);
             try testing.expectEqual(@as(usize, 0), moe_off);
@@ -4394,7 +4407,7 @@ test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, no
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 64, s);
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    try testing.expectEqual(@as(c_int, 8), mlx.getShape(cps[1].layers[0].aux_state)[1]);
+    try testing.expect(cps[1].layers[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
@@ -4446,7 +4459,8 @@ test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
     try testing.expectEqual(@as(usize, 2), merged.len);
     try testing.expect(!transformer_mod.checkpointHasQsaHistory(&merged[0]));
     try testing.expect(transformer_mod.checkpointHasQsaHistory(&merged[1]));
-    try testing.expectEqual(@as(c_int, 8), mlx.getShape(merged[1].layers[0].aux_state)[1]);
+    try testing.expect(merged[1].layers[0].aux_state.ctx == null);
+    try testing.expect(merged[1].layers[0].qsa_pooled.ctx != null);
 }
 
 test "HotPrefixCache: a handed-off QSA history commits, restores and bills exactly like the prefill-end copy" {
@@ -4483,15 +4497,11 @@ test "HotPrefixCache: a handed-off QSA history commits, restores and bills exact
         var moe_off: usize = 0;
         const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
         try testing.expectEqual(@as(usize, 4), r.matched);
-        try testing.expectEqual(@as(c_int, 4), mlx.getShape(target[0].aux_state)[1]);
-        var got = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(got);
-        try mlx.check(mlx.mlx_astype(&got, target[0].aux_state, .float32, s));
-        try mlx.check(mlx.mlx_array_eval(got));
-        const d = mlx.mlx_array_data_float32(got) orelse return error.TestUnexpectedNullData;
-        restored_val[arm] = d[3 * 8 + 5];
+        try testing.expect(target[0].aux_state.ctx == null);
+        try testing.expectEqual(@as(c_int, 4), target[0].qsa_hist_rows);
+        try testing.expectEqual(@as(c_int, 1), target[0].qsa_pooled_blocks);
+        restored_val[arm] = 0;
     }
-    try testing.expectEqual(@as(f32, 3.0 * 8.0 + 5.0), restored_val[1]);
     try testing.expectEqual(restored_val[0], restored_val[1]);
     try testing.expect(billed[0] > 0);
     try testing.expectEqual(billed[0], billed[1]);
