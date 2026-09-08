@@ -2554,7 +2554,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
                         );
                         dropped.deinit(allocator);
                     }
@@ -2668,7 +2668,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin),
+                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
                         );
                         dropped.deinit(allocator);
                     }
@@ -3389,6 +3389,7 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
         const mdl = self.xfm.dsv4.?;
         const t1 = self.next_token_id;
         const accepted_cap = capAcceptedForTokenBudget(
@@ -3615,6 +3616,8 @@ pub const Generator = struct {
                 };
             }
         }
+
+        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -4051,6 +4054,8 @@ pub const Generator = struct {
                 .accepted_tokens = 0,
             };
         }
+
+        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -4517,6 +4522,8 @@ pub const Generator = struct {
             tokens[0] = tok_opt.?;
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
+
+        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -5782,6 +5789,8 @@ pub const Generator = struct {
             self.mtpMaybeReleaseModuleHead();
             return try self.mtpSerialTick(allocator);
         }
+
+        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -9048,22 +9057,10 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return true;
         }
-        for (self.eos_token_ids) |eos_id| {
-            if (self.next_token_id == eos_id) {
-                self.done = true;
-                self.finish_reason = "stop";
-                return true;
-            }
-        }
-        if (self.next_token_id == 0) {
-            self.consecutive_pad += 1;
-            if (self.consecutive_pad >= 3) {
-                self.done = true;
-                self.finish_reason = "stop";
-                return true;
-            }
-        } else {
-            self.consecutive_pad = 0;
+        if (tokenStops(self.next_token_id, self.eos_token_ids, &self.consecutive_pad)) {
+            self.done = true;
+            self.finish_reason = "stop";
+            return true;
         }
         return false;
     }
@@ -10000,6 +9997,17 @@ fn finishPldResult(
 pub fn isEosId(id: u32, eos: []const u32) bool {
     for (eos) |e| if (id == e) return true;
     return false;
+}
+
+/// Token-only stop conditions of `checkStop`; `consecutive_pad` is carried state reset by any real token.
+pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pad: *u32) bool {
+    if (isEosId(next_token_id, eos_token_ids)) return true;
+    if (next_token_id != 0) {
+        consecutive_pad.* = 0;
+        return false;
+    }
+    consecutive_pad.* += 1;
+    return consecutive_pad.* >= 3;
 }
 
 /// Max cycle length (in tokens) scanned by `isDegenerateTailLoop`, and how many
@@ -15122,4 +15130,23 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     defer cache.deinit();
     cache.reserve(0);
     try t.expectEqual(@as(usize, 0), cache.reserve_tokens);
+}
+
+test "a block decoder's entry token stops the round before it drafts" {
+    // Bar: an EOS or third pad as the round's entry token ends the request before any draft.
+    const eos = [_]u32{ 151645, 151643 };
+    var pad: u32 = 0;
+    try testing.expect(tokenStops(151645, &eos, &pad));
+    try testing.expect(tokenStops(151643, &eos, &pad));
+    try testing.expect(!tokenStops(17, &eos, &pad));
+
+    // A pad run stops on the third; any real token resets it.
+    pad = 0;
+    try testing.expect(!tokenStops(0, &eos, &pad));
+    try testing.expect(!tokenStops(0, &eos, &pad));
+    try testing.expect(tokenStops(0, &eos, &pad));
+    pad = 0;
+    try testing.expect(!tokenStops(0, &eos, &pad));
+    try testing.expect(!tokenStops(9, &eos, &pad));
+    try testing.expectEqual(@as(u32, 0), pad);
 }

@@ -4784,6 +4784,11 @@ fn dflashContextCoversPrefix(context_len: usize, prefix_len: usize) bool {
     return context_len == prefix_len;
 }
 
+/// Only an all-pad generation poisons the prefix; a zero-token one still holds a real prefill.
+fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
+    return n_gen > 0 and all_pad;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -4810,13 +4815,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         return;
     };
     const n_gen = gen_ptr.generated_ids.items.len;
-    if (n_gen > 0 and slot.was_pad_only) return;
-    // Zero emitted tokens is worth committing only when the client cancelled
-    // between prefill completion and the first token: the KV holds exactly
-    // the prompt (cache.step == prompt_len) and the next identical request
-    // skips the whole prefill. A normally-finished empty generation is the
-    // old no-op.
-    if (n_gen == 0 and !slot.cancelled.load(.acquire)) return;
+    if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
     // Construct the full token sequence: the original prompt + everything
     // generated this turn. The cache reflects exactly this state — Generator
@@ -5045,6 +5044,76 @@ fn publishSlotTerminator(slot: anytype, reason: []const u8, latched: ?[]const u8
     slot.markFinished(reason);
 }
 
+/// Decoded bytes of the answer that ride the `[short-gen]` line.
+const SHORT_GEN_TEXT_CAP = 200;
+
+/// `emitted` (what the client got) and `realized` (what the generator appended) diverge only on a block path.
+fn formatShortGen(
+    out: []u8,
+    reason: []const u8,
+    emitted: u32,
+    ids: []const u32,
+    text: []const u8,
+    path: []const u8,
+) []const u8 {
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(out[n..], "[short-gen] reason={s} emitted={d} realized={d} ids=[", .{ reason, emitted, ids.len }) catch return out[0..n]).len;
+    for (ids, 0..) |id, i| {
+        const sep: []const u8 = if (i == 0) "" else ",";
+        n += (std.fmt.bufPrint(out[n..], "{s}{d}", .{ sep, id }) catch break).len;
+    }
+    n += (std.fmt.bufPrint(out[n..], "] bytes=\"", .{}) catch return out[0..n]).len;
+    var cap = @min(text.len, SHORT_GEN_TEXT_CAP);
+    // A token is a BPE fragment: never cut inside a multi-byte sequence.
+    while (cap > 0 and cap < text.len and (text[cap] & 0xC0) == 0x80) cap -= 1;
+    for (text[0..cap]) |c| {
+        var one = [_]u8{if (c < 0x20) ' ' else c};
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => one[0..1],
+        };
+        if (n + esc.len > out.len) break;
+        @memcpy(out[n..][0..esc.len], esc);
+        n += esc.len;
+    }
+    n += (std.fmt.bufPrint(out[n..], "\" path={s}", .{path}) catch return out[0..n]).len;
+    return out[0..n];
+}
+
+/// A one-word answer and a block-path handling bug look identical until the ids are named.
+fn logShortGen(slot: *Slot, reason: []const u8) void {
+    const gen = if (slot.legacy_gen) |*g| g else return;
+    const mode = specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        gen.dflash != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
+    const ids = gen.generated_ids.items;
+    const decoded: ?[]u8 = if (slot.model.tokenizer) |tok|
+        (tok.decode(slot.allocator, ids, false) catch null)
+    else
+        null;
+    defer if (decoded) |d| slot.allocator.free(d);
+    var buf: [1024]u8 = undefined;
+    log.info("{s}\n", .{formatShortGen(
+        &buf,
+        reason,
+        slot.completion_tokens,
+        ids,
+        decoded orelse "",
+        if (mode == .regular) "serial" else @tagName(mode),
+    )});
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -5061,6 +5130,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
+    if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
@@ -6692,9 +6762,6 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     // committed, full re-prefill on retry).
     const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
     try testing.expect(route_pos < pad_pos);
-    // A cancel landing between prefill completion and the first token has a
-    // live Generator with zero emitted tokens and a KV holding the prompt.
-    try testing.expect(std.mem.indexOf(u8, body, "n_gen == 0 and !slot.cancelled") != null);
 
     const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
     const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
@@ -6831,6 +6898,14 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
     try testing.expectEqual(@as(usize, 4), calls);
 }
 
+/// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
+const BatchedTickAction = struct { record: bool, publish: bool };
+
+fn batchedTickAction(cancelled: bool) BatchedTickAction {
+    // The KV row is already written, so the ledger records it even when cancelled.
+    return .{ .record = true, .publish = !cancelled };
+}
+
 /// Batched decode kernel for >=2 active slots. All slots must have already
 /// done a non-spec prefill (`skip_lazy_preforward = true`) so cache.step is
 /// at prompt_len with `next_token_id` carrying t1. We forward those N tokens
@@ -6960,17 +7035,20 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
-        if (slot.cancelled.load(.acquire)) continue;
         const gen = &slot.legacy_gen.?;
+        const act = batchedTickAction(slot.cancelled.load(.acquire));
         // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
         // the initWithOptions chokepoint and carries the model's
         // reserved-token suppression mask; the slot's copy is the raw
         // request params.
-        const lazy = gen.sampleLazy(logits_arr[i]);
-        try mlx.check(mlx.mlx_array_eval(lazy));
-        var val: i32 = 0;
-        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
+        const sampled: ?i32 = if (act.publish) blk: {
+            const lazy = gen.sampleLazy(logits_arr[i]);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+            _ = mlx.mlx_array_free(lazy);
+            break :blk val;
+        } else null;
 
         const emit = gen.next_token_id;
         gen.generated_ids.append(slot.allocator, emit) catch |err| {
@@ -6978,6 +7056,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             continue;
         };
         gen.advanceStep(1);
+        if (emit != 0) slot.was_pad_only = false;
+        const val = sampled orelse continue;
         gen.next_token_id = @intCast(val);
 
         // Stop checks (mirrors Generator.checkStop).
@@ -6989,12 +7069,10 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             // behavior we emit and then mark finished if `next_token_id` is
             // EOS (i.e. STOP is the next sampled token, ignored).
             slot.pushToken(emit);
-            if (emit != 0) slot.was_pad_only = false;
             slot.completion_tokens = gen.completion_tokens;
             // not finished yet; next tick's checkStop on next_token_id ends it
         } else {
             slot.pushToken(emit);
-            if (emit != 0) slot.was_pad_only = false;
             slot.completion_tokens = gen.completion_tokens;
         }
 
@@ -7947,4 +8025,47 @@ test "postEvictionPrefillChunk: the re-asked width is the one that runs, in BOTH
     inline for (.{ 512, 1024, 2048, 4096, 8192 }) |floor| {
         try testing.expectEqual(@as(u32, floor), postEvictionPrefillChunk(8192, floor).width);
     }
+}
+
+test "prefix-cache commit declines a pad-only generation, never a zero-token one" {
+    // Bar: a zero-token answer still commits; only an all-pad generation is declined.
+    try testing.expect(!commitDeclinesPadOnly(0, true));
+    try testing.expect(!commitDeclinesPadOnly(0, false));
+    try testing.expect(commitDeclinesPadOnly(3, true));
+    try testing.expect(!commitDeclinesPadOnly(3, false));
+}
+
+test "[short-gen] carries both token counts, the ids and what they decode to" {
+    // Bar: the line carries emitted vs realized and survives quotes, newlines and a 300-byte answer.
+    var buf: [1024]u8 = undefined;
+    const ids = [_]u32{ 151645, 17 };
+    try testing.expectEqualStrings(
+        "[short-gen] reason=stop emitted=0 realized=2 ids=[151645,17] bytes=\"hi\" path=mtp",
+        formatShortGen(&buf, "stop", 0, &ids, "hi", "mtp"),
+    );
+
+    const esc = formatShortGen(&buf, "length", 2, &.{}, "a\"b\nc", "serial");
+    try testing.expectEqualStrings(
+        "[short-gen] reason=length emitted=2 realized=0 ids=[] bytes=\"a\\\"b\\nc\" path=serial",
+        esc,
+    );
+
+    var long: [300]u8 = undefined;
+    @memset(&long, 'x');
+    const capped = formatShortGen(&buf, "stop", 1, &.{}, &long, "pld");
+    try testing.expectEqual(@as(usize, SHORT_GEN_TEXT_CAP), std.mem.count(u8, capped, "x"));
+}
+
+test "a cancel mid batched tick keeps generated_ids level with the KV rows" {
+    // Bar: kv rows == full_prompt + generated_ids even when the slot cancels mid tick.
+    const prompt_len: usize = 7;
+    var kv_rows = prompt_len;
+    var ids: usize = 0;
+    for ([_]bool{ false, false, false, true }) |cancelled| {
+        kv_rows += 1;
+        const act = batchedTickAction(cancelled);
+        if (act.record) ids += 1;
+        if (cancelled) try testing.expect(!act.publish);
+    }
+    try testing.expectEqual(kv_rows, prompt_len + ids);
 }

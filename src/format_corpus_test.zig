@@ -1677,6 +1677,47 @@ const corpus = [_]Expect{
         .raw = "Wrap the config in a <functional> or <function-like> block — this is just prose, no call here.",
         .no_tool_calls = true,
     },
+    .{
+        // Cut before any close tag with a package.json as the `content` value.
+        .family = "qwen",
+        .name = "truncated <function=> whose content parameter is a JSON object",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/package.json\n</parameter>\n<parameter=content>\n{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}",
+        .tool_name = "write_file",
+    },
+    .{
+        // A value may spell the dialect's own close tags (a file documenting the format).
+        .family = "qwen",
+        .name = "<function=> parameter value carrying </parameter>",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nclose it with </parameter> when done\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "close it with </parameter> when done",
+    },
+    .{
+        .family = "qwen",
+        .name = "<function=> parameter value carrying </tool_call>",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nthe wrapper ends at </tool_call> here\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "the wrapper ends at </tool_call> here",
+    },
+    .{
+        .family = "qwen",
+        .name = "<function=> parameter value carrying </function>",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nthe block ends at </function> here\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "the block ends at </function> here",
+    },
+    .{
+        // A numeric-looking value types from JSON's grammar, not parseFloat's.
+        .family = "qwen",
+        .name = "<function=> parameter value that only parseFloat calls a number",
+        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=mode>\n0755\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -2136,9 +2177,11 @@ test "format corpus: history round-trip serialization survives any byte content"
     //
     // Invariants, for every corpus entry's raw text AND hostile tool-result
     // samples:
-    //   1. The serialized form contains NO raw control byte (< 0x20) — the
-    //      strictest parser downstream must accept it.
-    //   2. A strict JSON parse round-trips every content byte exactly.
+    //   1. The serialized form contains NO raw control byte (< 0x20) and is
+    //      well-formed UTF-8 — the strictest parser downstream (nlohmann)
+    //      rejects either one, with the same silent fallback.
+    //   2. A strict JSON parse round-trips every content byte exactly, except
+    //      that ill-formed UTF-8 (which no prompt can carry) becomes U+FFFD.
     const allocator = testing.allocator;
 
     // Tool-result shapes that have to survive verbatim: ANSI codes from the
@@ -2148,6 +2191,8 @@ test "format corpus: history round-trip serialization survives any byte content"
     const hostile_tool_results = [_][]const u8{
         "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?\n\u{2502}  \u{25cf} SvelteKit minimal", // verbatim live failure
         &all_ctrl,
+        // Ill-formed UTF-8 from a `grep -a` over a binary.
+        "\xff\xfe\x80 binary",
     };
 
     for (corpus) |entry| {
@@ -2171,6 +2216,10 @@ test "format corpus: history round-trip serialization survives any byte content"
                     return error.FormatCorpusExpectFailed;
                 }
             }
+            if (!std.unicode.utf8ValidateSlice(serialized)) {
+                std.debug.print("\n[{s}] {s}: ill-formed UTF-8 in serialized history\n", .{ entry.family, entry.name });
+                return error.FormatCorpusExpectFailed;
+            }
 
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch {
                 std.debug.print("\n[{s}] {s}: serialized history is not valid JSON\n  got: {s}\n", .{ entry.family, entry.name, serialized });
@@ -2182,7 +2231,12 @@ test "format corpus: history round-trip serialization survives any byte content"
             const assistant_content = msgs[1].object.get("content").?.string;
             const tool_content = msgs[2].object.get("content").?.string;
             try testing.expectEqualStrings(entry.raw, assistant_content);
-            try testing.expectEqualStrings(tool_result, tool_content);
+            if (std.unicode.utf8ValidateSlice(tool_result)) {
+                try testing.expectEqualStrings(tool_result, tool_content);
+            } else {
+                // Only the ill-formed bytes are replaced; the rest is verbatim.
+                try testing.expectEqualStrings("\u{FFFD}\u{FFFD}\u{FFFD} binary", tool_content);
+            }
         }
     }
 }
@@ -2362,7 +2416,16 @@ test "format corpus: a parameter VALUE never decides the call" {
                 std.debug.print("\nhostile value produced invalid args JSON\n  value: {s}\n  args: {s}\n", .{ value, calls[0].arguments });
                 return error.HostileValueBrokeArgsJson;
             };
-            parsed.deinit();
+            defer parsed.deinit();
+            // Bar: a hostile spelling may not empty, truncate or drop the value the model wrote.
+            const got = parsed.value.object.get("content") orelse {
+                std.debug.print("\nhostile value dropped the parameter\n  value: {s}\n  args: {s}\n", .{ value, calls[0].arguments });
+                return error.HostileValueDroppedParam;
+            };
+            if (got != .string or !std.mem.eql(u8, got.string, value)) {
+                std.debug.print("\nhostile value did not round-trip\n  want: {s}\n  args: {s}\n", .{ value, calls[0].arguments });
+                return error.HostileValueMangled;
+            }
         }
     }
 }

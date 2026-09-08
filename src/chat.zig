@@ -643,17 +643,20 @@ fn renderChatTemplate(
         tools_z = try allocator.dupeSentinel(u8, tj, 0);
     }
 
+    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
+    var rendered_len: usize = 0;
     const result_ptr = jinja_c.jinja_render_chat(
         tmpl_z.ptr,
         msgs_z.ptr,
         if (tools_z) |tz| tz.ptr else null,
         extra_z.ptr,
         1,
+        &rendered_len,
     );
 
     if (result_ptr) |ptr| {
         defer jinja_c.jinja_str_free(ptr);
-        const collapsed = try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
+        const collapsed = try collapseDoubledThinkTags(allocator, ptr[0..rendered_len]);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -3177,9 +3180,16 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             var exact_buf: [40]u8 = undefined;
             if (open_name.len + 3 <= exact_buf.len) {
                 const exact = std.fmt.bufPrint(&exact_buf, "</{s}>", .{open_name}) catch unreachable;
-                if (std.mem.indexOf(u8, hay, exact)) |found| {
+                var from: usize = 0;
+                while (std.mem.indexOfPos(u8, hay, from, exact)) |found| {
+                    // A `<parameter=…>` value may spell the wrapper's own close.
+                    if (hermesParamSpanEnclosing(hay, found)) |past| {
+                        from = past;
+                        continue;
+                    }
                     close_rel = found;
                     close_len = exact.len;
+                    break;
                 }
             }
             if (close_rel == null) {
@@ -3197,6 +3207,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                         }
                     }
                     if (word_only and j < jlimit and hay[j] == '>') {
+                        if (hermesParamSpanEnclosing(hay, open_at)) |past| {
+                            cpos = past;
+                            continue;
+                        }
                         close_rel = open_at;
                         close_len = j + 1 - open_at;
                         break;
@@ -3211,7 +3225,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             // …well-formed args…}` then nothing); (2) max_tokens truncated.
             // The args object itself is usually intact — snap a balanced
             // JSON object from right after the open tag and try to parse it.
-            if (balancedJsonObject(effective_text[content_start..])) |json_body| {
+            // Function-tag form first: a parameter VALUE is arbitrary bytes and never names the tool.
+            const truncated_fn_tag = std.mem.indexOf(u8, effective_text[content_start..], "<function=") != null;
+            const truncated_json: ?[]const u8 = if (truncated_fn_tag) null else balancedJsonObject(effective_text[content_start..]);
+            if (truncated_json) |json_body| {
                 const json_off = @intFromPtr(json_body.ptr) - @intFromPtr(effective_text[content_start..].ptr);
                 const advance_to = content_start + json_off + json_body.len;
                 // Hermes shape (top-level "name" + "arguments"): use as-is.
@@ -6289,6 +6306,30 @@ fn convertGemma4Value(
     return pos + first_sep;
 }
 
+/// End of a `<parameter=…>` value: the LAST `</parameter>` before the next opener (a value may
+/// spell its own close tag); an unclosed parameter falls back to the first close.
+fn hermesValueEnd(body: []const u8, val_start: usize) ?usize {
+    const bound = std.mem.indexOfPos(u8, body, val_start, "<parameter=") orelse body.len;
+    var best: ?usize = null;
+    var i = val_start;
+    while (std.mem.indexOfPos(u8, body, i, "</parameter>")) |at| {
+        if (at >= bound) break;
+        best = at;
+        i = at + 1;
+    }
+    return best orelse std.mem.indexOfPos(u8, body, val_start, "</parameter>");
+}
+
+/// If `at` falls inside a `<parameter=…>` value, the position just past that value's close; else null.
+fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
+    const open = std.mem.lastIndexOf(u8, body[0..at], "<parameter=") orelse return null;
+    const gt = std.mem.indexOfScalarPos(u8, body, open, '>') orelse return null;
+    if (gt >= at) return null;
+    const end = hermesValueEnd(body, gt + 1) orelse return null;
+    if (end <= at) return null;
+    return end + "</parameter>".len;
+}
+
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
     const fn_start_tag = "<function=";
     const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
@@ -6301,7 +6342,17 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
     args_map.append(allocator, '{') catch return null;
 
     const fn_body_start = name_start + name_end + 1;
-    const fn_end = std.mem.indexOf(u8, block[fn_body_start..], "</function>") orelse block.len - fn_body_start;
+    const fn_end = blk: {
+        var from = fn_body_start;
+        while (std.mem.indexOfPos(u8, block, from, "</function>")) |found| {
+            if (hermesParamSpanEnclosing(block, found)) |past| {
+                from = past;
+                continue;
+            }
+            break :blk found - fn_body_start;
+        }
+        break :blk block.len - fn_body_start;
+    };
     const fn_body = block[fn_body_start .. fn_body_start + fn_end];
 
     // Track emitted parameter names so a repeated `<parameter=NAME>` can't
@@ -6331,7 +6382,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         }
 
         const p_val_start = p_name_start + p_name_end + 1;
-        const p_val_end = std.mem.indexOf(u8, fn_body[p_val_start..], "</parameter>") orelse break;
+        const p_val_end = (hermesValueEnd(fn_body, p_val_start) orelse break) - p_val_start;
         const p_val = stripHermesValueFraming(fn_body[p_val_start .. p_val_start + p_val_end]);
 
         // Skip a duplicate name (first wins); still advance past its block.
@@ -6625,8 +6676,31 @@ fn isJsonLiteral(s: []const u8) bool {
     if (s.len == 0) return false;
     if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
     // Objects/arrays are handled by brace-matching in the caller, not here
-    _ = std.fmt.parseFloat(f64, s) catch return false;
-    return true;
+    return isJsonNumber(s);
+}
+
+/// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
+fn isJsonNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+    if (s[i] == '0') {
+        i += 1;
+    } else {
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    return i == s.len;
 }
 
 /// THE JSON string escaper (quoted, control bytes \u-escaped). Public so other
@@ -6634,24 +6708,45 @@ fn isJsonLiteral(s: []const u8) bool {
 /// escaper is exactly how the control-byte class shipped twice before.
 pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
     try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            // Every other control char (e.g. ESC from ANSI codes in tool
-            // results) must be \u-escaped — nlohmann inside jinja_render_chat
-            // rejects raw control bytes, and the render failure silently
-            // downgrades the prompt to fallbackFormatChat.
-            0...8, 0x0B, 0x0C, 0x0E...0x1F => {
-                var esc: [6]u8 = undefined;
-                const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
-                try buf.appendSlice(allocator, n);
-            },
-            else => try buf.append(allocator, c),
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            i += 1;
+            switch (c) {
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                '\n' => try buf.appendSlice(allocator, "\\n"),
+                '\r' => try buf.appendSlice(allocator, "\\r"),
+                '\t' => try buf.appendSlice(allocator, "\\t"),
+                // Every other control char (e.g. ESC from ANSI codes in tool
+                // results) must be \u-escaped — nlohmann inside jinja_render_chat
+                // rejects raw control bytes, and the render failure silently
+                // downgrades the prompt to fallbackFormatChat.
+                0...8, 0x0B, 0x0C, 0x0E...0x1F => {
+                    var esc: [6]u8 = undefined;
+                    const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try buf.appendSlice(allocator, n);
+                },
+                else => try buf.append(allocator, c),
+            }
+            continue;
         }
+        // nlohmann rejects ill-formed UTF-8 like a raw control byte: each invalid subpart becomes U+FFFD.
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            try buf.appendSlice(allocator, "\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+            try buf.appendSlice(allocator, s[i .. i + len]);
+            i += len;
+            continue;
+        }
+        var j = i + 1;
+        while (j < s.len and j < i + len and s[j] & 0xC0 == 0x80) j += 1;
+        try buf.appendSlice(allocator, "\u{FFFD}");
+        i = j;
     }
     try buf.append(allocator, '"');
 }
@@ -13914,4 +14009,160 @@ test "streamShouldBufferForTools: the gate is a strict SUPERSET of parseMiniCpm5
             };
         }
     }
+}
+
+test "renderChatTemplate: a NUL byte in message content does not truncate the prompt" {
+    // Bar: content after the NUL, and the assistant header, survive the render.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- for message in messages -%}
+        \\<|im_start|>{{ message['role'] }}
+        \\{{ message['content'] }}<|im_end|>
+        \\{% endfor %}{%- if add_generation_prompt -%}<|im_start|>assistant
+        \\{% endif %}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const messages = [_]Message{
+        .{ .role = "user", .content = "before\x00after" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "before") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "after") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant") != null);
+}
+
+test "parseToolCalls qwen: a truncated <function= call is never renamed by a JSON parameter value" {
+    // Bar: a call cut before any close tag keeps the name its `<function=`
+    // opener declared, whatever the parameter value looks like.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
+        "<parameter=content>\n{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("write_file", calls[0].name);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </parameter> is not emptied" {
+    // Bar: the value ends at the close tag that actually ends it, byte-exact.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nsee </parameter> in the docs\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("see </parameter> in the docs", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </tool_call> is not dropped" {
+    // Bar: a required parameter survives a value that spells the wrapper close.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nemit </tool_call> here\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("emit </tool_call> here", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value types from JSON's number grammar, not parseFloat" {
+    // Bar: only a spelling JSON itself calls a number stays unquoted.
+    const allocator = testing.allocator;
+    const Case = struct { spelling: []const u8, number: bool };
+    const cases = [_]Case{
+        .{ .spelling = "Infinity", .number = false },
+        .{ .spelling = "nan", .number = false },
+        .{ .spelling = "+1", .number = false },
+        .{ .spelling = "0755", .number = false },
+        .{ .spelling = ".5", .number = false },
+        .{ .spelling = "5.", .number = false },
+        .{ .spelling = "1.5", .number = true },
+        .{ .spelling = "-2", .number = true },
+        .{ .spelling = "3e5", .number = true },
+        .{ .spelling = "0", .number = true },
+    };
+    for (cases) |c| {
+        const raw = try std.mem.concat(allocator, u8, &.{
+            "<tool_call>\n<function=edit>\n<parameter=mode>\n", c.spelling, "\n</parameter>\n</function>\n</tool_call>",
+        });
+        defer allocator.free(raw);
+        const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
+            std.debug.print("\n{s}: args not valid JSON: {s}\n", .{ c.spelling, calls[0].arguments });
+            return error.ArgsNotValidJson;
+        };
+        defer parsed.deinit();
+        const v = parsed.value.object.get("mode") orelse return error.MissingParam;
+        if (c.number) {
+            if (v == .string) {
+                std.debug.print("\n{s}: shipped as a string\n", .{c.spelling});
+                return error.NumberQuoted;
+            }
+        } else {
+            if (v != .string) {
+                std.debug.print("\n{s}: shipped unquoted as {s}\n", .{ c.spelling, @tagName(v) });
+                return error.NonNumberUnquoted;
+            }
+            try testing.expectEqualStrings(c.spelling, v.string);
+        }
+    }
+}
+
+test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-exact" {
+    // Bar: the escaper's output is always well-formed UTF-8 (nlohmann rejects
+    // anything else), and every valid sequence survives unchanged.
+    const allocator = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try appendJsonString(allocator, &buf, "\xff\xfe\x80 binary");
+    try testing.expect(std.unicode.utf8ValidateSlice(buf.items));
+    try testing.expectEqualStrings("\"\u{FFFD}\u{FFFD}\u{FFFD} binary\"", buf.items);
+
+    buf.clearRetainingCapacity();
+    const valid = "héllo \u{4e2d}\u{6587} \u{1F600} ok";
+    try appendJsonString(allocator, &buf, valid);
+    try testing.expectEqualStrings("\"" ++ valid ++ "\"", buf.items);
+
+    // A truncated multibyte sequence at end-of-input is one replacement.
+    buf.clearRetainingCapacity();
+    try appendJsonString(allocator, &buf, "a\xe4\xb8");
+    try testing.expectEqualStrings("\"a\u{FFFD}\"", buf.items);
 }

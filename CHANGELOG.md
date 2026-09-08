@@ -21,6 +21,15 @@
 
 ### Fixes
 
+- A text-only turn after image turns on a hybrid model no longer re-prefills the whole conversation: the image turn now keeps the cached checkpoints for the text before the image, so the next turn restores that prefix instead of a cold prefill of hundreds of thousands of tokens.
+- A chat message containing a NUL byte (typically `grep -a` output over a binary pasted into an agent turn) no longer truncates the prompt at that byte. The model used to see a conversation that ended in the middle of that message, answer with an immediate end-of-turn, and the agent's turn ended empty with no error.
+- Speculative decoding no longer pays a draft-and-verify round when the model's very first token ends the turn, and such a prompt still lands in the prefix cache for the next turn.
+- A tool call whose parameter value contains the format's own close tags, or that was cut off mid-call with JSON inside a parameter, is parsed as written instead of being emptied, dropped or renamed; numeric-looking values are typed by JSON's number grammar, so `0755` stays a string and the other arguments survive.
+- Binary (ill-formed UTF-8) bytes in a message no longer make the prompt fall back to the generic chat format.
+- A prefix-cache restore that fails part-way no longer leaves a half-restored cache under a cold prefill, and a commit while every cached entry is in use no longer hangs the server.
+- A hybrid-model restore from SSD takes its speculative-decoding sidecar from the entry it restored the trunk from, skips poisoned disk entries, and drops an entry with an unreadable manifest value instead of crashing.
+- A spent reasoning budget no longer streams the rest of the model's thinking as the answer; a non-streaming tool-call reply keeps the text the model said before the call; a client that disconnects from a non-streaming request is no longer answered with `finish_reason: "length"`; streaming honours `stop` sequences at the exact match; `seed: -1` means unseeded instead of crashing the server.
+- A cancel during batched decoding keeps the cached prefix aligned with the tokens that were generated.
 - JSON-schema output no longer collapses decode speed. The grammar mask walked the entire vocabulary on every token and the constrained step built the next forward only after sampling; the mask now probes only tokens the grammar can accept and the forward is built while the GPU is still busy, so constrained decode runs at the serial decode rate instead of ~1 tok/s on Flash Next. (#380)
 - The prefix-cache budget now follows what is resident. It used to be clamped once at load against every model on the machine, so a model loaded beside a large one could keep a near-zero budget for the whole session and unloading the other model did not give it back. (#364)
 - A batch sweep no longer evicts your conversation from the prefix cache. Cache entries are grouped by workload (`prompt_cache_key`, else `metadata.user_id`, else the system prompt) and eviction takes the oldest entry of the largest group, so a sweep of documents evicts its own documents and a warm conversation stays warm. One workload alone behaves exactly as before. (#378)

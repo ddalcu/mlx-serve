@@ -666,6 +666,7 @@ pub const DiskTier = struct {
     ) ?HybridMatch {
         var best: ?HybridMatch = null;
         for (self.entries.items, 0..) |*e, i| {
+            if (e.poisoned) continue; // a failed write killed it: this is a MISS
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
             const max_shared = @min(e.tokens.len, prompt_ids.len);
@@ -2896,10 +2897,6 @@ pub const DiskTier = struct {
         const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
         const has_tools_v = obj.get("has_tools") orelse return null;
         if (has_tools_v != .bool) return null;
-        const scheme_v = obj.get("scheme") orelse return null;
-        if (scheme_v != .string) return null;
-        const bits = jsonU64(obj, "bits") orelse 0;
-        const group_size = jsonU64(obj, "group_size") orelse 0;
         const chunk_bytes_v = obj.get("chunk_bytes") orelse return null;
         if (chunk_bytes_v != .array) return null;
 
@@ -2908,16 +2905,7 @@ pub const DiskTier = struct {
         if (chunk_tokens != self.chunk_tokens) return null;
         if (kv_len == 0 or kv_len > n_tokens) return null;
 
-        const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-        var quant: kv_quant.KVQuantConfig = switch (scheme) {
-            .off => kv_quant.KVQuantConfig.dense,
-            .affine => kv_quant.KVQuantConfig.affine(@intCast(bits)),
-            else => return null,
-        };
-        if (scheme == .affine) {
-            if (group_size == 0 or bits == 0) return null;
-            quant.group_size = @intCast(group_size);
-        }
+        const quant = manifestQuant(obj) orelse return null;
 
         const n_chunks: u64 = (kv_len + chunk_tokens - 1) / chunk_tokens;
         if (chunk_bytes_v.array.items.len != n_chunks) return null;
@@ -3059,7 +3047,7 @@ pub const DiskTier = struct {
             if (qh_v != .object) break :qh_blk;
             const qo = qh_v.object;
             const rec_bytes = jsonU64(qo, "bytes") orelse break :qh_blk;
-            const rec_rows = jsonU64(qo, "rows") orelse break :qh_blk;
+            const rec_rows = jsonInt(u32, qo, "rows") orelse break :qh_blk;
             const inh_v = qo.get("inherited");
             inherited_qsa = inh_v != null and inh_v.? == .bool and inh_v.?.bool;
             const qp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, id }) catch break :qh_blk;
@@ -3070,7 +3058,7 @@ pub const DiskTier = struct {
                 break :qh_blk;
             }
             qsa_history_bytes = rec_bytes;
-            qsa_history_rows = @intCast(rec_rows);
+            qsa_history_rows = rec_rows;
             if (!inherited_qsa) total += rec_bytes;
         }
 
@@ -3357,6 +3345,30 @@ fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
     return @intCast(v.integer);
 }
 
+/// A manifest scalar narrowed to the field that will hold it. meta.json is on disk and
+/// hand-editable, so a value that does not fit drops its record rather than being cast.
+fn jsonInt(comptime T: type, obj: std.json.ObjectMap, key: []const u8) ?T {
+    const v = obj.get(key) orelse return null;
+    if (v != .integer) return null;
+    return std.math.cast(T, v.integer);
+}
+
+/// The KV quant config a manifest describes, or null when it is not one this build can hold.
+fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
+    const scheme_v = obj.get("scheme") orelse return null;
+    if (scheme_v != .string) return null;
+    const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
+    if (scheme == .off) return kv_quant.KVQuantConfig.dense;
+    if (scheme != .affine) return null;
+    const bits = jsonInt(u8, obj, "bits") orelse return null;
+    if (bits != 4 and bits != 8) return null;
+    const gs = jsonInt(u32, obj, "group_size") orelse return null;
+    if (gs == 0) return null;
+    var q = kv_quant.KVQuantConfig.affine(bits);
+    q.group_size = gs;
+    return q;
+}
+
 fn writeSpecMetaJson(a: std.mem.Allocator, w: *std.ArrayList(u8), name: []const u8, sm: SpecMeta) !void {
     try w.print(a, ",\"{s}\":{{\"base\":{d},\"step\":{d},\"layers\":{d},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d}", .{
         name, sm.base, sm.step, sm.layers, @tagName(sm.quant.scheme), sm.quant.bits, sm.quant.group_size,
@@ -3383,50 +3395,35 @@ fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
     if (v != .object) return null;
     const o = v.object;
     const base = jsonU64(o, "base") orelse return null;
-    const step = jsonU64(o, "step") orelse return null;
-    const layers = jsonU64(o, "layers") orelse return null;
+    const step = jsonInt(u32, o, "step") orelse return null;
+    const layers = jsonInt(u32, o, "layers") orelse return null;
     if (step == 0 or layers == 0) return null;
-    const scheme_v = o.get("scheme") orelse return null;
-    if (scheme_v != .string) return null;
-    const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-    const bits = jsonU64(o, "bits") orelse 0;
-    const gs = jsonU64(o, "group_size") orelse 0;
-    const quant: kv_quant.KVQuantConfig = switch (scheme) {
-        .off => kv_quant.KVQuantConfig.dense,
-        .affine => blk: {
-            if (bits == 0 or gs == 0) return null;
-            var q = kv_quant.KVQuantConfig.affine(@intCast(bits));
-            q.group_size = @intCast(gs);
-            break :blk q;
-        },
-        else => return null,
-    };
+    const quant = manifestQuant(o) orelse return null;
     // v5 head half; absent on every earlier manifest.
     var head: ?SpecHeadMeta = null;
     if (o.get("head")) |hv| head_blk: {
         if (hv != .object) break :head_blk;
         const ho = hv.object;
-        const pb = ho.get("pos_base") orelse break :head_blk;
-        if (pb != .integer) break :head_blk;
-        const ratio = jsonU64(ho, "ratio") orelse break :head_blk;
+        const pb = jsonInt(i32, ho, "pos_base") orelse break :head_blk;
+        const ratio = jsonInt(i32, ho, "ratio") orelse break :head_blk;
         if (ratio == 0) break :head_blk;
         const pooled_v = ho.get("pooled") orelse break :head_blk;
         if (pooled_v != .bool) break :head_blk;
-        const rows = jsonU64(ho, "rows") orelse 0;
-        var hm: SpecHeadMeta = .{ .pos_base = @intCast(pb.integer), .ratio = @intCast(ratio), .pooled = pooled_v.bool, .rows = @intCast(rows) };
+        const rows = jsonInt(i32, ho, "rows") orelse 0;
+        var hm: SpecHeadMeta = .{ .pos_base = pb, .ratio = ratio, .pooled = pooled_v.bool, .rows = rows };
         // v8 leftovers; absent on every earlier manifest.
         if (ho.get("marks")) |mv| {
             if (mv == .array) {
                 for (mv.array.items) |iv| {
                     if (iv != .integer or hm.mark_count == transformer_mod.QSA_HEAD_MARKS_MAX) break;
-                    hm.marks[hm.mark_count] = @intCast(iv.integer);
+                    hm.marks[hm.mark_count] = std.math.cast(i32, iv.integer) orelse break;
                     hm.mark_count += 1;
                 }
             }
         }
         head = hm;
     }
-    return .{ .base = base, .step = @intCast(step), .layers = @intCast(layers), .quant = quant, .head = head };
+    return .{ .base = base, .step = step, .layers = layers, .quant = quant, .head = head };
 }
 
 // ── Tests ──
@@ -6815,6 +6812,102 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
     var back = try KVCache.init(testing.allocator, 2);
     defer back.deinit();
     try testing.expectEqual(@as(u32, 600), try tier.restoreInto(&back, 0, s));
+}
+
+test "DiskTier: a poisoned entry is invisible to the hybrid lookup too" {
+    // Poisoning is the tier's "this entry is dead" mark; the hybrid arm is the lookup qwen4_exp
+    // actually takes, so a gap there makes the mark meaningless.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-poison-hyb", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps: [1]transformer_mod.SSMCheckpoint = .{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s)};
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) != null);
+    tier.entries.items[0].poisoned = true;
+    try testing.expect(tier.bestMatch(&tokens, false, cache.config) == null);
+    try testing.expect(tier.bestHybridMatch(&tokens, false, cache.config, 600) == null);
+}
+
+test "DiskTier: a manifest scalar that does not fit its field drops the record, never casts" {
+    // meta.json is on disk and hand-editable; an unchecked @intCast of a corrupt scalar is
+    // ReleaseFast UB.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-badmeta", 0, 128);
+    defer tier.deinit();
+
+    const qcfg = kv_quant.KVQuantConfig.affine(4);
+    var cache = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 520, 64, 0.0, .bfloat16);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 520, 8, 9.5, .float32);
+    var tokens: [520]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    );
+    const id = tier.entries.items[0].id;
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-badmeta/e{d}/meta.json", .{ base, id });
+    defer testing.allocator.free(meta_path);
+    const orig = readFileAlloc(testing.allocator, io, meta_path, 64 * 1024).?;
+    defer testing.allocator.free(orig);
+    if (tier.loadEntry(id)) |l| {
+        var e = l.e;
+        defer tier.freeIndexEntryOwned(&e);
+        try testing.expect(e.spec_mtp != null);
+    } else return error.TestUnexpectedResult;
+
+    const cases = [_]struct { find: []const u8, replace: []const u8, entry_survives: bool }{
+        .{ .find = "\"bits\":4", .replace = "\"bits\":4000", .entry_survives = false },
+        .{ .find = "\"group_size\":64", .replace = "\"group_size\":68719476736", .entry_survives = false },
+        .{ .find = "\"layers\":1", .replace = "\"layers\":68719476736", .entry_survives = true },
+    };
+    for (cases) |c| {
+        const patched = try std.mem.replaceOwned(u8, testing.allocator, orig, c.find, c.replace);
+        defer testing.allocator.free(patched);
+        try testing.expect(!std.mem.eql(u8, patched, orig));
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = meta_path, .data = patched });
+        if (tier.loadEntry(id)) |l| {
+            var e = l.e;
+            defer tier.freeIndexEntryOwned(&e);
+            try testing.expect(c.entry_survives);
+            // The spec half is the only part an out-of-range spec scalar costs.
+            try testing.expect(e.spec_mtp == null);
+        } else {
+            try testing.expect(!c.entry_survives);
+        }
+    }
 }
 
 test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk fails it with a clean writer)" {

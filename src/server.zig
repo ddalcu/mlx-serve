@@ -1134,9 +1134,23 @@ pub fn launchMaxTokensDefault() u32 {
 fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
     const val = v orelse return auto_default;
     return switch (val) {
-        .integer => |i| if (i > 0) @intCast(i) else auto_default,
+        .integer => |i| if (i > 0) @intCast(@min(i, std.math.maxInt(u32))) else auto_default,
         else => auto_default,
     };
+}
+
+/// A request's `seed`; negative is the llama.cpp "random" convention and means unseeded.
+fn parseRequestSeed(v: ?std.json.Value) ?u64 {
+    const val = v orelse return null;
+    return switch (val) {
+        .integer => |i| if (i < 0) null else @as(u64, @intCast(i)),
+        else => null,
+    };
+}
+
+/// A client-supplied JSON integer narrowed to i32 by clamping, never by `@intCast`.
+fn clampJsonI32(i: i64) i32 {
+    return @intCast(std.math.clamp(i, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
 /// Who decided the effective `max_tokens`: the client, the `--max-tokens` launch default, or nobody (auto).
@@ -7522,10 +7536,7 @@ fn handleChatCompletions(
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Parse logprobs: "logprobs": true, "top_logprobs": N (0-20)
     const logprobs_n: u32 = blk: {
@@ -7702,7 +7713,7 @@ fn handleChatCompletions(
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
     const effort_budget: i32 = if (effort_cfg) |e| e.budget else server_config.default_reasoning_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| @intCast(i),
+        .integer => |i| clampJsonI32(i),
         else => effort_budget,
     } else effort_budget;
 
@@ -8117,10 +8128,7 @@ fn handleCompletions(
         else => 0.0,
     } else 0.0;
 
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -8435,6 +8443,8 @@ fn handleStreamingCompletion(
     var client_gone = false;
 
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -8468,7 +8478,7 @@ fn handleStreamingCompletion(
         const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
 
         // Handle incomplete UTF-8 sequences across token boundaries
-        const token_text = blk: {
+        var token_text = blk: {
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -8498,13 +8508,12 @@ fn handleStreamingCompletion(
 
         if (stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
-                    stopped = true;
-                    break;
-                }
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
-            if (stopped) break;
         }
 
         const escaped = try jsonEscape(allocator, token_text);
@@ -8564,6 +8573,32 @@ fn handleStreamingCompletion(
     log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
+}
+
+/// Where a stop sequence cuts the accumulated text and how many bytes of the arriving token
+/// survive: streaming delivers the same `text[0..index]` non-streaming keeps.
+const StopCut = struct { index: usize, token_keep: usize, matched: []const u8 };
+
+fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8) ?StopCut {
+    const emitted = text.len - @min(token_len, text.len);
+    var best: ?StopCut = null;
+    for (stops) |stop_seq| {
+        if (stop_seq.len == 0) continue;
+        const idx = std.mem.indexOf(u8, text, stop_seq) orelse continue;
+        if (best) |b| if (b.index <= idx) continue;
+        best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
+    }
+    return best;
+}
+
+/// A client that vanished mid-generation did not hit a token cap.
+fn nonStreamFinishReason(client_gone: bool, slot_reason: []const u8) []const u8 {
+    return if (client_gone) "client_disconnect" else slot_reason;
+}
+
+/// The text the model said before the tool markup, byte for byte as the stream flushes it.
+fn visibleToolPreamble(content: []const u8) []const u8 {
+    return if (std.mem.trim(u8, content, " \t\r\n").len > 0) content else "";
 }
 
 /// Run a non-streaming generation through the scheduler. Returns the same
@@ -8640,6 +8675,7 @@ fn nonStreamingViaScheduler(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
+    var client_gone = false;
     wait: while (true) {
         const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
             // Idle (long prefill). If the client is gone, cancel and serve
@@ -8649,6 +8685,7 @@ fn nonStreamingViaScheduler(
                 if (c.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
                     slot.cancel();
+                    client_gone = true;
                     break :wait;
                 }
             }
@@ -8691,7 +8728,7 @@ fn nonStreamingViaScheduler(
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
         .completion_tokens = slot.completion_tokens,
-        .finish_reason = slot.finish_reason,
+        .finish_reason = nonStreamFinishReason(client_gone, slot.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
         .prefill_ns = slot.prefill_ns,
@@ -8864,10 +8901,10 @@ fn handleNonStreamingGeneration(
 
             // Reasoning is delivered whenever the model produced it — the
             // request's thinking flag shaped the prompt, not the delivery.
+            const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
             {
-                const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
                 if (tc_think_split.reasoning_content) |reasoning| {
                     const escaped_reasoning = try jsonEscape(allocator, reasoning);
                     tc_reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
@@ -8876,6 +8913,12 @@ fn handleNonStreamingGeneration(
                 }
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
+
+            // The same pre-markup text the stream flushes as a text delta.
+            const tc_preamble = visibleToolPreamble(tc_think_split.content);
+            const tc_content_esc = jsonEscapeOrEmpty(allocator, tc_preamble);
+            defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
+            const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
 
             const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
@@ -8889,11 +8932,12 @@ fn handleNonStreamingGeneration(
             defer allocator.free(tc_usage_obj);
 
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
                 nowMs(stream.io),
                 nowSecs(stream.io),
                 model_name,
+                tc_content_json,
                 tc_reasoning_json,
                 tc_buf.items,
                 toolCallFinishReason(finish_reason),
@@ -9548,6 +9592,8 @@ fn handleStreamingGeneration(
     // Generate tokens via the adapter — yields one decoded token id per call
     // regardless of whether the underlying decode is regular, PLD, or drafter.
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -9582,7 +9628,7 @@ fn handleStreamingGeneration(
 
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        const token_text = blk: {
+        var token_text = blk: {
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -9621,19 +9667,16 @@ fn handleStreamingGeneration(
             try text_buf.appendSlice(allocator, token_text);
         }
 
-        // Check stop sequences
+        // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            var hit_stop = false;
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq)) |_| {
-                    hit_stop = true;
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) {
+                    allocator.free(token_text);
                     break;
                 }
-            }
-            if (hit_stop) {
-                allocator.free(token_text);
-                stopped = true;
-                break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
         }
 
@@ -9859,17 +9902,10 @@ fn handleStreamingGeneration(
                 }
             }
 
-            // Check if reasoning budget exhausted
+            // A spent budget caps DELIVERY only: the tail stays withheld reasoning until the close tag.
             if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
                 budget_exhausted = true;
-                // Flush all buffered reasoning
-                if (think_buf.items.len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
-                }
-                think_buf.clearRetainingCapacity();
-                in_think_block = false;
                 log.info("  reasoning budget exhausted ({d}/{d} tokens)\n", .{ think_tokens, reasoning_budget });
-                continue;
             }
 
             // Check for the close tag — accept whichever appears first.
@@ -9931,7 +9967,7 @@ fn handleStreamingGeneration(
             };
 
             if (close_match) |m| {
-                if (m.pos > 0) {
+                if (m.pos > 0 and !budget_exhausted) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
@@ -9989,7 +10025,9 @@ fn handleStreamingGeneration(
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
+                    if (!budget_exhausted) {
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
+                    }
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -10041,7 +10079,9 @@ fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
+            if (!budget_exhausted) {
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
+            }
         } else {
             const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
             if (vis_tail.len > 0) {
@@ -14163,10 +14203,7 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
     var tools_json: ?[]const u8 = null;
@@ -14241,7 +14278,7 @@ fn handleAnthropicMessages(
             }
             if (think_val.object.get("budget_tokens")) |bt| {
                 if (bt == .integer) {
-                    reasoning_budget = @intCast(bt.integer);
+                    reasoning_budget = clampJsonI32(bt.integer);
                     budget_explicit = true;
                 }
             }
@@ -14667,6 +14704,20 @@ fn handleAnthropicNonStreaming(
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
 
+            // The same pre-markup text the stream flushes as a text delta.
+            const tu_preamble = visibleToolPreamble(chat_mod.trimLeakedToolMarkup(final_text));
+            if (tu_preamble.len > 0) {
+                if (block_count > 0) try content.append(allocator, ',');
+                const esc_pre = try jsonEscape(allocator, tu_preamble);
+                defer allocator.free(esc_pre);
+                const pre_block = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"text","text":{s}}}
+                , .{esc_pre});
+                defer allocator.free(pre_block);
+                try content.appendSlice(allocator, pre_block);
+                block_count += 1;
+            }
+
             // Emit tool_use content blocks
             for (tool_calls, 0..) |tc, i| {
                 if (block_count > 0) try content.append(allocator, ',');
@@ -14907,6 +14958,8 @@ fn handleAnthropicStreaming(
     var utf8_carry_len: u8 = 0;
 
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -14939,7 +14992,7 @@ fn handleAnthropicStreaming(
         const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
 
         // UTF-8 carry handling
-        const token_text = blk: {
+        var token_text = blk: {
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -14972,16 +15025,15 @@ fn handleAnthropicStreaming(
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
-                    stopped = true;
-                    matched_stop_seq = stop_seq;
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                matched_stop_seq = cut.matched;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) {
+                    allocator.free(token_text);
                     break;
                 }
-            }
-            if (stopped) {
-                allocator.free(token_text);
-                break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
         }
 
@@ -15197,20 +15249,14 @@ fn handleAnthropicStreaming(
                 }
             }
 
-            // Budget check
+            // A spent budget closes the DELIVERED thinking block; the tail is withheld, never text.
             if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
                 budget_exhausted = true;
-                if (thinking_block_open and think_buf.items.len > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
-                }
-                think_buf.clearRetainingCapacity();
                 if (thinking_block_open) {
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
                     thinking_block_open = false;
                     block_index += 1;
                 }
-                in_think_block = false;
-                continue;
             }
 
             // Check for the close tag — accept whichever appears first
@@ -15311,14 +15357,14 @@ fn handleAnthropicStreaming(
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
                 think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
-            } else if (skipped_think_open and thinking_block_open) {
+            } else if (skipped_think_open) {
                 // Hold back a still-growing partial close tag (suffixed forms
                 // included), then back off to a UTF-8 boundary — a cut mid-
                 // codepoint ships a lone continuation byte in the delta JSON.
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
+                    if (thinking_block_open) try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -15909,10 +15955,7 @@ fn handleResponsesInner(
         (if (v == .string) v.string else null)
     else
         null;
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // ── stop sequences ──
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -16347,6 +16390,8 @@ fn handleResponsesInner(
         var live_output_index: u32 = 0;
 
         while (true) {
+            // A stop cut resolved on the previous token ends the turn here.
+            if (stopped) break;
             const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
                 .done => break,
@@ -16379,7 +16424,7 @@ fn handleResponsesInner(
             const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
 
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            const token_text = blk: {
+            var token_text = blk: {
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -16409,13 +16454,12 @@ fn handleResponsesInner(
             try raw_buf.appendSlice(allocator, token_text);
 
             if (stop_sequences.items.len > 0) {
-                for (stop_sequences.items) |stop_seq| {
-                    if (std.mem.indexOf(u8, raw_buf.items, stop_seq) != null) {
-                        stopped = true;
-                        break;
-                    }
+                if (stopSequenceCut(raw_buf.items, token_text.len, stop_sequences.items)) |cut| {
+                    stopped = true;
+                    raw_buf.shrinkRetainingCapacity(cut.index);
+                    if (cut.token_keep == 0) break;
+                    token_text = try allocator.realloc(token_text, cut.token_keep);
                 }
-                if (stopped) break;
             }
 
             // Beat BEFORE the tool early-continue below: a tool-active request
@@ -22688,4 +22732,63 @@ test "the MLX buffer pool is inside `available` by construction, so a refusal ca
     try t.expectEqual(pool + free_system, ceiling - active);
     const cleared = physicalMemoryCeiling(wired, active, free_system + pool);
     try t.expectEqual(ceiling, cleared);
+}
+
+test "a request integer from a client is clamped, never blindly @intCast" {
+    // Bar: `seed: -1`, a 2^32 max_tokens and an out-of-range budget resolve without a cast.
+    const t = std.testing;
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
+    try t.expectEqual(@as(?u64, 0), parseRequestSeed(.{ .integer = 0 }));
+    try t.expectEqual(@as(?u64, 42), parseRequestSeed(.{ .integer = 42 }));
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "42" }));
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(null));
+
+    try t.expectEqual(@as(u32, std.math.maxInt(u32)), resolveRequestMaxTokens(.{ .integer = 1 << 32 }, 7));
+    try t.expectEqual(@as(u32, 512), resolveRequestMaxTokens(.{ .integer = 512 }, 7));
+    try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 0 }, 7));
+
+    try t.expectEqual(@as(i32, std.math.maxInt(i32)), clampJsonI32(1 << 40));
+    try t.expectEqual(@as(i32, std.math.minInt(i32)), clampJsonI32(-(1 << 40)));
+    try t.expectEqual(@as(i32, -1), clampJsonI32(-1));
+    try t.expectEqual(@as(i32, 1024), clampJsonI32(1024));
+}
+
+test "a vanished client is not a token cap: the non-stream finish reason says so" {
+    // Bar: the non-streaming path reports what the three streaming paths do.
+    const t = std.testing;
+    try t.expectEqualStrings("client_disconnect", nonStreamFinishReason(true, "length"));
+    try t.expectEqualStrings("stop", nonStreamFinishReason(false, "stop"));
+    try t.expectEqualStrings("length", nonStreamFinishReason(false, "length"));
+}
+
+test "a tool-call answer keeps the model's visible preamble" {
+    // Bar: non-streamed content == what the stream flushes before the tool markup.
+    const t = std.testing;
+    const raw = "<think>pick a tool</think>Checking the weather.\n<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>";
+    const split = chat_mod.splitThinkBlock(raw, true, false);
+    try t.expectEqualStrings("Checking the weather.", visibleToolPreamble(split.content));
+    const bare = chat_mod.splitThinkBlock("<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>", true, false);
+    try t.expectEqualStrings("", visibleToolPreamble(bare.content));
+    try t.expectEqualStrings("", visibleToolPreamble("  \n "));
+}
+
+test "a streaming stop sequence cuts at the match, not at the token boundary" {
+    // Bar: the streamed bytes are the bytes non-streaming keeps (`text[0..idx]`).
+    const t = std.testing;
+    const stops = [_][]const u8{"\n\nHuman:"};
+    // The stop opens inside the token that completes it: the leading bytes of
+    // that token are answer text and must still be delivered.
+    const buf = "Paris.\n\nHuman:";
+    const cut = stopSequenceCut(buf, "s.\n\nHuman:".len, &stops).?;
+    try t.expectEqual(@as(usize, 6), cut.index);
+    try t.expectEqual(@as(usize, 2), cut.token_keep);
+    try t.expectEqualStrings("\n\nHuman:", cut.matched);
+    // Match entirely inside already-delivered bytes: nothing of this token survives.
+    const late = stopSequenceCut(buf, 1, &stops).?;
+    try t.expectEqual(@as(usize, 6), late.index);
+    try t.expectEqual(@as(usize, 0), late.token_keep);
+    // Earliest match wins, and a clean buffer cuts nothing.
+    const many = [_][]const u8{ "END", "N" };
+    try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
+    try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
 }

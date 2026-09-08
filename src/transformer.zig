@@ -6632,7 +6632,7 @@ pub const QsaHeadMarkSet = struct {
         self.dropAbove(pos);
         if (self.len > 0 and self.items[self.len - 1].pos == pos) self.dropAt(self.len - 1);
         if (self.len == QSA_HEAD_MARKS_MAX) {
-            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency));
+            self.dropAt(spanPreservingDropIndex(QsaHeadMark, self.slice(), markPosOf, .min_span_recency, null));
         }
         self.items[self.len] = .{ .pos = pos, .rows = rows };
         self.len += 1;
@@ -8038,6 +8038,10 @@ pub fn spanPreservingDropIndex(
     items: []const T,
     comptime posOf: fn (*const T) usize,
     policy: ThinPolicy,
+    /// An index the caller knows a later turn must restore from (a media boundary): never
+    /// selected. When it is the only candidate the oldest goes instead — that one sits below
+    /// it, so the protected position survives either way.
+    protect: ?usize,
 ) usize {
     std.debug.assert(items.len > 0);
     if (policy == .oldest) return 0;
@@ -8052,12 +8056,14 @@ pub fn spanPreservingDropIndex(
     var best_span: usize = std.math.maxInt(usize);
     var k: usize = 1;
     while (k + 1 < items.len and k < scan_end) : (k += 1) {
+        if (protect) |p| if (k == p) continue;
         const span = posOf(&items[k + 1]) -| posOf(&items[k - 1]);
         if (span < best_span) {
             best_span = span;
             best_at = k;
         }
     }
+    if (best_span == std.math.maxInt(usize)) return 0;
     return best_at;
 }
 
@@ -8077,17 +8083,17 @@ fn usizePosOf(p: *const usize) usize {
 }
 
 /// `spanPreservingDropIndex` over a checkpoint list.
-pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy);
+pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
+    return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf, policy);
+    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null);
 }
 
 pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf, policy);
+    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null);
 }
 
 /// QSA indexer key history lives on full-attention layers: `aux_state` is
