@@ -9952,11 +9952,6 @@ fn handleStreamingGeneration(
         };
 
         // Accumulate for stop sequence and tool call detection
-        // Constrained routing: consult the generator's payload boundary once
-        // the token carrying it arrives. A DIRECT answer (payload at
-        // generated token 0) leaves the think arm before it can buffer
-        // anything; a later boundary is confirmed after the close scan has
-        // already routed the transition.
         if (constrained_proto and !payload_started) {
             if (slot_handle.?.constraintPayloadStart()) |ps| {
                 payload_started = true;
