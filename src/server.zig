@@ -8,6 +8,7 @@ const mtp_mod = @import("mtp.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const rp_mod = @import("reasoning_protocol.zig");
+const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
@@ -1095,6 +1096,46 @@ fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *c
 ///    fallback until its own format is supported), generation starts at the
 ///    unresolved opener choice: the model may open reasoning or answer
 ///    directly, and the choice mask keeps both legal until it decides.
+/// Fill a delimiter's per-suffix canonical encodings: entry k spells
+/// `text[k..]` in ordinary tokens whose bytes concatenate exactly. A suffix
+/// the tokenizer cannot spell keeps `len == 0` — forced recovery refuses at
+/// that partial state instead of approximating the delimiter.
+fn fillSuffixTable(
+    alloc: std.mem.Allocator,
+    tok: *const Tokenizer,
+    tb: *const token_mask.TokenBytes,
+    text: []const u8,
+    table: []rp_mod.SuffixRun,
+    buf: []u32,
+) void {
+    var off: u32 = 0;
+    for (0..text.len) |k| {
+        const suffix = text[k..];
+        const ids = tok.encode(alloc, suffix) catch continue;
+        defer alloc.free(ids);
+        if (ids.len == 0 or off + ids.len > buf.len) continue;
+        var consumed: usize = 0;
+        var ok = true;
+        for (ids) |id| {
+            const b = tb.bytes[id] orelse {
+                ok = false;
+                break;
+            };
+            if (consumed + b.len > suffix.len or
+                !std.mem.eql(u8, b, suffix[consumed..consumed + b.len]))
+            {
+                ok = false;
+                break;
+            }
+            consumed += b.len;
+        }
+        if (!ok or consumed != suffix.len) continue;
+        @memcpy(buf[off..][0..ids.len], ids);
+        table[k] = .{ .offset = off, .len = @intCast(ids.len) };
+        off += @intCast(ids.len);
+    }
+}
+
 fn resolveReasoningProtocol(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1135,13 +1176,16 @@ fn resolveReasoningProtocol(
     }
 
     // The close must be samplable: an atomic special token, or ordinary bytes
-    // whose canonical encoding reproduces the delimiter exactly.
+    // whose canonical encoding reproduces the delimiter exactly. The
+    // per-suffix recovery table is filled either way — a partial close
+    // always recovers through the remaining BYTES, atomic or not.
+    const tb = lm.grammarTokenBytes(allocator, io) catch return false;
+    fillSuffixTable(allocator, tok, tb, proto.closerText(), &proto.closer_suffix, &proto.closer_suffix_buf);
     proto.closer_atomic = tok.specialTokenId(proto.closerText());
     if (proto.closer_atomic == null) {
         const ids = tok.encode(allocator, proto.closerText()) catch return false;
         defer allocator.free(ids);
         if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) return false;
-        const tb = lm.grammarTokenBytes(allocator, io) catch return false;
         var joined: std.ArrayList(u8) = .empty;
         defer joined.deinit(allocator);
         for (ids) |id| {
@@ -1152,11 +1196,13 @@ fn resolveReasoningProtocol(
         if (!proto.setForced(ids)) return false;
     }
 
-    // The choice state needs opener candidates from the model-level index.
-    if (proto.openerText() != null) {
-        proto.opener_atomic = tok.specialTokenId(proto.openerText().?);
+    // The choice state needs opener candidates (model-level index) and the
+    // opener's own suffix table for partial-opener recovery.
+    if (proto.openerText()) |opener| {
+        fillSuffixTable(allocator, tok, tb, opener, &proto.opener_suffix, &proto.opener_suffix_buf);
+        proto.opener_atomic = tok.specialTokenId(opener);
         if (proto.opener_atomic == null) {
-            const cands = lm.reasoningOpenerCandidates(allocator, io, proto.openerText().?) catch return false;
+            const cands = lm.reasoningOpenerCandidates(allocator, io, opener) catch return false;
             if (cands.len == 0) return false;
             proto.opener_candidates = cands;
         }

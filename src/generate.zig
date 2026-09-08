@@ -3095,16 +3095,39 @@ pub const Generator = struct {
         switch (constraint.pstate.phase) {
             .json_body => return .refused,
             .choice => {
-                // The model never committed a channel: a direct constrained
-                // answer needs no transition token at all. The pending logits
-                // stay — they are the distribution the next JSON-masked
-                // sample reads.
-                constraint.pstate.phase = .json_body;
-                constraint.pstate.recovering = false;
-                constraint.pending_span = .{ .token_index = @intCast(self.generated_ids.items.len), .byte_offset = 0 };
-                self.loop_guard_start = self.generated_ids.items.len;
-                log.info("[grammar] reasoning loop at the channel choice; enforcing JSON schema immediately\n", .{});
-                return .activated;
+                if (constraint.pstate.open_cursor == 0) {
+                    // The model never committed a channel and emitted no
+                    // opener bytes: a direct constrained answer needs no
+                    // transition token at all. The pending logits stay —
+                    // they are the distribution the next JSON-masked sample
+                    // reads.
+                    constraint.pstate.phase = .json_body;
+                    constraint.pstate.recovering = false;
+                    constraint.pending_span = .{ .token_index = @intCast(self.generated_ids.items.len), .byte_offset = 0 };
+                    self.loop_guard_start = self.generated_ids.items.len;
+                    log.info("[grammar] reasoning loop at the channel choice; enforcing JSON schema immediately\n", .{});
+                    return .activated;
+                }
+                // Opener bytes are already in the output: starting the JSON
+                // here would strand them (the response split reads them as an
+                // unclosed opener and files the answer as reasoning).
+                // Complete the opener, close it, then constrain. Fall through
+                // to the shared planner below.
+                log.info("[grammar] completing the generated reasoning opener before the boundary\n", .{});
+                if (self.has_pending_logits) {
+                    _ = mlx.mlx_array_free(self.pending_logits);
+                    self.has_pending_logits = false;
+                }
+                if (!constraint.pstate.recovering) {
+                    var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
+                    const planned_len = proto.planRecovery(&constraint.pstate, &planned) orelse return .refused;
+                    if (!forcedBoundaryCanContinue(self.completion_tokens, self.max_tokens, planned_len)) return .refused;
+                    constraint.pstate.recovering = true;
+                    constraint.pstate.forced_cursor = 0;
+                    constraint.pstate.pending_len = @intCast(planned_len);
+                    @memcpy(constraint.pstate.pending[0..planned_len], planned[0..planned_len]);
+                }
+                return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint, proto) };
             },
             .reasoning => {
                 if (self.has_pending_logits) {
@@ -3112,9 +3135,13 @@ pub const Generator = struct {
                     self.has_pending_logits = false;
                 }
                 if (!constraint.pstate.recovering) {
-                    if (!forcedBoundaryCanContinue(self.completion_tokens, self.max_tokens, proto.recoveryTokenCount())) return .refused;
+                    var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
+                    const planned_len = proto.planRecovery(&constraint.pstate, &planned) orelse return .refused;
+                    if (!forcedBoundaryCanContinue(self.completion_tokens, self.max_tokens, planned_len)) return .refused;
                     constraint.pstate.recovering = true;
                     constraint.pstate.forced_cursor = 0;
+                    constraint.pstate.pending_len = @intCast(planned_len);
+                    @memcpy(constraint.pstate.pending[0..planned_len], planned[0..planned_len]);
                 }
                 return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint, proto) };
             },
@@ -3125,7 +3152,8 @@ pub const Generator = struct {
     /// then leave its logits pending for the next sample. Called once per
     /// scheduler tick while `pstate.recovering` drains.
     fn commitForcedConstraintToken(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !u32 {
-        const seq = proto.recoveryRemaining();
+        _ = proto;
+        const seq = constraint.pstate.pending[0..constraint.pstate.pending_len];
         const tok = seq[constraint.pstate.forced_cursor];
         constraint.pstate.forced_cursor += 1;
 

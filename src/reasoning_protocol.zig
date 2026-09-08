@@ -35,6 +35,14 @@ const token_mask = @import("token_mask.zig");
 pub const MAX_MARKER_BYTES = 32;
 /// Canonical token encoding of the longest delimiter.
 pub const MAX_FORCED_TOKENS = MAX_MARKER_BYTES;
+/// A full recovery transition: opener remainder + close delimiter.
+pub const MAX_TRANSITION_TOKENS = 2 * MAX_FORCED_TOKENS;
+/// Flat storage for one delimiter's per-suffix canonical encodings (the
+/// remainder after each possible partial match). Worst case every suffix
+/// needs the full token budget.
+pub const SUFFIX_TABLE_BYTES = MAX_MARKER_BYTES * MAX_FORCED_TOKENS;
+
+pub const SuffixRun = struct { offset: u32, len: u8 };
 
 /// Where the constrained JSON payload begins in the generated stream, for
 /// response routing: `token_index` is the index of the generated token that
@@ -75,6 +83,15 @@ pub const Protocol = struct {
     closer_len: u8 = 0,
     forced_buf: [MAX_FORCED_TOKENS]u32 = undefined,
     forced_len: u8 = 0,
+    /// Canonical remainder encodings per partial-match length: entry k spells
+    /// `closer_buf[k..]` in ordinary bytes. `len == 0` marks an unencodable
+    /// suffix — forced recovery from that partial state is refused (safe
+    /// stop), never approximated.
+    closer_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 }),
+    closer_suffix_buf: [SUFFIX_TABLE_BYTES]u32 = undefined,
+    /// Same for the opener (choice state): entry k spells `opener_buf[k..]`.
+    opener_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 }),
+    opener_suffix_buf: [SUFFIX_TABLE_BYTES]u32 = undefined,
 
     /// The opener literal; null when the prompt already opened the block and
     /// generation starts inside reasoning. Delimiters live in this struct's
@@ -131,6 +148,43 @@ pub const Protocol = struct {
         if (self.closer_atomic != null) return 1;
         return self.forced_len;
     }
+
+    /// Compose the whole remaining forced transition into `out`: the opener
+    /// remainder when choice-state opener bytes are in flight, then the close
+    /// delimiter — its byte remainder after a partial match, else the atomic
+    /// id, else the full canonical sequence. Returns the composed token count,
+    /// or null when a needed suffix is unencodable (recovery is refused;
+    /// delimiter bytes are never approximated).
+    pub fn planRecovery(self: *const Protocol, state: *const State, out: *[MAX_TRANSITION_TOKENS]u32) ?usize {
+        var n: usize = 0;
+        if (state.phase == .choice and state.open_cursor > 0) {
+            const cursor: usize = state.open_cursor;
+            if (cursor < self.opener_len) {
+                const run = self.opener_suffix[cursor];
+                if (run.len == 0) return null;
+                if (n + run.len > out.len) return null;
+                @memcpy(out[n..][0..run.len], self.opener_suffix_buf[run.offset..][0..run.len]);
+                n += run.len;
+            }
+        }
+        if (state.close_match > 0 and state.close_match < self.closer_len) {
+            const run = self.closer_suffix[state.close_match];
+            if (run.len == 0) return null;
+            if (n + run.len > out.len) return null;
+            @memcpy(out[n..][0..run.len], self.closer_suffix_buf[run.offset..][0..run.len]);
+            n += run.len;
+        } else if (self.closer_atomic) |aid| {
+            if (n + 1 > out.len) return null;
+            out[n] = aid;
+            n += 1;
+        } else {
+            const full = self.forcedIds();
+            if (n + full.len > out.len) return null;
+            @memcpy(out[n..][0..full.len], full);
+            n += full.len;
+        }
+        return n;
+    }
 };
 
 pub const Phase = enum { choice, reasoning, json_body };
@@ -148,9 +202,13 @@ pub const State = struct {
     tail: [MAX_MARKER_BYTES]u8 = undefined,
     tail_len: u8 = 0,
     /// A forced transition (loop/EOS/padding recovery) is being drained: one
-    /// canonical token per scheduler tick through the live forward path.
+    /// canonical token per scheduler tick through the live forward path. The
+    /// composed sequence (opener remainder + close delimiter) is planned once
+    /// and consumed by cursor.
     recovering: bool = false,
     forced_cursor: u8 = 0,
+    pending_len: u8 = 0,
+    pending: [MAX_TRANSITION_TOKENS]u32 = undefined,
 
     pub fn initPromptOpened() State {
         return .{ .phase = .reasoning };
@@ -512,6 +570,117 @@ test "reasoning: a token that completes the close carries a validated payload su
     const closed = observeReasoningToken(&proto, &state, Vocab.span_close_json, tb.bytes[Vocab.span_close_json]).?;
     try testing.expectEqualStrings("{", closed); // "{" is the payload suffix; the caller feeds the grammar
     try testing.expectEqual(Phase.reasoning, state.phase); // the CALLER flips the phase after feeding
+}
+
+test "recovery composes the exact byte remainder after a partial close" {
+    var proto = makeProtocol(null, "</think:opensource>", &.{});
+    proto.closer_atomic = null;
+    // Canonical per-suffix encodings (suffix k spells closer[k..]); the
+    // server-side filler produces exactly this shape from the tokenizer.
+    var buf: [SUFFIX_TABLE_BYTES]u32 = undefined;
+    var table: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 });
+    var off: u32 = 0;
+    for (0.."</think:opensource>".len) |k| {
+        const run_len: u32 = @intCast("</think:opensource>".len - k);
+        for (0..run_len) |i| buf[off + i] = @intCast(100 + k + i);
+        table[k] = .{ .offset = off, .len = @intCast(run_len) };
+        off += run_len;
+    }
+    proto.closer_suffix = table;
+    proto.closer_suffix_buf = buf;
+    const ids = [_]u32{50};
+    try testing.expect(proto.setForced(&ids));
+
+    for (1.."</think:opensource>".len) |k| {
+        var state = State.initPromptOpened();
+        state.close_match = @intCast(k);
+        var out: [MAX_TRANSITION_TOKENS]u32 = undefined;
+        const n = proto.planRecovery(&state, &out).?;
+        // One synthetic token per remaining byte.
+        try testing.expectEqual("</think:opensource>".len - k, n);
+        for (0.."</think:opensource>".len - k) |i| try testing.expectEqual(@as(u32, @intCast(100 + k + i)), out[i]);
+    }
+
+    // No partial bytes: the full canonical sequence.
+    var state = State.initPromptOpened();
+    var out: [MAX_TRANSITION_TOKENS]u32 = undefined;
+    const n = proto.planRecovery(&state, &out).?;
+    try testing.expectEqualSlices(u32, &ids, out[0..n]);
+}
+
+test "recovery after partial atomic-close bytes forces the byte remainder" {
+    var proto = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    proto.closer_atomic = 3;
+    // Only the remainder after a 5-byte partial match is encodable.
+    var buf: [SUFFIX_TABLE_BYTES]u32 = undefined;
+    var table: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 });
+    const k = 5; // "</thi"
+    const rest = BARE_THINK_CLOSER[k..];
+    for (0..rest.len) |i| buf[i] = @intCast(200 + i);
+    table[k] = .{ .offset = 0, .len = @intCast(rest.len) };
+    proto.closer_suffix = table;
+    proto.closer_suffix_buf = buf;
+
+    var state = State.initPromptOpened();
+    state.close_match = @intCast(k);
+    var out: [MAX_TRANSITION_TOKENS]u32 = undefined;
+    const n = proto.planRecovery(&state, &out).?;
+    try testing.expectEqual(rest.len, n);
+    for (0..rest.len) |i| try testing.expectEqual(@as(u32, @intCast(200 + i)), out[i]);
+    // The atomic id must NOT be appended after the remainder.
+    try testing.expectEqual(@as(usize, rest.len), n);
+
+    // Without partial bytes the atomic id is the whole transition.
+    var state2 = State.initPromptOpened();
+    const n2 = proto.planRecovery(&state2, &out).?;
+    try testing.expectEqual(@as(usize, 1), n2);
+    try testing.expectEqual(@as(u32, 3), out[0]);
+}
+
+test "recovery refuses an unencodable partial suffix instead of approximating" {
+    var proto = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    proto.closer_atomic = 3;
+    // No table entry for the 2-byte partial: refuse rather than guess.
+    var state = State.initPromptOpened();
+    state.close_match = 2;
+    var out: [MAX_TRANSITION_TOKENS]u32 = undefined;
+    try testing.expect(proto.planRecovery(&state, &out) == null);
+}
+
+test "recovery completes a partial generated opener before closing" {
+    var proto = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, &.{});
+    proto.closer_atomic = 3;
+    // Opener suffix table: cursor 6 -> ">" (token 9), cursor 5 -> "k>" (9,10).
+    var obuf: [SUFFIX_TABLE_BYTES]u32 = undefined;
+    var otable: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 });
+    otable[6] = .{ .offset = 0, .len = 1 };
+    obuf[0] = 9;
+    otable[5] = .{ .offset = 1, .len = 2 };
+    obuf[1] = 9;
+    obuf[2] = 10;
+    proto.opener_suffix = otable;
+    proto.opener_suffix_buf = obuf;
+
+    var state = State.initChoice();
+    state.open_cursor = 6;
+    var out: [MAX_TRANSITION_TOKENS]u32 = undefined;
+    const n = proto.planRecovery(&state, &out).?;
+    // ">" then the atomic close.
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u32, 9), out[0]);
+    try testing.expectEqual(@as(u32, 3), out[1]);
+
+    // Cursor 1 ("<"): "think>" then the atomic close.
+    var state2 = State.initChoice();
+    state2.open_cursor = 1;
+    otable[1] = .{ .offset = 3, .len = 6 };
+    for (0..6) |i| obuf[3 + i] = @intCast(20 + i);
+    proto.opener_suffix = otable;
+    proto.opener_suffix_buf = obuf;
+    const n2 = proto.planRecovery(&state2, &out).?;
+    try testing.expectEqual(@as(usize, 7), n2);
+    try testing.expectEqual(@as(u32, 20), out[0]);
+    try testing.expectEqual(@as(u32, 3), out[6]);
 }
 
 test "recovery plan: atomic closer is one token; byte closer drains canonically" {
