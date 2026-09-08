@@ -8,6 +8,31 @@ import AppKit
 /// the system.
 enum ChatImagePreview {
 
+    /// Attachment width at the shared height, from its own ratio, clamped so a
+    /// panorama can share a row and a sliver stays visible. No size = square.
+    static func displayWidth(for image: NSImage,
+                             height: CGFloat = ChatMetrics.attachmentHeight,
+                             maxWidth: CGFloat = ChatMetrics.userBubbleMaxWidth) -> CGFloat {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else { return height }
+        let width = height * (size.width / size.height)
+        return min(max(width, height * 0.35), maxWidth)
+    }
+
+    /// Exact box for a generated picture under both caps: the rounded corners
+    /// clip the frame, so the frame must be the picture (no crop, no fit).
+    static func displaySize(for image: NSImage,
+                            maxHeight: CGFloat,
+                            maxWidth: CGFloat) -> CGSize {
+        let size = image.size
+        guard size.width > 0, size.height > 0 else {
+            return CGSize(width: maxHeight, height: maxHeight)
+        }
+        let ratio = size.width / size.height
+        let width = min(maxHeight * ratio, maxWidth)
+        return CGSize(width: width, height: width / ratio)
+    }
+
     /// Directory the staged temp files live in.
     static var tempDir: String {
         (NSTemporaryDirectory() as NSString).appendingPathComponent("mlx-serve-chat-images")

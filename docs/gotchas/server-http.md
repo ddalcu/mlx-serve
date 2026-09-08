@@ -1033,6 +1033,45 @@ log before degrading, instead of sampling through it. The prompt-side
 instruction had been carrying these cases — that is why an
 `additionalProperties` violation read as a model-quality problem.
 
+## JSON-schema decode was 60x slower on Flash Next: the mask walked all 248k tokens per step (#380, 2026-09-07)
+
+`token_mask.buildMask` ran every vocab id through the grammar on every
+generated token: a `restoreFrom` (a memcpy of the whole frame stack, each frame
+carrying a 256-byte key buffer) plus a byte walk, 248k times per step. The
+reporter measured 0.9 tok/s against 54 without `response_format`; on this box
+the same walk cost 3-7 ms in structural states, which the GPU forward mostly
+hid, and the reporter's schema shape made it ~930 ms.
+
+Fix, all in `token_mask.zig`: `TokenBytes.init` indexes the vocabulary once
+per model — buckets by first byte, each bucket ordered by second byte, and a
+split into "plain" string tokens (no quote, backslash or control byte) and the
+rest. A step in a string body (`Grammar.stringBodyRoom`) admits every plain
+token whose length fits the remaining `maxLength` without touching the
+grammar and probes only the ~2.8k others. Any other state asks `allowedBytes`
+for the legal first bytes, and for each one asks again for the legal second
+byte, so only tokens whose first two bytes are legal are walked (the
+second level matters: most BPE tokens start with a space, which is legal
+everywhere between values, so a one-level bucket still probed 107k tokens).
+Mask build is now 0.1-0.4 ms at every state.
+
+Guard: the oracle test in `token_mask.zig` drives a grammar through a whole
+document and diffs the fast mask against the brute-force walk at every byte,
+plus a probe-count bar.
+
+The second half was the constrained step itself. `nextConstrained` sampled
+synchronously and built the next forward from the realized id, so the CPU
+graph build (~840 kernels on Flash Next, ~4 ms) ran while the GPU idled. It
+now samples lazily off the masked logits, hands the still-lazy token to
+`lazyForward` (the same deferred-PLE leaf the unconstrained path uses), dispatches,
+and only then realizes the token and advances the grammar. Byte-identical
+greedy output; Flash Next schema decode 49 -> 53 tok/s = the serial plain rate
+(spec decode stays off under a grammar, so MTP's 65-70 is not the bar).
+
+Trap met on the way: a per-model `"mtp": true` in `model-settings.json`
+overrides `--no-mtp` on the command line, so a "plain" arm launched with the
+flag was still spec-decoding. Send `enable_mtp:false` per request, or read
+the `[spec-stats]` lines, before calling an arm serial.
+
 ## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
 
 Audit prompted by the grammar-mask singleton above: same shape, different
@@ -1670,16 +1709,15 @@ noThinkTailSuffix machinery). `/v1/chat/completions` and `/v1/responses`
 built the same mask with no gate — issue #331 re-found the identical symptom
 via `reasoning_effort` + `response_format`.
 
-Fix: one predicate (`server.schemaMasksThinking`) consulted at all three
-mask-building sites. Tools present = no mask on every surface (tool calls
-must stay reachable), so thinking stays whatever the request resolved.
-"Real reasoning then schema-valid JSON" would need a mask that arms only
-after the think block closes — not built; schema stays a content-only
-contract.
+Fix: defer only for a bare template-opened `<think>`, an atomic `</think>`, and
+no finite response-side reasoning budget. Loop-stop, EOS, and terminal padding
+can force the close through live model state when constrained output still fits.
+All other schema requests keep the thinking-off, token-zero fallback. Tools
+still skip grammar; constraints still skip speculation; ordinary `max_tokens`
+exhaustion is unchanged.
 
-Guards: `tests/test_json_schema_thinking.sh` (all three surfaces + stream arm
-+ mask-engagement count) and the server.zig source scan pairing every
-`[grammar] enforcing` site with a gate call.
+Guards: `tests/test_json_schema_thinking.sh` and the policy/phase tests in
+`server.zig` and `generate.zig`.
 
 ## A Metal working-set OOM killed the server, and the fatal part was mlx-c's default error handler (#353, PR #363)
 
@@ -1889,3 +1927,100 @@ reads `cache.step` (0 forever on a linear-layer-0 trunk, so the cap is dead
 there; the 27B's batched wins were measured with it dead), the chunk sizer
 still reads the hot-cache ask, and `--prefill-chunk` still outranks the pin
 only at forward time.
+
+## The cancelled-prefill commits that never were, and the disk tier that never served (2026-09-07)
+
+A 122k-token agent session (Qwen3.8-27B, `--prefix-cache-mem 1GB
+--prefix-cache-disk 40GB --kv-quant 8`) died in a retry loop: every request
+cold-prefilled ~95k tokens past a frozen 26624-token cache entry while the
+log claimed `committed 80896/121956` after every disconnect. The same log
+carried `skipped oversized entry (80896 tokens, 5131.00 MB > 1024.00 MB
+budget)` one line earlier — the two lines were the SAME event, and neither
+tier ever recovered the work. Four independent bugs stacked:
+
+**1. A decline logged as a commit.** `commitWithMediaState` declined
+oversized candidates via plain `return` (no error), so the scheduler's
+`committed N/M` fired unconditionally on the non-error path. The whole
+#330/#20 investigation ran on a log that lied. Fix: `CommitStatus`
+(`ok: len` / `kept_resident: len` / `declined`) returned through the whole
+commit wrapper chain; the scheduler switches on it; `trimLenForBudget`
+returning null and `trimmedCopy` failing now log their own reasons (the
+latter used to `catch break` in silence — the OOM that hid behind a
+generic "skipped" for days).
+
+**2. Cancel commits poisoned their own key.** The cancel path pre-null'd
+`media_start` when the forwarded prefix ended before the request's media
+position, but kept the pixel `vision_key` — a boundary-less cross-key
+entry, which `findBestRestorableMatch` conservatively rejects. The client
+alternated with-image and no-image retries of the same conversation, and
+each shape locked the other out of their shared 121819-token text prefix.
+Fix: the entry's pixel key is derived from the rows it actually covers —
+a committed range ending before the media position is pure text and lands
+under the null key (the scheduler now passes the boundary raw; a trim that
+cuts below the boundary re-keys the same way, and the replace scan runs
+under the effective key).
+
+**3. The SSD tier blanket-skipped media requests.** `vision_key != 0 →
+break :disk` refused the whole disk tier to any image-bearing request,
+even when the media sat in the last turn and 99.8% of the prompt was
+pixel-independent text — while 36 entries / 39.6 GB sat on disk unused.
+Disk entries are text-only by construction (the flush refuses
+vision-keyed entries), so the fix mirrors the RAM path: cap the restore
+at the request's media boundary instead of refusing. The cap is
+load-bearing even when tokens match past it: placeholder ids only ever
+legitimately appear at/after the media position, and a restored row there
+must come from the vision splice, never from a text prefix.
+
+**4. Chunk-first budgeting starved checkpoints to zero.** The Sep-4 disk
+wave (20+ entries, every one `0 ssm-cp`) was structurally unrestorable:
+`persistSsmCheckpoints` ran AFTER the chunk loop from the REMAINING
+per-flush budget, and cancel-salvage retries appending +16 chunks (544 MB)
+against a 512 MB cap left exactly zero checkpoint budget, every time. The
+same-token catch-up path (`appendSsmOnly`) never fires for a growing
+conversation. Fix: checkpoints come off the TOP of the budget (share
+capped at half so chunk progress never stalls), and the eligibility bound
+is the target length — a checkpoint beyond the chunks this flush reaches
+is still written (position-keyed, immutable) and becomes restorable when
+a later flush extends kv_len past it.
+
+Plus the structural change: a RAM budget decline now OFFERS the candidate
+to the SSD tier before discarding it (text candidates only — the disk
+never holds pixel-keyed rows). The budget declines retention, not value;
+a byte-capped spill continues from the next commit of the same
+conversation (chunks dedupe by token range).
+
+Guards: `budget decline reports a status`, `an entry shorter than its
+media boundary is pure text`, `media request restores the pre-media text
+prefix from SSD`, `chunk-heavy hybrid flush still lands its SSM
+checkpoints`, `a budget-declined candidate spills to the SSD tier` (all
+in prefix_cache.zig), plus the decline-reason log lines the next live
+post-mortem will need.
+
+## The restore ceiling that would not climb (flush pace + wrong ranking, 2026-09-07)
+
+With the decline/spill/restore chain live, a 122k retry loop still restored
+the same 51200 tokens every time. Two causes:
+
+1. Flush pace: the decline-spill inherited `max_flush_bytes` (512 MB ≈
+   13k tokens), so each retry banked 13k of the ~48k tokens it had just
+   computed — the growing entry needed ~8 retries to pass the old entry's
+   51200 restore point. The cap prices the stall a LIVE next request
+   pays after a response; a decline-spill runs on a request whose client
+   is already gone. `spillDeclinedToDisk` now floors its flush budget at
+   4 GB (the tier's byte budget + LRU is the real bound) — one spill
+   banks a full 122k-token hybrid candidate.
+2. Ranking: the disk hybrid arm picked its entry by raw usable length
+   (`bestMatch`) and then took THAT entry's checkpoint — the RAM tier's
+   #312 lesson, unlearned on the disk side. The moment the growing
+   conversation entry's usable length passed the old entry's, it would
+   have shadowed cp@51200 with cp@49152 and REGRESSED the restore.
+   `bestHybridMatch` ranks by the highest checkpoint at or below the
+   usable prefix.
+
+Guards: `a decline-spill is not bounded by the per-flush byte cap` and
+`hybrid disk restore ranks entries by restorable checkpoint, not raw
+length` (prefix_cache.zig).
+
+### The hot-cache budget was clamped once and never revisited (#364, 2026-09-07)
+
+`max_kv_bytes` had one write site, `initWithMem`, fed by a clamp that read `mlx_get_active_memory`, which counts every resident model. Load a second model beside a 70 GB one and its budget landed at ~0 for the life of the process (197 straight declines on the reporter's box); unloading the neighbour did not give it back. Fix: `reviseHotCacheBudgets` runs after every load/unload on the inference thread and re-resolves each resident model's budget with its own resident cache bytes excluded (a full cache must not ratchet itself down); `setBudget` evicts LRU down to a smaller cap and is silent when the megabyte value is unchanged. Trap found on the way: MLX frees the weights at once but the system-free number the ceiling reads recovers over seconds, so the unload-time revise saw almost none of it; the revise repeats before each prefill batch for 10 s after an unload. The resolver publishes a process-global the admission guard reads, so the current model is resolved last. Guard: `tests/test_prefix_cache_budget_revisit.sh` (A loses B's weights when B loads and gets them back after the unload, warm turn intact).

@@ -14,8 +14,8 @@
 #   1. Drives turn 1: short system+user, generates ~120 tokens at temp=0.
 #   2. Drives turn 2: same conversation + the assistant reply + a short
 #      follow-up user message. Captures wall time.
-#   3. Greps the server log for the `[cache] reusing N/M tokens` line
-#      emitted by `reuseKVCache`. Asserts:
+#   3. Greps the server log for the `[hot-cache] reused N/M tokens` line
+#      emitted by the hot prefix cache restore. Asserts:
 #        a. Reused N covers the previous turn's PROMPT *plus* its generation
 #           — within a small slack to allow the chat template to insert a
 #           newline or a turn boundary token between the assistant block and
@@ -143,27 +143,24 @@ m2 = m1 + [
 r2 = chat(m2, max_tokens=200)
 print(f"  prompt_tokens={r2['prompt_tokens']}  completion_tokens={r2['completion_tokens']}  elapsed={r2['elapsed_ms']}ms")
 
-# ── Parse server log for the [cache] reusing line emitted on turn 2 ──
+# ── Parse server log for the [hot-cache] reused line emitted on turn 2 ──
 with open(LOG) as f:
     f.seek(log_start_offset)
     log_text = f.read()
 
-# Reuse logs come from `reuseKVCache` — match either the extension-reuse
-# log ("reusing N/M tokens from previous prompt") or the identical-re-issue
-# log ("reusing N/M tokens, re-forwarding last token"). Take the LAST one
-# in the captured window so we look at turn 2.
-reuse_pat = re.compile(r"\[cache\] reusing (\d+)/(\d+) tokens", re.M)
+# Take the LAST reuse line in the captured window so we look at turn 2.
+reuse_pat = re.compile(r"\[hot-cache\] reused (\d+)/(\d+) tokens", re.M)
 matches = reuse_pat.findall(log_text)
 print(f"\n{DIM}reuse-line matches in this window: {matches}{NC}")
 
 if not matches:
     # Could be that turn 2 went through a path that resets the cache
     # entirely. Surface the last few cache-related log lines for diagnosis.
-    cache_lines = [l for l in log_text.splitlines() if "[cache]" in l][-6:]
-    print(f"\n{DIM}last [cache] lines:{NC}")
+    cache_lines = [l for l in log_text.splitlines() if "[hot-cache]" in l][-6:]
+    print(f"\n{DIM}last [hot-cache] lines:{NC}")
     for l in cache_lines: print(f"    {l}")
     check(False, "turn 2 emitted a cache-reuse log line",
-          "no `[cache] reusing N/M tokens` line found — cache was hard-reset")
+          "no `[hot-cache] reused N/M tokens` line found — cache was hard-reset")
 else:
     n_reused, n_total = (int(x) for x in matches[-1])
     # Expected lower bound: turn-1 prompt + turn-1 completion. Slack of 8

@@ -37,7 +37,8 @@ enum SettingsReset {
         // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
         // each of its rows (appearance/accent/text size/compact/shortcut)
         // carries its own control default or Reset (the shortcut row's).
-        case .modelFolders, .updates, .about, .interface:
+        // Providers live in providers.json, edited row by row in their own pane.
+        case .modelFolders, .updates, .about, .interface, .providers:
             return []
 
         case .server:
@@ -78,7 +79,7 @@ enum SettingsReset {
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
+                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 

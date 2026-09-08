@@ -223,6 +223,12 @@ else
     HCOLD_MS="${HOUT1%%|*}"
     HCONTENT1="${HOUT1#*|}"
     echo "  cold total=${HCOLD_MS}ms content='${HCONTENT1:0:60}'"
+    # A hybrid restore is not bit-identical to cold (checkpoint replay, ~0.05
+    # nats) and this prompt sits on a near-tie, so the bar is the RAM restore:
+    # the SSD tier must reproduce it byte for byte.
+    HOUTW=$(fire_long)
+    HCONTENTW="${HOUTW#*|}"
+    [ "$HCONTENT1" = "$HCONTENTW" ] || echo "  note: RAM-warm output differs from cold (hybrid restore class): '${HCONTENTW:0:60}'"
     sleep 1
     if grep -q '\[disk-cache\] persisted' "$LOGFILE"; then
         # A hybrid persist reports SSM checkpoints in the count.
@@ -245,10 +251,10 @@ else
         echo -e "${RED}FAIL${NC} hybrid: no '[disk-cache] restored … (ssm@…)' line after restart"
         tail -30 "$LOGFILE"; FAIL=1
     fi
-    if [ "$HCONTENT1" = "$HCONTENT2" ]; then
-        echo -e "${GREEN}PASS${NC} hybrid output byte-identical across restart restore"
+    if [ "$HCONTENTW" = "$HCONTENT2" ]; then
+        echo -e "${GREEN}PASS${NC} hybrid SSD restore matches the RAM restore byte for byte"
     else
-        echo -e "${RED}FAIL${NC} hybrid output diverged: '$HCONTENT1' vs '$HCONTENT2'"
+        echo -e "${RED}FAIL${NC} hybrid SSD restore diverged from the RAM restore: '$HCONTENTW' vs '$HCONTENT2'"
         FAIL=1
     fi
     HSPEEDUP_OK=$(python3 -c "print(1 if $HRESTART_MS * 2 <= $HCOLD_MS else 0)")

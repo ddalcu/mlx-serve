@@ -178,6 +178,7 @@ class APIClient {
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
+            kvQuant: meta["kv_quant"] as? String ?? "",
             loaded: topLoaded,
             state: topState,
             bytesResident: topBytesResident,
@@ -188,7 +189,8 @@ class APIClient {
             recTemperature: meta["gen_temperature"] as? Double,
             recTopP: meta["gen_top_p"] as? Double,
             recTopK: meta["gen_top_k"] as? Int,
-            lanPeer: first["lan_peer"] as? String
+            lanPeer: (first["lan_peer"] as? String) ?? (first["provider"] as? String),
+            provider: first["provider"] as? String
         )
     }
 
@@ -239,6 +241,26 @@ class APIClient {
     /// returns 200.
     /// Ask the server to absorb models downloaded after it booted (discovery
     /// only walks the roots at startup). Add-only and idempotent server-side.
+    func reloadProviders(port: UInt16) async throws {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/providers/reload")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                                     detail: String(decoding: data, as: UTF8.self))
+        }
+    }
+
+    func providerStatus(port: UInt16) async throws -> [ProviderStatus] {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/providers")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        let (data, _) = try await session.data(for: request)
+        return ProviderStatus.decodeList(data)
+    }
+
     func rescanModels(port: UInt16) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/models/rescan")!
         var request = URLRequest(url: url)

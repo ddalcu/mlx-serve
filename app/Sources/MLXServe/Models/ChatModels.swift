@@ -213,6 +213,25 @@ struct ChatImage: Identifiable, Codable, Equatable {
     }
 }
 
+enum ThinkingDuration {
+
+    /// "Thinking" until measured, then "Thinking took 2 minutes 7 seconds".
+    static func label(seconds: Double?) -> String {
+        guard let seconds, seconds >= 1 else { return "Thinking" }
+        let total = Int(seconds.rounded())
+        let minutes = total / 60
+        let remainder = total % 60
+
+        if minutes == 0 { return "Thinking took \(plural(remainder, "second"))" }
+        if remainder == 0 { return "Thinking took \(plural(minutes, "minute"))" }
+        return "Thinking took \(plural(minutes, "minute")) \(plural(remainder, "second"))"
+    }
+
+    private static func plural(_ n: Int, _ unit: String) -> String {
+        "\(n) \(unit)\(n == 1 ? "" : "s")"
+    }
+}
+
 /// A generated media file attached to a message BY REFERENCE.
 struct ChatMediaRef: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case image, audio, video }
@@ -279,6 +298,9 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     var promptTokens: Int?
     var completionTokens: Int?
     var tokensPerSecond: Double?
+    /// Seconds from the message's timestamp to the first content delta
+    /// (includes prefill). Absent in older histories.
+    var thinkingSeconds: Double?
     var toolCallId: String?   // For tool response messages
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
@@ -333,7 +355,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     enum CodingKeys: String, CodingKey {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
-        case promptTokens, completionTokens, tokensPerSecond
+        case promptTokens, completionTokens, tokensPerSecond, thinkingSeconds
         case toolCallId, toolName, toolCalls, images, videos, audio, failedRetry, processHandles
         case errorNotice, media, truncationNotice, revisions, activeRevision
     }
@@ -352,6 +374,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens)
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens)
         tokensPerSecond = try c.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        thinkingSeconds = try c.decodeIfPresent(Double.self, forKey: .thinkingSeconds)
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
@@ -430,6 +453,8 @@ struct ModelInfo {
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
     var mtpLoaded: Bool = false
+    /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
+    var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
     /// servers (single-model) still decode without these.
     /// Whether this entry currently holds resident weights.
@@ -458,6 +483,11 @@ struct ModelInfo {
     /// (the server badges remote entries with `lan_peer`; their ids are
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
+    /// Set when this entry is a configured upstream provider (`provider`
+    /// badge, `src/providers.zig`). Routing is identical to a LAN peer — the
+    /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
+    /// too; this field only decides the picker heading and the label.
+    var provider: String? = nil
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not

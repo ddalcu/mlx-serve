@@ -346,9 +346,18 @@ struct StatusMenuView: View {
             // LAN discovery on). Tags are "lan:"-prefixed so they can't collide
             // with paths.
             let lanChat = server.lanModels(capability: "chat")
-            if !lanChat.isEmpty {
-                Section("On Your Network") {
-                    ForEach(lanChat, id: \.name) { m in
+            let network = lanChat.filter { $0.provider == nil }
+            let providers = lanChat.filter { $0.provider != nil }
+            if !network.isEmpty {
+                Section(ModelPalette.networkSection) {
+                    ForEach(network, id: \.name) { m in
+                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                    }
+                }
+            }
+            if !providers.isEmpty {
+                Section(ModelPalette.providersSection) {
+                    ForEach(providers, id: \.name) { m in
                         Text(m.lanDisplayName).tag("lan:" + m.name)
                     }
                 }
@@ -431,7 +440,7 @@ struct StatusMenuView: View {
         // Model slots — one row per RESIDENT registry entry (chat,
         // image/video/audio gen, embeddings), each with an eject button that
         // frees its memory. Unloaded stubs are hidden.
-        let loadedModels = server.allModels.filter(\.loaded)
+        let loadedModels = server.residentModels
         return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             TraySectionHeader(title: "In Memory",
                               detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)

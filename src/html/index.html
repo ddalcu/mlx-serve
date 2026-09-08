@@ -137,6 +137,8 @@
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/load-model</div><div class=d>Load a discovered model, or register + load one by absolute path</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/unload-model</div><div class=d>Free a model's memory now</div></div></div>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/models/rescan</div><div class=d>Pick up models added to the model folders since startup</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/providers>/v1/providers</a></div><div class=d>Configured upstream chat providers (~/.mlx-serve/providers.json) and whether each answered its last probe</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/providers/reload</div><div class=d>Re-read providers.json and re-probe now</div></div></div>
 </div>
 
 <h2>Discovery</h2>

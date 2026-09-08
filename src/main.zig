@@ -14,6 +14,7 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
@@ -1168,6 +1169,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (!config_owned_by_registry) allocator.destroy(config_storage);
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
+    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -1956,6 +1958,8 @@ fn runDs4Serve(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
+    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    const model_ctx = settings.ctx_size orelse ctx_size;
     // Resolve the GGUF file once on this thread so the engine's open() call
     // (running on the inference thread) gets an absolute path.
     const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
@@ -1989,7 +1993,8 @@ fn runDs4Serve(
         // 0/unset → ds4's default) on the standard field. `runPrefillDs4` reads
         // it back to size the ds4 session, and `getEffectiveContextLength` /
         // /v1/models report it.
-        .max_position_embeddings = ds4_arch.clampSessionCtx(ctx_size),
+        .max_position_embeddings = ds4_arch.clampSessionCtx(model_ctx),
+        .ctx_override = settings.ctx_size orelse 0,
         .is_encoder_only = false,
     };
 
@@ -2252,7 +2257,8 @@ fn runLlamaServe(
     // inference thread). Used for BOTH the llama session size (via the stub
     // config's max_position_embeddings, read in runPrefillLlama) AND the
     // server's context guard (server_config.max_context_size), so they agree.
-    const effective_ctx: u32 = if (ctx_size > 0) ctx_size else 8192;
+    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    const effective_ctx: u32 = settings.ctx_size orelse (if (ctx_size > 0) ctx_size else 8192);
 
     log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});
     log.info("[args] model: {s}\n", .{gguf_path_owned});
@@ -2269,6 +2275,7 @@ fn runLlamaServe(
         .weight_prefix = "model",
         .head_dim = 128,
         .max_position_embeddings = effective_ctx,
+        .ctx_override = settings.ctx_size orelse 0,
         .is_encoder_only = false,
     };
 
@@ -2399,7 +2406,7 @@ fn runLlamaServe(
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
-        .max_context_size = effective_ctx,
+        .max_context_size = if (ctx_size > 0) ctx_size else 8192,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
         .default_max_tokens = serve_default_max_tokens,

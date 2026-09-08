@@ -17,11 +17,19 @@ final class MTPSettingsTests: XCTestCase {
 
     /// Defaults are ON / auto — the same as the server's — so a default launch
     /// must emit neither flag.
-    func testDefaultsEmitNoMtpFlags() {
+    /// `--mtp` rides every default launch (MoE heads ON — the app's one
+    /// deliberate divergence from the server default); nothing else does.
+    func testDefaultsEmitMtpAndNothingElse() {
         let a = args { _ in }
         XCTAssertFalse(a.contains("--no-mtp"))
         XCTAssertFalse(a.contains("--mtp-depth"))
+        XCTAssertTrue(a.contains("--mtp"))
+    }
+
+    func testTurningMoeMtpOffEmitsNoFlag() {
+        let a = args { $0.mtpOnMoE = false }
         XCTAssertFalse(a.contains("--mtp"))
+        XCTAssertFalse(a.contains("--no-mtp"))
     }
 
     func testTurningMtpOffEmitsNoMtp() {
@@ -35,7 +43,7 @@ final class MTPSettingsTests: XCTestCase {
     /// and it is the ONLY way a client which sends no sampling/spec fields at
     /// all (Claude Code, llmprobe, curl) can reach a MoE head.
     func testForcingMtpOnMoeEmitsTheMtpFlag() {
-        let a = args { $0.forceMTPOnMoE = true }
+        let a = args { $0.mtpOnMoE = true }
         XCTAssertTrue(a.contains("--mtp"))
     }
 
@@ -44,7 +52,7 @@ final class MTPSettingsTests: XCTestCase {
     func testMtpOffSuppressesTheForceFlag() {
         let a = args {
             $0.enableMTP = false
-            $0.forceMTPOnMoE = true
+            $0.mtpOnMoE = true
         }
         XCTAssertTrue(a.contains("--no-mtp"))
         XCTAssertFalse(a.contains("--mtp"))
@@ -77,9 +85,9 @@ final class MTPSettingsTests: XCTestCase {
         deeper.mtpDepth = 4
         XCTAssertFalse(base.serverLaunchEquals(deeper))
 
-        var forced = base
-        forced.forceMTPOnMoE = true
-        XCTAssertFalse(base.serverLaunchEquals(forced))
+        var unforced = base
+        unforced.mtpOnMoE = false
+        XCTAssertFalse(base.serverLaunchEquals(unforced))
     }
 
     /// A config written before these fields existed must decode with MTP ON and
@@ -90,7 +98,18 @@ final class MTPSettingsTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
         XCTAssertTrue(decoded.enableMTP)
         XCTAssertEqual(decoded.mtpDepth, 0)
-        XCTAssertFalse(decoded.forceMTPOnMoE)
+        XCTAssertTrue(decoded.mtpOnMoE)
+    }
+
+    /// The default flipped ON, and every config written before that stored
+    /// the OLD default as `forceMTPOnMoE:false` — a tolerant decode of that
+    /// key would have kept MoE MTP off for everyone forever. The key was
+    /// retired with the flip, so the stored value is ignored.
+    func testConfigWithTheRetiredForceKeyDecodesToMoeMtpOn() throws {
+        let old = #"{"host":"0.0.0.0","port":11234,"forceMTPOnMoE":false}"#.data(using: .utf8)!
+        XCTAssertTrue(try JSONDecoder().decode(ServerOptions.self, from: old).mtpOnMoE)
+        let off = #"{"host":"0.0.0.0","port":11234,"mtpOnMoE":false}"#.data(using: .utf8)!
+        XCTAssertFalse(try JSONDecoder().decode(ServerOptions.self, from: off).mtpOnMoE)
     }
 
     /// The rows are rendered from this metadata — a missing entry means a
@@ -98,9 +117,9 @@ final class MTPSettingsTests: XCTestCase {
     func testTheUIHasCopyForBothControls() {
         XCTAssertNotNil(ServerOptions.serverFlagFields["enableMTP"])
         XCTAssertNotNil(ServerOptions.serverFlagFields["mtpDepth"])
-        XCTAssertNotNil(ServerOptions.serverFlagFields["forceMTPOnMoE"])
+        XCTAssertNotNil(ServerOptions.serverFlagFields["mtpOnMoE"])
         XCTAssertTrue(ServerOptions.serverFlagFields["enableMTP"]?.needsRestart ?? false)
-        XCTAssertTrue(ServerOptions.serverFlagFields["forceMTPOnMoE"]?.needsRestart ?? false)
+        XCTAssertTrue(ServerOptions.serverFlagFields["mtpOnMoE"]?.needsRestart ?? false)
     }
 
     // MARK: DSpark (DeepSeek-V4 draft stages)

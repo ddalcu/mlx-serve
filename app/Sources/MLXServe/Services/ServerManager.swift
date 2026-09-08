@@ -37,6 +37,13 @@ class ServerManager: ObservableObject {
     /// Discovered LAN models advertising `capability` ("chat", "image",
     /// "video", "music", "audio", "3d"). Empty when the server is down or
     /// discovery is off — pickers then show local models only.
+    /// What is resident on THIS Mac — the tray's "In Memory" list. A remote
+    /// row (LAN peer or provider) may report `loaded` from where it runs, but
+    /// nothing here holds it and nothing here can eject it.
+    var residentModels: [ModelInfo] {
+        allModels.filter { $0.loaded && $0.lanPeer == nil }
+    }
+
     func lanModels(capability: String) -> [ModelInfo] {
         allModels.filter { $0.lanAdvertises(capability) }
     }
@@ -647,6 +654,19 @@ class ServerManager: ObservableObject {
     /// after it booted (POST /v1/models/rescan), then refresh the list so the
     /// media panes' "On This Mac" rows see them. No-op when stopped — the
     /// next boot's discovery covers it.
+    /// Ask the running server to re-read providers.json and re-probe, then
+    /// pick up the new rows.
+    func reloadProviders() async {
+        guard status == .running else { return }
+        try? await api.reloadProviders(port: port)
+        await refreshModels()
+    }
+
+    func providerStatus() async -> [ProviderStatus] {
+        guard status == .running else { return [] }
+        return (try? await api.providerStatus(port: port)) ?? []
+    }
+
     func rescanModels() {
         guard status == .running else { return }
         Task {

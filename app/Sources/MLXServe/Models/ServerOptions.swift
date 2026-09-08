@@ -122,13 +122,15 @@ struct ServerOptions: Codable, Equatable {
     /// explicit opt-in.
     var decodeAttnQuantChoice: Bool? = nil
     /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
-    /// request that omits `enable_mtp` (the server's `defaultEnableMtp`: the
-    /// verify forward pays the expert-routing penalty, the same caution the
-    /// drafter carries). That makes the head unreachable from clients which
-    /// send no spec fields at all — Claude Code, llmprobe, curl. Turning this
-    /// on flips the default for MoE targets; dense targets are unaffected
-    /// (they already default ON). Off, matching the server.
-    var forceMTPOnMoE: Bool = false
+    /// request that omits `enable_mtp` (the server's `defaultEnableMtp`, a
+    /// multi-client caution: the MTP slot decodes exclusively, so concurrent
+    /// chats stop batching). This app is one user, and measured on 35B-A3B
+    /// and Flash-Next MTP wins on code and long context and ties on prose —
+    /// so it is ON here and `--mtp` rides every launch. Dense targets are
+    /// unaffected (they already default ON). Renamed from `forceMTPOnMoE`
+    /// when the default flipped: the old stored `false` was the old default
+    /// for nearly everyone, and a tolerant decode would have kept it forever.
+    var mtpOnMoE: Bool = true
     /// `--dspark`. DeepSeek-V4's DSpark draft stages are OPT-IN server-side:
     /// enabling them materializes ~11 GB of stage weights at load (the memory
     /// fit-gate still applies and disables with a log when the box can't hold
@@ -507,7 +509,7 @@ struct ServerOptions: Codable, Equatable {
         draftBlockSize == other.draftBlockSize &&
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
-        forceMTPOnMoE == other.forceMTPOnMoE &&
+        mtpOnMoE == other.mtpOnMoE &&
         enableDSpark == other.enableDSpark &&
         anePrefill == other.anePrefill &&
         maxConcurrent == other.maxConcurrent &&
@@ -646,11 +648,10 @@ struct ServerOptions: Codable, Equatable {
                      "--draft-block-size", "\(draftBlockSize)"]
         }
         // MTP: the server auto-loads a checkpoint's `mtp/` head and defaults
-        // depth to auto, so a default launch emits NOTHING here (guarded by
-        // testDefaultLaunchOmitsAllMatchDefaultFlags).
+        // depth to auto; `--mtp` is the one deliberate divergence (MoE ON).
         if !enableMTP {
             args += ["--no-mtp"]
-        } else if forceMTPOnMoE {
+        } else if mtpOnMoE {
             // `--mtp --no-mtp` would be incoherent, and with the head unloaded
             // there is nothing to force on — so "off" wins over "force".
             args += ["--mtp"]
@@ -851,7 +852,7 @@ extension ServerOptions {
             }
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .mtpOnMoE) { mtpOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
@@ -1027,9 +1028,9 @@ extension ServerOptions {
             title: "Tokens guessed ahead",
             explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
             needsRestart: true),
-        "forceMTPOnMoE": .init(
+        "mtpOnMoE": .init(
             title: "Also use MTP on mixture-of-experts models",
-            explainer: "Mixture-of-experts models (Qwen3.5 35B-A3B, Qwen3.8-Flash-Next) leave their MTP head switched off by default: every guessed token reads its own set of experts, so a multi-token check costs about two normal steps and only pays when most guesses land. On Qwen3.8-Flash-Next that is code (up to +40%); prose and long contexts are a wash. Turn this on to use it, and turn it back off if replies get slower. Dense models are unaffected.",
+            explainer: "Mixture-of-experts models (Qwen3.6 35B-A3B, Qwen3.8-Flash-Next) ship an MTP head the server leaves off for multi-user boxes. In this app it is on: measured on an M4 Max, 35B-A3B goes 166 -> 244 tok/s on code and 122 -> 177 at 16k context, with prose a wash. Turn it off if you run several chats at once — the MTP slot decodes alone, so concurrent requests stop batching. Dense models are unaffected.",
             needsRestart: true),
         "enableDSpark": .init(
             title: "DSpark draft stages (DeepSeek‑V4)",

@@ -1200,6 +1200,16 @@ class AppState: ObservableObject {
         }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }
         if let streaming { chatSessions[sIdx].messages[mIdx].isStreaming = streaming }
+
+        // Thinking ends at the first content delta, or at stream end for a
+        // reasoning-only reply. Measured from the message's timestamp, so it
+        // includes the prefill (time the user waited on the pulsing brain).
+        let msg = chatSessions[sIdx].messages[mIdx]
+        let answerStarted = (content?.isEmpty == false) || streaming == false
+        if msg.thinkingSeconds == nil, answerStarted, msg.reasoningContent?.isEmpty == false {
+            chatSessions[sIdx].messages[mIdx].thinkingSeconds =
+                Date().timeIntervalSince(msg.timestamp)
+        }
     }
 
     // MARK: - Agent Helpers

@@ -43,14 +43,6 @@ enum ChatMetrics {
         columnWidth > 0 && columnWidth < compactComposerWidth
     }
 
-    /// The reading measure for a column of `columnWidth`. Pure; pinned by
-    /// `ChatColumnMetricsTests`.
-    static func contentWidth(forColumn columnWidth: CGFloat) -> CGFloat {
-        guard columnWidth > 0 else { return contentFallbackWidth }
-        if columnWidth < narrowColumnWidth { return max(0, columnWidth - 2 * gutter) }
-        return columnWidth * contentWidthFraction
-    }
-
     /// Reading width used for the single frame before `ChatDetailView` has
     /// measured its own column (`onGeometryChange` hasn't fired yet).
     static let contentFallbackWidth: CGFloat = 740
@@ -61,21 +53,27 @@ enum ChatMetrics {
     /// on `ServerOptions`.
     static var compactMode: Bool { UserDefaults.standard.bool(forKey: InterfacePrefKey.compactMode) }
 
-    /// Between turns in the transcript. Wider than the old 12: with the column
-    /// capped, vertical rhythm is what separates one turn from the next — the
-    /// window's edges no longer do it. Compact mode trades that rhythm for
-    /// density.
-    static var transcriptSpacing: CGFloat { compactMode ? 10 : 18 }
+    /// Between turns. Small: every turn already carries its own trailing band
+    /// (a reply's footer, a user turn's action row).
+    static var transcriptSpacing: CGFloat { compactMode ? 6 : 10 }
 
     /// Inner padding + radius of a message bubble (and the tool-call card,
     /// which is styled as one).
     static let bubblePaddingH: CGFloat = 14
-    static var bubblePaddingV: CGFloat { compactMode ? 6 : 10 }
+    /// Not a density knob: compact tightens the leading (`userLineSpacing`),
+    /// and less padding reads as a rendering fault.
+    static let bubblePaddingV: CGFloat = 10
     static let bubbleCornerRadius: CGFloat = 14
 
     /// Indent of the token-stats caption under an assistant reply so it
     /// aligns with the bubble's text column, not the bubble edge.
     static var statsIndent: CGFloat { bubblePaddingH }
+
+    /// Half the action row's height, in compact where the row is not drawn.
+    static var userBubbleBottomPadding: CGFloat { compactMode ? 10 : 0 }
+
+    /// Extra air under a reply: the turn boundary is answer -> next question.
+    static var assistantTurnBottomPadding: CGFloat { compactMode ? 4 : 10 }
 
     /// Single-line height of the composer's input pill — also the frame of
     /// every round control beside it (attach / mic / send), so a
@@ -104,23 +102,49 @@ enum ChatMetrics {
     /// read as a wall next to every web chat (~1.6–1.75 of the font size);
     /// 1.4 × natural lands in that zone. Code gets less — a listing wants
     /// rows, not air.
-    static let proseLineHeightMultiple: CGFloat = 1.4
+    /// Baked into the render cache: `MarkdownText`'s key carries the density.
+    static var proseLineHeightMultiple: CGFloat { compactMode ? 1.15 : 1.4 }
     static let codeLineHeightMultiple: CGFloat = 1.2
 
-    /// The user's bubble is plain SwiftUI `Text`, where leading is EXTRA
-    /// points, not a multiple — this is `proseLineHeightMultiple` restated in
-    /// that unit (1.4 × the ~1.19·size natural height, minus the natural
-    /// height), so both roles read at one density.
-    static var userLineSpacing: CGFloat { (transcriptFontSize * 0.48).rounded() }
+    /// The user's bubble is plain SwiftUI `Text`, where leading is extra points
+    /// rather than a multiple. Tighter than the reply on purpose. Never below
+    /// zero: negative leading overlaps lines.
+    static var userLineSpacing: CGFloat {
+        let base = (transcriptFontSize * 0.48 * 0.8).rounded()
+        return compactMode ? max(0, base - 3.5) : base
+    }
 
-    /// Prose line length, applied as a paragraph `tailIndent` INSIDE the
-    /// attributed string — never a frame cap: tables, code blocks and XML
-    /// keep the full column (`contentWidthFraction` of the window, so on a
-    /// wide window prose used to run edge to edge with it), only flowing
-    /// text wraps early. ~45em of the reading size (≈ 95 chars at 14pt); a
-    /// narrower column wins automatically, since the text container bounds
-    /// the line before the indent does.
-    static var proseMeasure: CGFloat { (transcriptFontSize * 45).rounded() }
+    /// Settings ▸ Interface ▸ Chat Column. Absent = `.wide`.
+    static var chatColumn: ChatColumnWidth { ChatColumnWidth.current }
+
+    /// One height for every attachment; width follows each picture's ratio so
+    /// a row shares a baseline.
+    static var attachmentHeight: CGFloat { compactMode ? 140 : 200 }
+    static let attachmentSpacing: CGFloat = 6
+
+    /// Height cap for generated media; image width follows its ratio
+    /// (`ChatImagePreview.displaySize`), a video's box is fixed.
+    static var generatedImageHeight: CGFloat { compactMode ? 220 : 300 }
+    static var generatedVideoHeight: CGFloat { compactMode ? 200 : 260 }
+    /// One width for every generated row, so stacked media share an edge.
+    static let generatedMediaMaxWidth: CGFloat = 420
+
+    /// Widest a user turn gets; a reply takes the column.
+    static var userBubbleMaxWidth: CGFloat { chatColumn.userBubbleWidth }
+
+    /// The reading column: the setting's points, or the window when narrower.
+    /// `.wide` stays proportional (`contentWidthFraction`) until the panel is
+    /// narrow (the desktop pane's chat column), then it wraps to the panel
+    /// like the fixed modes do, or the composer's control row overflows it.
+    /// Pure; pinned by `ChatColumnMetricsTests` + `TranscriptTypographyTests`.
+    static func proseWidth(panelWidth: CGFloat) -> CGFloat {
+        guard panelWidth > 0 else { return contentFallbackWidth }
+        guard let target = chatColumn.proseWidth else {
+            if panelWidth < narrowColumnWidth { return panelWidth }
+            return (panelWidth * contentWidthFraction).rounded()
+        }
+        return min(target, panelWidth)
+    }
     /// Fenced/inline code inside the transcript. Monospaced digits and glyphs
     /// run wide, so matching the prose size makes code look larger than the
     /// sentence around it.

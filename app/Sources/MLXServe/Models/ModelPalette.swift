@@ -32,6 +32,12 @@ enum ModelPalette {
 
     /// Heading for models shared by other Macs, spelled as the pill spells it.
     static let networkSection = "On Your Network"
+    /// Heading for configured upstream providers (Settings ▸ Providers).
+    static let providersSection = "Providers"
+
+    static func remoteSection(for m: ModelInfo) -> String {
+        m.provider == nil ? networkSection : providersSection
+    }
 
     // MARK: - Rows
 
@@ -86,12 +92,12 @@ enum ModelPalette {
     private static func row(forLan peer: ModelInfo) -> ModelPaletteRow {
         let title = ModelDisplayName.pretty(peer.name)
         let host = peer.lanPeer ?? ""
-        let detail = host.isEmpty ? "On your network" : "On \(host)"
+        let detail = peer.provider != nil ? "Via \(host)" : host.isEmpty ? "On your network" : "On \(host)"
         return ModelPaletteRow(
             tag: ChatModelSelection.tag(localPath: "", lanChatModelId: peer.name),
             title: title,
             detail: detail,
-            section: networkSection,
+            section: remoteSection(for: peer),
             searchText: [title, peer.name, host]
                 .joined(separator: " ").lowercased())
     }

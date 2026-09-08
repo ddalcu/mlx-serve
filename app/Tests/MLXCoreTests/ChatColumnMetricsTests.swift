@@ -25,16 +25,15 @@ final class ChatColumnMetricsTests: XCTestCase {
     /// measures its own width — it should still sit in a sane reading-width
     /// range so that frame doesn't flash something absurd.
     /// A wide column keeps prose off the edges; a narrow one (the desktop
-    /// pane's chat column) is used edge to edge minus the gutters, or the
+    /// pane's chat column) wraps to the panel like the fixed modes do, or the
     /// composer's control row overflows the column on both sides.
     func testANarrowColumnUsesItsFullWidth() {
-        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 1000), 800)
-        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 480), 480 - 2 * ChatMetrics.gutter)
-        XCTAssertEqual(ChatMetrics.contentWidth(forColumn: 0), ChatMetrics.contentFallbackWidth, "unmeasured → fallback")
-        // Continuous enough at the seam: no visible jump when dragging past it.
-        let below = ChatMetrics.contentWidth(forColumn: ChatMetrics.narrowColumnWidth - 1)
-        let above = ChatMetrics.contentWidth(forColumn: ChatMetrics.narrowColumnWidth)
-        XCTAssertLessThan(abs(below - above), 120)
+        UserDefaults.standard.removeObject(forKey: InterfacePrefKey.chatColumn)  // .wide
+        XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 1000), 800)
+        XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 480), 480)
+        XCTAssertEqual(ChatMetrics.proseWidth(panelWidth: 0), ChatMetrics.contentFallbackWidth, "unmeasured → fallback")
+        XCTAssertLessThan(ChatMetrics.proseWidth(panelWidth: ChatMetrics.narrowColumnWidth),
+                          ChatMetrics.narrowColumnWidth, "past the seam the margin comes back")
     }
 
     /// A narrow column sheds the Start caption and the context pill; the

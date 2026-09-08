@@ -24,6 +24,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
+    _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
@@ -85,5 +86,6 @@ test {
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");
+    _ = @import("providers.zig");
     _ = @import("mlx.zig");
 }
