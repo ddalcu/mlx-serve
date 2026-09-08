@@ -4859,3 +4859,15 @@ prefill term at every context. Guards: the `qsa score kernel` bit-equality grid 
 sliced-Q parent, prefix-view bank), ids through `qsaSelectTopBlocks`, the geometry-fallback and
 bill-follows-predicate tests, `tests/test_qwen4_exp.sh` with the kernel engaged, and the
 `QWEN4_DUMP_QSA_BLOCKS` dump for real-prompt block-id identity.
+
+## QSA cooperative NAX prefill
+
+`gatherQsa256` can use cooperative input tensors on G17 with macOS 26.3+;
+ordinary NAX availability (26.2) is insufficient for this API. The old gather
+path serves older systems and unhandled geometries.
+
+Relaxed float32-by-bf16 MMA rounds softmax weights. Split each weight into
+three bf16 terms and accumulate all three products in float32. Sparse block
+selection and causal tails stay unchanged. Guards: `gatherQsa256 NAX` tests,
+`tests/qsa_nax_precision.cpp` (CPU float64 oracle), and
+`tests/test_qsa_nax_prefill.py` (HTTP answers plus arm engagement).
