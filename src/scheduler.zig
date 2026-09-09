@@ -32,6 +32,8 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const media_prefix = @import("media_prefix.zig");
+const media_cache = @import("media_cache.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -277,6 +279,8 @@ pub const SubmitParams = struct {
     vision_key: u64 = 0,
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
+    /// Borrowed during submit; the slot copies the ordered media identities.
+    media_spans: ?[]const media_prefix.Span = null,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -428,6 +432,7 @@ pub const Slot = struct {
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
     media_start: ?usize,
+    media_spans: ?[]media_prefix.Span,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -621,6 +626,8 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
+        const media_spans = if (params.media_spans) |spans| try allocator.dupe(media_prefix.Span, spans) else null;
+        errdefer if (media_spans) |spans| allocator.free(spans);
         const media_start = firstMediaPlaceholder(
             full_prompt_owned,
             config.image_token_id,
@@ -641,6 +648,7 @@ pub const Slot = struct {
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
             .media_start = media_start,
+            .media_spans = media_spans,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
             .mrope_delta = params.mrope_delta,
@@ -768,6 +776,7 @@ pub const Slot = struct {
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
+        if (self.media_spans) |spans| self.allocator.free(spans);
         self.allocator.free(self.eos_token_ids);
         if (self.error_code) |code| self.allocator.free(code);
         if (self.generated_ids) |g| self.allocator.free(g);
@@ -1000,7 +1009,11 @@ pub const VisionVideoPixels = struct {
 /// `done`. Ownership of `result` transfers to the caller on success — pass
 /// to `scheduler.submit(.{ .vision_embeddings = arr, ... })` and the slot's
 /// `deinit` will free it.
+pub const VisionPartIndex = struct { kind: enum { image, video }, index: usize };
+
 pub const VisionEncodeRequest = struct {
+    order: []const VisionPartIndex = &.{},
+    expected_rows: ?usize = null,
     /// Plan 05 Phase D: target model whose `vision_encoder` services this
     /// request. The conn thread holds a refcount (via `ensureLoaded`) for
     /// the duration of the call.
@@ -4452,9 +4465,15 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     }.f;
 
     var n_vision: usize = 0;
+    var image_hits: usize = 0;
     for (req.images) |img| {
         var emb: mlx.mlx_array = undefined;
-        if (img.grid_h > 0) {
+        const key = media_cache.pixelKey(1, &.{ img.width, img.height, img.grid_h, img.grid_w }, img.pixels);
+        const cached = req.model.media_embeddings.get(req.model.allocator, key) catch null;
+        if (cached) |value| {
+            emb = value.array;
+            image_hits += 1;
+        } else if (img.grid_h > 0) {
             // Patch-grid ViT: pixels hold pixel_values [N, feat]; the tower
             // produces [1, N/merge², out_hidden].
             const n: usize = @as(usize, img.grid_h) * img.grid_w;
@@ -4478,6 +4497,14 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             };
         }
         const es = mlx.getShape(emb);
+        if (cached == null) {
+            if (mlx.mlx_array_eval(emb) != 0) {
+                _ = mlx.mlx_array_free(emb);
+                failParts(sch, req, emb_parts.items, "VisionEvaluationFailed");
+                return;
+            }
+            req.model.media_embeddings.put(req.model.allocator, key, .{ .array = emb, .bytes = mlx.mlx_array_size(emb) * mlx.mlx_array_itemsize(emb) }) catch {};
+        }
         n_vision += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
@@ -4541,9 +4568,35 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         };
     }
 
+    log.info("  [media-embeddings] images={d} hits={d} encoded={d} retained={d} bytes\n", .{ req.images.len, image_hits, req.images.len - image_hits, req.model.media_embeddings.bytes });
+
     if (emb_parts.items.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
+    }
+
+    if (req.expected_rows) |expected| if (expected != n_vision + n_video + n_audio) {
+        failParts(sch, req, emb_parts.items, "MediaRowCountMismatch");
+        return;
+    };
+    if (req.order.len > 0) {
+        if (req.order.len != emb_parts.items.len) {
+            failParts(sch, req, emb_parts.items, "MediaOrderMismatch");
+            return;
+        }
+        const sorted = req.allocator.dupe(mlx.mlx_array, emb_parts.items) catch {
+            failParts(sch, req, emb_parts.items, "OutOfMemory");
+            return;
+        };
+        defer req.allocator.free(sorted);
+        for (req.order, 0..) |part, i| {
+            const limit = if (part.kind == .image) req.images.len else req.videos.len;
+            if (part.index >= limit) {
+                failParts(sch, req, sorted, "MediaOrderMismatch");
+                return;
+            }
+            emb_parts.items[i] = sorted[part.index + if (part.kind == .video) req.images.len else @as(usize, 0)];
+        }
     }
 
     // Single modality/clip: pass through. Multiple: concatenate along token dim.
@@ -4899,7 +4952,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
         };
     };
-    const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
+    const finish_st = hc.commitMediaHistory(&slot.cache, total_tokens, slot.has_tools, slot.cache_key, .{ .key = slot.vision_key, .start = slot.media_start, .spans = slot.media_spans }, ssm_cps_opt, dflash_commit, mtp_commit) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
         // here too was a double free, with a different allocator).
@@ -4964,7 +5017,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
-    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null) catch |err| {
+    const st = hc.commitMediaHistory(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.cache_key, .{ .key = slot.vision_key, .start = media_start, .spans = slot.media_spans }, cps, null, null) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -5882,15 +5935,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
-            const lookup = hc.lookupAndRestoreForSlot(
+            const lookup = hc.lookupAndRestoreMediaHistory(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
                 xfm_ptr.s,
                 slot.full_prompt,
                 slot.has_tools,
-                slot.vision_key,
-                slot.media_start,
+                .{ .key = slot.vision_key, .start = slot.media_start, .spans = slot.media_spans },
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
                 @intFromPtr(slot),
@@ -6775,7 +6827,7 @@ test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefi
     // `cache.step` only advances when Generator init COMPLETES, so it reads
     // 0 on every aborted prefill (found live: step=0 while pos=1536).
     try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
+    try testing.expect(std.mem.indexOf(u8, cp_body, "commitMediaHistory") != null);
 }
 
 test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
@@ -6789,7 +6841,7 @@ test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
     const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
     const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "commitWithMediaState") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "commitMediaHistory") != null);
     try testing.expect(std.mem.indexOf(u8, body, "cp.deinit") == null);
 
     // The cancelled-prefill commit detaches the salvage BEFORE the call so
@@ -6798,7 +6850,7 @@ test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
     const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\nfn ") orelse return error.MissingCancelledPrefillEnd;
     const cp_body = source[cp_start..cp_end];
     const detach = std.mem.indexOf(u8, cp_body, "slot.cancelled_prefill = .{};") orelse return error.MissingDetach;
-    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitWithMediaState") orelse return error.MissingCommit;
+    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitMediaHistory") orelse return error.MissingCommit;
     try testing.expect(detach < commit_pos);
 }
 

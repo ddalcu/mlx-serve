@@ -440,6 +440,7 @@ fn appendMessageItem(
             var text_parts = std.ArrayList(u8).empty;
             defer text_parts.deinit(allocator);
             var image_list = std.ArrayList(chat_mod.ImageData).empty;
+            var declared_images: usize = 0;
             errdefer {
                 for (image_list.items) |img| allocator.free(img.pixels);
                 image_list.deinit(allocator);
@@ -456,6 +457,7 @@ fn appendMessageItem(
                         try text_parts.appendSlice(allocator, tx.string);
                     }
                 } else if (std.mem.eql(u8, pt, "input_image")) {
+                    declared_images += 1;
                     const url_val = part.object.get("image_url") orelse continue;
                     const url = switch (url_val) {
                         .string => |s| s,
@@ -465,6 +467,7 @@ fn appendMessageItem(
                     if (image_decoder) |dec| dec(allocator, &image_list, url, vp);
                 }
             }
+            if (vp.mode == .qwen and declared_images != image_list.items.len) return error.InvalidImage;
             if (text_parts.items.len > 0) {
                 const owned = try allocator.dupe(u8, text_parts.items);
                 try pi.owned_strings.append(allocator, owned);
@@ -657,10 +660,18 @@ pub const StoredResponse = struct {
     /// messages are concatenated in front of the new input items. Owned by
     /// the arena (including all inner []const u8 slices and tool_calls).
     history: []chat_mod.Message,
+    /// Pixel buffers are deliberately not copied into this count-bounded
+    /// store. An incomplete history must never become a blind continuation.
+    media_omitted: bool = false,
 
     arena: std.heap.ArenaAllocator,
 
     list_node: std.DoublyLinkedList.Node = .{},
+
+    pub fn continuationHistory(self: *const StoredResponse) ![]const chat_mod.Message {
+        if (self.media_omitted) return error.IncompleteMediaHistory;
+        return self.history;
+    }
 
     pub fn deinit(self: *StoredResponse) void {
         var arena = self.arena;
@@ -1003,6 +1014,30 @@ fn makeTestStored(gpa: std.mem.Allocator, id: []const u8) !*StoredResponse {
         .arena = arena,
     };
     return sr;
+}
+
+test "media: Responses rejects every undecodable declared Qwen image" {
+    const bodies = [_][]const u8{
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"describe\"},{\"type\":\"input_image\"}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"bad\"}]}]",
+    };
+    for (bodies) |body| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        if (parseInput(testing.allocator, parsed.value, null, null, null, .{ .mode = .qwen })) |result| {
+            var owned = result;
+            owned.deinit();
+            return error.MissingImageWasAccepted;
+        } else |err| try testing.expectEqual(error.InvalidImage, err);
+    }
+}
+
+test "media: stored Responses cannot continue omitted pixels" {
+    const sr = try makeTestStored(testing.allocator, "media_history");
+    defer sr.deinit();
+    try testing.expectEqual(@as(usize, 0), (try sr.continuationHistory()).len);
+    sr.media_omitted = true;
+    try testing.expectError(error.IncompleteMediaHistory, sr.continuationHistory());
 }
 
 test "ResponseStore basic put/get/delete" {

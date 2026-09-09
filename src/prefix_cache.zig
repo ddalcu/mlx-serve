@@ -15,6 +15,7 @@
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
 
 const std = @import("std");
+const media_prefix = @import("media_prefix.zig");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const model_mod = @import("model.zig");
@@ -149,6 +150,7 @@ const Entry = struct {
     /// Workload the request belonged to (`server.requestCacheKey`, 0 = anonymous).
     /// Eviction is fair across keys: the key holding the most entries pays first.
     cache_key: u64 = 0,
+    media_spans: ?[]media_prefix.Span = null,
     /// Snapshot of the live KVCache at end of generation. Owns refcount-shared
     /// handles to the GPU buffers backing positions 0..tokens.len.
     snapshot: KVCacheSnapshot,
@@ -438,6 +440,7 @@ pub const HotPrefixCache = struct {
     /// they don't drift apart.
     fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
         allocator.free(e.tokens);
+        if (e.media_spans) |spans| allocator.free(spans);
         e.snapshot.deinit();
         if (e.ssm_checkpoints) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
@@ -901,6 +904,19 @@ pub const HotPrefixCache = struct {
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
     ) ?struct { idx: usize, shared: usize } {
+        const match = self.findBestMediaMatch(prompt_ids, has_tools, .{ .key = vision_key, .start = media_start }, quant_config, require_ssm_checkpoint, probe) orelse return null;
+        return .{ .idx = match.idx, .shared = match.shared };
+    }
+
+    fn findBestMediaMatch(
+        self: *const HotPrefixCache,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: media_prefix.State,
+        quant_config: kv_quant.KVQuantConfig,
+        require_ssm_checkpoint: bool,
+        probe: ?*MatchProbe,
+    ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_effective: usize = 0;
@@ -910,18 +926,11 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
-            var max_shared = @min(e.tokens.len, prompt_ids.len);
-            if (e.vision_key != vision_key) {
-                // Placeholder token IDs do not encode media pixels. Once an
-                // image/audio/video row is forwarded, model state depends on
-                // the media hash and cannot cross keys. State strictly before
-                // the first such row remains ordinary text.
-                const safe_boundary = if (e.media_start) |entry_start|
-                    if (media_start) |request_start| @min(entry_start, request_start) else entry_start
-                else
-                    media_start orelse continue;
-                max_shared = @min(max_shared, safe_boundary);
-            }
+            const max_shared = media_prefix.sharedLimit(.{
+                .key = e.vision_key,
+                .start = e.media_start,
+                .spans = e.media_spans,
+            }, media, @min(e.tokens.len, prompt_ids.len));
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
 
@@ -1035,13 +1044,29 @@ pub const HotPrefixCache = struct {
         /// `releaseCheckout` on every path that ends the slot).
         slot_id: ?usize,
     ) !LookupResult {
+        return self.lookupAndRestoreMediaHistory(target_cache, target_moe_seq_offset, target_ssm_entries, s, prompt_ids, has_tools, .{ .key = vision_key, .start = media_start }, dflash_target, mtp_target, slot_id);
+    }
+
+    pub fn lookupAndRestoreMediaHistory(
+        self: *HotPrefixCache,
+        target_cache: *KVCache,
+        target_moe_seq_offset: *usize,
+        target_ssm_entries: ?[]SSMCacheEntry,
+        s: mlx.mlx_stream,
+        prompt_ids: []const u32,
+        has_tools: bool,
+        media: media_prefix.State,
+        dflash_target: ?DflashTarget,
+        mtp_target: ?DflashTarget,
+        slot_id: ?usize,
+    ) !LookupResult {
+        const media_start = media.start;
         self.last_restored_used = null;
         var probe: MatchProbe = .{};
-        const match = self.findBestRestorableMatch(
+        const match = self.findBestMediaMatch(
             prompt_ids,
             has_tools,
-            vision_key,
-            media_start,
+            media,
             target_cache.config,
             target_ssm_entries != null,
             &probe,
@@ -1433,6 +1458,30 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !CommitStatus {
+        return self.commitMediaHistory(source_cache, tokens, has_tools, cache_key, .{ .key = vision_key, .start = media_start }, ssm_cps, dflash, mtp);
+    }
+
+    pub fn commitMediaHistory(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        cache_key: u64,
+        media: media_prefix.State,
+        ssm_cps: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+    ) !CommitStatus {
+        const vision_key = media.key;
+        const media_start = media.start;
+        var spans_owned: ?[]media_prefix.Span = if (media.spans) |spans| self.allocator.dupe(media_prefix.Span, spans) catch |err| {
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            return err;
+        } else null;
+        defer if (spans_owned) |spans| self.allocator.free(spans);
         const quant_config = source_cache.config;
 
         // Record what the live cache holds now, before any byte-budget trim.
@@ -1467,7 +1516,7 @@ pub const HotPrefixCache = struct {
         var replace_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
-            if (e.vision_key != eff_vision_key) continue;
+            if (media_prefix.sharedLimit(.{ .key = e.vision_key, .start = e.media_start, .spans = e.media_spans }, .{ .key = eff_vision_key, .start = eff_media_start, .spans = spans_owned }, e.tokens.len) < e.tokens.len) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             if (e.tokens.len <= tokens.len) {
                 var shared: usize = 0;
@@ -1479,7 +1528,13 @@ pub const HotPrefixCache = struct {
             }
         }
 
-        var new_snap = try source_cache.snapshot();
+        var new_snap = source_cache.snapshot() catch |err| {
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            return err;
+        };
         // The speculative-side payloads are best-effort: a snapshot failure
         // must not cost the trunk KV entry they ride on.
         var new_dflash: ?DflashSnap = null;
@@ -1529,7 +1584,7 @@ pub const HotPrefixCache = struct {
             var trimmed_ok = false;
             var decline: TrimDecline = .no_restorable_prefix;
             var decline_err: ?anyerror = null;
-            var limit = if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
+            var limit = if (media.spans != null) tokens.len else if (eff_media_start) |ms| @min(tokens.len, ms) else tokens.len;
             var inputs_logged = false;
             trim_blk: while (true) {
                 const row_bytes = snapshotRowBytes(&new_snap);
@@ -1706,7 +1761,7 @@ pub const HotPrefixCache = struct {
         // resident, so this costs GPU memory only in the accounting, and only
         // until the donor is evicted.
         if (replace_idx == null) inherit: {
-            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, quant_config) orelse
+            const donor = self.bestMediaCheckpointDonor(eff_tokens, has_tools, .{ .key = eff_vision_key, .start = eff_media_start, .spans = spans_owned }, quant_config) orelse
                 break :inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -1768,6 +1823,7 @@ pub const HotPrefixCache = struct {
             // Free everything the old entry owned EXCEPT the (now-detached)
             // ssm_checkpoints, which were moved above.
             self.allocator.free(e.tokens);
+            if (e.media_spans) |spans| self.allocator.free(spans);
             e.snapshot.deinit();
             // The old speculative payloads describe a strict PREFIX of the
             // new tokens, but they are keyed to their own base_pos and
@@ -1790,6 +1846,8 @@ pub const HotPrefixCache = struct {
             e.vision_key = eff_vision_key;
             e.cache_key = cache_key;
             e.media_start = eff_media_start;
+            e.media_spans = spans_owned;
+            spans_owned = null;
             e.quant_config = quant_config;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
             e.ssm_checkpoints = merged_cps;
@@ -1843,6 +1901,7 @@ pub const HotPrefixCache = struct {
             .vision_key = eff_vision_key,
             .cache_key = cache_key,
             .media_start = eff_media_start,
+            .media_spans = spans_owned,
             .snapshot = new_snap,
             .last_used = self.bumpCounter(),
             .quant_config = quant_config,
@@ -1865,6 +1924,7 @@ pub const HotPrefixCache = struct {
             }
             return err;
         };
+        spans_owned = null;
         self.current_kv_bytes += new_bytes;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
@@ -2325,6 +2385,17 @@ pub const HotPrefixCache = struct {
         media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
     ) ?struct { idx: usize, shared: usize } {
+        const match = self.bestMediaCheckpointDonor(tokens, has_tools, .{ .key = vision_key, .start = media_start }, quant_config) orelse return null;
+        return .{ .idx = match.idx, .shared = match.shared };
+    }
+
+    fn bestMediaCheckpointDonor(
+        self: *const HotPrefixCache,
+        tokens: []const u32,
+        has_tools: bool,
+        media: media_prefix.State,
+        quant_config: kv_quant.KVQuantConfig,
+    ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
         var best_pos: usize = 0;
@@ -2332,16 +2403,7 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const cps = e.ssm_checkpoints orelse continue;
-            var max_shared = @min(e.tokens.len, tokens.len);
-            if (e.vision_key != vision_key) {
-                // Same rule as `findBestRestorableMatch`: rows before the
-                // earliest media placeholder are ordinary text and cross keys.
-                const safe_boundary = if (e.media_start) |entry_start|
-                    if (media_start) |commit_start| @min(entry_start, commit_start) else entry_start
-                else
-                    media_start orelse continue;
-                max_shared = @min(max_shared, safe_boundary);
-            }
+            const max_shared = media_prefix.sharedLimit(.{ .key = e.vision_key, .start = e.media_start, .spans = e.media_spans }, media, @min(e.tokens.len, tokens.len));
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == tokens[shared]) shared += 1;
             const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
@@ -3493,6 +3555,40 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
 // ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
 
 const conv_shape_pc = [_]c_int{ 1, 3, 8 };
+
+test "HotPrefixCache: appended media retains post-image hybrid checkpoints" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 900, 900, 5, 6, 7, 8, 9, 10, 900, 900, 13, 14 };
+    const a = media_prefix.Span{ .start = 2, .end = 4, .digest = @splat(1) };
+    const b = media_prefix.Span{ .start = 10, .end = 12, .digest = @splat(2) };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var source = try KVCache.init(testing.allocator, 3);
+    defer source.deinit();
+    try testFillCache(&source, s, 3, 10);
+    var states = pcBuildHybrid(s, 123, 456);
+    defer pcFreeHybrid(&states);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &states, 2, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &states, 8, s);
+    _ = try hc.commitMediaHistory(&source, tokens[0..10], false, 0, .{ .key = 1, .start = 2, .spans = &.{a} }, cps, null, null);
+    var target = try KVCache.init(testing.allocator, 3);
+    defer target.deinit();
+    var restored = pcEmptySsm();
+    defer pcFreeHybrid(&restored);
+    var offset: usize = 0;
+    const next = media_prefix.State{ .key = 2, .start = 2, .spans = &.{ a, b } };
+    const hit = try hc.lookupAndRestoreMediaHistory(&target, &offset, &restored, s, &tokens, false, next, null, null, null);
+    try testing.expectEqual(@as(usize, 8), hit.matched);
+    try testing.expectEqual(@as(usize, 8), target.step);
+    try testing.expectEqual(@as(f32, 123), pcSsmVal(restored[0].conv_state, 0, s));
+    var edited = a;
+    edited.digest = b.digest;
+    const miss = try hc.lookupAndRestoreMediaHistory(&target, &offset, &restored, s, &tokens, false, .{ .key = 3, .start = 2, .spans = &.{ edited, b } }, null, null, null);
+    try testing.expectEqual(@as(usize, 2), miss.matched);
+    const donor = hc.bestMediaCheckpointDonor(&tokens, false, next, source.config).?;
+    try testing.expectEqual(@as(usize, 10), donor.shared);
+}
 const ssm_shape_pc = [_]c_int{ 1, 2, 4, 4 };
 
 fn pcArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
