@@ -17031,6 +17031,7 @@ fn handleResponsesInner(
     // ── parse input → messages ──
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
+        if (stream.ws_mode != null) return err;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
     };
@@ -17119,6 +17120,7 @@ fn handleResponsesInner(
     if (config.qwen_vision and lm.vision_encoder != null) {
         const prepared = prepareQwenHistory(allocator, lm, prompt_ids_raw, pi.messages.items, active_tools_json, active_tool_choice_instruction) catch |err| {
             allocator.free(prompt_ids_raw);
+            if (stream.ws_mode != null) return err;
             try sendGenerationError(allocator, stream, err, .openai);
             return;
         };

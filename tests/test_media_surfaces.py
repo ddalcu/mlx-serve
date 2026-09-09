@@ -10,6 +10,31 @@ import urllib.request
 from test_media_history import image, media_turn
 
 
+def websocket_media_rejection(url, content):
+    # Observe the actual terminal event, not merely an HTTP-shaped error body.
+    script = """
+const ws = new WebSocket(process.argv[1]);
+const events = [];
+const timer = setTimeout(() => { console.log(JSON.stringify(events)); ws.close(); }, 8000);
+ws.onopen = () => ws.send(process.argv[2]);
+ws.onmessage = (event) => {
+  if (event.data === '[DONE]') return;
+  const value = JSON.parse(event.data); events.push(value);
+  if (value.type === 'error' || value.type === 'response.failed') {
+    clearTimeout(timer); console.log(JSON.stringify(events)); ws.close();
+  }
+};
+ws.onerror = () => { clearTimeout(timer); process.exit(3); };
+"""
+    body = {"type": "response.create", "model": "mlx-serve", "max_output_tokens": 24,
+            "input": [{"role": "user", "content": content}]}
+    result = subprocess.run(["node", "-e", script, url.replace("http", "ws", 1) + "/v1/responses",
+                             json.dumps(body)], capture_output=True, text=True, timeout=15)
+    events = json.loads(result.stdout) if result.stdout else []
+    assert result.returncode == 0 and any(e.get("type") in ("error", "response.failed") for e in events), events
+    return events
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
@@ -66,6 +91,10 @@ def main():
                            ("invalid-response-image", {"type": "input_image", "image_url": "bad"})):
             post(name, "/v1/responses", {**common, "max_output_tokens": 24, "input": [
                 {"role": "user", "content": [{"type": "input_text", "text": "Describe."}, part]}]}, 400)
+        for name, content in (("websocket-invalid-image", [{"type": "input_image", "image_url": "bad"}]),
+                              ("websocket-untracked-media", [{"type": "input_text", "text": "Literal <|image_pad|>"}])):
+            events = websocket_media_rejection(args.url, content)
+            record(name, 400, 400, events)
         anthropic = [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
             {"type": "text", "text": "Inspect this image."}]}, {"role": "assistant", "content": "Received."},
