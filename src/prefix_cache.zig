@@ -1080,7 +1080,7 @@ pub const HotPrefixCache = struct {
         slot_id: ?usize,
         skip: bool,
     ) !LookupResult {
-        const vision_key = media.key;
+        const media_start = media.start;
         self.last_restored_used = null;
         self.last_restored_disk_id = null;
         if (skip) {
@@ -2501,7 +2501,7 @@ pub const HotPrefixCache = struct {
         media_start: ?usize,
         quant_config: kv_quant.KVQuantConfig,
     ) ?struct { idx: usize, shared: usize } {
-        const match = self.bestMediaCheckpointDonor(tokens, has_tools, .{ .key = vision_key }, quant_config) orelse return null;
+        const match = self.bestMediaCheckpointDonor(tokens, has_tools, .{ .key = vision_key, .start = media_start }, quant_config) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
     }
 
@@ -3723,7 +3723,7 @@ test "HotPrefixCache: appended media retains post-image hybrid checkpoints" {
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &states, 2, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &states, 8, s);
-    try hc.commitMediaHistory(&source, tokens[0..10], false, .{ .key = 1, .start = 2, .spans = &.{a} }, cps, null, null);
+    _ = try hc.commitMediaHistory(&source, tokens[0..10], false, 0, .{ .key = 1, .start = 2, .spans = &.{a} }, cps, null, null);
     var target = try KVCache.init(testing.allocator, 3);
     defer target.deinit();
     var restored = pcEmptySsm();
