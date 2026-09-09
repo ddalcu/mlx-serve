@@ -98,13 +98,21 @@ class APIClient {
     }()
     private let decoder = JSONDecoder()
 
-    /// Build a URL pointing at the server, honouring `host`.
+    /// Build a URL pointing at the server, honouring `host`. The settings
+    /// field is free text, so anything that does not form a valid URL falls
+    /// back to loopback instead of trapping — a 1 s health poll must be able
+    /// to report the server down, not crash the app.
     func serverURL(port: UInt16, path: String) -> URL {
-        let effectiveHost = (host.isEmpty || host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host
-        // An unbracketed IPv6 host makes the authority malformed (the port
-        // parses as part of the address) and URL(string:) returns nil.
+        var effectiveHost = host
+        if effectiveHost.isEmpty || effectiveHost == "0.0.0.0" || effectiveHost == "::" {
+            effectiveHost = "127.0.0.1"
+        }
+        if effectiveHost.hasPrefix("[") && effectiveHost.hasSuffix("]") {
+            effectiveHost = String(effectiveHost.dropFirst().dropLast())
+        }
         let authority = effectiveHost.contains(":") ? "[\(effectiveHost)]" : effectiveHost
-        return URL(string: "http://\(authority):\(port)\(path)")!
+        return URL(string: "http://\(authority):\(port)\(path)")
+            ?? URL(string: "http://127.0.0.1:\(port)\(path)")!
     }
 
     func checkHealth(port: UInt16) async throws -> Bool {
