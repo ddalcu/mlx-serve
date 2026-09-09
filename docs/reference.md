@@ -42,7 +42,7 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `log.zig` | Leveled logging + persistent file sink (`--log-file`, default `~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation). libc `write(2)` + pthread mutex — callers carry no `Io`. |
 | `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --kv-quant --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --metrics --api-key --lan-share --lan-discover --lan-name --no-tool-autocorrect --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --timeout --loop-repetitions --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --kv-quant --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --metrics --api-key --lan-share --lan-discover --lan-name --no-tool-autocorrect --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
 
 CLI subcommands (Ollama-grade, `src/cli.zig`): `mlx-serve run <model>` (pull-if-missing + serve + TTY chat REPL), `pull <model>`, `list`, `serve` (headless over `~/.mlx-serve/models`). Short names resolve via the alias table in cli.zig (mirrors `gemmaModelOptions`); `org/repo`, `hf.co/org/repo`, and `:tag` forms accepted everywhere.
 

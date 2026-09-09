@@ -49,6 +49,7 @@ final class ServerOptionsTests: XCTestCase {
         // that. These value assertions can; update both sides together.
         XCTAssertEqual(d.ctxSize, 0)                  // main.zig ctx_size
         XCTAssertEqual(d.requestTimeout, 300)         // main.zig timeout
+        XCTAssertEqual(d.loopRepetitions, 16)         // generate.zig degenerate_loop_reps
         XCTAssertEqual(d.noVision, false)             // main.zig no_vision
         XCTAssertEqual(d.maxConcurrent, 1)            // server.zig max_concurrent
         XCTAssertEqual(d.kvQuant, .off)               // server.zig kv-quant
@@ -67,7 +68,7 @@ final class ServerOptionsTests: XCTestCase {
         // Corollary: with defaults matching the server, a fresh launch omits
         // every match-default flag (each guard fires only on a real change).
         let args = d.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
-        for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
+        for flag in ["--ctx-size", "--timeout", "--loop-repetitions", "--no-vision", "--max-concurrent",
                      "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
                      "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
                      "--ssd-streaming", "--top-k", "--drafter"] {
@@ -140,6 +141,18 @@ final class ServerOptionsTests: XCTestCase {
 
         opts.requestTimeout = 0  // unlimited
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "0"))
+    }
+
+    func testLoopRepetitionCutoffIsExposedAsALaunchFlag() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs().contains("--loop-repetitions"))
+
+        opts.loopRepetitions = 32
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--loop-repetitions", value: "32"))
+
+        opts.loopRepetitions = 0
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--loop-repetitions", value: "0"))
+        XCTAssertEqual(ServerOptions.loopRepetitionPresets, [0, 16, 24, 32, 48, 64])
     }
 
     // MARK: - Host / port (Settings UI fields)
@@ -453,6 +466,9 @@ final class ServerOptionsTests: XCTestCase {
         b = ServerOptions()
         b.tokenizeCacheEntries = 0
         XCTAssertFalse(a.serverLaunchEquals(b))
+        b = ServerOptions()
+        b.loopRepetitions = 32
+        XCTAssertFalse(a.serverLaunchEquals(b))
         // Sanity: untouched defaults are equal.
         a = ServerOptions(); b = ServerOptions()
         XCTAssertTrue(a.serverLaunchEquals(b))
@@ -602,6 +618,7 @@ extension ServerOptionsTests {
         o.noVision = true
         o.logLevel = .debug
         o.requestTimeout = 600
+        o.loopRepetitions = 32
         o.enablePLD = false
         o.pldDraftLen = 7
         o.pldKeyLen = 4
