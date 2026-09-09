@@ -101,7 +101,10 @@ class APIClient {
     /// Build a URL pointing at the server, honouring `host`.
     func serverURL(port: UInt16, path: String) -> URL {
         let effectiveHost = (host.isEmpty || host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host
-        return URL(string: "http://\(effectiveHost):\(port)\(path)")!
+        // An unbracketed IPv6 host makes the authority malformed (the port
+        // parses as part of the address) and URL(string:) returns nil.
+        let authority = effectiveHost.contains(":") ? "[\(effectiveHost)]" : effectiveHost
+        return URL(string: "http://\(authority):\(port)\(path)")!
     }
 
     func checkHealth(port: UInt16) async throws -> Bool {

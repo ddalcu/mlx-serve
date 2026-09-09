@@ -46,4 +46,11 @@ final class APIClientServerURLTests: XCTestCase {
         XCTAssertEqual(api.serverURL(port: 11234, path: "/v1/audio/speech").absoluteString,
                        "http://192.168.1.10:11234/v1/audio/speech")
     }
+
+    func testIPv6HostIsBracketed() {
+        let api = APIClient()
+        api.host = "::1"
+        XCTAssertEqual(api.serverURL(port: 11234, path: "/health").absoluteString,
+                       "http://[::1]:11234/health")
+    }
 }
