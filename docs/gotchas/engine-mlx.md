@@ -4860,14 +4860,21 @@ sliced-Q parent, prefix-view bank), ids through `qsaSelectTopBlocks`, the geomet
 bill-follows-predicate tests, `tests/test_qwen4_exp.sh` with the kernel engaged, and the
 `QWEN4_DUMP_QSA_BLOCKS` dump for real-prompt block-id identity.
 
-## QSA cooperative NAX prefill
+## The QSA gather attention rides NAX cooperative tensors at prefill (2026-09-09)
 
-`gatherQsa256` can use cooperative input tensors on G17 with macOS 26.3+;
-ordinary NAX availability (26.2) is insufficient for this API. The old gather
-path serves older systems and unhandled geometries.
-
-Relaxed float32-by-bf16 MMA rounds softmax weights. Split each weight into
-three bf16 terms and accumulate all three products in float32. Sparse block
-selection and causal tails stay unchanged. Guards: `gatherQsa256 NAX` tests,
-`tests/qsa_nax_precision.cpp` (CPU float64 oracle), and
-`tests/test_qsa_nax_prefill.py` (HTTP answers plus arm engagement).
+`gatherQsa256` (the block-gathered sparse attention of qwen4_exp prefill) was the largest
+flat prefill term at every context: ~65 ms per 4096-row call, ~26% of a chunk, ~3 TFLOP/s
+on a 60 TFLOP/s part. PR #385 (Nikolai V.) ported the split-head-dimension attention of
+MLX's steel NAX kernels to per-query sparse block selection (`msv_qsa_nax_precise`). The
+cooperative input-tensor API needs macOS 26.3 on a G17 GPU, one release past ordinary NAX
+availability, so the gate is its own predicate (`qsaNaxEligible`: G17 + 26.3 + bf16 + hd 256
++ gqa 12 + q_len >= 16) and the kernel is never compiled where it fails. The bf16 MMA rounds
+the softmax weights: the PR split each weight into three bf16 terms; two terms match stock's
+bf16 store to the same max error and beat three on the chained graph (33.5 vs 36.2 ms), one
+term is worse than stock, so two ship. Not bit-identical to the stock gather, so the bar is
+per-element error against float64 of the bf16-rounded inputs, no worse than stock
+(`tests/qsa_nax_precision.py`), and greedy answers are expected to fork on long prompts.
+Measured: gather 2.06x at kv 4k, 1.93x at 65k, 1.64x at 262k (it is not flat in kv: scattered
+K/V reads from a larger buffer); live 162k prefill 1480 -> 1667 tok/s (+12.6%). Default on
+where eligible, `MLX_SERVE_QSA_NAX=0` restores the stock gather. Guards: the `gatherQsa256 NAX`
+tests, the eligibility-predicate test, the precision probe, `tests/test_qsa_nax_prefill.py`.

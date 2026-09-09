@@ -1,4 +1,4 @@
-// Copyright © 2023-2024 Apple Inc. Adapted from MLX steel/attn/nax.h.
+// Copyright © 2025 Apple Inc. Adapted from MLX steel/attn/nax.h.
 // Only the cooperative fragments used by sparse attention are retained.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")

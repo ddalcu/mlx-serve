@@ -1,7 +1,9 @@
 // Sparse QSA for bf16 D=256, GQA12, on G17.
-// Three bf16 terms retain float32 softmax precision under relaxed NAX MMA.
+// Two bf16 terms retain enough softmax precision under relaxed NAX MMA.
 // D and block IDs are contiguous; KV rows are aligned for uint4 loads.
 using namespace mlx::steel;
+// Two simdgroups split D=256 (warp*128) and share exchange[2][512]; one 32-key tile per KV pass.
+static_assert(NSG == 2 && BK == 32, "msv_qsa_nax_precise is written for 2 simdgroups and BK 32");
 constexpr int BD = 256, LD = 264, TDH = 8, TK = BK / 16;
 const int qL=q_shape[2], kL=k_shape[2], Hq=q_shape[1], Hk=k_shape[1];
 const int gqa=Hq/Hk, KB=blocks_shape[2];
@@ -96,18 +98,15 @@ for(int t0=0;t0<L;t0+=BK) {
     for(short ik=0;ik<TK;++ik) {
       NAXTile<T,1,2> V;
       V.template load<T,LD,1>(KV+ik*16*LD+warp*128+d*16);
-      NAXTile<T,1,1> Shi, Slo, Stail;
+      NAXTile<T,1,1> Shi, Slo;
       for(short j=0;j<8;++j) {
         Shi.frag_at(0,0)[j]=T(S.frag_at(0,ik)[j]);
         float residual=S.frag_at(0,ik)[j]-float(Shi.frag_at(0,0)[j]);
         Slo.frag_at(0,0)[j]=T(residual);
-        Stail.frag_at(0,0)[j]=T(residual-float(Slo.frag_at(0,0)[j]));
       }
       BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Shi.frag_at(0,0),
         metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
       BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Slo.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Stail.frag_at(0,0),
         metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
     }
   }

@@ -192,6 +192,13 @@ variant) so a fused kernel stays bit-identical to the op chain it replaces.
 Those are our own implementations written against MLX's observable behaviour,
 not copies of its source.
 
+`src/kernels/qsa_nax_header.metal` adapts the cooperative NAX fragment layout
+and MMA helpers from MLX's `steel/attn/nax.h` (Copyright (c) 2025 Apple
+Inc., MIT License, the same license as this project's LICENSE), and
+`src/kernels/qsa_nax.metal` adapts the split-head-dimension attention
+algorithm to per-query sparse block selection with a two-term bf16 PV.
+Contributed by Nikolai V.
+
 --------------------------------------------------------------------------------
 mlx-lm
 https://github.com/ml-explore/mlx-lm
@@ -411,13 +418,3 @@ and they are listed because they made that work possible.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. mlx-serve does not redistribute them.
-
---------------------------------------------------------------------------------
-Apple MLX
-https://github.com/ml-explore/mlx
-Copyright © 2023-2024 Apple Inc.
-Licensed under the MIT License (src/kernels/MLX-LICENSE).
-
-src/kernels/qsa_nax_header.metal adapts the cooperative fragment layout and
-MMA helpers from steel/attn/nax.h. qsa_nax.metal adapts the split-head-dimension
-attention algorithm to per-query sparse block selection and corrected bf16 PV.
