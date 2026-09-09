@@ -84,11 +84,9 @@ struct RetryPolicy {
 }
 
 class APIClient {
-    /// The host address used to connect to the server. Defaults to loopback;
-    /// set to the configured `ServerOptions.host` so the app can monitor a
-    /// server bound to a specific LAN IP (e.g. `192.168.1.10`).
-    /// When the server binds `0.0.0.0`, loopback still works, so the default
-    /// is safe for the common case.
+    /// Host used to reach the server. Set to `ServerOptions.host` at launch so
+    /// a server bound to a specific interface address is still reachable;
+    /// wide binds stay on loopback (the no-api-key trust boundary).
     var host: String = "127.0.0.1"
 
     private let session: URLSession = {
@@ -100,12 +98,8 @@ class APIClient {
     }()
     private let decoder = JSONDecoder()
 
-    /// Build a URL pointing at the local server. Centralises the host so
-    /// callers don't hardcode `127.0.0.1`.
+    /// Build a URL pointing at the server, honouring `host`.
     func serverURL(port: UInt16, path: String) -> URL {
-        // When the server binds 0.0.0.0, connecting via 127.0.0.1 works and
-        // stays inside the loopback trust boundary (no api-key needed).
-        // Only use the configured host when it's a specific interface address.
         let effectiveHost = (host.isEmpty || host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host
         return URL(string: "http://\(effectiveHost):\(port)\(path)")!
     }

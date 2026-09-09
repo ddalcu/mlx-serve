@@ -270,9 +270,7 @@ final class VoiceCloneTTS {
     private var loadedModelId: String?
     private var loadedDir: String?
 
-    init(server: ServerManager) {
-        self.server = server
-    }
+    init(server: ServerManager) { self.server = server }
 
     func synthesize(text: String, voice sel: NeuralVoice) async -> Data? {
         api.host = server.api.host
