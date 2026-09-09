@@ -6,7 +6,7 @@ Each model owns separate bounded CPU preprocessing and projected-image caches (2
 
 ## Limits
 
-- Media prefix state is RAM-only; SSD lookup/commit is bypassed for media requests. Restart, eviction and early edits can replay history, and warm hybrid requests can replay a short checkpoint tail.
+- Post-image prefix state is RAM-only. When a disk tier is enabled, lookup may restore text strictly before the first media span; media-bearing state is not committed to SSD. Restart, eviction and early edits can replay history, and warm hybrid requests can replay a short checkpoint tail.
 - Video embeddings are not cached. Images and video in separate turns work; mixing both in one message is rejected until cross-modality order is represented.
 - Incomplete media, unsupported Qwen audio and literal image/video protocol-control tokens are rejected rather than producing a blind answer. Ordinary role-marker text is allowed.
 - Stored Responses histories omit pixels. Image-bearing `previous_response_id` continuations (HTTP, WebSocket and compact) must resend full history instead.
