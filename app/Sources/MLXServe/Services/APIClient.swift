@@ -84,6 +84,13 @@ struct RetryPolicy {
 }
 
 class APIClient {
+    /// The host address used to connect to the server. Defaults to loopback;
+    /// set to the configured `ServerOptions.host` so the app can monitor a
+    /// server bound to a specific LAN IP (e.g. `192.168.1.10`).
+    /// When the server binds `0.0.0.0`, loopback still works, so the default
+    /// is safe for the common case.
+    var host: String = "127.0.0.1"
+
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 600
@@ -93,8 +100,18 @@ class APIClient {
     }()
     private let decoder = JSONDecoder()
 
+    /// Build a URL pointing at the local server. Centralises the host so
+    /// callers don't hardcode `127.0.0.1`.
+    func serverURL(port: UInt16, path: String) -> URL {
+        // When the server binds 0.0.0.0, connecting via 127.0.0.1 works and
+        // stays inside the loopback trust boundary (no api-key needed).
+        // Only use the configured host when it's a specific interface address.
+        let effectiveHost = (host.isEmpty || host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host
+        return URL(string: "http://\(effectiveHost):\(port)\(path)")!
+    }
+
     func checkHealth(port: UInt16) async throws -> Bool {
-        let url = URL(string: "http://127.0.0.1:\(port)/health")!
+        let url = serverURL(port: port, path: "/health")
         let (data, response) = try await session.data(from: url)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             return false
@@ -117,7 +134,7 @@ class APIClient {
     /// callers prefer this over `fetchModels(port:)` so the picker UI can
     /// show loaded/unloaded badges per model.
     func fetchAllModels(port: UInt16) async throws -> [ModelInfo] {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/models")!
+        let url = serverURL(port: port, path: "/v1/models")
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let dataArr = json["data"] as? [[String: Any]] else { return [] }
@@ -211,7 +228,7 @@ class APIClient {
     }
 
     func loadModel(port: UInt16, id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/load-model")!
+        let url = serverURL(port: port, path: "/v1/load-model")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -242,7 +259,7 @@ class APIClient {
     /// Ask the server to absorb models downloaded after it booted (discovery
     /// only walks the roots at startup). Add-only and idempotent server-side.
     func reloadProviders(port: UInt16) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/providers/reload")!
+        let url = serverURL(port: port, path: "/v1/providers/reload")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 10
@@ -254,7 +271,7 @@ class APIClient {
     }
 
     func providerStatus(port: UInt16) async throws -> [ProviderStatus] {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/providers")!
+        let url = serverURL(port: port, path: "/v1/providers")
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         let (data, _) = try await session.data(for: request)
@@ -262,7 +279,7 @@ class APIClient {
     }
 
     func rescanModels(port: UInt16) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/models/rescan")!
+        let url = serverURL(port: port, path: "/v1/models/rescan")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 30
@@ -273,7 +290,7 @@ class APIClient {
     }
 
     func unloadModel(port: UInt16, id: String) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/unload-model")!
+        let url = serverURL(port: port, path: "/v1/unload-model")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -297,7 +314,7 @@ class APIClient {
                 do {
                     var body = json
                     body["stream"] = true
-                    var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+                    var req = URLRequest(url: serverURL(port: port, path: path))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -342,7 +359,7 @@ class APIClient {
     /// (the server runs one padded masked GPU forward per 64-text chunk).
     /// Returns one vector per input, in input order.
     func embeddings(port: UInt16, model: String, input: [String]) async throws -> [[Double]] {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/embeddings")!
+        let url = serverURL(port: port, path: "/v1/embeddings")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -375,7 +392,7 @@ class APIClient {
     }
 
     func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
-        let url = URL(string: "http://127.0.0.1:\(port)/props")!
+        let url = serverURL(port: port, path: "/props")
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
@@ -385,7 +402,7 @@ class APIClient {
     /// Live throughput feed. 503s when the server was launched without
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
-        let url = URL(string: "http://127.0.0.1:\(port)/metrics.json")!
+        let url = serverURL(port: port, path: "/metrics.json")
         let (data, response) = try await session.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
@@ -552,7 +569,7 @@ class APIClient {
         continueFinalMessage: Bool = false,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
-        let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+        let url = serverURL(port: port, path: "/v1/chat/completions")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

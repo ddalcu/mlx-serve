@@ -65,7 +65,7 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
-    private let api = APIClient()
+    let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -184,6 +184,7 @@ class ServerManager: ObservableObject {
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
         port = options.port
+        api.host = options.host
         status = .starting
         lastError = ""
         chatDefaultEnsured = false
@@ -528,13 +529,14 @@ class ServerManager: ObservableObject {
     private func startHealthPolling() {
         healthTask?.cancel()
         let checkPort = port
+        let healthURL = api.serverURL(port: checkPort, path: "/health")
         // Use a GCD timer on the main queue — guaranteed to fire even during init.
         // URLSession completion runs on a background queue and dispatches back to main.
         let source = DispatchSource.makeTimerSource(queue: .main)
         source.schedule(deadline: .now() + 1, repeating: 1.0)
         source.setEventHandler { [weak self] in
             guard let self else { source.cancel(); return }
-            let url = URL(string: "http://127.0.0.1:\(checkPort)/health")!
+            let url = healthURL
             URLSession.shared.dataTask(with: url) { data, response, error in
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

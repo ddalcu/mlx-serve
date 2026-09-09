@@ -270,9 +270,12 @@ final class VoiceCloneTTS {
     private var loadedModelId: String?
     private var loadedDir: String?
 
-    init(server: ServerManager) { self.server = server }
+    init(server: ServerManager) {
+        self.server = server
+    }
 
     func synthesize(text: String, voice sel: NeuralVoice) async -> Data? {
+        api.host = server.api.host
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         // The engine choice picks the MODEL too — Kokoro is its own checkpoint,
@@ -348,7 +351,8 @@ final class VoiceCloneTTS {
                 loadedDir = dir
             }
             guard let json = VoiceCloneTTS.warmBody(model: loadedModelId ?? dir, voice: sel) else { return }
-            var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/audio/speech")!)
+            api.host = server.api.host
+            var req = URLRequest(url: api.serverURL(port: port, path: "/v1/audio/speech"))
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: json)
