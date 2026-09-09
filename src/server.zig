@@ -3128,7 +3128,7 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
     if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
-        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio);
+        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -3772,6 +3772,7 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
 /// The deployed long-context shape at the live per-token widths: 12 caching layers, hd 256,
 /// 2 KV heads (13,056 B/tok at 8-bit); a 128-wide QSA indexer at ratio 4.
 fn qwen4RequestTestConfig() model_mod.ModelConfig {
+    transformer_mod.qsa_score_fused_override = false;
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
@@ -3872,6 +3873,8 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
 test "the clamp bills the context that will be SERVED, not the placeholder" {
     // With a placeholder context the clamp hands back nearly the whole ask.
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
@@ -4059,6 +4062,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     const MiB: u64 = 1 << 20;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
@@ -4199,6 +4204,8 @@ test "the per-token widths the request chooser is built on" {
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
     try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
     try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
@@ -4209,6 +4216,8 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
     // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
@@ -18338,6 +18347,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
     // default sysctl keep the old expression byte for byte.
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
     const total_ram: u64 = 131_072 * mb;
     const working_set: u64 = 120_000 * mb;
@@ -18388,6 +18399,8 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     // Bar: a checked-out restore credits the rows it holds even when the append outgrows the
     // buffer; the grow bills the new capacity plus one eval window of old buffers.
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
     const cfg = qwen4ExpLive364kConfig();
     const kv_bits: u64 = 8;
@@ -20652,10 +20665,29 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
     transformer_mod.qsa_gather_override = true;
     defer transformer_mod.qsa_gather_override = null;
+    const saved_fused = transformer_mod.qsa_score_fused_override;
+    const saved_nax = transformer_mod.vqmm_nax_probe_override;
+    defer {
+        transformer_mod.qsa_score_fused_override = saved_fused;
+        transformer_mod.vqmm_nax_probe_override = saved_nax;
+    }
+    transformer_mod.vqmm_nax_probe_override = false;
+    transformer_mod.qsa_score_fused_override = true;
+    const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expect(gathered_composed > 0);
+    try t.expect(gathered_composed < 4 * 4096 * 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
+    transformer_mod.vqmm_nax_probe_override = null;
+    transformer_mod.qsa_score_fused_override = true;
+    const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
+    if (transformer_mod.qsaScoreFusedActive()) {
+        try t.expect(gathered_fused < gathered_composed);
+    }
+    transformer_mod.qsa_score_fused_override = false;
+    transformer_mod.vqmm_nax_probe_override = false;
     const gathered = qsaMaskBytes(&q4, 4096, 250_000);
-    try t.expect(gathered > 0);
-    try t.expect(gathered < 4 * 4096 * 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4), gathered);
+    try t.expectEqual(gathered_composed, gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);
     const q4_bill = prefillTransientReserve(&q4, 16, 8192);
     try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);
@@ -21694,6 +21726,7 @@ test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag"
 
 /// The qwen4_exp shape of the live #353 report: Qwen3.8-Flash-Next mixed-4-8bit, `--ctx-size 1048576 --kv-quant 8`.
 fn qwen4ExpOomConfig() model_mod.ModelConfig {
+    transformer_mod.qsa_score_fused_override = false;
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
     cfg.num_hidden_layers = 48;
@@ -21810,6 +21843,8 @@ fn oomBillFor(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64, terms: Pr
 
 test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the context" {
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     // A 383,067-token prompt with no `max_tokens` was admitted by eviction and then refused on
     // the inference thread: `clampMaxTokens` made the reservation cover the whole context
     // (~13 GB for a generation that would never run). The reservation exists to stop buffer
@@ -21878,6 +21913,8 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
 test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
     const t = std.testing;
     const cfg = qwen4ExpOomConfig();
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const one = cfg.qsaHistoryBytesPerToken();
     const bank = cfg.qsaScoreBankBytesPerToken();
     try t.expect(one > 0);
@@ -22325,6 +22362,8 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // by name; the restore hands over the entry's buffers without a second copy, so those
     // ~14.5 GB were already inside `mlx_get_active_memory` and `needed` billed them again.
     const cfg = qwen4ExpOomConfig();
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const seq: u64 = 786_707;
     const chunk: u64 = 512; // the width the ladder came down to that evening
     const kv_bits: u64 = 8;
@@ -22444,6 +22483,8 @@ const CheckoutCase = struct {
 
 test "the warm KV credit fires ONLY where the restore checked its entry out" {
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     // `KVCache.restore` binds by refcount and mlx donates only at `use_count() == 1`, so on a
     // shared restore the first `writeAtOffset` copies the whole prefix: the credited bytes are
     // allocated. Only the checkout makes the credit true; it used to fire on `matched > 0` alone.
@@ -22717,6 +22758,8 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     // of the bill was 32 SSM checkpoints; a warm prefill forwards a 3,730-token tail and captures
     // at most one, and the entry's own checkpoints are already resident and merged at commit.
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const per_cp = cfg.ssmCheckpointBytes();
@@ -22789,6 +22832,8 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints
     // the incident's own numbers (Turn A admitted at 16,233 MB; Turn B refused at 13,664 MB).
     const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const kv_bits: u64 = 8;

@@ -98,6 +98,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "ds4_commit", ds4_commit);
     build_options.addOption([]const u8, "llama_tag", llama_tag);
+    const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
+    build_options.addOption([]const u8, "git_sha", git_sha);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -394,6 +396,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
+    ios_options.addOption([]const u8, "git_sha", "");
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),

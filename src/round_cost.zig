@@ -18,6 +18,10 @@
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const log = @import("log.zig");
+const transformer_mod = @import("transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
@@ -166,6 +170,10 @@ pub const Table = struct {
     restored_serial: u32 = 0,
     /// Persisted width cells dropped at load for failing the step bound.
     restored_dropped: u32 = 0,
+    serial_baseline: [N_BUCKETS]f32 = @splat(0),
+    serial_new_folds: [N_BUCKETS]u32 = @splat(0),
+    serial_drop_done: [N_BUCKETS]bool = @splat(false),
+    width_drops: u32 = 0,
 
     /// Folded width cells; never counts the serial row.
     pub fn foldedCells(self: *const Table) u32 {
@@ -281,7 +289,37 @@ pub const Table = struct {
             return .implausible;
         }
         self.serial_folded += 1;
-        return foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
+        const v = foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
+        if (self.serial_baseline[bucket] > 0 and !self.serial_drop_done[bucket]) {
+            self.serial_new_folds[bucket] += 1;
+            if (self.serial_new_folds[bucket] >= MIN_SAMPLES and
+                serialMoved(self.serial_baseline[bucket], self.serial[bucket].ms))
+            {
+                self.dropStaleWidthCells(bucket);
+            }
+        }
+        return v;
+    }
+
+    fn dropStaleWidthCells(self: *Table, moved: usize) void {
+        const old_ms = self.serial_baseline[moved];
+        const new_ms = self.serial[moved].ms;
+        var dropped_any = false;
+        for (0..N_BUCKETS) |b| {
+            if (b != moved and self.serial_new_folds[b] >= MIN_SAMPLES) continue;
+            var w: u32 = 0;
+            while (w <= MAX_WIDTH) : (w += 1) {
+                if (self.cells[w][b].n == 0) continue;
+                self.cells[w][b] = .{};
+                dropped_any = true;
+            }
+            self.serial_drop_done[b] = true;
+            if (self.serial[b].n >= MIN_SAMPLES) self.serial_baseline[b] = self.serial[b].ms;
+            self.serial_new_folds[b] = MIN_SAMPLES;
+        }
+        if (!dropped_any) return;
+        self.width_drops += 1;
+        log.info("[spec-cost] bucket {d} width cells dropped: serial moved {d:.1} -> {d:.1}\n", .{ moved, old_ms, new_ms });
     }
 
     fn selfSpike(cell: Cell, ms: f32, clock: u32) bool {
@@ -734,13 +772,12 @@ pub const WidthChooser = struct {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 //
-// Every fresh boot otherwise pays the exploration again (measured: 3-4% on
-// whichever request carries a trial block, 22-round requests), while the
-// knowledge is per (chip, model, quant, OS build) and does not change
-// between boots. Stored under ~/.mlx-serve/round-cost/<key>.txt, restored
-// at load, written at the end of any request that folded new samples.
-// Stale version or unreadable content is a QUIET miss (the kv_disk_cache
-// discipline). `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
+// Knowledge is per (chip, model, quant, OS build, engine build): the same
+// binary across boots shares a table, a different binary never does.
+// Stored under ~/.mlx-serve/round-cost/<key>.txt, restored at load, written
+// at request end unless a barrier diagnostic is armed. Stale version or
+// unreadable content is a QUIET miss (the kv_disk_cache discipline).
+// `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
 
 /// v2 added the `serial` row; v3 split the top bucket (edges 64k/128k/256k). Bucket indices
 /// are the file's only spelling of "which context", so a stale version is a quiet miss.
@@ -765,11 +802,180 @@ pub fn persistEnabled() bool {
     return !std.mem.eql(u8, std.mem.span(raw), "0");
 }
 
+pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
+    for (raws) |raw| {
+        if (transformer_mod.diagEnvValueOn(raw)) return true;
+    }
+    return false;
+}
+
+fn qwen4ProfileArmed() bool {
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const s = std.mem.span(entry);
+        if (!std.mem.startsWith(u8, s, "QWEN4_PROFILE_")) continue;
+        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+        if (transformer_mod.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
+    }
+    return false;
+}
+
+pub fn persistDiagArmed() bool {
+    return qwen4ProfileArmed() or
+        persistDiagArmedFrom(&.{
+            std.c.getenv("MLX_SERVE_MTP_TRACE"),
+            std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH"),
+        });
+}
+
+pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool {
+    return persist_on and !diag_armed and key_len != 0;
+}
+
+fn serialMoved(old: f32, new: f32) bool {
+    if (!(old > 0)) return false;
+    return @abs(new - old) > old * SWITCH_MARGIN;
+}
+
+var build_id_buf: [64]u8 = undefined;
+var build_id_len: usize = 0;
+var build_id_mu: std.c.pthread_mutex_t = .{};
+
+pub fn engineBuildId() []const u8 {
+    _ = std.c.pthread_mutex_lock(&build_id_mu);
+    defer _ = std.c.pthread_mutex_unlock(&build_id_mu);
+    if (build_id_len != 0) return build_id_buf[0..build_id_len];
+    var h = std.hash.Fnv1a_64.init();
+    if (buildIdReadsExe(build_options.git_sha)) mixExeBytes(&h) else h.update(build_options.git_sha);
+    h.update("\x00");
+    mixMlxArtifacts(&h);
+    const printed = std.fmt.bufPrint(&build_id_buf, "{x:0>16}", .{h.final()}) catch build_id_buf[0..0];
+    build_id_len = printed.len;
+    return printed;
+}
+
+// A release build's sha stands for its bytes (the packager owns that promise); a dev build
+// has no sha and hashes the executable so an edit-and-rebuild never shares a table.
+pub fn buildIdReadsExe(git_sha: []const u8) bool {
+    return git_sha.len == 0;
+}
+
+fn mixExeBytes(h: *std.hash.Fnv1a_64) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = exePath(&path_buf) orelse return;
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const got = std.c.read(fd, &buf, buf.len);
+        if (got < 0) {
+            const e = std.c._errno().*;
+            if (e == @intFromEnum(std.c.E.INTR)) continue;
+            break;
+        }
+        if (got == 0) break;
+        h.update(buf[0..@intCast(got)]);
+    }
+}
+
+fn exePath(buf: []u8) ?[:0]const u8 {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
+            var n: u32 = @intCast(buf.len);
+            if (std.c._NSGetExecutablePath(buf.ptr, &n) != 0) return null;
+            return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
+        },
+        else => return null,
+    }
+}
+
+fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
+    var dylib_buf: [4096]u8 = undefined;
+    const dylib = mlxDylibPath(&dylib_buf) orelse return;
+    mixFileStamp(h, dylib);
+    var metal_buf: [4096]u8 = undefined;
+    const dir = std.fs.path.dirname(dylib) orelse return;
+    const metal = std.fmt.bufPrint(&metal_buf, "{s}/mlx.metallib", .{dir}) catch return;
+    mixFileStamp(h, metal);
+}
+
+fn mlxDylibPath(buf: []u8) ?[]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        const n = std.c._dyld_image_count();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const name = std.mem.span(std.c._dyld_get_image_name(i));
+            if (std.mem.endsWith(u8, name, "libmlx.dylib")) return name;
+        }
+    }
+    var exe_buf: [4096]u8 = undefined;
+    const exe = exePath(&exe_buf) orelse return null;
+    const dir = std.fs.path.dirname(exe) orelse return null;
+    for ([_][]const u8{ "../../lib/mlx/lib/libmlx.dylib", "../../../lib/mlx/lib/libmlx.dylib" }) |rel| {
+        const p = std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, rel }) catch continue;
+        if (fileExists(p)) return p;
+    }
+    return null;
+}
+
+fn fileExists(path: []const u8) bool {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return false;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = std.c.close(fd);
+    return true;
+}
+
+fn mixFileStamp(h: *std.hash.Fnv1a_64, path: []const u8) void {
+    const fp = fileFingerprint(path) orelse return;
+    h.update(std.mem.asBytes(&fp));
+}
+
+// Size plus six sampled 64 KiB windows: a byte-identical reinstall keeps its table (mtime is
+// not identity), a rebuilt dylib or metallib rotates it, and a 182 MB metallib costs 384 KiB.
+pub fn fileFingerprint(path: []const u8) ?u64 {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return null;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    const size: u64 = @intCast(@max(st.size, 0));
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.asBytes(&size));
+    const win: u64 = 65536;
+    var k: u64 = 0;
+    while (k < 6) : (k += 1) {
+        const off: u64 = if (size <= win) 0 else if (k == 5) size - win else (size - win) * k / 5;
+        var buf: [65536]u8 = undefined;
+        var done: usize = 0;
+        while (done < buf.len) {
+            const got = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+            if (got < 0) {
+                if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+                return null;
+            }
+            if (got == 0) break;
+            done += @intCast(got);
+        }
+        h.update(buf[0..done]);
+        if (size <= win) break;
+    }
+    return h.final();
+}
+
 /// Same identity rule as the spec-cost probe's key: every field the cost
 /// depends on, hashed, so one machine's cliff is never served to another.
-pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout) []const u8 {
+pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout, build_id: []const u8) []const u8 {
     var h = std.hash.Fnv1a_64.init();
-    for ([_][]const u8{ chip, model_dir, quant, os_build }) |part| {
+    for ([_][]const u8{ chip, model_dir, quant, os_build, build_id }) |part| {
         h.update(part);
         h.update("\x00");
     }
@@ -831,6 +1037,9 @@ pub fn parse(text: []const u8, layout: Layout) ?Table {
     t.serial_seq = RESEED_GAP + 1;
     t.restored = t.foldedCells();
     t.restored_serial = t.foldedSerialCells();
+    for (t.serial, 0..) |c, b| {
+        if (c.n >= MIN_SAMPLES) t.serial_baseline[b] = c.ms;
+    }
     return t;
 }
 
@@ -886,7 +1095,7 @@ pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, lay
 
 /// Best-effort: a machine that cannot write re-explores next boot.
 pub fn storeCached(io: std.Io, key: []const u8, t: *const Table) void {
-    if (!persistEnabled() or key.len == 0) return;
+    if (!storeShouldWrite(persistEnabled(), persistDiagArmed(), key.len)) return;
     var dir_buf: [512]u8 = undefined;
     const dir = std.fmt.bufPrint(&dir_buf, "{s}/.mlx-serve/round-cost", .{homeDir()}) catch return;
     std.Io.Dir.cwd().createDirPath(io, dir) catch return;
@@ -910,6 +1119,17 @@ const testing = std.testing;
 fn feed(t: *Table, width: u32, kv: u32, ms: f32, tok: f32) void {
     var i: u32 = 0;
     while (i < MIN_SAMPLES) : (i += 1) _ = t.observe(width, kv, ms, tok, true, false);
+}
+
+fn feedSerial(t: *Table, kv: u32, ms: f32) void {
+    var i: u32 = 0;
+    while (i < MIN_SAMPLES) : (i += 1) _ = t.observeSerial(kv, ms, true, false);
+}
+
+fn persistRoundTrip(t: Table) Table {
+    var buf: [2048]u8 = undefined;
+    const text = serialize(&buf, &t) catch unreachable;
+    return parse(text, t.layout) orelse unreachable;
 }
 
 test "round_cost: kv buckets" {
@@ -1164,12 +1384,12 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     try testing.expect(parse("rc3\n99 0 50 4 3\n", .long) == null);
     try testing.expect(parse("", .long) == null);
     var kb: [64]u8 = undefined;
-    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long), "rc3-"));
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long, "x"), "rc3-"));
     var kb2: [64]u8 = undefined;
-    const legacy_key = cacheKey(&kb2, "M4", "/m", "q4g64", "26.4", .legacy);
+    const legacy_key = cacheKey(&kb2, "M4", "/m", "q4g64", "26.4", .legacy, "x");
     try testing.expect(std.mem.startsWith(u8, legacy_key, "rc1-"));
     try testing.expectEqualStrings(
-        cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long)[4..],
+        cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long, "x")[4..],
         legacy_key[4..],
     );
 }
@@ -1447,4 +1667,120 @@ test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft nev
     try testing.expect(!t.clearlyWorse(3, 2, 0));
     _ = t.observe(4, 1000, 56.0, 1.6, true, false);
     try testing.expectApproxEqAbs(56.0 / 3.0, t.rawMsPerTok(4, 0).?, 1e-3);
+}
+
+test "round_cost: a git sha stands for the executable; without one the executable is hashed" {
+    try testing.expect(!buildIdReadsExe("a1b2c3d"));
+    try testing.expect(buildIdReadsExe(""));
+}
+
+test "round_cost: an artifact fingerprint follows the bytes, not the mtime" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bytes: [300_000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    prng.random().bytes(&bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.bin", .data = &bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.bin", .data = &bytes });
+    bytes[150_000] ^= 0x5A;
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.bin", .data = &bytes });
+    var pa: [std.fs.max_path_bytes]u8 = undefined;
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    var pc: [std.fs.max_path_bytes]u8 = undefined;
+    const a = pa[0..try tmp.dir.realPathFile(io, "a.bin", &pa)];
+    const b = pb[0..try tmp.dir.realPathFile(io, "b.bin", &pb)];
+    const c = pc[0..try tmp.dir.realPathFile(io, "c.bin", &pc)];
+    const fa = fileFingerprint(a) orelse return error.NoFingerprint;
+    const fb = fileFingerprint(b) orelse return error.NoFingerprint;
+    const fc = fileFingerprint(c) orelse return error.NoFingerprint;
+    try testing.expectEqual(fa, fb);
+    try testing.expect(fa != fc);
+}
+
+test "round_cost: cacheKey differs for two build ids and matches for the same id" {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    var c: [64]u8 = undefined;
+    const k1 = cacheKey(&a, "M4", "/m", "q4g64", "26.4", .long, "build-a");
+    const k2 = cacheKey(&b, "M4", "/m", "q4g64", "26.4", .long, "build-b");
+    const k3 = cacheKey(&c, "M4", "/m", "q4g64", "26.4", .long, "build-a");
+    try testing.expect(!std.mem.eql(u8, k1, k2));
+    try testing.expectEqualStrings(k1, k3);
+}
+
+test "round_cost: serial-move drop waits for MIN_SAMPLES new folds against the persisted baseline" {
+    var live = Table{ .layout = .long };
+    feed(&live, 1, 1000, 23.2, 1.89);
+    feed(&live, 2, 1000, 30.3, 1.10);
+    feedSerial(&live, 1000, 19.0);
+    var t = persistRoundTrip(live);
+    try testing.expect(t.measuredMs(1, 0) != null);
+    try testing.expect(t.measuredMs(2, 0) != null);
+
+    try testing.expectEqual(Verdict.reseeded, t.observeSerial(1000, 15.2, true, false));
+    try testing.expectEqual(@as(u32, 2), t.measuredCount(0));
+    try testing.expectEqual(@as(u32, 0), t.width_drops);
+
+    feedSerial(&t, 1000, 15.2);
+    try testing.expectEqual(@as(u32, 0), t.measuredCount(0));
+    try testing.expectEqual(@as(u32, 1), t.width_drops);
+    try testing.expect(!t.active(0));
+
+    feed(&t, 1, 1000, 20.0, 1.8);
+    try testing.expect(t.measuredMs(1, 0) != null);
+    feedSerial(&t, 1000, 17.0);
+    try testing.expect(t.measuredMs(1, 0) != null);
+    try testing.expectEqual(@as(u32, 1), t.width_drops);
+
+    var keep_live = Table{ .layout = .long };
+    feed(&keep_live, 1, 1000, 23.2, 1.89);
+    feed(&keep_live, 2, 1000, 30.3, 1.10);
+    feedSerial(&keep_live, 1000, 19.0);
+    var u = persistRoundTrip(keep_live);
+    feedSerial(&u, 1000, 18.5);
+    try testing.expect(u.measuredMs(1, 0) != null);
+    try testing.expect(u.measuredMs(2, 0) != null);
+    try testing.expectEqual(@as(u32, 2), u.measuredCount(0));
+    try testing.expectEqual(@as(u32, 0), u.width_drops);
+}
+
+test "round_cost: a serial-move drop covers buckets whose serial is not re-confirmed" {
+    var live = Table{ .layout = .long };
+    feed(&live, 1, 1000, 23.2, 1.89);
+    feed(&live, 2, 3000, 30.3, 1.10);
+    feedSerial(&live, 1000, 19.0);
+    feedSerial(&live, 3000, 19.0);
+    var t = persistRoundTrip(live);
+    try testing.expect(t.active(0));
+    try testing.expect(t.active(1));
+
+    feedSerial(&t, 1000, 15.2);
+    try testing.expectEqual(@as(u32, 0), t.measuredCount(0));
+    try testing.expectEqual(@as(u32, 0), t.measuredCount(1));
+    try testing.expectEqual(@as(u32, 1), t.width_drops);
+
+    var u_live = Table{ .layout = .long };
+    feed(&u_live, 1, 1000, 23.2, 1.89);
+    feed(&u_live, 2, 3000, 30.3, 1.10);
+    feedSerial(&u_live, 1000, 19.0);
+    feedSerial(&u_live, 3000, 19.0);
+    var u = persistRoundTrip(u_live);
+    feedSerial(&u, 3000, 19.0);
+    feedSerial(&u, 1000, 15.2);
+    try testing.expectEqual(@as(u32, 0), u.measuredCount(0));
+    try testing.expect(u.measuredMs(2, 1) != null);
+    try testing.expectEqual(@as(u32, 1), u.width_drops);
+}
+
+test "round_cost: persist write is a no-op when a diagnostic that adds barriers is armed" {
+    try testing.expect(storeShouldWrite(true, false, 8));
+    try testing.expect(!storeShouldWrite(true, true, 8));
+    try testing.expect(!storeShouldWrite(false, false, 8));
+    try testing.expect(!storeShouldWrite(true, false, 0));
+    try testing.expect(persistDiagArmedFrom(&.{"1", null, null}));
+    try testing.expect(persistDiagArmedFrom(&.{null, null, null}) == false);
+    try testing.expect(persistDiagArmedFrom(&.{"0", "0", "0"}) == false);
+    try testing.expect(persistDiagArmedFrom(&.{null, "1", null}));
+    try testing.expect(persistDiagArmedFrom(&.{null, null, "5"}));
 }

@@ -827,6 +827,7 @@ pub const ModelConfig = struct {
     /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        if (@import("transformer.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);

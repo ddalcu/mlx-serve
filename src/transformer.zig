@@ -3016,19 +3016,23 @@ const QSA_SELECT_KERNEL_HEADER =
     \\
 ;
 
-/// One threadgroup per query row. 1. MSD radix select over the 32-bit ordinal (11/11/10-bit
-/// digits) counting only visible blocks, stopping early when a bin's count is exactly what is
-/// still needed. 2. Compaction: selected iff `ord > T`, or `ord == T` with rank below
-/// `need_eq`; the output slot is the count of selected elements with a smaller index, so the
-/// output is born sorted. 3. Rows with `bounds[row] <= K` are `0 .. bounds-1` then INT_MAX.
-/// Threadgroup memory ~8.3 KiB.
-const QSA_SELECT_KERNEL_SOURCE =
+/// One threadgroup per query row. 1. MSD radix select over the 32-bit ordinal (the DIGITS
+/// template picks 11/11/10-bit digits at prefill widths or four 8-bit digits at decode widths,
+/// where each level's fixed cost, not the walk, is the bill) counting only visible blocks,
+/// stopping early when a bin's count is exactly what is still needed. 2. Compaction: selected
+/// iff `ord > T`, or `ord == T` with rank below `need_eq`; the output slot is the count of
+/// selected elements with a smaller index (a simd prefix scan per chunk), so the output is
+/// born sorted. 3. Rows with `bounds[row] <= K` are `0 .. bounds-1` then INT_MAX.
+/// Threadgroup memory ~8.3 KiB at 2048 bins, ~1.3 KiB at 256.
+const QSA_SELECT_SHARED =
     \\constexpr uint TGN   = (uint)TGS;
     \\constexpr uint SIMDW = 32u;
     \\constexpr uint NSIMD = TGN / SIMDW;
-    \\constexpr uint BINS  = 2048u;
+    \\constexpr uint BINS  = (DIGITS == 8) ? 256u : 2048u;
+    \\constexpr uint NLEV  = (DIGITS == 8) ? 4u : 3u;
     \\constexpr uint KTOP  = (uint)K;
     \\constexpr int  SENTINEL = 2147483647;
+    \\static_assert(NSIMD <= SIMDW);
     \\
     \\threadgroup metal::atomic_uint hist[BINS];
     \\threadgroup uint sgs[2u * NSIMD];
@@ -3039,60 +3043,50 @@ const QSA_SELECT_KERNEL_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg   = simdgroup_index_in_threadgroup;
     \\
-    \\// nb rides the SHAPE, never a template arg: it grows every `ratio`
-    \\// tokens of a generation, and a template value would JIT a fresh
-    \\// specialization per decode step.
-    \\const uint nb = (uint)scores_shape[2];
-    \\const int  vbi = bounds[row];
-    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
-    \\const device float* sc = scores + (ulong)row * (ulong)nb;
-    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
-    \\
-    \\if (vb <= KTOP) {
-    \\  // Fewer visible blocks than the budget: every one of them is a pick.
-    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < vb) ? int(i) : SENTINEL;
-    \\  return;
-    \\}
-    \\
-    \\uint pref = 0u;   // ordinal bits fixed so far, right-aligned
-    \\uint fixed = 0u;  // how many bits that is
-    \\uint need = KTOP; // still to take from within the prefix bucket
+;
+
+// One radix-select body composed into three kernels (single row, row slice, merge) so a
+// fix to the digit walk or the tie rule lands once; the kernels differ only in setup.
+const QSA_SELECT_RADIX_BODY =
+    \\uint pref = 0u;
+    \\uint fixed = 0u;
+    \\uint need = KTOP;
     \\uint T = 0u;
     \\uint need_eq = 0u;
     \\
-    \\for (uint lv = 0u; lv < 3u; ++lv) {
-    \\  const uint width = (lv == 2u) ? 10u : 11u;
+    \\for (uint lv = 0u; lv < NLEV; ++lv) {
+    \\  const uint width = (DIGITS == 8) ? 8u : ((lv == 2u) ? 10u : 11u);
     \\  const uint nbins = 1u << width;
     \\  const uint shift = 32u - fixed - width;
-    \\  // Clamped: at level 0 nothing is fixed and `32u - fixed` would be an
-    \\  // out-of-range shift. The `fixed != 0u` guard below is what actually
-    \\  // skips it; the clamp keeps the expression well-defined regardless.
-    \\  const uint hi    = (fixed == 0u) ? 31u : (32u - fixed);
+    \\  const uint hi_b  = (fixed == 0u) ? 31u : (32u - fixed);
     \\
     \\  for (uint b = tid; b < nbins; b += TGN) metal::atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
     \\  if (tid == 0u) { sh[0] = 0u; sh[1] = 0u; sh[2] = 0u; }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
-    \\  // Run-length coalescing: a relu score row is mostly exact zeros, which
-    \\  // all land in ONE bin. Folding a thread's consecutive equal digits into
-    \\  // a single atomic keeps that bin from serializing the whole pass.
     \\  uint last_d = 0xFFFFFFFFu;
     \\  uint run = 0u;
-    \\  for (uint i = tid; i < vb; i += TGN) {
-    \\    const uint u = msv_qsa_ord(sc[i]);
-    \\    if (fixed != 0u && (u >> hi) != pref) continue;
-    \\    const uint d = (u >> shift) & (nbins - 1u);
-    \\    if (d == last_d) { run += 1u; continue; }
-    \\    if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
-    \\    last_d = d;
-    \\    run = 1u;
+    \\  for (uint base = SEL_LO; base < SEL_HI; base += TGN) {
+    \\    const uint i = base + tid;
+    \\    uint u = 0u;
+    \\    int out_idx = SENTINEL;
+    \\    uint ok = 0u;
+    \\    SEL_LOAD(i, u, out_idx, ok)
+    \\    if (ok != 0u) {
+    \\      if (!(fixed != 0u && (u >> hi_b) != pref)) {
+    \\        const uint d = (u >> shift) & (nbins - 1u);
+    \\        if (d == last_d) { run += 1u; }
+    \\        else {
+    \\          if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
+    \\          last_d = d;
+    \\          run = 1u;
+    \\        }
+    \\      }
+    \\    }
     \\  }
     \\  if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
-    \\  // One simdgroup scans the bins from the TOP down: lane 0 owns the
-    \\  // highest chunk, so the exclusive prefix over lanes IS the count of
-    \\  // elements above that lane's chunk.
     \\  if (sg == 0u) {
     \\    const uint chunk = nbins / SIMDW;
     \\    const uint base  = nbins - (lane + 1u) * chunk;
@@ -3118,9 +3112,6 @@ const QSA_SELECT_KERNEL_SOURCE =
     \\  need = need - above_w;
     \\  pref = (pref << width) | d_sel;
     \\  fixed += width;
-    \\  // `cnt_d == need` means the whole bucket is taken: the threshold can be
-    \\  // the bucket's FLOOR (low bits zero) and `need_eq` covers however many
-    \\  // sit exactly on it — gt + eq is still exactly K either way.
     \\  if (cnt_d == need || fixed >= 32u) {
     \\    T = (fixed >= 32u) ? pref : (pref << (32u - fixed));
     \\    need_eq = need;
@@ -3128,50 +3119,52 @@ const QSA_SELECT_KERNEL_SOURCE =
     \\  }
     \\}
     \\
-    \\// Pre-fill with the sentinel: the compaction is proven to write exactly
-    \\// KTOP slots, and a slot left unwritten must read as "no block" rather
-    \\// than as whatever the allocator handed us.
-    \\for (uint i = tid; i < KTOP; i += TGN) outp[i] = SENTINEL;
+    \\for (uint base = 0u; base < KTOP; base += TGN) {
+    \\  const uint i = base + tid;
+    \\  if (i < KTOP) outp[i] = SENTINEL;
+    \\}
     \\threadgroup_barrier(metal::mem_flags::mem_device);
     \\
     \\uint run_gt = 0u;
     \\uint run_eq = 0u;
-    \\for (uint base = 0u; base < vb; base += TGN) {
+    \\for (uint base = SEL_LO; base < SEL_HI; base += TGN) {
     \\  const uint i = base + tid;
-    \\  uint g = 0u;
+    \\  uint gtf = 0u;
     \\  uint e = 0u;
-    \\  if (i < vb) {
-    \\    const uint u = msv_qsa_ord(sc[i]);
-    \\    g = (u > T) ? 1u : 0u;
+    \\  int out_idx = SENTINEL;
+    \\  uint u = 0u;
+    \\  uint ok = 0u;
+    \\  SEL_LOAD(i, u, out_idx, ok)
+    \\  if (ok != 0u) {
+    \\    gtf = (u > T) ? 1u : 0u;
     \\    e = (u == T) ? 1u : 0u;
     \\  }
-    \\  const uint pg = metal::simd_prefix_exclusive_sum(g);
+    \\  const uint pg = metal::simd_prefix_exclusive_sum(gtf);
     \\  const uint pe = metal::simd_prefix_exclusive_sum(e);
-    \\  const uint sg_g = metal::simd_sum(g);
+    \\  const uint sg_g = metal::simd_sum(gtf);
     \\  const uint sg_e = metal::simd_sum(e);
     \\  if (lane == 0u) { sgs[sg] = sg_g; sgs[NSIMD + sg] = sg_e; }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  uint off_g = 0u, off_e = 0u, tot_g = 0u, tot_e = 0u;
-    \\  for (uint j = 0u; j < NSIMD; ++j) {
-    \\    const uint a = sgs[j];
-    \\    const uint b = sgs[NSIMD + j];
-    \\    if (j < sg) { off_g += a; off_e += b; }
-    \\    tot_g += a;
-    \\    tot_e += b;
+    \\  {
+    \\    const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
+    \\    const uint b = (lane < NSIMD) ? sgs[NSIMD + lane] : 0u;
+    \\    const uint pa = metal::simd_prefix_exclusive_sum(a);
+    \\    const uint pb = metal::simd_prefix_exclusive_sum(b);
+    \\    off_g = metal::simd_shuffle(pa, sg);
+    \\    off_e = metal::simd_shuffle(pb, sg);
+    \\    tot_g = metal::simd_sum(a);
+    \\    tot_e = metal::simd_sum(b);
     \\  }
     \\  const uint gb = run_gt + off_g + pg;
     \\  const uint eb = run_eq + off_e + pe;
-    \\  if (i < vb) {
-    \\    // Slot = the number of SELECTED elements with a smaller index, so
-    \\    // the row is written already ascending. `gt + min(eq, need_eq)` is
-    \\    // exactly KTOP by construction; the bound is belt-and-braces so a
-    \\    // miscount can never scribble into the next row.
-    \\    if (g != 0u) {
+    \\  if (ok != 0u) {
+    \\    if (gtf != 0u) {
     \\      const uint pos = gb + metal::min(eb, need_eq);
-    \\      if (pos < KTOP) outp[pos] = int(i);
+    \\      if (pos < KTOP) outp[pos] = out_idx;
     \\    } else if (e != 0u && eb < need_eq) {
     \\      const uint pos = gb + eb;
-    \\      if (pos < KTOP) outp[pos] = int(i);
+    \\      if (pos < KTOP) outp[pos] = out_idx;
     \\    }
     \\  }
     \\  run_gt += tot_g;
@@ -3181,6 +3174,108 @@ const QSA_SELECT_KERNEL_SOURCE =
     \\}
 ;
 
+const QSA_SELECT_SINGLE_SETUP =
+    \\const uint nb = (uint)scores_shape[2];
+    \\const int  vbi = bounds[row];
+    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
+    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
+    \\if (vb <= KTOP) {
+    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < vb) ? int(i) : SENTINEL;
+    \\  return;
+    \\}
+    \\#define SEL_LO 0u
+    \\#define SEL_HI vb
+    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = int(i); u = msv_qsa_ord(sc[i]); ok = 1u; } }
+    \\
+;
+
+const QSA_SELECT_SLICE_SETUP =
+    \\const uint g    = threadgroup_position_in_grid.x;
+    \\const uint G    = threadgroups_per_grid.x;
+    \\const uint nb = (uint)scores_shape[2];
+    \\const int  vbi = bounds[row];
+    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
+    \\const uint lo  = (uint)(((ulong)g * (ulong)vb) / (ulong)G);
+    \\const uint hi  = (uint)(((ulong)(g + 1u) * (ulong)vb) / (ulong)G);
+    \\const uint nsl = hi - lo;
+    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\device int* outp = ids + (((ulong)row * (ulong)G) + (ulong)g) * (ulong)KTOP;
+    \\if (nsl <= KTOP) {
+    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < nsl) ? int(lo + i) : SENTINEL;
+    \\  return;
+    \\}
+    \\#define SEL_LO lo
+    \\#define SEL_HI hi
+    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = int(i); u = msv_qsa_ord(sc[i]); ok = 1u; } }
+    \\
+;
+
+// Candidates arrive ascending by ORIGINAL index with SENTINEL slots skipped, never sorted
+// in; that is what resolves a cross-slice tie at the K-th ordinal to the lowest index. Every
+// simd reduction below runs in a uniform base-stepped loop: a divergent simd_sum is undefined.
+const QSA_SELECT_MERGE_SETUP =
+    \\const uint nb = (uint)scores_shape[2];
+    \\const uint nc = (uint)local_ids_shape[2];
+    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\const device int* loc = local_ids + (ulong)row * (ulong)nc;
+    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
+    \\
+    \\uint nvalid = 0u;
+    \\for (uint base = 0u; base < nc; base += TGN) {
+    \\  const uint i = base + tid;
+    \\  uint v = 0u;
+    \\  if (i < nc) v = (loc[i] != SENTINEL) ? 1u : 0u;
+    \\  nvalid += metal::simd_sum(v);
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (lane == 0u) sgs[sg] = nvalid;
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\{
+    \\  const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
+    \\  nvalid = metal::simd_sum(a);
+    \\}
+    \\
+    \\if (nvalid <= KTOP) {
+    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = SENTINEL;
+    \\  threadgroup_barrier(metal::mem_flags::mem_device);
+    \\  uint run = 0u;
+    \\  for (uint base = 0u; base < nc; base += TGN) {
+    \\    const uint i = base + tid;
+    \\    uint gtf = 0u;
+    \\    int idx = SENTINEL;
+    \\    if (i < nc) {
+    \\      idx = loc[i];
+    \\      gtf = (idx != SENTINEL) ? 1u : 0u;
+    \\    }
+    \\    const uint pg = metal::simd_prefix_exclusive_sum(gtf);
+    \\    const uint sg_g = metal::simd_sum(gtf);
+    \\    if (lane == 0u) sgs[sg] = sg_g;
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    uint off_g = 0u, tot_g = 0u;
+    \\    {
+    \\      const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
+    \\      const uint pa = metal::simd_prefix_exclusive_sum(a);
+    \\      off_g = metal::simd_shuffle(pa, sg);
+    \\      tot_g = metal::simd_sum(a);
+    \\    }
+    \\    const uint pos = run + off_g + pg;
+    \\    if (gtf != 0u && pos < KTOP) outp[pos] = idx;
+    \\    run += tot_g;
+    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  }
+    \\  return;
+    \\}
+    \\#define SEL_LO 0u
+    \\#define SEL_HI nc
+    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = loc[i]; if (out_idx != SENTINEL) { u = msv_qsa_ord(sc[out_idx]); ok = 1u; } } }
+    \\
+;
+
+const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_RADIX_BODY });
+const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });
+const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_MERGE_SETUP, QSA_SELECT_RADIX_BODY });
+
 /// Threads per row-threadgroup. `MLX_SERVE_QSA_SELECT_TG=256|512|1024` is the A/B. Read once.
 const QSA_SELECT_TG_DEFAULT: c_int = 1024;
 pub var qsa_select_tg_override: ?c_int = null;
@@ -3189,13 +3284,24 @@ var qsa_select_tg_cached: ?c_int = null;
 fn qsaSelectTg() c_int {
     if (qsa_select_tg_override) |v| return v;
     if (qsa_select_tg_cached) |v| return v;
-    var v: c_int = QSA_SELECT_TG_DEFAULT;
+    var v: c_int = 0;
     if (std.c.getenv("MLX_SERVE_QSA_SELECT_TG")) |raw| {
         const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
         if (parsed == 256 or parsed == 512 or parsed == 1024) v = parsed;
     }
     qsa_select_tg_cached = v;
     return v;
+}
+
+// A row's threadgroup is a per-shape choice: the wide passes of a prefill chunk run more
+// rows concurrently at 256 threads, a narrow pass wants 512, and the decode widths keep
+// 1024 (the split kernels size their own slices). Outputs are identical at every width.
+pub fn qsaSelectTgFor(rows: c_int) c_int {
+    const forced = qsaSelectTg();
+    if (forced != 0) return forced;
+    if (rows >= 256) return 256;
+    if (rows >= 64) return 512;
+    return QSA_SELECT_TG_DEFAULT;
 }
 
 var qsa_select_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -3224,7 +3330,7 @@ fn getQsaSelectKernel() !mlx.mlx_fast_metal_kernel {
 
 /// Keyed on what the config reads: output `[1, rows, kb]`, grid `(tg, rows, 1)`, templates
 /// TGS and K. `nb` is a runtime shape (it advances every `ratio` decode tokens).
-const QsaSelectCfgKey = struct { rows: c_int, k: c_int, tg: c_int };
+const QsaSelectCfgKey = struct { rows: c_int, k: c_int, tg: c_int, digits: c_int };
 var qsa_select_cfgs = QsaCfgCache(QsaSelectCfgKey, 1){};
 pub fn qsaSelectCfgBuilds() usize {
     return qsa_select_cfgs.builds;
@@ -3283,9 +3389,18 @@ pub fn qsaSelectTopBlocks(
     if (rows <= 0 or nb <= 0 or bsh[0] != rows) return null;
     if (kb <= 0 or kb > nb) return null;
 
+    qsa_select_used_split = false;
+    if (qsaSelectSplitEnabled() and qsaSelectSplitServes(rows, nb, kb)) {
+        if (try qsaSelectTopBlocksSplit(s, scores, bounds, kb, rows, nb)) |picks| {
+            qsa_select_used_split = true;
+            return picks;
+        }
+    }
+
     const kernel = getQsaSelectKernel() catch return null;
-    const tg = qsaSelectTg();
-    const key = QsaSelectCfgKey{ .rows = rows, .k = kb, .tg = tg };
+    const tg = qsaSelectTgFor(rows);
+    const digits = qsaSelectDigitBits(rows);
+    const key = QsaSelectCfgKey{ .rows = rows, .k = kb, .tg = tg, .digits = digits };
     const sel_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_select_cfgs.get(key) orelse blk: {
         const config = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
@@ -3295,6 +3410,7 @@ pub fn qsaSelectTopBlocks(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TGS", tg));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K", kb));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DIGITS", digits));
         qsa_select_cfgs.put(key, .{config});
         break :blk .{config};
     };
@@ -3315,6 +3431,711 @@ pub fn qsaSelectTopBlocks(
         );
     }
     return out;
+}
+
+// One threadgroup per row is latency-bound at decode widths (0.72 ms at 215k blocks; ~20x
+// under the bandwidth floor), so rows split over G slices, each running the exact select,
+// and a second dispatch selects over the G*K candidates. Exact because the order is total
+// (ordinal, then lowest original index): every global top-K element is in its slice's
+// top-K. The floor is the crossover of the marginal in-graph cost (probe: the split pair
+// beats the single kernel from ~24k blocks once the compaction scan and 8-bit digits landed;
+// live, +4% at 40k blocks and +18% serial at 200k); 2*G*K <= nb (16k blocks at G=16) keeps
+// the candidate list smaller than the row it replaces and is the design's hard minimum.
+pub const QSA_SELECT_SPLIT_MIN_NB: c_int = 24576;
+pub const QSA_SELECT_SPLIT_MAX_ROWS: c_int = 15;
+pub const QSA_SELECT_SPLIT_G: c_int = 16;
+
+pub var qsa_select_digits_override: ?c_int = null;
+
+pub fn qsaSelectDigitBits(rows: c_int) c_int {
+    if (qsa_select_digits_override) |v| return v;
+    if (rows <= QSA_SELECT_SPLIT_MAX_ROWS) return 8;
+    return 11;
+}
+
+pub var qsa_select_split_override: ?bool = null;
+var qsa_select_split_env: ?bool = null;
+pub var qsa_select_used_split: bool = false;
+
+pub fn qsaSelectSplitEnabled() bool {
+    if (qsa_select_split_override) |v| return v;
+    if (qsa_select_split_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_SELECT_SPLIT") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_select_split_env = v;
+    return v;
+}
+
+pub fn qsaSelectSplitServes(rows: c_int, nb: c_int, kb: c_int) bool {
+    if (rows < 1 or rows > QSA_SELECT_SPLIT_MAX_ROWS) return false;
+    if (nb < QSA_SELECT_SPLIT_MIN_NB) return false;
+    if (kb <= 0 or kb > nb) return false;
+    const span = std.math.mul(c_int, kb, QSA_SELECT_SPLIT_G) catch return false;
+    const twice = std.math.mul(c_int, span, 2) catch return false;
+    return twice <= nb;
+}
+
+var qsa_select_split_local_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_select_split_merge_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getQsaSelectSplitLocalKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_select_split_local_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "scores", "bounds" };
+    const output_names = [_][*:0]const u8{"ids"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_select_split_local",
+        in_vec,
+        out_vec,
+        QSA_SELECT_SPLIT_LOCAL_SOURCE,
+        QSA_SELECT_KERNEL_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_select_split_local_kernel_cached = kernel;
+    return kernel;
+}
+
+fn getQsaSelectSplitMergeKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_select_split_merge_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "scores", "local_ids" };
+    const output_names = [_][*:0]const u8{"ids"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_select_split_merge",
+        in_vec,
+        out_vec,
+        QSA_SELECT_SPLIT_MERGE_SOURCE,
+        QSA_SELECT_KERNEL_HEADER,
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_select_split_merge_kernel_cached = kernel;
+    return kernel;
+}
+
+const QsaSelectSplitCfgKey = struct { rows: c_int, k: c_int, slice_tg: c_int, merge_tg: c_int, digits: c_int };
+var qsa_select_split_cfgs = QsaCfgCache(QsaSelectSplitCfgKey, 2){};
+pub fn qsaSelectSplitCfgBuilds() usize {
+    return qsa_select_split_cfgs.builds;
+}
+var qsa_select_split_engaged_bits: OneShotBits = .{};
+
+fn qsaSelectTopBlocksSplit(
+    s: mlx.mlx_stream,
+    scores: mlx.mlx_array,
+    bounds: mlx.mlx_array,
+    kb: c_int,
+    rows: c_int,
+    nb: c_int,
+) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const g = QSA_SELECT_SPLIT_G;
+    const loc_count = std.math.mul(c_int, kb, g) catch return null;
+    const local_kernel = getQsaSelectSplitLocalKernel() catch return null;
+    const merge_kernel = getQsaSelectSplitMergeKernel() catch return null;
+    const forced = qsaSelectTg();
+    const slice_tg: c_int = if (forced != 0) forced else 512;
+    const merge_tg: c_int = if (forced != 0) forced else QSA_SELECT_TG_DEFAULT;
+    const digits = qsaSelectDigitBits(rows);
+    const key = QsaSelectSplitCfgKey{ .rows = rows, .k = kb, .slice_tg = slice_tg, .merge_tg = merge_tg, .digits = digits };
+    const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qsa_select_split_cfgs.get(key) orelse blk: {
+        const local_cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(local_cfg);
+        const local_shape = [_]c_int{ 1, rows, loc_count };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(local_cfg, &local_shape, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(local_cfg, slice_tg * g, rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(local_cfg, slice_tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(local_cfg, "TGS", slice_tg));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(local_cfg, "K", kb));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(local_cfg, "DIGITS", digits));
+        const merge_cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(merge_cfg);
+        const o_shape = [_]c_int{ 1, rows, kb };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(merge_cfg, &o_shape, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(merge_cfg, merge_tg, rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(merge_cfg, merge_tg, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "TGS", merge_tg));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "K", kb));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge_cfg, "DIGITS", digits));
+        qsa_select_split_cfgs.put(key, .{ local_cfg, merge_cfg });
+        break :blk .{ local_cfg, merge_cfg };
+    };
+
+    const local_in = [_]mlx.mlx_array{ scores, bounds };
+    const local_in_vec = mlx.mlx_vector_array_new_data(&local_in, local_in.len);
+    defer _ = mlx.mlx_vector_array_free(local_in_vec);
+    var local_out_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(local_out_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&local_out_vec, local_kernel, local_in_vec, cfgs[0], s));
+    if (mlx.mlx_vector_array_size(local_out_vec) != 1) return error.MetalKernelBadOutputCount;
+    var local_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(local_ids);
+    try mlx.check(mlx.mlx_vector_array_get(&local_ids, local_out_vec, 0));
+
+    const merge_in = [_]mlx.mlx_array{ scores, local_ids };
+    const merge_in_vec = mlx.mlx_vector_array_new_data(&merge_in, merge_in.len);
+    defer _ = mlx.mlx_vector_array_free(merge_in_vec);
+    var merge_out_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(merge_out_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&merge_out_vec, merge_kernel, merge_in_vec, cfgs[1], s));
+    if (mlx.mlx_vector_array_size(merge_out_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, merge_out_vec, 0));
+    if (qsa_select_split_engaged_bits.take(qsaWidthBucket(rows))) {
+        log.info(
+            "[qsa-select] engaged (split G={d} S={d} nb={d} k={d} tg={d}) — MLX_SERVE_QSA_SELECT_SPLIT=0 restores the single-threadgroup kernel\n",
+            .{ g, rows, nb, kb, slice_tg },
+        );
+    }
+    return out;
+}
+
+pub const QsaScoreLayout = enum(u8) { base = 0, h4 = 1 };
+
+pub var qsa_score_fused_override: ?bool = null;
+var qsa_score_fused_env: ?bool = null;
+pub var qsa_score_layout_override: ?QsaScoreLayout = null;
+pub var qsa_score_tf32_override: ?bool = null;
+var qsa_score_tf32_env: ?bool = null;
+var qsa_score_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_score_kernel_builds: usize = 0;
+pub var qsa_dump_blocks_path_override: ?[]const u8 = null;
+var qsa_dump_blocks_cached: ?[]const u8 = null;
+var qsa_dump_blocks_read: bool = false;
+
+pub fn qsaScoreKernelBuilt() bool {
+    return qsa_score_kernel_cached != null;
+}
+
+pub fn qsaScoreKernelBuilds() usize {
+    return qsa_score_kernel_builds;
+}
+
+pub fn qsaScoreFusedEnabled() bool {
+    if (qsa_score_fused_override) |v| return v;
+    if (qsa_score_fused_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_FUSED") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_score_fused_env = v;
+    return v;
+}
+
+pub fn qsaScoreFusedActive() bool {
+    if (!qsaScoreFusedEnabled()) return false;
+    if (!verifyQmmNaxAvailable()) return false;
+    if (!qsaScoreTf32Enabled()) return false;
+    return qsaScoreFusedProbeOk();
+}
+
+var qsa_score_probe_state: std.atomic.Value(u8) = .init(0);
+
+fn qsaScoreFusedProbeOk() bool {
+    return qsa_score_probe_state.load(.acquire) == 2;
+}
+
+pub fn qsaScoreFusedArm() void {
+    if (qsa_score_probe_state.load(.acquire) != 0) return;
+    if (!qsaScoreFusedEnabled() or !verifyQmmNaxAvailable() or !qsaScoreTf32Enabled()) return;
+    const ok = qsaScoreFusedRunProbe();
+    qsa_score_probe_state.store(if (ok) 2 else 1, .release);
+}
+
+pub fn qsaScoreFusedActiveFor(batch: c_int, n_idx: c_int, idx_hd: c_int) bool {
+    return qsaScoreFusedActive() and batch == 1 and n_idx == 4 and idx_hd == 128;
+}
+
+fn qsaScoreTf32ValueOn(raw: []const u8) bool {
+    var i: usize = 0;
+    while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+    if (i >= raw.len) return false;
+    var sign: i32 = 1;
+    if (raw[i] == '-') {
+        sign = -1;
+        i += 1;
+    } else if (raw[i] == '+') {
+        i += 1;
+    }
+    var val: i64 = 0;
+    var any = false;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c < '0' or c > '9') break;
+        any = true;
+        val = val * 10 + @as(i64, c - '0');
+    }
+    if (!any) return false;
+    return (if (sign < 0) -val else val) != 0;
+}
+
+fn qsaScoreTf32Enabled() bool {
+    if (qsa_score_tf32_override) |v| return v;
+    if (qsa_score_tf32_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_ENABLE_TF32") orelse break :blk true;
+        break :blk qsaScoreTf32ValueOn(std.mem.sliceTo(raw, 0));
+    };
+    qsa_score_tf32_env = v;
+    return v;
+}
+
+pub fn qsaScoreFusedEligible(batch: c_int, n_idx: c_int, idx_hd: c_int, q_dt: mlx.mlx_dtype, pooled_dt: mlx.mlx_dtype) bool {
+    return qsaScoreFusedActiveFor(batch, n_idx, idx_hd) and
+        q_dt == .bfloat16 and pooled_dt == .bfloat16;
+}
+
+fn qsaScoreFusedEligibleFrom(q: mlx.mlx_array, pooled: mlx.mlx_array) bool {
+    if (q.ctx == null or pooled.ctx == null) return false;
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(pooled) != 3) return false;
+    const qs = mlx.getShape(q);
+    const ps = mlx.getShape(pooled);
+    if (qs[2] <= 0 or ps[1] <= 0) return false;
+    if (qs[3] != ps[2]) return false;
+    return qsaScoreFusedEligible(qs[0], qs[1], qs[3], mlx.mlx_array_dtype(q), mlx.mlx_array_dtype(pooled));
+}
+
+fn qsaPooledRowContiguous(pooled: mlx.mlx_array) bool {
+    if (mlx.mlx_array_ndim(pooled) != 3) return false;
+    const ps = mlx.getShape(pooled);
+    if (ps[0] != 1 or ps[2] != 128) return false;
+    const st = mlx.mlx_array_strides(pooled);
+    return st[2] == 1 and st[1] == 128;
+}
+
+fn qsaScoreLayoutFor(rows: c_int) QsaScoreLayout {
+    if (qsa_score_layout_override) |v| return v;
+    return if (rows >= 128) .h4 else .base;
+}
+
+fn qsaScoreNsg(layout: QsaScoreLayout) c_int {
+    return if (layout == .h4) 8 else 4;
+}
+
+fn qsaScoreRowsPerTg(layout: QsaScoreLayout, nsg: c_int) c_int {
+    return nsg * (if (layout == .h4) @as(c_int, 16) else 4);
+}
+
+fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
+    const slabs_per: u32 = if (layout == .h4) 32 else 1;
+    var nsh: u32 = @max(@as(u32, 1), nslab / slabs_per);
+    const min_nsh: u32 = @max(@as(u32, 1), (256 + ngrp - 1) / ngrp);
+    if (nsh < min_nsh) nsh = min_nsh;
+    if (nsh > nslab) nsh = nslab;
+    return nsh;
+}
+
+const QSA_SCORE_KERNEL_HEADER =
+    \\#include <metal_stdlib>
+    \\#include <metal_simdgroup>
+    \\#include <metal_simdgroup_matrix>
+    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+    \\using namespace metal;
+    \\
+;
+
+// The lane -> (row, col) map (`fm`/`fn`) is the matmul2d cooperative-fragment layout,
+// hand-derived from the SDK; every A, B and C fragment must use it. K stays 8 ascending
+// 16-deep `op.run` calls: that is the stock tf32 GEMM's order and the bit-identity contract.
+const QSA_SCORE_KERNEL_SOURCE =
+    \\constexpr uint NSG = (uint)NSGVAL;
+    \\constexpr uint TGN = NSG * 32u;
+    \\static_assert(4096u % TGN == 0);
+    \\constexpr uint USEH4 = (uint)USEH4VAL;
+    \\constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+    \\    16, 32, 16, false, false, true,
+    \\    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    \\threadgroup bfloat tile[128*32];
+    \\const uint nb   = (uint)POOL_shape[1];
+    \\const uint rows = (uint)Q_shape[2];
+    \\const uint tid  = thread_position_in_threadgroup.x;
+    \\const uint sg   = tid / 32u;
+    \\const uint lane = tid % 32u;
+    \\const uint rg   = threadgroup_position_in_grid.y;
+    \\const uint gsh  = threadgroup_position_in_grid.x;
+    \\const uint NSH  = (uint)threadgroups_per_grid.x;
+    \\const short qid = lane >> 2;
+    \\const short fm  = ((qid & 4) | ((lane >> 1) & 3));
+    \\const short fn  = ((qid & 2) | (lane & 1)) * 4;
+    \\const uint nslab = (nb + 31u) / 32u;
+    \\auto ct_a = op.get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+    \\auto ct_b = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+    \\auto ct_c = op.get_destination_cooperative_tensor<
+    \\    metal::remove_addrspace_t<decltype(ct_a)>,
+    \\    metal::remove_addrspace_t<decltype(ct_b)>, float>();
+    \\if (USEH4 != 0u) {
+    \\  const uint qrow0 = rg * (NSG*16u) + sg * 16u;
+    \\  bfloat A[4][8][8];
+    \\  #pragma unroll
+    \\  for (short h = 0; h < 4; h++) {
+    \\    #pragma unroll
+    \\    for (short ks = 0; ks < 8; ks++) {
+    \\      #pragma unroll
+    \\      for (short i = 0; i < 2; i++) {
+    \\        #pragma unroll
+    \\        for (short j = 0; j < 4; j++) {
+    \\          const uint qr = qrow0 + (uint)(fm + i*8), c = (uint)ks*16u + (uint)(fn + j);
+    \\          A[h][ks][i*4+j] = (qr < rows) ? Q[((ulong)h*(ulong)rows + qr)*128ul + c] : (bfloat)0;
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  float acc[16];
+    \\  for (uint sl = gsh; sl < nslab; sl += NSH) {
+    \\    const uint n0 = sl * 32u;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma unroll
+    \\    for (uint i = 0; i < 4096u/TGN; i++) {
+    \\      const uint idx = tid + i*TGN;
+    \\      const uint n = idx / 128u, k = idx % 128u;
+    \\      tile[k*32u + n] = ((n0 + n) < nb) ? POOL[(ulong)(n0 + n)*128ul + k] : (bfloat)0;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma unroll
+    \\    for (short e = 0; e < 16; e++) acc[e] = 0.0f;
+    \\    #pragma unroll
+    \\    for (short h = 0; h < 4; h++) {
+    \\      #pragma unroll
+    \\      for (short e = 0; e < 16; e++) ct_c[e] = 0.0f;
+    \\      #pragma unroll
+    \\      for (short ks = 0; ks < 8; ks++) {
+    \\        #pragma unroll
+    \\        for (short i = 0; i < 8; i++) ct_a[i] = A[h][ks][i];
+    \\        #pragma unroll
+    \\        for (short i = 0; i < 2; i++) {
+    \\          #pragma unroll
+    \\          for (short j = 0; j < 4; j++) {
+    \\            const uint kk = (uint)ks*16u + (uint)(fm + i*8);
+    \\            ct_b[i*4+j]     = tile[kk*32u + (uint)(fn + j)];
+    \\            ct_b[8 + i*4+j] = tile[kk*32u + (uint)(fn + j + 16)];
+    \\          }
+    \\        }
+    \\        op.run(ct_a, ct_b, ct_c);
+    \\      }
+    \\      #pragma unroll
+    \\      // heads accumulate ascending in f32: mlx_sum_axis reduces a length-4 axis sequentially
+    \\      for (short e = 0; e < 16; e++) acc[e] += metal::max(ct_c[e], 0.0f);
+    \\    }
+    \\    #pragma unroll
+    \\    for (short i = 0; i < 2; i++) {
+    \\      #pragma unroll
+    \\      for (short j = 0; j < 4; j++) {
+    \\        const uint qr = qrow0 + (uint)(fm + i*8);
+    \\        const uint c0 = n0 + (uint)(fn + j), c1 = c0 + 16u;
+    \\        if (qr < rows) {
+    \\          if (c0 < nb) OUT[(ulong)qr*(ulong)nb + c0] = acc[i*4+j];
+    \\          if (c1 < nb) OUT[(ulong)qr*(ulong)nb + c1] = acc[8 + i*4+j];
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\} else {
+    \\  const uint arow0 = rg * (NSG*16u) + sg * 16u;
+    \\  const uint qrow0 = arow0 / 4u;
+    \\  bfloat a0[8],a1[8],a2[8],a3[8],a4[8],a5[8],a6[8],a7[8];
+    \\  #define LOADA(KS, DST) { _Pragma("unroll") for (short i = 0; i < 2; i++) { _Pragma("unroll") for (short j = 0; j < 4; j++) { const uint ar = arow0 + fm + i*8, c = (KS)*16u + fn + j; const uint qr = ar >> 2, hh = ar & 3u; DST[i*4+j] = (qr < rows) ? Q[((ulong)hh*(ulong)rows + qr)*128ul + c] : (bfloat)0; } } }
+    \\  LOADA(0u,a0) LOADA(1u,a1) LOADA(2u,a2) LOADA(3u,a3)
+    \\  LOADA(4u,a4) LOADA(5u,a5) LOADA(6u,a6) LOADA(7u,a7)
+    \\  for (uint sl = gsh; sl < nslab; sl += NSH) {
+    \\    const uint n0 = sl * 32u;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma unroll
+    \\    for (uint i = 0; i < 4096u/TGN; i++) {
+    \\      const uint idx = tid + i*TGN;
+    \\      const uint n = idx / 128u, k = idx % 128u;
+    \\      tile[k*32u + n] = ((n0 + n) < nb) ? POOL[(ulong)(n0 + n)*128ul + k] : (bfloat)0;
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma unroll
+    \\    for (short i = 0; i < 16; i++) ct_c[i] = 0.0f;
+    \\    #define STEP(KS, SRCA) { _Pragma("unroll") for (short i = 0; i < 8; i++) ct_a[i] = SRCA[i]; _Pragma("unroll") for (short i = 0; i < 2; i++) { _Pragma("unroll") for (short j = 0; j < 4; j++) { const uint kk = (KS)*16u + fm + i*8; ct_b[i*4+j] = tile[kk*32u + (fn + j)]; ct_b[8 + i*4+j] = tile[kk*32u + (fn + j + 16)]; } } op.run(ct_a, ct_b, ct_c); }
+    \\    STEP(0u,a0) STEP(1u,a1) STEP(2u,a2) STEP(3u,a3) STEP(4u,a4) STEP(5u,a5) STEP(6u,a6) STEP(7u,a7)
+    \\    float sv[16];
+    \\    #pragma unroll
+    \\    for (short e = 0; e < 16; e++) {
+    \\      float v = metal::max(ct_c[e], 0.0f);
+    \\      // lanes l^2, l^4, l^6 hold heads 1..3; the sum stays ascending, matching mlx_sum_axis
+    \\      v += metal::max(simd_shuffle_xor(ct_c[e], 2u), 0.0f);
+    \\      v += metal::max(simd_shuffle_xor(ct_c[e], 4u), 0.0f);
+    \\      v += metal::max(simd_shuffle_xor(ct_c[e], 6u), 0.0f);
+    \\      sv[e] = v;
+    \\    }
+    \\    if ((fm & 3) == 0) {
+    \\      #pragma unroll
+    \\      for (short i = 0; i < 2; i++) {
+    \\        #pragma unroll
+    \\        for (short j = 0; j < 4; j++) {
+    \\          const uint qr = qrow0 + (uint)(fm + i*8) / 4u;
+    \\          const uint c0 = n0 + fn + j, c1 = c0 + 16u;
+    \\          if (qr < rows) {
+    \\            if (c0 < nb) OUT[(ulong)qr*(ulong)nb + c0] = sv[i*4+j];
+    \\            if (c1 < nb) OUT[(ulong)qr*(ulong)nb + c1] = sv[8 + i*4+j];
+    \\          }
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\}
+    \\
+;
+
+const QsaScoreCfgKey = struct { nsg: c_int, rows: c_int, nb: c_int, layout: u8 };
+var qsa_score_cfgs = QsaCfgCache(QsaScoreCfgKey, 1){};
+var qsa_score_engaged_bits: OneShotBits = .{};
+
+fn getQsaScoreKernel() !mlx.mlx_fast_metal_kernel {
+    if (!verifyQmmNaxAvailable()) return error.NaxUnavailable;
+    if (qsa_score_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "Q", "POOL" };
+    const output_names = [_][*:0]const u8{"OUT"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_qsa_score",
+        in_vec,
+        out_vec,
+        QSA_SCORE_KERNEL_SOURCE,
+        QSA_SCORE_KERNEL_HEADER,
+        // row-contiguous is load-bearing: q is an axis-2 slice whose parent head stride is
+        // S*128; the copy is what makes Q_shape[2] the physical row stride the kernel indexes by
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_score_kernel_cached = kernel;
+    qsa_score_kernel_builds += 1;
+    return kernel;
+}
+
+pub fn qsaScoreSheetComposed(s: mlx.mlx_stream, q: mlx.mlx_array, k32t: mlx.mlx_array) !mlx.mlx_array {
+    if (k32t.ctx == null) return error.QsaScoreBankMissing;
+    var q32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q32);
+    try mlx.check(mlx.mlx_astype(&q32, q, .float32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_matmul(&sc, q32, k32t, s));
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var relu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(relu);
+    try mlx.check(mlx.mlx_maximum(&relu, sc, zero, s));
+    var scores = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, s));
+    return scores;
+}
+
+pub fn qsaScoreK32tFromPooled(s: mlx.mlx_stream, pooled: mlx.mlx_array) !mlx.mlx_array {
+    const ps = mlx.getShape(pooled);
+    var k4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k4);
+    try mlx.check(mlx.mlx_reshape(&k4, pooled, &[_]c_int{ ps[0], 1, ps[1], ps[2] }, 4, s));
+    const perm = [_]c_int{ 0, 1, 3, 2 };
+    var kt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kt);
+    try mlx.check(mlx.mlx_transpose_axes(&kt, k4, &perm, 4, s));
+    var k32 = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&k32, kt, .float32, s));
+    return k32;
+}
+
+fn qsaScoreFusedFillConfig(config: mlx.mlx_fast_metal_kernel_config, rows: c_int, nb: c_int, nsg: c_int, ngrp: c_int, nsh: c_int, layout: QsaScoreLayout) !void {
+    const o_shape = [_]c_int{ 1, rows, nb };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nsh * nsg * 32, ngrp, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, nsg * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSGVAL", nsg));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "USEH4VAL", if (layout == .h4) 1 else 0));
+}
+
+fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !mlx.mlx_array {
+    const qs = mlx.getShape(q);
+    const ps = mlx.getShape(pooled);
+    const rows = qs[2];
+    const nb = ps[1];
+    const layout = qsaScoreLayoutFor(rows);
+    const nsg = qsaScoreNsg(layout);
+    const r_tg = qsaScoreRowsPerTg(layout, nsg);
+    const ngrp: c_int = @divTrunc(rows + r_tg - 1, r_tg);
+    const nslab: u32 = @intCast(@divTrunc(nb + 31, 32));
+    const nsh: c_int = @intCast(qsaScoreNsh(nslab, @intCast(ngrp), layout));
+    const kernel = try getQsaScoreKernel();
+    const key = QsaScoreCfgKey{
+        .nsg = nsg,
+        .rows = rows,
+        .nb = nb,
+        .layout = @intFromEnum(layout),
+    };
+    const score_cfgs: [1]mlx.mlx_fast_metal_kernel_config = qsa_score_cfgs.get(key) orelse blk: {
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        try qsaScoreFusedFillConfig(config, rows, nb, nsg, ngrp, nsh, layout);
+        qsa_score_cfgs.put(key, .{config});
+        break :blk .{config};
+    };
+    const inputs_arr = [_]mlx.mlx_array{ q, pooled };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, score_cfgs[0], s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (qsa_score_engaged_bits.take(qsaWidthBucket(rows))) {
+        log.info(
+            "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d}) — MLX_SERVE_QSA_SCORE_FUSED=0 restores the composed chain\n",
+            .{ rows, nb, if (layout == .h4) "h4" else "base", nsg, nsh },
+        );
+    }
+    return out;
+}
+
+fn qsaScoreFusedRunProbe() bool {
+    if (mlx.noGpuBackend()) {
+        log.info("[qsa-score] disabled: no gpu\n", .{});
+        return false;
+    }
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) {
+        log.info("[qsa-score] disabled: not gpu stream\n", .{});
+        return false;
+    }
+    const kernel = getQsaScoreKernel() catch |e| {
+        log.info("[qsa-score] disabled: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    if (mlx.mlx_zeros(&q, &[_]c_int{ 1, 4, 1, 128 }, 4, .bfloat16, s) != 0) {
+        log.info("[qsa-score] disabled: probe alloc\n", .{});
+        return false;
+    }
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    if (mlx.mlx_zeros(&pooled, &[_]c_int{ 1, 32, 128 }, 3, .bfloat16, s) != 0) {
+        log.info("[qsa-score] disabled: probe alloc\n", .{});
+        return false;
+    }
+    const rows: c_int = 1;
+    const nb: c_int = 32;
+    const layout = qsaScoreLayoutFor(rows);
+    const nsg = qsaScoreNsg(layout);
+    const r_tg = qsaScoreRowsPerTg(layout, nsg);
+    const ngrp: c_int = @divTrunc(rows + r_tg - 1, r_tg);
+    const nslab: u32 = @intCast(@divTrunc(nb + 31, 32));
+    const nsh: c_int = @intCast(qsaScoreNsh(nslab, @intCast(ngrp), layout));
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    qsaScoreFusedFillConfig(config, rows, nb, nsg, ngrp, nsh, layout) catch |e| {
+        log.info("[qsa-score] disabled: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    const inputs_arr = [_]mlx.mlx_array{ q, pooled };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    if (mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s) != 0) {
+        log.info("[qsa-score] disabled: probe apply\n", .{});
+        return false;
+    }
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) {
+        log.info("[qsa-score] disabled: MetalKernelBadOutputCount\n", .{});
+        return false;
+    }
+    var out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out);
+    if (mlx.mlx_vector_array_get(&out, outputs_vec, 0) != 0) {
+        log.info("[qsa-score] disabled: probe alloc\n", .{});
+        return false;
+    }
+    if (mlx.mlx_array_eval(out) != 0) {
+        log.info("[qsa-score] disabled: probe eval\n", .{});
+        return false;
+    }
+    return true;
+}
+
+pub fn qsaScoreFused(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array) !?mlx.mlx_array {
+    qsaScoreFusedArm();
+    if (!qsaScoreFusedEligibleFrom(q, pooled)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
+    if (!qsaPooledRowContiguous(pooled)) return null;
+    return try qsaScoreFusedDispatch(s, q, pooled);
+}
+
+pub fn qsaScoreSheet(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_array, k32t: mlx.mlx_array, fused: bool) !mlx.mlx_array {
+    if (fused) {
+        return (try qsaScoreFused(s, q, pooled)) orelse error.QsaScoreFusedDeclined;
+    }
+    if (k32t.ctx == null) return error.QsaScoreBankMissing;
+    return qsaScoreSheetComposed(s, q, k32t);
+}
+
+fn qsaDumpBlocksPath() ?[]const u8 {
+    if (qsa_dump_blocks_path_override) |p| {
+        if (p.len == 0 or p[0] == '0') return null;
+        return p;
+    }
+    if (qsa_dump_blocks_read) return qsa_dump_blocks_cached;
+    qsa_dump_blocks_read = true;
+    const raw = std.c.getenv("QWEN4_DUMP_QSA_BLOCKS") orelse return null;
+    if (!diagEnvValueOn(raw)) return null;
+    const s = std.mem.sliceTo(raw, 0);
+    qsa_dump_blocks_cached = s;
+    return s;
+}
+
+fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx.mlx_array) void {
+    const path = qsaDumpBlocksPath() orelse return;
+    if (blocks.ctx == null) return;
+    if (mlx.mlx_array_eval(blocks) != 0) return;
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    const s = mlx.gpuStream();
+    if (mlx.mlx_contiguous(&contig, blocks, false, s) != 0) return;
+    if (mlx.mlx_array_eval(contig) != 0) return;
+    const data = mlx.mlx_array_data_int32(contig) orelse return;
+    const n = mlx.mlx_array_size(contig);
+    var path_z: [1024]u8 = undefined;
+    if (path.len == 0 or path.len >= path_z.len) return;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const fd = std.c.open(@ptrCast(&path_z), .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+    }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var hdr: [128]u8 = undefined;
+    const header = std.fmt.bufPrint(&hdr, "layer={d} row0={d} rows={d} kb={d}\n", .{ layer, row0, rows, kb }) catch return;
+    _ = std.c.write(fd, header.ptr, header.len);
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const piece = if (i == 0)
+            std.fmt.bufPrint(&buf, "{d}", .{data[i]}) catch return
+        else
+            std.fmt.bufPrint(&buf, " {d}", .{data[i]}) catch return;
+        _ = std.c.write(fd, piece.ptr, piece.len);
+    }
+    _ = std.c.write(fd, "\n", 1);
 }
 
 // ── The composed selection arm (the kernel's reference) ──
@@ -3676,6 +4497,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaVerifyGatherEnabled();
     _ = qsaVerifyGatherMinKv();
     _ = qsaSelectEnabledWarm();
+    _ = qsaSelectSplitEnabled();
     _ = qsaSelectTg();
     _ = qsaAttnKernelEnabled();
     _ = qsaAttnNSplit();
@@ -5040,19 +5862,33 @@ pub fn qsaScoreSheetBudget() u64 {
     return mb << 20;
 }
 
-pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64) u64 {
-    const per_row = n_idx * nb * 4;
+pub fn qsaScoreRowsPerChunkFor(per_row: u64, rows: u64) u64 {
     if (per_row == 0) return rows;
     return @max(16, @min(rows, qsaScoreSheetBudget() / per_row));
 }
 
-/// Prefill transient of the block-gathered QSA path for ONE live layer:
-/// the row-chunked score sheet (matmul out + relu per head, summed/biased/
-/// masked scores + argpartition temps) plus the selection itself.
-pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64) u64 {
+pub fn qsaScoreRowsPerChunkFused(n_idx: u64, nb: u64, rows: u64, fused: bool) u64 {
+    const per_row: u64 = if (fused) nb * 4 else n_idx * nb * 4;
+    return qsaScoreRowsPerChunkFor(per_row, rows);
+}
+
+pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64, idx_hd: u64) u64 {
+    return qsaScoreRowsPerChunkFused(n_idx, nb, rows, qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd)));
+}
+
+/// Prefill transient of the block-gathered QSA path for ONE live layer.
+/// Composed: matmul out + relu per head + scores + argpartition temps + selection.
+/// Fused: the [rows,nb] f32 sheet (×4 when the select kernel is off) + selection.
+pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_hd: u64) u64 {
     if (ratio == 0) return 0;
     const nb = kv / ratio;
-    const rows = qsaScoreRowsPerChunk(n_idx, nb, fwd);
+    const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
+    const rows = qsaScoreRowsPerChunkFused(n_idx, nb, fwd, fused);
+    if (fused) {
+        const sheet = rows * nb * 4;
+        const select_mult: u64 = if (qsaSelectKernelEnabled()) 1 else 4;
+        return sheet * select_mult + fwd * @min(nb, 512) * 4;
+    }
     return rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
 }
 
@@ -10802,6 +11638,7 @@ pub const Transformer = struct {
         // tried to use it. We re-bind `self.s` to the connection thread's default stream
         // via `useCurrentThreadStream` before each request.
         const s = mlx.gpuStream();
+        if (config.indexer_budget != 0) qsaScoreFusedArm();
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
@@ -16194,9 +17031,9 @@ pub const Transformer = struct {
         return k32;
     }
 
-    /// The score operand for `nb` blocks, borrowed. A completed block appends its own columns
-    /// into `qsa_score_buf`; the from-scratch arm serves a restore, a cold entry and a
-    /// rollback. Bit-identical to rebuilding the whole bank.
+    /// The score operand for `nb` blocks, borrowed. Built only on the composed arm.
+    /// A completed block appends columns; from-scratch rebuilds after restore, a cold
+    /// entry, or rollback.
     fn qsaScoreBank(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int) !mlx.mlx_array {
         if (entry.qsa_score_bank.ctx != null and entry.qsa_score_blocks == nb) return entry.qsa_score_bank;
         const old_nb = entry.qsa_score_blocks;
@@ -16237,6 +17074,11 @@ pub const Transformer = struct {
         try capBufAppend(self.s, &entry.qsa_score_buf, &entry.qsa_score_bank, &entry.qsa_score_blocks, cols, 3, reserve);
         self.qsa_score_bank_builds += 1;
         return entry.qsa_score_bank;
+    }
+
+    fn qsaScoreOperand(self: *Transformer, entry: *SSMCacheEntry, batch: c_int, nb: c_int, idx_hd: c_int, fused: bool) !mlx.mlx_array {
+        if (fused) return .{ .ctx = null };
+        return self.qsaScoreBank(entry, batch, nb, idx_hd);
     }
 
     /// The pooled-block cos/sin for this forward, built on first ask. Borrowed handles.
@@ -16282,7 +17124,7 @@ pub const Transformer = struct {
         const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
         defer _ = mlx.mlx_array_free(qk);
         if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
-        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len);
+        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);
     }
 
     /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
@@ -16316,7 +17158,7 @@ pub const Transformer = struct {
             var qk_i = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(qk_i);
             try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, 0, 1, 1);
+            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, 0, 1, 1, layer);
             if (sc.qsa_blocks.ctx != null) {
                 // Decode-width selection is per-slot unusable in the stacked
                 // mask path — expand it to the equivalent dense mask (the same
@@ -16357,7 +17199,7 @@ pub const Transformer = struct {
     }
 
     /// Serial per-slot body of `qsaMask` over the projected `qk` rows.
-    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32) !mlx.mlx_array {
         const offset = cache_len;
         const cfg = &self.config;
         const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -16491,8 +17333,11 @@ pub const Transformer = struct {
             const qs = mlx.getShape(entry.qsa_pooled);
             std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
         }
-        // scores[b, s, blk] = sum_h relu(q_h . k_blk) / sqrt(hd), in f32 like the reference. Borrowed from the entry.
-        const k32 = try self.qsaScoreBank(entry, batch, nb, idx_hd);
+        // scores[b, s, blk] = sum_h relu(q_h . k_blk) in f32 like the reference; the 1/sqrt(hd)
+        // scale is dropped because it is monotone for the top-k. Borrowed from the entry.
+        const fused = qsaScoreFusedEligibleFrom(q_rope, entry.qsa_pooled) and
+            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(self.s);
+        const k32 = try self.qsaScoreOperand(entry, batch, nb, idx_hd, fused);
 
         // Block selection (no dense mask) for prefill widths AND decode width:
         // at S==1 the same sorted single-row top-k feeds the decode gatherer
@@ -16514,13 +17359,17 @@ pub const Transformer = struct {
             const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
-                try mlx.check(mlx.mlx_array_eval(k32));
+                if (k32.ctx != null) try mlx.check(mlx.mlx_array_eval(k32));
                 clk = ProfClock.init();
             }
             // Free before assign: a `defer` registered below a fallible call leaked a handle per tick.
             if (ctx.qsa_blocks.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_blocks);
             ctx.qsa_blocks = .{ .ctx = null };
-            ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, offset, seq_len, nb, block_topk);
+            ctx.qsa_blocks = try self.qsaSelectBlocks(q_rope, k32, entry.qsa_pooled, offset, seq_len, nb, block_topk, fused);
+            if (ctx.qsa_blocks.ctx != null) {
+                const kb_dim: c_int = if (mlx.mlx_array_ndim(ctx.qsa_blocks) == 3) mlx.getShape(ctx.qsa_blocks)[2] else block_topk;
+                qsaDumpQsaBlocks(layer, offset, seq_len, kb_dim, ctx.qsa_blocks);
+            }
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(ctx.qsa_blocks));
                 log.info("[qsa-prof] select S={d} nb={d}: {d:.2} ms\n", .{ seq_len, nb, @as(f64, @floatFromInt(clk.lap())) / 1e6 });
@@ -16528,20 +17377,8 @@ pub const Transformer = struct {
             return mlx.mlx_array_new();
         }
 
-        var q32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q32);
-        try mlx.check(mlx.mlx_astype(&q32, q_rope, .float32, self.s));
-        var sc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sc);
-        try mlx.check(mlx.mlx_matmul(&sc, q32, k32, self.s)); // [B,n,S,nb]
-        const zero = mlx.mlx_array_new_float(0.0);
-        defer _ = mlx.mlx_array_free(zero);
-        var relu = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(relu);
-        try mlx.check(mlx.mlx_maximum(&relu, sc, zero, self.s));
-        var scores = mlx.mlx_array_new();
+        const scores = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
         defer _ = mlx.mlx_array_free(scores);
-        try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [B,S,nb] (scale is monotone — skipped)
 
         if (envFlagCached(&qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
             var f = mlx.mlx_array_new();
@@ -16701,15 +17538,13 @@ pub const Transformer = struct {
     /// int32). Row-chunked so the [n_idx, rows, nb] f32 score sheet stays
     /// under `qsaScoreSheetBudget()`. `k32t` is the pooled key bank
     /// [1,1,hd,nb] f32.
-    fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+    fn qsaSelectBlocks(self: *Transformer, q_rope: mlx.mlx_array, k32t: mlx.mlx_array, pooled: mlx.mlx_array, offset: c_int, seq_len: c_int, nb: c_int, block_topk: c_int, fused: bool) !mlx.mlx_array {
         const n_idx: c_int = @intCast(self.config.indexer_n_heads);
         const idx_hd: c_int = @intCast(self.config.indexer_head_dim);
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         const kb: c_int = @min(nb, block_topk);
-        const rows_per: c_int = @intCast(qsaScoreRowsPerChunk(@intCast(n_idx), @intCast(nb), @intCast(seq_len)));
+        const rows_per: c_int = @intCast(qsaScoreRowsPerChunkFused(@intCast(n_idx), @intCast(nb), @intCast(seq_len), fused));
         const strides4 = [_]c_int{ 1, 1, 1, 1 };
-        const zero = mlx.mlx_array_new_float(0.0);
-        defer _ = mlx.mlx_array_free(zero);
         var canonical = mlx.mlx_array{ .ctx = null };
         defer if (canonical.ctx != null) {
             _ = mlx.mlx_array_free(canonical);
@@ -16734,18 +17569,8 @@ pub const Transformer = struct {
             var q_chunk = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_chunk);
             try mlx.check(mlx.mlx_slice(&q_chunk, q_rope, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, n_idx, r1, idx_hd }, 4, &strides4, 4, self.s));
-            var q32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(q32);
-            try mlx.check(mlx.mlx_astype(&q32, q_chunk, .float32, self.s));
-            var sc = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sc);
-            try mlx.check(mlx.mlx_matmul(&sc, q32, k32t, self.s)); // [1,n,rows,nb]
-            var relu = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(relu);
-            try mlx.check(mlx.mlx_maximum(&relu, sc, zero, self.s));
-            var scores = mlx.mlx_array_new();
+            const scores = try qsaScoreSheet(self.s, q_chunk, pooled, k32t, fused);
             defer _ = mlx.mlx_array_free(scores);
-            try mlx.check(mlx.mlx_sum_axis(&scores, relu, 1, false, self.s)); // [1,rows,nb]
             const sorted = try self.qsaChunkSelect(scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
             errdefer _ = mlx.mlx_array_free(sorted);
             try parts.append(self.allocator, sorted);
@@ -26279,7 +27104,7 @@ fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
     return v;
 }
 /// The diagnostic-switch decision, split from the `getenv` so it is testable.
-fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
+pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
     return v[0] != '0';
 }
@@ -47182,6 +48007,9 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
 
 test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95k" {
     const t = std.testing;
+    const saved_fused = qsa_score_fused_override;
+    defer qsa_score_fused_override = saved_fused;
+    qsa_score_fused_override = false;
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(null));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(""));
     try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("wide"));
@@ -47198,9 +48026,9 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
     defer qsa_score_sheet_mb_override = prev;
 
     qsa_score_sheet_mb_override = 256;
-    const rows_256 = qsaScoreRowsPerChunk(n_idx, nb, chunk);
+    const rows_256 = qsaScoreRowsPerChunk(n_idx, nb, chunk, 128);
     qsa_score_sheet_mb_override = 1024;
-    const rows_1024 = qsaScoreRowsPerChunk(n_idx, nb, chunk);
+    const rows_1024 = qsaScoreRowsPerChunk(n_idx, nb, chunk, 128);
 
     try t.expectEqual(@as(u64, (256 << 20) / (4 * nb * 4)), rows_256);
     try t.expectEqual(rows_256 * 4, rows_1024);
@@ -47215,15 +48043,15 @@ test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95
 
     // A wider sheet must be billed: the admission guard reads the same helper.
     qsa_score_sheet_mb_override = 256;
-    const bill_256 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4);
+    const bill_256 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4, 128);
     qsa_score_sheet_mb_override = 1024;
-    const bill_1024 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4);
+    const bill_1024 = qsaPrefillTransientBytes(n_idx, chunk, 383205, 4, 128);
     try t.expect(bill_1024 > bill_256);
     try t.expectEqual((rows_1024 - rows_256) * nb * 4 * (n_idx * 2 + 4), bill_1024 - bill_256);
 
     qsa_score_sheet_mb_override = 4096;
-    try t.expectEqual(@as(u64, 64), qsaScoreRowsPerChunk(n_idx, 1024, 64));
-    try t.expectEqual(@as(u64, 16), qsaScoreRowsPerChunk(n_idx, 1 << 30, 4096));
+    try t.expectEqual(@as(u64, 64), qsaScoreRowsPerChunk(n_idx, 1024, 64, 128));
+    try t.expectEqual(@as(u64, 16), qsaScoreRowsPerChunk(n_idx, 1 << 30, 4096, 128));
 }
 
 test "qsa block constants: one build per nb, not one per full-attention layer" {
@@ -47365,6 +48193,9 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
     // k/16 in [0, 0.5] plus forced zeros: the regime where the chain's bias is also exact, so
     // both arms can be held to the same bar.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const prev_split = qsa_select_split_override;
+    defer qsa_select_split_override = prev_split;
+    qsa_select_split_override = false;
     const s = mlx.gpuStream();
     const ta = testing.allocator;
     const ratio: c_int = 4;
@@ -47624,6 +48455,1023 @@ test "qsa select kernel: the config is cached per FULL shape and rebuilt when ro
     try Run.once(s, ta, 4, 64, k);
     try testing.expectEqual(base + 1, qsaSelectCfgBuilds());
     try testing.expect(@TypeOf(qsa_select_cfgs).SLOTS == 4);
+}
+
+fn qsaIdsBitEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+    try mlx.check(mlx.mlx_array_equal(&res, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(res));
+    var v: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&v, res));
+    return v;
+}
+
+fn qsaSelectMakeSheet(kind: u8, buf: []f32, rnd: std.Random) void {
+    switch (kind) {
+        0 => {
+            for (buf) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
+        },
+        1 => {
+            for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 5) == 0) rnd.float(f32) else 0.0;
+        },
+        2 => {
+            @memset(buf, 0.0);
+            const n = buf.len;
+            const span = @min(n, 1024);
+            for (0..span) |i| buf[i] = 5.0;
+        },
+        3 => {
+            for (buf) |*v| v.* = rnd.float(f32);
+            buf[0] = std.math.nan(f32);
+            if (buf.len > 1) buf[1] = -0.0;
+            if (buf.len > 2) buf[2] = 0.0;
+        },
+        else => {
+            for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0) 0.0 else @as(f32, @floatFromInt(rnd.uintLessThan(u32, 9))) / 16.0;
+        },
+    }
+}
+
+test "qsa select split: ids are identical to the single-threadgroup kernel" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const k: c_int = 512;
+    const prev = qsa_select_split_override;
+    defer qsa_select_split_override = prev;
+    qsa_select_split_override = false;
+
+    const nbs = [_]c_int{ 2048, 15675, 65536, 215000, 262144 };
+    const row_counts = [_]c_int{ 1, 2, 4, 7, 15, 16 };
+    var prng = std.Random.DefaultPrng.init(0x51E7_0A11);
+    const rnd = prng.random();
+
+    for (nbs) |nb| {
+        for (row_counts) |rows| {
+            if (nb >= 215000 and rows >= 16) continue;
+            const nbu: usize = @intCast(nb);
+            const rowsu: usize = @intCast(rows);
+            const buf = try ta.alloc(f32, rowsu * nbu);
+            defer ta.free(buf);
+            var kind: u8 = 0;
+            while (kind < 5) : (kind += 1) {
+                qsaSelectMakeSheet(kind, buf, rnd);
+                const sc_shape = [_]c_int{ 1, rows, nb };
+                const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+                defer _ = mlx.mlx_array_free(scores);
+                const bound_kinds = [_]i32{ nb, @divTrunc(nb, 2), 10, 0 };
+                for (bound_kinds) |bv| {
+                    const bounds_host = try ta.alloc(i32, rowsu);
+                    defer ta.free(bounds_host);
+                    var r: usize = 0;
+                    while (r < rowsu) : (r += 1) {
+                        const adj = bv + @as(i32, @intCast(r % 3)) - 1;
+                        bounds_host[r] = @max(0, @min(nb, adj));
+                    }
+                    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+                    defer _ = mlx.mlx_array_free(bounds);
+                    const single = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+                    defer _ = mlx.mlx_array_free(single);
+                    const split = (try qsaSelectTopBlocksSplit(s, scores, bounds, k, rows, nb)) orelse return error.SelectKernelDeclined;
+                    defer _ = mlx.mlx_array_free(split);
+                    if (!try qsaIdsBitEqual(s, single, split)) {
+                        std.debug.print("[qsa-select-split] mismatch nb={d} rows={d} kind={d} bound={d}\n", .{ nb, rows, kind, bv });
+                        return error.QsaSelectSplitMismatch;
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        const nb: c_int = 65536;
+        const rows: c_int = 1;
+        const kk: c_int = 511;
+        const buf = try ta.alloc(f32, @intCast(nb));
+        defer ta.free(buf);
+        qsaSelectMakeSheet(1, buf, rnd);
+        const scores = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, rows, nb }, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+        var bh = [_]i32{nb};
+        const bounds = mlx.mlx_array_new_data(&bh, &[_]c_int{rows}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const single = (try qsaSelectTopBlocks(s, scores, bounds, kk)) orelse return error.SelectKernelDeclined;
+        defer _ = mlx.mlx_array_free(single);
+        const split = (try qsaSelectTopBlocksSplit(s, scores, bounds, kk, rows, nb)) orelse return error.SelectKernelDeclined;
+        defer _ = mlx.mlx_array_free(split);
+        if (!try qsaIdsBitEqual(s, single, split)) return error.QsaSelectSplitMismatch;
+    }
+}
+
+test "qsa select split: declines above the width floor and below the nb floor" {
+    const k: c_int = 512;
+    try testing.expect(!qsaSelectSplitServes(16, 215000, k));
+    try testing.expect(!qsaSelectSplitServes(32, 262144, k));
+    try testing.expect(!qsaSelectSplitServes(1, 24575, k));
+    try testing.expect(qsaSelectSplitServes(1, 24576, k));
+    try testing.expect(qsaSelectSplitServes(1, 32768, k));
+    try testing.expect(!qsaSelectSplitServes(15, 2048, k));
+    try testing.expect(!qsaSelectSplitServes(0, 65536, k));
+    try testing.expect(!qsaSelectSplitServes(-1, 65536, k));
+    try testing.expect(!qsaSelectSplitServes(1, 65536, 0));
+    try testing.expect(!qsaSelectSplitServes(1, 65536, 4096));
+    try testing.expect(qsaSelectSplitServes(1, 65536, k));
+    try testing.expect(qsaSelectSplitServes(15, 65536, k));
+    try testing.expect(qsaSelectSplitServes(7, 215000, k));
+
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const prev = qsa_select_split_override;
+    defer qsa_select_split_override = prev;
+    qsa_select_split_override = true;
+
+    const Run = struct {
+        fn once(st: mlx.mlx_stream, alloc: std.mem.Allocator, rows: c_int, nb: c_int) !void {
+            const buf = try alloc.alloc(f32, @intCast(rows * nb));
+            defer alloc.free(buf);
+            for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+            const sh = [_]c_int{ 1, rows, nb };
+            const sc = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+            defer _ = mlx.mlx_array_free(sc);
+            const bh = try alloc.alloc(i32, @intCast(rows));
+            defer alloc.free(bh);
+            @memset(bh, nb);
+            const bd = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bd);
+            const out = (try qsaSelectTopBlocks(st, sc, bd, 8)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+    };
+
+    try Run.once(s, ta, 16, 65536);
+    try testing.expect(!qsa_select_used_split);
+    try Run.once(s, ta, 1, 2048);
+    try testing.expect(!qsa_select_used_split);
+    try Run.once(s, ta, 1, 24576);
+    try testing.expect(qsa_select_used_split);
+}
+
+test "qsa select split: the fused radix-select IS the exact top-k" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const ratio: c_int = 4;
+    const k: c_int = 512;
+    const prev = qsa_select_split_override;
+    defer qsa_select_split_override = prev;
+    qsa_select_split_override = true;
+
+    const cases = [_]struct { nb: c_int, rows: c_int }{
+        .{ .nb = 700, .rows = 1 },
+        .{ .nb = 700, .rows = 6 },
+        .{ .nb = 2048, .rows = 1 },
+        .{ .nb = 2048, .rows = 15 },
+        .{ .nb = 15675, .rows = 1 },
+        .{ .nb = 15675, .rows = 6 },
+        .{ .nb = 65536, .rows = 1 },
+        .{ .nb = 65536, .rows = 15 },
+        .{ .nb = 262144, .rows = 1 },
+        .{ .nb = 262144, .rows = 6 },
+    };
+    var prng = std.Random.DefaultPrng.init(0x9A50_C711);
+    const rnd = prng.random();
+
+    for (cases) |c| {
+        const nbu: usize = @intCast(c.nb);
+        const rowsu: usize = @intCast(c.rows);
+        const buf = try ta.alloc(f32, rowsu * nbu);
+        defer ta.free(buf);
+        for (buf) |*v| v.* = if (rnd.uintLessThan(u8, 3) == 0)
+            0.0
+        else
+            @as(f32, @floatFromInt(rnd.uintLessThan(u32, 9))) / 16.0;
+        const sc_shape = [_]c_int{ 1, c.rows, c.nb };
+        const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(scores);
+
+        const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
+        for (row0s) |row0| {
+            const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
+            const bounds_host = try ta.alloc(i32, rowsu);
+            defer ta.free(bounds_host);
+            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
+            const want = try qsaExactTopHost(ta, buf, c.rows, c.nb, bounds_host, k);
+            defer ta.free(want);
+
+            const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{c.rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bounds);
+            const got = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            qsaExpectMatchesHost(got, want, c.rows, k, "split-forced fused kernel") catch |e| {
+                std.debug.print("[qsa-select] split-forced case nb={d} rows={d} row0={d} all_vis={}\n", .{ c.nb, c.rows, row0, all_vis });
+                return e;
+            };
+        }
+    }
+}
+
+test "qsa select split: kill switch off uses the single-threadgroup kernel" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const prev = qsa_select_split_override;
+    defer qsa_select_split_override = prev;
+
+    const Run = struct {
+        fn once(st: mlx.mlx_stream, alloc: std.mem.Allocator, rows: c_int, nb: c_int) !void {
+            const buf = try alloc.alloc(f32, @intCast(rows * nb));
+            defer alloc.free(buf);
+            for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+            const sh = [_]c_int{ 1, rows, nb };
+            const sc = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+            defer _ = mlx.mlx_array_free(sc);
+            const bh = try alloc.alloc(i32, @intCast(rows));
+            defer alloc.free(bh);
+            @memset(bh, nb);
+            const bd = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bd);
+            const out = (try qsaSelectTopBlocks(st, sc, bd, 512)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+    };
+
+    qsa_select_split_override = false;
+    try Run.once(s, ta, 1, 65536);
+    try testing.expect(!qsa_select_used_split);
+
+    qsa_select_split_override = true;
+    try Run.once(s, ta, 1, 65536);
+    try testing.expect(qsa_select_used_split);
+}
+
+test "qsa select split: the config is cached per FULL shape and rebuilt when rows change" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const prev = qsa_select_split_override;
+    defer qsa_select_split_override = prev;
+    qsa_select_split_override = true;
+    const k: c_int = 512;
+
+    const Run = struct {
+        fn once(st: mlx.mlx_stream, alloc: std.mem.Allocator, rows: c_int, nb: c_int, kk: c_int) !void {
+            const buf = try alloc.alloc(f32, @intCast(rows * nb));
+            defer alloc.free(buf);
+            for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+            const sh = [_]c_int{ 1, rows, nb };
+            const sc = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+            defer _ = mlx.mlx_array_free(sc);
+            const bh = try alloc.alloc(i32, @intCast(rows));
+            defer alloc.free(bh);
+            @memset(bh, nb);
+            const bd = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{rows}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bd);
+            const out = (try qsaSelectTopBlocks(st, sc, bd, kk)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+    };
+
+    try Run.once(s, ta, 1, 65536, k);
+    try testing.expect(qsa_select_used_split);
+    const base = qsaSelectSplitCfgBuilds();
+    for (0..3) |_| try Run.once(s, ta, 1, 65536, k);
+    try testing.expectEqual(base, qsaSelectSplitCfgBuilds());
+    try Run.once(s, ta, 1, 131072, k);
+    try testing.expectEqual(base, qsaSelectSplitCfgBuilds());
+    try Run.once(s, ta, 2, 65536, k);
+    try testing.expectEqual(base + 1, qsaSelectSplitCfgBuilds());
+    try Run.once(s, ta, 1, 65536, k);
+    try testing.expectEqual(base + 1, qsaSelectSplitCfgBuilds());
+}
+
+test "qsa select: the digit scheme is a pure function of rows" {
+    const saved_digits = qsa_select_digits_override;
+    defer qsa_select_digits_override = saved_digits;
+    qsa_select_digits_override = null;
+    try testing.expectEqual(@as(c_int, 8), qsaSelectDigitBits(1));
+    try testing.expectEqual(@as(c_int, 8), qsaSelectDigitBits(7));
+    try testing.expectEqual(@as(c_int, 8), qsaSelectDigitBits(15));
+    try testing.expectEqual(@as(c_int, 11), qsaSelectDigitBits(16));
+    try testing.expectEqual(@as(c_int, 11), qsaSelectDigitBits(256));
+    try testing.expectEqual(@as(c_int, 11), qsaSelectDigitBits(4096));
+    qsa_select_digits_override = 8;
+    try testing.expectEqual(@as(c_int, 8), qsaSelectDigitBits(256));
+    qsa_select_digits_override = 11;
+    try testing.expectEqual(@as(c_int, 11), qsaSelectDigitBits(1));
+    qsa_select_digits_override = null;
+
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const prev_split = qsa_select_split_override;
+    defer qsa_select_split_override = prev_split;
+    qsa_select_split_override = false;
+    const kk: c_int = 13;
+    const rows: c_int = 5;
+    const nb: c_int = 96;
+
+    const Run = struct {
+        fn once(st: mlx.mlx_stream, alloc: std.mem.Allocator, r: c_int, n: c_int, k: c_int) !void {
+            const buf = try alloc.alloc(f32, @intCast(r * n));
+            defer alloc.free(buf);
+            for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 97);
+            const sh = [_]c_int{ 1, r, n };
+            const sc = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+            defer _ = mlx.mlx_array_free(sc);
+            const bh = try alloc.alloc(i32, @intCast(r));
+            defer alloc.free(bh);
+            @memset(bh, n);
+            const bd = mlx.mlx_array_new_data(bh.ptr, &[_]c_int{r}, 1, .int32);
+            defer _ = mlx.mlx_array_free(bd);
+            const out = (try qsaSelectTopBlocks(st, sc, bd, k)) orelse return error.SelectKernelDeclined;
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+    };
+
+    qsa_select_digits_override = 11;
+    try Run.once(s, ta, rows, nb, kk);
+    const base = qsaSelectCfgBuilds();
+    try Run.once(s, ta, rows, nb, kk);
+    try testing.expectEqual(base, qsaSelectCfgBuilds());
+    qsa_select_digits_override = 8;
+    try Run.once(s, ta, rows, nb, kk);
+    try testing.expectEqual(base + 1, qsaSelectCfgBuilds());
+    try Run.once(s, ta, rows, nb, kk);
+    try testing.expectEqual(base + 1, qsaSelectCfgBuilds());
+}
+
+test "qsa select: 8-bit digits are the exact top-k" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    const saved_digits = qsa_select_digits_override;
+    const saved_split = qsa_select_split_override;
+    defer {
+        qsa_select_digits_override = saved_digits;
+        qsa_select_split_override = saved_split;
+    }
+    const k: c_int = 512;
+    const nbs = [_]c_int{ 2048, 15675, 24576, 65536, 215000 };
+    const row_counts = [_]c_int{ 1, 7, 15, 16, 256 };
+    var prng = std.Random.DefaultPrng.init(0x8B17_D161);
+    const rnd = prng.random();
+
+    for (nbs) |nb| {
+        for (row_counts) |rows| {
+            if (nb >= 215000 and rows >= 16) continue;
+            const nbu: usize = @intCast(nb);
+            const rowsu: usize = @intCast(rows);
+            const ku: usize = @intCast(k);
+            const buf = try ta.alloc(f32, rowsu * nbu);
+            defer ta.free(buf);
+            var kind: u8 = 0;
+            while (kind < 5) : (kind += 1) {
+                switch (kind) {
+                    0 => {
+                        for (buf) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
+                    },
+                    1 => {
+                        for (buf) |*v| v.* = if (rnd.float(f32) < 0.60) 0.0 else rnd.float(f32) * 2.0 - 1.0;
+                    },
+                    2 => {
+                        for (buf) |*v| v.* = if (rnd.float(f32) < 0.95) 0.0 else rnd.float(f32) * 2.0 - 1.0;
+                    },
+                    3 => {
+                        for (buf) |*v| v.* = rnd.float(f32) * 0.5;
+                        var r: usize = 0;
+                        while (r < rowsu) : (r += 1) {
+                            const row = buf[r * nbu ..][0..nbu];
+                            var t: usize = 0;
+                            while (t < ku + 400) : (t += 1) {
+                                row[rnd.uintLessThan(usize, nbu)] = 3.0;
+                            }
+                            var h: usize = 0;
+                            while (h < 50) : (h += 1) {
+                                row[rnd.uintLessThan(usize, nbu)] = 9.0;
+                            }
+                        }
+                    },
+                    else => {
+                        for (buf) |*v| v.* = rnd.float(f32);
+                        var i: usize = 0;
+                        while (i < buf.len) : (i += 1) {
+                            const u = rnd.uintLessThan(u8, 100);
+                            if (u < 2) buf[i] = std.math.nan(f32) else if (u < 32) buf[i] = -0.0 else if (u < 52) buf[i] = 0.0;
+                        }
+                    },
+                }
+                const sc_shape = [_]c_int{ 1, rows, nb };
+                const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
+                defer _ = mlx.mlx_array_free(scores);
+                const bound_kinds = [_]i32{ nb, @divTrunc(k, 2), @min(nb, k + 17) };
+                for (bound_kinds) |bv| {
+                    const bounds_host = try ta.alloc(i32, rowsu);
+                    defer ta.free(bounds_host);
+                    var r: usize = 0;
+                    while (r < rowsu) : (r += 1) {
+                        const adj = bv + @as(i32, @intCast(r % 3)) - 1;
+                        bounds_host[r] = @max(0, @min(nb, adj));
+                    }
+                    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+                    defer _ = mlx.mlx_array_free(bounds);
+
+                    qsa_select_split_override = false;
+                    qsa_select_digits_override = 11;
+                    const ref11 = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+                    defer _ = mlx.mlx_array_free(ref11);
+
+                    qsa_select_digits_override = 8;
+                    const single8 = (try qsaSelectTopBlocks(s, scores, bounds, k)) orelse return error.SelectKernelDeclined;
+                    defer _ = mlx.mlx_array_free(single8);
+                    if (!try qsaIdsBitEqual(s, ref11, single8)) {
+                        std.debug.print("[qsa-select-8bit] single mismatch nb={d} rows={d} kind={d} bound={d}\n", .{ nb, rows, kind, bv });
+                        return error.QsaSelect8BitMismatch;
+                    }
+
+                    if (rows <= QSA_SELECT_SPLIT_MAX_ROWS) {
+                        const split8 = (try qsaSelectTopBlocksSplit(s, scores, bounds, k, rows, nb)) orelse return error.SelectKernelDeclined;
+                        defer _ = mlx.mlx_array_free(split8);
+                        if (!try qsaIdsBitEqual(s, ref11, split8)) {
+                            std.debug.print("[qsa-select-8bit] split mismatch nb={d} rows={d} kind={d} bound={d}\n", .{ nb, rows, kind, bv });
+                            return error.QsaSelect8BitMismatch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "qsa score kernel: fused score sheet is bit-identical to the composed chain" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    defer qsa_score_layout_override = null;
+    var prng = std.Random.DefaultPrng.init(0x51C0_4E11);
+    const rnd = prng.random();
+
+    const nbs = [_]c_int{ 700, 2048, 15675, 65536 };
+    const rowss = [_]c_int{ 1, 2, 3, 8, 15, 16, 17, 31, 64, 128, 256 };
+    const layouts = [_]QsaScoreLayout{ .base, .h4 };
+    for (nbs) |nb| {
+        for (rowss) |rows| {
+            const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+            defer _ = mlx.mlx_array_free(q);
+            const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+            defer _ = mlx.mlx_array_free(pooled);
+            try mlx.check(mlx.mlx_array_eval(pooled));
+            const k32t = try qsaScoreK32tFromPooled(s, pooled);
+            defer _ = mlx.mlx_array_free(k32t);
+            const want = try qsaScoreSheetComposed(s, q, k32t);
+            defer _ = mlx.mlx_array_free(want);
+            for (layouts) |layout| {
+                qsa_score_layout_override = layout;
+                const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+                defer _ = mlx.mlx_array_free(got);
+                try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, want, s));
+            }
+        }
+    }
+
+    {
+        const extras = [_]struct { nb: c_int, rows: c_int }{
+            .{ .nb = 262144, .rows = 1 },
+            .{ .nb = 262144, .rows = 16 },
+            .{ .nb = 262144, .rows = 64 },
+            .{ .nb = 2048, .rows = 4096 },
+        };
+        for (extras) |c| {
+            const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, c.rows, 128 }, s);
+            defer _ = mlx.mlx_array_free(q);
+            const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, c.nb, 128 }, s);
+            defer _ = mlx.mlx_array_free(pooled);
+            try mlx.check(mlx.mlx_array_eval(pooled));
+            const k32t = try qsaScoreK32tFromPooled(s, pooled);
+            defer _ = mlx.mlx_array_free(k32t);
+            const want = try qsaScoreSheetComposed(s, q, k32t);
+            defer _ = mlx.mlx_array_free(want);
+            for (layouts) |layout| {
+                qsa_score_layout_override = layout;
+                const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+                defer _ = mlx.mlx_array_free(got);
+                try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, want, s));
+            }
+        }
+    }
+
+    {
+        const parent_rows: c_int = 96;
+        const rows: c_int = 40;
+        const row0: c_int = 24;
+        const nb: c_int = 2048;
+        const parent = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, parent_rows, 128 }, s);
+        defer _ = mlx.mlx_array_free(parent);
+        var q = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q);
+        try mlx.check(mlx.mlx_slice(&q, parent, &[_]c_int{ 0, 0, row0, 0 }, 4, &[_]c_int{ 1, 4, row0 + rows, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_array_eval(pooled));
+        const k32t = try qsaScoreK32tFromPooled(s, pooled);
+        defer _ = mlx.mlx_array_free(k32t);
+        const want = try qsaScoreSheetComposed(s, q, k32t);
+        defer _ = mlx.mlx_array_free(want);
+        for (layouts) |layout| {
+            qsa_score_layout_override = layout;
+            const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, want, s));
+        }
+    }
+
+    {
+        const nb: c_int = 2048;
+        const cap: c_int = 3072;
+        const rows: c_int = 16;
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const buf = try attn256RandBf16(rnd, &[_]c_int{ 1, cap, 128 }, s);
+        defer _ = mlx.mlx_array_free(buf);
+        var pooled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_slice(&pooled, buf, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, nb, 128 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        try mlx.check(mlx.mlx_array_eval(pooled));
+        const k32t = try qsaScoreK32tFromPooled(s, pooled);
+        defer _ = mlx.mlx_array_free(k32t);
+        const want = try qsaScoreSheetComposed(s, q, k32t);
+        defer _ = mlx.mlx_array_free(want);
+        for (layouts) |layout| {
+            qsa_score_layout_override = layout;
+            const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, want, s));
+        }
+    }
+
+    {
+        const nb: c_int = 2048;
+        const cap: c_int = 3072;
+        const rows: c_int = 16;
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const buf = try attn256RandBf16(rnd, &[_]c_int{ 1, cap, 128 }, s);
+        defer _ = mlx.mlx_array_free(buf);
+        var pooled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_slice(&pooled, buf, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, nb, 128 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        try mlx.check(mlx.mlx_array_eval(pooled));
+        var k4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k4);
+        try mlx.check(mlx.mlx_reshape(&k4, buf, &[_]c_int{ 1, 1, cap, 128 }, 4, s));
+        var kt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kt);
+        try mlx.check(mlx.mlx_transpose_axes(&kt, k4, &[_]c_int{ 0, 1, 3, 2 }, 4, s));
+        var k32full = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k32full);
+        try mlx.check(mlx.mlx_astype(&k32full, kt, .float32, s));
+        var k32t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k32t);
+        try mlx.check(mlx.mlx_slice(&k32t, k32full, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 1, 128, nb }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        const want = try qsaScoreSheetComposed(s, q, k32t);
+        defer _ = mlx.mlx_array_free(want);
+        for (layouts) |layout| {
+            qsa_score_layout_override = layout;
+            const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got, want, s));
+        }
+    }
+}
+
+test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on both arms" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    qsa_score_layout_override = .h4;
+    defer qsa_score_layout_override = null;
+    var prng = std.Random.DefaultPrng.init(0xB10C_1D5);
+    const rnd = prng.random();
+    const nb: c_int = 2048;
+    const rows: c_int = 16;
+    const ratio: c_int = 4;
+    const k: c_int = 512;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_array_eval(pooled));
+    const k32t = try qsaScoreK32tFromPooled(s, pooled);
+    defer _ = mlx.mlx_array_free(k32t);
+    const composed = try qsaScoreSheetComposed(s, q, k32t);
+    defer _ = mlx.mlx_array_free(composed);
+    const fused = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+
+    const row0s = [_]c_int{ 0, 2044, nb * ratio };
+    for (row0s) |row0| {
+        const all_vis = qsaAllBlocksVisible(row0, nb, ratio);
+        const bounds_host = try ta.alloc(i32, @intCast(rows));
+        defer ta.free(bounds_host);
+        qsaVisibleBoundsHost(bounds_host, row0, rows, nb, ratio, all_vis);
+        const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+        defer _ = mlx.mlx_array_free(bounds);
+        const ids_c = (try qsaSelectTopBlocks(s, composed, bounds, k)) orelse return error.SelectKernelDeclined;
+        defer _ = mlx.mlx_array_free(ids_c);
+        const ids_f = (try qsaSelectTopBlocks(s, fused, bounds, k)) orelse return error.SelectKernelDeclined;
+        defer _ = mlx.mlx_array_free(ids_f);
+        try testing.expect(try qsaArraysAllEqual(ids_c, ids_f, s));
+    }
+}
+
+test "qsa score kernel: never built without NAX" {
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    vqmm_nax_probe_override = false;
+    defer vqmm_nax_probe_override = null;
+    const saved = qsa_score_kernel_cached;
+    qsa_score_kernel_cached = null;
+    defer qsa_score_kernel_cached = saved;
+    try testing.expect(!qsaScoreFusedEligible(1, 4, 128, .bfloat16, .bfloat16));
+    try testing.expect(!qsaScoreKernelBuilt());
+    const builds = qsaScoreKernelBuilds();
+    try testing.expectError(error.NaxUnavailable, getQsaScoreKernel());
+    try testing.expectEqual(builds, qsaScoreKernelBuilds());
+    try testing.expect(!qsaScoreKernelBuilt());
+}
+
+test "qsa score fused: default on engages, =0 declines" {
+    const saved_override = qsa_score_fused_override;
+    const saved_env = qsa_score_fused_env;
+    defer {
+        qsa_score_fused_override = saved_override;
+        qsa_score_fused_env = saved_env;
+    }
+    qsa_score_fused_override = null;
+    qsa_score_fused_env = null;
+    try testing.expect(qsaScoreFusedEnabled());
+    qsa_score_fused_env = false;
+    try testing.expect(!qsaScoreFusedEnabled());
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDEF0);
+    const q = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 4, 2, 128 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 64, 128 }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_array_eval(pooled));
+    try testing.expect((try qsaScoreFused(s, q, pooled)) == null);
+    qsa_score_fused_env = null;
+    qsa_score_fused_override = true;
+    if (verifyQmmNaxAvailable() and qsaScoreTf32Enabled()) {
+        const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+        defer _ = mlx.mlx_array_free(got);
+    }
+}
+
+test "qsa score kernel: TF32 off declines" {
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    qsa_score_tf32_override = false;
+    defer qsa_score_tf32_override = null;
+    try testing.expect(!qsaScoreFusedEligible(1, 4, 128, .bfloat16, .bfloat16));
+}
+
+test "qsa score fused: the bill follows the predicate" {
+    const saved_fused = qsa_score_fused_override;
+    const saved_nax = vqmm_nax_probe_override;
+    const saved_sheet = qsa_score_sheet_mb_override;
+    defer {
+        qsa_score_fused_override = saved_fused;
+        vqmm_nax_probe_override = saved_nax;
+        qsa_score_sheet_mb_override = saved_sheet;
+    }
+    qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    const n_idx: u64 = 4;
+    const fwd: u64 = 4096;
+    const nb: u64 = 262144;
+    const kv = nb * 4;
+    const ratio: u64 = 4;
+
+    vqmm_nax_probe_override = false;
+    qsa_score_fused_override = true;
+    const composed_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
+    const composed_bill = qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128);
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 48;
+    cfg.full_attention_interval = 4;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    const composed_bank = cfg.qsaScoreBankBytesPerToken();
+    try testing.expectEqual(@as(u64, 64), composed_rows);
+    try testing.expectEqual(@as(u64, 1_536), composed_bank);
+
+    qsa_score_fused_override = false;
+    try testing.expectEqual(composed_rows, qsaScoreRowsPerChunk(n_idx, nb, fwd, 128));
+    try testing.expectEqual(composed_bill, qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128));
+    try testing.expectEqual(composed_bank, cfg.qsaScoreBankBytesPerToken());
+
+    qsa_score_fused_override = true;
+    vqmm_nax_probe_override = null;
+    qsaScoreFusedArm();
+    if (qsaScoreFusedActive()) {
+        const fused_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
+        try testing.expectEqual(composed_rows * 4, fused_rows);
+        try testing.expect(fused_rows >= 128);
+        const fused_bill = qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128);
+        try testing.expectEqual(fused_rows * nb * 4 + fwd * @min(nb, 512) * 4, fused_bill);
+        try testing.expectEqual(@as(u64, 0), cfg.qsaScoreBankBytesPerToken());
+        const saved_sel = qsa_select_kernel_override;
+        defer qsa_select_kernel_override = saved_sel;
+        qsa_select_kernel_override = false;
+        try testing.expectEqual(fused_rows * nb * 4 * 4 + fwd * @min(nb, 512) * 4, qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128));
+    }
+}
+
+test "qsa score fused: sizing policy" {
+    try testing.expect(qsaScoreTf32ValueOn("1"));
+    try testing.expect(qsaScoreTf32ValueOn(" 1"));
+    try testing.expect(!qsaScoreTf32ValueOn("0"));
+    try testing.expect(!qsaScoreTf32ValueOn("00"));
+    try testing.expect(!qsaScoreTf32ValueOn("false"));
+    try testing.expect(!qsaScoreTf32ValueOn(" 0"));
+    try testing.expect(!qsaScoreTf32ValueOn("0x0"));
+    try testing.expectEqual(QsaScoreLayout.base, qsaScoreLayoutFor(1));
+    try testing.expectEqual(QsaScoreLayout.base, qsaScoreLayoutFor(127));
+    try testing.expectEqual(QsaScoreLayout.h4, qsaScoreLayoutFor(128));
+    try testing.expectEqual(@as(c_int, 4), qsaScoreNsg(.base));
+    try testing.expectEqual(@as(c_int, 8), qsaScoreNsg(.h4));
+    try testing.expectEqual(@as(c_int, 16), qsaScoreRowsPerTg(.base, 4));
+    try testing.expectEqual(@as(c_int, 128), qsaScoreRowsPerTg(.h4, 8));
+    try testing.expectEqual(@as(u32, 64), qsaScoreNsh(64, 1, .base));
+    try testing.expectEqual(@as(u32, 32), qsaScoreNsh(1024, 8, .h4));
+    const saved_fused = qsa_score_fused_override;
+    const saved_nax = vqmm_nax_probe_override;
+    const saved_sheet = qsa_score_sheet_mb_override;
+    defer {
+        qsa_score_fused_override = saved_fused;
+        vqmm_nax_probe_override = saved_nax;
+        qsa_score_sheet_mb_override = saved_sheet;
+    }
+    qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    const composed = qsaScoreRowsPerChunkFor(4 * 262144 * 4, 4096);
+    const fused = qsaScoreRowsPerChunkFor(262144 * 4, 4096);
+    try testing.expectEqual(composed * 4, fused);
+    try testing.expect(fused >= 128);
+}
+
+test "qsa score fused: the argpartition decline arm consumes the fused sheet" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    qsa_score_layout_override = .h4;
+    defer qsa_score_layout_override = null;
+    var prng = std.Random.DefaultPrng.init(0xA2B0);
+    const rnd = prng.random();
+    const nb: c_int = 2048;
+    const rows: c_int = 16;
+    const k: c_int = 512;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_array_eval(pooled));
+    const fused = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const bounds_host = try ta.alloc(i32, @intCast(rows));
+    defer ta.free(bounds_host);
+    qsaVisibleBoundsHost(bounds_host, nb * 4, rows, nb, 4, true);
+    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    const ids_k = (try qsaSelectTopBlocks(s, fused, bounds, k)) orelse return error.SelectKernelDeclined;
+    defer _ = mlx.mlx_array_free(ids_k);
+    const saved_sel = qsa_select_kernel_override;
+    defer qsa_select_kernel_override = saved_sel;
+    qsa_select_kernel_override = false;
+    try testing.expect((try qsaSelectTopBlocks(s, fused, bounds, k)) == null);
+    const bias = try qsaTieBiasForTest(s, nb);
+    defer _ = mlx.mlx_array_free(bias);
+    const vis = mlx.mlx_array{ .ctx = null };
+    const ids_a = try qsaSelectComposedOps(s, fused, vis, bias, rows, nb, k, k, true);
+    defer _ = mlx.mlx_array_free(ids_a);
+    try testing.expect(try qsaArraysAllEqual(ids_k, ids_a, s));
+}
+
+test "qsa score fused: no bank is built under the fused arm" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    xfm.qsa_score_bank_builds = 0;
+    var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+    defer ssmFreeQsaState(&entry);
+    entry.qsa_ratio = 4;
+    entry.qsa_reserve_rows = 256;
+    var prng = std.Random.DefaultPrng.init(0xBA11);
+    const hd: c_int = 128;
+    const nb: c_int = 32;
+    const pooled = try attn256RandBf16(prng.random(), &[_]c_int{ 1, nb, hd }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try xfm.qsaAppendPooled(&entry, pooled, 0);
+    const saved_fused = qsa_score_fused_override;
+    const saved_nax = vqmm_nax_probe_override;
+    defer {
+        qsa_score_fused_override = saved_fused;
+        vqmm_nax_probe_override = saved_nax;
+    }
+    qsa_score_fused_override = false;
+    vqmm_nax_probe_override = false;
+    _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, false);
+    try testing.expect(entry.qsa_score_bank.ctx != null);
+    if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
+    entry.qsa_score_bank = .{ .ctx = null };
+    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_blocks = 0;
+    qsa_score_fused_override = true;
+    vqmm_nax_probe_override = null;
+    qsaScoreFusedArm();
+    if (qsaScoreFusedActive()) {
+        _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, true);
+        try testing.expect(entry.qsa_score_bank.ctx == null);
+    }
+}
+
+test "qsa score fused: unsupported indexer geometry falls back to the composed chain" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    xfm.qsa_score_bank_builds = 0;
+    const saved_fused = qsa_score_fused_override;
+    const saved_nax = vqmm_nax_probe_override;
+    const saved_sheet = qsa_score_sheet_mb_override;
+    defer {
+        qsa_score_fused_override = saved_fused;
+        vqmm_nax_probe_override = saved_nax;
+        qsa_score_sheet_mb_override = saved_sheet;
+    }
+    qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
+    qsa_score_fused_override = true;
+
+    const fwd: u64 = 4096;
+    const kv: u64 = 262144 * 4;
+    const ratio: u64 = 4;
+    qsa_score_fused_override = false;
+    const composed_n2 = qsaPrefillTransientBytes(2, fwd, kv, ratio, 128);
+    const composed_hd64 = qsaPrefillTransientBytes(4, fwd, kv, ratio, 64);
+    const composed_rows_n2 = qsaScoreRowsPerChunk(2, kv / ratio, fwd, 128);
+    const composed_rows_hd64 = qsaScoreRowsPerChunk(4, kv / ratio, fwd, 64);
+    qsa_score_fused_override = true;
+    try testing.expect(!qsaScoreFusedActiveFor(1, 2, 128));
+    try testing.expect(!qsaScoreFusedActiveFor(1, 4, 64));
+    try testing.expectEqual(composed_n2, qsaPrefillTransientBytes(2, fwd, kv, ratio, 128));
+    try testing.expectEqual(composed_hd64, qsaPrefillTransientBytes(4, fwd, kv, ratio, 64));
+    try testing.expectEqual(composed_rows_n2, qsaScoreRowsPerChunk(2, kv / ratio, fwd, 128));
+    try testing.expectEqual(composed_rows_hd64, qsaScoreRowsPerChunk(4, kv / ratio, fwd, 64));
+
+    var cfg2 = model_mod.ModelConfig{};
+    cfg2.num_hidden_layers = 48;
+    cfg2.full_attention_interval = 4;
+    cfg2.indexer_budget = 2048;
+    cfg2.indexer_n_heads = 2;
+    cfg2.indexer_head_dim = 128;
+    cfg2.indexer_compress_ratio = 4;
+    const bank2 = cfg2.qsaScoreBankBytesPerToken();
+    try testing.expect(bank2 > 0);
+    var cfg64 = cfg2;
+    cfg64.indexer_n_heads = 4;
+    cfg64.indexer_head_dim = 64;
+    try testing.expect(cfg64.qsaScoreBankBytesPerToken() > 0);
+
+    var prng = std.Random.DefaultPrng.init(0x6E01);
+    const rnd = prng.random();
+    const nb: c_int = 32;
+    const rows: c_int = 4;
+    {
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        defer ssmFreeQsaState(&entry);
+        entry.qsa_ratio = 4;
+        entry.qsa_reserve_rows = 256;
+        const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        try xfm.qsaAppendPooled(&entry, pooled, 0);
+        const fused = qsaScoreFusedActiveFor(1, 2, 128);
+        try testing.expect(!fused);
+        _ = try xfm.qsaScoreOperand(&entry, 1, nb, 128, fused);
+        try testing.expect(entry.qsa_score_bank.ctx != null);
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, rows, 128 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const sheet = try qsaScoreSheet(s, q, pooled, entry.qsa_score_bank, fused);
+        defer _ = mlx.mlx_array_free(sheet);
+        const want = try qsaScoreSheetComposed(s, q, entry.qsa_score_bank);
+        defer _ = mlx.mlx_array_free(want);
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(sheet, want, s));
+    }
+    {
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        defer ssmFreeQsaState(&entry);
+        entry.qsa_ratio = 4;
+        entry.qsa_reserve_rows = 256;
+        const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 64 }, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        try xfm.qsaAppendPooled(&entry, pooled, 0);
+        const fused = qsaScoreFusedActiveFor(1, 4, 64);
+        try testing.expect(!fused);
+        _ = try xfm.qsaScoreOperand(&entry, 1, nb, 64, fused);
+        try testing.expect(entry.qsa_score_bank.ctx != null);
+        const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 64 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const sheet = try qsaScoreSheet(s, q, pooled, entry.qsa_score_bank, fused);
+        defer _ = mlx.mlx_array_free(sheet);
+        const want = try qsaScoreSheetComposed(s, q, entry.qsa_score_bank);
+        defer _ = mlx.mlx_array_free(want);
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(sheet, want, s));
+    }
+    {
+        var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        defer ssmFreeQsaState(&entry);
+        entry.qsa_ratio = 4;
+        entry.qsa_reserve_rows = 256;
+        const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        try xfm.qsaAppendPooled(&entry, pooled, 0);
+        try mlx.check(mlx.mlx_array_eval(pooled));
+        const q_bf = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+        defer _ = mlx.mlx_array_free(q_bf);
+        var q32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q32);
+        try mlx.check(mlx.mlx_astype(&q32, q_bf, .float32, s));
+        const fused = qsaScoreFusedEligibleFrom(q32, entry.qsa_pooled) and
+            qsaPooledRowContiguous(entry.qsa_pooled) and mlx.streamIsGpu(s);
+        try testing.expect(!fused);
+        _ = try xfm.qsaScoreOperand(&entry, 1, nb, 128, fused);
+        try testing.expect(entry.qsa_score_bank.ctx != null);
+        const sheet = try qsaScoreSheet(s, q32, pooled, entry.qsa_score_bank, fused);
+        defer _ = mlx.mlx_array_free(sheet);
+        const want = try qsaScoreSheetComposed(s, q32, entry.qsa_score_bank);
+        defer _ = mlx.mlx_array_free(want);
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(sheet, want, s));
+    }
+}
+
+test "qsa score fused: dump hook writes a parseable line" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    var file_buf: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&file_buf, "{s}/qsa-blocks.txt", .{path_buf[0..root_len]});
+    qsa_dump_blocks_path_override = path;
+    defer qsa_dump_blocks_path_override = null;
+    const s = mlx.gpuStream();
+    const ta = testing.allocator;
+    qsa_score_fused_override = true;
+    defer qsa_score_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0xD00B);
+    const rnd = prng.random();
+    const nb: c_int = 64;
+    const rows: c_int = 2;
+    const k: c_int = 8;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 4, rows, 128 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const pooled = try attn256RandBf16(rnd, &[_]c_int{ 1, nb, 128 }, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_array_eval(pooled));
+    const fused = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const bounds_host = try ta.alloc(i32, @intCast(rows));
+    defer ta.free(bounds_host);
+    qsaVisibleBoundsHost(bounds_host, nb * 4, rows, nb, 4, true);
+    const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    const ids = (try qsaSelectTopBlocks(s, fused, bounds, k)) orelse return error.SelectKernelDeclined;
+    defer _ = mlx.mlx_array_free(ids);
+    qsaDumpQsaBlocks(3, 12, rows, k, ids);
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "qsa-blocks.txt", ta, .limited(1 << 20));
+    defer ta.free(body);
+    try testing.expect(std.mem.startsWith(u8, body, "layer=3 row0=12 rows=2 kb=8\n"));
+    try testing.expect(std.mem.indexOfScalar(u8, body, ' ') != null);
 }
 
 test "generation past the reserved headroom takes the +25% growth policy, never a mid-prefill grow" {
@@ -47916,4 +49764,23 @@ test "diagEnvOnCached answers once and latches" {
     try testing.expectEqual(@as(?bool, false), cache);
     cache = true;
     try testing.expectEqual(true, diagEnvOnCached(&cache, "MLX_SERVE_NO_SUCH_DIAG_SWITCH_PROBE"));
+}
+
+test "qsa select tg policy: a pure function of rows, forced width wins" {
+    const saved = qsa_select_tg_override;
+    defer qsa_select_tg_override = saved;
+    qsa_select_tg_override = null;
+    qsa_select_tg_cached = 0;
+    try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(4096));
+    try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(1024));
+    try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(256));
+    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(255));
+    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(64));
+    try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(63));
+    try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(16));
+    try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(1));
+    qsa_select_tg_override = 512;
+    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(4096));
+    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(1));
+    qsa_select_tg_cached = null;
 }

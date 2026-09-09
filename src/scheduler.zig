@@ -3634,7 +3634,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // grid); every other arch keeps the `rc1` table 26.9.1 wrote and boots warm.
         const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
         xfm_ptr.round_cost.layout = rc_layout;
-        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout);
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout, round_cost_mod.engineBuildId());
         xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
         if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
             xfm_ptr.round_cost = t;
