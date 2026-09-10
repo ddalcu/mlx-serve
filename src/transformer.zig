@@ -6085,6 +6085,13 @@ pub const KVCache = struct {
         scheme: KVQuantConfig,
     ) !void {
         if (scheme.scheme == .affine and scheme.bits == 8) {
+            const Once = struct {
+                var logged: bool = false;
+            };
+            if (!Once.logged) {
+                Once.logged = true;
+                log.info("[batched] affine-8 kv append engaged (slots={d}) (batched_kv_append_override=false restores per-slot appends)\n", .{caches.len});
+            }
             try appendAffineBatched(stacked_k, stacked_v, caches, layer, s, max_seq, scheme);
             return;
         }
