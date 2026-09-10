@@ -1196,6 +1196,10 @@ fn resolveReasoningProtocol(
         if (!proto.setForced(ids)) return false;
     }
 
+    // Boundary-crossing candidates for the reasoning-phase pre-sample mask:
+    // tokens whose bytes contain the full close delimiter.
+    proto.closer_span_candidates = lm.reasoningCloserSpanCandidates(allocator, io, proto.closerText()) catch &.{};
+
     // The choice state needs opener candidates (model-level index) and the
     // opener's own suffix table for partial-opener recovery.
     if (proto.openerText()) |opener| {
@@ -8969,6 +8973,26 @@ fn nonStreamingViaScheduler(
     const text = try decodeTokens(allocator, lm, tok, emit_ids, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
+    // Convert the generator's (token index, byte offset) payload boundary
+    // into a byte offset inside `text`. The prefix decode uses the same
+    // leading-space convention as the full text, so offsets are exact.
+    var constraint_payload_byte: ?usize = null;
+    if (slot.constraintPayloadStart()) |ps| {
+        var pb: ?usize = ps.byte_offset;
+        if (ps.token_index > 0) {
+            if (ps.token_index <= emit_ids.len) {
+                const prefix = decodeTokens(allocator, lm, tok, emit_ids[0..ps.token_index], strip_leading) catch null;
+                if (prefix) |p| {
+                    pb = p.len + ps.byte_offset;
+                    allocator.free(p);
+                } else pb = null;
+            } else pb = null;
+        }
+        if (pb) |b| {
+            if (b <= text.len) constraint_payload_byte = b;
+        }
+    }
+
     // Phase A5: take ownership of the slot's accumulated logprobs. After
     // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
     // to free what we just transferred to the caller.
@@ -8990,27 +9014,36 @@ fn nonStreamingViaScheduler(
         .cached_tokens = slot.cached_tokens,
         .logprobs = logprobs_slice,
         .finish_details = slot.finish_details,
-        .constraint_payload_start = slot.constraintPayloadStart(),
+        .constraint_payload_byte = constraint_payload_byte,
     };
 }
 
-/// Generation is authoritative for constrained responses: a DIRECT answer
-/// (payload began at generated token 0) never ran a reasoning block, so the
-/// whole text is content — a standalone re-parse could read marker text
-/// inside JSON string data as protocol structure. Every other constrained
-/// shape keeps the existing split: the real close precedes the payload, so
-/// the parser's first-close-wins scan agrees with the protocol state.
+/// Generation is authoritative for constrained responses: when the generator
+/// published a payload boundary, the split is a byte cut at that offset —
+/// reasoning is everything before it (delimiter markup stripped, whitespace
+/// policy matched to the streaming suppression), content is everything after,
+/// UNREParsed. A standalone re-scan of the payload would read marker text
+/// inside JSON string data ("the close delimiter") as protocol structure and
+/// truncate valid JSON. Without a boundary the existing parser applies.
 fn constrainedThinkSplit(
     text: []const u8,
-    payload_start: ?rp_mod.ConstraintSpan,
+    payload_byte: ?usize,
     keep_markup: bool,
     opened_by_template: bool,
 ) chat_mod.ThinkSplit {
-    if (payload_start) |ps| {
-        // Direct answer: no reasoning block exists to scan for, and the stream
-        // suppresses a whitespace lead (chat.streamContentLead) — trim here
-        // too, so both deliveries agree byte for byte.
-        if (ps.token_index == 0) return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, text, "\n ") };
+    if (payload_byte) |pb| {
+        // The reasoning side ends right at the boundary; strip the delimiter
+        // bytes (close at the end, a generated opener at the start) the same
+        // way the text-based split does, then apply the shared whitespace
+        // policy so streaming and non-streaming agree byte for byte.
+        var reasoning_raw = text[0..pb];
+        if (chat_mod.thinkOpenTagLenAt(reasoning_raw)) |olen| reasoning_raw = reasoning_raw[olen..];
+        const reasoning = std.mem.trim(u8, chat_mod.trimTrailingThinkClosers(reasoning_raw), "\n ");
+        const content = std.mem.trimStart(u8, text[pb..], "\n ");
+        return .{
+            .reasoning_content = if (reasoning.len > 0) reasoning else null,
+            .content = content,
+        };
     }
     return if (keep_markup)
         chat_mod.splitThinkBlockKeepingMarkup(text, true, opened_by_template)
@@ -9101,10 +9134,15 @@ fn handleNonStreamingGeneration(
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
-    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-    defer if (normalized_text) |n| allocator.free(n);
-    if (normalized_text) |n| final_text = n;
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
+    // mid-turn). A span-routed constrained response skips this: its payload
+    // is authoritative and marker text inside it is DATA.
+    var normalized_text: ?[]u8 = null;
+    if (result.constraint_payload_byte == null) {
+        normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+        defer if (normalized_text) |n| allocator.free(n);
+        if (normalized_text) |n| final_text = n;
+    }
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
     // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
@@ -9239,7 +9277,7 @@ fn handleNonStreamingGeneration(
     // Split thinking content from response. Always the think-capable split:
     // whatever reasoning was generated ships as reasoning_content, never
     // stripped (tokens we discarded still counted against tok/s).
-    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_start, false, opens_think);
+    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, false, opens_think);
     const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
@@ -14964,10 +15002,15 @@ fn handleAnthropicNonStreaming(
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
-    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-    defer if (normalized_text) |n| allocator.free(n);
-    if (normalized_text) |n| final_text = n;
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
+    // mid-turn). A span-routed constrained response skips this: its payload
+    // is authoritative and marker text inside it is DATA.
+    var normalized_text: ?[]u8 = null;
+    if (result.constraint_payload_byte == null) {
+        normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+        defer if (normalized_text) |n| allocator.free(n);
+        if (normalized_text) |n| final_text = n;
+    }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
@@ -14988,7 +15031,7 @@ fn handleAnthropicNonStreaming(
     // Reasoning the model generated is always delivered as a thinking block —
     // the request's thinking flag shaped the prompt, never the delivery.
     {
-        const think_split = constrainedThinkSplit(final_text, result.constraint_payload_start, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+        const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = chat_mod.trimLeakedToolMarkup(r);
@@ -17054,16 +17097,21 @@ fn handleResponsesInner(
     const status_str: []const u8 = if (std.mem.eql(u8, finish_reason, "length")) "incomplete" else "completed";
 
     // Merge re-opened mid-text thought channels into the leading block so the
-    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
-    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-    defer if (normalized_text) |n| allocator.free(n);
-    if (normalized_text) |n| final_text = n;
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels
+    // mid-turn). A span-routed constrained response skips this: its payload
+    // is authoritative and marker text inside it is DATA.
+    var normalized_text: ?[]u8 = null;
+    if (result.constraint_payload_byte == null) {
+        normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+        defer if (normalized_text) |n| allocator.free(n);
+        if (normalized_text) |n| final_text = n;
+    }
 
     // ── split thinking & tool calls ──
     // Reasoning the model actually generated is always delivered — the
     // request's thinking flag shaped the PROMPT (chat.noThinkTailSuffix),
     // never the delivery.
-    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_start, false, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids));
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
@@ -20530,6 +20578,33 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     for (unsupported_tails) |tail| {
         try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, chat_mod.promptThinkTailClass(tail) != .none));
     }
+}
+
+test "constrained span split routes by the generator boundary, never re-parses the payload" {
+    const OPEN = chat_mod.BARE_THINK_OPENER;
+    const CLOSE = chat_mod.BARE_THINK_CLOSER;
+    // Legitimate reasoning, a real close, then JSON that CONTAINS the close
+    // spelling inside a string: the text-based split would cut or strip the
+    // embedded delimiter; the span cut must keep the JSON intact as DATA.
+    const payload = "{\\\"note\\\":\\\"use " ++ CLOSE ++ " here\\\",\\\"v\\\":2}";
+    const text = "18*2 = 36." ++ CLOSE ++ payload;
+    const pb = text.len - payload.len;
+    const split = constrainedThinkSplit(text, pb, false, true);
+    try std.testing.expectEqualStrings("18*2 = 36.", split.reasoning_content orelse "");
+    try std.testing.expectEqualStrings(payload, split.content);
+
+    // Direct answer: everything is content (leading whitespace trimmed to
+    // match the streaming suppression).
+    const direct = constrainedThinkSplit("  {\\\"a\\\":1}", 0, false, false);
+    try std.testing.expect(direct.reasoning_content == null);
+    try std.testing.expectEqualStrings("{\\\"a\\\":1}", direct.content);
+
+    // A generated opener at the start of the reasoning side is stripped.
+    const with_opener = OPEN ++ "thinking" ++ CLOSE ++ "{\\\"a\\\":1}";
+    const pb2 = (OPEN ++ "thinking" ++ CLOSE).len;
+    const split2 = constrainedThinkSplit(with_opener, pb2, false, false);
+    try std.testing.expectEqualStrings("thinking", split2.reasoning_content orelse "");
+    try std.testing.expectEqualStrings("{\\\"a\\\":1}", split2.content);
 }
 
 test "every JSON grammar mask site consults the fallback or deferral policy" {

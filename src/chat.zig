@@ -1641,7 +1641,7 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
 /// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
 /// call, so any residual `<tool_call|>` reaching here is orphan by construction.
 /// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
-fn trimTrailingThinkClosers(content: []const u8) []const u8 {
+pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
     var s = content;
     while (true) {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");

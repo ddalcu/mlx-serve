@@ -26,6 +26,7 @@ const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const token_mask_mod = @import("token_mask.zig");
+const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
@@ -86,8 +87,9 @@ pub const LoadState = enum {
 /// (weights/transformer/vision_encoder/drafter) are optional so a stub
 /// entry can exist for `unloaded`/`error_state`/`loading` without faking
 /// half-built mlx state.
-/// Reasoning-protocol opener candidate index payload (see
-/// `LoadedModel.reasoningOpenerCandidates`).
+/// Cached token-id list keyed by the marker text it was built for (opener
+/// prefixes/completions, or closer-span tokens — see
+/// `LoadedModel.reasoningOpenerCandidates` / `reasoningCloserSpanCandidates`).
 pub const OpenerCandidates = struct {
     opener: [32]u8,
     opener_len: u8,
@@ -184,6 +186,10 @@ pub const LoadedModel = struct {
     /// model under the same lock as the token-byte table. See
     /// `reasoningOpenerCandidates`.
     opener_candidates: ?OpenerCandidates = null,
+    /// Same shape, for the close-delimiter: ids whose bytes CONTAIN the
+    /// full delimiter (the boundary-crossing candidates the reasoning mask
+    /// validates). See `reasoningCloserSpanCandidates`.
+    closer_candidates: ?OpenerCandidates = null,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -305,6 +311,9 @@ pub const LoadedModel = struct {
         if (self.opener_candidates) |*c| {
             if (c.matches(opener)) return c.ids;
         }
+        if (self.closer_candidates) |*c| {
+            if (c.matches(opener)) return c.ids;
+        }
         const tb = blk: {
             if (self.token_bytes) |*t| break :blk t;
             const tok = self.tokenizer orelse return error.NoTokenizer;
@@ -320,9 +329,10 @@ pub const LoadedModel = struct {
             if (tb.eos_id) |eos| {
                 if (id == eos) continue;
             }
-            if ((b.len <= opener.len and std.mem.startsWith(u8, opener, b)) or
-                (b.len >= opener.len and std.mem.startsWith(u8, b, opener)))
-            {
+            // Shared with the protocol tests so the production list and the
+            // tested list can never drift (a list missing continuation
+            // tokens starves the choice mask and disables constraints).
+            if (rp_mod.openerCandidateBytesMatch(opener, b)) {
                 try ids.append(arena.allocator(), @intCast(id));
             }
         }
@@ -332,6 +342,56 @@ pub const LoadedModel = struct {
         self.opener_candidates = .{
             .opener = buf,
             .opener_len = @intCast(opener.len),
+            .ids = owned,
+            .arena = arena,
+        };
+        return owned;
+    }
+
+    /// Ordinary token ids whose bytes CONTAIN the full `closer` text — the
+    /// only tokens able to complete the close from match state 0, so the set
+    /// the reasoning-phase mask validates before sampling. Built once per
+    /// model+delimiter; EOS is never a candidate.
+    pub fn reasoningCloserSpanCandidates(
+        self: *LoadedModel,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        closer: []const u8,
+    ) ![]const u32 {
+        if (closer.len == 0 or closer.len > 32) return &.{};
+        self.token_bytes_mutex.lockUncancelable(io);
+        defer self.token_bytes_mutex.unlock(io);
+        if (self.opener_candidates) |*c| {
+            if (c.matches(closer)) return c.ids;
+        }
+        if (self.closer_candidates) |*c| {
+            if (c.matches(closer)) return c.ids;
+        }
+        const tb = blk: {
+            if (self.token_bytes) |*t| break :blk t;
+            const tok = self.tokenizer orelse return error.NoTokenizer;
+            self.token_bytes = try token_mask_mod.build(gpa, tok);
+            break :blk &self.token_bytes.?;
+        };
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(arena.allocator());
+        for (tb.bytes, 0..) |maybe, id| {
+            const b = maybe orelse continue;
+            if (tb.eos_id) |eos| {
+                if (id == eos) continue;
+            }
+            if (std.mem.indexOf(u8, b, closer) != null) {
+                try ids.append(arena.allocator(), @intCast(id));
+            }
+        }
+        const owned = try arena.allocator().dupe(u32, ids.items);
+        var buf: [32]u8 = undefined;
+        @memcpy(buf[0..closer.len], closer);
+        self.closer_candidates = .{
+            .opener = buf,
+            .opener_len = @intCast(closer.len),
             .ids = owned,
             .arena = arena,
         };
@@ -421,6 +481,10 @@ pub const LoadedModel = struct {
         if (self.opener_candidates) |*c| {
             c.arena.deinit();
             self.opener_candidates = null;
+        }
+        if (self.closer_candidates) |*c| {
+            c.arena.deinit();
+            self.closer_candidates = null;
         }
         if (self.tokenizer) |tok| {
             tok.deinit();

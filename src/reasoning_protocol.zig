@@ -52,10 +52,46 @@ pub const SuffixRun = struct { offset: u32, len: u8 };
 /// JSON string data.
 pub const ConstraintSpan = struct { token_index: u32, byte_offset: u32 };
 
+/// Byte offset of the payload start within the token that carried it: the
+/// token's own byte length minus the payload suffix it carried. Special
+/// tokens have no bytes — the caller passes null and the payload begins
+/// AFTER the token (the caller expresses that in the token index).
+pub fn payloadByteOffset(token_bytes: ?[]const u8, suffix: []const u8) u32 {
+    const b = token_bytes orelse return 0;
+    std.debug.assert(suffix.len <= b.len);
+    return @intCast(b.len - suffix.len);
+}
+
+/// Whether `bytes` can extend or complete `opener` from SOME cursor: the
+/// production candidate predicate. A token qualifies when it is a prefix of
+/// some opener suffix (continuation) or some opener suffix is a prefix of it
+/// (completion, possibly with payload). Shared by the model-level candidate
+/// builder and the tests so the two can never drift.
+pub fn openerCandidateBytesMatch(opener: []const u8, bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    for (0..opener.len) |k| {
+        const rest = opener[k..];
+        if (std.mem.startsWith(u8, rest, bytes) or std.mem.startsWith(u8, bytes, rest)) return true;
+    }
+    return false;
+}
+
+fn isJsonWhitespaceRun(bytes: []const u8) bool {
+    for (bytes) |c| {
+        switch (c) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 pub const Kind = enum {
-    /// `机智…机智` — Qwen/DeepSeek/LFM/Laguna-style bare think tags.
+    /// The delimited reasoning block Qwen/DeepSeek/LFM/Laguna share: an
+    /// opening tag and a closing tag spelling the same base (see
+    /// `chat.BARE_THINK_OPENER` / `BARE_THINK_CLOSER`).
     bare_think,
-    /// `<think:S>…</think:S>` — the Hy3 suffixed family. The suffix is fixed
+    /// `<think:S>...</think:S>` — the Hy3 suffixed family. The suffix is fixed
     /// by whichever opener resolved (prompt-injected) and the close must
     /// carry the SAME suffix; think tags with other suffixes are body text.
     suffixed_think,
@@ -92,6 +128,11 @@ pub const Protocol = struct {
     /// Same for the opener (choice state): entry k spells `opener_buf[k..]`.
     opener_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 }),
     opener_suffix_buf: [SUFFIX_TABLE_BYTES]u32 = undefined,
+    /// Model-level candidate set (borrowed from `LoadedModel`): ordinary
+    /// tokens whose bytes CONTAIN the full close delimiter — the only tokens
+    /// that can complete the close from match state 0. The reasoning-phase
+    /// mask validates their payload suffixes before they can be sampled.
+    closer_span_candidates: []const u32 = &.{},
 
     /// The opener literal; null when the prompt already opened the block and
     /// generation starts inside reasoning. Delimiters live in this struct's
@@ -273,6 +314,10 @@ pub fn observeChoice(p: *const Protocol, state: *State, token_id: u32, bytes: ?[
         state.phase = .json_body;
         return .json;
     };
+    // JSON-legal whitespace does not resolve the choice: an opener or a JSON
+    // value can both follow. Stay ambiguous (the cursor is untouched — the
+    // opener match is byte-exact) and keep the grammar unfed.
+    if (isJsonWhitespaceRun(b)) return .progress;
     if (openerCompletedBy(p, state.open_cursor, b)) {
         state.phase = .reasoning;
         return .opened;
@@ -312,12 +357,16 @@ pub fn applyChoiceMask(
     } else {
         @memset(mask, false);
     }
+    const closer = p.closerText();
     for (p.opener_candidates) |id| {
         if (id >= mask.len or mask[id]) continue;
         const bytes = tb.bytes[id] orelse continue;
         if (tb.eos_id) |eos| {
             if (id == eos) continue;
         }
+        // A candidate whose bytes contain the close delimiter would emit the
+        // BOUNDARY as opener progress; it is never a legal choice token.
+        if (std.mem.indexOf(u8, bytes, closer) != null) continue;
         const cursor = state.open_cursor;
         if (openerContinuesFrom(p, cursor, bytes) or openerCompletedBy(p, cursor, bytes)) {
             mask[id] = true;
@@ -328,6 +377,42 @@ pub fn applyChoiceMask(
 }
 
 // ── Reasoning-phase close recognition ────────────────────────────────────────
+
+/// The ONE close-delimiter transition mechanism: per-byte matcher stepping
+/// shared by post-sampling observation and the pre-sample candidate probe,
+/// so recognition and masking can never drift apart.
+const CloseSim = struct {
+    closer: []const u8,
+    match: u8,
+    tail: [MAX_MARKER_BYTES]u8 = undefined,
+    tail_len: u8 = 0,
+
+    fn init(closer: []const u8, match: u8, tail_src: []const u8) CloseSim {
+        var sim = CloseSim{ .closer = closer, .match = match };
+        const n = @min(tail_src.len, MAX_MARKER_BYTES);
+        @memcpy(sim.tail[0..n], tail_src[tail_src.len - n ..]);
+        sim.tail_len = @intCast(n);
+        return sim;
+    }
+
+    /// Feed one byte; true when the closer just completed.
+    fn feed(self: *CloseSim, c: u8) bool {
+        if (self.tail_len < MAX_MARKER_BYTES) {
+            self.tail[self.tail_len] = c;
+            self.tail_len += 1;
+        } else {
+            std.mem.copyForwards(u8, self.tail[0 .. MAX_MARKER_BYTES - 1], self.tail[1..]);
+            self.tail[MAX_MARKER_BYTES - 1] = c;
+        }
+        if (c == self.closer[self.match]) {
+            self.match += 1;
+            if (self.match == self.closer.len) return true;
+        } else {
+            self.match = longestClosePrefix(self.tail[0..self.tail_len], self.closer);
+        }
+        return false;
+    }
+};
 
 /// Longest length k such that the last k bytes of `text` equal a prefix of
 /// `closer`. Bounded by the delimiter size; this is what lets the matcher
@@ -340,28 +425,120 @@ fn longestClosePrefix(tail: []const u8, closer: []const u8) u8 {
     return 0;
 }
 
+/// Where a close completion would land inside `bytes` given the current
+/// match state, WITHOUT mutating tracked state. One past the closer's last
+/// byte, or null. Pure — this is the probe the reasoning-phase mask runs
+/// over boundary-sensitive candidates before they can be sampled.
+pub fn probeCloseCompletion(p: *const Protocol, state: *const State, bytes: []const u8) ?usize {
+    var sim = CloseSim.init(p.closerText(), state.close_match, state.tail[0..state.tail_len]);
+    for (bytes, 0..) |c, i| {
+        if (sim.feed(c)) return i + 1;
+    }
+    return null;
+}
+
 /// Feed one reasoning token through the close-delimiter matcher.
 /// Returns the payload suffix carried by this token when the close completed
 /// inside it (may be empty), else null.
 pub fn observeReasoningToken(p: *const Protocol, state: *State, token_id: u32, bytes: ?[]const u8) ?[]const u8 {
     if (p.closer_atomic) |aid| {
-        if (token_id == aid) return bytes orelse "";
+        // An atomic close has no bytes: the payload it carries is empty by
+        // definition, whatever the tokenizer's decode says.
+        if (token_id == aid) return "";
     }
     const b = bytes orelse return null;
-    const closer = p.closerText();
+    var sim = CloseSim.init(p.closerText(), state.close_match, state.tail[0..state.tail_len]);
     for (b, 0..) |c, i| {
-        state.pushTail(c);
-        if (c == closer[state.close_match]) {
-            state.close_match += 1;
-            if (state.close_match == closer.len) {
-                state.close_match = 0;
-                return b[i + 1 ..];
-            }
-        } else {
-            state.close_match = longestClosePrefix(state.tail[0..state.tail_len], closer);
+        if (sim.feed(c)) {
+            state.close_match = 0;
+            return b[i + 1 ..];
         }
     }
+    state.close_match = sim.match;
+    @memcpy(state.tail[0..sim.tail_len], sim.tail[0..sim.tail_len]);
+    state.tail_len = sim.tail_len;
     return null;
+}
+
+/// Upper bound on tokens masked out in one reasoning step (the candidate
+/// sets are tiny; the cap only bounds a pathological vocabulary).
+const MAX_MASKED_OUT = 256;
+
+/// Reasoning-phase pre-sample validation: among the boundary-sensitive
+/// candidates — tokens containing the full close delimiter, plus, while a
+/// partial match is open, tokens beginning with the remaining delimiter
+/// bytes — those whose payload suffix the grammar REJECTS are masked out
+/// BEFORE sampling, so a close-sharing token can never bypass the schema by
+/// degrading enforcement afterwards. Returns the number of masked-out ids;
+/// 0 means nothing was excluded and the caller may sample unconstrained.
+pub fn applyReasoningMask(
+    p: *const Protocol,
+    state: *const State,
+    grammar: *json_grammar.Grammar,
+    tb: *const token_mask.TokenBytes,
+    mask: []bool,
+) std.mem.Allocator.Error!usize {
+    if (grammar.isDead()) return 0;
+    std.debug.assert(mask.len == tb.bytes.len);
+    var invalid: [MAX_MASKED_OUT]u32 = undefined;
+    var n: usize = 0;
+
+    const snap = try grammar.snapshot();
+    defer grammar.discardSnapshot(snap);
+
+    if (p.closer_span_candidates.len > 0) {
+        for (p.closer_span_candidates) |id| {
+            if (id >= mask.len) continue;
+            const bytes = tb.bytes[id] orelse continue;
+            if (tb.eos_id) |eos| {
+                if (id == eos) continue;
+            }
+            if (probeCloseCompletion(p, state, bytes)) |end| {
+                const suffix = bytes[end..];
+                try grammar.restoreFrom(snap);
+                var ok = true;
+                for (suffix) |c| {
+                    if (!try grammar.acceptByteFast(c)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (!ok and n < invalid.len) {
+                    invalid[n] = id;
+                    n += 1;
+                }
+            }
+        }
+    }
+    if (state.close_match > 0 and state.close_match < p.closer_len) {
+        const rest = p.closerText()[state.close_match..];
+        // Any token beginning with the remaining delimiter bytes completes
+        // the close at its first bytes; only a schema-valid suffix may ride
+        // along. The by_first bucket bounds the scan to plausible starters.
+        for (tb.by_first[rest[0]]) |id| {
+            if (id >= mask.len) continue;
+            const bytes = tb.bytes[id] orelse continue;
+            if (!std.mem.startsWith(u8, bytes, rest)) continue;
+            const suffix = bytes[rest.len..];
+            try grammar.restoreFrom(snap);
+            var ok = true;
+            for (suffix) |c| {
+                if (!try grammar.acceptByteFast(c)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok and n < invalid.len) {
+                invalid[n] = id;
+                n += 1;
+            }
+        }
+    }
+    try grammar.restoreFrom(snap);
+    if (n == 0) return 0;
+    @memset(mask, true);
+    for (invalid[0..n]) |id| mask[id] = false;
+    return n;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -388,8 +565,11 @@ const Vocab = struct {
     const prose: u32 = 7; // "hello"
     const lt: u32 = 8; // "<"
     const eos: u32 = 9;
-    const span_close_json: u32 = 10; // "</think>{"
+    const span_close_json: u32 = 10; // close bytes followed by "{"
     const span_gt_reason: u32 = 11; // ">x": completes the opener plus reasoning
+    const span_close_invalid: u32 = 12; // close bytes followed by "x" (schema-invalid)
+    const ws_nl: u32 = 13; // "\n"
+    const COUNT: u32 = 14;
 
     fn build(a: std.mem.Allocator) !token_mask.TokenBytes {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -397,7 +577,8 @@ const Vocab = struct {
         const al = arena.allocator();
         var list: std.ArrayList(?[]const u8) = .empty;
         const words = [_]?[]const u8{
-            "<think", ">", "</think>", null, "{", "}", " ", "hello", "<", null, "</think>{", ">x",
+            "<think", ">", BARE_THINK_CLOSER, null, "{", "}", " ", "hello", "<", null,
+            BARE_THINK_CLOSER ++ "{", ">x", BARE_THINK_CLOSER ++ "x", "\n",
         };
         for (words) |w| try list.append(al, if (w) |s| try al.dupe(u8, s) else null);
         return token_mask.TokenBytes.init(arena, try list.toOwnedSlice(al), eos);
@@ -427,7 +608,7 @@ test "choice mask at cursor 0: opener candidates and JSON starts, nothing else" 
     });
 
     var state = State.initChoice();
-    var mask: [Vocab.span_gt_reason + 1]bool = undefined;
+    var mask: [Vocab.COUNT]bool = undefined;
     const allowed = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
 
     try testing.expect(mask[Vocab.opener]); // "<think" starts the opener
@@ -457,7 +638,7 @@ test "choice mask: once opener bytes are in flight only opener continuations rem
     });
 
     var state = State.initChoice();
-    var mask: [Vocab.span_gt_reason + 1]bool = undefined;
+    var mask: [Vocab.COUNT]bool = undefined;
     _ = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
 
     // The model committed to "<think": JSON is no longer reachable.
@@ -521,7 +702,7 @@ test "choice: the atomic opener id resolves without bytes" {
     proto.opener_atomic = Vocab.close_atomic;
 
     var state = State.initChoice();
-    var mask: [Vocab.span_gt_reason + 1]bool = undefined;
+    var mask: [Vocab.COUNT]bool = undefined;
     _ = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
     try testing.expect(mask[Vocab.close_atomic]);
 
@@ -717,4 +898,215 @@ test "marker bytes beyond the matcher window cannot desync the tail" {
     try testing.expect(observeReasoningToken(&proto, &state, 300, &flood) == null);
     try testing.expect(state.tail_len == MAX_MARKER_BYTES);
     try testing.expect(observeReasoningToken(&proto, &state, 301, "</think>") != null);
+}
+
+test "payload offset is safe for atomic close tokens (no bytes)" {
+    // The atomic close has null TokenBytes: the offset must come from the
+    // bytes we actually observed, never a forced optional unwrap.
+    try testing.expectEqual(@as(u32, 0), payloadByteOffset(null, ""));
+    const bytes = BARE_THINK_CLOSER ++ "{x";
+    try testing.expectEqual(@as(u32, bytes.len - 2), payloadByteOffset(bytes, "{x"));
+    try testing.expectEqual(@as(u32, bytes.len), payloadByteOffset(bytes, ""));
+}
+
+test "production opener predicate admits continuation tokens" {
+    const opener = BARE_THINK_OPENER; // "<think"
+    try testing.expect(openerCandidateBytesMatch(opener, "<"));
+    try testing.expect(openerCandidateBytesMatch(opener, "<th"));
+    try testing.expect(openerCandidateBytesMatch(opener, "<think"));
+    // Continuations past byte 6: ">" completes the opener.
+    try testing.expect(openerCandidateBytesMatch(opener, ">"));
+    // Completions carrying reasoning payload.
+    try testing.expect(openerCandidateBytesMatch(opener, ">x"));
+    // Unrelated tokens never match.
+    try testing.expect(!openerCandidateBytesMatch(opener, "prose"));
+    try testing.expect(!openerCandidateBytesMatch(opener, "{"));
+    try testing.expect(!openerCandidateBytesMatch(opener, "x>"));
+}
+
+test "choice mask built from the PRODUCTION candidate builder admits continuations" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var tb = try Vocab.build(testing.allocator);
+    defer tb.deinit();
+
+    // Build the candidate list exactly the way LoadedModel does: scan the
+    // vocabulary through the shared predicate. No hand-picked lists.
+    var cands: std.ArrayList(u32) = .empty;
+    defer cands.deinit(testing.allocator);
+    for (tb.bytes, 0..) |maybe, id| {
+        const b = maybe orelse continue;
+        if (openerCandidateBytesMatch(BARE_THINK_OPENER, b)) {
+            try cands.append(testing.allocator, @intCast(id));
+        }
+    }
+
+    var proto = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, cands.items);
+    proto.closer_atomic = null;
+
+    var state = State.initChoice();
+    var mask: [Vocab.COUNT]bool = undefined;
+    // Cursor 0: opener starters are available.
+    _ = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
+    try testing.expect(mask[Vocab.lt]);
+    try testing.expect(mask[Vocab.opener]);
+    // The close spelling is never opener progress even when the predicate
+    // matches it (full-opener tokens are excluded at mask time).
+    try testing.expect(!mask[Vocab.close_full]);
+
+    // Commit "<think" (6 bytes), then ask again: the production list MUST
+    // still offer a completion (">" or a ">x" span) — an empty legal set here
+    // is the failure that disabled constraints in production.
+    const out = observeChoice(&proto, &state, Vocab.opener, tb.bytes[Vocab.opener]);
+    try testing.expectEqual(ChoiceOutcome.progress, out);
+    _ = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
+    try testing.expect(mask[Vocab.close_gt]); // ">" completes
+    try testing.expect(mask[Vocab.span_gt_reason]); // ">x" completes with reasoning
+
+    const done = observeChoice(&proto, &state, Vocab.close_gt, tb.bytes[Vocab.close_gt]);
+    try testing.expectEqual(ChoiceOutcome.opened, done);
+}
+
+test "choice: whitespace keeps the channel choice ambiguous" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var tb = try Vocab.build(testing.allocator);
+    defer tb.deinit();
+
+    var proto = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, &.{
+        Vocab.opener, Vocab.lt, Vocab.close_gt, Vocab.span_gt_reason,
+    });
+
+    var state = State.initChoice();
+    // A leading space (JSON-legal whitespace) must NOT commit the choice:
+    // both the opener and JSON remain reachable afterwards.
+    const ws = observeChoice(&proto, &state, Vocab.json_ws, tb.bytes[Vocab.json_ws]);
+    try testing.expectEqual(ChoiceOutcome.progress, ws);
+    try testing.expectEqual(Phase.choice, state.phase);
+    try testing.expectEqual(@as(u8, 0), state.open_cursor);
+
+    const ws2 = observeChoice(&proto, &state, Vocab.ws_nl, tb.bytes[Vocab.ws_nl]);
+    try testing.expectEqual(ChoiceOutcome.progress, ws2);
+    try testing.expectEqual(Phase.choice, state.phase);
+
+    // The opener is still reachable after whitespace.
+    var mask: [Vocab.COUNT]bool = undefined;
+    _ = try applyChoiceMask(&proto, &state, &g, &tb, &mask);
+    try testing.expect(mask[Vocab.opener]);
+    try testing.expect(mask[Vocab.lt]);
+
+    // And a direct JSON token still resolves the choice.
+    const js = observeChoice(&proto, &state, Vocab.json_ob, tb.bytes[Vocab.json_ob]);
+    try testing.expectEqual(ChoiceOutcome.json, js);
+    try testing.expectEqual(Phase.json_body, state.phase);
+
+    // A fresh state proves the whitespace never entered the grammar: "{" is
+    // still the accepted first byte.
+    var g2 = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g2.deinit();
+    try testing.expect(try g2.acceptByte('{'));
+}
+
+test "reasoning mask rejects close-crossing tokens with schema-invalid payloads BEFORE sampling" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var tb = try Vocab.build(testing.allocator);
+    defer tb.deinit();
+
+    var proto = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    proto.closer_atomic = null;
+    // Production-style candidate set: every token whose bytes CONTAIN the
+    // full closer (the only tokens that can complete it from match 0).
+    var cands: std.ArrayList(u32) = .empty;
+    defer cands.deinit(testing.allocator);
+    for (tb.bytes, 0..) |maybe, id| {
+        const b = maybe orelse continue;
+        if (std.mem.indexOf(u8, b, BARE_THINK_CLOSER) != null) {
+            try cands.append(testing.allocator, @intCast(id));
+        }
+    }
+    proto.closer_span_candidates = cands.items;
+
+    var state = State.initPromptOpened();
+    var mask: [Vocab.COUNT]bool = undefined;
+    const masked_out = try applyReasoningMask(&proto, &state, &g, &tb, &mask);
+
+    // The invalid-payload crossing token ("close + x") must be excluded;
+    // the valid one ("close + {") must stay; ordinary reasoning tokens and
+    // EOS are untouched.
+    try testing.expect(masked_out >= 1);
+    try testing.expect(!mask[Vocab.span_close_invalid]);
+    try testing.expect(mask[Vocab.span_close_json]);
+    try testing.expect(mask[Vocab.prose]);
+    try testing.expect(mask[Vocab.eos]);
+    // With NO boundary-sensitive candidates and no partial match in flight,
+    // the probe is a no-op and the caller keeps the unconstrained fast path.
+    proto.closer_span_candidates = &.{};
+    var state2 = State.initPromptOpened();
+    const masked_out2 = try applyReasoningMask(&proto, &state2, &g, &tb, &mask);
+    try testing.expectEqual(@as(usize, 0), masked_out2);
+}
+
+test "reasoning mask validates partial-close continuations from the live match state" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    var tb = try Vocab.build(testing.allocator);
+    defer tb.deinit();
+
+    var proto = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    proto.closer_atomic = null;
+    // Production-style Set A: tokens whose bytes CONTAIN the full closer.
+    var cands: std.ArrayList(u32) = .empty;
+    defer cands.deinit(testing.allocator);
+    for (tb.bytes, 0..) |maybe, id| {
+        const b = maybe orelse continue;
+        if (std.mem.indexOf(u8, b, BARE_THINK_CLOSER) != null) {
+            try cands.append(testing.allocator, @intCast(id));
+        }
+    }
+    proto.closer_span_candidates = cands.items;
+
+    var mask: [Vocab.COUNT]bool = undefined;
+    _ = try applyReasoningMask(&proto, &freshReasoningState(), &g, &tb, &mask);
+
+    // Match state 8 of the 9-byte closer: the next byte must be ">".
+    var state = State.initPromptOpened();
+    state.close_match = @intCast(BARE_THINK_CLOSER.len - 1);
+    _ = try applyReasoningMask(&proto, &state, &g, &tb, &mask);
+    // ">x" completes with payload "x" — schema-invalid, masked out (Set B:
+    // the token begins with the remaining delimiter bytes).
+    try testing.expect(!mask[Vocab.span_gt_reason]);
+    // ">" completes with an empty payload — legal.
+    try testing.expect(mask[Vocab.close_gt]);
+    // Prose that neither continues nor completes the close is untouched.
+    try testing.expect(mask[Vocab.prose]);
+    try testing.expect(mask[Vocab.eos]);
+
+    // From an earlier partial (match 4, closer[4..] = "hink>"), candidates
+    // are re-judged from the LIVE state: the invalid close-span token
+    // re-completes after the diverging "<" resets the matcher and stays
+    // masked (Set A probe through the shared simulator); a diverging ">"
+    // is ordinary reasoning and stays legal.
+    var state2 = State.initPromptOpened();
+    state2.close_match = 4;
+    _ = try applyReasoningMask(&proto, &state2, &g, &tb, &mask);
+    try testing.expect(!mask[Vocab.span_close_invalid]);
+    try testing.expect(mask[Vocab.close_gt]);
+    try testing.expect(mask[Vocab.prose]);
+}
+
+fn freshReasoningState() State {
+    return State.initPromptOpened();
 }

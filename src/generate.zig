@@ -758,11 +758,12 @@ pub const GenerationResult = struct {
     /// ("length", which never moves — see `scheduler.loopStopReason`).
     /// Static string; nothing to free.
     finish_details: ?[]const u8 = null,
-    /// Where the constrained JSON payload begins relative to the generated
-    /// stream (token index + byte offset inside that token) when a reasoning
-    /// protocol was active. `token_index == 0` = direct answer: the whole
-    /// text is payload. Null when no protocol ran or the payload never began.
-    constraint_payload_start: ?rp_mod.ConstraintSpan = null,
+    /// Absolute byte offset into `text` where the constrained JSON payload
+    /// begins, when a reasoning protocol was active and the payload began.
+    /// 0 = direct answer. Null when no protocol ran, the payload never began
+    /// (completion cap mid-reasoning), or the boundary fell outside the
+    /// emitted (loop-trimmed) tokens.
+    constraint_payload_byte: ?usize = null,
 };
 
 /// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths
@@ -8902,7 +8903,18 @@ pub const Generator = struct {
             if (owns_step_logits) _ = mlx.mlx_array_free(step_logits);
         }
 
-        const lazy = self.sampleLazy(step_logits);
+        // Boundary-crossing candidates (tokens carrying the close delimiter
+        // plus a payload suffix) are validated BEFORE they can be sampled: a
+        // suffix the schema rejects is masked out here, never sampled and
+        // degraded afterwards.
+        const invalid_crossers = try rp_mod.applyReasoningMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        const lazy = blk: {
+            if (invalid_crossers == 0) break :blk self.sampleLazy(step_logits);
+            var masked_logits = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(masked_logits);
+            try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.s);
+            break :blk self.sampleLazy(masked_logits);
+        };
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
@@ -8954,9 +8966,9 @@ pub const Generator = struct {
         const payload_suffix = rp_mod.observeReasoningToken(proto, &constraint.pstate, token, token_bytes);
         if (payload_suffix) |suffix| {
             // The close delimiter completed inside this token; any bytes after
-            // it are the first payload bytes. Feed them to the grammar now —
-            // they were sampled unconstrained, so an invalid suffix degrades
-            // the same way an invalid sampled token does.
+            // it are the first payload bytes. The pre-sample mask validated
+            // every crossing candidate's suffix, so acceptance here is
+            // expected; the degrade below is a defensive last resort.
             for (suffix) |b| {
                 const ok = try constraint.grammar.acceptByte(b);
                 if (!ok) {
@@ -8966,10 +8978,14 @@ pub const Generator = struct {
                 }
             }
             constraint.pstate.phase = .json_body;
-            constraint.pending_span = .{
-                .token_index = @intCast(self.generated_ids.items.len),
-                .byte_offset = @intCast(token_bytes.?.len - suffix.len),
-            };
+            // A byte-spelled close shares this token: the payload begins at
+            // byte_offset inside it. An atomic close has no bytes at all —
+            // the payload begins with the NEXT token (never unwrap the
+            // null token bytes).
+            constraint.pending_span = if (token_bytes == null)
+                .{ .token_index = @intCast(self.generated_ids.items.len + 1), .byte_offset = 0 }
+            else
+                .{ .token_index = @intCast(self.generated_ids.items.len), .byte_offset = rp_mod.payloadByteOffset(token_bytes, suffix) };
             self.loop_guard_start = self.generated_ids.items.len;
             log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
         }
