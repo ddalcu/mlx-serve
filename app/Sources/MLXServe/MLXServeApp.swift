@@ -30,6 +30,9 @@ struct MLXCoreApp: App {
     }()
 
     @NSApplicationDelegateAdaptor(MLXCoreAppDelegate.self) private var appDelegate
+    /// The View ▸ Interface menu writes the same keys the Settings rows do.
+    @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
     @Environment(\.openWindow) private var openWindow
@@ -88,7 +91,6 @@ struct MLXCoreApp: App {
                 openServerLog: { openAndFocus("serverLog") },
                 openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
-                openSandboxTerminal: { openAndFocus("sandboxTerminal") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -138,6 +140,7 @@ struct MLXCoreApp: App {
                 // Settings, Tasks and Agents render here as modes too, so their
                 // objects ride this scene (`ChatWorkspace`).
                 .environmentObject(appState.taskScheduler)
+                .environmentObject(appState.terminals)
                 .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .environmentObject(appState.toolExecutor)
@@ -190,17 +193,22 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 560)
 
-        // The Sandbox window: an embedded terminal for agent CLI sessions
-        // (pi / hermes / shell over ssh) inside the guest, plus the Activity
-        // transcript of everything running in it. Title tracks the live
-        // session via .navigationTitle ("pi — MLX Sandbox").
-        Window("MLX Sandbox", id: "sandboxTerminal") {
-            SandboxTerminalView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .appAppearance()
+        // A sandbox terminal moved out of the chat window ("Move Tab to New
+        // Window", 2026-09-02). One window per session id; the session itself
+        // stays in `appState.terminals` — the window only hosts its view, so
+        // closing the window puts the terminal back in the sidebar's detail
+        // column and ends nothing.
+        WindowGroup("Terminal", id: "terminalWindow", for: UUID.self) { $sessionId in
+            if let sessionId {
+                TerminalWindowView(sessionId: sessionId)
+                    .environmentObject(appState)
+                    .environmentObject(appState.server)
+                    .environmentObject(appState.terminals)
+                    .frame(minWidth: 560, minHeight: 360)
+                    .appAppearance()
+            }
         }
-        .defaultSize(width: 780, height: 560)
+        .defaultSize(width: 900, height: 600)
 
         // Agents (personas): who you're talking to, and the settings that
         // conversation runs under. Configuration only — chatting with an agent
@@ -282,6 +290,33 @@ struct MLXCoreApp: App {
             // the tray popover, reachable from the menu bar and Help-menu
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
+            // View ▸ Interface: the same `@AppStorage` keys the Settings rows
+            // write. `CommandGroup`, not `CommandMenu("View")`, which would
+            // build a second View menu beside the system one.
+            CommandGroup(after: .sidebar) {
+                Menu {
+                    ForEach(ChatColumnWidth.allCases) { width in
+                        Toggle(isOn: Binding(
+                            get: { chatColumnRaw == width.rawValue },
+                            set: { if $0 { chatColumnRaw = width.rawValue } }
+                        )) {
+                            Text("\(width.label) chat column")
+                        }
+                        .keyboardShortcut(width.menuShortcut, modifiers: [.command, .option])
+                    }
+
+                    Divider()
+
+                    // Never a bare Control combo: menu key equivalents run
+                    // before keyDown, so ⌃C would be stolen from the embedded
+                    // terminal.
+                    Toggle("Compact mode", isOn: $compactMode)
+                        .keyboardShortcut("c", modifiers: [.command, .option])
+                } label: {
+                    Label("Interface", systemImage: "paintbrush")
+                }
+            }
+
             CommandMenu("Tools") {
                 // ⌘L: the model switcher, over the same rows the composer's
                 // pill offers. A menu key equivalent so it works from every

@@ -126,7 +126,10 @@ enum SandboxAgentRegistry {
 
     /// The session bootstrap. Runs under `ssh -t` as a plain (non-login)
     /// command, so it exports its own PATH rather than relying on `.profile`.
-    static func bootstrapScript(for spec: SandboxAgentSpec, model: String) -> String {
+    /// `cwd` is the guest path of the session's workspace: `/workspace` for the
+    /// Settings default, `/projects/<slug>` for a hot-mounted folder.
+    static func bootstrapScript(for spec: SandboxAgentSpec, model: String,
+                                cwd: String = "/workspace") -> String {
         // Dummy args — only the guest PATHS matter here, and every spec's
         // path set is argument-independent (pinned by the registry tests).
         let configPaths = spec.configFiles(model, 0, AgentBudget.fallback, nil, [])
@@ -148,7 +151,7 @@ enum SandboxAgentRegistry {
           echo "Installing \(spec.displayName) (first run — output streams below)…"
           \(spec.installScript) || { echo "mlx-serve: \(spec.displayName) install failed" >&2; exit 1; }
         fi
-        cd /workspace 2>/dev/null || echo "mlx-serve: /workspace share missing — starting in $HOME" >&2
+        cd \(VzGuest.shellQuote(cwd)) 2>/dev/null || echo "mlx-serve: workspace share missing — starting in $HOME" >&2
         exec \(spec.launchCommand(model))
         """
     }
@@ -160,7 +163,8 @@ enum SandboxAgentRegistry {
     @discardableResult
     static func materialize(spec: SandboxAgentSpec, model: String, serverPort: UInt16,
                             budget: AgentBudget.Budget, apiKey: String?,
-                            entries: [AgentModelEntry], rootfsDir: String) throws -> String {
+                            entries: [AgentModelEntry], rootfsDir: String,
+                            cwd: String = "/workspace") throws -> String {
         let fm = FileManager.default
         for file in spec.configFiles(model, serverPort, budget, apiKey, entries) {
             let host = rootfsDir + file.guestPath
@@ -170,7 +174,7 @@ enum SandboxAgentRegistry {
         }
         let bootstrap = bootstrapPath(agentId: spec.id)
         let bootstrapHost = rootfsDir + bootstrap
-        try bootstrapScript(for: spec, model: model)
+        try bootstrapScript(for: spec, model: model, cwd: cwd)
             .write(toFile: bootstrapHost, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bootstrapHost)
         return bootstrap

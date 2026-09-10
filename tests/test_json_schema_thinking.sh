@@ -1,14 +1,8 @@
 #!/bin/bash
-# Guard (issue #331): JSON-schema output + thinking enabled must land the JSON
-# in CONTENT, on every surface that builds a grammar mask.
-#
-# The grammar mask constrains from token 0 and cannot express "think first,
-# then JSON". On a template that ends the rendered prompt inside a bare
-# <think> block (qwen3.5/3.8), `</think>` is not valid JSON, so the model
-# emits the schema-valid object INSIDE the reasoning block and `content`
-# ships empty. /v1/messages got the rule in the output_config fix (a schema
-# request is a content-only contract — thinking forced off, pinned by
-# test_output_config.sh); /v1/chat/completions and /v1/responses did not.
+# Guard (issue #331): completed schema JSON must reach CONTENT on every mask-building
+# surface. Supported unlimited Qwen reasoning may defer the grammar; requests
+# with a finite response-side reasoning budget retain the thinking-off fallback.
+# Exhausting max_tokens during reasoning may leave content empty with length.
 #
 # Greedy throughout. Usage: ./tests/test_json_schema_thinking.sh [model_dir] [port]
 
@@ -69,7 +63,7 @@ fi
 echo "=== /v1/chat/completions: same request, stream ==="
 STREAM=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
     \"model\": \"mlx-serve\", \"max_tokens\": 512, \"temperature\": 0, \"stream\": true,
-    \"reasoning_effort\": \"medium\",
+    \"reasoning_effort\": \"low\",
     \"response_format\": {\"type\": \"json_schema\", \"json_schema\": {\"name\": \"answer\", \"strict\": true, \"schema\": $SCHEMA}},
     \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}]
 }")
@@ -82,7 +76,7 @@ fi
 
 echo "=== /v1/responses: reasoning.effort + text.format json_schema ==="
 BODY=$(curl -s -m 300 "$BASE/v1/responses" -H "Content-Type: application/json" -d "{
-    \"model\": \"mlx-serve\", \"max_output_tokens\": 512, \"temperature\": 0, \"stream\": false,
+    \"model\": \"mlx-serve\", \"max_output_tokens\": 2048, \"temperature\": 0, \"stream\": false,
     \"reasoning\": {\"effort\": \"medium\"},
     \"text\": {\"format\": {\"type\": \"json_schema\", \"name\": \"answer\", \"strict\": true, \"schema\": $SCHEMA}},
     \"input\": \"$PROMPT\"
@@ -94,14 +88,65 @@ else
     run_test "schema JSON lands in output_text (responses)" FAIL "output_text: '$(echo "$RTEXT" | head -c 120)'"
 fi
 
-# The pass condition above is meaningless if the mask never ran (prompt-only
-# enforcement can luck into valid JSON on a 0.8B).
-N_MASKS=$(grep -c "\[grammar\] enforcing JSON schema" "$LOG")
-if [ "$N_MASKS" -ge 3 ]; then
-    run_test "grammar mask engaged on all three requests" PASS ""
+echo "=== /v1/messages: finite thinking budget + json_schema, stream ==="
+STREAM=$(curl -s -m 300 -N "$BASE/v1/messages" -H "Content-Type: application/json" -d "{
+    \"model\": \"mlx-serve\", \"max_tokens\": 512, \"temperature\": 0, \"stream\": true,
+    \"thinking\": {\"type\": \"enabled\", \"budget_tokens\": 256},
+    \"output_config\": {\"format\": {\"type\": \"json_schema\", \"schema\": $SCHEMA}},
+    \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}]
+}")
+MTEXT=$(echo "$STREAM" | sed -n 's/^data: //p' | jq -rj 'select(.type=="content_block_delta" and .delta.type=="text_delta") | .delta.text' 2>/dev/null)
+if echo "$MTEXT" | jq -e 'has("answer")' >/dev/null 2>&1; then
+    run_test "schema JSON lands in text delta (messages, finite budget)" PASS ""
 else
-    run_test "grammar mask engaged on all three requests" FAIL "enforcing lines: $N_MASKS/3"
+    run_test "schema JSON lands in text delta (messages, finite budget)" FAIL "streamed text: '$(echo "$MTEXT" | head -c 120)'"
 fi
+
+# Unlike a reasoning cutoff with answer capacity left, the hard completion cap
+# must not force a boundary, reserve answer tokens, or move reasoning to content.
+# This short request exercises exhaustion inside the prompt-opened think block;
+# only routing, accounting, and the finish reason matter, never the model's prose.
+for STREAMING in false true; do
+    echo "=== /v1/chat/completions: reasoning exhausts max_tokens, stream=$STREAMING ==="
+    BODY=$(curl -s -m 300 -N "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "{
+        \"model\": \"mlx-serve\", \"max_tokens\": 64, \"temperature\": 0, \"stream\": $STREAMING,
+        \"enable_thinking\": true, \"reasoning_budget_tokens\": -1,
+        \"stream_options\": {\"include_usage\": true},
+        \"response_format\": {\"type\": \"json_schema\", \"json_schema\": {\"name\": \"answer\", \"strict\": true, \"schema\": $SCHEMA}},
+        \"messages\": [{\"role\": \"user\", \"content\": \"$PROMPT\"}]
+    }")
+    if [ "$STREAMING" = true ]; then
+        RESULT=$(echo "$BODY" | sed -n 's/^data: \({.*}\)$/\1/p' | jq -s '{
+            finish_reason: [.[] | .choices[]? | .finish_reason // empty] | last,
+            completion_tokens: [.[] | .usage.completion_tokens // empty] | last,
+            content: [.[] | .choices[]? | .delta.content // empty] | join(""),
+            reasoning: [.[] | .choices[]? | .delta.reasoning_content // empty] | join("")
+        }' 2>/dev/null)
+    else
+        RESULT=$(echo "$BODY" | jq '{
+            finish_reason: .choices[0].finish_reason,
+            completion_tokens: .usage.completion_tokens,
+            content: (.choices[0].message.content // ""),
+            reasoning: (.choices[0].message.reasoning_content // "")
+        }' 2>/dev/null)
+    fi
+    if echo "$RESULT" | jq -e '.finish_reason == "length" and .completion_tokens == 64 and
+        .content == "" and (.reasoning | length > 0)' >/dev/null 2>&1; then
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" PASS ""
+    else
+        run_test "reasoning-only length stop respects completion cap (stream=$STREAMING)" FAIL "$(echo "$RESULT" | head -c 240)"
+    fi
+done
+
+grep -q '\[grammar\] finite reasoning budget; rerendered with thinking off' "$LOG" \
+    && run_test "finite budgets retain thinking-off fallback" PASS "" \
+    || run_test "finite budgets retain thinking-off fallback" FAIL "missing fallback log"
+grep -q '\[grammar\] deferring JSON schema' "$LOG" \
+    && run_test "supported unlimited request defers grammar" PASS "" \
+    || run_test "supported unlimited request defers grammar" FAIL "missing deferral log"
+grep -Eq '\[grammar\] reasoning boundary (reached|forced)' "$LOG" \
+    && run_test "deferred grammar activates at a boundary" PASS "" \
+    || run_test "deferred grammar activates at a boundary" FAIL "missing activation log"
 
 echo
 echo "=== $PASS/$TOTAL passed ==="

@@ -2,6 +2,13 @@ name: Feature request
 description: New capability or improvement
 labels: ["enhancement"]
 body:
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before opening
+      options:
+        - label: I searched open and closed issues, open PRs and recent commits for this, and it is not already reported or fixed
+          required: true
   - type: textarea
     id: problem
     attributes:

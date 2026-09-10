@@ -206,7 +206,7 @@ enum WorkspacePicker {
     /// practice — `AppActivation` just makes it explicit).
     @MainActor
     static func pickDirectory() -> String? {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false

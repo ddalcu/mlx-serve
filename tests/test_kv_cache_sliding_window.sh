@@ -185,17 +185,13 @@ TIME4=$((END - START))
 echo "  cache-miss request time: ${TIME4}ms"
 echo "  cache-hit request time (test 3): ${TIME3}ms"
 
-# If cache reuse works, TIME3 should be significantly faster than TIME4
-# (reusing ~500 token prefix vs encoding all ~520 tokens from scratch)
-# Use a generous threshold — cache hit should be at least 20% faster
-if [ "$TIME3" -gt 0 ] && [ "$TIME4" -gt 0 ]; then
-    SPEEDUP=$((TIME4 * 100 / TIME3))
-    echo "  cache-miss/cache-hit ratio: ${SPEEDUP}%"
-    # If ratio > 110%, cache reuse is working (miss is slower than hit)
-    assert_gt "cache hit is faster than cache miss" "$SPEEDUP" 110
-else
-    echo "  (timing too fast to compare)"
-fi
+# The claim is REUSE and the server reports it as `cached_tokens`; wall clock
+# cannot see a ~500-token prefill difference under 32 tokens of decode.
+CACHED3=$(echo "$RESULT3" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage'].get('prompt_tokens_details',{}).get('cached_tokens',0))" 2>/dev/null)
+CACHED4=$(echo "$RESULT4" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage'].get('prompt_tokens_details',{}).get('cached_tokens',0))" 2>/dev/null)
+echo "  cached_tokens: warm=$CACHED3, after an intervening prefix=$CACHED4"
+assert_gt "the warm request reuses the system prefix" "${CACHED3:-0}" 400
+assert_gt "the prefix survives an intervening conversation" "${CACHED4:-0}" 400
 
 echo ""
 echo "--- Test 5: Multi-turn with tools (simulates Claude Code agent loop) ---"

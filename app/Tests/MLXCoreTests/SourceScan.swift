@@ -4,8 +4,8 @@ import XCTest
 /// Shared machinery for the source-scan guards.
 ///
 /// Every scan in this target has the same first problem: the thing it greps for
-/// is also the thing the code COMMENTS about. `DialogDefaultActionTests` trips
-/// over a comment in SandboxTerminalView that discusses `.alert(`; the Escape
+/// is also the thing the code COMMENTS about. `DialogDefaultActionTests` tripped
+/// over a comment in the old sandbox window that discussed `.alert(`; the Escape
 /// guard counted a doc comment explaining why there are only two
 /// `.keyboardShortcut(.cancelAction)` claims as a third claim. One stripper, so
 /// the next scan starts from code.

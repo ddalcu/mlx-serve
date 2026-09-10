@@ -68,7 +68,8 @@ with open('$MODEL/config.json') as f:
     c = json.load(f)
 tc = c.get('text_config') or c
 mt = c.get('model_type', '')
-moe_layers = tc.get('num_local_experts', 0) > 0 or tc.get('num_experts', 0) > 0
+# A config may carry the key with a null value (dense sibling of a MoE family).
+moe_layers = (tc.get('num_local_experts') or 0) > 0 or (tc.get('num_experts') or 0) > 0
 gdn_dense = tc.get('full_attention_interval', 0) > 0 and not moe_layers
 hybrid = mt in ('qwen3_5', 'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'nemotron_h', 'lfm2', 'lfm2_vl')
 encoder = tc.get('is_encoder_only', False) or 'bert' in mt.lower()

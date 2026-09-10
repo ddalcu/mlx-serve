@@ -475,6 +475,8 @@ struct ChatView: View {
                     set: { appState.selectModelSection($0) }))
             } else if appState.chatWorkspace.isSettings {
                 SettingsView()
+            } else if case .terminal(let id) = appState.chatWorkspace {
+                TerminalPane(sessionId: id)
             } else if case .create(let experiment) = appState.chatWorkspace {
                 // The four generators were four Window scenes; they are pages
                 // of this window now. Each keeps its own view untouched — only
@@ -560,6 +562,42 @@ struct ChatView: View {
     private func cancelGate() {
         gateCancelled = true
         DispatchQueue.main.async { dismissWindow(id: "chat") }
+    }
+}
+
+/// Drag-to-reorder for one sidebar row: the row is a drag source carrying its
+/// id, and a drop target that takes the dragged row into its slot the moment
+/// the drag ENTERS it. `onDrag`/`onDrop` rather than `.draggable`, because the
+/// live reorder needs `dropEntered`, which only a `DropDelegate` gets.
+struct SidebarReorder: ViewModifier {
+    let id: UUID
+    @Binding var dragging: UUID?
+    let move: (UUID, UUID) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onDrag {
+                dragging = id
+                return NSItemProvider(object: id.uuidString as NSString)
+            }
+            .onDrop(of: [.text], delegate: Delegate(id: id, dragging: $dragging, move: move))
+    }
+
+    private struct Delegate: DropDelegate {
+        let id: UUID
+        @Binding var dragging: UUID?
+        let move: (UUID, UUID) -> Void
+
+        func dropEntered(info: DropInfo) {
+            guard let moved = dragging, moved != id else { return }
+            move(moved, id)
+        }
+        func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+        func performDrop(info: DropInfo) -> Bool {
+            dragging = nil
+            return true
+        }
+        func dropExited(info: DropInfo) {}
     }
 }
 
@@ -820,8 +858,14 @@ struct ChatSidebar: View {
     /// server and the agent store, so a badge reading `appState.downloads`
     /// never repainted while a transfer started, progressed or finished.
     @EnvironmentObject var downloads: DownloadManager
+    /// Sandbox terminals share the Chats section with the conversations.
+    @EnvironmentObject var terminals: TerminalSessionStore
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// The row being dragged to a new slot, nil outside a drag.
+    @State private var draggingRowId: UUID?
+    /// The rename dialog's text.
+    @State private var renameDraft = ""
     /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
     /// alone by shift itself so dragging a range up and down keeps re-ranging
     /// from the same origin instead of walking away from it.
@@ -893,16 +937,40 @@ struct ChatSidebar: View {
     /// instead of going to it. The flags are stated explicitly instead, and the
     /// decision itself is `ChatQuickSwitch.outcome`.
     private func quickSwitch(to slot: Int, extend: Bool) {
-        guard let outcome = ChatQuickSwitch.outcome(
+        let rows = panelRows
+        switch ChatQuickSwitch.target(
             slot: slot,
-            sessions: appState.visibleChatSessions,
+            visible: rows.visible,
+            chats: rows.chats,
             numbering: numberedRows,
             selection: appState.sidebarSelection,
             anchor: selectionAnchor,
             active: appState.activeChatId,
-            extend: extend)
-        else { return }
-        apply(outcome)
+            extend: extend) {
+        case .chat(let outcome)?: apply(outcome)
+        case .terminal(let id)?: showTerminal(id)
+        case nil: break
+        }
+    }
+
+    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
+    /// terminals interleaved), both in the ONE dragged order. `visible` is
+    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
+    /// a shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
+                            visible: [UUID], chats: [UUID]) {
+        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
+        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
+                                           order: appState.sidebarOrder)
+        let sessions = SidebarChatRows.merge(chats: groups.chats,
+                                             terminals: terminals.sessions.sessions,
+                                             order: appState.sidebarOrder)
+        let all = agents + sessions
+        let chats = all.compactMap { row -> UUID? in
+            if case .chat(let s) = row { return s.id }
+            return nil
+        }
+        return (agents, sessions, all.map(\.id), chats)
     }
 
     /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
@@ -939,21 +1007,31 @@ struct ChatSidebar: View {
             // Two sections, one row builder. Agent threads sit above the plain
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
-            let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-            // The panel's visual order, both sections flattened — a shift-click
-            // ranges across the Agents/Chats boundary, because the split is a
-            // heading, not a wall.
-            let ordered = groups.agents.map(\.id) + groups.chats.map(\.id)
+            // Conversations and sandbox terminals, one list (`panelRows`).
+            // Terminals take no part in multi-select; they do wear ⌘ numbers.
+            let rows = panelRows
+            let agentRows = rows.agents, sessionRows = rows.sessions
+            let visible = rows.visible, ordered = rows.chats
             LazyVStack(alignment: .leading, spacing: 2) {
-                if !groups.agents.isEmpty {
+                if !agentRows.isEmpty {
                     sectionHeader("Agents")
-                    ForEach(groups.agents) { session in
-                        sessionRow(session, ordered: ordered)
+                    ForEach(agentRows) { row in
+                        if case .chat(let session) = row {
+                            sessionRow(session, ordered: ordered)
+                                .modifier(reorderable(session.id, visible: visible))
+                        }
                     }
                 }
-                sectionHeader("Chats")
-                ForEach(groups.chats) { session in
-                    sessionRow(session, ordered: ordered)
+                sectionHeader("Sessions") { newSessionMenu }
+                ForEach(sessionRows) { row in
+                    switch row {
+                    case .chat(let session):
+                        sessionRow(session, ordered: ordered)
+                            .modifier(reorderable(session.id, visible: visible))
+                    case .terminal(let t):
+                        terminalRow(t)
+                            .modifier(reorderable(t.id, visible: visible))
+                    }
                 }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
@@ -1041,6 +1119,7 @@ struct ChatSidebar: View {
         // they address THIS view's conversation list; hidden in a background so
         // they cost no layout.
         .background(quickSwitchShortcuts)
+        .background(renameDialog)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1064,12 +1143,9 @@ struct ChatSidebar: View {
         // list of places stays where the eye learned it.
         .safeAreaInset(edge: .top) {
             VStack(spacing: 2) {
-                // New Chat, and beside it the choice of WHO the chat is with.
-                destinationRow("New Chat", icon: "square.and.pencil",
-                               selected: false) {
-                    appState.showConversation()
-                    _ = appState.newChatSession()
-                }
+                // Starting something new (a chat, a coding CLI) is the +
+                // beside the Sessions heading — one place, next to the list
+                // it adds to — rather than two destination rows up here.
                 destinationRow("Models", icon: "square.stack.3d.up",
                                selected: appState.chatWorkspace.isModels,
                                badge: activeDownloadCount) {
@@ -1107,13 +1183,8 @@ struct ChatSidebar: View {
                                selected: appState.chatWorkspace.isTasks) {
                     appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
                 }
-                // A launcher is a CHOICE of CLI, so the row is the menu it has
-                // always been (the tray's own list, shared) rather than an
-                // invented pane with one list in it.
-                codeLauncherRow
-
                 // No "Chats" heading here: the list carries its own section
-                // headers ("Agents", "Chats"), and one of them appears only
+                // headers ("Agents", "Sessions"), and one of them appears only
                 // when it has rows. A heading pinned in this inset could not
                 // do that — it would sit above an empty list announcing a
                 // section that isn't there.
@@ -1253,15 +1324,60 @@ struct ChatSidebar: View {
 
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // The stack owns the gutter; the heading owes only the row's inner
-            // inset, so it sits on the same left line as the labels under it.
-            .padding(.horizontal, ChatMetrics.sidebarRowInset)
-            .padding(.top, 10)
-            .padding(.bottom, 2)
+        sectionHeader(title) { EmptyView() }
+    }
+
+    /// A heading with an optional trailing control (the Sessions +).
+    private func sectionHeader<T: View>(_ title: String,
+                                        @ViewBuilder trailing: () -> T) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            trailing()
+        }
+        // The stack owns the gutter; the heading owes only the row's inner
+        // inset, so it sits on the same left line as the labels under it.
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+    }
+
+    /// The + beside Sessions: a new chat first, then the coding CLIs (the
+    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
+    /// Store build can't detect or launch other apps' CLIs).
+    private var newSessionMenu: some View {
+        Menu {
+            Button {
+                appState.showConversation()
+                _ = appState.newChatSession()
+            } label: {
+                Label("New Chat", systemImage: "square.and.pencil")
+            }
+            if BuildFeatures.current.cliLauncher {
+                Divider()
+                CLILauncherMenuItems(
+                    detector: cliDetector,
+                    baseURL: appState.server.baseURL,
+                    servedModelId: appState.server.chatModelId ?? "mlx-serve",
+                    serverContextLength: appState.server.chatModelInfo?.contextLength,
+                    models: appState.server.allModels,
+                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("New chat, or a coding agent in a terminal")
     }
 
     /// One conversation row, shared by both sections. `ordered` is the panel's
@@ -1300,6 +1416,12 @@ struct ChatSidebar: View {
                         Image(systemName: agent.symbol)
                             .font(.system(size: 10))
                             .foregroundStyle(Color.accentColor)
+                    } else if !session.isExternalBridge {
+                        // Every row in this column carries a glyph saying what
+                        // it is — a terminal, an agent, a plain conversation.
+                        Image(systemName: "bubble.left")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
                     }
                     Text(ChatSessionTitle.display(title: session.title,
                                                   agentName: agent?.name))
@@ -1342,16 +1464,7 @@ struct ChatSidebar: View {
         // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
         // a preference write per row per scroll frame, and outside this
         // transient mode nothing reads the answer.
-        .background {
-            if modifiers.commandHeld {
-                GeometryReader { proxy in
-                    let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
-                    Color.clear.preference(
-                        key: SidebarRowSpansKey.self,
-                        value: [session.id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
-                }
-            }
-        }
+        .background(rowSpanProbe(session.id))
         // One meaning for gray in this panel, and one SHAPE: the fill rides the
         // row's own content inside the stack's gutter, exactly as a
         // destination's `.background` does. (It was a `listRowBackground` once,
@@ -1373,27 +1486,8 @@ struct ChatSidebar: View {
         // joins the selection, so the pointer is regularly here with ⌘ held —
         // and the ✕ is one pixel away from a click meaning "delete this".
         .overlay(alignment: .trailing) {
-            if modifiers.commandHeld, let slot = ChatQuickSwitch.slot(for: session.id,
-                                                                      in: appState.visibleChatSessions,
-                                                                      numbering: numberedRows) {
-                Text("\(slot)")
-                    .font(.caption2.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.primary.opacity(0.08))
-                    )
-                    .padding(.trailing, ChatMetrics.sidebarRowInset)
-                    // Decoration: it must never eat the click that selects the
-                    // row it is drawn on.
-                    .allowsHitTesting(false)
-                    .transition(AnyTransition.asymmetric(
-                        insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
-                        removal: .opacity.animation(.easeOut(duration: 0.15))
-                     ))
-                    .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld)
+            if let badge = quickSwitchBadge(for: session.id) {
+                badge
             } else if hoveredSessionId == session.id {
                 Button {
                     requestDeleteChats([session.id], keyboard: false)
@@ -1412,6 +1506,7 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
+            Button("Rename…") { beginRename(session.id, current: session.title) }
             // Right-clicking INSIDE a multi-selection acts on all of it, and
             // says how many; right-clicking outside one is a single delete.
             if appState.sidebarSelection.count > 1,
@@ -1424,6 +1519,213 @@ struct ChatSidebar: View {
                     requestDeleteChats([session.id], keyboard: false)
                 }
             }
+        }
+    }
+
+    /// One sandbox terminal row: the same chrome as a conversation row, a
+    /// terminal glyph tinted by phase, the workspace's folder as the caption.
+    @ViewBuilder
+    private func terminalRow(_ t: TerminalSessionList.Session) -> some View {
+        let isSelected = appState.chatWorkspace == .terminal(t.id)
+        Button {
+            KeyboardFocus.resignTextEditor(in: NSApp.keyWindow)
+            showTerminal(t.id)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: t.isInOwnWindow ? "macwindow" : "terminal")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(terminalTint(t.phase))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(t.displayName)
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(.primary)
+                    Text((t.workspace as NSString).lastPathComponent)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.leading, ChatMetrics.sidebarRowInset)
+            .padding(.trailing, ChatMetrics.sidebarRowInset + 18)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
+                   alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(rowSpanProbe(t.id))
+        .background(
+            RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                .fill(SidebarRowStyle.fill(selected: isSelected,
+                                           hovering: hoveredSessionId == t.id))
+        )
+        .overlay(alignment: .trailing) {
+            if let badge = quickSwitchBadge(for: t.id) {
+                badge
+            } else if hoveredSessionId == t.id {
+                Button {
+                    requestCloseTerminal(t.id)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                .help(t.isActive ? "End session" : "Close")
+            }
+        }
+        .onHover { isHovered in
+            hoveredSessionId = isHovered ? t.id : nil
+        }
+        .contextMenu {
+            Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            if t.isInOwnWindow {
+                Button("Show Window") { showTerminal(t.id) }
+            } else {
+                Button("Move Tab to New Window") { moveToNewWindow(t.id) }
+            }
+            Menu("Theme") {
+                Toggle("App Default", isOn: Binding(
+                    get: { t.themeId == nil },
+                    set: { _ in terminals.setTheme(t.id, themeId: nil) }))
+                Divider()
+                ForEach(TerminalTheme.all) { theme in
+                    Toggle(theme.name, isOn: Binding(
+                        get: { t.themeId == theme.id },
+                        set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
+                }
+            }
+            Button(t.isActive ? "End Session" : "Close", role: .destructive) {
+                requestCloseTerminal(t.id)
+            }
+        }
+        // Per row, so only the row asked presents; a live session's ✕ is a
+        // small target and a misclick must not kill a TUI.
+        .confirmationDialog(
+            "End the \(t.displayName) session?",
+            isPresented: Binding(get: { appState.pendingTerminalClose == t.id },
+                                 set: { if !$0 { appState.pendingTerminalClose = nil } })
+        ) {
+            Button("End Session", role: .destructive) { appState.closeTerminal(t.id) }
+                .keyboardShortcut(.defaultAction)
+            Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
+        } message: {
+            Text("The session running inside the sandbox will be terminated. Files it wrote are kept.")
+        }
+    }
+
+    /// Drag a row onto another to take its slot. Reorders LIVE as the drag
+    /// passes over rows (the `dropEntered` idiom), so the list shows where the
+    /// row will land; the drop itself only ends the drag.
+    private func reorderable(_ id: UUID, visible: [UUID]) -> SidebarReorder {
+        SidebarReorder(id: id, dragging: $draggingRowId) { moved, target in
+            appState.moveSidebarRow(moved, onto: target, visible: visible)
+        }
+    }
+
+    /// Where a row sits, so the numbering can skip whatever is under the
+    /// frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+    /// a preference write per row per scroll frame, and outside this
+    /// transient mode nothing reads the answer.
+    @ViewBuilder
+    private func rowSpanProbe(_ id: UUID) -> some View {
+        if modifiers.commandHeld {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: .named(ChatSidebar.bandSpace))
+                Color.clear.preference(
+                    key: SidebarRowSpansKey.self,
+                    value: [id: SidebarRowSpan(top: frame.minY, bottom: frame.maxY)])
+            }
+        }
+    }
+
+    /// The ⌘-digit badge for a row, nil when it wears none (⌘ up, or the row
+    /// is under the frost). Shared by chat and terminal rows — one panel, one
+    /// numbering.
+    private func quickSwitchBadge(for id: UUID) -> AnyView? {
+        guard modifiers.commandHeld,
+              let slot = ChatQuickSwitch.slot(for: id, visible: panelRows.visible,
+                                              numbering: numberedRows) else { return nil }
+        return AnyView(
+            Text("\(slot)")
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.primary.opacity(0.08))
+                )
+                .padding(.trailing, ChatMetrics.sidebarRowInset)
+                // Decoration: it must never eat the click that selects the
+                // row it is drawn on.
+                .allowsHitTesting(false)
+                .transition(AnyTransition.asymmetric(
+                    insertion: .opacity.animation(.easeIn(duration: 0.25).delay(0.2)),
+                    removal: .opacity.animation(.easeOut(duration: 0.15))
+                 ))
+                .animation(.easeInOut(duration: 0.25), value: modifiers.commandHeld))
+    }
+
+    private func beginRename(_ id: UUID, current: String) {
+        renameDraft = ChatSessionTitle.isPlaceholder(current) ? "" : current
+        appState.pendingRename = id
+    }
+
+    /// The one rename dialog, for chats and terminals alike.
+    private var renameDialog: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .alert("Rename Session",
+                   isPresented: Binding(get: { appState.pendingRename != nil },
+                                        set: { if !$0 { appState.pendingRename = nil } }),
+                   presenting: appState.pendingRename) { id in
+                TextField("Name", text: $renameDraft)
+                Button("Rename") {
+                    appState.renameSession(id, to: renameDraft)
+                    appState.pendingRename = nil
+                }
+                .keyboardShortcut(.defaultAction)
+                Button("Cancel", role: .cancel) { appState.pendingRename = nil }
+            } message: { _ in
+                Text("Leave it empty to go back to the automatic name.")
+            }
+    }
+
+    /// A terminal shows in the detail column, or — once moved out — in its
+    /// own window, which a repeat open only raises.
+    private func showTerminal(_ id: UUID) {
+        if terminals.sessions.session(id)?.isInOwnWindow == true {
+            AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+        } else {
+            appState.showTerminal(id)
+        }
+    }
+
+    private func moveToNewWindow(_ id: UUID) {
+        if appState.chatWorkspace == .terminal(id) { appState.showConversation() }
+        terminals.setInOwnWindow(id, true)
+        AppActivation.openWindow(id: "terminalWindow", value: id, using: openWindow)
+    }
+
+    private func terminalTint(_ phase: TerminalSessionList.Session.Phase) -> Color {
+        switch phase {
+        case .preparing: return .orange
+        case .live: return .green
+        case .exited: return .secondary
+        case .failed: return .red
+        }
+    }
+
+    /// Instant for exited/failed rows, confirmed while a session is alive.
+    private func requestCloseTerminal(_ id: UUID) {
+        if terminals.sessions.closeNeedsConfirmation(id) {
+            appState.pendingTerminalClose = id
+        } else {
+            appState.closeTerminal(id)
         }
     }
 
@@ -1472,34 +1774,6 @@ struct ChatSidebar: View {
         }
     }
 
-    /// The Code Launcher row: the tray's own CLI list, so the two can't drift.
-    /// DMG-only — the App Store build can't detect or launch other apps' CLIs,
-    /// and a row that can only fail is the dead-control class.
-    @ViewBuilder
-    private var codeLauncherRow: some View {
-        if BuildFeatures.current.cliLauncher {
-            Menu {
-                CLILauncherMenuItems(
-                    detector: cliDetector,
-                    baseURL: appState.server.baseURL,
-                    servedModelId: appState.server.chatModelId ?? "mlx-serve",
-                    serverContextLength: appState.server.chatModelInfo?.contextLength,
-                    models: appState.server.allModels,
-                    openSandboxAgent: { agentId in
-                        appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
-                        AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
-                    })
-            } label: {
-                // "Code", matching the tray's own Code button over the same menu.
-                destinationLabel("Code", icon: "terminal", selected: false)
-            }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .frame(height: ChatMetrics.sidebarButtonHeight)
-        }
-    }
-
     private var activeDownloadCount: Int {
         downloads.downloads.values.filter { $0.status == .downloading }.count
     }
@@ -1511,6 +1785,7 @@ struct ChatSidebar: View {
 struct ChatDetailView: View {
     let sessionId: UUID
     @EnvironmentObject var appState: AppState
+    @State private var modelSettings: ModelSettingsRequest?
     /// Observed directly (AppState does not forward download publishes) — the
     /// create banner's "not downloaded" pill and the held-prompt readiness
     /// checks must repaint when the bytes land.
@@ -1527,6 +1802,8 @@ struct ChatDetailView: View {
     // on the row stack, which is what forces the rebuild.
     @AppStorage(InterfacePrefKey.textSize) private var interfaceTextSize = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var interfaceCompact = false
+    /// Read only to rebuild the transcript when it changes.
+    @AppStorage(InterfacePrefKey.chatColumn) private var interfaceChatColumn = ChatColumnWidth.wide.rawValue
     @State private var inputText = ""
     /// Where ↑/↓ have walked back to in this chat's own history. Per-tab state
     /// like everything else here — `ChatDetailView` is REUSED across tabs, so a
@@ -1574,10 +1851,10 @@ struct ChatDetailView: View {
     /// `body`'s root view reports its first `onGeometryChange`.
     @State private var columnWidth: CGFloat = 0
 
-    /// The shared reading measure all three capped sites (transcript,
-    /// composer, empty-state greeting) apply. See `ChatMetrics.contentWidthFraction`.
+    /// The reading column (Settings ▸ Interface ▸ Chat Column) every capped
+    /// site shares: transcript, composer, empty-state greeting.
     private var contentWidth: CGFloat {
-        columnWidth > 0 ? columnWidth * ChatMetrics.contentWidthFraction : ChatMetrics.contentFallbackWidth
+        ChatMetrics.proseWidth(panelWidth: columnWidth)
     }
     @State private var composerHeight: CGFloat = 36
     // The composer's "create mode" (the chip rewired the composer into a
@@ -2045,6 +2322,30 @@ struct ChatDetailView: View {
         session?.messages.last { $0.role == .assistant }?.id
     }
 
+    private static let wordmark: NSImage? = {
+        let image = BundledAsset.image("mlx-serve-wordmark.png")
+        image?.isTemplate = true
+        return image
+    }()
+
+    /// The wordmark, anchored just under the toolbar on an empty plain chat:
+    /// a TEMPLATE image (alpha only), tinted with the label colour so it reads
+    /// in both modes — the source art is white on black and would vanish in
+    /// light mode.
+    @ViewBuilder
+    private var wordmarkHeader: some View {
+        if activeAgent == nil, let mark = Self.wordmark {
+            Image(nsImage: mark)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 240)
+                .foregroundStyle(.primary)
+                .padding(.top, 24)
+                .accessibilityLabel("MLX-Serve")
+        }
+    }
+
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
@@ -2093,6 +2394,7 @@ struct ChatDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             if isEmptyConversation {
+                wordmarkHeader
                 // Two SIBLING spacers (this one + the trailing one below the
                 // composer) split the slack evenly, so greeting + chips +
                 // composer sit as one group in the middle of the window.
@@ -2109,7 +2411,14 @@ struct ChatDetailView: View {
                                     message: m,
                                     sources: sourcesFor(m),
                                     onIncreaseContext: {
-                                        appState.showSettings()
+                                        let path = appState.selectedModelPath
+                                        let has = ModelSettingsFile.load().override(for: path)?.hasSettings ?? false
+                                        switch ContextIncreaseTarget.resolve(hasOverride: has) {
+                                        case .modelSettings:
+                                            modelSettings = ModelSettingsRequest(path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
+                                        case .appSettings:
+                                            appState.showSettings()
+                                        }
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
@@ -2160,8 +2469,10 @@ struct ChatDetailView: View {
                                         ? { appState.forkSession(sessionId, from: m.id) }
                                         : nil)
                                 .id(m.id)
-                            case .toolCall(let call, let results):
-                                ToolCallRow(call: call, results: results).id(call.id)
+                            case .toolCall(let call, let results, let calls, let owned):
+                                ToolCallRow(call: call, results: results, calls: calls,
+                                            ownedHandles: owned,
+                                            sessionId: sessionId).id(call.id)
                             }
                         }
                         // Live media generation, under the tool-call row that
@@ -2182,7 +2493,7 @@ struct ChatDetailView: View {
                     // @AppStorage pair above). Only fires on a Settings edit —
                     // the transcript isn't even visible then (Settings is a
                     // mode of this window), so the scroll reset is unseen.
-                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)")
+                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -2190,6 +2501,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
                 }
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what
@@ -2721,7 +3033,7 @@ struct ChatDetailView: View {
 
     /// Pick a folder of mixed documents to index in-memory for this session.
     private func pickDocumentFolder() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -2832,7 +3144,7 @@ struct ChatDetailView: View {
     // MARK: - Image Helpers
 
     private func pickAttachment() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         // Only offer audio/video on models that can use them.
         var types: [UTType] = [.image, .pdf]
         if videoSupported { types.append(.movie) }
@@ -3618,6 +3930,9 @@ struct MessageBubble: View {
     /// new chat and this one is left alone. nil when there would be nothing to
     /// fork (`ChatFork.isForkable`) or on a read-only surface.
     var onFork: (() -> Void)?
+    /// Hover over the whole row reveals the user turn's action row; the
+    /// buttons themselves start invisible.
+    @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
     @State private var isEditing = false
@@ -3638,31 +3953,47 @@ struct MessageBubble: View {
         }
     }
 
-    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
-    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
-    /// label, so the "Thinking" text was a dead click target — same fix as the
-    /// Agents editor's Advanced row (the label holds no buttons of its own, so
-    /// a tap gesture here can't swallow child clicks).
+    private var isThinkingNow: Bool {
+        message.isStreaming && message.content.isEmpty
+    }
+
+    /// Hand-built, not a `DisclosureGroup`: that pins its chevron to the
+    /// leading edge and hit-tests only the chevron.
     @ViewBuilder
     private var thinkingBlock: some View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-            DisclosureGroup(isExpanded: $thinkingExpanded) {
-                Text(reasoning)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Thinking", systemImage: "brain")
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "brain")
+                            .symbolEffect(.pulse, isActive: isThinkingNow)
+                        Text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds))
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
+                    }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
-                    }
+                }
+                .buttonStyle(.plain)
+
+                if thinkingExpanded {
+                    Text(reasoning)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            .padding(8)
-            .background(.quaternary.opacity(0.5))
+            // Collapsed = one line of type at the column edge, no container.
+            .padding(.horizontal, thinkingExpanded ? ChatMetrics.bubblePaddingH : 0)
+            .padding(.vertical, thinkingExpanded ? ChatMetrics.bubblePaddingV : 0)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(thinkingExpanded ? AnyShapeStyle(.quaternary.opacity(0.5))
+                                         : AnyShapeStyle(Color.clear))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
     }
@@ -3672,7 +4003,6 @@ struct MessageBubble: View {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                // Reasoning (collapsible)
                 thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
@@ -3684,7 +4014,7 @@ struct MessageBubble: View {
                 // it is the original the generator wrote, not a re-encode.
                 if let images = message.images, !images.isEmpty,
                    message.media?.contains(where: { $0.kind == .image }) != true {
-                    HStack(spacing: 4) {
+                    AttachmentFlowLayout(spacing: ChatMetrics.attachmentSpacing) {
                         ForEach(images) { img in
                             // No bytes: the file under `attachments/` is gone,
                             // or this message predates attachments on disk and
@@ -3699,16 +4029,21 @@ struct MessageBubble: View {
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
                             } else if let nsImage = NSImage(data: img.data) {
+                                // `.fill`: the rounded corners clip the frame,
+                                // so a letterboxed picture keeps square corners.
                                 Image(nsImage: nsImage)
                                     .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 400, maxHeight: 300)
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
+                                           height: ChatMetrics.attachmentHeight)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                                     .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
                                     .help("Double-click to open in Preview")
                             }
                         }
                     }
+                    // The whole column, not the bubble's reading measure.
+                    .frame(maxWidth: .infinity, alignment: .trailing)
                 }
 
                 // Generated tracks / clips, attached by path (see ChatMediaRef).
@@ -3793,7 +4128,10 @@ struct MessageBubble: View {
                     .background(bubbleBackground)
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: isBare ? 0 : ChatMetrics.bubbleCornerRadius))
-                    .frame(maxWidth: .infinity, alignment: isBare ? .leading : .trailing)
+                    // Cap on the bubble, not the text: a frame on the text
+                    // stretches a one-line question across the width.
+                    .frame(maxWidth: message.role == .user ? ChatMetrics.userBubbleMaxWidth : .infinity,
+                           alignment: isBare ? .leading : .trailing)
                 }
 
                 // A cut reply's notice: DATA on the message, drawn as a footnote
@@ -3817,10 +4155,20 @@ struct MessageBubble: View {
                 }
 
                 if showsFooter { footer }
+                if showsUserActions { userActions }
             }
-
-            if message.role == .assistant { Spacer(minLength: 60) }
+            // Turn gap keyed on the footer, not the role: an assistant turn is
+            // several rows (thinking-only message, tool card, reply).
+            .padding(.bottom, message.role == .user
+                     ? ChatMetrics.userBubbleBottomPadding
+                     : (showsFooter ? ChatMetrics.assistantTurnBottomPadding : 0))
+            .frame(maxWidth: .infinity,
+                   alignment: message.role == .user ? .trailing : .leading)
         }
+        // Hover must cover the transparent action row too, or it vanishes as
+        // the pointer approaches it.
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
             if onEdit != nil {
@@ -3931,25 +4279,12 @@ struct MessageBubble: View {
             && !message.isAgentSummary && !message.content.isEmpty
     }
 
-    /// Timestamp and token stats on the left, actions pinned to the right.
+    /// Left-aligned strip under a reply: time, actions, speed. Always visible,
+    /// unlike the user turn's row: Regenerate and Continue have no other home.
     private var footer: some View {
-        HStack(spacing: 8) {
-            Text(message.timestamp.formatted(date: .abbreviated, time: .shortened))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-
-            if let tps = message.tokensPerSecond, tps > 0 {
-                Label("\(Int(tps)) tokens/sec", systemImage: "gauge.with.needle")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            if let completion = message.completionTokens {
-                Text("(\(completion) tokens)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-
-            Spacer(minLength: 8)
+        HStack(spacing: 6) {
+            StatPill(text: message.timestamp.formatted(date: .omitted, time: .shortened),
+                     expanded: message.timestamp.formatted(date: .numeric, time: .shortened))
 
             // Which version of this reply you are reading. Left of the actions
             // because it is a statement about the text above it, not another
@@ -3977,7 +4312,7 @@ struct MessageBubble: View {
             }
 
             HStack(spacing: 2) {
-                footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
@@ -4006,16 +4341,56 @@ struct MessageBubble: View {
                                  action: onDelete)
                 }
             }
+
+            if let tps = message.tokensPerSecond, tps > 0 {
+                StatPill(text: "\(Int(tps)) tok/sec",
+                         expanded: message.completionTokens.map {
+                             "\(Int(tps)) tok/sec (\($0) tokens)"
+                         } ?? "\(Int(tps)) tok/sec")
+            }
+
+            Spacer(minLength: 0)
         }
         .padding(.leading, isBare ? 0 : ChatMetrics.statsIndent)
-        .padding(.top, 2)
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
     }
 
-    private func footerButton(_ icon: String, help: String,
+    /// Not drawn at all in compact: an invisible row still holds its height.
+    /// The context menu keeps the same actions.
+    private var showsUserActions: Bool {
+        message.role == .user && !message.isStreaming && !ChatMetrics.compactMode
+    }
+
+    private var userActions: some View {
+        HStack(spacing: 2) {
+            footerButton("square.on.square", help: "Copy this message") { copyMessage() }
+            if onEdit != nil {
+                footerButton("pencil", help: "Edit this message and send it again") { startEditing() }
+            }
+            if let onFork {
+                // Flipped: this branches back from a message above you.
+                footerButton("arrow.trianglehead.branch",
+                             help: "Start a new chat from this message",
+                             flipped: true, action: onFork)
+            }
+            if let onDelete {
+                footerButton("trash", help: "Delete this message from the conversation",
+                             action: onDelete)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.top, 2)
+        .opacity(isHovered ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+        .allowsHitTesting(isHovered)
+    }
+
+    private func footerButton(_ icon: String, help: String, flipped: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
+                .scaleEffect(y: flipped ? -1 : 1)
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 18)
                 .contentShape(Rectangle())
@@ -4030,17 +4405,67 @@ struct MessageBubble: View {
     }
 }
 
+/// Short at rest, full value floating over the pointer on hover. Floating
+/// rather than growing in place, so the buttons beside it never move.
+private struct StatPill: View {
+    let text: String
+    let expanded: String
+
+    @State private var pointer: CGPoint?
+
+    var body: some View {
+        label(text)
+            // Continuous, not `onHover`: the position is the point of it.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location): pointer = location
+                case .ended: pointer = nil
+                }
+            }
+            .overlay(alignment: .topLeading) {
+                if let pointer {
+                    label(expanded)
+                        .background(Color(nsColor: .textBackgroundColor), in: Capsule())
+                        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+                        .fixedSize()
+                        // Above the pointer and slightly left of it, so the
+                        // cursor never sits on top of the text it revealed.
+                        .offset(x: pointer.x - 10, y: -24)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            // Later siblings draw over earlier ones, so without this the
+            // buttons paint on top of the pill that just opened.
+            .zIndex(pointer == nil ? 0 : 1)
+    }
+
+    private func label(_ string: String) -> some View {
+        Text(string)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.secondary.opacity(0.1), in: Capsule())
+    }
+}
+
 // MARK: - Tool-call grouping (collapse call + result into one collapsible row)
 
 /// A renderable transcript row: a normal message, or a tool call paired with its
 /// result(s) so they show as a single collapsible row instead of two bubbles.
 enum ChatRow: Identifiable, Equatable {
     case message(ChatMessage)
-    case toolCall(call: ChatMessage, results: [ChatMessage])
+    /// `calls`: the structured record from the assistant message that made the
+    /// call (one message before the summary); empty on older histories.
+    /// `ownedHandles`: background handles this row may still speak for.
+    case toolCall(call: ChatMessage, results: [ChatMessage], calls: [SerializedToolCall],
+                  ownedHandles: [String])
     var id: UUID {
         switch self {
         case .message(let m): return m.id
-        case .toolCall(let c, _): return c.id
+        case .toolCall(let c, _, _, _): return c.id
         }
     }
 }
@@ -4112,15 +4537,22 @@ enum ChatRowBuilder {
         let visible = messages.filter { $0.toolCallId == nil }
         var rows: [ChatRow] = []
         var i = 0
+        var pendingCalls: [SerializedToolCall] = []
+        // Handle names are reused across launches: the last announcer owns it.
+        let owned = ProcessCardControls.handleOwnership(
+            visible.map { ($0.id, $0.processHandles ?? []) })
         while i < visible.count {
             let m = visible[i]
+            if let calls = m.toolCalls, !calls.isEmpty { pendingCalls = calls }
             if isCallSummary(m) {
                 var results: [ChatMessage] = []
                 var j = i + 1
                 while j < visible.count, isResultSummary(visible[j]) {
                     results.append(visible[j]); j += 1
                 }
-                rows.append(.toolCall(call: m, results: results))
+                rows.append(.toolCall(call: m, results: results, calls: pendingCalls,
+                                      ownedHandles: owned[m.id] ?? []))
+                pendingCalls = []
                 i = j
             } else {
                 rows.append(.message(m))
@@ -4136,45 +4568,92 @@ enum ChatRowBuilder {
 private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
+    /// See `ChatRow.toolCall`.
+    var calls: [SerializedToolCall] = []
+    var ownedHandles: [String] = []
+    /// A handle is only an identity inside one chat
+    /// (`ProcessRegistry.isAlive(handle:sessionId:)`).
+    var sessionId: UUID?
     @State private var expanded = false
-    @State private var hovering = false
     @EnvironmentObject var processRegistry: ProcessRegistry
 
-    /// Live background-process handles this card started — drives the kill X.
-    /// Independent of `call.isStreaming` so the X stays after the tool returns,
-    /// and it vanishes once the registry flips the process dead.
-    private var killableHandles: [String] {
-        ProcessCardControls.killable(handles: call.processHandles, isAlive: processRegistry.isAlive)
+    private var isRunning: Bool { call.isStreaming }
+
+    private var title: String {
+        ToolCallDisplay.title(calls: calls, summary: call.content)
     }
 
-    /// At least one background process from this card is still alive — drives the
-    /// green "running" border. Goes false the moment the registry flips the last
-    /// one dead (e.g. you click its X), so border + kill X disappear together.
-    private var isRunningBackground: Bool { !killableHandles.isEmpty }
+    /// Flat across the round; only the header's headline (first call) reads it.
+    private var argumentRows: [ToolCallDisplay.Argument] {
+        calls.flatMap { ToolCallDisplay.arguments(fromJSON: $0.arguments) }
+    }
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                headerRow
-                if expanded { expandedResults }
+    /// One call with its arguments and result. Results pair with calls by
+    /// index: the engine runs them in order and result messages carry no id.
+    private struct CallGroup: Identifiable {
+        let id: String
+        let name: String
+        /// Shown as part of the name (`browse:click`).
+        let variant: String?
+        let arguments: [ToolCallDisplay.Argument]
+        let result: String?
+        /// Read out of the result text, the only place the association exists.
+        let handle: String?
+    }
+
+    private var groups: [CallGroup] {
+        let bodies = results.map { ToolCallDisplay.resultBody($0.content) }
+        // Older history without structured calls: one group per result.
+        guard !calls.isEmpty else {
+            return bodies.enumerated().map { i, body in
+                CallGroup(id: "legacy-\(i)", name: title, variant: nil, arguments: [], result: body,
+                          handle: ToolCallDisplay.backgroundHandle(inResult: body))
             }
-            .padding(.horizontal, ChatMetrics.bubblePaddingH)
-            .padding(.vertical, ChatMetrics.bubblePaddingV)
-            .background(Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius)
-                    .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
-            )
-            .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
-            // Recede a settled tool call so the assistant's prose carries the
-            // conversation; full opacity while it's running, hovered, or expanded.
-            .opacity(call.isStreaming || hovering || expanded ? 1.0 : 0.35)
-            .animation(.easeInOut(duration: 0.15), value: hovering)
-            .onHover { hovering = $0 }
-
-            Spacer(minLength: 60)
         }
+        return calls.enumerated().map { i, call in
+            let body = i < bodies.count ? bodies[i] : nil
+            let args = ToolCallDisplay.arguments(fromJSON: call.arguments)
+            return CallGroup(
+                id: call.id.isEmpty ? "call-\(i)" : call.id,
+                name: call.name,
+                variant: ToolCallDisplay.variant(toolName: call.name, arguments: args),
+                arguments: args,
+                result: body,
+                handle: body.flatMap { ToolCallDisplay.backgroundHandle(inResult: $0) })
+        }
+    }
+
+    /// Handles no call claimed keep their button in the header.
+    private var unclaimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).unclaimed
+    }
+
+    /// Handles whose pill sits beside their call inside the panel.
+    private var claimedHandles: [String] {
+        ProcessCardControls.split(live: killableHandles,
+                                  claimedBy: groups.map(\.handle)).claimed
+    }
+
+    /// Live handles this card owns. Independent of `call.isStreaming`, so the
+    /// stop button outlives the tool result and vanishes when the process dies.
+    private var killableHandles: [String] {
+        ProcessCardControls.killable(handles: ownedHandles) {
+            processRegistry.isAlive(handle: $0, sessionId: sessionId)
+        }
+    }
+
+    /// Built like `thinkingBlock`, for the same reasons.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            headerRow
+            if expanded { expandedBody }
+        }
+        .padding(.horizontal, expanded ? ChatMetrics.bubblePaddingH : 0)
+        .padding(.vertical, expanded ? ChatMetrics.bubblePaddingV : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(expanded ? AnyShapeStyle(.quaternary.opacity(0.5)) : AnyShapeStyle(Color.clear))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     // Broken out into separately type-checked pieces — a single deeply nested
@@ -4182,78 +4661,245 @@ private struct ToolCallRow: View {
     // SwiftUI type-checker into pathological (effectively non-terminating)
     // compile times.
     @ViewBuilder private var headerRow: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-            } label: {
-                headerLabel
-            }
-            .buttonStyle(.plain)
-            .disabled(results.isEmpty)
-
-            ProcessKillButtons(handles: killableHandles) { processRegistry.kill(handle: $0) }
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+        } label: {
+            headerLabel
         }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder private var headerLabel: some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(Self.stripBold(call.content))
-                .font(.caption.monospaced())
-                .multilineTextAlignment(.leading)
-                .foregroundStyle(.primary)
-            Spacer(minLength: 6)
-            if call.isStreaming {
-                GeneratingIndicator()
-            } else if !results.isEmpty {
-                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                .symbolEffect(.pulse, isActive: isRunning)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
+            if calls.count > 1 {
+                multiToolTitle
+            } else {
+                singleToolTitle
             }
+            Spacer(minLength: 8)
+            ForEach(headerHandles, id: \.self) { handle in
+                ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+            }
+            // Several calls: one stop button here could not say which process
+            // it stops, so the shut card only says that something is running.
+            if !expanded, groups.count > 1, !claimedHandles.isEmpty {
+                RunningIndicator()
+            }
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
     }
 
-    @ViewBuilder private var expandedResults: some View {
-        ForEach(results) { r in
-            Text(Self.stripBold(r.content))
+    /// One call: every live handle. Several: only the unclaimed ones; the rest
+    /// sit beside their call inside the panel.
+    private var headerHandles: [String] {
+        groups.count > 1 ? unclaimedHandles : killableHandles
+    }
+
+    /// The one place a tool's name is drawn, so `server__tool` reads as a path
+    /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
+    @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
+        Text(ToolCallDisplay.displayName(name))
+            .font(.caption.monospaced())
+            .foregroundStyle(Color.accentColor.opacity(0.7))
+        if let variant {
+            Text(":" + variant)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, -4)
+        }
+    }
+
+    @ViewBuilder private var singleToolTitle: some View {
+        toolLabel(name: title,
+                  variant: calls.first.map {
+                      ToolCallDisplay.variant(toolName: $0.name, arguments: argumentRows)
+                  } ?? nil)
+        if let headline {
+            Text("· " + headline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                // Keep a path's filename.
+                .truncationMode(.middle)
+        }
+        if let resultHeadline {
+            Text("· " + resultHeadline)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .layoutPriority(1)
+        }
+    }
+
+    /// Names only, no arguments (one query in the header would look like the
+    /// only one); past three the tail becomes a count.
+    @ViewBuilder private var multiToolTitle: some View {
+        let shown = groups.count > 3 ? Array(groups.prefix(2)) : groups
+        let hidden = groups.count - shown.count
+
+        ForEach(Array(shown.enumerated()), id: \.offset) { index, group in
+            if index > 0 { middot }
+            toolLabel(name: group.name, variant: group.variant)
+        }
+        if hidden > 0 {
+            middot
+            Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var middot: some View {
+        Text("·")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var headline: String? {
+        guard let name = calls.first?.name else { return nil }
+        return ToolCallDisplay.headline(toolName: name, arguments: argumentRows)
+    }
+
+    private var resultHeadline: String? {
+        guard let name = calls.first?.name, let first = results.first else { return nil }
+        return ToolCallDisplay.resultHeadline(toolName: name,
+                                              result: ToolCallDisplay.resultBody(first.content))
+    }
+
+    @ViewBuilder private var expandedBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                if groups.count > 1 {
+                    HStack(spacing: 0) {
+                        toolLabel(name: group.name, variant: group.variant)
+                        Spacer(minLength: 8)
+                        if let handle = group.handle, killableHandles.contains(handle) {
+                            ProcessPill(handle: handle) { processRegistry.kill(handle: $0) }
+                        }
+                    }
+                    .padding(.top, index == 0 ? 0 : 4)
+                }
+                callGrid(group)
+            }
+        }
+    }
+
+    @ViewBuilder private func callGrid(_ group: CallGroup) -> some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 10, verticalSpacing: 6) {
+            ForEach(group.arguments) { arg in
+                gridRow(name: arg.name, value: arg.value)
+            }
+
+            if let result = group.result {
+                if !group.arguments.isEmpty {
+                    GridRow { Divider().gridCellColumns(2) }
+                }
+                GridRow {
+                    Text("result")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .gridColumnAlignment(.leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                    Text(result)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func gridRow(name: String, value: String) -> some View {
+        GridRow {
+            Text(name)
                 .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.leading)
+                .fixedSize(horizontal: true, vertical: false)
+            Text(value)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+}
 
-    /// The summary strings use `**name**` markdown bold; the compact mono header
-    /// and body render as plain text, so strip the `**` markers.
-    static func stripBold(_ s: String) -> String {
-        s.replacingOccurrences(of: "**", with: "")
+/// "running" badge without a button; the stop control is `StopProcessButton`.
+private struct RunningIndicator: View {
+    @Environment(\.colorScheme) private var scheme
+    @State private var pulsing = false
+
+    private var ink: Color {
+        scheme == .dark ? Color(red: 0.44, green: 0.82, blue: 0.50)
+                        : Color(red: 0.05, green: 0.42, blue: 0.16)
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            // By hand: `.symbolEffect(.scale)` has nothing to move on
+            // `circle.fill`.
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7))
+                .foregroundStyle(ink)
+                .scaleEffect(pulsing ? 0.55 : 1)
+                .opacity(pulsing ? 0.45 : 1)
+                .animation(.easeInOut(duration: 0.75).repeatForever(autoreverses: true),
+                           value: pulsing)
+                .onAppear { pulsing = true }
+                .accessibilityHidden(true)
+
+            Text("running")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(ink)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(Color.green.opacity(0.2), in: Capsule())
     }
 }
 
-/// Per-handle red kill X for a tool-call card's live background processes. Its
-/// own type (not an inline ForEach in ToolCallRow.body) so the SwiftUI
-/// type-checker handles it as an isolated, trivial unit.
-private struct ProcessKillButtons: View {
-    let handles: [String]
+private struct StopProcessButton: View {
+    let handle: String
     let onKill: (String) -> Void
 
     var body: some View {
-        ForEach(handles, id: \.self) { handle in
-            Button {
-                onKill(handle)
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.red)
-                    .symbolRenderingMode(.hierarchical)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Stop background process \(handle)")
+        Button { onKill(handle) } label: {
+            // Sized off the pill beside it.
+            Image(systemName: "xmark.circle.fill")
+                .resizable()
+                .symbolRenderingMode(.palette)
+                .foregroundStyle(.white, .red)
+                .aspectRatio(contentMode: .fit)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .help("Stop background process \(handle)")
+        .accessibilityLabel("Stop background process \(handle)")
+    }
+}
+
+private struct ProcessPill: View {
+    let handle: String
+    let onKill: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            RunningIndicator()
+            StopProcessButton(handle: handle, onKill: onKill)
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 }
 
@@ -4366,9 +5012,29 @@ struct MarkdownText: View {
         case paragraph(String)
         case heading(Int, String)              // level, text
         case code(String, String)              // language, content
-        case listItem(String)
+        case listItem(String, String)          // marker (`•`, `1.`, `2)`), text
+        case quote(String)                     // `>` lines, already merged
         case xmlBlock(String)                  // raw XML/tag content
         case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
+    }
+
+    /// Anchored: at most nine digits (CommonMark) then `.` or `)` and a space.
+    fileprivate static func listItem(in line: String) -> (marker: String, text: String)? {
+        if line.hasPrefix("- ") || line.hasPrefix("* ") {
+            return ("•", String(line.dropFirst(2)))
+        }
+        guard let match = line.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
+            return nil
+        }
+        return (String(line[match]).trimmingCharacters(in: .whitespaces),
+                String(line[match.upperBound...]))
+    }
+
+    /// `>` alone is a blank line inside a quote and keeps the block open.
+    fileprivate static func quoteBody(in line: String) -> String? {
+        if line.hasPrefix("> ") { return String(line.dropFirst(2)) }
+        if line == ">" { return "" }
+        return nil
     }
 
     fileprivate static func parseBlocks(source: String) -> [Block] {
@@ -4468,18 +5134,20 @@ struct MarkdownText: View {
                 continue
             }
 
-            // List item
-            if line.starts(with: "- ") || line.starts(with: "* ") ||
-               (line.count >= 3 && line.first?.isNumber == true && line.contains(". ")) {
-                let text: String
-                if line.starts(with: "- ") || line.starts(with: "* ") {
-                    text = String(line.dropFirst(2))
-                } else if let dotIdx = line.firstIndex(of: "."), line[line.index(after: dotIdx)] == " " {
-                    text = String(line[line.index(dotIdx, offsetBy: 2)...])
-                } else {
-                    text = line
+            // Consecutive `>` lines are one quote (models mark every line).
+            if quoteBody(in: line) != nil {
+                var quoted: [String] = []
+                while i < lines.count, let body = quoteBody(in: lines[i]) {
+                    quoted.append(body)
+                    i += 1
                 }
-                blocks.append(.listItem(text))
+                blocks.append(.quote(quoted.joined(separator: "\n")))
+                continue
+            }
+
+            // List item
+            if let item = listItem(in: line) {
+                blocks.append(.listItem(item.marker, item.text))
                 i += 1
                 continue
             }
@@ -4495,9 +5163,12 @@ struct MarkdownText: View {
             i += 1
             while i < lines.count {
                 let next = lines[i]
+                // A paragraph ends where any block begins: models skip the
+                // blank line before a list.
                 if next.trimmingCharacters(in: .whitespaces).isEmpty ||
                    next.hasPrefix("#") || next.hasPrefix("```") ||
-                   next.starts(with: "- ") || next.starts(with: "* ") ||
+                   listItem(in: next) != nil ||
+                   quoteBody(in: next) != nil ||
                    next.hasPrefix("<") ||
                    next.trimmingCharacters(in: .whitespaces).hasPrefix("|") {
                     break
@@ -4528,10 +5199,11 @@ struct MarkdownText: View {
     }
 
     static func attributedString(for source: String, theme: LaTeXTheme) -> NSAttributedString {
-        // The text size rides the key: fonts are baked into the cached string,
-        // so a Settings ▸ Interface change with the old key would hand every
-        // re-rendered row back at the size it was built at.
-        let key = "\(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\(source)" as NSString
+        // Everything baked into the string (fonts, leading) rides the key.
+        let key = """
+        \(theme.rawValue)\u{0}\(ChatMetrics.transcriptFontSize)\u{0}\
+        \(ChatMetrics.compactMode)\u{0}\(source)
+        """ as NSString
         if let hit = renderCache.object(forKey: key) { return hit }
         let built = buildAttributedString(for: source, theme: theme)
         renderCache.setObject(built, forKey: key)
@@ -4544,19 +5216,24 @@ struct MarkdownText: View {
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let blocks = parseBlocks(source: source)
+
+        func isItem(_ index: Int) -> Bool {
+            guard index >= 0, index < blocks.count else { return false }
+            if case .listItem = blocks[index] { return true }
+            return false
+        }
+
         for (idx, block) in blocks.enumerated() {
-            if idx > 0 { result.append(blockSpacer()) }
+            // Items are their own blocks and carry their own newline; the
+            // spacer only opens and closes the list.
+            if idx > 0, !(isItem(idx) && isItem(idx - 1)) { result.append(blockSpacer()) }
             switch block {
             case .paragraph(let text):
                 // Leading + a real gap after each paragraph (single-newline
-                // "**Label.** text" runs the models love are paragraphs too),
-                // and the reading measure as a POSITIVE tailIndent — an
-                // absolute wrap point, so prose stops at ~45em while tables,
-                // code and XML keep the full column.
+                // "**Label.** text" runs the models love are paragraphs too).
                 let p = NSMutableParagraphStyle()
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 p.paragraphSpacing = 8
-                p.tailIndent = ChatMetrics.proseMeasure
                 let para = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
                 para.addAttribute(.paragraphStyle, value: p,
                                   range: NSRange(location: 0, length: para.length))
@@ -4571,7 +5248,6 @@ struct MarkdownText: View {
                 p.paragraphSpacingBefore = 10
                 p.paragraphSpacing = 2
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
-                p.tailIndent = ChatMetrics.proseMeasure
                 let heading = NSMutableAttributedString(
                     attributedString: renderInline(text, theme: theme, fontSize: size)
                 )
@@ -4586,11 +5262,11 @@ struct MarkdownText: View {
                 let p = NSMutableParagraphStyle()
                 p.paragraphSpacingBefore = 4
                 p.paragraphSpacing = 4
+                // Its own gutter, so the tinted block stands off the text.
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 p.tailIndent = -8
-                // Less air than prose — a listing wants rows. And never the
-                // prose measure: code keeps the full column.
+                // Less air than prose — a listing wants rows.
                 p.lineHeightMultiple = ChatMetrics.codeLineHeightMultiple
                 let attrs: [NSAttributedString.Key: Any] = [
                     .font: NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize, weight: .regular),
@@ -4602,27 +5278,57 @@ struct MarkdownText: View {
                 linkifyBareUrls(code)
                 result.append(code)
 
-            case .listItem(let text):
-                let bullet = NSAttributedString(string: "• ", attributes: [
+            case .listItem(let marker, let text):
+                let bullet = NSAttributedString(string: marker + " ", attributes: [
                     .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
                     .foregroundColor: NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                // Hanging indent measured off the bullet itself, so wrapped
-                // lines align under the text at every text size.
+                // Hanging indent off the marker's own width.
                 p.headIndent = bullet.size().width.rounded(.up)
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
-                p.paragraphSpacing = 4
-                p.tailIndent = ChatMetrics.proseMeasure
+                // Tight between items, a paragraph's worth after the last.
+                p.paragraphSpacing = isItem(idx + 1) ? 4 : 8
                 let inline = renderInline(text, theme: theme)
                 let combined = NSMutableAttributedString()
                 combined.append(bullet)
                 combined.append(inline)
+                // No block spacer between items, so the item ends itself.
+                if isItem(idx + 1) { combined.append(NSAttributedString(string: "\n")) }
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
 
             case .table(let headers, let rows, let alignments):
                 result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
+
+            case .quote(let text):
+                // The bar is a one-cell `NSTextTable` with a leading border:
+                // an attributed string has no "rule beside this paragraph".
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(3, type: .absoluteValueType, for: .border, edge: .minX)
+                cell.setBorderColor(NSColor.separatorColor, for: .minX)
+                // A text block ignores paragraph spacing: air is the cell's
+                // margin. Vertical padding is lopsided because the extra
+                // leading sits above the letters.
+                cell.setWidth(10, type: .absoluteValueType, for: .padding, edge: .minX)
+                cell.setWidth(0, type: .absoluteValueType, for: .padding, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(6, type: .absoluteValueType, for: .margin, edge: .maxY)
+
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
+                p.paragraphSpacing = 4
+                let quoted = NSMutableAttributedString(attributedString: renderInline(text, theme: theme))
+                let range = NSRange(location: 0, length: quoted.length)
+                quoted.addAttribute(.paragraphStyle, value: p, range: range)
+                quoted.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: range)
+                result.append(quoted)
 
             case .xmlBlock(let content):
                 let p = NSMutableParagraphStyle()
@@ -4683,6 +5389,10 @@ struct MarkdownText: View {
         table.numberOfColumns = cols
         let fractions = MarkdownTable.columnFractions(headers: headers, rows: rows)
         let dividerColor = NSColor.separatorColor
+        // A tint of the page toward the ink: thinning a label colour only
+        // darkens, in both appearances.
+        let headerFill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
 
         func textAlignment(_ column: Int) -> NSTextAlignment {
             guard column < alignments.count else { return .left }
@@ -4693,6 +5403,13 @@ struct MarkdownText: View {
             }
         }
 
+        // `NSTextTable` has no frame of its own: the outline is the edge cells'
+        // borders. Only `.maxY` between rows, or a neighbour's `.minY` doubles
+        // the line.
+        let outlineWeight: CGFloat = 1
+        let rowRuleWeight: CGFloat = 0.5
+        let lastRow = rows.count   // header is row 0
+
         func appendRow(_ cells: [String], rowIndex: Int, bold: Bool) {
             for column in 0..<cols {
                 let text = column < cells.count ? cells[column] : ""
@@ -4702,12 +5419,30 @@ struct MarkdownText: View {
                 )
                 block.setContentWidth(Double(fractions[column]) * 100, type: .percentageValueType)
                 block.setWidth(6, type: .absoluteValueType, for: .padding)
-                // Divider under the header row only — no vertical borders,
-                // no rules between data rows, matching the "minimal GFM"
-                // look chat UIs use.
+
                 if rowIndex == 0 {
-                    block.setBorderColor(dividerColor, for: .maxY)
-                    block.setWidth(1, type: .absoluteValueType, for: .border, edge: .maxY)
+                    block.backgroundColor = headerFill
+                    block.setBorderColor(dividerColor, for: .minY)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minY)
+                    // A text table ignores the previous paragraph's spacing:
+                    // air above is a margin on the first row.
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .minY)
+                }
+                if rowIndex == lastRow {
+                    block.setWidth(10, type: .absoluteValueType, for: .margin, edge: .maxY)
+                }
+                block.setBorderColor(dividerColor, for: .maxY)
+                block.setWidth(rowIndex == lastRow || rowIndex == 0 ? outlineWeight : rowRuleWeight,
+                               type: .absoluteValueType, for: .border, edge: .maxY)
+
+                // No rules between columns.
+                if column == 0 {
+                    block.setBorderColor(dividerColor, for: .minX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .minX)
+                }
+                if column == cols - 1 {
+                    block.setBorderColor(dividerColor, for: .maxX)
+                    block.setWidth(outlineWeight, type: .absoluteValueType, for: .border, edge: .maxX)
                 }
                 let pStyle = NSMutableParagraphStyle()
                 pStyle.textBlocks = [block]
@@ -4869,6 +5604,34 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
+        tintInlineCode(result, bodyFont: bodyFont)
+    }
+
+    /// Inline code is found by `inlinePresentationIntent`, never by the font:
+    /// `NSFont.monospacedSystemFont` does not advertise the `.monoSpace` trait.
+    private static func tintInlineCode(_ result: NSMutableAttributedString, bodyFont: NSFont) {
+        let full = NSRange(location: 0, length: result.length)
+        let mono = NSFont.monospacedSystemFont(ofSize: ChatMetrics.transcriptCodeFontSize,
+                                               weight: .regular)
+        result.enumerateAttributes(in: full, options: []) { attrs, range, _ in
+            guard isInlineCode(attrs[.inlinePresentationIntent]),
+                  // A fenced block sets its own ground and its own colours.
+                  attrs[.backgroundColor] == nil
+            else { return }
+            // A marker, not `.backgroundColor` (that paints the whole line
+            // fragment): `IntrinsicTextView` draws the ground itself.
+            result.addAttributes([.font: mono, .inlineCodeGround: true], range: range)
+        }
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber` of the
+    /// option set's raw value, not as the Swift type.
+    private static func isInlineCode(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.code) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.code)
+        }
+        return false
     }
 
     /// Shared detector — creating an NSDataDetector is not free and renderInline
@@ -4945,6 +5708,11 @@ fileprivate struct DisplayLaTeXView: View {
     }
 }
 
+extension NSAttributedString.Key {
+    /// Marks an inline code span; `IntrinsicTextView` draws the ground.
+    static let inlineCodeGround = NSAttributedString.Key("MLXInlineCodeGround")
+}
+
 // MARK: - SelectableMarkdownNSText (NSTextView wrapper)
 
 /// NSViewRepresentable around an NSTextView. NSTextView is the only AppKit text
@@ -5013,6 +5781,47 @@ fileprivate final class IntrinsicTextView: NSTextView {
     override func invalidateIntrinsicContentSize() {
         cachedHeight = nil
         super.invalidateIntrinsicContentSize()
+    }
+
+    /// Inline-code grounds go under the glyphs, at the font's own band rather
+    /// than the line fragment a `.backgroundColor` attribute would fill.
+    override func draw(_ dirtyRect: NSRect) {
+        drawInlineCodeGrounds()
+        super.draw(dirtyRect)
+    }
+
+    private func drawInlineCodeGrounds() {
+        guard let layoutManager, let textContainer, let textStorage else { return }
+        let origin = textContainerOrigin
+        // Same tint as a table header.
+        let fill = NSColor.textBackgroundColor
+            .blended(withFraction: 0.05, of: .labelColor) ?? .quaternaryLabelColor
+        fill.setFill()
+
+        textStorage.enumerateAttribute(.inlineCodeGround,
+                                       in: NSRange(location: 0, length: textStorage.length),
+                                       options: []) { value, range, _ in
+            guard value != nil else { return }
+            let font = textStorage.attribute(.font, at: range.location,
+                                             effectiveRange: nil) as? NSFont
+            let band = ((font?.ascender ?? 10) - (font?.descender ?? -3)) + 2
+            let glyphs = layoutManager.glyphRange(forCharacterRange: range,
+                                                  actualCharacterRange: nil)
+            layoutManager.enumerateEnclosingRects(
+                forGlyphRange: glyphs,
+                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                in: textContainer
+            ) { rect, _ in
+                var box = rect.offsetBy(dx: origin.x, dy: origin.y)
+                if box.height > band {
+                    box = box.insetBy(dx: 0, dy: (box.height - band) / 2)
+                }
+                // Flipped view: extra height grows downward.
+                box = box.insetBy(dx: -4, dy: 0)
+                box.size.height += 4
+                NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+            }
+        }
     }
 
     override func didChangeText() {

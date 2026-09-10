@@ -2,8 +2,8 @@ import Foundation
 
 private let bytesPerGiB: Double = 1_073_741_824
 
-/// Data behind the Model Browser's "Recommended" pane: every Gemma 4 and
-/// Qwen 3.5/3.6 checkpoint this app is tuned hardest for (native MTP
+/// Data behind the Model Browser's "Recommended" pane: the Gemma 4 and
+/// Qwen checkpoints this app is tuned hardest for (native MTP
 /// speculative decode, PLD, the assistant-drafter catalog all target these),
 /// grouped by family and explained in plain English for someone who has
 /// never picked a local model before. It intentionally does NOT reuse
@@ -41,13 +41,15 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// per-cell CSV lives in git history at docs/perf-csvs/all-26.7.12.csv):
 /// `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s — a 4.7× gap a
 /// cloud comparison shows as nearly level. The score is `round(100 × tok/s / 200)`
-/// over PLAIN autoregressive decode, calibrated against that CSV where a row
-/// exists and estimated from active params + weight bytes elsewhere.
-/// Speculative decode (MTP/PLD/drafter) is deliberately excluded: it is a
-/// property of how we run the model rather than of the model, it moves some
-/// picks 2-3× on their own, and each pick that has one already says so in its
-/// blurb. `activeParamsB` exists so these hand-edited numbers can be CHECKED
-/// rather than trusted — see the ordering invariant in `RecommendedModelsTests`.
+/// over PLAIN autoregressive decode, capped at 100, calibrated against that
+/// CSV where a row exists and estimated from active params + weight bytes
+/// elsewhere. A pick whose checkpoint ships its own draft head that this app
+/// runs by default (`speedIsWithMtp`) scores the bench's `mtp` cell instead:
+/// that IS the rate the user gets, and scoring it serial would rank the
+/// fastest model here behind Gemma E2B. Opt-in speculation (DSpark, PLD, the
+/// assistant drafter) stays excluded. `activeParamsB` exists so the plain
+/// scores can be CHECKED rather than trusted — see the ordering invariant in
+/// `RecommendedModelsTests`; MTP-scored picks are swept separately there.
 ///
 /// **Context** is the checkpoint's own `max_position_embeddings`, read from
 /// each repo's `config.json`. It is deliberately NOT the RAM-clamped effective
@@ -55,13 +57,12 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// of the user's Mac.
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
-/// `largest` is a RAM tier — the biggest models this app runs (DeepSeek-V4-Flash
-/// on the native MLX arch, Hunyuan 3), grouped by "needs a very large Mac"
-/// rather than vendor.
+/// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
+/// Flash-Next, DeepSeek-V4-Flash on the native MLX arch), grouped by "needs a
+/// very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
-    case poolside = "poolside"
     case largest = "Largest models"
 }
 
@@ -88,12 +89,15 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// 0–100. Our own Apple-Silicon decode estimate — never the site's
     /// cloud-GPU speed. See the file header.
     let speed: Int
+    /// True when `speed` is the bench's MTP cell rather than plain decode —
+    /// the checkpoint ships a draft head this app runs by default.
+    var speedIsWithMtp: Bool = false
     /// The checkpoint's own context window (`max_position_embeddings`), NOT the
     /// RAM-clamped effective one.
     let contextTokens: Int
     /// Active parameters per token, in billions — dense models count their
-    /// whole size, an MoE counts only what it wakes (Laguna S 2.1 is
-    /// 117.6B-**A8.5B**, so 8.5). Read from each repo's config/model card, and
+    /// whole size, an MoE counts only what it wakes (Flash-Next is
+    /// 125B-**A6B**, so 6). Read from each repo's config/model card, and
     /// the basis the hand-edited `speed` scores are checked against: on Apple
     /// Silicon decode is bandwidth-bound, so a model with more active
     /// parameters must never be scored FASTER than one with fewer.
@@ -174,23 +178,8 @@ struct RecommendedModelPick: Identifiable, Hashable {
 
 /// The fixed pool of picks the Recommended pane draws from, as static
 /// members on the type itself so the catalogs below can use plain
-/// dot-shorthand (`.gemmaE2B`).
+/// dot-shorthand (`.gemmaE4B`).
 extension RecommendedModelPick {
-    static let gemmaE2B = RecommendedModelPick(
-        id: "gemma-4-e2b",
-        name: "Gemma 4 E2B",
-        tagline: "Small and capable",
-        blurb: "A well-rounded everyday assistant — good at chatting, answering questions, and simple coding help, while staying small and fast to run.",
-        repoId: "mlx-community/gemma-4-e2b-it-4bit",
-        sizeGB: 3.3,
-        family: .gemma,
-        intelligence: 15,
-        intelligenceIsEstimated: false,
-        speed: 90,
-        contextTokens: 131_072,
-        activeParamsB: 2.0
-    )
-
     static let gemmaE4B = RecommendedModelPick(
         id: "gemma-4-e4b",
         name: "Gemma 4 E4B",
@@ -266,21 +255,6 @@ extension RecommendedModelPick {
         activeParamsB: 4.0
     )
 
-    static let gemma31B8bit = RecommendedModelPick(
-        id: "gemma-4-31b-8bit",
-        name: "Gemma 4 31B (highest quality)",
-        tagline: "The best this app offers",
-        blurb: "The highest-quality model on this list: Gemma's largest model at full 8-bit precision. This is about as good as local answers get here — save it for when quality matters more than speed.",
-        repoId: "mlx-community/gemma-4-31b-it-8bit",
-        sizeGB: 31.5,
-        family: .gemma,
-        intelligence: 48,
-        intelligenceIsEstimated: false,
-        speed: 7,
-        contextTokens: 262_144,
-        activeParamsB: 31.0
-    )
-
     /// Qwen 3.5 9B — the entry-level Qwen pick. Replaces the earlier 0.8B
     /// entry, which was too small to be a meaningful comparison against the
     /// Gemma lineup.
@@ -305,12 +279,11 @@ extension RecommendedModelPick {
     /// draft head inside the checkpoint rather than in a sidecar.
     ///
     /// `intelligence` is ESTIMATED: the model shipped 2026-08-14 and the index
-    /// has no entry for it. Placed level with Hunyuan 3 and one point above the
-    /// 3.6 27B it supersedes — a newer generation of the same size class — and
-    /// below DeepSeek-V4-Flash. `speed` is our own measurement of PLAIN decode
-    /// on an M4 Max (26.3 tok/s on code, 26.7 on prose, median of 3 at temp 0,
-    /// `--no-mtp`): the draft head takes it to ~75, which is excluded from the
-    /// score by policy and named in the blurb instead — see the file header.
+    /// has no entry for it. Placed one point above the 3.6 27B it supersedes
+    /// — a newer generation of the same size class — and below
+    /// DeepSeek-V4-Flash. `speed` is the bench's MTP cell (68 tok/s on
+    /// an M4 Max, 26.9.2) — the head ships in the checkpoint and runs by
+    /// default, so that is the rate the user sees.
     static let qwen38_27b = RecommendedModelPick(
         id: "qwen38-27b",
         name: "Qwen 3.8 27B",
@@ -321,34 +294,10 @@ extension RecommendedModelPick {
         family: .qwen,
         intelligence: 63,
         intelligenceIsEstimated: true,
-        speed: 13,
+        speed: 34,
+        speedIsWithMtp: true,
         contextTokens: 262_144,
         activeParamsB: 27.0
-    )
-
-    /// Tencent Hunyuan 3 (295B-A21B MoE) — the largest open model this app
-    /// runs. This is the imatrix-calibrated 2-bit build (mlx-community oQ2e):
-    /// the FULL 192-expert model with attention/router/shared-expert/embeddings
-    /// kept at 8-bit, ~84 GB. Unlike the older ~105 GB mixed build (which loaded
-    /// on a 128 GB Mac but left almost no room for context), this fits 128 GB
-    /// with a usable window, so it's recommended INLINE on 128 GB — the generic
-    /// weights×1.2 formula (~100 GB) already gates it above a 96 GB Mac.
-    static let hy3_295b = RecommendedModelPick(
-        id: "hy3-oq2e",
-        name: "Hunyuan 3 295B",
-        tagline: "The biggest model here",
-        blurb: "Tencent's flagship open model — 295 billion parameters, of which it wakes only 21 billion per word (mixture of experts). Top-tier reasoning, agent work, and tool use, entirely on your Mac. This is the full model stored compactly (importance-calibrated 2-bit), so on a 128 GB Mac it runs with a genuinely usable context window rather than just a few sentences. Best on Macs with 128 GB of memory or more.",
-        repoId: "mlx-community/Hy3-oQ2e",
-        sizeGB: 83.7,
-        family: .largest,
-        // Estimated: the site has no Hunyuan 3 entry. Placed just under
-        // DeepSeek-V4-Flash — a comparable flagship open MoE at a similar
-        // activated-parameter scale — and above every Qwen/Gemma pick here.
-        intelligence: 63,
-        intelligenceIsEstimated: true,
-        speed: 14,
-        contextTokens: 262_144,
-        activeParamsB: 21.0
     )
 
     /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
@@ -368,87 +317,74 @@ extension RecommendedModelPick {
         family: .largest,
         intelligence: 67,
         intelligenceIsEstimated: false,
-        // Plain autoregressive decode measures ~23 tok/s on an M4 Max against
-        // Hunyuan 3's ~26, so the two score level here rather than this one
-        // sitting below it (ties are what the activeParams ordering invariant
-        // leaves free, and it floors this pick at Hunyuan's score anyway).
-        // DSpark takes it to ~35 tok/s; spec decode is excluded from the score
-        // by policy and named in the blurb instead — see the file header.
+        // Plain autoregressive decode measures ~23 tok/s on an M4 Max, level
+        // with the dense 31B (ties are what the activeParams invariant leaves
+        // free). DSpark takes it to ~35 but is opt-in, so it stays out of the
+        // score and is named in the blurb instead — see the file header.
         speed: 14,
         contextTokens: 1_048_576,
         activeParamsB: 13.0,
         // Weights×1.2 would demand 141 GB and hide the model from the exact
         // machine the conversion targets: it serves in ~110 GB resident on a
-        // 128 GB Mac.
-        ramOverrideGB: 128.0
+        // 128 GB Mac, tight against Metal's default ~107 GB working set there
+        // (the blurb says to raise the wired limit), and still above a 96 GB
+        // Mac's gate.
+        ramOverrideGB: 104.0
     )
 
+    /// Our own MLX-Serve pack of the 3.6 35B-A3B with the MTP head in the
+    /// checkpoint. `speed` is the bench's MTP cell (259 tok/s on an M4 Max,
+    /// 26.9.2) — the fastest model in this list by a wide margin.
     static let qwen36_35bA3b = RecommendedModelPick(
         id: "qwen36-35b-a3b",
         name: "Qwen 3.6 35B-A3B",
-        tagline: "Qwen's largest model here",
-        blurb: "Qwen's biggest model on this list — 35 billion parameters in total, but like the Gemma mixture-of-experts model above, it only activates a few billion per word, so it stays efficient. Excellent for demanding coding and reasoning work.",
-        repoId: "mlx-community/Qwen3.6-35B-A3B-4bit",
-        sizeGB: 19.0,
+        tagline: "The fastest model here",
+        blurb: "Qwen's mixture-of-experts model — 35 billion parameters in total, but like the Gemma mixture-of-experts model above, it only activates a few billion per word. It ships with a built-in speed trick that drafts and double-checks several words at once, which makes it the fastest model on this list by a wide margin. Excellent for demanding coding and reasoning work.",
+        repoId: "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit",
+        sizeGB: 19.5,
         family: .qwen,
         intelligence: 53,
         intelligenceIsEstimated: false,
-        speed: 76,
+        speed: 100,
+        speedIsWithMtp: true,
         contextTokens: 262_144,
         activeParamsB: 3.0
     )
 
-    /// poolside's Laguna XS 2.1 in poolside's own NVFP4 4-bit MLX build —
-    /// the checkpoint the 26.7.12 decode-perf round was tuned and validated
-    /// on (121 tok/s on an M4 Max, see benchmarks.md). ~20 GB of weights, so
-    /// with the ×1.2 overhead it fits a 32 GB Mac inline.
-    static let lagunaXS21 = RecommendedModelPick(
-        id: "laguna-xs-2.1-nvfp4",
-        name: "Laguna XS 2.1",
-        tagline: "Fast coder",
-        blurb: "The smaller Laguna, same specialty: writing and editing code and multi-step \u{201c}agent\u{201d} work like using tools across a project. A 33-billion-parameter mixture-of-experts model in poolside's own 4-bit NVFP4 build, and the fastest coding model in this list: about 121 tokens per second on an M4 Max. Fits a 32 GB Mac.",
-        repoId: "poolside/Laguna-XS-2.1-NVFP4-mlx",
-        sizeGB: 20.1,
-        family: .poolside,
-        // Estimated: poolside publish no Laguna entry on the site. A coding
-        // specialist scores below its general-purpose size class on a general
-        // index, so it sits under Qwen 3.6 35B-A3B despite the same 3B active.
-        intelligence: 43,
+    /// Qwen 3.8 Flash-Next (125B-A6B) in our mixed 4/8-bit MLX-Serve pack:
+    /// the qwen3_5 trunk inside hyper-connections, an n-gram embedding table
+    /// (32 GB, mmapped at serve time, never resident) and the MTP layer in the
+    /// checkpoint. ~100 GB on disk, but only the ~70 GB of weights is
+    /// resident, so the RAM gate is an explicit 78 GB: a 96 GB Mac (tight
+    /// against Metal's default working set there), not the ×1.2 128.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed level with
+    /// DeepSeek-V4-Flash. `speed` is the bench's MTP cell (93 tok/s on an M4
+    /// Max, 26.9.2).
+    static let qwen38FlashNext = RecommendedModelPick(
+        id: "qwen38-flash-next",
+        name: "Qwen 3.8 Flash-Next",
+        tagline: "Frontier-class, still quick",
+        blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own mixed 4/8-bit build, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
+        repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit",
+        sizeGB: 100.0,
+        family: .largest,
+        intelligence: 67,
         intelligenceIsEstimated: true,
-        speed: 61,
+        speed: 47,
+        speedIsWithMtp: true,
         contextTokens: 262_144,
-        activeParamsB: 3.0
+        activeParamsB: 6.0,
+        ramOverrideGB: 78.0
     )
 
-    /// poolside's Laguna S 2.1 — the full-size coding-specialist MoE (117.6B
-    /// total, ~8.5B active per word) in poolside's own NVFP4 4-bit MLX build
-    /// (~67 GB on disk, so ~80 GB RAM with the ×1.2 overhead: a 96 GB+ Mac
-    /// inline, behind "Requires more RAM" below that). Replaced the compact
-    /// 2-bit community build (`pipenetwork/Laguna-S-2.1-MLX-2bit`) — the
-    /// 2-bit's output quality is noticeably below the NVFP4 original.
-    static let lagunaS21 = RecommendedModelPick(
-        id: "laguna-s-2.1-nvfp4",
-        name: "Laguna S 2.1",
-        tagline: "Built for code",
-        blurb: "poolside's full-size coding specialist, built for writing and editing code and for multi-step \u{201c}agent\u{201d} work like using tools across a whole project. A large mixture-of-experts model — 117 billion parameters in total, but only about 8.5 billion wake up per word — in poolside's own 4-bit NVFP4 build, the quantization the model ships in. Needs a Mac with a lot of memory; the XS above covers smaller machines.",
-        repoId: "poolside/Laguna-S-2.1-NVFP4-mlx",
-        sizeGB: 67.0,
-        family: .poolside,
-        // Estimated: no site entry (see Laguna XS). Placed between Qwen 3.6
-        // 35B-A3B and 27B — the full-size coder, still a specialist.
-        intelligence: 55,
-        intelligenceIsEstimated: true,
-        speed: 28,
-        contextTokens: 262_144,
-        activeParamsB: 8.5
-    )
 }
 
 extension RecommendedModelPick {
     /// Gemma 4 picks, ascending by size — one of the Recommended pane's two
     /// family sections.
     static let gemmaCatalog: [RecommendedModelPick] = [
-        .gemmaE2B, .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit, .gemma31B8bit,
+        .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit,
     ]
 
     /// Qwen picks, ascending by size — the Recommended pane's other family
@@ -457,25 +393,18 @@ extension RecommendedModelPick {
         .qwen35_9b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
-    /// poolside's Laguna family, ascending by size — the fast XS 2.1, then
-    /// the full-size S 2.1, both poolside's own NVFP4 builds. Its own
-    /// section: coding specialists that aren't Gemma or Qwen.
-    static let poolsideCatalog: [RecommendedModelPick] = [
-        .lagunaXS21, .lagunaS21,
-    ]
-
     /// The largest models this app runs, ascending by on-disk size (the app's
-    /// smallest-first convention) — Hunyuan 3 295B (the compact ~84 GB oQ2e
-    /// build) then DeepSeek-V4-Flash (~87 GB ds4 GGUF). Grouped by "needs a
-    /// very large Mac" rather than by vendor.
+    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB) then
+    /// DeepSeek-V4-Flash (~130 GB). Grouped by "needs a very large Mac"
+    /// rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .hy3_295b, .deepseekV4Flash,
+        .qwen38FlashNext, .deepseekV4Flash,
     ]
 
-    /// Every curated pick, across all four sections — the union the score
+    /// Every curated pick, across all three sections — the union the score
     /// invariants sweep and the one list a new section can't slip past.
     static let allCatalogs: [RecommendedModelPick] =
-        gemmaCatalog + qwenCatalog + poolsideCatalog + largestCatalog
+        gemmaCatalog + qwenCatalog + largestCatalog
 
     // MARK: - The starter recommendation
 
@@ -492,20 +421,21 @@ extension RecommendedModelPick {
     ///
     /// | Physical RAM | Pick | Disk | RAM needed |
     /// |---|---|---|---|
-    /// | ≤ 8 GB  | Gemma 4 E2B  |  3.3 GB |  4.0 GB |
-    /// | 8–16 GB | Gemma 4 E4B  |  4.8 GB |  5.8 GB |
+    /// | ≤ 16 GB | Gemma 4 E4B  |  4.8 GB |  5.8 GB |
     /// | 16–32 GB| Gemma 4 12B  |  6.3 GB |  7.6 GB |
-    /// | 32 GB+  | Qwen 3.8 27B | 18.2 GB | 21.8 GB |
+    /// | 32–96 GB| Qwen 3.8 27B | 18.2 GB | 21.8 GB |
+    /// | 96 GB+  | Qwen 3.8 Flash-Next | 100 GB | 78 GB |
     ///
     /// Bands are upper-INCLUSIVE: a 16 GB Mac gets E4B, not 12B. A boundary
     /// machine is the one with the least headroom in its band, so it takes the
-    /// smaller side.
+    /// smaller side. The one exception is the top: Flash-Next is sized for a
+    /// 96 GB Mac, so 96 GB gets it.
     static func starterPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
         let gib = Double(physicalMemoryBytes) / bytesPerGiB
-        if gib <= 8 { return .gemmaE2B }
         if gib <= 16 { return .gemmaE4B }
         if gib <= 32 { return .gemma12B }
-        return .qwen38_27b
+        if gib < 96 { return .qwen38_27b }
+        return .qwen38FlashNext
     }
 }
 
@@ -526,5 +456,16 @@ extension Array where Element == RecommendedModelPick {
             }
         }
         return (fits, requiresMoreRAM)
+    }
+}
+
+/// The hover card over the two capability bars: which bar is which, and the
+/// score behind it — the bars alone cannot say either.
+enum CapabilityTip {
+    static func lines(for pick: RecommendedModelPick) -> [String] {
+        [
+            "Intelligence: \(pick.intelligence)" + (pick.intelligenceIsEstimated ? " (our estimate)" : ""),
+            "Speed: \(pick.speed)" + (pick.speedIsWithMtp ? " (with its built-in draft head)" : ""),
+        ]
     }
 }

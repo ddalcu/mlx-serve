@@ -133,6 +133,7 @@ struct AudioHistoryShelf: View {
 struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For "Send to Chat" — the hand-off opens a new conversation and switches
     /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
@@ -556,7 +557,7 @@ struct VoiceGenView: View {
 
     private func chooseReferenceFile() {
         refError = nil
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -671,10 +672,6 @@ struct VoiceGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "Audio generation log"
-        alert.informativeText = logText.isEmpty ? "(no output)" : logText
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }

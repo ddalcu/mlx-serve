@@ -42,9 +42,12 @@ enum AgentEngine {
     // MARK: - Context Helpers
 
     /// Determine effective context length from user config or model metadata.
+    /// The server's advertised context wins: it already reflects `--ctx-size`
+    /// and the model's own `model-settings.json` override. The slider answers
+    /// only before a server has reported one.
     static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?) -> Int {
-        if appContextSize > 0 { return appContextSize }
         if let modelCtx = modelContextLength, modelCtx > 0 { return modelCtx }
+        if appContextSize > 0 { return appContextSize }
         return 32768  // safe default
     }
 

@@ -29,17 +29,31 @@ supported = {
     "bailing_hybrid",
 }
 # lfm2 is a prefix match — any model_type starting with 'lfm2' is supported.
+# The models root is TWO-LEVEL (`<org>/<repo>`); flat `<repo>` is the legacy shape.
+def candidates(root):
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return
+    for name in entries:
+        if name.startswith("."):
+            continue
+        if os.path.isfile(os.path.join(root, name, "config.json")):
+            yield name
+            continue
+        try:
+            subs = sorted(os.listdir(os.path.join(root, name)))
+        except OSError:
+            continue
+        for sub in subs:
+            if sub.startswith("."):
+                continue
+            if os.path.isfile(os.path.join(root, name, sub, "config.json")):
+                yield os.path.join(name, sub)
+
 out = []
-try:
-    entries = sorted(os.listdir(root))
-except OSError:
-    sys.exit(0)
-for name in entries:
-    if name.startswith("."):
-        continue
+for name in candidates(root):
     cfg = os.path.join(root, name, "config.json")
-    if not os.path.isfile(cfg):
-        continue
     try:
         with open(cfg) as f:
             data = json.load(f)

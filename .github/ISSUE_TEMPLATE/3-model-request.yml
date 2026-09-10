@@ -23,6 +23,8 @@ body:
     attributes:
       label: Checks
       options:
+        - label: I searched open and closed issues and PRs for this model
+          required: true
         - label: I tried loading it and it failed (paste the error below if so)
         - label: An MLX-format conversion already exists on HF
   - type: textarea

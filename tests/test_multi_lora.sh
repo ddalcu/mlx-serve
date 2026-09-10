@@ -100,7 +100,8 @@ boot() {
   done
   echo "FAIL: server never became healthy"; return 1
 }
-have() { [ -d "$MODELS/$1" ]; }
+# An interrupted download leaves only `.partial` parts; discovery skips it, so must we.
+have() { [ -d "$MODELS/$1" ] && [ -f "$MODELS/$1/config.json" -o -f "$MODELS/$1/model_index.json" ]; }
 
 # One server serves every backend in turn, so without this each finished
 # backend stays resident and the next one loads on top of it. Four image/video

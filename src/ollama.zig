@@ -19,6 +19,7 @@
 //! is ignored (residency is managed by the registry's LRU).
 
 const std = @import("std");
+const chat_mod = @import("chat.zig");
 
 // ── Request translation ─────────────────────────────────────────────────
 
@@ -361,8 +362,18 @@ pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// Bytes >= 0x80 walk by UTF-8 sequence; an invalid one becomes U+FFFD (`chat.utf8Next`).
 fn writeJsonStringBody(w: *std.Io.Writer, s: []const u8) !void {
-    for (s) |ch| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch >= 0x80) {
+            const seq = chat_mod.utf8Next(s, i);
+            try w.writeAll(if (seq.valid) s[i..seq.end] else "\u{FFFD}");
+            i = seq.end;
+            continue;
+        }
+        i += 1;
         switch (ch) {
             '"' => try w.writeAll("\\\""),
             '\\' => try w.writeAll("\\\\"),
@@ -370,11 +381,7 @@ fn writeJsonStringBody(w: *std.Io.Writer, s: []const u8) !void {
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
             else => {
-                if (ch < 0x20) {
-                    try w.print("\\u{x:0>4}", .{ch});
-                } else {
-                    try w.writeByte(ch);
-                }
+                if (ch < 0x20) try w.print("\\u{x:0>4}", .{ch}) else try w.writeByte(ch);
             },
         }
     }

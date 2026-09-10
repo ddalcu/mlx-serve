@@ -37,6 +37,13 @@ class ServerManager: ObservableObject {
     /// Discovered LAN models advertising `capability` ("chat", "image",
     /// "video", "music", "audio", "3d"). Empty when the server is down or
     /// discovery is off — pickers then show local models only.
+    /// What is resident on THIS Mac — the tray's "In Memory" list. A remote
+    /// row (LAN peer or provider) may report `loaded` from where it runs, but
+    /// nothing here holds it and nothing here can eject it.
+    var residentModels: [ModelInfo] {
+        allModels.filter { $0.loaded && $0.lanPeer == nil }
+    }
+
     func lanModels(capability: String) -> [ModelInfo] {
         allModels.filter { $0.lanAdvertises(capability) }
     }
@@ -58,7 +65,7 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
-    private let api = APIClient()
+    let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -177,6 +184,7 @@ class ServerManager: ObservableObject {
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
         port = options.port
+        api.host = options.host
         status = .starting
         lastError = ""
         chatDefaultEnsured = false
@@ -412,18 +420,6 @@ class ServerManager: ObservableObject {
         logBuffer.clear()
     }
 
-    /// The gen panes' "Show Log" body: the pane's own stream lines, with the
-    /// server log's tail appended — or standing alone, because a model that
-    /// failed to LOAD never streamed anything, so the pane log is empty for
-    /// exactly the failure people click Log for (live 2026-08-08: a memory
-    /// refusal showed "(no output)"). ONE copy; it was pasted into all four
-    /// gen views, which is how a tweak lands in some panes and not others.
-    nonisolated func combinedGenLog(own lines: [String]) -> String {
-        let own = lines.joined(separator: "\n")
-        let serverTail = String(currentServerLogSnapshot().suffix(6000))
-        return own.isEmpty ? serverTail : own + "\n\n——— server log ———\n" + serverTail
-    }
-
     /// Pure helper: clamp `buf` to at most `maxBytes` characters by keeping
     /// the tail. Mirrors `String(buf.suffix(maxBytes))` but avoids the
     /// alloc when already in range, and well-defined at the degenerate
@@ -533,13 +529,14 @@ class ServerManager: ObservableObject {
     private func startHealthPolling() {
         healthTask?.cancel()
         let checkPort = port
+        let healthURL = api.serverURL(port: checkPort, path: "/health")
         // Use a GCD timer on the main queue — guaranteed to fire even during init.
         // URLSession completion runs on a background queue and dispatches back to main.
         let source = DispatchSource.makeTimerSource(queue: .main)
         source.schedule(deadline: .now() + 1, repeating: 1.0)
         source.setEventHandler { [weak self] in
             guard let self else { source.cancel(); return }
-            let url = URL(string: "http://127.0.0.1:\(checkPort)/health")!
+            let url = healthURL
             URLSession.shared.dataTask(with: url) { data, response, error in
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -647,6 +644,19 @@ class ServerManager: ObservableObject {
     /// after it booted (POST /v1/models/rescan), then refresh the list so the
     /// media panes' "On This Mac" rows see them. No-op when stopped — the
     /// next boot's discovery covers it.
+    /// Ask the running server to re-read providers.json and re-probe, then
+    /// pick up the new rows.
+    func reloadProviders() async {
+        guard status == .running else { return }
+        try? await api.reloadProviders(port: port)
+        await refreshModels()
+    }
+
+    func providerStatus() async -> [ProviderStatus] {
+        guard status == .running else { return [] }
+        return (try? await api.providerStatus(port: port)) ?? []
+    }
+
     func rescanModels() {
         guard status == .running else { return }
         Task {

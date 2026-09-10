@@ -170,13 +170,12 @@ enum SandboxSmoke {
                           "ls /usr/lib/python3.*/EXTERNALLY-MANAGED 2>/dev/null || echo PIP_UNBLOCKED", "PIP_UNBLOCKED")
                 }
 
-                // Phase 3: the Sandbox Terminal path — runUserCommand + transcript
-                // (exactly what SandboxTerminalView calls).
+                // Phase 3: runUserCommand + transcript (the transcript store
+                // keeps recording; nothing renders it since 2026-09-02).
                 log("[smoke] phase 3: Sandbox Terminal (runUserCommand + transcript)…")
                 syncAwait { await AgentSandbox.shared.runUserCommand("echo USER_TERMINAL_$((8*8))") }
                 // The transcript is published on the main queue; this smoke has no
-                // running runloop, so pump it until the entry lands (the real app's
-                // runloop delivers these live to SandboxTerminalView).
+                // running runloop, so pump it until the entry lands.
                 var userHit = false, agentHit = false
                 let deadline = Date().addingTimeInterval(3)
                 while Date() < deadline {

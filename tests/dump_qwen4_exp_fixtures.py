@@ -107,6 +107,16 @@ TINY = dict(
 T_PREFILL = 14
 T_DECODE = 6
 
+# `build --yarn`: the tiny geometry (8 rotary dims = 4 frequency pairs) gets a
+# trained window of 8 stretched x4, so positions 8..19 of the 20-token prompt
+# sit past the window. beta_fast/beta_slow are shrunk so the ramp still SPLITS
+# the 4 pairs (pair 0 extrapolated, pair 1 ramped, pairs 2-3 interpolated) —
+# the real checkpoint's 32/1 would put every pair in the interpolated band at
+# this size. mscale 0.1*ln(4)+1 rides on cos/sin like the reference.
+YARN = dict(rope_type="yarn", factor=4.0, original_max_position_embeddings=8,
+            beta_fast=1.0, beta_slow=0.1, truncate=True)
+YARN_MAX_POS = 32
+
 TINY_VISION = dict(
     depth=2, hidden_size=64, num_heads=4, intermediate_size=128, in_channels=3,
     patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
@@ -603,6 +613,7 @@ def main():
     b.add_argument("--vision", action="store_true")
     b.add_argument("--topk", type=int, default=None,
                    help="num_experts_per_tok (< num_experts covers top-k SELECTION; ties then acquit more rows)")
+    b.add_argument("--yarn", action="store_true", help="YaRN rope_parameters (window 8 -> 32): the context-extension oracle")
     d = sub.add_parser("dump")
     d.add_argument("--hf", required=True)
     d.add_argument("--pack", required=True)
@@ -612,13 +623,20 @@ def main():
     if a.cmd == "build":
         if a.topk is not None:
             TINY["num_experts_per_tok"] = a.topk
+        if a.yarn:
+            TINY["rope_parameters"] = dict(TINY["rope_parameters"], **YARN)
+            TINY["max_position_embeddings"] = YARN_MAX_POS
         build(os.path.expanduser(a.out), a.vision)
     else:
         # The reference is built from TINY, so a `build --topk` checkpoint
         # must hand its k back (the pack's config carries it).
         with open(os.path.join(os.path.expanduser(a.hf), "config.json")) as f:
             hc = json.load(f)
-        TINY["num_experts_per_tok"] = hc.get("text_config", hc).get("num_experts_per_tok", TINY["num_experts_per_tok"])
+        tc = hc.get("text_config", hc)
+        TINY["num_experts_per_tok"] = tc.get("num_experts_per_tok", TINY["num_experts_per_tok"])
+        # ... and its rope block: a `build --yarn` checkpoint renders with YaRN.
+        TINY["rope_parameters"] = tc.get("rope_parameters", TINY["rope_parameters"])
+        TINY["max_position_embeddings"] = tc.get("max_position_embeddings", TINY["max_position_embeddings"])
         dump(os.path.expanduser(a.hf), os.path.expanduser(a.pack), a.out, a.vision)
 
 

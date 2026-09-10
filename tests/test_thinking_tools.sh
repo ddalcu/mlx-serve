@@ -156,6 +156,27 @@ run_test "No thinking tags in content" "$([ "$NO_TAGS" -eq 0 ] && echo PASS || e
 
 # ─────────────────────────────────────────────────────
 echo ""
+echo -e "${YELLOW}Test 6b: the same request streamed and not must split the SAME${NC}"
+# Gemma 4 opens its own thought channel mid-stream; the bar is the split, not a
+# tag grep: at temp 0 both surfaces must agree byte for byte.
+# ─────────────────────────────────────────────────────
+REQ='{"model":"mlx-serve","messages":[{"role":"user","content":"What is 15 times 17?"}],"max_tokens":500,"temperature":0,"enable_thinking":true}'
+NS=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$REQ" \
+  | python3 -c 'import json,sys;m=json.load(sys.stdin)["choices"][0]["message"];print(((m.get("reasoning_content") or "").strip()+"\x1e"+(m.get("content") or "").strip()))')
+ST=$(curl -sfN "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "${REQ%\}},\"stream\":true}" \
+  | python3 -c '
+import json,sys
+rc=c=""
+for l in sys.stdin:
+    if not l.startswith("data: ") or "[DONE]" in l: continue
+    d=json.loads(l[6:])["choices"][0]["delta"]
+    rc+=d.get("reasoning_content") or ""; c+=d.get("content") or ""
+print(rc.strip()+"\x1e"+c.strip())')
+run_test "stream and non-stream split identically" "$([ "$NS" = "$ST" ] && echo PASS || echo FAIL)" "non-stream='${NS:0:60}' stream='${ST:0:60}'"
+run_test "the answer is content, not reasoning" "$([ -n "${ST#*$'\x1e'}" ] && echo PASS || echo FAIL)" "content='${ST#*$'\x1e'}'"
+
+# ─────────────────────────────────────────────────────
+echo ""
 echo -e "${YELLOW}Test 7: No thinking, tools enabled, streaming${NC}"
 # ─────────────────────────────────────────────────────
 STREAM=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" \

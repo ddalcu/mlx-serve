@@ -12,7 +12,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
-                       ["claude", "pi", "omp", "opencode", "codex", "hermes", "aider"],
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
@@ -81,6 +81,60 @@ final class CLISetupInstructionsTests: XCTestCase {
         // The inline export is single-quoted; a quote INSIDE the JSON would
         // truncate it silently in the user's shell.
         XCTAssertFalse(json.contains("'"), "opencodeJSON must stay single-quote-free")
+    }
+
+    func testOpencode2TabUsesDedicatedXdgConfigAndRegistersThePlugin() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "opencode2" })
+        XCTAssertTrue(tab.command.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#))
+        XCTAssertTrue(tab.command.contains("opencode2 --standalone"))
+        XCTAssertFalse(tab.command.contains("opencode2 --model"))
+        XCTAssertTrue(tab.command.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#))
+        XCTAssertTrue(tab.command.contains("npm install -g @opencode/cli"))
+        XCTAssertTrue(tab.command.contains("./plugins/mlx-serve"))
+        XCTAssertTrue(tab.command.contains("http://localhost:11234/metrics.json"))
+        XCTAssertFalse(tab.command.contains("~/.config/opencode"), "must never write the user's real opencode config")
+        let json = AgentConfigs.opencodeJSON(
+            baseURL: "http://localhost:11234", defaultModel: "gemma-4-e4b-it-4bit",
+            entries: [AgentModelEntry(id: "gemma-4-e4b-it-4bit", budget: budget, vision: false)],
+            pinModel: true)
+        XCTAssertTrue(tab.command.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"))
+    }
+
+    func testDMGLauncherOpencode2MatchesTheTab() {
+        XCTAssertNotNil(LauncherCLI.opencode2.prepareConfig)
+        let script = LauncherCLI.opencode2.scriptBody("http://localhost:11234",
+                                                     "gemma-4-e4b-it-4bit", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains(#"export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2""#), script)
+        XCTAssertTrue(script.contains("opencode2 --standalone"), script)
+        XCTAssertFalse(script.contains("opencode2 --model"), script)
+        XCTAssertTrue(script.contains(#""model": "mlx/gemma-4-e4b-it-4bit""#), script)
+        XCTAssertTrue(script.contains("npm install -g @opencode/cli"), script)
+        XCTAssertTrue(script.contains("exit 127"), script)
+    }
+
+    func testOpencode2CliJsonMergeKeepsThemeAndReplacesMlxServe() throws {
+        let existing = """
+        {"theme":"nord","plugins":[{"package":"other-plugin","options":{"a":1}},{"package":"./plugins/mlx-serve","options":{"metricsUrl":"http://old:1/metrics.json"}}]}
+        """
+        let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: "http://127.0.0.1:11234")
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["theme"] as? String, "nord")
+        let plugins = try XCTUnwrap(obj["plugins"] as? [Any]).compactMap { $0 as? [String: Any] }
+        XCTAssertEqual(plugins.count, 2)
+        let other = plugins.first { ($0["package"] as? String) == "other-plugin" }
+        XCTAssertNotNil(other)
+        XCTAssertEqual((other?["options"] as? [String: Any])?["a"] as? Int, 1)
+        let mlx = plugins.filter { ($0["package"] as? String) == "./plugins/mlx-serve" }
+        XCTAssertEqual(mlx.count, 1)
+        let opts = try XCTUnwrap(mlx[0]["options"] as? [String: Any])
+        XCTAssertEqual(opts["metricsUrl"] as? String, "http://127.0.0.1:11234/metrics.json")
+        XCTAssertNil(opts["metricsToken"])
+
+        let remote = AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: "http://10.0.0.2:11234")
+        let remoteObj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(remote.utf8)) as? [String: Any])
+        let remotePlugins = try XCTUnwrap(remoteObj["plugins"] as? [Any]).compactMap { $0 as? [String: Any] }
+        let remoteOpts = try XCTUnwrap(remotePlugins[0]["options"] as? [String: Any])
+        XCTAssertEqual(remoteOpts["metricsToken"] as? String, "mlx-serve")
     }
 
     /// The DMG one-click launcher makes the same move: inline env var in the
@@ -183,7 +237,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
         XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
             "/Applications/ChatGPT.app/Contents/Resources/codex"))
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider] {
             XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
         }
     }

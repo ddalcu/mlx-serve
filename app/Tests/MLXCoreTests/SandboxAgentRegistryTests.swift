@@ -176,24 +176,31 @@ final class SandboxAgentRegistryTests: XCTestCase {
     // ssh drops the bootstrap in /root, and nothing cd'd before the exec —
     // live 2026-07-20 a pi session built its whole project in /root/fps-game,
     // invisible on the host, while the configured workspace share sat empty.
-    // `/workspace` IS the configured default agent workspace (ensureBooted's
-    // nil-workingDirectory share = ChatSession.defaultWorkingDirectory), so
-    // every agent session must start there; a missing share stays loud but
-    // non-fatal.
-    func testBootstrapStartsAgentSessionsInTheWorkspaceShare() {
+    // Every agent session starts in the folder the user picked (`/workspace`
+    // for the default, `/projects/<slug>` for a hot-mounted one); a missing
+    // share stays loud but non-fatal.
+    func testBootstrapStartsAgentSessionsInTheirWorkspace() {
         for spec in SandboxAgentRegistry.all {
-            let s = SandboxAgentRegistry.bootstrapScript(for: spec, model: "m")
-            let cd = s.range(of: "cd /workspace")
+            let s = SandboxAgentRegistry.bootstrapScript(for: spec, model: "m", cwd: "/projects/app-1a2b3c")
+            let cd = s.range(of: "cd '/projects/app-1a2b3c'")
             let ex = s.range(of: "exec ")
-            XCTAssertNotNil(cd, "\(spec.id): must start in the workspace share, not /root")
+            XCTAssertNotNil(cd, "\(spec.id): must start in the picked workspace, not /root")
             XCTAssertNotNil(ex, spec.id)
             if let cd, let ex {
                 XCTAssertLessThan(cd.lowerBound, ex.lowerBound,
                                   "\(spec.id): the cd must precede the agent exec")
             }
-            XCTAssertTrue(s.contains("/workspace share missing"),
+            XCTAssertTrue(s.contains("share missing"),
                           "\(spec.id): a missing share must be loud, never a silent /root session")
         }
+    }
+
+    func testBootstrapQuotesTheWorkspacePath() {
+        // A folder name with an apostrophe must stay ONE quoted `cd` — a split
+        // word here is the ShellSentinel-desync class, and the session would
+        // start in $HOME with the agent none the wiser.
+        let s = SandboxAgentRegistry.bootstrapScript(for: .pi, model: "m", cwd: "/projects/dave's-app")
+        XCTAssertTrue(s.contains("cd '/projects/dave'\\''s-app' 2>/dev/null"), s)
     }
 
     func testBootstrapQuotesTheModelId() {

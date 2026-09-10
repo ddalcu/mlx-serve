@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 struct VideoGenView: View {
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For "Send to Chat" — the hand-off opens a new conversation and switches
     /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
@@ -912,7 +913,7 @@ struct VideoGenView: View {
     }
 
     private func chooseAudioFile() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1206,7 +1207,7 @@ struct VideoGenView: View {
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
@@ -1230,7 +1231,7 @@ struct VideoGenView: View {
     /// than earning a 400 at generate time.
     private func chooseRefFiles(types: [UTType], limit room: Int, into urls: Binding<[URL]>) {
         guard room > 0 else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = types
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1246,7 +1247,7 @@ struct VideoGenView: View {
     }
 
     private func chooseKeyframeImage(into slot: Binding<URL?>) {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -1628,11 +1629,7 @@ struct VideoGenView: View {
     }
 
     private func showLogWindow() {
-        let text = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "Video generation log"
-        alert.informativeText = text.isEmpty ? "(no output)" : text
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }
 

@@ -17,6 +17,13 @@ import Foundation
 /// claimed otherwise.
 enum ContextSizeDisplay {
 
+    /// The context ladder Settings and the per-model sheet both pick from. 0 = Auto.
+    static let presets: [Int] = [
+        0, 4_096, 6_144, 8_192, 12_288, 16_384, 24_576, 32_768,
+        49_152, 65_536, 98_304, 131_072, 196_608, 262_144,
+        393_216, 524_288, 786_432, 1_048_576,
+    ]
+
     /// "Auto" for 0; otherwise a 1024-based K/M abbreviation.
     static func formatTokens(_ n: Int) -> String {
         if n == 0 { return "Auto" }

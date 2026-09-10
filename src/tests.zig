@@ -24,6 +24,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
+    _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
@@ -35,10 +36,12 @@ test {
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
+    _ = @import("restore_dump.zig");
     _ = @import("metrics.zig");
     _ = @import("status.zig");
     _ = @import("sleep_inhibit.zig");
     _ = @import("kv_disk_cache.zig");
+    _ = @import("kv_disk_writer.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");
@@ -84,5 +87,6 @@ test {
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");
+    _ = @import("providers.zig");
     _ = @import("mlx.zig");
 }

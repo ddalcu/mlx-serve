@@ -104,19 +104,11 @@ final class AppActivationTests: XCTestCase {
                        "a blank, unidentified window is not evidence it's ours")
     }
 
-    /// The Sandbox window has its own title case. Without one, "sandboxTerminal"
-    /// fell through to the "Browser" default — and the raise pass would
-    /// makeKeyAndOrderFront an open BROWSER window (title "Browser") instead of
-    /// the Sandbox window the tray's "pi in Sandbox" shortcut just opened.
-    func testSandboxSceneMatchesItsOwnWindowNeverABrowser() {
-        XCTAssertEqual(AppActivation.windowTitle(for: "sandboxTerminal"), "MLX Sandbox")
-        XCTAssertFalse(AppActivation.windowMatches(id: "sandboxTerminal", title: "Browser", identifier: nil),
-                       "a Browser window must never satisfy the sandbox scene lookup")
-        XCTAssertTrue(AppActivation.windowMatches(id: "sandboxTerminal", title: "MLX Sandbox", identifier: nil))
-        // A live session retitles the window ("pi — MLX Sandbox") — the scene
-        // identifier fallback covers that; title alone rightly does not.
-        XCTAssertTrue(AppActivation.windowMatches(id: "sandboxTerminal", title: "pi — MLX Sandbox",
-                                                  identifier: "sandboxTerminal-AppWindow-1"))
+    /// The sandbox terminal window is retired (terminals are rows of the chat
+    /// window, 2026-09-02): its id falls through like every other retired
+    /// scene, so nothing can raise a window that no longer exists.
+    func testSandboxTerminalSceneIsRetired() {
+        XCTAssertEqual(AppActivation.windowTitle(for: "sandboxTerminal"), "Browser")
     }
 
     // MARK: - Source audit (the universal part)

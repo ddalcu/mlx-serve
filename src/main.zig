@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
+const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
@@ -13,6 +14,7 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
@@ -55,6 +57,8 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// Serve-mode default for requests that omit max_tokens (0 = flag not given).
+var serve_default_max_tokens: u32 = 0;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -110,7 +114,8 @@ fn printUsage(io: std.Io) void {
         \\                      inputs get a 400 naming index/count/limit, never truncation)
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
-        \\  --max-tokens <n>    Max tokens to generate (default: 100)
+        \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
+        \\                      mode, the default for requests that omit the field
         \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
         \\                      Serve: default for requests that omit `temperature`
         \\                      (otherwise the model's generation_config.json, then 1.0)
@@ -198,6 +203,17 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
+        \\                        context tokens (default: 0 = no ceiling).
+        \\                        A verify row is BYTES, so on a long-context
+        \\                        trunk a round can cost more than the serial
+        \\                        steps it replaces. A request whose prompt is
+        \\                        past <n> decodes serially, and one that
+        \\                        GENERATES past it switches mid-flight. The
+        \\                        bound is inclusive (<n> itself still drafts)
+        \\                        and it outranks `enable_mtp:true` in the
+        \\                        request body. MTP only — PLD, the drafter
+        \\                        and DFlash/DSpark are unaffected.
         \\  --mtp-history-window <n>
         \\                      MTP prefill-history window: prompts forwarding
         \\                        more than 16384 tokens only build head history
@@ -359,6 +375,12 @@ pub fn main(init: std.process.Init) !void {
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
+    // Resolve lazily-cached env reads on the main thread before other threads exist.
+    @import("transformer.zig").warmQsaEnvCaches();
+    @import("prefix_cache.zig").warmEnvCaches();
+
+    // mlx-c's default handler exits the process; latch MLX failures instead (#353).
+    mlx.installErrorHandler();
 
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
@@ -552,6 +574,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
             i += 1;
             max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+            serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
             temperature = try std.fmt.parseFloat(f32, args[i]);
@@ -685,6 +708,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
+            i += 1;
+            generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
             // 0 = full history; otherwise the last-N-token window applied
@@ -1143,6 +1169,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (!config_owned_by_registry) allocator.destroy(config_storage);
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
+    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -1345,6 +1372,7 @@ pub fn main(init: std.process.Init) !void {
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
+            .default_max_tokens = serve_default_max_tokens,
             .default_temperature = if (temp_explicit) temperature else null,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
@@ -1367,6 +1395,8 @@ pub fn main(init: std.process.Init) !void {
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
+
+        xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
         generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
@@ -1753,6 +1783,7 @@ fn runGenServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -1883,6 +1914,7 @@ fn runHeadlessServe(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
@@ -1926,6 +1958,8 @@ fn runDs4Serve(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
+    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    const model_ctx = settings.ctx_size orelse ctx_size;
     // Resolve the GGUF file once on this thread so the engine's open() call
     // (running on the inference thread) gets an absolute path.
     const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
@@ -1959,7 +1993,8 @@ fn runDs4Serve(
         // 0/unset → ds4's default) on the standard field. `runPrefillDs4` reads
         // it back to size the ds4 session, and `getEffectiveContextLength` /
         // /v1/models report it.
-        .max_position_embeddings = ds4_arch.clampSessionCtx(ctx_size),
+        .max_position_embeddings = ds4_arch.clampSessionCtx(model_ctx),
+        .ctx_override = settings.ctx_size orelse 0,
         .is_encoder_only = false,
     };
 
@@ -2097,6 +2132,7 @@ fn runDs4Serve(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
@@ -2221,7 +2257,8 @@ fn runLlamaServe(
     // inference thread). Used for BOTH the llama session size (via the stub
     // config's max_position_embeddings, read in runPrefillLlama) AND the
     // server's context guard (server_config.max_context_size), so they agree.
-    const effective_ctx: u32 = if (ctx_size > 0) ctx_size else 8192;
+    const settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    const effective_ctx: u32 = settings.ctx_size orelse (if (ctx_size > 0) ctx_size else 8192);
 
     log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});
     log.info("[args] model: {s}\n", .{gguf_path_owned});
@@ -2238,6 +2275,7 @@ fn runLlamaServe(
         .weight_prefix = "model",
         .head_dim = 128,
         .max_position_embeddings = effective_ctx,
+        .ctx_override = settings.ctx_size orelse 0,
         .is_encoder_only = false,
     };
 
@@ -2368,9 +2406,10 @@ fn runLlamaServe(
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
-        .max_context_size = effective_ctx,
+        .max_context_size = if (ctx_size > 0) ctx_size else 8192,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,

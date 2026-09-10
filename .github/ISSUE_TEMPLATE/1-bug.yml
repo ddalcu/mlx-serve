@@ -2,6 +2,13 @@ name: Bug report
 description: Crash, wrong output, API misbehavior, or app problem
 labels: ["bug"]
 body:
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before opening
+      options:
+        - label: I searched open and closed issues, open PRs and recent commits for this, and it is not already reported or fixed
+          required: true
   - type: dropdown
     id: priority
     attributes:

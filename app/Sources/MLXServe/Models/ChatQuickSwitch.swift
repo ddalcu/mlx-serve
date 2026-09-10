@@ -68,29 +68,68 @@ enum ChatQuickSwitch {
     ///   clear, so nothing is numbered.
     static func numbered(_ sessions: [ChatSession], numbering: Set<UUID>? = nil) -> [ChatSession] {
         let rows = ordered(sessions)
-        guard let numbering else { return Array(rows.prefix(maxSlots)) }
-        return Array(rows.filter { numbering.contains($0.id) }.prefix(maxSlots))
+        let ids = numbered(visible: rows.map(\.id), numbering: numbering)
+        return ids.compactMap { id in rows.first { $0.id == id } }
+    }
+
+    /// The general form: `visible` is the panel's rows top to bottom — chats
+    /// AND terminals, in their dragged order — which is the only list the
+    /// numbers can honestly follow.
+    static func numbered(visible: [UUID], numbering: Set<UUID>? = nil) -> [UUID] {
+        guard let numbering else { return Array(visible.prefix(maxSlots)) }
+        return Array(visible.filter { numbering.contains($0) }.prefix(maxSlots))
     }
 
     /// The 1-based number drawn on a row, or nil when it gets none.
     static func slot(for id: UUID, in sessions: [ChatSession],
                      numbering: Set<UUID>? = nil) -> Int? {
-        guard let index = numbered(sessions, numbering: numbering)
-            .firstIndex(where: { $0.id == id })
+        slot(for: id, visible: ordered(sessions).map(\.id), numbering: numbering)
+    }
+
+    static func slot(for id: UUID, visible: [UUID], numbering: Set<UUID>? = nil) -> Int? {
+        guard let index = numbered(visible: visible, numbering: numbering).firstIndex(of: id)
         else { return nil }
         return index + 1
     }
 
-    /// The chat a digit reaches, or nil when no row wears that number.
+    /// The row a digit reaches, or nil when no row wears that number.
     ///
     /// Reads the same `numbered` list the badge was drawn from, so the digit
     /// cannot land on a different row than the one showing it.
     static func id(forSlot slot: Int, in sessions: [ChatSession],
                    numbering: Set<UUID>? = nil) -> UUID? {
+        id(forSlot: slot, visible: ordered(sessions).map(\.id), numbering: numbering)
+    }
+
+    static func id(forSlot slot: Int, visible: [UUID], numbering: Set<UUID>? = nil) -> UUID? {
         guard slot >= 1, slot <= maxSlots else { return nil }
-        let rows = numbered(sessions, numbering: numbering)
+        let rows = numbered(visible: visible, numbering: numbering)
         guard slot <= rows.count else { return nil }
-        return rows[slot - 1].id
+        return rows[slot - 1]
+    }
+
+    /// Where a digit lands: a conversation (with the selection maths) or a
+    /// terminal (shown as is — there is nothing to range on one).
+    enum Target {
+        case chat(SidebarMultiSelect.Outcome)
+        case terminal(UUID)
+    }
+
+    /// `visible` is the whole panel; `chats` is the conversation subset in the
+    /// same order, which is what a range runs over.
+    static func target(slot: Int,
+                       visible: [UUID],
+                       chats: [UUID],
+                       numbering: Set<UUID>?,
+                       selection: Set<UUID>,
+                       anchor: UUID?,
+                       active: UUID?,
+                       extend: Bool) -> Target? {
+        guard let hit = id(forSlot: slot, visible: visible, numbering: numbering) else { return nil }
+        guard chats.contains(hit) else { return .terminal(hit) }
+        return .chat(SidebarMultiSelect.click(
+            hit, ordered: chats, selection: selection, anchor: anchor ?? active,
+            active: active, command: false, shift: extend))
     }
 
     /// What ⌘\<digit\> and ⇧⌘\<digit\> do, as one decision.
@@ -118,19 +157,16 @@ enum ChatQuickSwitch {
                         anchor: UUID?,
                         active: UUID?,
                         extend: Bool) -> SidebarMultiSelect.Outcome? {
-        guard let target = id(forSlot: slot, in: sessions, numbering: numbering) else { return nil }
-        return SidebarMultiSelect.click(
-            target,
-            ordered: ordered(sessions).map(\.id),
-            selection: selection,
-            anchor: anchor ?? active,
-            active: active,
-            // Never `command`: ⌘ is physically down for every one of these, but
-            // the gesture being described is a plain click or a shift-click.
-            // Passing it through would make ⌘\<digit\> TOGGLE the row into a
-            // multi-selection instead of going to it.
-            command: false,
-            shift: extend)
+        // Never `command` (inside `target`): ⌘ is physically down for every one
+        // of these, but the gesture being described is a plain click or a
+        // shift-click. Passing it through would make ⌘\<digit\> TOGGLE the row
+        // into a multi-selection instead of going to it.
+        let chats = ordered(sessions).map(\.id)
+        guard case .chat(let outcome)? = target(slot: slot, visible: chats, chats: chats,
+                                                numbering: numbering, selection: selection,
+                                                anchor: anchor, active: active, extend: extend)
+        else { return nil }
+        return outcome
     }
 }
 

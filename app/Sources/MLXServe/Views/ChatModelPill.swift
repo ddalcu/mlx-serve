@@ -218,9 +218,18 @@ struct ChatModelPill: View {
                     }
                 }
             }
-            if !lanChatModels.isEmpty {
-                Section("On Your Network") {
-                    ForEach(lanChatModels, id: \.name) { m in
+            let network = lanChatModels.filter { $0.provider == nil }
+            let providers = lanChatModels.filter { $0.provider != nil }
+            if !network.isEmpty {
+                Section(ModelPalette.networkSection) {
+                    ForEach(network, id: \.name) { m in
+                        row(title: m.lanDisplayName, tag: "lan:" + m.name)
+                    }
+                }
+            }
+            if !providers.isEmpty {
+                Section(ModelPalette.providersSection) {
+                    ForEach(providers, id: \.name) { m in
                         row(title: m.lanDisplayName, tag: "lan:" + m.name)
                     }
                 }
