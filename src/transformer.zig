@@ -5635,6 +5635,7 @@ pub const KVCacheEntry = struct {
 
     offset: usize, // logical token count (may be < buffer capacity)
     initialized: bool,
+    shared_view: bool = false,
 };
 
 /// Materialized dense `[B,H,T,D]` K/V pair handed to SDPA. Owns its arrays
@@ -5955,6 +5956,7 @@ pub const KVCache = struct {
                     try mlx.check(mlx.mlx_array_set(&dst.values_scales, src.values_scales));
                     try mlx.check(mlx.mlx_array_set(&dst.values_biases, src.values_biases));
                 }
+                dst.shared_view = true;
             }
         }
         self.step = snap.step;
@@ -6073,6 +6075,110 @@ pub const KVCache = struct {
         }
     }
 
+    pub fn appendBatched(
+        stacked_k: mlx.mlx_array,
+        stacked_v: mlx.mlx_array,
+        caches: []const *KVCache,
+        layer: u32,
+        s: mlx.mlx_stream,
+        max_seq: u32,
+        scheme: KVQuantConfig,
+    ) !void {
+        if (scheme.scheme == .affine and scheme.bits == 8) {
+            try appendAffineBatched(stacked_k, stacked_v, caches, layer, s, max_seq, scheme);
+            return;
+        }
+        try appendBatchedPerSlot(stacked_k, stacked_v, caches, layer, s, max_seq);
+    }
+
+    pub fn appendFromStacked(
+        stacked_k: mlx.mlx_array,
+        stacked_v: mlx.mlx_array,
+        caches: []const *KVCache,
+        layer: u32,
+        s: mlx.mlx_stream,
+        max_seq: u32,
+        use_batched: bool,
+    ) !void {
+        if (use_batched and caches.len > 0) {
+            try appendBatched(stacked_k, stacked_v, caches, layer, s, max_seq, caches[0].config);
+            return;
+        }
+        try appendBatchedPerSlot(stacked_k, stacked_v, caches, layer, s, max_seq);
+    }
+
+    fn appendBatchedPerSlot(
+        stacked_k: mlx.mlx_array,
+        stacked_v: mlx.mlx_array,
+        caches: []const *KVCache,
+        layer: u32,
+        s: mlx.mlx_stream,
+        max_seq: u32,
+    ) !void {
+        for (caches, 0..) |cache, i| {
+            const k_slot = try sliceStackedRow(s, stacked_k, i);
+            defer _ = mlx.mlx_array_free(k_slot);
+            const v_slot = try sliceStackedRow(s, stacked_v, i);
+            defer _ = mlx.mlx_array_free(v_slot);
+            var view = try cache.update(layer, k_slot, v_slot, s, max_seq);
+            view.deinit();
+        }
+    }
+
+    fn sliceStackedRow(s: mlx.mlx_stream, stacked: mlx.mlx_array, i: usize) !mlx.mlx_array {
+        const sh = mlx.getShape(stacked);
+        const i_c: c_int = @intCast(i);
+        const start = [_]c_int{ i_c, 0, 0, 0 };
+        const stop = [_]c_int{ i_c + 1, sh[1], sh[2], sh[3] };
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_slice(&out, stacked, &start, 4, &stop, 4, &strides, 4, s));
+        return out;
+    }
+
+    fn appendAffineBatched(
+        stacked_k: mlx.mlx_array,
+        stacked_v: mlx.mlx_array,
+        caches: []const *KVCache,
+        layer: u32,
+        s: mlx.mlx_stream,
+        max_seq: u32,
+        scheme: KVQuantConfig,
+    ) !void {
+        var new_kq = try kv_quant.quantizeAffine(s, stacked_k, scheme.group_size, scheme.bits);
+        defer new_kq.deinit();
+        var new_vq = try kv_quant.quantizeAffine(s, stacked_v, scheme.group_size, scheme.bits);
+        defer new_vq.deinit();
+        for (caches, 0..) |cache, i| {
+            var row_kq: kv_quant.QuantizedKV = .{
+                .q = mlx.mlx_array_new(),
+                .scales = mlx.mlx_array_new(),
+                .biases = mlx.mlx_array_new(),
+            };
+            defer row_kq.deinit();
+            _ = mlx.mlx_array_free(row_kq.q);
+            row_kq.q = try sliceStackedRow(s, new_kq.q, i);
+            _ = mlx.mlx_array_free(row_kq.scales);
+            row_kq.scales = try sliceStackedRow(s, new_kq.scales, i);
+            _ = mlx.mlx_array_free(row_kq.biases);
+            row_kq.biases = try sliceStackedRow(s, new_kq.biases, i);
+            var row_vq: kv_quant.QuantizedKV = .{
+                .q = mlx.mlx_array_new(),
+                .scales = mlx.mlx_array_new(),
+                .biases = mlx.mlx_array_new(),
+            };
+            defer row_vq.deinit();
+            _ = mlx.mlx_array_free(row_vq.q);
+            row_vq.q = try sliceStackedRow(s, new_vq.q, i);
+            _ = mlx.mlx_array_free(row_vq.scales);
+            row_vq.scales = try sliceStackedRow(s, new_vq.scales, i);
+            _ = mlx.mlx_array_free(row_vq.biases);
+            row_vq.biases = try sliceStackedRow(s, new_vq.biases, i);
+            try cache.writeAffineChunk(layer, row_kq, row_vq, s, max_seq);
+        }
+    }
+
     /// Wave 2 — TurboQuant write path. Rotate K and V by the per-layer
     /// Hadamard matrices, then re-use the affine grow/write/view machinery.
     /// Read-back at SDPA time dequantizes + rotates back via `denseView`.
@@ -6131,6 +6237,55 @@ pub const KVCache = struct {
         const bits: u8 = cfg.bits;
 
         // 1. Free stale views (6 of them — dense + 4 quant scale/bias views).
+        // 2. Quantize incoming K/V.
+        var new_kq = try kv_quant.quantizeAffine(s, new_k, group_size, bits);
+        defer new_kq.deinit();
+        var new_vq = try kv_quant.quantizeAffine(s, new_v, group_size, bits);
+        defer new_vq.deinit();
+
+        // 3. Shape info: new_k is [B, heads, new_len, head_dim]. The V widths
+        //    are solved from new_v's OWN head dim, not K's: an MLA arch scores
+        //    over nope+rope (192) and stores values at v_head_dim (128), so a
+        //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
+        //    (an mlx slice_update mismatch we cannot catch). Identical on every
+        //    symmetric arch — the same generalization `updateDense` carries.
+        try self.writeAffineChunk(layer, new_kq, new_vq, s, max_seq);
+
+        // 8. Dequantize K/V for SDPA. Owner of these dense arrays is the
+        //    DenseKVView returned to the caller. The quant triples ride along
+        //    as borrows so fused call sites can skip the dense read — mlx is
+        //    lazy, so the dequant graph below costs nothing unless SDPA
+        //    actually reads `.k`/`.v`. (Engagement bug class: the decode
+        //    forward calls update(), not denseView() — omitting the triples
+        //    here made `--kv-attn-mode fused` a silent no-op.)
+        const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, group_size, bits);
+        errdefer _ = mlx.mlx_array_free(dense_k);
+        const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, group_size, bits);
+        return .{
+            .k = dense_k,
+            .v = dense_v,
+            .owned = true,
+            .k_triple_q = entry.key_view,
+            .k_triple_scales = entry.key_scales_view,
+            .k_triple_biases = entry.key_biases_view,
+            .v_triple_q = entry.value_view,
+            .v_triple_scales = entry.value_scales_view,
+            .v_triple_biases = entry.value_biases_view,
+            .has_quant_triple = true,
+            .bits = bits,
+            .group_size = group_size,
+        };
+    }
+
+    fn writeAffineChunk(
+        self: *KVCache,
+        layer: u32,
+        new_kq: kv_quant.QuantizedKV,
+        new_vq: kv_quant.QuantizedKV,
+        s: mlx.mlx_stream,
+        max_seq: u32,
+    ) !void {
+        const entry = &self.entries[layer];
         _ = mlx.mlx_array_free(entry.key_view);
         _ = mlx.mlx_array_free(entry.value_view);
         _ = mlx.mlx_array_free(entry.key_scales_view);
@@ -6144,36 +6299,30 @@ pub const KVCache = struct {
         entry.value_scales_view = mlx.mlx_array_new();
         entry.value_biases_view = mlx.mlx_array_new();
 
-        // 2. Quantize incoming K/V.
-        var new_kq = try kv_quant.quantizeAffine(s, new_k, group_size, bits);
-        defer new_kq.deinit();
-        var new_vq = try kv_quant.quantizeAffine(s, new_v, group_size, bits);
-        defer new_vq.deinit();
+        const q_shape = mlx.getShape(new_kq.q);
+        const vq_shape = mlx.getShape(new_vq.q);
+        const sc_shape = mlx.getShape(new_kq.scales);
+        const vsc_shape = mlx.getShape(new_vq.scales);
+        const new_len: usize = @intCast(q_shape[2]);
+        const B = q_shape[0];
+        const heads = q_shape[1];
+        const q_last = q_shape[3];
+        const vq_last = vq_shape[3];
+        const sc_last = sc_shape[3];
+        const vsc_last = vsc_shape[3];
 
-        // 3. Shape info: new_k is [B, heads, new_len, head_dim]. The V widths
-        //    are solved from new_v's OWN head dim, not K's: an MLA arch scores
-        //    over nope+rope (192) and stores values at v_head_dim (128), so a
-        //    K-derived packed width writes a 16-u32 chunk into a 24-u32 window
-        //    (an mlx slice_update mismatch we cannot catch). Identical on every
-        //    symmetric arch — the same generalization `updateDense` carries.
-        const new_shape = mlx.getShape(new_k);
-        const new_len: usize = @intCast(new_shape[2]);
-        const B = new_shape[0];
-        const heads = new_shape[1];
-        const head_dim_u32: u32 = @intCast(new_shape[3]);
-        const v_head_dim_u32: u32 = @intCast(mlx.getShape(new_v)[3]);
-        const q_last: c_int = @intCast(head_dim_u32 * @as(u32, bits) / 32);
-        const sc_last: c_int = @intCast(head_dim_u32 / group_size);
-        const vq_last: c_int = @intCast(v_head_dim_u32 * @as(u32, bits) / 32);
-        const vsc_last: c_int = @intCast(v_head_dim_u32 / group_size);
+        const will_grow = !entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys);
+        if (entry.shared_view) {
+            if (entry.initialized and !will_grow) try cowAffineBuffers(s, entry);
+            entry.shared_view = false;
+        }
 
         // 4. Grow buffers if needed (6 of them, in lockstep on the seq axis).
-        if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
+        if (will_grow) {
             const needed = entry.offset + new_len;
             const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
             const new_cap: c_int = @intCast(self.nextCapacityReserved(cur_cap, needed));
             kv_cap_buf_grows += 1;
-
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
             try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
@@ -6213,31 +6362,22 @@ pub const KVCache = struct {
         try buildSliceView(s, &entry.key_biases_view, entry.keys_biases, total, view_start);
         try buildSliceView(s, &entry.value_scales_view, entry.values_scales, total, view_start);
         try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
+    }
 
-        // 8. Dequantize K/V for SDPA. Owner of these dense arrays is the
-        //    DenseKVView returned to the caller. The quant triples ride along
-        //    as borrows so fused call sites can skip the dense read — mlx is
-        //    lazy, so the dequant graph below costs nothing unless SDPA
-        //    actually reads `.k`/`.v`. (Engagement bug class: the decode
-        //    forward calls update(), not denseView() — omitting the triples
-        //    here made `--kv-attn-mode fused` a silent no-op.)
-        const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, group_size, bits);
-        errdefer _ = mlx.mlx_array_free(dense_k);
-        const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, group_size, bits);
-        return .{
-            .k = dense_k,
-            .v = dense_v,
-            .owned = true,
-            .k_triple_q = entry.key_view,
-            .k_triple_scales = entry.key_scales_view,
-            .k_triple_biases = entry.key_biases_view,
-            .v_triple_q = entry.value_view,
-            .v_triple_scales = entry.value_scales_view,
-            .v_triple_biases = entry.value_biases_view,
-            .has_quant_triple = true,
-            .bits = bits,
-            .group_size = group_size,
+    fn cowAffineBuffers(s: mlx.mlx_stream, entry: *KVCacheEntry) !void {
+        const bufs = [_]*mlx.mlx_array{
+            &entry.keys,
+            &entry.values,
+            &entry.keys_scales,
+            &entry.keys_biases,
+            &entry.values_scales,
+            &entry.values_biases,
         };
+        for (bufs) |buf| {
+            const owned = try materializedOwnedCopy(s, buf.*);
+            _ = mlx.mlx_array_free(buf.*);
+            buf.* = owned;
+        }
     }
 
     fn updateDense(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -6257,8 +6397,21 @@ pub const KVCache = struct {
         const new_len: usize = @intCast(new_shape[2]);
         const v_head_dim = mlx.getShape(new_v)[3];
 
+        const will_grow = !entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys);
+        if (entry.shared_view) {
+            if (entry.initialized and !will_grow) {
+                const k_owned = try materializedOwnedCopy(s, entry.keys);
+                _ = mlx.mlx_array_free(entry.keys);
+                entry.keys = k_owned;
+                const v_owned = try materializedOwnedCopy(s, entry.values);
+                _ = mlx.mlx_array_free(entry.values);
+                entry.values = v_owned;
+            }
+            entry.shared_view = false;
+        }
+
         // 3. Grow buffer if needed
-        if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
+        if (will_grow) {
             const B = new_shape[0];
             const heads = new_shape[1];
             const head_dim = new_shape[3];
@@ -12809,6 +12962,8 @@ pub const Transformer = struct {
     /// Test seam only (no env): `false` runs the old per-tick merge/split path so the
     /// transition tests can compare bytes. The persistent group is an exact change.
     persistent_group_state_override: ?bool = null,
+    /// Test seam only (no env): `false` runs the old per-slot KV update for byte comparisons.
+    batched_kv_append_override: ?bool = null,
     ssm_group: PersistentSsmGroup = .{},
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
@@ -16968,24 +17123,18 @@ pub const Transformer = struct {
                     try mlx.check(mlx.mlx_fast_rope_dynamic(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
                 }
 
-                // Per-slot cache update at B=1 — slice axis 0 of stacked tensors.
-                const k_shape_full = mlx.getShape(own_k_rope);
-                const k_h_dim = k_shape_full[1];
-                const k_hd_dim = k_shape_full[3];
-                for (ctxs, 0..) |slot_ctx, i| {
-                    const i_c: c_int = @intCast(i);
-                    const slc_start = [_]c_int{ i_c, 0, 0, 0 };
-                    const slc_stop = [_]c_int{ i_c + 1, k_h_dim, 1, k_hd_dim };
-                    const slc_strides = [_]c_int{ 1, 1, 1, 1 };
-                    var k_slot = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(k_slot);
-                    var v_slot = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(v_slot);
-                    try mlx.check(mlx.mlx_slice(&k_slot, own_k_rope, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
-                    try mlx.check(mlx.mlx_slice(&v_slot, own_v_t, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
-                    var slot_view = try slot_ctx.cache.update(li, k_slot, v_slot, self.s, max_kv_per_layer);
-                    slot_view.deinit();
-                }
+                // Affine-8: one stacked quantize then per-slot writes; other schemes keep per-slot update.
+                var cache_buf: [MAX_BATCH_ROWS]*KVCache = undefined;
+                for (ctxs, 0..) |slot_ctx, i| cache_buf[i] = slot_ctx.cache;
+                try KVCache.appendFromStacked(
+                    own_k_rope,
+                    own_v_t,
+                    cache_buf[0..ctxs.len],
+                    li,
+                    self.s,
+                    max_kv_per_layer,
+                    self.batched_kv_append_override orelse true,
+                );
             }
 
             // Gather per-slot views and find kv_max. For KV-shared layers the
@@ -21532,23 +21681,17 @@ pub const Transformer = struct {
             var attn_out_b = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_out_b);
             {
-                const k_shape_full = mlx.getShape(k_rope);
-                const k_h_dim = k_shape_full[1];
-                const k_hd_dim = k_shape_full[3];
-                for (slots, 0..) |slot_ctx, i| {
-                    const i_c: c_int = @intCast(i);
-                    const slc_start = [_]c_int{ i_c, 0, 0, 0 };
-                    const slc_stop = [_]c_int{ i_c + 1, k_h_dim, seq_len, k_hd_dim };
-                    const slc_strides = [_]c_int{ 1, 1, 1, 1 };
-                    var k_slot = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(k_slot);
-                    var v_slot = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(v_slot);
-                    try mlx.check(mlx.mlx_slice(&k_slot, k_rope, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
-                    try mlx.check(mlx.mlx_slice(&v_slot, v_t, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
-                    var slot_view = try slot_ctx.cache.update(layer, k_slot, v_slot, self.s, 0);
-                    slot_view.deinit();
-                }
+                var cache_buf: [MAX_BATCH_ROWS]*KVCache = undefined;
+                for (slots, 0..) |slot_ctx, i| cache_buf[i] = slot_ctx.cache;
+                try KVCache.appendFromStacked(
+                    k_rope,
+                    v_t,
+                    cache_buf[0..slots.len],
+                    layer,
+                    self.s,
+                    0,
+                    self.batched_kv_append_override orelse true,
+                );
 
                 if (try self.qsaBatchedAttn(ctx, slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
                     _ = mlx.mlx_array_free(attn_out_b);
@@ -34614,6 +34757,263 @@ test "KVCache snapshot/restore in a tight loop does not leak" {
         defer _ = mlx.mlx_array_free(v);
         _ = try cache.update(0, k, v, s, 0);
         try cache.restore(&snap);
+    }
+}
+
+const kv_append_kv_h: c_int = 2;
+const kv_append_hd: c_int = 256;
+
+fn kvAppendPacked(n: c_int, seq: c_int, seed: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const nn: usize = @intCast(n * kv_append_kv_h * seq * kv_append_hd);
+    const buf = try testing.allocator.alloc(f32, nn);
+    defer testing.allocator.free(buf);
+    var st: u32 = seed;
+    for (buf) |*x| {
+        st = st *% 1664525 +% 1013904223;
+        x.* = @as(f32, @floatFromInt(st >> 16)) / 65536.0 - 0.5;
+    }
+    const shape = [_]c_int{ n, kv_append_kv_h, seq, kv_append_hd };
+    const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f32_arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32_arr, .bfloat16, s));
+    return out;
+}
+
+fn kvAppendPrefill(cache: *KVCache, tokens: usize, seed: u32, s: mlx.mlx_stream) !void {
+    const k = try kvAppendPacked(1, @intCast(tokens), seed, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try kvAppendPacked(1, @intCast(tokens), seed ^ 0x9E3779B9, s);
+    defer _ = mlx.mlx_array_free(v);
+    var dv = try cache.update(0, k, v, s, 0);
+    dv.deinit();
+}
+
+fn kvAppendOperandsEqual(a: *const KVCacheEntry, b: *const KVCacheEntry, s: mlx.mlx_stream) !void {
+    try testing.expectEqual(a.offset, b.offset);
+    try testing.expect(try qsaArraysAllEqual(a.keys, b.keys, s));
+    try testing.expect(try qsaArraysAllEqual(a.values, b.values, s));
+    try testing.expect(try qsaArraysAllEqual(a.keys_scales, b.keys_scales, s));
+    try testing.expect(try qsaArraysAllEqual(a.keys_biases, b.keys_biases, s));
+    try testing.expect(try qsaArraysAllEqual(a.values_scales, b.values_scales, s));
+    try testing.expect(try qsaArraysAllEqual(a.values_biases, b.values_biases, s));
+}
+
+fn kvAppendDummyAttn(cache: *KVCache, s: mlx.mlx_stream) !mlx.mlx_array {
+    var dv = try cache.denseView(0, s);
+    defer dv.deinit();
+    const ksh = mlx.getShape(dv.k);
+    const q_shape = [_]c_int{ ksh[0], ksh[1], 1, ksh[3] };
+    var q = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_ones(&q, &q_shape, 4, .bfloat16, s));
+    const none = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kv_append_hd)));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &out,
+        q,
+        dv.k,
+        dv.v,
+        scale,
+        "",
+        none,
+        .{ .ctx = null },
+        false,
+        s,
+    ));
+    _ = mlx.mlx_array_free(q);
+    return out;
+}
+
+test "batched KV append: affine-8 N=2/4/8 matches N solo updates at production geometry" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const s = mlx.gpuStream();
+    const cfg = kv_quant.KVQuantConfig.affine(8);
+    const ns = [_]usize{ 2, 4, 8 };
+    const lens = [_]usize{ 2, 5, 3, 8, 4, 7, 6, 9 };
+    for (ns) |n| {
+        const solo = try alloc.alloc(KVCache, n);
+        const batched = try alloc.alloc(KVCache, n);
+        defer {
+            for (solo) |*c| c.deinit();
+            alloc.free(solo);
+            for (batched) |*c| c.deinit();
+            alloc.free(batched);
+        }
+        const solo_ptrs = try alloc.alloc(*KVCache, n);
+        defer alloc.free(solo_ptrs);
+        const batched_ptrs = try alloc.alloc(*KVCache, n);
+        defer alloc.free(batched_ptrs);
+        for (0..n) |i| {
+            solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            try kvAppendPrefill(&solo[i], lens[i], @intCast(0xA000 + i), s);
+            try kvAppendPrefill(&batched[i], lens[i], @intCast(0xA000 + i), s);
+            solo_ptrs[i] = &solo[i];
+            batched_ptrs[i] = &batched[i];
+        }
+        const stacked_k = try kvAppendPacked(@intCast(n), 1, 0xC0FFE, s);
+        defer _ = mlx.mlx_array_free(stacked_k);
+        const stacked_v = try kvAppendPacked(@intCast(n), 1, 0x0D15EA, s);
+        defer _ = mlx.mlx_array_free(stacked_v);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, solo_ptrs, 0, s, 0, false);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, batched_ptrs, 0, s, 0, true);
+        for (0..n) |i| {
+            try kvAppendOperandsEqual(&solo[i].entries[0], &batched[i].entries[0], s);
+            const attn_s = try kvAppendDummyAttn(&solo[i], s);
+            defer _ = mlx.mlx_array_free(attn_s);
+            const attn_b = try kvAppendDummyAttn(&batched[i], s);
+            defer _ = mlx.mlx_array_free(attn_b);
+            try testing.expect(try qsaArraysAllEqual(attn_s, attn_b, s));
+        }
+    }
+}
+
+test "batched KV append: two restored siblings append and truncate independently; the snapshot stays byte-identical" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const s = mlx.gpuStream();
+    const cfg = kv_quant.KVQuantConfig.affine(8);
+    var src = try KVCache.initWithConfig(alloc, 1, cfg);
+    defer src.deinit();
+    try kvAppendPrefill(&src, 6, 0x51A0, s);
+    var snap = try src.snapshot();
+    defer snap.deinit();
+    const snap_k = try materializedOwnedCopy(s, snap.entries[0].keys);
+    defer _ = mlx.mlx_array_free(snap_k);
+    const snap_v = try materializedOwnedCopy(s, snap.entries[0].values);
+    defer _ = mlx.mlx_array_free(snap_v);
+    const snap_ks = try materializedOwnedCopy(s, snap.entries[0].keys_scales);
+    defer _ = mlx.mlx_array_free(snap_ks);
+    const snap_kb = try materializedOwnedCopy(s, snap.entries[0].keys_biases);
+    defer _ = mlx.mlx_array_free(snap_kb);
+    const snap_vs = try materializedOwnedCopy(s, snap.entries[0].values_scales);
+    defer _ = mlx.mlx_array_free(snap_vs);
+    const snap_vb = try materializedOwnedCopy(s, snap.entries[0].values_biases);
+    defer _ = mlx.mlx_array_free(snap_vb);
+    try mlx.check(mlx.mlx_array_eval(snap_k));
+    var a = try KVCache.initWithConfig(alloc, 1, cfg);
+    defer a.deinit();
+    var b = try KVCache.initWithConfig(alloc, 1, cfg);
+    defer b.deinit();
+    try a.restore(&snap);
+    try b.restore(&snap);
+    const stacked_k = try kvAppendPacked(2, 1, 0xABBA, s);
+    defer _ = mlx.mlx_array_free(stacked_k);
+    const stacked_v = try kvAppendPacked(2, 1, 0xBEEF, s);
+    defer _ = mlx.mlx_array_free(stacked_v);
+    var sibs = [_]*KVCache{ &a, &b };
+    try KVCache.appendBatched(stacked_k, stacked_v, &sibs, 0, s, 0, cfg);
+    try testing.expectEqual(@as(usize, 7), a.entries[0].offset);
+    try testing.expectEqual(@as(usize, 7), b.entries[0].offset);
+    try a.truncate(6, s);
+    try testing.expectEqual(@as(usize, 6), a.entries[0].offset);
+    try testing.expectEqual(@as(usize, 7), b.entries[0].offset);
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].keys, snap_k, s));
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].values, snap_v, s));
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].keys_scales, snap_ks, s));
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].keys_biases, snap_kb, s));
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].values_scales, snap_vs, s));
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].values_biases, snap_vb, s));
+    const k1 = try KVCache.sliceStackedRow(s, stacked_k, 0);
+    defer _ = mlx.mlx_array_free(k1);
+    const v1 = try KVCache.sliceStackedRow(s, stacked_v, 0);
+    defer _ = mlx.mlx_array_free(v1);
+    var dv = try a.update(0, k1, v1, s, 0);
+    dv.deinit();
+    try testing.expect(try qsaArraysAllEqual(snap.entries[0].keys, snap_k, s));
+}
+
+test "batched KV append: per-layer op count is quantize-once plus per-slot writes, not N x (2 slices + update)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const s = mlx.gpuStream();
+    const cfg = kv_quant.KVQuantConfig.affine(8);
+    const ns = [_]usize{ 2, 4, 8 };
+    const lens = [_]usize{ 2, 5, 3, 8, 4, 7, 6, 9 };
+    var solo_at: [3]u64 = undefined;
+    var bat_at: [3]u64 = undefined;
+    for (ns, 0..) |n, ni| {
+        const solo = try alloc.alloc(KVCache, n);
+        const batched = try alloc.alloc(KVCache, n);
+        defer {
+            for (solo) |*c| c.deinit();
+            alloc.free(solo);
+            for (batched) |*c| c.deinit();
+            alloc.free(batched);
+        }
+        const solo_ptrs = try alloc.alloc(*KVCache, n);
+        defer alloc.free(solo_ptrs);
+        const batched_ptrs = try alloc.alloc(*KVCache, n);
+        defer alloc.free(batched_ptrs);
+        for (0..n) |i| {
+            solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            try kvAppendPrefill(&solo[i], lens[i], @intCast(0xB000 + i), s);
+            try kvAppendPrefill(&batched[i], lens[i], @intCast(0xB000 + i), s);
+            solo_ptrs[i] = &solo[i];
+            batched_ptrs[i] = &batched[i];
+        }
+        const stacked_k = try kvAppendPacked(@intCast(n), 1, 0x1111, s);
+        defer _ = mlx.mlx_array_free(stacked_k);
+        const stacked_v = try kvAppendPacked(@intCast(n), 1, 0x2222, s);
+        defer _ = mlx.mlx_array_free(stacked_v);
+        const c_solo = mlx.op_count.load(.monotonic);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, solo_ptrs, 0, s, 0, false);
+        solo_at[ni] = mlx.op_count.load(.monotonic) - c_solo;
+        const c_bat = mlx.op_count.load(.monotonic);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, batched_ptrs, 0, s, 0, true);
+        bat_at[ni] = mlx.op_count.load(.monotonic) - c_bat;
+        std.debug.print("batched KV append op-count N={d}: solo {d} batched {d}\n", .{ n, solo_at[ni], bat_at[ni] });
+        try testing.expectEqual(24 * @as(u64, @intCast(n)), solo_at[ni]);
+        try testing.expectEqual(8 + 18 * @as(u64, @intCast(n)), bat_at[ni]);
+    }
+    try testing.expect((bat_at[2] - bat_at[0]) < (solo_at[2] - solo_at[0]));
+}
+
+test "batched KV append: dense, affine-4, and turbo stay on the per-slot path" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const s = mlx.gpuStream();
+    const schemes = [_]kv_quant.KVQuantConfig{
+        kv_quant.KVQuantConfig.dense,
+        kv_quant.KVQuantConfig.affine(4),
+        kv_quant.KVQuantConfig.turboquant(4),
+    };
+    for (schemes) |cfg| {
+        var solo: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
+        var batched: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
+        defer for (&solo) |*c| c.deinit();
+        defer for (&batched) |*c| c.deinit();
+        try kvAppendPrefill(&solo[0], 3, 0x10, s);
+        try kvAppendPrefill(&solo[1], 5, 0x11, s);
+        try kvAppendPrefill(&batched[0], 3, 0x10, s);
+        try kvAppendPrefill(&batched[1], 5, 0x11, s);
+        var solo_ptrs = [_]*KVCache{ &solo[0], &solo[1] };
+        var batched_ptrs = [_]*KVCache{ &batched[0], &batched[1] };
+        const stacked_k = try kvAppendPacked(2, 1, 0x30, s);
+        defer _ = mlx.mlx_array_free(stacked_k);
+        const stacked_v = try kvAppendPacked(2, 1, 0x31, s);
+        defer _ = mlx.mlx_array_free(stacked_v);
+        const c0 = mlx.op_count.load(.monotonic);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, &solo_ptrs, 0, s, 0, false);
+        const solo_ops = mlx.op_count.load(.monotonic) - c0;
+        const c1 = mlx.op_count.load(.monotonic);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, &batched_ptrs, 0, s, 0, true);
+        const batched_ops = mlx.op_count.load(.monotonic) - c1;
+        try testing.expectEqual(solo_ops, batched_ops);
+        for (0..2) |i| {
+            try testing.expectEqual(solo[i].entries[0].offset, batched[i].entries[0].offset);
+            try testing.expect(try qsaArraysAllEqual(solo[i].entries[0].keys, batched[i].entries[0].keys, s));
+            try testing.expect(try qsaArraysAllEqual(solo[i].entries[0].values, batched[i].entries[0].values, s));
+            if (cfg.scheme == .affine) {
+                try kvAppendOperandsEqual(&solo[i].entries[0], &batched[i].entries[0], s);
+            }
+        }
     }
 }
 
