@@ -21,7 +21,7 @@ enum WelcomeModelPicks {
     }
 
     /// Types the welcome screen offers, in order. Strengths are family-level
-    /// (every Gemma is a good all-rounder; every Laguna is a coder), kept to one
+    /// (every Gemma is a good all-rounder; every Qwen is a coder), kept to one
     /// short sentence deliberately. The "largest models" tier is intentionally
     /// absent — it's a niche that only fits very large Macs and the browser
     /// covers it.
@@ -32,9 +32,6 @@ enum WelcomeModelPicks {
         Category(label: "Coding & agents",
                  strength: "Strong at coding and multi-step agent work like using tools.",
                  catalog: RecommendedModelPick.qwenCatalog),
-        Category(label: "Coding specialist",
-                 strength: "A focused coding model built for working across a whole project.",
-                 catalog: RecommendedModelPick.poolsideCatalog),
     ]
 
     /// The best model of each type for this Mac's usable memory, with its

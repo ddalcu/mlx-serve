@@ -19,6 +19,7 @@ final class CLILauncher: ObservableObject {
         .pi,
         .omp,
         .opencode,
+        .opencode2,
         .codex,
         .hermes,
         .aider,
@@ -372,6 +373,43 @@ extension LauncherCLI {
             export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
             \(cdLine)
             opencode --model mlx/\(model)
+            """
+        }
+    )
+
+    static let opencode2 = LauncherCLI(
+        id: "opencode2",
+        displayName: "OpenCode 2",
+        binaryName: "opencode2",
+        iconSystemName: "chevron.left.forwardslash.chevron.right",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, _, _, _ in
+            let pluginDest = NSString(string: "~/.mlx-serve/opencode2/opencode/plugins/mlx-serve").expandingTildeInPath
+            AgentConfigs.copyOpencode2Plugin(to: pluginDest)
+            let cliDir = NSString(string: "~/.mlx-serve/opencode2/opencode").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: cliDir, withIntermediateDirectories: true)
+            let userCli: String
+            if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdg.isEmpty {
+                userCli = (xdg as NSString).appendingPathComponent("opencode/cli.json")
+            } else {
+                userCli = NSString(string: "~/.config/opencode/cli.json").expandingTildeInPath
+            }
+            let existing = (try? String(contentsOfFile: userCli, encoding: .utf8)) ?? "{}"
+            let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: baseURL)
+            try? json.write(toFile: (cliDir as NSString).appendingPathComponent("cli.json"),
+                            atomically: true, encoding: .utf8)
+        },
+        scriptBody: { baseURL, model, cdLine, budget, entries in
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            return """
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true))'
+            export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+            \(cdLine)
+            if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
+            opencode2 --standalone
             """
         }
     )

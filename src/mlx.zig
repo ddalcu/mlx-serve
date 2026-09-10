@@ -241,6 +241,7 @@ pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
 
@@ -714,4 +715,259 @@ test "wired fit target: zero headroom, clamped, declines empty" {
     // Nothing live / dead query: decline.
     try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
     try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
+}
+
+// mlx-c error latch. mlx-c's default error handler calls exit(-1) after the C boundary
+// already caught the exception, so a Metal working-set OOM killed the server (#353).
+// Our handler latches the message and returns; the engine raises a named error at its
+// next checkpoint and the process stays serviceable.
+var mlx_error_latched = std.atomic.Value(bool).init(false);
+var mlx_error_buf: [512]u8 = undefined;
+var mlx_error_len: usize = 0;
+/// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
+var mlx_error_mtx: std.c.pthread_mutex_t = .{};
+fn lockErrBuf() void {
+    _ = std.c.pthread_mutex_lock(&mlx_error_mtx);
+}
+fn unlockErrBuf() void {
+    _ = std.c.pthread_mutex_unlock(&mlx_error_mtx);
+}
+
+/// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
+/// `[malloc]`/`[metal::malloc]` failures, `Resource limit exceeded`).
+pub fn mlxErrorIsMemory(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "Insufficient Memory",
+        "insufficient memory",
+        "Unable to allocate",
+        "Resource limit",
+        "out of memory",
+        "Out of memory",
+        "maximum allowed buffer size",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    lockErrBuf();
+    defer unlockErrBuf();
+    // First error wins: follow-on noise from a poisoned stream must not hide the cause.
+    if (!mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, mlx_error_buf.len);
+        @memcpy(mlx_error_buf[0..n], span[0..n]);
+        mlx_error_len = n;
+        mlx_error_latched.store(true, .release);
+    }
+    log.err("[mlx] {s}\n", .{span});
+}
+
+/// Install the latching handler. Called once from `main()`. `MLX_SERVE_MLX_ERROR_LATCH=0`
+/// restores mlx-c's `exit(-1)` handler.
+pub fn installErrorHandler() void {
+    if (std.c.getenv("MLX_SERVE_MLX_ERROR_LATCH")) |p| {
+        if (std.mem.eql(u8, std.mem.span(p), "0")) {
+            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
+            return;
+        }
+    }
+    mlx_set_error_handler(latchMlxError, null, null);
+}
+
+/// True when an MLX call has failed since the last `takeError`.
+pub fn errorPending() bool {
+    return mlx_error_latched.load(.acquire);
+}
+
+/// Peek the latch without consuming it: the name of the error `checkError` would raise, or
+/// null. A slot finish must not answer 200 over a failed forward, yet must leave the latch
+/// for the decode-tick wrapper that fails the rest of a batched group.
+pub fn peekErrorName() ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+}
+
+/// Consume the latched message into `buf` (copied), clearing the latch.
+pub fn takeError(buf: []u8) ?[]const u8 {
+    if (!mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(mlx_error_len, buf.len);
+    @memcpy(buf[0..n], mlx_error_buf[0..n]);
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return buf[0..n];
+}
+
+/// Release-build fault injection: `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal
+/// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_STEP). at transforms.cpp:15";
+
+/// One armed, self-disarming injector; prefill and decode checkpoints count separately.
+const FaultSite = struct {
+    env: [:0]const u8,
+    msg: [:0]const u8,
+    at: ?u64 = null,
+    seen: u64 = 0,
+
+    fn target(self: *FaultSite) u64 {
+        if (self.at) |v| return v;
+        var v: u64 = 0;
+        if (std.c.getenv(self.env.ptr)) |pz| {
+            v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
+        }
+        self.at = v;
+        if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ self.env, v });
+        return v;
+    }
+
+    fn maybeFire(self: *FaultSite) void {
+        const t = self.target();
+        if (t == 0) return;
+        self.seen += 1;
+        if (self.seen != t) return;
+        self.at = 0;
+        latchErrorForTest(self.msg);
+    }
+
+    fn reset(self: *FaultSite) void {
+        self.at = null;
+        self.seen = 0;
+    }
+};
+
+var fault_chunk = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
+var fault_step = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
+
+/// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
+fn consumeLatch() !void {
+    if (!mlx_error_latched.load(.acquire)) return;
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
+    return error.MlxFailure;
+}
+
+/// Prefill checkpoint: once per chunk plus once after the last.
+pub fn checkError() !void {
+    fault_chunk.maybeFire();
+    return consumeLatch();
+}
+
+/// Decode checkpoint: once per decode tick, after the forward. Without it a failed decode
+/// forward finished 200 with garbage and handed the latch to the NEXT request's prefill.
+pub fn checkErrorDecode() !void {
+    fault_step.maybeFire();
+    return consumeLatch();
+}
+
+pub fn latchErrorForTest(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
+}
+
+pub fn resetFaultChunkForTest() void {
+    fault_chunk.reset();
+    fault_step.reset();
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+}
+
+test "an MLX memory failure is classified as a memory error, an argument error is not" {
+    const t = std.testing;
+    try t.expect(mlxErrorIsMemory("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:15"));
+    try t.expect(mlxErrorIsMemory("[malloc] Unable to allocate 8589934592 bytes."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Resource limit (128000) exceeded."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Attempting to allocate 99 bytes which is greater than the maximum allowed buffer size of 5 bytes."));
+    try t.expect(!mlxErrorIsMemory("[slice_update] Invalid slice sizes."));
+    try t.expect(!mlxErrorIsMemory("[matmul] Last dimension of first input must match."));
+}
+
+test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
+    const t = std.testing;
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expect(errorPending());
+    latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try t.expectError(error.OutOfMemory, checkError());
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!errorPending());
+}
+
+test "the injected MLX error costs ONE checkError and the engine keeps working after it" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkError());
+
+    try t.expect(!errorPending());
+    try checkError();
+    const s = gpuStream();
+    const shape = [_]c_int{2};
+    const data = [_]f32{ 1.5, 2.5 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try t.expectEqual(@as(c_int, 0), mlx_sum(&sum, a, false, s));
+    _ = mlx_array_eval(sum);
+    var out: f32 = 0;
+    _ = mlx_array_item_float32(&out, sum);
+    try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
+    try checkError();
+}
+
+test "peekErrorName names the class WITHOUT consuming the latch" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expect(errorPending());
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("MlxFailure", peekErrorName().?);
+    try t.expectError(error.MlxFailure, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+}
+
+test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkErrorDecode();
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(!errorPending());
+    try checkError();
+
+    try checkError();
+    try checkError();
+    try checkErrorDecode();
+    try t.expect(!errorPending());
 }

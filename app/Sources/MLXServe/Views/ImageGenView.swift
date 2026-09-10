@@ -8,6 +8,7 @@ import UniformTypeIdentifiers
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For "Send to Chat" — the hand-off opens a new conversation and switches
     /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
@@ -893,10 +894,6 @@ struct ImageGenView: View {
     }
 
     private func showLogWindow() {
-        let text = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "Image generation log"
-        alert.informativeText = text.isEmpty ? "(no output)" : text
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }

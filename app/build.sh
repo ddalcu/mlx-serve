@@ -223,9 +223,9 @@ else
     ICONSET="$ICON_DIR/AppIcon.iconset"
     mkdir -p "$ICONSET"
     for size in 16 32 64 128 256 512; do
-        sips -z $size $size "$SCRIPT_DIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+        sips -z $size $size "$SCRIPT_DIR/appicon.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
         double=$((size * 2))
-        sips -z $double $double "$SCRIPT_DIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+        sips -z $double $double "$SCRIPT_DIR/appicon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
     done
     iconutil -c icns "$ICONSET" -o "$ICON_DIR/AppIcon.icns" 2>/dev/null || echo "  (iconutil skipped, will use default icon)"
 fi
@@ -253,6 +253,20 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
+
+PLUGIN_SRC="$PROJECT_ROOT/lib/opencode2-mlx-serve"
+PLUGIN_DST="$CONTENTS/Resources/opencode2-mlx-serve"
+if [ -d "$PLUGIN_SRC" ]; then
+    mkdir -p "$PLUGIN_DST"
+    for f in LICENSE package.json tui.tsx; do
+        [ -f "$PLUGIN_SRC/$f" ] && cp "$PLUGIN_SRC/$f" "$PLUGIN_DST/"
+    done
+    for f in "$PLUGIN_SRC"/*.ts; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in *.test.ts) continue ;; esac
+        cp "$f" "$PLUGIN_DST/"
+    done
+fi
 
 # SwiftPM does not embed resource bundles when we assemble the .app by hand.
 # SwaTex loads its KaTeX fonts from this bundle at runtime.

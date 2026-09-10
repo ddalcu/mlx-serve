@@ -81,6 +81,13 @@ pub const VideoData = struct {
     grid_w: u32,
 };
 
+/// OpenAI spells the system turn `developer` for reasoning models (pi does
+/// when `supportsDeveloperRole` is unset). No template we serve tells the two
+/// apart and Qwen's raises on the unknown role, which is a SILENT fallback.
+pub fn canonicalRole(role: []const u8) []const u8 {
+    return if (std.mem.eql(u8, role, "developer")) "system" else role;
+}
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
@@ -643,17 +650,20 @@ fn renderChatTemplate(
         tools_z = try allocator.dupeSentinel(u8, tj, 0);
     }
 
+    // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
+    var rendered_len: usize = 0;
     const result_ptr = jinja_c.jinja_render_chat(
         tmpl_z.ptr,
         msgs_z.ptr,
         if (tools_z) |tz| tz.ptr else null,
         extra_z.ptr,
         1,
+        &rendered_len,
     );
 
     if (result_ptr) |ptr| {
         defer jinja_c.jinja_str_free(ptr);
-        const collapsed = try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
+        const collapsed = try collapseDoubledThinkTags(allocator, ptr[0..rendered_len]);
         // A continuation commits the content channel and then hands the model
         // its own unfinished sentence. It runs INSTEAD of the thinking-off
         // tail, never beside it — both append the same channel commit, and
@@ -1669,6 +1679,16 @@ const INKLING_END_TAG = "<|end_message|>";
 const INKLING_MODEL_TAG = "<|message_model|>";
 const INKLING_INVOKE_TAG = "<|content_invoke_tool_json|>";
 
+/// A think block the MODEL opens when the template did not: a bare `<think>` token, or
+/// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
+/// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
+/// has been emitted. Returns the opener to seed `think_buf` with.
+pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+    if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
+    return null;
+}
+
 /// Control-channel marker TOKENS that must never appear in a visible stream
 /// delta. Every entry is a single special token in its family's vocab, so
 /// exact-match filtering at the delta level is complete — a marker can't be
@@ -2174,6 +2194,20 @@ pub fn museThinkOpenerAt(buf: []const u8) MuseThinkOpener {
     return .growing;
 }
 
+/// A muse prompt that ends at `<|start|>assistant` leaves the model to write its own
+/// header, so the plain stream arm must start skipping as if `<|start|>` had just arrived.
+pub fn promptTailOpensMuseHeader(tail: []const u8) bool {
+    return std.mem.endsWith(u8, std.mem.trimEnd(u8, tail, "\n "), MUSE_START_TAG ++ "assistant");
+}
+
+/// The held header bytes between `<|start|>` and `<|message|>` name `self`: the segment is reasoning.
+pub fn museHeaderOpensReasoning(head: []const u8) bool {
+    var rest = std.mem.trimStart(u8, head, " \n");
+    if (std.mem.startsWith(u8, rest, "assistant")) rest = std.mem.trimStart(u8, rest["assistant".len..], " \n");
+    if (!std.mem.startsWith(u8, rest, "to=")) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, rest["to=".len..], " \n"), "self");
+}
+
 /// Length of a COMPLETE next-segment header at the start of `text`
 /// (`<|start|>assistant to=<r><|message|>`), or null when text doesn't start
 /// with one or the header hasn't fully arrived yet.
@@ -2200,6 +2234,14 @@ pub fn museHeaderSkipNext(skipping: bool, token_text: []const u8) bool {
 pub fn promptTailOpensThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
     return endsWithThinkOpenTag(trimmed) != null;
+}
+
+/// Narrow form used by generation-side phase switches. A suffixed reasoning
+/// family (for example Hy3's `<think:opensource>`) has a different close token
+/// and must not be armed against Qwen's bare `</think>` boundary.
+pub fn promptTailOpensBareThink(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return std.mem.endsWith(u8, trimmed, "<think>");
 }
 
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
@@ -3169,9 +3211,16 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             var exact_buf: [40]u8 = undefined;
             if (open_name.len + 3 <= exact_buf.len) {
                 const exact = std.fmt.bufPrint(&exact_buf, "</{s}>", .{open_name}) catch unreachable;
-                if (std.mem.indexOf(u8, hay, exact)) |found| {
+                var from: usize = 0;
+                while (std.mem.indexOfPos(u8, hay, from, exact)) |found| {
+                    // A `<parameter=…>` value may spell the wrapper's own close.
+                    if (hermesParamSpanEnclosing(hay, found)) |past| {
+                        from = past;
+                        continue;
+                    }
                     close_rel = found;
                     close_len = exact.len;
+                    break;
                 }
             }
             if (close_rel == null) {
@@ -3189,6 +3238,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                         }
                     }
                     if (word_only and j < jlimit and hay[j] == '>') {
+                        if (hermesParamSpanEnclosing(hay, open_at)) |past| {
+                            cpos = past;
+                            continue;
+                        }
                         close_rel = open_at;
                         close_len = j + 1 - open_at;
                         break;
@@ -3203,7 +3256,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             // …well-formed args…}` then nothing); (2) max_tokens truncated.
             // The args object itself is usually intact — snap a balanced
             // JSON object from right after the open tag and try to parse it.
-            if (balancedJsonObject(effective_text[content_start..])) |json_body| {
+            // Function-tag form first: a parameter VALUE is arbitrary bytes and never names the tool.
+            const truncated_fn_tag = std.mem.indexOf(u8, effective_text[content_start..], "<function=") != null;
+            const truncated_json: ?[]const u8 = if (truncated_fn_tag) null else balancedJsonObject(effective_text[content_start..]);
+            if (truncated_json) |json_body| {
                 const json_off = @intFromPtr(json_body.ptr) - @intFromPtr(effective_text[content_start..].ptr);
                 const advance_to = content_start + json_off + json_body.len;
                 // Hermes shape (top-level "name" + "arguments"): use as-is.
@@ -6281,6 +6337,30 @@ fn convertGemma4Value(
     return pos + first_sep;
 }
 
+/// End of a `<parameter=…>` value: the LAST `</parameter>` before the next opener (a value may
+/// spell its own close tag); an unclosed parameter falls back to the first close.
+fn hermesValueEnd(body: []const u8, val_start: usize) ?usize {
+    const bound = std.mem.indexOfPos(u8, body, val_start, "<parameter=") orelse body.len;
+    var best: ?usize = null;
+    var i = val_start;
+    while (std.mem.indexOfPos(u8, body, i, "</parameter>")) |at| {
+        if (at >= bound) break;
+        best = at;
+        i = at + 1;
+    }
+    return best orelse std.mem.indexOfPos(u8, body, val_start, "</parameter>");
+}
+
+/// If `at` falls inside a `<parameter=…>` value, the position just past that value's close; else null.
+fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
+    const open = std.mem.lastIndexOf(u8, body[0..at], "<parameter=") orelse return null;
+    const gt = std.mem.indexOfScalarPos(u8, body, open, '>') orelse return null;
+    if (gt >= at) return null;
+    const end = hermesValueEnd(body, gt + 1) orelse return null;
+    if (end <= at) return null;
+    return end + "</parameter>".len;
+}
+
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
     const fn_start_tag = "<function=";
     const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
@@ -6293,7 +6373,17 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
     args_map.append(allocator, '{') catch return null;
 
     const fn_body_start = name_start + name_end + 1;
-    const fn_end = std.mem.indexOf(u8, block[fn_body_start..], "</function>") orelse block.len - fn_body_start;
+    const fn_end = blk: {
+        var from = fn_body_start;
+        while (std.mem.indexOfPos(u8, block, from, "</function>")) |found| {
+            if (hermesParamSpanEnclosing(block, found)) |past| {
+                from = past;
+                continue;
+            }
+            break :blk found - fn_body_start;
+        }
+        break :blk block.len - fn_body_start;
+    };
     const fn_body = block[fn_body_start .. fn_body_start + fn_end];
 
     // Track emitted parameter names so a repeated `<parameter=NAME>` can't
@@ -6323,7 +6413,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         }
 
         const p_val_start = p_name_start + p_name_end + 1;
-        const p_val_end = std.mem.indexOf(u8, fn_body[p_val_start..], "</parameter>") orelse break;
+        const p_val_end = (hermesValueEnd(fn_body, p_val_start) orelse break) - p_val_start;
         const p_val = stripHermesValueFraming(fn_body[p_val_start .. p_val_start + p_val_end]);
 
         // Skip a duplicate name (first wins); still advance past its block.
@@ -6617,8 +6707,58 @@ fn isJsonLiteral(s: []const u8) bool {
     if (s.len == 0) return false;
     if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
     // Objects/arrays are handled by brace-matching in the caller, not here
-    _ = std.fmt.parseFloat(f64, s) catch return false;
-    return true;
+    return isJsonNumber(s);
+}
+
+/// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
+fn isJsonNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+    if (s[i] == '0') {
+        i += 1;
+    } else {
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    return i == s.len;
+}
+
+/// One UTF-8 sequence starting at `i`: `valid` = well-formed, else `end` is the maximal
+/// subpart to replace with U+FFFD (a character split across two tokens costs ONE replacement).
+pub const Utf8Seq = struct { end: usize, valid: bool };
+
+pub fn utf8Next(s: []const u8, i: usize) Utf8Seq {
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return .{ .end = i + 1, .valid = false };
+    if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) return .{ .end = i + len, .valid = true };
+    var j = i + 1;
+    while (j < s.len and j < i + len and s[j] & 0xC0 == 0x80) j += 1;
+    return .{ .end = j, .valid = false };
+}
+
+/// The lossy view of bytes that are not valid UTF-8: one U+FFFD per invalid sequence.
+/// A token is a BPE fragment, so ANY string built from model bytes can end mid-character;
+/// raw, that makes a response body unparseable and a prompt render fall back silently.
+pub fn utf8Sanitize(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var clean = std.ArrayList(u8).empty;
+    errdefer clean.deinit(allocator);
+    var i: usize = 0;
+    while (i < input.len) {
+        const seq = utf8Next(input, i);
+        try clean.appendSlice(allocator, if (seq.valid) input[i..seq.end] else "\u{FFFD}");
+        i = seq.end;
+    }
+    return clean.toOwnedSlice(allocator);
 }
 
 /// THE JSON string escaper (quoted, control bytes \u-escaped). Public so other
@@ -6626,7 +6766,17 @@ fn isJsonLiteral(s: []const u8) bool {
 /// escaper is exactly how the control-byte class shipped twice before.
 pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
     try buf.append(allocator, '"');
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c >= 0x80) {
+            // nlohmann rejects ill-formed UTF-8 like a raw control byte.
+            const seq = utf8Next(s, i);
+            try buf.appendSlice(allocator, if (seq.valid) s[i..seq.end] else "\u{FFFD}");
+            i = seq.end;
+            continue;
+        }
+        i += 1;
         switch (c) {
             '"' => try buf.appendSlice(allocator, "\\\""),
             '\\' => try buf.appendSlice(allocator, "\\\\"),
@@ -11863,6 +12013,8 @@ test "hy3 think: dangling re-opened suffixed opener never leaks" {
 test "hy3 think: promptTailOpensThink recognizes the suffixed opener, not a closed no_think tail" {
     try testing.expect(promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
     try testing.expect(!promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource></think:opensource>"));
+    try testing.expect(!promptTailOpensBareThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
+    try testing.expect(promptTailOpensBareThink("assistant\n<think>\n"));
 }
 
 test "hy3 think: streamThinkGate splits on suffixed close and holds on a partial suffixed re-open" {
@@ -13904,4 +14056,186 @@ test "streamShouldBufferForTools: the gate is a strict SUPERSET of parseMiniCpm5
             };
         }
     }
+}
+
+test "renderChatTemplate: a NUL byte in message content does not truncate the prompt" {
+    // Bar: content after the NUL, and the assistant header, survive the render.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- for message in messages -%}
+        \\<|im_start|>{{ message['role'] }}
+        \\{{ message['content'] }}<|im_end|>
+        \\{% endfor %}{%- if add_generation_prompt -%}<|im_start|>assistant
+        \\{% endif %}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const messages = [_]Message{
+        .{ .role = "user", .content = "before\x00after" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "before") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "after") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant") != null);
+}
+
+test "parseToolCalls qwen: a truncated <function= call is never renamed by a JSON parameter value" {
+    // Bar: a call cut before any close tag keeps the name its `<function=`
+    // opener declared, whatever the parameter value looks like.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
+        "<parameter=content>\n{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("write_file", calls[0].name);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </parameter> is not emptied" {
+    // Bar: the value ends at the close tag that actually ends it, byte-exact.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nsee </parameter> in the docs\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("see </parameter> in the docs", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </tool_call> is not dropped" {
+    // Bar: a required parameter survives a value that spells the wrapper close.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nemit </tool_call> here\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("emit </tool_call> here", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value types from JSON's number grammar, not parseFloat" {
+    // Bar: only a spelling JSON itself calls a number stays unquoted.
+    const allocator = testing.allocator;
+    const Case = struct { spelling: []const u8, number: bool };
+    const cases = [_]Case{
+        .{ .spelling = "Infinity", .number = false },
+        .{ .spelling = "nan", .number = false },
+        .{ .spelling = "+1", .number = false },
+        .{ .spelling = "0755", .number = false },
+        .{ .spelling = ".5", .number = false },
+        .{ .spelling = "5.", .number = false },
+        .{ .spelling = "1.5", .number = true },
+        .{ .spelling = "-2", .number = true },
+        .{ .spelling = "3e5", .number = true },
+        .{ .spelling = "0", .number = true },
+    };
+    for (cases) |c| {
+        const raw = try std.mem.concat(allocator, u8, &.{
+            "<tool_call>\n<function=edit>\n<parameter=mode>\n", c.spelling, "\n</parameter>\n</function>\n</tool_call>",
+        });
+        defer allocator.free(raw);
+        const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
+            std.debug.print("\n{s}: args not valid JSON: {s}\n", .{ c.spelling, calls[0].arguments });
+            return error.ArgsNotValidJson;
+        };
+        defer parsed.deinit();
+        const v = parsed.value.object.get("mode") orelse return error.MissingParam;
+        if (c.number) {
+            if (v == .string) {
+                std.debug.print("\n{s}: shipped as a string\n", .{c.spelling});
+                return error.NumberQuoted;
+            }
+        } else {
+            if (v != .string) {
+                std.debug.print("\n{s}: shipped unquoted as {s}\n", .{ c.spelling, @tagName(v) });
+                return error.NonNumberUnquoted;
+            }
+            try testing.expectEqualStrings(c.spelling, v.string);
+        }
+    }
+}
+
+test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-exact" {
+    // Bar: the escaper's output is always well-formed UTF-8 (nlohmann rejects
+    // anything else), and every valid sequence survives unchanged.
+    const allocator = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try appendJsonString(allocator, &buf, "\xff\xfe\x80 binary");
+    try testing.expect(std.unicode.utf8ValidateSlice(buf.items));
+    try testing.expectEqualStrings("\"\u{FFFD}\u{FFFD}\u{FFFD} binary\"", buf.items);
+
+    buf.clearRetainingCapacity();
+    const valid = "héllo \u{4e2d}\u{6587} \u{1F600} ok";
+    try appendJsonString(allocator, &buf, valid);
+    try testing.expectEqualStrings("\"" ++ valid ++ "\"", buf.items);
+
+    // A truncated multibyte sequence at end-of-input is one replacement.
+    buf.clearRetainingCapacity();
+    try appendJsonString(allocator, &buf, "a\xe4\xb8");
+    try testing.expectEqualStrings("\"a\u{FFFD}\"", buf.items);
+}
+
+test "a muse header the MODEL writes at position 0 is resolved, self means reasoning" {
+    // The prompt ends at `<|start|>assistant`; the model's ` to=self<|message|>` used to
+    // stream as content because only a `<|start|>` TOKEN armed the header skip.
+    try std.testing.expect(promptTailOpensMuseHeader("...<|eot|><|start|>assistant"));
+    try std.testing.expect(promptTailOpensMuseHeader("<|start|>assistant\n"));
+    try std.testing.expect(!promptTailOpensMuseHeader("<|start|>assistant to=user<|message|>"));
+    try std.testing.expect(museHeaderOpensReasoning(" to=self"));
+    try std.testing.expect(museHeaderOpensReasoning("assistant to=self\n"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=user"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=selfish"));
+    try std.testing.expect(!museHeaderOpensReasoning(""));
+}
+
+test "a model-opened think block latches from its own opener token" {
+    // Both openers are dropped from visible deltas as channel markers, so without
+    // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>").?);
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>\n").?);
+    try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(true, "thought").?);
+    try std.testing.expect(modelThinkOpener(false, "thought") == null);
+    // Prose that merely BEGINS with the word is not the opener token.
+    try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
+    try std.testing.expect(modelThinkOpener(true, "\n") == null);
+    try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
 }

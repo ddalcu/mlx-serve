@@ -1,6 +1,8 @@
 #ifndef JINJA_WRAPPER_H
 #define JINJA_WRAPPER_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,6 +15,8 @@ extern "C" {
  * tools_json:    JSON array of tool objects, or NULL if no tools
  * extra_json:    JSON object with extra context (bos_token, eos_token, etc.), or NULL
  * add_generation_prompt: 1 to add, 0 to skip
+ * out_len:       receives the rendered byte length (the result may CONTAIN NUL
+ *                bytes, so read *out_len, never strlen), or NULL if not wanted.
  *
  * Returns a malloc'd string on success, NULL on failure.
  * The caller must free the result with jinja_str_free().
@@ -23,7 +27,8 @@ char* jinja_render_chat(
     const char* messages_json,
     const char* tools_json,
     const char* extra_json,
-    int add_generation_prompt
+    int add_generation_prompt,
+    size_t* out_len
 );
 
 /* Free a string returned by jinja_render_chat. */

@@ -8,6 +8,7 @@ import AppKit
 struct MusicGenView: View {
     @EnvironmentObject var service: MusicGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For the model row's Download button (`MediaModelChooser`) — a completed
     /// transfer has to re-scan the models directory.
@@ -794,10 +795,6 @@ struct MusicGenView: View {
                     } description: {
                         Text(msg)
                     } actions: {
-                        // The Voice tab has had this; music's failure state
-                        // offered nothing. `combinedGenLog` falls back to the
-                        // server tail, which is where a model that failed to
-                        // LOAD leaves its reason.
                         Button("Show log") { showLogWindow() }
                     }
                 }
@@ -835,11 +832,7 @@ struct MusicGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "Music generation log"
-        alert.informativeText = logText.isEmpty ? "(no output)" : logText
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 
     private var outputFolderLink: some View {

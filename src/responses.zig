@@ -10,7 +10,18 @@ const chat_mod = @import("chat.zig");
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
 
+/// Escape into a JSON string literal. Every string here is built from model
+/// bytes, and a token is a BPE fragment — see the same chokepoint in server.zig.
 pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) {
+        const clean = try chat_mod.utf8Sanitize(allocator, input);
+        defer allocator.free(clean);
+        return jsonEscapeValid(allocator, clean);
+    }
+    return jsonEscapeValid(allocator, input);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '"');
@@ -417,7 +428,7 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    const role = role_val.string;
+    const role = chat_mod.canonicalRole(role_val.string);
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -853,6 +864,18 @@ test "parseInput string becomes single user message" {
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
     try testing.expectEqualStrings("hello", pi.messages.items[0].content);
+}
+
+test "parseInput reads a developer item as the system turn" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("You are S.", pi.messages.items[0].content);
 }
 
 test "parseInput with instructions prepends system" {

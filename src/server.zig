@@ -4,6 +4,7 @@ const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const mtp_mod = @import("mtp.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
@@ -29,6 +30,7 @@ const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 const ane_mod = @import("ane.zig");
+const qwen4_mod = @import("qwen4_exp.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -89,6 +91,11 @@ pub var g_lan_share_spec: ?[]const u8 = null;
 pub var g_lan_name: ?[]const u8 = null;
 pub var g_lan_discover: bool = false;
 
+/// Upstream chat providers (src/providers.zig): `~/.mlx-serve/providers.json`,
+/// rows mirrored into /v1/models as `<id>@<name>`, `/v1/chat/completions`
+/// proxied with the provider's key. Started by `serve()` beside the LAN.
+pub var g_providers: ?*providers_mod.Providers = null;
+
 /// Should boot print the open-bind warning? True only when serve mode is about
 /// to listen on a non-loopback address the user never chose: no explicit
 /// `--host` (the default is still 0.0.0.0) and no `--lan-share` (which needs
@@ -117,6 +124,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
@@ -243,6 +251,9 @@ pub const Conn = struct {
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
     ws_mode: ?*WsBridge = null,
+    /// True once this connection has written a `text/event-stream` head: past it a generation
+    /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
+    sse_headers_sent: bool = false,
     /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
     /// every write the inner handler makes is fed to the sink (SSE → NDJSON
     /// re-framing) instead of the socket. The sink writes its translated
@@ -257,6 +268,7 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
+        c.sse_headers_sent = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -416,13 +428,8 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 }
 
 /// Wrapper reading the live server config + scheduler default scheme.
-fn resolveKvAttnFused(explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
-    const scheme: kv_quant_mod.Scheme = if (kv_override) |o|
-        o.scheme
-    else if (global_scheduler) |sch|
-        sch.kv_quant_config.scheme
-    else
-        .off;
+fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
     return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
 
@@ -472,6 +479,10 @@ pub const ServerConfig = struct {
     default_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
+    /// Default `max_tokens` for a request that omits the field (`--max-tokens N` in serve mode;
+    /// 0 = flag not given). Agent clients send nothing, and an omitted budget is the rest of
+    /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
+    default_max_tokens: u32 = 0,
     /// `--mtp`: force the native MTP head ON for MoE targets too. The
     /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
     /// verify-forward expert-routing caution the drafter shares), which makes
@@ -508,6 +519,11 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// checkpoint AND has been measured no-worse-than-serial across the context
 /// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
 /// still needs a head LOADED — the claim is about the head, not the arch.
+/// `--mtp` process-wide, or the model's own `"mtp": true` in `model-settings.json`.
+fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
+    return config.mtp_override == true or server_config.default_force_mtp;
+}
+
 pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool) bool {
     if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
@@ -536,6 +552,16 @@ fn dsv4DraftStages(lm: *LoadedModel) bool {
 /// default/dispatch layers were correct (the per-surface wiring class).
 fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null or dsv4DraftStages(lm);
+}
+
+/// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
+/// per surface after tokenization; a machine limit, so it outranks an explicit `enable_mtp:true`.
+fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
+    if (!enable_mtp) return false;
+    const max = generate_mod.max_mtp_ctx;
+    if (mtp_mod.mtpCtxWithinLimit(max, prompt_tokens)) return true;
+    log.info("  mtp=off (ctx {d} > --max-mtp-ctx {d})\n", .{ prompt_tokens, max });
+    return false;
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -578,6 +604,29 @@ fn getTimeoutNs() u64 {
 /// inference request handler routes through this; the scheduler's
 /// inference thread is the single mlx-call site.
 var global_scheduler: ?*scheduler_mod.Scheduler = null;
+
+/// The boot's parsed `--kv-quant`, published by `serve()` before `Scheduler.init` so a
+/// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
+/// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k).
+var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
+
+/// The process-wide kv-quant config at any point: the scheduler's once it exists, the boot's
+/// published value during the load, dense when no flag was given.
+fn configuredKvQuant() transformer_mod.KVQuantConfig {
+    if (global_scheduler) |sch| return sch.kv_quant_config;
+    return configured_kv_quant orelse transformer_mod.KVQuantConfig.dense;
+}
+
+/// The width THIS model stores at: its `model-settings.json` override, else the process default.
+pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
+    return config.kv_quant_override orelse configuredKvQuant();
+}
+
+/// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
+/// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
+pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
+    return if (config.ctx_override > 0) config.ctx_override else server_config.max_context_size;
+}
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
 /// `serve()`); handleConnection resolves `model` body fields against this
@@ -666,6 +715,8 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/messages",
     "/v1/models",
     "/v1/models/rescan",
+    "/v1/providers",
+    "/v1/providers/reload",
     "/v1/responses",
     "/v1/responses/compact",
     "/v1/unload-model",
@@ -745,6 +796,29 @@ pub var prefix_cache_capacity: u32 = 32;
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
+
+/// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
+/// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
+/// inference thread, read from connection threads. `maxInt(u64)` is the unresolved sentinel,
+/// not 0 (`--prefix-cache-mem 0` under SSD-first publishes a real zero).
+const HOT_CACHE_MEM_UNRESOLVED: u64 = std.math.maxInt(u64);
+var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED);
+
+/// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
+pub fn resolvedPrefixCacheMem() u64 {
+    const v = hot_cache_mem_resolved.load(.monotonic);
+    return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
+}
+
+/// Publish the clamp's answer (inference thread, end of a load); `clearResolvedPrefixCacheMem`
+/// resets it on unload so the next model does not inherit this one's budget.
+pub fn publishResolvedPrefixCacheMem(v: u64) void {
+    hot_cache_mem_resolved.store(v, .monotonic);
+}
+
+pub fn clearResolvedPrefixCacheMem() void {
+    hot_cache_mem_resolved.store(HOT_CACHE_MEM_UNRESOLVED, .monotonic);
+}
 
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
@@ -996,6 +1070,31 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
+    const c = lm.config orelse return false;
+    if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailOpensMuseHeader(tail);
+}
+
+/// Generation-side grammar switching currently has one exact boundary: the
+/// atomic bare `</think>` token. Keep this narrower than response parsing,
+/// which also recognizes suffixed and channel-based reasoning families.
+fn promptOpensBareThink(
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+) bool {
+    if (prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailOpensBareThink(tail);
+}
+
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
 /// Bounded LRU; lost on restart.
 var global_response_store: ?responses_mod.ResponseStore = null;
@@ -1017,7 +1116,22 @@ const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 /// return 4096 — an omitted-max_tokens client silently capped at 4096 tokens,
 /// truncating any large tool call. Same class as the 256 default it replaced.
 fn omittedMaxTokensDefault(effective_ctx: u32) u32 {
-    return if (effective_ctx > 0) std.math.maxInt(u32) / 4 else 4096;
+    return omittedMaxTokensDefaultWith(effective_ctx, launchMaxTokensDefault());
+}
+
+/// Pure core of the above with the launch default (`--max-tokens N`, 0 = unset) passed in.
+/// The flag outranks both fallbacks.
+fn omittedMaxTokensDefaultWith(effective_ctx: u32, launch_default: u32) u32 {
+    if (launch_default > 0) return launch_default;
+    return if (effective_ctx > 0) AUTO_MAX_TOKENS_SENTINEL else 4096;
+}
+
+/// The "no budget named, peg it to the window" sentinel, in one place; `clampMaxTokens` reduces it to `context - prompt`.
+const AUTO_MAX_TOKENS_SENTINEL: u32 = std.math.maxInt(u32) / 4;
+
+/// The one read of `ServerConfig.default_max_tokens`. 0 = flag not given.
+pub fn launchMaxTokensDefault() u32 {
+    return server_config.default_max_tokens;
 }
 
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
@@ -1029,9 +1143,65 @@ fn omittedMaxTokensDefault(effective_ctx: u32) u32 {
 fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
     const val = v orelse return auto_default;
     return switch (val) {
-        .integer => |i| if (i > 0) @intCast(i) else auto_default,
+        .integer => |i| if (i > 0) @intCast(@min(i, std.math.maxInt(u32))) else auto_default,
         else => auto_default,
     };
+}
+
+/// A request's `seed`; negative is the llama.cpp "random" convention and means unseeded.
+fn parseRequestSeed(v: ?std.json.Value) ?u64 {
+    const val = v orelse return null;
+    return switch (val) {
+        .integer => |i| if (i < 0) null else @as(u64, @intCast(i)),
+        else => null,
+    };
+}
+
+/// A client-supplied JSON integer narrowed to i32 by clamping, never by `@intCast`.
+fn clampJsonI32(i: i64) i32 {
+    return @intCast(std.math.clamp(i, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+/// Who decided the effective `max_tokens`: the client, the `--max-tokens` launch default, or nobody (auto).
+const MaxTokensOrigin = enum { client, launch_default, auto };
+
+/// The origin of the number `resolveRequestMaxTokens` returns, from the same two inputs.
+fn maxTokensOrigin(requested: ?std.json.Value, launch_default: u32) MaxTokensOrigin {
+    if (requested) |val| switch (val) {
+        .integer => |i| if (i > 0) return .client,
+        else => {},
+    };
+    return if (launch_default > 0) .launch_default else .auto;
+}
+
+/// Widest string `describeMaxTokens` writes: a 10-digit budget plus
+/// " (launch default)".
+const MAX_TOKENS_DESC_LEN: usize = 27;
+
+/// Render the request log's `max_tokens=` field: auto prints as `auto` (or `auto (N)` for the
+/// finite unknown-context fallback), a launch-filled budget names its source, a client's number
+/// prints bare. The sentinel used to print as a client asking for a billion tokens.
+fn describeMaxTokens(buf: []u8, value: u32, origin: MaxTokensOrigin) []const u8 {
+    return switch (origin) {
+        .client => std.fmt.bufPrint(buf, "{d}", .{value}) catch "?",
+        .launch_default => std.fmt.bufPrint(buf, "{d} (launch default)", .{value}) catch "?",
+        .auto => if (value == AUTO_MAX_TOKENS_SENTINEL)
+            "auto"
+        else
+            std.fmt.bufPrint(buf, "auto ({d})", .{value}) catch "auto",
+    };
+}
+
+/// Does the generation budget warrant the "budget squeezed" warning? The auto sentinel is
+/// excluded: it is always more than 4x anything that remains.
+fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
+    if (max_tokens == AUTO_MAX_TOKENS_SENTINEL) return false;
+    return remaining < max_tokens / 4;
+}
+
+/// The auto budget's own tightness question: under a quarter of the window left.
+fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
+    return remaining < effective_ctx / 4;
 }
 
 /// Finish reason for a response whose generated text yielded tool calls.
@@ -1199,6 +1369,10 @@ pub fn serve(
     cfg: ServerConfig,
 ) !void {
     server_config = cfg;
+    // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
+    // asks for the KV width.
+    configured_kv_quant = load_params.kv_quant_config;
+    defer configured_kv_quant = null;
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
     //    Transformer/vision/drafter load, JIT compile, and warmup before
@@ -1213,6 +1387,24 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
+    scheduler_mod.prefill_admission_fits = &prefillFitsNow;
+    defer scheduler_mod.prefill_admission_fits = null;
+    scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
+    defer scheduler_mod.prefill_request_chunk = null;
+    // The published budget is per model; retire it whenever the scheduler drops the cache.
+    scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefixCacheMem;
+    defer scheduler_mod.hot_cache_budget_invalidate = null;
+    scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
+    defer scheduler_mod.prefill_admission_refused_log = null;
+    // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
+    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
+    defer scheduler_mod.prefill_chunk_widen_ok = null;
+    // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -1250,8 +1442,8 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (prefix_cache_mem_bytes > 0) {
-            const cap_mb = @as(f64, @floatFromInt(prefix_cache_mem_bytes)) / (1024.0 * 1024.0);
+        if (resolvedPrefixCacheMem() > 0) {
+            const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
@@ -1342,14 +1534,29 @@ pub fn serve(
         g_lan = null;
         l.shutdown();
     };
+    // The App Store build cannot exec curl (the providers transport), so it
+    // never starts them — same limit as `mlx-serve pull`.
+    if (!build_options.mas) {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.mlx-serve/providers.json", .{home}) catch "";
+        g_providers = providers_mod.Providers.start(allocator, io, path, port) catch |err| blk: {
+            log.warn("[providers] failed to start ({s}); providers disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    defer if (g_providers) |p| {
+        g_providers = null;
+        p.shutdown();
+    };
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (server_config.max_context_size > 0) {
-        log.info("Context size: {d} tokens (manual)\n", .{server_config.max_context_size});
+    if (manualContext(config) > 0) {
+        log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
         const memory_allows = safeAutoContext(memory_ctx);
@@ -1374,6 +1581,9 @@ pub fn serve(
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
     }
+    if (launchMaxTokensDefault() > 0) {
+        log.info("default max_tokens for omitted requests: {d}\n", .{launchMaxTokensDefault()});
+    }
     if (server_config.default_enable_pld) {
         log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     }
@@ -1384,6 +1594,9 @@ pub fn serve(
     }
     if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
+    }
+    if (generate_mod.max_mtp_ctx != 0) {
+        log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
@@ -1761,6 +1974,16 @@ fn handleConnection(
         try handleUnloadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/providers/reload")) {
+        try handleProvidersReload(allocator, stream);
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/providers")) {
+        const body = if (g_providers) |p| try p.statusJson(allocator) else try allocator.dupe(u8, "{\"providers\":[]}");
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+        return;
+    }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
@@ -1815,6 +2038,15 @@ fn handleConnection(
     //    that marker, not loopback-ness, is the multi-hop bound. A
     //    registered LOCAL id containing '@' keeps winning via the peek; an
     //    offline peer is an honest 404, never a silent local-default answer.
+    // ── Configured provider (`<id>@<provider>`) → proxied to its
+    //    /v1/chat/completions with the provider's key. Checked before the LAN
+    //    table: a provider is a URL the user typed, a peer is discovered.
+    if (g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
+        !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
+    {
+        try handleProviderProxy(allocator, stream, prov, path, request_body, requested_model_id);
+        return;
+    };
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
@@ -2515,10 +2747,16 @@ fn safeAutoContext(raw: u32) u32 {
 /// a YaRN-scaled checkpoint — the same derivation vLLM applies to
 /// `max_model_len`, because a position past the scaled window aliases back
 /// inside the ramp rather than reading as a longer distance.
+/// The context the server advertises, from the largest context memory alone allows (85%
+/// margin on the memory number, checkpoint cap afterwards). Shared by the load-time session
+/// bill and the boot-time sizer so the two cannot spell the relation two ways.
+fn autoContextFrom(memory_ctx: u32, ctx_cap: u32) u32 {
+    const with_headroom = safeAutoContext(memory_ctx);
+    return if (ctx_cap > 0) @min(with_headroom, ctx_cap) else with_headroom;
+}
+
 fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
-    const with_headroom = safeAutoContext(computeMemoryContext(config));
-    const max_pos = config.contextCap();
-    return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
+    return autoContextFrom(computeMemoryContext(config), config.contextCap());
 }
 
 /// Freeze this model's auto-context at load time. Idempotent; a no-op (and
@@ -2535,7 +2773,7 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     // resolved before any context is computed from it. Pinned even under an
     // explicit `--ctx-size`, because the guard reads it on every request.
     _ = pinPrefillChunk(config);
-    if (server_config.max_context_size > 0) return server_config.max_context_size;
+    if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context == 0) {
         config.pinned_context = autoContextFor(config);
     }
@@ -2543,7 +2781,7 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (server_config.max_context_size > 0) return server_config.max_context_size;
+    if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
     // current GPU memory rather than a fixed 16K cap.
@@ -2592,6 +2830,78 @@ fn getGpuWorkingSetLimit() u64 {
 /// reject/clamp before that allocation is ever submitted.
 fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system: u64) u64 {
     return @min(working_set_limit, mlx_footprint +| free_system);
+}
+
+/// How far under the enforced wired limit a plan may reach: past the limit Metal returns
+/// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
+pub const WIRED_LIMIT_MARGIN_BYTES: u64 = 8 << 30;
+
+/// PURE: the floor an explicitly raised `iogpu.wired_limit_mb` puts under the ceiling; 0 when
+/// the sysctl is absent or at the macOS default (75% of RAM), which leaves the ceiling as is.
+/// A floor, not a cap: the working-set term already tracks the sysctl. The term it lifts is
+/// the free-RAM one, which counts other processes' pages as gone; the operator who raised the
+/// enforced limit has said the GPU may claim that much.
+pub fn wiredLimitFloor(wired_limit: u64, total_ram: u64) u64 {
+    if (wired_limit == 0 or total_ram == 0) return 0;
+    if (wired_limit <= total_ram * 75 / 100) return 0; // the macOS default: no declaration
+    return @min(wired_limit -| WIRED_LIMIT_MARGIN_BYTES, total_ram -| WIRED_LIMIT_MARGIN_BYTES);
+}
+
+/// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
+/// `physicalMemoryCeiling` byte for byte.
+pub fn gpuCeilingWithWiredFloor(
+    working_set_limit: u64,
+    mlx_footprint: u64,
+    free_system: u64,
+    wired_floor: u64,
+) u64 {
+    const physical = physicalMemoryCeiling(working_set_limit, mlx_footprint, free_system);
+    return @max(physical, wired_floor);
+}
+
+/// Test seam: `iogpu.wired_limit_mb` in MB; `null` reads the machine.
+pub var wired_limit_mb_override: ?u64 = null;
+
+var wired_limit_bytes_cached: u64 = 0;
+var wired_limit_read: bool = false;
+
+/// `iogpu.wired_limit_mb` in bytes, read ONCE per process: re-reading it per admission would
+/// let the ceiling move under a live request. 0 when the OID is absent.
+pub fn wiredLimitBytes() u64 {
+    if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
+    if (wired_limit_read) return wired_limit_bytes_cached;
+    var v: u32 = 0;
+    var len: usize = @sizeOf(u32);
+    wired_limit_bytes_cached = if (sysctlbyname("iogpu.wired_limit_mb", @ptrCast(&v), &len, null, 0) == 0)
+        @as(u64, v) * 1024 * 1024
+    else
+        0;
+    wired_limit_read = true;
+    return wired_limit_bytes_cached;
+}
+
+var wired_floor_logged = std.atomic.Value(bool).init(false);
+
+/// The floor for THIS model, gated on `ModelConfig.longCtxGated()`. `null` config (no model
+/// resolved yet) takes no floor.
+fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
+    return wiredCeilingFloorForRam(config, metrics.getTotalMemBytes());
+}
+
+/// PURE: the floor for a machine with `total_ram` bytes; the wrapper above reads the machine.
+fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
+    const c = config orelse return 0;
+    if (!c.longCtxGated()) return 0;
+    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram);
+    if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
+        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
+            floor >> 20,
+            wiredLimitBytes() >> 20,
+            getGpuWorkingSetLimit() >> 20,
+            WIRED_LIMIT_MARGIN_BYTES >> 20,
+        });
+    }
+    return floor;
 }
 
 /// PURE (unit-testable): the cap to put on MLX's reclaimable buffer pool for a
@@ -2657,7 +2967,20 @@ pub fn applyMlxCacheLimit() void {
 /// regression), while external pressure — reflected in `getAvailableMemBytes`
 /// (total − wired − compressed − internal-anon) — tightens it. See
 /// `physicalMemoryCeiling`.
-fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+/// The ceiling term that does not move with instantaneous free RAM: Metal's recommended
+/// working set (or the wired limit). The load-time hot-cache clamp bills against this and
+/// nothing else: two boots 11 minutes apart resolved the same ask to 1076 and 9757 MB off the
+/// live term. Request-time admission still reads live memory.
+/// Tests only: stand in for the machine's working-set limit (CI runners have 7 GB).
+pub var static_ceiling_override: ?u64 = null;
+
+pub fn staticGpuMemoryCeiling() u64 {
+    return static_ceiling_override orelse getGpuWorkingSetLimit();
+}
+
+/// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
+/// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
+fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
     // the noisy free-RAM term they made auto-context swing across boots of the
@@ -2667,10 +2990,11 @@ fn currentGpuMemoryCeiling(active_mem: u64) u64 {
     const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
-    return physicalMemoryCeiling(
+    return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
         metrics.getAvailableMemBytes() +| ane_bytes,
+        wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
 
@@ -2735,9 +3059,10 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 /// The process-wide KV width a request gets when it names none — the same
 /// expression `checkAttentionMemory` falls back to, so the sizer and the
 /// admission guard read one answer.
-fn defaultKvBits() u64 {
-    const cfg: transformer_mod.KVQuantConfig =
-        if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense;
+///
+/// Through `configuredKvQuant`, so a load-time bill gets the boot's `--kv-quant`, not the dense fallback.
+fn defaultKvBits(config: *const model_mod.ModelConfig) u64 {
+    const cfg: transformer_mod.KVQuantConfig = configuredKvQuantFor(config);
     return if (cfg.scheme == .off) 16 else cfg.bits;
 }
 
@@ -2757,8 +3082,21 @@ fn defaultKvBits() u64 {
 /// Same estimator as the admission guard with the KV term zeroed, because the
 /// KV cache is exactly what the sizer is solving for.
 pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    return prefillTransientReserveAtKv(config, kv_bits, chunk, chunk);
+}
+
+/// `prefillTransientReserve` with the KV length made explicit. The load-time sizer asks at
+/// `kv = chunk`; a per-chunk decision has a KV, and the attention score sheet and the QSA
+/// sheet are linear in it (~0.5 GB under-billed at the default sheet, ~9 GB at 4096 MB).
+pub fn prefillTransientReserveAtKv(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    chunk: u64,
+    kv_len: u64,
+) u64 {
+    const seq: u64 = @max(kv_len, chunk);
     return prefillMemoryNeeded(
-        chunk,
+        seq,
         config.num_attention_heads,
         config.num_key_value_heads,
         0,
@@ -2768,10 +3106,11 @@ pub fn prefillTransientReserve(config: *const model_mod.ModelConfig, kv_bits: u6
         prefillFfnWidth(config),
         kv_bits,
         chunk,
-        config.prefillAttnKeys(chunk),
+        config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-    ) + qsaMaskBytes(config, chunk, chunk);
+        .{},
+    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -2789,7 +3128,7 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
     if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
-        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio);
+        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -2808,15 +3147,28 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
 ///
 /// The KV term is a RESERVE, not a prediction: see `ane.MIN_CONTEXT_TOKENS`.
 pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
-    const kv_bits: u64 = defaultKvBits();
+    const kv_bits: u64 = defaultKvBits(config);
     const ctx: u64 = if (config.max_position_embeddings > 0)
         @min(ane_mod.MIN_CONTEXT_TOKENS, config.max_position_embeddings)
     else
         ane_mod.MIN_CONTEXT_TOKENS;
     return ane_mod.GATE_BASELINE_BYTES +|
         (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx) +|
-        prefix_cache_mem_bytes +|
+        resolvedPrefixCacheMem() +|
         prefillTransientReserve(config, kv_bits, chunk);
+}
+
+var ctx_bar_cached: ?bool = null;
+
+/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
+pub fn ctxBarEnabled() bool {
+    if (ctx_bar_cached) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_CTX_BAR") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    ctx_bar_cached = v;
+    return v;
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -2829,6 +3181,10 @@ pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
 /// trading the whole session's context for one forward's speed, which is the
 /// trade that reported a 1024-token context on a 16 GB Mac.
 const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
+
+/// The hot prefix cache's smallest useful budget: a prefill chunk that would price the cache
+/// under this steps down instead. Stops `requested == 0` from resolving to the 1-byte floor.
+const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// PURE: the widest prefill chunk THIS machine can afford for THIS model.
 ///
@@ -2844,16 +3200,45 @@ const PREFILL_RESERVE_BUDGET_SHARE: u64 = 4;
 ///
 /// Never raises anything: `effectivePrefillChunk` takes the MIN of this and the
 /// launch chunk, and an explicit `--prefill-chunk` outranks it entirely.
+///
+/// It does not read the hot-cache ask: the clamp downstream subtracts this chunk's reserve
+/// from the cache's headroom, so feeding the ask in here was non-monotone (a bigger
+/// `--prefix-cache-mem` stepped the chunk down and handed the cache MORE bytes). The chunk is
+/// sized against the serving budget alone; the cache is the residual claimant. `ctx_kv_bytes`
+/// is the KV a pinned context has already spoken for (0 under auto-context).
+/// The byte cap one prefill forward's transient may claim, and the one place the sizer's two
+/// changes (dropping the ask, adding the ctx bar) are gated by arch; every other arch keeps
+/// the previous arithmetic. `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` drops the ctx bar inside the gate.
+pub fn prefillChunkCap(
+    config: *const model_mod.ModelConfig,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
+) u64 {
+    if (!config.longCtxGated()) {
+        // Ungated: the ask is spoken for, and a quarter of what is left is the whole cap.
+        const spoken_for: u64 = active_mem +| hot_cache_ask;
+        return (ceiling -| spoken_for) / PREFILL_RESERVE_BUDGET_SHARE;
+    }
+    const serving_budget: u64 = ceiling -| active_mem;
+    // Two ask-independent bars: a share of the serving budget, and whatever the pinned context leaves less a cache worth having.
+    const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    // The ctx bar can only ever narrow; `--ctx-size` is a cap, not an allocation, so it can pin
+    // chunk 512 for the life of a process. The narrowing is logged.
+    const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
+    return @min(share_bar, ctx_bar);
+}
+
 pub fn resolvePrefillChunk(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
     ceiling: u64,
     active_mem: u64,
-    hot_cache_reserve: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
 ) u32 {
-    const spoken_for: u64 = active_mem +| hot_cache_reserve;
-    const serving_budget: u64 = if (ceiling > spoken_for) ceiling - spoken_for else 0;
-    const cap: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
+    const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
@@ -2861,6 +3246,41 @@ pub fn resolvePrefillChunk(
     // rung: it is the smallest bill this box can be asked for, and returning 0
     // would read as "not pinned" and hand the forward the launch width.
     return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+/// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
+/// forward does: `--prefill-chunk 4096` used to run against a 512-token reserve.
+pub fn explicitPrefillChunk() u32 {
+    // `MLX_SERVE_PREFILL_CHUNK` outranks everything in `generate.effectivePrefillChunk`, so the
+    // bill must see it too. Clamped: the env value is unbounded at its source.
+    const env_w: usize = @min(generate_mod.envPrefillChunk(), @as(usize, std.math.maxInt(u32)));
+    if (env_w > 0) return @intCast(env_w);
+    if (!generate_mod.prefill_chunk_explicit) return 0;
+    const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
+    return @intCast(raw);
+}
+
+/// The chunk this model is billed at, and therefore runs at. `chunk_override` (0 = none)
+/// mirrors `generate.effectivePrefillChunk`'s precedence.
+pub fn billedPrefillChunk(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_mem: u64,
+    ctx_kv_bytes: u64,
+    hot_cache_ask: u64,
+    chunk_override: u32,
+) u32 {
+    if (chunk_override > 0) return chunk_override;
+    return resolvePrefillChunk(config, kv_bits, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
+}
+
+/// The context KV the chunk sizer must leave standing: the pinned context's bill under an
+/// explicit `--ctx-size`, 0 while the context is auto (the auto sizer adapts to the rung).
+pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    if (manualContext(config) == 0) return 0;
+    return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| manualContext(config);
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -2872,13 +3292,29 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
     if (config.pinned_prefill_chunk == 0) {
         var active_mem: usize = 0;
         _ = mlx.mlx_get_active_memory(&active_mem);
-        config.pinned_prefill_chunk = resolvePrefillChunk(
+        const kv_bits: u64 = defaultKvBits(config);
+        // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
+        // ask as before (the accessor would pin a second model against the first's budget).
+        const hot_cache_ask = if (config.longCtxGated()) resolvedPrefixCacheMem() else legacyPrefixCacheAsk();
+        // The override's precedence is the second gated input: ungated, `--prefill-chunk`
+        // still outranks the pin only at forward time, as before (a known inconsistency).
+        const pin_override: u32 = if (config.longCtxGated()) explicitPrefillChunk() else 0;
+        config.pinned_prefill_chunk = billedPrefillChunk(
             config,
-            defaultKvBits(),
-            currentGpuMemoryCeiling(active_mem),
+            kv_bits,
+            currentGpuMemoryCeiling(config, active_mem),
             active_mem,
-            prefix_cache_mem_bytes,
+            sizerCtxKvBytes(config, kv_bits),
+            hot_cache_ask,
+            pin_override,
         );
+        // Say when the ctx bar is the binding one.
+        if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
+            const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
+            if (share_only > config.pinned_prefill_chunk) {
+                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
+            }
+        }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown.
@@ -2911,30 +3347,261 @@ pub fn clampedPrefixCacheMem(
     return @min(requested, headroom);
 }
 
+/// What the hot cache gets and what it was charged for getting it.
+pub const HotCachePlan = struct {
+    /// The width the sizer pinned.
+    chunk: u32,
+    /// The width the clamp reserved for; not `chunk` on an arch that re-bills per request (`clampReserveWidth`).
+    reserve_chunk: u32,
+    reserve: u64,
+    ctx_kv: u64,
+    /// The clamped byte budget handed to `initWithMem`.
+    budget: u64,
+};
+
+/// The whole chain in the one order that is monotone in the ask: chunk first
+/// (ask-independent), then the cache takes the residual.
+/// The prefill width the load-time clamp reserves for: the ladder floor on an arch that
+/// re-bills its width per request (the load-time reserve is a promise to the first request
+/// only). Billing the sizer's rung made the clamp non-monotone in the ceiling (a bigger
+/// ceiling bought a wider rung and a smaller cache: 3873 vs 1076 MB). An explicit
+/// `--prefill-chunk` is billed as-is; ungated archs keep the sizer's rung.
+pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32) u32 {
+    if (explicitPrefillChunk() > 0) return pinned_width;
+    if (!perRequestPrefillChunkEnabled(config)) return pinned_width;
+    return PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+}
+
+pub fn planHotCache(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    ceiling: u64,
+    active_weights: u64,
+    ctx_tokens: u64,
+    sizer_ctx_kv: u64,
+    requested: u64,
+    chunk_override: u32,
+) HotCachePlan {
+    const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
+    const reserve_chunk = clampReserveWidth(config, chunk);
+    const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config)) *| ctx_tokens;
+    return .{
+        .chunk = chunk,
+        .reserve_chunk = reserve_chunk,
+        .reserve = reserve,
+        .ctx_kv = ctx_kv,
+        .budget = clampedPrefixCacheMem(requested, ceiling, active_weights, ctx_kv, reserve),
+    };
+}
+
+/// SSD-first budget semantics. The RAM-first formula treats the hot cache as what is left
+/// after the live session's reserve, which double-counts (the resident entry's arrays are
+/// shared with the live KV). Here the budget floors at one entry at the working context and
+/// `--prefix-cache-mem` is the RAM allowance for idle entries on top (0 = none idle).
+pub fn ssdFirstPrefixCacheMem(
+    idle_requested: u64,
+    gpu_ceiling: u64,
+    active_weights: u64,
+    ctx_kv_bytes: u64,
+    transient_reserve: u64,
+) u64 {
+    const headroom = gpu_ceiling -| (active_weights +| ctx_kv_bytes +| transient_reserve);
+    const idle = @min(idle_requested, headroom);
+    // Never 0: `initWithMem` reads 0 as "no byte cap".
+    return @max(ctx_kv_bytes +| idle, 1);
+}
+
+/// The context a load-time bill must use, before `pinAutoContext` has run: on an auto boot
+/// `getEffectiveContextLength` re-derives through `computeMemoryContext`, which reserves the
+/// very ask being resolved and answered a 1024-token placeholder. `cache_reserve` is
+/// `CTX_SIZING_CACHE_RESERVE` on both arms so the billed session is the advertised one; it
+/// must never be the ask or anything derived from it. Runs `autoContextFrom`, the same helper
+/// `autoContextFor` runs.
+pub fn resolvedContextForLoad(
+    explicit_ctx: u32,
+    pinned_ctx: u32,
+    ceiling: u64,
+    active_mem: u64,
+    cache_reserve: u64,
+    transient_reserve: u64,
+    per_tok: u64,
+    ctx_cap: u32,
+) u32 {
+    if (explicit_ctx > 0) return explicit_ctx;
+    if (pinned_ctx > 0) return pinned_ctx;
+    return autoContextFrom(safeContextForBudget(
+        ceiling,
+        active_mem,
+        cache_reserve +| transient_reserve,
+        per_tok,
+        0,
+    ), ctx_cap);
+}
+
+/// The SSD-first call site. Takes the static ceiling (the budget is a property of the machine),
+/// the same reserve constant the RAM arm and `computeMemoryContext` pass, and the boot's
+/// configured KV width (billing at bf16 on a `--kv-quant 8` boot was the 22,464-vs-13,824 MB defect).
+fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u32 {
+    return resolvedContextForLoad(
+        manualContext(config),
+        config.pinned_context,
+        ceiling,
+        active_mem,
+        ctxSizingCacheReserve(config),
+        prefillTransientReserve(config, kv_bits, chunk),
+        kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
+        config.contextCap(),
+    );
+}
+
+/// The bytes the SSD-first budget floors at: one session at the working context, at the width the cache stores.
+fn ssdFirstSessionKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u64 {
+    return (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk);
+}
+
+/// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included. Null when the arch
+/// gate is off; the caller falls through to `clampedPrefixCacheMem`.
+fn ssdFirstBudgetForLoad(
+    config: *model_mod.ModelConfig,
+    requested: u64,
+    ceiling: u64,
+    active_mem: usize,
+    ctx_kv: u64,
+    transient_reserve: u64,
+    idle_out: *u64,
+    quiet: bool,
+) ?u64 {
+    // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
+    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
+    const budget = ssdFirstPrefixCacheMem(
+        requested,
+        ceiling,
+        active_mem,
+        ctx_kv,
+        transient_reserve,
+    );
+    // Publish the cache's cost BEYOND the live session, not the whole budget: `budget` includes
+    // `ctx_kv`, and `computeMemoryContext` subtracts the published figure, so publishing the
+    // whole would bill the session twice and halve the auto-context.
+    publishResolvedPrefixCacheMem(budget -| ctx_kv);
+    // The idle allowance, handed to the cache for `spillIdleEntries` to enforce.
+    idle_out.* = budget -| ctx_kv;
+    // On this arch `--prefix-cache-mem` is the idle allowance, not the whole cache; say so once.
+    if (quiet) return budget;
+    log.info("[hot-cache] SSD-first budget {d} MB = one session at the working context ({d} MB) + {d} MB idle (--prefix-cache-mem {d} MB = the IDLE allowance on this arch; 0 = no idle entries)\n", .{
+        budget >> 20,
+        ctx_kv >> 20,
+        (budget -| ctx_kv) >> 20,
+        requested >> 20,
+    });
+    return budget;
+}
+
 /// Impure wrapper for the model-load site (`Scheduler.doLoadOnInferenceThread`,
 /// reached through the LoadParams/LoadRequest resolver pointer — the scheduler
 /// deliberately has no server.zig import): the weights are resident there, so
-/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites.
-pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64) u64 {
+/// `mlx_get_active_memory` is honest. Logs one line when the clamp bites, and publishes the
+/// answer so the auto-context sizer and the ANE gate stop reserving a budget the cache never got.
+/// The hot-cache reserve the context is sized against at load time on the RAM-first arm: a
+/// constant (the server's own `--prefix-cache-mem` default), never the ask. Reading the ask
+/// let a 60GB ask collapse the advertised context to 870 tokens; context is the primary
+/// claimant and the cache the residual.
+const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
+/// ungated archs so their advertised `context_length` does not move.
+fn legacyPrefixCacheAsk() u64 {
+    return prefix_cache_mem_bytes; // legacy_ask_read
+}
+
+/// The context the RAM-first clamp bills, through the one shared pure resolver.
+fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
+    return resolvedContextForLoad(
+        manualContext(config),
+        config.pinned_context,
+        currentGpuMemoryCeiling(config, active_mem),
+        active_mem,
+        ctxSizingCacheReserve(config),
+        prefillTransientReserve(config, kv_bits, chunk),
+        kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config),
+        config.contextCap(),
+    );
+}
+
+/// `revise` marks a post-load re-clamp (#364): the cache's own resident bytes come off the
+/// machine read so it never bills itself, and the budget lines stay quiet.
+pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
+    // RAM-first default: no idle allowance. Written first so every early return carries it.
+    idle_out.* = 0;
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
-    const kv_bits: u64 = defaultKvBits();
-    const chunk: u64 = pinPrefillChunk(config);
-    const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken()) *|
-        getEffectiveContextLength(config);
-    const clamped = clampedPrefixCacheMem(
-        requested,
-        currentGpuMemoryCeiling(active_mem),
-        active_mem,
-        ctx_kv,
-        prefillTransientReserve(config, kv_bits, chunk),
-    );
-    if (requested > 0 and clamped < requested) {
-        log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
-    } else if (requested == 0) {
-        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+    active_mem -|= @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
+    const kv_bits: u64 = defaultKvBits(config);
+    // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
+    // load-time context resolver, the floor-width reserve), all measured on qwen4_exp alone.
+    // Ungated is the previous `prefixCacheMemForLoad`.
+    if (!config.longCtxGated()) {
+        const chunk: u64 = pinPrefillChunk(config);
+        // `statePerTokenBilled` is 0 off qwen4_exp.
+        const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
+            getEffectiveContextLength(config);
+        const clamped = clampedPrefixCacheMem(
+            requested,
+            currentGpuMemoryCeiling(config, active_mem),
+            active_mem,
+            ctx_kv,
+            prefillTransientReserve(config, kv_bits, chunk),
+        );
+        // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
+        publishResolvedPrefixCacheMem(clamped);
+        if (revise.quiet) return clamped;
+        if (requested > 0 and clamped < requested) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        } else if (requested == 0) {
+            log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
+        }
+        return clamped;
     }
-    return clamped;
+    // SSD-first takes the budget before the RAM-first plan: its resident entry IS the live KV.
+    const ssd_chunk: u64 = pinPrefillChunk(config);
+    // Not `getEffectiveContextLength`: on an auto boot it is still unpinned here.
+    const ssd_ctx_kv: u64 = ssdFirstSessionKvBytes(config, kv_bits, staticGpuMemoryCeiling(), active_mem, @intCast(ssd_chunk));
+    // Static ceiling on both arms (the budget is a property of the machine), and the clamp
+    // reserve at the same width `planHotCache` reserves for: the ladder floor on an arch that
+    // re-bills per request. The session is billed at the pinned width, the budget at the floor.
+    const ssd_clamp_reserve: u64 = prefillTransientReserve(config, kv_bits, clampReserveWidth(config, @intCast(ssd_chunk)));
+    if (ssdFirstBudgetForLoad(config, requested, staticGpuMemoryCeiling(), active_mem, ssd_ctx_kv, ssd_clamp_reserve, idle_out, revise.quiet)) |b| return b;
+    // Pin first, then hand the pinned width in as the override.
+    const pinned: u32 = pinPrefillChunk(config);
+    // Static ceiling, not the live one: the budget must be reproducible boot to boot.
+    const plan = planHotCache(
+        config,
+        kv_bits,
+        staticGpuMemoryCeiling(),
+        active_mem,
+        // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
+        ramFirstContextForLoad(config, kv_bits, active_mem, pinned),
+        sizerCtxKvBytes(config, kv_bits),
+        requested,
+        pinned,
+    );
+    publishResolvedPrefixCacheMem(plan.budget);
+    if (revise.quiet) return plan.budget;
+    // Say so when the box is under external pressure right now, but do not shrink the budget for it.
+    const live_ceiling: u64 = currentGpuMemoryCeiling(config, active_mem);
+    if (live_ceiling < staticGpuMemoryCeiling()) {
+        const free_gb = @as(f64, @floatFromInt(live_ceiling -| active_mem)) / (1024.0 * 1024.0 * 1024.0);
+        log.info("[hot-cache] budget {d} MB (static ceiling); free at load {d:.1} GB — live admission will evict as needed\n", .{ plan.budget >> 20, free_gb });
+    }
+    if (requested > 0 and plan.budget < requested) {
+        log.info("[hot-cache] budget clamped {d} -> {d} MB (chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ requested >> 20, plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    } else if (requested == 0) {
+        log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
+    }
+    return plan.budget;
 }
 
 test "clampedPrefixCacheMem: the budget never exceeds what the weights leave under the ceiling" {
@@ -2952,23 +3619,856 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
     try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
 }
 
-/// The largest context this model's per-token footprint fits into RAM right
-/// now, IGNORING the checkpoint's own maximum. Reads live memory.
+/// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk with a QSA
+/// indexer. Declares `qwen4_exp`: every long-context mechanism is gated on it.
+fn longCtxTestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 40;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 2560;
+    cfg.intermediate_size = 9216;
+    cfg.intermediate_size_declared = true;
+    cfg.quant_bits = 4;
+    cfg.max_position_embeddings = 1048576;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    return cfg;
+}
+
+test "planHotCache: the budget is MONOTONE in the ask" {
+    // The defect: a bigger ask stepped the chunk down, shrank the reserve and bought MORE cache
+    // (10GB -> 3873 MB, 24GB -> 5703 MB, same box).
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const ctx_tokens: u64 = 262144;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const plan = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, ask, 0);
+        try t.expect(plan.budget >= prev);
+        try t.expect(plan.budget <= @max((ceiling -| weights) -| plan.ctx_kv -| plan.reserve, 1));
+        prev = plan.budget;
+    }
+
+    // The two live asks now agree: the sizer no longer sees the ask.
+    const at10 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const at24 = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, 0, 24 * GiB, 0);
+    try t.expect(at24.budget >= at10.budget);
+    try t.expectEqual(at10.chunk, at24.chunk);
+}
+
+test "planHotCache: an out-of-the-box boot gets the whole remaining headroom, never the 1-byte floor" {
+    // One boot with no flags: `requested == 0` used to hand the sizer a zero reserve, so it took
+    // a wide rung and the clamp returned its 1-byte floor.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const cfg = longCtxTestConfig();
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    const ceiling: u64 = weights + 28_909 * (1 << 20);
+    const ctx_tokens: u64 = 262144;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) + statePerTokenBilled(&cfg);
+    const sizer_ctx_kv: u64 = per_tok * ctx_tokens;
+
+    const boot = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 0, 0);
+    // Everything left over: the cache is the residual claimant.
+    try t.expectEqual(@max((ceiling -| weights) -| boot.ctx_kv -| boot.reserve, 1), boot.budget);
+    // A cache worth having, or the ladder bottomed out and the box is too small.
+    try t.expect(boot.budget >= HOT_CACHE_FLOOR_BYTES or
+        boot.chunk == PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // The rung is the widest that clears both ask-independent bars.
+    const serving: u64 = ceiling - weights;
+    const cap: u64 = @min(serving / PREFILL_RESERVE_BUDGET_SHARE, (serving -| sizer_ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= boot.chunk) break;
+        try t.expect(prefillTransientReserve(&cfg, kv_bits, c) > cap);
+    }
+
+    // An explicit ask can only take a slice of the same headroom.
+    const huge = planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 1024 * GiB, 0);
+    try t.expectEqual(boot.budget, huge.budget);
+    try t.expect(planHotCache(&cfg, kv_bits, ceiling, weights, ctx_tokens, sizer_ctx_kv, 4 * GiB, 0).budget <= boot.budget);
+}
+
+test "the clamp's live inversion, as arithmetic" {
+    // The reported boot reduced to `clampedPrefixCacheMem`: ceiling - weights = 28,909 MiB, ctx KV 20,736 MiB.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const serving: u64 = 28_909 * MiB;
+    const ctx_kv: u64 = 20_736 * MiB;
+    const reserve_1024: u64 = 4_300 * MiB;
+    const reserve_512: u64 = 2_470 * MiB;
+
+    const ask10 = clampedPrefixCacheMem(10 * GiB, serving, 0, ctx_kv, reserve_1024);
+    const ask24 = clampedPrefixCacheMem(24 * GiB, serving, 0, ctx_kv, reserve_512);
+    try t.expectEqual(3_873 * MiB, ask10);
+    try t.expectEqual(5_703 * MiB, ask24);
+    try t.expect(ask10 < ask24); // the inversion, in the numbers that shipped
+
+    // One ask-independent reserve: the clamp is `@min(ask, headroom)` over a headroom no ask can move.
+    var prev: u64 = 0;
+    var ask: u64 = GiB;
+    while (ask <= 64 * GiB) : (ask += GiB) {
+        const got = clampedPrefixCacheMem(ask, serving, 0, ctx_kv, reserve_1024);
+        try t.expect(got >= prev);
+        try t.expect(got <= @max((serving -| ctx_kv) -| reserve_1024, 1));
+        prev = got;
+    }
+    try t.expectEqual(3_873 * MiB, clampedPrefixCacheMem(0, serving, 0, ctx_kv, reserve_1024));
+}
+
+test "an explicit --prefill-chunk is the chunk that gets BILLED" {
+    // `--prefill-chunk 4096` used to run a 4096-token forward against a 512-token reserve.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    var cfg = longCtxTestConfig();
+    cfg.head_dim = 128; // fused dim: boundedPrefillChunk returns its base untouched
+    const kv_bits: u64 = 8;
+    const weights: u64 = 69 * GiB;
+    // Squeezed so the machine sizer would step below the flag.
+    const ceiling: u64 = weights + 6 * GiB;
+
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
+    const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
+    try t.expect(sized < 4096); // the machine would have narrowed it
+
+    const billed = billedPrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0, explicitPrefillChunk());
+    try t.expectEqual(@as(u32, 4096), billed);
+
+    // The other reader agrees.
+    try t.expectEqual(@as(usize, 4096), generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        40_000,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        billed,
+    ));
+
+    const plan = planHotCache(&cfg, kv_bits, ceiling, weights, 8192, 0, 2 * GiB, billed);
+    try t.expectEqual(@as(u32, 4096), plan.chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), plan.reserve);
+    try t.expect(plan.reserve > prefillTransientReserve(&cfg, kv_bits, sized));
+}
+
+/// The deployed long-context shape at the live per-token widths: 12 caching layers, hd 256,
+/// 2 KV heads (13,056 B/tok at 8-bit); a 128-wide QSA indexer at ratio 4.
+fn qsaScoreFusedOffGuard() struct {
+    pub fn deinit(_: @This()) void {
+        transformer_mod.qsa_score_fused_override = null;
+    }
+} {
+    transformer_mod.qsa_score_fused_override = false;
+    return .{};
+}
+
+fn qwen4RequestTestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 48;
+    cfg.full_attention_interval = 4;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    // No sliding-band layers: the field defaults to true, which routes a different chunk policy.
+    cfg.has_sliding_window = false;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 1024;
+    cfg.num_experts_per_tok = 8;
+    cfg.num_experts = 512;
+    cfg.quant_bits = 4;
+    cfg.max_position_embeddings = 1048576;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    cfg.pinned_prefill_chunk = 1024; // what load-time sizing gives at 1M ctx
+    return cfg;
+}
+
+test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
+    const saved = transformer_mod.qsa_score_fused_override;
+    defer transformer_mod.qsa_score_fused_override = saved;
+    transformer_mod.qsa_score_fused_override = null;
+    _ = qwen4RequestTestConfig();
+    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+}
+
+/// The width a ladder rung actually forwards at for this prompt.
+fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
+    return @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        @intCast(seq),
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        rung,
+    ));
+}
+
+test "the load-time budget is reproducible: free RAM at load does not move it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // Two boots 11 minutes apart resolved the same 10 GB ask to 1076 and 9757 MB off the live ceiling.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const GB: u64 = 1000 * 1000 * 1000;
+    const weights: u64 = 70 * GB;
+    const ctx_tokens: u64 = 1_048_576; // the deployed --ctx-size
+    const static_ceiling: u64 = 120_000 * 1024 * 1024; // the wired limit, both boots
+    // `requested == 0` is the arm where the clamp alone decides: the budget IS the headroom.
+    const uncapped: u64 = 0;
+
+    const busy = physicalMemoryCeiling(static_ceiling, weights, 108_700 * 1000 * 1000 -| weights);
+    const quiet = physicalMemoryCeiling(static_ceiling, weights, 116_600 * 1000 * 1000 -| weights);
+    try t.expect(busy < quiet);
+
+    const on_busy = planHotCache(&cfg, kv_bits, busy, weights, ctx_tokens, 0, uncapped, 0);
+    const on_quiet = planHotCache(&cfg, kv_bits, quiet, weights, ctx_tokens, 0, uncapped, 0);
+    try t.expect(on_busy.budget != on_quiet.budget);
+    try t.expect(on_quiet.budget > on_busy.budget);
+
+    // Billed against the static term, both boots agree.
+    const a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
+    const b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, uncapped, 0);
+    try t.expectEqual(a.budget, b.budget);
+    try t.expect(a.budget >= on_quiet.budget);
+
+    const capped_a = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    const capped_b = planHotCache(&cfg, kv_bits, static_ceiling, weights, ctx_tokens, 0, 24 * GB, 0);
+    try t.expectEqual(capped_a.budget, capped_b.budget);
+    try t.expect(capped_a.budget <= a.budget);
+
+    try t.expectEqual(static_ceiling, physicalMemoryCeiling(static_ceiling, weights, 400 * GB));
+}
+
+test "an auto boot sizes the SAME context whatever the cache ask (live check #6)" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `--prefix-cache-mem 60GB` collapsed the advertised context to 870 tokens (ctx KV billed at 26 MB).
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB; // backed out of the live clamp line
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+    const cap: u32 = cfg.contextCap();
+
+    // The sizing reserve is a constant, so the answer cannot move with the ask.
+    const ctx_default = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    const ctx_big_ask = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cap);
+    try t.expectEqual(ctx_default, ctx_big_ask);
+    try t.expect(ctx_default > 900_000); // a real context, not the floor
+
+    // The defect, both spellings: sizing against the granted budget...
+    const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
+    try t.expect(vs_granted <= 1024);
+    // ...and against the raw ask, which saturates usable to zero.
+    const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
+    try t.expect(vs_raw_ask <= 1024);
+    try t.expect(ctx_default > vs_granted * 500);
+}
+
+test "the clamp bills the context that will be SERVED, not the placeholder" {
+    // With a placeholder context the clamp hands back nearly the whole ask.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const static_ceiling: u64 = 120_000 * MiB;
+    const ask: u64 = 60 * 1024 * MiB;
+
+    const placeholder = planHotCache(&cfg, kv_bits, static_ceiling, active, 1024, 0, ask, 4096);
+    const real = planHotCache(&cfg, kv_bits, static_ceiling, active, 1_048_576, 0, ask, 4096);
+
+    try t.expect(placeholder.budget > 45_000 * MiB); // reproduces the live 48,673
+    // 13,056 KV + 5,376 state (one history copy + the f32 score bank).
+    try t.expectEqual(@as(u64, 1_048_576) * (13_056 + 5_376), real.ctx_kv);
+
+    // Both budgets are their headroom, so the whole difference is the session each billed.
+    try t.expectEqual(placeholder.budget - real.budget, real.ctx_kv - placeholder.ctx_kv);
+    try t.expect(real.budget < placeholder.budget);
+    try t.expect(placeholder.ctx_kv < 30 * MiB);
+    try t.expect(real.ctx_kv > 18_000 * MiB);
+    try t.expect(real.budget > 0);
+}
+
+test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live numbers" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `ssdFirstBudgetForLoad` short-circuits above `planHotCache`, so the floor-width reserve never ran on qwen4_exp.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    const orig_explicit = generate_mod.prefill_chunk_explicit;
+    defer generate_mod.prefill_chunk_explicit = orig_explicit;
+    generate_mod.prefill_chunk_explicit = false;
+
+    // The pure chunk resolver: `pinPrefillChunk` reads live memory.
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    try t.expect(perRequestPrefillChunkEnabled(&cfg));
+    const floor_w = clampReserveWidth(&cfg, chunk);
+    try t.expectEqual(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], floor_w);
+    try t.expect(floor_w < chunk);
+
+    const reserve_pinned = prefillTransientReserve(&cfg, kv_bits, chunk);
+    const reserve_floor = prefillTransientReserve(&cfg, kv_bits, floor_w);
+    try t.expect(reserve_floor < reserve_pinned);
+
+    const ctx_kv: u64 = (kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg)) *|
+        ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    const ask: u64 = 10 * 1024 * MiB;
+
+    // The idle allowance is the residual after the reserve, so the whole difference lands there.
+    const now = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_floor);
+    const before = ssdFirstPrefixCacheMem(ask, ceiling, active, ctx_kv, reserve_pinned);
+    try t.expect(now >= before);
+
+    // The RAM arm reserves the same floor for the same pack.
+    const plan = planHotCache(&cfg, kv_bits, ceiling, active, 1_048_576, sizerCtxKvBytes(&cfg, kv_bits), ask, chunk);
+    try t.expectEqual(floor_w, plan.reserve_chunk);
+    try t.expectEqual(reserve_floor, plan.reserve);
+
+    // The session the floor holds is the one the server advertises.
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| reserve_pinned, kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg), 0),
+        cfg.contextCap(),
+    );
+    try t.expectEqual(advertised, ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+}
+
+test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp takes the RAM arm" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `ssdFirstEnabled()` never checked that a tier exists, and `--prefix-cache-disk` is off by default.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+
+    const orig_disk = prefix_cache_disk_bytes;
+    defer prefix_cache_disk_bytes = orig_disk;
+    // `prefixCacheMemForLoad` publishes into a process global; put it back or a later test reads it.
+    defer clearResolvedPrefixCacheMem();
+    const orig_over = prefix_cache_mod.ssd_first_override;
+    defer prefix_cache_mod.ssd_first_override = orig_over;
+    prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
+    // The budget is a property of the machine; the test's machine is a 128 GB one, not the runner.
+    const orig_ceiling = static_ceiling_override;
+    defer static_ceiling_override = orig_ceiling;
+    static_ceiling_override = 109_395 * (1 << 20);
+
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    var dense = model_mod.ModelConfig{};
+    dense.model_type = "qwen3";
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    prefix_cache_mod.ssd_first_override = false;
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    prefix_cache_mod.ssd_first_override = true;
+
+    // The SSD arm floors at one session's KV, the RAM arm is a residual bounded by the ask.
+    const orig_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = orig_ctx;
+    server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
+    cfg.pinned_context = 0;
+    const ask: u64 = 4 * 1024 * 1024 * 1024;
+
+    prefix_cache_disk_bytes = 0;
+    var idle_off: u64 = 12345;
+    const ram_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_off);
+    try t.expectEqual(@as(u64, 0), idle_off);
+    try t.expect(ram_arm <= ask);
+
+    prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
+    var idle_on: u64 = 0;
+    const ssd_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_on);
+    try t.expect(ssd_arm > ask);
+    try t.expect(ssd_arm > ram_arm);
+    try t.expect(idle_on > 0 and idle_on <= ask);
+    try t.expect(ssd_arm -| idle_on > ask); // the one-session floor
+}
+
+test "an auto boot advertises the session the SSD-first budget floor was billed for" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The load-time bill and the pinned context must be one session: the SSD arm billed with
+    // `cache_reserve = 0` while `pinAutoContext` sized against `CTX_SIZING_CACHE_RESERVE`, so
+    // the floor held RAM for a larger session than the one advertised.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const ceiling: u64 = 109_395 * MiB;
+
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 0;
+
+    const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
+        cfg.prefillScoreHeadDim(),
+        cfg.num_attention_heads,
+        0,
+        cfg.has_sliding_window,
+        cfg.isMoe(),
+        cfg.pinned_prefill_chunk,
+    ));
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
+
+    const advertised = autoContextFrom(
+        safeContextForBudget(ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0),
+        cfg.contextCap(),
+    );
+    const billed = ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk);
+    try t.expectEqual(advertised, billed);
+
+    // Shown on a tighter box where the checkpoint cap does not bind.
+    const tight: u64 = active + 24_000 * MiB;
+    const billed_t = ssdFirstSessionTokensNow(&cfg, kv_bits, tight, active, chunk);
+    const old_billed = resolvedContextForLoad(0, 0, tight, active, 0, transient, per_tok, cfg.contextCap());
+    try t.expect(old_billed > billed_t);
+    try t.expect(billed > 500_000);
+    try t.expect(billed_t > 300_000);
+
+    const idle: u64 = 4 * 1024 * MiB;
+    const floor_now = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, billed_t), transient);
+    const floor_old = ssdFirstPrefixCacheMem(idle, tight, active, per_tok *| @as(u64, old_billed), transient);
+    try t.expect(floor_old > floor_now);
+    try t.expectEqual(per_tok *| @as(u64, old_billed - billed_t), floor_old - floor_now);
+}
+
+test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
+    // Live: the SSD-first budget billed the session at 22,464 MB with `--kv-quant 8` and with
+    // `off` alike (dense 29,952 B/tok): `defaultKvBits` asked `global_scheduler`, which `serve`
+    // assigns only after `Scheduler.init` performs the load.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const MiB: u64 = 1 << 20;
+    transformer_mod.qsa_history_share_override = true;
+    defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+    try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
+    try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
+
+    // An explicit `--ctx-size`, so the two numbers differ in the width and nothing else.
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 786_432;
+    const ceiling: u64 = 109_395 * MiB;
+    const active: u64 = 69_827 * MiB;
+    const chunk: u32 = cfg.pinned_prefill_chunk;
+
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+
+    // `--kv-quant 8`, no scheduler yet: the state the load runs in.
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
+    try t.expectEqual(
+        @as(u64, 13_824 * MiB),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
+    );
+
+    configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
+    try t.expectEqual(
+        @as(u64, 22_464 * MiB),
+        ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
+    );
+    configured_kv_quant = null;
+    try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
+
+    const idle: u64 = 10 * 1024 * MiB;
+    const transient: u64 = prefillTransientReserve(&cfg, 8, chunk);
+    const at8 = ssdFirstPrefixCacheMem(idle, ceiling, active, 13_824 * MiB, transient);
+    const at16 = ssdFirstPrefixCacheMem(idle, ceiling, active, 22_464 * MiB, transient);
+    try t.expectEqual(@as(u64, 8_640 * MiB), at16 -| at8);
+}
+
+test "an explicit --ctx-size boot never consults the session reserve" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `--ctx-size` wins in the resolver's first branch; asserted as invariance in the reserve.
+    const t = std.testing;
+    var cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+
+    server_config.max_context_size = 262_144;
+    cfg.pinned_context = 0;
+    for ([_]u64{ 0, 40_000 * MiB, 109_395 * MiB, 900_000 * MiB }) |ceiling| {
+        for ([_]u64{ 0, 69_827 * MiB }) |active| {
+            for ([_]u32{ 512, 1024, 4096, 8192 }) |chunk| {
+                try t.expectEqual(@as(u32, 262_144), ssdFirstSessionTokensNow(&cfg, kv_bits, ceiling, active, chunk));
+            }
+        }
+    }
+    for ([_]u64{ 0, CTX_SIZING_CACHE_RESERVE, 99_000 * MiB }) |reserve| {
+        try t.expectEqual(
+            @as(u32, 262_144),
+            resolvedContextForLoad(262_144, 0, 109_395 * MiB, 69_827 * MiB, reserve, 3 * 1024 * MiB, per_tok, cfg.contextCap()),
+        );
+    }
+
+    server_config.max_context_size = 0;
+    cfg.pinned_context = 131_072;
+    try t.expectEqual(@as(u32, 131_072), ssdFirstSessionTokensNow(&cfg, kv_bits, 109_395 * MiB, 69_827 * MiB, 4096));
+}
+
+test "an explicit --ctx-size keeps the load-time context byte-identical" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = 20_736;
+    try t.expectEqual(@as(u32, 1_048_576), resolvedContextForLoad(1_048_576, 0, 0, 0, 99_000 * MiB, 99_000 * MiB, per_tok, 262_144));
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(0, 262_144, 0, 0, 99_000 * MiB, 0, per_tok, 1_048_576));
+}
+
+test "clampReserveWidth: the load-time reserve is a promise to the FIRST request" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The ceiling inversion: same ask, `iogpu.wired_limit_mb 120000` got a 3.6x smaller cache
+    // because the wider rung's reserve grew faster than the headroom. Billing the ladder floor
+    // makes the budget monotone in the ceiling.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    const weights: u64 = 70 * GiB;
+    const ctx_tokens: u64 = 1_048_576;
+    const floor_rung = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
+
+    const low = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    const high = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(floor_rung, low.reserve_chunk);
+    try t.expectEqual(floor_rung, high.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, floor_rung), low.reserve);
+    // A bigger ceiling never buys a smaller cache.
+    try t.expect(high.budget >= low.budget);
+    try t.expect(low.chunk >= low.reserve_chunk);
+
+    var prev: u64 = 0;
+    var mb: u64 = 24_000;
+    while (mb <= 60_000) : (mb += 1_000) {
+        const p = planHotCache(&cfg, kv_bits, weights + mb * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+        try t.expect(p.budget >= prev);
+        prev = p.budget;
+    }
+
+    // An explicit --prefill-chunk is billed as-is.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
+    generate_mod.prefill_chunk_override = 8192;
+    generate_mod.prefill_chunk_explicit = false;
+    try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
+
+    // Gate off: the clamp reserves at the sizer's rung.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off = planHotCache(&cfg, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(off.chunk, off.reserve_chunk);
+    try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, off.chunk), off.reserve);
+    per_request_chunk_override = null;
+
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
+    try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
+}
+
+test "the per-token widths the request chooser is built on" {
+    // Pin the two constants every number in the story is derived from.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    try t.expectEqual(@as(u32, 12), cfg.attnCacheLayerCount());
+    try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
+    transformer_mod.qsa_history_share_override = true;
+    defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
+    try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+    try t.expectEqual(@as(u64, 18_432 * (1 << 20)), (13_056 + 5_376) * @as(u64, 1_048_576));
+}
+
+test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M session cannot" {
+    // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
+    // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const available: u64 = 28_909 * MiB;
+    const pin = cfg.pinned_prefill_chunk;
+
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expect(4096 > pin);
+
+    // The full 1M context fits at 2048 on this box under the one-copy history bill.
+    const full = chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0, .{});
+    try t.expectEqual(@as(u32, 2048), full);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 2048, .{}) <= available);
+    try t.expect(prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 4096, .{}) > available);
+
+    // A shorter prompt can afford at least as wide a forward.
+    var prev: u32 = 0;
+    var i: usize = 0;
+    const seqs = [_]u64{ 1_048_576, 384_000, 300_000, 60_000, 4096 };
+    while (i < seqs.len) : (i += 1) {
+        const w = chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0, .{});
+        try t.expect(w >= prev);
+        prev = w;
+    }
+}
+
+test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // "Widest that fits": priced at the exact bill of a width that width comes out; one byte
+    // under, a strictly narrower one (except at the floor). Walks the config's own ladder.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const pin = cfg.pinned_prefill_chunk;
+    const floor_width: u32 = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    var prev_width: u32 = 0;
+    var distinct: usize = 0;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        const width = widthForRung(&cfg, seq, rung);
+        if (width == prev_width) continue; // rungs 8192 and 4096 both forward at 4096
+        prev_width = width;
+        distinct += 1;
+        const bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, width, .{});
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0, .{}));
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0, .{});
+        if (width == floor_width) {
+            try t.expectEqual(floor_width, under);
+        } else {
+            try t.expect(under < width);
+        }
+    }
+    try t.expect(distinct >= 4);
+
+    // Nothing fits: the ladder floor, never 0 and never the load-time pin.
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+}
+
+test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const roomy: u64 = 200 * (@as(u64, 1) << 30);
+    const pin = cfg.pinned_prefill_chunk;
+
+    // An explicit `--prefill-chunk` wins outright and is billed as-is.
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}));
+    try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}));
+
+    // Kill switch: the load-time pin for every request.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    per_request_chunk_override = null;
+
+    // Another arch keeps the load-time pin exactly.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expect(cfg.perRequestPrefillChunk());
+}
+
+test "admission tries the ladder DOWN before refusing: a prompt that fits only at 512" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The probe used to price the load-time pin while the scheduler chose a per-request width,
+    // so a prompt that fit only at the floor was refused for a forward that never ran.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 384_000;
+    const pin = cfg.pinned_prefill_chunk;
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+    const pin_width = widthForRung(&cfg, seq, pin);
+
+    try t.expect(pin_width > floor_width);
+    const at_floor = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{});
+    const at_pin = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{});
+    try t.expect(at_floor < at_pin);
+
+    // Exactly enough for the floor width and not a byte more.
+    const available = at_floor;
+
+    try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{}) <= available);
+
+    // Gate off: the load-time pin does not fit.
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    try t.expectEqual(pin, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{}) > available);
+    per_request_chunk_override = null;
+
+    // An explicit `--prefill-chunk` keeps the refusal: the operator chose the width.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk(), .{});
+    try t.expectEqual(@as(u32, 4096), forced);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, forced, .{}) > available);
+}
+
+test "the post-eviction re-ask never exceeds what live memory affords, and never runs on an arch that has no per-request width" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The composition the scheduler runs: the chooser is asked before and after the eviction
+    // pass, and the second reading (live memory) runs.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 383_000;
+    const pin: u32 = 512;
+    const floor_width = widthForRung(&cfg, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]);
+
+    // Pre-eviction: nothing on the ladder fits, the chooser hands back the floor.
+    const admitted = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    try t.expectEqual(floor_width, admitted);
+
+    // Post-eviction, with the cache's bytes returned: a wider rung fits.
+    const roomy: u64 = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, widthForRung(&cfg, seq, 4096), .{});
+    const reasked = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expect(reasked > admitted);
+    try t.expectEqual(reasked, scheduler_mod.postEvictionPrefillChunk(admitted, reasked).width);
+
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(0, admitted).width);
+
+    // The reverse reading (memory moved between the asks) runs at the floor.
+    try t.expectEqual(admitted, scheduler_mod.postEvictionPrefillChunk(reasked, admitted).width);
+
+    // A non-qwen4 arch is untouched end to end.
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expectEqual(pin, other_pre);
+    try t.expectEqual(pin, other_post);
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(other_pre, other_post).width);
+
+    per_request_chunk_override = false;
+    defer per_request_chunk_override = null;
+    const off_pre = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const off_post = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    try t.expectEqual(pin, scheduler_mod.postEvictionPrefillChunk(off_pre, off_post).width);
+}
+
+test "admissionLogLevel: free on the first request after a load and at the edge, quiet in the middle" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+
+    // A fresh load is always free.
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 100 * GiB, true));
+
+    // Inside 10% of what is available.
+    try t.expectEqual(log.Level.info, admissionLogLevel(95 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(120 * GiB, 100 * GiB, false)); // already over
+    // The boundary itself: exactly 0.9 is quiet.
+    try t.expectEqual(log.Level.debug, admissionLogLevel(90 * GiB, 100 * GiB, false));
+    try t.expectEqual(log.Level.info, admissionLogLevel(90 * GiB + 1, 100 * GiB, false));
+
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1 * GiB, 100 * GiB, false));
+
+    try t.expectEqual(log.Level.info, admissionLogLevel(1 * GiB, 0, false));
+
+    try t.expectEqual(log.Level.info, admissionLogLevel(std.math.maxInt(u64), 1, false));
+    try t.expectEqual(log.Level.debug, admissionLogLevel(1, std.math.maxInt(u64), false));
+}
+
+test "admissionVerdict names the same three arms the guard acts on" {
+    const t = std.testing;
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 10, .available = 20 }));
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(.{ .needed = 20, .available = 20 }));
+    // Fits once the cache gives back what it can prove: `reclaimable`, never `evictable`.
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(.{ .needed = 30, .available = 20, .reclaimable = 10 }));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 30, .available = 20, .evictable = 1000, .reclaimable = 0 }));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(.{ .needed = 100, .available = 20, .reclaimable = 10 }));
+
+    try t.expectEqualStrings("admit", AdmissionVerdict.admit.name());
+    try t.expectEqualStrings("evict", AdmissionVerdict.evict.name());
+    try t.expectEqualStrings("refuse", AdmissionVerdict.refuse.name());
+}
+
+/// The largest context this model's per-token footprint fits into RAM right now, ignoring the checkpoint's own maximum.
 fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
-    //   KV cache: config.kvBytesPerToken() — the arch's own count of CACHING
-    //   layers and its own K/V widths, not a uniform layers × 2 × kv_heads ×
-    //   head_dim — billed at the width the ACTIVE kv-quant scheme stores, not
-    //   an unconditional fp16. A `--kv-quant 4` server otherwise reports (and
-    //   serves) under a third of the context it can actually hold.
-    const kv_bits: u64 = defaultKvBits();
-    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + config.qsaHistoryBytesPerToken();
+    //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
+    const kv_bits: u64 = defaultKvBits(config);
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) + statePerTokenBilled(config);
 
-    // `total_ctx = 0` asks boundedPrefillChunk for the UNSHRUNK cap: every
-    // branch that narrows the chunk does so for longer contexts, so this is the
-    // widest forward any prompt can run and therefore the honest reserve.
+    // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
     const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
@@ -2982,20 +4482,24 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     _ = mlx.mlx_get_active_memory(&active_mem);
 
     return safeContextForBudget(
-        // Real reachable ceiling, not the static device max — so auto-context
-        // shrinks when another process (e.g. a docker stack) holds unified
-        // memory, instead of oversubscribing into an uncatchable Metal OOM (#64).
-        currentGpuMemoryCeiling(active_mem),
+        // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
+        currentGpuMemoryCeiling(config, active_mem),
         active_mem,
-        // The hot prefix cache fills to this cap over a session, and a prefill
-        // has to land on top of whatever context we report — reserve both.
-        prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk),
+        // The hot prefix cache fills to this cap over a session, and a prefill has to land on
+        // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
+        // budget and not the ask: the ask starved the context, the resolved budget was a
+        // one-step loop. Gated: off the gate this is the raw ask, so `/v1/models` is unchanged.
+        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
-        // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
-        // cap AFTER the safety margin, so a model whose own max is the binding
-        // constraint keeps every token of it (see `autoContextFor`).
+        // 0 = do not clamp to the checkpoint's max here; the caller applies it after the margin.
         0,
     );
+}
+
+/// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
+/// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
+fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
 /// Pure memory model behind checkAttentionMemory. All quantities in bytes,
@@ -3063,7 +4567,96 @@ const PREFILL_RUNTIME_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 /// every 4th layer, so 4 layers' worth is what the peak holds.
 const MOE_PREFILL_COEXIST: u64 = 4;
 
-pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64) u64 {
+/// What a warm turn already holds. A RAM hot-cache restore hands the slot the entry's KV
+/// buffers without allocating another copy, so `available` is already net of them and
+/// billing them again refused a 786k warm turn whose own entry was resident. KV only: the
+/// QSA history is privatised on restore. Credited only while the prefix fits the destination
+/// capacity (a grow allocates a fresh buffer beside the protected entry).
+pub const WarmPrefix = struct {
+    /// Prompt rows the hot cache restored. 0 = cold.
+    matched_tokens: u64 = 0,
+    /// Tokens of capacity the restored buffers hold (`KVCache.residentCapacityTokens`). The
+    /// connection thread passes 0 and defers the warm decision to the inference thread.
+    capacity_tokens: u64 = 0,
+    /// Did the restore check out its entry (`prefix_cache.checkoutEligible`)? A shared restore
+    /// is copied whole by the first append, so crediting it is an under-bill.
+    will_donate: bool = false,
+
+    /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
+    /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
+    /// on nearly every turn. The grow's own cost is `reserved - credited` plus
+    /// `PrefillRequestTerms.grow_coexist_bytes`. `will_donate` gates the whole credit.
+    pub fn creditedRows(self: WarmPrefix, reserved: u64) u64 {
+        if (!self.will_donate) return 0;
+        if (self.matched_tokens == 0) return 0;
+        return @min(@min(self.matched_tokens, self.capacity_tokens), reserved);
+    }
+
+    /// Does this append grow the buffers at all? The per-layer grow fires on `offset + new_len
+    /// > capacity`; a reservation above the prompt allocates nothing by itself.
+    pub fn grows(self: WarmPrefix, seq: u64) bool {
+        if (!self.will_donate or self.matched_tokens == 0) return false;
+        return seq > self.capacity_tokens;
+    }
+};
+
+/// PURE: the most KV-caching layers that fall inside one window of `window` consecutive layers,
+/// i.e. how many old buffers can be alive at once at that eval cadence.
+fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u32 {
+    const n = config.num_hidden_layers;
+    if (window == 0 or n == 0) return 0;
+    if (window >= n) return config.attnCacheLayerCount();
+    var best: u32 = 0;
+    var start: u32 = 0;
+    while (start + window <= n) : (start += 1) {
+        var count: u32 = 0;
+        var i: u32 = start;
+        while (i < start + window) : (i += 1) {
+            if (!config.isLinearLayer(i)) count += 1;
+        }
+        if (count > best) best = count;
+    }
+    return @min(best, config.attnCacheLayerCount());
+}
+
+/// PURE: bytes of OLD KV buffer alive beside the new ones while a warm append grows the cache.
+/// `growQuantBuf` drops our reference to the old buffer at once, but the graph node holds it
+/// until it EVALUATES, so the coexistence window is the prefill loop's eval cadence rather than
+/// the size of the cache. A forward narrower than `prefillEvalCadenceApplies` runs one eval for
+/// the whole layer loop and therefore does pay the whole old cache.
+fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, kv_per_tok: u64) u64 {
+    if (!warm.grows(seq)) return 0;
+    const attn = config.attnCacheLayerCount();
+    if (attn == 0) return 0;
+    const span: u64 = seq -| warm.matched_tokens;
+    const window: u32 = if (transformer_mod.Transformer.prefillEvalCadenceApplies(@intCast(@min(span, 1 << 20))))
+        attnLayersPerEvalWindow(config, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS)
+    else
+        attn;
+    if (window == 0) return 0;
+    // The old buffer's own size, spread over the layers that cache.
+    return warm.capacity_tokens *| kv_per_tok / attn *| window;
+}
+
+/// Per-request bytes that scale with the prompt rather than the chunk.
+pub const PrefillRequestTerms = struct {
+    /// Cache capacity reserved at admission beyond `seq * kv_per_tok`: the generation headroom
+    /// plus a chunk of slack, so no buffer grows during the prefill (#353).
+    reserved_kv_bytes: u64 = 0,
+    /// Per-request state the arch keeps outside the KV cache (the qwen4_exp QSA indexer history), at its reserved size.
+    state_bytes: u64 = 0,
+    /// SSM checkpoints the prefill is still holding when it reaches its last chunk.
+    checkpoint_bytes: u64 = 0,
+    /// Bytes of the KV terms above already resident in the buffer the restore handed this slot
+    /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
+    shared_resident_bytes: u64 = 0,
+    /// Old KV buffers that coexist with the new ones while a warm append GROWS the cache.
+    /// Zero when nothing grows, when the restore was shared (the whole copy is billed
+    /// uncredited instead), and on every arch outside the gate.
+    grow_coexist_bytes: u64 = 0,
+};
+
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
@@ -3088,7 +4681,10 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
-    return (kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4;
+    const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
+        req.grow_coexist_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+    // The one place a warm turn's resident rows leave the bill, inside the 5/4.
+    return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
 
 /// deepseek_v4 sibling of `prefillMemoryNeeded`: bills what `extendState`
@@ -3199,66 +4795,753 @@ fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
 /// `lm` is the resolved model: an embedded-engine model skips this guard
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
-    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
-    const heads = config.num_attention_heads;
-    if (heads == 0) return true; // unknown architecture, skip check
+/// Per-token bytes of the arch's out-of-cache request state as billed: the QSA indexer history
+/// at the copies a live slot holds (one by default; two with `MLX_SERVE_QSA_HISTORY_SHARE=0`
+/// or `MLX_SERVE_KV_RESERVE=0`), plus the f32 block-score bank the two-copy slack used to
+/// hide. One helper because the auto-context sizer and the admission guard must agree.
+pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
+    const one = config.qsaHistoryBytesPerToken();
+    if (one == 0) return 0;
+    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
+    return one * copies + config.qsaScoreBankBytesPerToken();
+}
 
-    const seq: u64 = @intCast(prompt_len);
+/// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
+/// of slack); `KVCache.reserve_tokens` allocates it on the first grow so the prefill never
+/// runs a second grow. The guard and the allocator are the same number by construction.
+pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 {
+    return transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, ctx);
+}
+
+/// Bytes of SSM checkpoints a prefill is still holding at its last chunk (~1.9 GB on a 36-layer
+/// GDN trunk, billed at zero before #353). Mirrors the prefill loop's stride. `matched` is the
+/// restored prefix: a warm prefill captures only over `seq - matched` (the entry's own
+/// checkpoints are already resident and merged, never re-allocated).
+pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
+    const per_cp = config.ssmCheckpointBytes();
+    if (per_cp == 0 or ssm_checkpoint_stride == 0) return 0;
+    const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
+        ssm_checkpoint_stride,
+        @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
+    );
+    if (stride == 0) return 0;
+    // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
+    // snapshot, the only capture a warm append shorter than one stride makes.
+    const span: u64 = seq -| @min(matched, seq);
+    var n: u64 = seq / stride -| @min(matched, seq) / stride;
+    if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
+    if (ssm_checkpoint_max > 0) n = @min(n, ssm_checkpoint_max);
+    return n * per_cp;
+}
+
+/// The per-request terms of the admission bill, in one place.
+pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
+    // Arch gate for every term (all new, all measured on qwen4_exp alone; the reservation's
+    // allocator twin is gated too, so an ungated guard billed memory never reserved). `.{}` is
+    // the identity: `prefillMemoryNeeded` then reduces to the previous expression.
+    if (!config.longCtxGated()) return .{};
+    // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
+    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
+    // Only the headroom is new here: the prompt's own rows are already billed.
+    const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    // Rows the restore hands over without allocating another copy. KV only: the history is
+    // privatised on restore (`seedCapBuf`), so crediting it cancelled the one-copy bill outright.
+    const credited = warm.creditedRows(reserved);
+    return .{
+        .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
+        .state_bytes = reserved * statePerTokenBilled(config),
+        // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
+        .shared_resident_bytes = credited *| kv_per_tok,
+        .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
+    };
+}
+
+/// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
+/// failure the operator can act on. One helper for the three slot-drain sites.
+fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+    // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
+    if (slot.errorNameIs("PrefillDoesNotFit")) return error.PrefillDoesNotFit;
+    if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
+    return error.GenerationFailed;
+}
+
+/// The message `error.GenerationOutOfMemory` sends on every surface and both paths.
+const GEN_OOM_MSG = "The engine ran out of GPU memory during this request and it was abandoned. The server is still running. Reduce the prompt length, lower --ctx-size, or free memory on the machine.";
+
+/// The body of the pre-flight memory 400. Two arms: with the credits present the message
+/// quotes them; with them structurally zero (every arch outside `longCtxGated`) the previous
+/// sentence, which named no cache. The discriminator is the arch gate, not `bill.evictable`,
+/// so the qwen4_exp bytes stay exactly as they were. Caller owns the returned bytes.
+fn memoryRefusalMessage(
+    allocator: std.mem.Allocator,
+    prompt_len: usize,
+    needed_mb: u64,
+    avail_mb: u64,
+    bill: AdmissionBill,
+    carries_cache: bool,
+) ![]u8 {
+    if (!carries_cache) {
+        return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+    }
+    return std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB is available and the hot prefix cache holds ~{d}MB more, all of which can be reclaimed (~{d}MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.", .{ prompt_len, needed_mb, avail_mb, bill.evictable / (1024 * 1024), bill.evictionCredit() / (1024 * 1024) });
+}
+
+/// The message `error.PrefillDoesNotFit` sends: refused before its first forward by the same
+/// estimator the guard uses, re-asked after the hot cache gave back everything it could.
+const PREFILL_NOFIT_MSG = "This prompt does not fit in GPU memory even after freeing the prefix cache; it was refused before any work started. Reduce the prompt length, lower --ctx-size, or free memory on the machine (the server log quotes the byte counts it compared).";
+
+/// A generation failure as the wire sees it: one status, one message, both dialects' type.
+pub const GenErrorWire = struct {
+    status_line: []const u8,
+    code: u32,
+    openai_type: []const u8,
+    anthropic_type: []const u8,
+    message: []const u8,
+};
+
+/// The mapping from a failed generation to what the client is told. It existed only on the
+/// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
+/// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
+pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    return switch (err) {
+        // The MLX working-set latch (#353): a memory 503.
+        error.GenerationOutOfMemory, error.OutOfMemory => .{
+            .status_line = "503 Service Unavailable",
+            .code = 503,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = GEN_OOM_MSG,
+        },
+        // Refused before the first forward: the request is too large, a named 400.
+        error.PrefillDoesNotFit => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = PREFILL_NOFIT_MSG,
+        },
+        error.GenerationFailed => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = "generation failed",
+        },
+        else => .{
+            .status_line = "500 Internal Server Error",
+            .code = 500,
+            .openai_type = "server_error",
+            .anthropic_type = "api_error",
+            .message = std.fmt.bufPrint(buf, "Internal server error: {s}", .{@errorName(err)}) catch
+                "Internal server error",
+        },
+    };
+}
+
+/// The terminal SSE frame for the OpenAI dialects, with a `finish_reason: "error"` choice so a
+/// chunk-only client terminates.
+fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}]}}
+    ++ "\n\n", .{ esc, w.openai_type, w.code });
+}
+
+/// The `/v1/messages` terminal `error` event payload.
+fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+    , .{ w.anthropic_type, esc });
+}
+
+/// The `/v1/responses` terminal `error` event payload (`sendResponsesEvent` adds `sequence_number`).
+fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
+    const esc = try jsonEscape(allocator, w.message);
+    defer allocator.free(esc);
+    return std.fmt.allocPrint(allocator,
+        \\{{"type":"error","code":"{s}","message":{s},"param":null}}
+    , .{ w.openai_type, esc });
+}
+
+/// Which wire dialect a generative surface speaks its errors in.
+const ErrorSurface = union(enum) {
+    openai,
+    anthropic,
+    responses: *u64,
+};
+
+/// The error arm for every generative surface, streaming or not: before the SSE head the
+/// stream gets the same response its non-streaming twin would; past it the same `type` and
+/// `message` ride the surface's terminal `error` event.
+fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror, surface: ErrorSurface) !void {
+    var msg_buf: [192]u8 = undefined;
+    const w = mapGenerationError(err, &msg_buf);
+
+    if (!stream.sse_headers_sent) {
+        return switch (surface) {
+            .anthropic => sendAnthropicError(allocator, stream, w.anthropic_type, w.message, w.code),
+            else => sendErrorResponse(allocator, stream, w.status_line, w.openai_type, w.message, w.code),
+        };
+    }
+
+    switch (surface) {
+        .openai => {
+            const body = try buildOpenAiStreamError(allocator, w);
+            defer allocator.free(body);
+            try stream.writeAllNoFlush(body);
+            try stream.writeAll("data: [DONE]\n\n");
+        },
+        .anthropic => {
+            const body = try buildAnthropicStreamError(allocator, w);
+            defer allocator.free(body);
+            // Anthropic streams have no `[DONE]`; the `error` event is the terminator.
+            try sendAnthropicEvent(stream, "error", body);
+        },
+        .responses => |seq| {
+            const body = try buildResponsesStreamError(allocator, w);
+            defer allocator.free(body);
+            try sendResponsesEvent(allocator, stream, seq, "error", body);
+            // Same gate as the success path: no `[DONE]` over the WS bridge.
+            if (stream.ws_mode == null) try stream.writeAll("data: [DONE]\n\n");
+        },
+    }
+}
+
+/// The admission bill and the headroom it is compared against, so the connection thread's
+/// guard and the inference thread's evict-or-refuse decision cannot compute them differently.
+pub const AdmissionBill = struct {
+    needed: u64 = 0,
+    available: u64 = 0,
+    /// Bytes the hot prefix cache is holding. Reported in a refusal, never credited (see `reclaimable`).
+    evictable: u64 = 0,
+    /// The part of `evictable` an eviction can prove it will return: residency minus the
+    /// largest entry (a restore pins at most one).
+    reclaimable: u64 = 0,
+    /// The prefill width this bill was taken at, so a refusal can name it.
+    chunk: u64 = 0,
+
+    pub fn fits(self: AdmissionBill) bool {
+        return self.needed <= self.available;
+    }
+
+    /// The one credit the decision and both sentences read: `reclaimable`, never `evictable`
+    /// (a refusal once quoted the slot's own checked-out prefix as "evicted").
+    pub fn evictionCredit(self: AdmissionBill) u64 {
+        return self.reclaimable;
+    }
+
+    /// Fits once the cache has given back what it provably can. Credits `reclaimable`, not
+    /// `evictable`: a 383k prompt was admitted on one entry it then restored from and refused
+    /// after the eviction pass returned nothing.
+    pub fn fitsAfterEviction(self: AdmissionBill) bool {
+        return self.needed <= self.available +| self.evictionCredit();
+    }
+};
+
+test "a refusal names the credit it COMPARED, never the residency it cannot take" {
+    const t = std.testing;
+    const mb: u64 = 1024 * 1024;
+
+    // The live shape: the whole residency is the checked-out entry.
+    const pinned_only = AdmissionBill{
+        .needed = 13_664 * mb,
+        .available = 13_374 * mb,
+        .evictable = 7_802 * mb,
+        .reclaimable = 0,
+        .chunk = 512,
+    };
+    try t.expectEqual(@as(u64, 0), pinned_only.evictionCredit());
+    try t.expectEqual(7_802 * mb, pinnedResidentBytes(pinned_only));
+    try t.expect(!pinned_only.fits());
+    try t.expect(!pinned_only.fitsAfterEviction());
+    try t.expectEqual(
+        pinned_only.needed <= pinned_only.available +| pinned_only.evictionCredit(),
+        pinned_only.fitsAfterEviction(),
+    );
+
+    // The same residency, genuinely reclaimable: the credit is real and the request is admitted to evict.
+    var reclaimable = pinned_only;
+    reclaimable.reclaimable = 7_802 * mb;
+    try t.expectEqual(7_802 * mb, reclaimable.evictionCredit());
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(reclaimable));
+    try t.expect(reclaimable.fitsAfterEviction());
+}
+
+/// Everything the admission guard bills for one request at one prefill width, so the
+/// per-request chunk chooser prices a rung with the same function that admits it. `chunk` is
+/// the width the forward will run, already through `generate.effectivePrefillChunk`.
+pub fn prefillNeededAtChunk(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    chunk: u64,
+    warm: WarmPrefix,
+) u64 {
+    // deepseek_v4 gets its own estimator: it sub-chunks prefill internally and its state is module-owned f32.
+    const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
+    const heads: u64 = config.num_attention_heads;
     const layers: u64 = config.num_hidden_layers;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
+    if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
+    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
+        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+}
 
-    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
-        (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
+/// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
+pub var per_request_chunk_override: ?bool = null;
+
+/// The arch capability AND the kill switch (`MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0` restores the load-time pin).
+pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
+    if (!config.perRequestPrefillChunk()) return false;
+    if (per_request_chunk_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_PER_REQUEST") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// The widest ladder rung this request can afford, priced by the same estimator that admits
+/// it against post-eviction memory. Candidates are priced at the width the forward will run
+/// (`effectivePrefillChunk` caps by arch), and the width is returned, not the rung. An explicit
+/// `--prefill-chunk` wins outright; nothing fitting means the ladder floor.
+pub fn chooseRequestPrefillChunk(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    available: u64,
+    load_time_pin: u32,
+    chunk_override: u32,
+    warm: WarmPrefix,
+) u32 {
+    // The arch gate first: an ungated arch's answer is the load-time pin, as before.
+    if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
+    if (chunk_override > 0) return chunk_override;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
+        const width: u64 = @min(
+            @as(u64, generate_mod.effectivePrefillChunk(
+                config.prefillScoreHeadDim(),
+                config.num_attention_heads,
+                @intCast(seq),
+                config.has_sliding_window,
+                config.isMoe(),
+                rung,
+            )),
+            @as(u64, std.math.maxInt(u32)),
+        );
+        if (prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm) <= available) return @intCast(width);
+    }
+    return @intCast(generate_mod.effectivePrefillChunk(
+        config.prefillScoreHeadDim(),
+        config.num_attention_heads,
+        @intCast(seq),
+        config.has_sliding_window,
+        config.isMoe(),
+        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
+    ));
+}
+
+/// Impure wrapper the scheduler reaches through `prefill_request_chunk`, mirroring
+/// `prefillFitsNow`'s inputs. Reads live memory, so it must run after the eviction pass.
+pub fn requestPrefillChunkNow(
+    config: *const model_mod.ModelConfig,
+    prompt_len: usize,
+    max_tokens: u32,
+    kv_cfg: transformer_mod.KVQuantConfig,
+    unchunked_prefill: bool,
+    warm_matched: u64,
+    warm_capacity: u64,
+    warm_will_donate: bool,
+) u32 {
+    const pin: u32 = config.pinned_prefill_chunk;
+    const explicit: u32 = explicitPrefillChunk();
+    if (explicit > 0) return explicit;
+    // The vision kill switch forwards the whole prompt; there is no chunk to choose.
+    if (unchunked_prefill) return pin;
+    if (!perRequestPrefillChunkEnabled(config)) return pin;
+
+    const seq: u64 = @intCast(prompt_len);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const available: u64 = currentGpuMemoryCeiling(config, active_mem) -| active_mem;
+    const warm = WarmPrefix{ .matched_tokens = warm_matched, .capacity_tokens = warm_capacity, .will_donate = warm_will_donate };
+    const chosen = chooseRequestPrefillChunk(config, seq, max_tokens, kv_bits, available, pin, 0, warm);
+    if (chosen != pin) {
+        const width: u64 = chosen;
+        const terms = prefillRequestTerms(config, seq, max_tokens, kv_bits, width, warm);
+        const kv_bytes: u64 = seq *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| terms.reserved_kv_bytes;
+        log.debug("[prefill] chunk {d} for this request (reserve {d} MB beside KV {d} MB)\n", .{ width, prefillTransientReserve(config, kv_bits, width) >> 20, kv_bytes >> 20 });
+    }
+    return chosen;
+}
+
+/// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
+pub var adaptive_chunk_override: ?bool = null;
+
+/// The per-chunk adaptive width: subordinate to the per-request gate, plus
+/// `MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
+pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
+    // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
+    if (!config.perRequestPrefillChunk()) return false;
+    if (explicitPrefillChunk() > 0) return false;
+    if (generate_mod.envPrefillChunk() > 0) return false;
+    if (!perRequestPrefillChunkEnabled(config)) return false;
+    if (adaptive_chunk_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// Consecutive supporting probes a widening needs: the probe is taken after `mlx_clear_cache`
+/// and never contains a chunk's own peak, so the second reading pays for that blind spot.
+pub const PREFILL_WIDEN_PROBES: u8 = 2;
+
+/// What one chunk of `width` costs beyond what is already resident: its transient envelope
+/// plus the per-token state the chunk is about to write. The growth term is billed even under
+/// the default reservation (`MLX_SERVE_KV_RESERVE=0` and short prompts do grow per chunk).
+pub fn prefillChunkCost(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    width: u64,
+    kv_len: u64,
+) u64 {
+    const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +|
+        statePerTokenBilled(config);
+    return prefillTransientReserveAtKv(config, kv_bits, width, kv_len) +| (width *| per_tok);
+}
+
+/// The width the next chunk runs at. Asymmetric because a Metal abort is uncatchable: HOLD
+/// while `headroom >= cost(current)` (the estimator carries its own 5/4); STEP DOWN at once,
+/// by as many rungs as it takes, floored at `PREFILL_CHUNK_FLOOR`; WIDEN one rung only at
+/// 1.25x its cost, after `PREFILL_WIDEN_PROBES` supporting probes, up to `cap`, never after a
+/// step-down. `cap` is the widest width this arch forwards for this prompt, not a raw rung.
+pub fn adaptivePrefillWidth(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    kv_len: u64,
+    headroom: u64,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+) u32 {
+    if (cap == 0 or current == 0) return current;
+    const floor: u32 = @min(cap, @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+
+    if (prefillChunkCost(config, kv_bits, current, kv_len) > headroom) {
+        st.supporting = 0;
+        st.ratcheted = true;
+        var best: u32 = floor;
+        for (PREFILL_CHUNK_LADDER) |rung| {
+            const w: u32 = @min(rung, cap);
+            if (w >= current) continue;
+            if (prefillChunkCost(config, kv_bits, w, kv_len) <= headroom) {
+                best = w;
+                break;
+            }
+        }
+        return @min(best, current);
+    }
+
+    var next: u32 = 0;
+    for (PREFILL_CHUNK_LADDER) |rung| {
+        const w: u32 = @min(rung, cap);
+        if (w > current and (next == 0 or w < next)) next = w;
+    }
+    if (next == 0 or st.ratcheted) {
+        st.supporting = 0;
+        return current;
+    }
+    const asked: u64 = prefillChunkCost(config, kv_bits, next, kv_len) *| 5 / 4;
+    if (asked > headroom) {
+        st.supporting = 0;
+        return current;
+    }
+    st.supporting +|= 1;
+    if (st.supporting < PREFILL_WIDEN_PROBES) return current;
+    st.supporting = 0;
+    return next;
+}
+
+/// The live headroom one prefill chunk has to fit in: the GPU ceiling less what MLX's
+/// allocator holds, read once per chunk boundary after its `mlx_clear_cache`. The same
+/// expression `prefillAdmissionBill` compares against.
+pub fn prefillHeadroomNow(config: *const model_mod.ModelConfig, staged_host: u64) u64 {
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    // The SSD write-through stages chunk blobs as host bytes behind a ~1 GiB permit that
+    // `mlx_get_active_memory` does not count; on unified memory they are the same pool. Read at
+    // the hook site (inference thread) and passed in.
+    return prefillHeadroomFrom(currentGpuMemoryCeiling(config, active_mem), active_mem, staged_host);
+}
+
+/// Pure half of `prefillHeadroomNow`.
+pub fn prefillHeadroomFrom(ceiling: u64, active: u64, staged_host: u64) u64 {
+    return ceiling -| active -| staged_host;
+}
+
+/// Does a widen the pre-tick probe chose still fit after the interleave tick allocated for
+/// co-tenant slots? Same 1.25 bar, same estimator, same live KV.
+pub fn adaptivePrefillWidenStillFits(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    pos: usize,
+    want: u32,
+    staged_host: u64,
+) bool {
+    if (!adaptivePrefillChunkEnabled(config)) return false;
+    const headroom = prefillHeadroomNow(config, staged_host);
+    const asked: u64 = prefillChunkCost(config, kv_bits, want, pos) *| 5 / 4;
+    if (asked <= headroom) return true;
+    log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
+        want,
+        pos,
+        headroom >> 20,
+        asked >> 20,
+    });
+    return false;
+}
+
+/// Impure wrapper the prefill loop reaches through `generate.prefill_chunk_adapt`. Logs one
+/// line per change, never per boundary (the bench harness greps it).
+pub fn adaptivePrefillWidthNow(
+    config: *const model_mod.ModelConfig,
+    kv_bits: u64,
+    pos: usize,
+    current: u32,
+    cap: u32,
+    st: *generate_mod.AdaptiveWidthState,
+    staged_host: u64,
+) u32 {
+    if (!adaptivePrefillChunkEnabled(config)) return current;
+    const headroom = prefillHeadroomNow(config, staged_host);
+    // `pos` is the live KV this chunk will attend to (see `prefillTransientReserveAtKv`).
+    const next = adaptivePrefillWidth(config, kv_bits, pos, headroom, current, cap, st);
+    if (next != current) {
+        // Quote the number it compared: `prefillChunkCost` at this KV.
+        log.info("[prefill] width {d} -> {d} at pos {d} (headroom {d} MB, cost {d} MB)\n", .{
+            current,
+            next,
+            pos,
+            headroom >> 20,
+            prefillChunkCost(config, kv_bits, next, pos) >> 20,
+        });
+    }
+    return next;
+}
+
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+    const heads = config.num_attention_heads;
+    if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
+    const seq: u64 = @intCast(prompt_len);
+
+    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse configuredKvQuantFor(config);
+    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
+    // Available = the lesser of Metal's static working-set max and what is physically reachable
+    // now (#64). Read before the width is chosen: on a per-request arch the width is a function of it.
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
+    const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+
     // A vision prefill chunks like text since issue #197 (the splice resumes
     // its row index across chunks), so it bills the chunk-bounded envelope —
     // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
     // whole-prompt forward, in which case `unchunked_prefill` bills the real
     // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
     // so the guard and the prefill loop cannot disagree.
+    //
+    // Otherwise the width comes from `chooseRequestPrefillChunk`, the same rule the scheduler
+    // pins with. An ungated arch (or an explicit `--prefill-chunk`) gets the load-time pin.
+    const chosen: u32 = if (unchunked_prefill) 0 else chooseRequestPrefillChunk(
+        config,
+        seq,
+        max_tokens,
+        kv_bits,
+        available,
+        config.pinned_prefill_chunk,
+        explicitPrefillChunk(),
+        warm,
+    );
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.pinned_prefill_chunk));
-    // deepseek_v4 gets its own estimator: the arch sub-chunks prefill
-    // internally and its state/transients are module-owned f32, so the
-    // generic bill misses in BOTH directions (over on the chunk term, under
-    // on the gather). Detection mirrors prefillAttnKeys: declared ratios or
-    // stay generic.
-    const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
+        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
-    // allocate another copy of the cached buffers. `active_mem` below already
+    // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
     // destination KV capacity that may be allocated when the restored cache
     // grows. Adding the resident entry here again would invent a third copy
     // and reject long warm prompts (and even cache misses) spuriously.
-    const needed: u64 = if (is_dsv4)
-        dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))
+    const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk, warm);
+    // Published number, never the pointer: `hot_prefix_cache` is inference-thread state, freed
+    // on every model switch. Stale by at most one entry, which is all a hint has to be.
+    const evictable: u64 = if (global_scheduler) |sch|
+        sch.resident_hot_cache_bytes.load(.monotonic)
     else
-        prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config)) +
-            qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
-            seq * config.qsaHistoryBytesPerToken();
+        0;
+    // Prompt-aware when the caller has the ids: an entry this prompt could not restore from is
+    // genuinely evictable. Still a published snapshot, never the cache pointer.
+    const reclaimable: u64 = if (global_scheduler) |sch|
+        if (prompt_tokens) |toks|
+            scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
+        else
+            sch.reclaimable_hot_cache_bytes.load(.monotonic)
+    else
+        0;
+    // Arch gate for the whole evict-to-admit half: both admit arms are driven entirely by the
+    // two credits, so zeroing them restores the previous single `needed > available` refusal.
+    // Off the gated arch an admit that then dies mid-prefill is worse than a clean 400. The
+    // publishers stay on every arch (the guard used to dereference `hot_prefix_cache`).
+    if (!config.longCtxGated()) {
+        return .{ .needed = needed, .available = available, .chunk = chunk };
+    }
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk };
+}
 
-    // Available = GPU allocation ceiling minus current usage (model weights,
-    // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
-    // working-set max and what's physically reachable now (currentGpuMemoryCeiling)
-    // so the two prefill guards agree AND both see external memory pressure — a
-    // docker stack holding tens of GB otherwise leaves this guard admitting a
-    // prefill that OOMs the command buffer (#64).
-    var active_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
-    const available = if (total_limit > active_mem) total_limit - active_mem else 0;
+/// Bytes of the resident hot cache this prompt pins: residency less what an eviction can prove
+/// it will return. Non-zero means an entry this prompt would restore from is holding memory
+/// that neither goes back nor has to be allocated again; the connection thread cannot price
+/// how much, so it defers to the inference thread's `WarmPrefix` bill.
+pub fn pinnedResidentBytes(bill: AdmissionBill) u64 {
+    return bill.evictable -| bill.evictionCredit();
+}
 
+/// What the admission guard decided, from one bill so the log line and the arm agree: fits
+/// outright, fits once the hot cache gives back what it provably can, or does not fit.
+pub const AdmissionVerdict = enum {
+    admit,
+    evict,
+    refuse,
+
+    pub fn name(self: AdmissionVerdict) []const u8 {
+        return switch (self) {
+            .admit => "admit",
+            .evict => "evict",
+            .refuse => "refuse",
+        };
+    }
+};
+
+pub fn admissionVerdict(bill: AdmissionBill) AdmissionVerdict {
+    if (bill.fits()) return .admit;
+    if (bill.fitsAfterEviction()) return .evict;
+    return .refuse;
+}
+
+/// The generation of `markReadyLocked` the last info-level admission line was emitted for.
+var admission_logged_generation = std.atomic.Value(u64).init(std.math.maxInt(u64));
+
+/// Has a model become resident since the last time this returned true? Consuming, so N racing connection threads produce one line.
+fn firstRequestAfterLoad() bool {
+    const gen = model_registry_mod.load_generation.load(.monotonic);
+    const last = admission_logged_generation.load(.monotonic);
+    if (gen == last) return false;
+    return admission_logged_generation.cmpxchgStrong(last, gen, .monotonic, .monotonic) == null;
+}
+
+/// The level one admission line is emitted at: info on the first request after a load and
+/// whenever the bill is within 10% of what is available; debug otherwise.
+pub fn admissionLogLevel(needed: u64, available: u64, first_after_load: bool) log.Level {
+    if (first_after_load) return .info;
+    // `needed > 0.9 * available` without floating point or overflow.
+    if (needed *| 10 > available *| 9) return .info;
+    return .debug;
+}
+
+/// One line per request at the admission decision, on admitted requests too. Every field comes
+/// off the same `bill` the arms act on. The level check runs first.
+fn logAdmissionDecision(bill: AdmissionBill) void {
+    // `info` is the loudest level this line is emitted at, and `firstRequestAfterLoad` consumes its token.
+    if (!log.enabled(.info)) return;
+    const level = admissionLogLevel(bill.needed, bill.available, firstRequestAfterLoad());
+    if (!log.enabled(level)) return;
+    const mb = 1024 * 1024;
+    log.atLevel(level, "[admission] needed={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
+        bill.needed / mb,
+        bill.available / mb,
+        bill.evictionCredit() / mb,
+        bill.chunk,
+        admissionVerdict(bill).name(),
+    });
+}
+
+/// Inference-thread predicate behind the scheduler's admission hook: does this request fit
+/// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
+/// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) bool {
+    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+        .matched_tokens = warm_matched,
+        .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
+    }).fits();
+}
+
+/// The inference thread's refusal, quoting the numbers it compared.
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool) void {
+    // The same warm inputs the probe was refused on, the checkout decision included.
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+        .matched_tokens = warm_matched,
+        .capacity_tokens = warm_capacity,
+        .will_donate = warm_will_donate,
+    });
+    const mb = 1024 * 1024;
+    // "Narrowest width tried" is only true where the ladder was walked.
+    const width_note: []const u8 = if (perRequestPrefillChunkEnabled(config)) "the narrowest width tried" else "the pinned width";
+    // The comparison first (`fitsAfterEviction` spelled out), then the residency as context, with
+    // the part eviction cannot take named.
+    log.warn("  prompt {d} tokens needs ~{d}MB at prefill chunk {d} ({s}), ~{d}MB available + ~{d}MB the hot cache can give back (~{d}MB resident, ~{d}MB of it pinned by this request's own prefix) — refused before prefill\n", .{
+        prompt_len,
+        bill.needed / mb,
+        bill.chunk,
+        width_note,
+        bill.available / mb,
+        bill.evictionCredit() / mb,
+        bill.evictable / mb,
+        pinnedResidentBytes(bill) / mb,
+    });
+}
+
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool) !bool {
+    const prompt_len: usize = prompt_ids.len;
+    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
+    if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
+    // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{});
+    logAdmissionDecision(bill);
+    const needed = bill.needed;
+    const available = bill.available;
+    // Evict to admit (#353): when the bill only fails because the cache is holding memory, admit;
+    // the inference thread evicts LRU entries until it fits and refuses by name only if it still does not.
+    if (needed > available and bill.fitsAfterEviction()) {
+        log.info("  prompt {d} tokens needs ~{d}MB, ~{d}MB available + ~{d}MB reclaimable hot cache (of ~{d}MB resident) — admitting, the prefill will evict\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024),
+        });
+        return true;
+    }
+    // Warm deferral. The bill above is cold; a non-zero `pinnedResidentBytes` means an entry
+    // this prompt would restore from is holding bytes that will neither be allocated nor
+    // reclaimed. How many is knowable only on the inference thread, which bills with `WarmPrefix`.
+    if (needed > available and pinnedResidentBytes(bill) > 0) {
+        log.info("  prompt {d} tokens needs ~{d}MB cold, ~{d}MB available, and ~{d}MB of hot cache is a prefix this prompt would SHARE — deferring to the prefill, which bills the warm request\n", .{
+            prompt_len, needed / (1024 * 1024), available / (1024 * 1024), pinnedResidentBytes(bill) / (1024 * 1024),
+        });
+        return true;
+    }
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
-        const msg = try std.fmt.allocPrint(allocator, "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
+        // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
+        // is evictable here by construction (the withheld case took the deferral arm). The cache
+        // clause is only true where the bill carries the cache; `memoryRefusalMessage` is the one formatter.
+        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill, config.longCtxGated());
         defer allocator.free(msg);
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
@@ -3296,8 +5579,11 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     const prompt: u32 = @intCast(@min(prompt_len, effective_ctx));
     if (prompt >= effective_ctx) return 1; // at least 1 token
     const remaining = effective_ctx - prompt;
-    if (remaining < max_tokens / 4) {
+    if (maxTokensBudgetSqueezed(max_tokens, remaining)) {
         log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
+    } else if (max_tokens == AUTO_MAX_TOKENS_SENTINEL and autoBudgetWindowTight(remaining, effective_ctx)) {
+        // The client named no budget, so this is context, not a deviation: debug.
+        log.debug("  generation budget squeezed: {d} of the window remain (auto budget; prompt={d}, ctx={d})\n", .{ remaining, prompt, effective_ctx });
     }
     if (max_tokens > remaining) {
         log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d})\n", .{ max_tokens, remaining, effective_ctx, prompt });
@@ -3577,7 +5863,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -3604,6 +5890,7 @@ fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
+            configuredKvQuantFor(config).wireName(),
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
@@ -3801,8 +6088,10 @@ fn handleModels(
         }
     }
 
-    // Discovered LAN models ride the same list for local clients.
+    // Discovered LAN models and configured providers ride the same list for
+    // local clients; neither is re-exported to the LAN.
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
+    if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
 
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
@@ -3891,15 +6180,17 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     // mirrored entry so client flows (load → generate → unload) work
     // unchanged on network models. Unknown peer/model falls through to
     // ensureLoaded's honest 404.
-    if (g_lan) |l| if (lan_mod.splitRemoteId(requested_id) != null) {
-        if (l.remoteEntryFor(allocator, requested_id)) |entry| {
+    if (lan_mod.splitRemoteId(requested_id) != null) {
+        const remote_entry: ?[]u8 = if (g_providers) |p| p.entryFor(allocator, requested_id) else null;
+        const entry_opt = remote_entry orelse if (g_lan) |l| l.remoteEntryFor(allocator, requested_id) else null;
+        if (entry_opt) |entry| {
             defer allocator.free(entry);
             const body = try std.fmt.allocPrint(allocator, "{{\"model\":{s}}}", .{entry});
             defer allocator.free(body);
             try sendResponse(stream, "200 OK", "application/json", body);
             return;
         }
-    };
+    }
     // Register-by-path: an absolute path to a model directory OUTSIDE the
     // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
     // The dir is validated exactly like discovery (config.json, supported
@@ -4128,12 +6419,14 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
     if (std.mem.startsWith(u8, requested_id, "/")) {
         var trimmed = requested_id;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        requested_id = std.fs.path.basename(trimmed);
+        // A discovered entry is keyed `org/name`, so the path is the only exact handle.
+        const by_path = if (global_registry) |r| r.peekByPath(trimmed) else null;
+        requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
     }
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
     // the load-model no-op (the peer's owner controls its memory).
-    if (g_lan != null and lan_mod.splitRemoteId(requested_id) != null and
+    if ((g_lan != null or g_providers != null) and lan_mod.splitRemoteId(requested_id) != null and
         (global_registry == null or global_registry.?.peek(requested_id) == null))
     {
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
@@ -4187,7 +6480,9 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
-    ane_json: []const u8,
+    /// Leading-comma JSON fragments spliced before the root close (the ANE
+    /// object, the qwen4 n-gram warm object). Concatenated by the handler.
+    extra_json: []const u8,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
@@ -4209,8 +6504,14 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
-        ane_json,
+        extra_json,
     });
+}
+
+/// The /props "ngram_warm" object; absent when no table is warming.
+fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
+    if (total == 0) return allocator.dupe(u8, "");
+    return std.fmt.allocPrint(allocator, ",\"ngram_warm\":{{\"bytes\":{d},\"total\":{d}}}", .{ bytes, total });
 }
 
 /// The /props "ane" object (A8): mode, coverage, geometry and the int8
@@ -4306,7 +6607,14 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     };
     defer allocator.free(ane_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, ane_json);
+    // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
+    // whenever no table is warming, so the object is absent off qwen4_exp.
+    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
+    defer allocator.free(ngram_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ane_json, ngram_json });
+    defer allocator.free(extra_json);
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -5521,17 +7829,32 @@ fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort,
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
 
-/// A grammar mask constrains from token 0 — it cannot express "think first,
-/// then JSON", so a schema request is a content-only contract and thinking is
-/// enforced OFF in the prompt (the noThinkTailSuffix machinery). Without this
-/// the mask pushes the JSON into the template's open think block and `content`
-/// ships EMPTY (live: qwen3.5 effort high + schema on /v1/messages; issue #331
-/// re-found the same hole on /v1/chat/completions and /v1/responses). Tools
-/// present = no mask (every surface skips it so tool calls stay reachable),
-/// so thinking stays whatever the request resolved. Every surface that builds
-/// a grammar mask consults this — the source scan pins the pairing.
-fn schemaMasksThinking(has_schema: bool, has_tools: bool) bool {
-    return has_schema and !has_tools;
+const SchemaThinkingPolicy = enum {
+    no_mask,
+    token_zero,
+    deferred,
+    fallback_thinking_off,
+};
+
+/// A schema grammar is safe with thinking only when generation starts in the
+/// one reasoning protocol this change can close: a bare template-opened
+/// `<think>` with an atomic `</think>` token. Every other masked surface keeps
+/// the upstream thinking-off safety net. A finite response-side reasoning
+/// budget also keeps that fallback because it can end the visible think block
+/// before generation reaches the grammar boundary. Tools still skip the mask.
+fn schemaMasksThinking(
+    has_schema: bool,
+    has_tools: bool,
+    enable_thinking: bool,
+    has_finite_reasoning_budget: bool,
+    prompt_opens_bare_think: bool,
+    close_token: ?u32,
+) SchemaThinkingPolicy {
+    if (!has_schema or has_tools) return .no_mask;
+    if (!enable_thinking) return .token_zero;
+    if (has_finite_reasoning_budget) return .fallback_thinking_off;
+    if (prompt_opens_bare_think and close_token != null) return .deferred;
+    return .fallback_thinking_off;
 }
 
 /// `continue_final_message`: extend the trailing assistant message instead of
@@ -5607,6 +7930,52 @@ fn joinedTextParts(allocator: std.mem.Allocator, parts: []const std.json.Value) 
     }
     if (n <= 1) return .{ .text = single, .owned = false };
     return .{ .text = try buf.toOwnedSlice(allocator), .owned = true };
+}
+
+/// Workload key for hot-cache eviction (#378): `prompt_cache_key` (OpenAI's own
+/// routing field) > `metadata.user_id` (Anthropic; Claude Code sends its session
+/// id) > the system prompt (OpenAI `messages[0]`, Anthropic `system`, Responses
+/// `instructions`) > 0 = anonymous. Text parts hash in order like `joinedTextParts`.
+fn requestCacheKey(root: std.json.ObjectMap) u64 {
+    if (root.get("prompt_cache_key")) |v| if (v == .string and v.string.len > 0)
+        return std.hash.Wyhash.hash(1, v.string);
+    if (root.get("metadata")) |mv| if (mv == .object) {
+        if (mv.object.get("user_id")) |v| if (v == .string and v.string.len > 0)
+            return std.hash.Wyhash.hash(2, v.string);
+    };
+    if (root.get("messages")) |mv| if (mv == .array and mv.array.items.len > 0) {
+        const first = mv.array.items[0];
+        if (first == .object) if (first.object.get("role")) |r| if (r == .string and std.mem.eql(u8, chat_mod.canonicalRole(r.string), "system")) {
+            if (first.object.get("content")) |c| return hashTextValue(c) orelse 0;
+        };
+    };
+    if (root.get("system")) |v| return hashTextValue(v) orelse 0;
+    if (root.get("instructions")) |v| return hashTextValue(v) orelse 0;
+    return 0;
+}
+
+fn hashTextValue(v: std.json.Value) ?u64 {
+    var h = std.hash.Wyhash.init(3);
+    var n: usize = 0;
+    switch (v) {
+        .string => |t| {
+            if (t.len == 0) return null;
+            h.update(t);
+            n = 1;
+        },
+        .array => |parts| for (parts.items) |part| {
+            if (part != .object) continue;
+            const ptype = part.object.get("type") orelse continue;
+            if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
+            const tv = part.object.get("text") orelse continue;
+            if (tv != .string or tv.string.len == 0) continue;
+            if (n > 0) h.update("\n");
+            h.update(tv.string);
+            n += 1;
+        },
+        else => {},
+    }
+    return if (n == 0) null else h.final();
 }
 
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
@@ -5827,7 +8196,7 @@ fn handleChatCompletions(
         if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !wire_presence.any() and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
-            .role = role_val.string,
+            .role = chat_mod.canonicalRole(role_val.string),
             .content = content,
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
@@ -5846,10 +8215,13 @@ fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → auto (peg to remaining context).
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = resolveRequestMaxTokens(
-        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
+    // For the request log line only: which of the three sources this came from.
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -5867,10 +8239,7 @@ fn handleChatCompletions(
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Parse logprobs: "logprobs": true, "top_logprobs": N (0-20)
     const logprobs_n: u32 = blk: {
@@ -6042,13 +8411,12 @@ fn handleChatCompletions(
     // the ones whose vendor documents thinking-on).
     const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
-    if (schemaMasksThinking(grammar_schema_val != null, has_tools)) enable_thinking = false;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
     const effort_budget: i32 = if (effort_cfg) |e| e.budget else server_config.default_reasoning_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
-        .integer => |i| @intCast(i),
+        .integer => |i| clampJsonI32(i),
         else => effort_budget,
     } else effort_budget;
 
@@ -6122,13 +8490,14 @@ fn handleChatCompletions(
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
     // sidecar only loads when it binds to this trunk; MoE mirrors the
-    // drafter caution). Priority MTP > drafter > PLD at dispatch. NOT
+    // drafter caution). Priority DFlash > MTP > gemma drafter > PLD at
+    // dispatch (`requestSpecModes`). NOT
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -6161,9 +8530,6 @@ fn handleChatCompletions(
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
 
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
-    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
-
     // Format chat template. ds4-backed models render through the engine's
     // built-in template/tokenizer; the MLX path renders via Jinja and
     // tokenizes through the loaded BPE tokenizer. Both paths now thread
@@ -6189,13 +8555,39 @@ fn handleChatCompletions(
     const active_media = activeTurnMediaMessage(messages.items, continue_final);
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null, continue_final);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = grammar_schema_val != null and !has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        grammar_schema_val != null,
+        has_tools,
+        enable_thinking,
+        reasoning_budget >= 0,
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, false, if (effort_cfg) |e| e.effort else null, continue_final);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
+    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Run vision encoder if any messages contain images. Phase A8: each
     // request owns its embedding locally; we hand it off to the slot at
     // submit time. Defer frees if we don't transfer ownership.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -6220,6 +8612,7 @@ fn handleChatCompletions(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
@@ -6238,11 +8631,13 @@ fn handleChatCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
+    // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     // ── Adaptive spec-decode gating ──
@@ -6268,8 +8663,8 @@ fn handleChatCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -6317,8 +8712,16 @@ fn handleChatCompletions(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
             }
@@ -6332,20 +8735,15 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            // Send SSE error event so the client gets a proper error instead of a dropped connection
-            const err_chunk = std.fmt.allocPrint(allocator,
-                \\data: {{"error":{{"message":"Internal server error: {s}","type":"server_error"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_chunk);
-            stream.writeAllNoFlush(err_chunk) catch {};
-            stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
+            // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -6371,6 +8769,7 @@ fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
+    const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported n)\n", .{});
@@ -6400,10 +8799,13 @@ fn handleCompletions(
         return;
     }
 
+    const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
     const max_tokens: u32 = resolveRequestMaxTokens(
-        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        requested_max_tokens,
         omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
+    // For the request log line only: which of the three sources this came from.
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -6429,10 +8831,7 @@ fn handleCompletions(
         else => 0.0,
     } else 0.0;
 
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -6483,12 +8882,13 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
-    log.info("POST /v1/completions (max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ max_tokens, temperature, top_p, top_k, is_stream });
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
     log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
 
     // Tokenize prompt directly (no chat template). ds4-backed models
@@ -6508,6 +8908,7 @@ fn handleCompletions(
         break :blk out;
     } else try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Enforce context size limit
     const effective_ctx = getEffectiveContextLength(config);
@@ -6518,12 +8919,12 @@ fn handleCompletions(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    // (/v1/completions has no per-request kv_quant field -> process default.)
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, null, lm, false)) return;
-
-    // Clamp max_tokens to stay within context window
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
+    // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, false)) return;
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
@@ -6536,8 +8937,8 @@ fn handleCompletions(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -6561,13 +8962,14 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, logprobs_n, cache_key) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, logprobs_n, cache_key) catch |err| {
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     }
 }
@@ -6587,20 +8989,20 @@ fn handleNonStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     logprobs_n: u32,
+    cache_key: u64,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
+    // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, .{}, logprobs_n, null, null, stream) catch |err| switch (err) {
-        error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-        else => return err,
-    };
+    // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -6678,13 +9080,13 @@ fn handleStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     logprobs_n: u32,
+    cache_key: u64,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -6714,8 +9116,9 @@ fn handleStreamingCompletion(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(null, prompt_ids.len, null),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
+        .cache_key = cache_key,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -6733,17 +9136,7 @@ fn handleStreamingCompletion(
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("completions");
+    try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
@@ -6753,6 +9146,8 @@ fn handleStreamingCompletion(
     var client_gone = false;
 
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -6786,7 +9181,7 @@ fn handleStreamingCompletion(
         const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
 
         // Handle incomplete UTF-8 sequences across token boundaries
-        const token_text = blk: {
+        var token_text = blk: {
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -6816,13 +9211,12 @@ fn handleStreamingCompletion(
 
         if (stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
-                    stopped = true;
-                    break;
-                }
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
-            if (stopped) break;
         }
 
         const escaped = try jsonEscape(allocator, token_text);
@@ -6884,6 +9278,32 @@ fn handleStreamingCompletion(
     });
 }
 
+/// Where a stop sequence cuts the accumulated text and how many bytes of the arriving token
+/// survive: streaming delivers the same `text[0..index]` non-streaming keeps.
+const StopCut = struct { index: usize, token_keep: usize, matched: []const u8 };
+
+fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8) ?StopCut {
+    const emitted = text.len - @min(token_len, text.len);
+    var best: ?StopCut = null;
+    for (stops) |stop_seq| {
+        if (stop_seq.len == 0) continue;
+        const idx = std.mem.indexOf(u8, text, stop_seq) orelse continue;
+        if (best) |b| if (b.index <= idx) continue;
+        best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
+    }
+    return best;
+}
+
+/// A client that vanished mid-generation did not hit a token cap.
+fn nonStreamFinishReason(client_gone: bool, slot_reason: []const u8) []const u8 {
+    return if (client_gone) "client_disconnect" else slot_reason;
+}
+
+/// The text the model said before the tool markup, byte for byte as the stream flushes it.
+fn visibleToolPreamble(content: []const u8) []const u8 {
+    return if (std.mem.trim(u8, content, " \t\r\n").len > 0) content else "";
+}
+
 /// Run a non-streaming generation through the scheduler. Returns the same
 /// shape as `generate.generate` so the calling handler's response builder
 /// is unchanged.
@@ -6911,6 +9331,7 @@ fn nonStreamingViaScheduler(
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -6942,9 +9363,10 @@ fn nonStreamingViaScheduler(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -6956,6 +9378,7 @@ fn nonStreamingViaScheduler(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
+    var client_gone = false;
     wait: while (true) {
         const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
             // Idle (long prefill). If the client is gone, cancel and serve
@@ -6965,6 +9388,7 @@ fn nonStreamingViaScheduler(
                 if (c.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
                     slot.cancel();
+                    client_gone = true;
                     break :wait;
                 }
             }
@@ -6973,7 +9397,7 @@ fn nonStreamingViaScheduler(
         switch (nr) {
             .token => |t| try output_ids.append(allocator, t),
             .done => break :wait,
-            .err => return error.GenerationFailed,
+            .err => return slotFailure(slot),
         }
     }
 
@@ -7007,7 +9431,7 @@ fn nonStreamingViaScheduler(
         .token_ids = token_ids,
         .prompt_tokens = slot.prompt_tokens,
         .completion_tokens = slot.completion_tokens,
-        .finish_reason = slot.finish_reason,
+        .finish_reason = nonStreamFinishReason(client_gone, slot.finish_reason),
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
         .prefill_ns = slot.prefill_ns,
@@ -7044,6 +9468,7 @@ fn handleNonStreamingGeneration(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -7068,9 +9493,10 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null;
-    const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Transfer vision ownership into the slot via the scheduler.
     const slot_ve: ?mlx.mlx_array = blk: {
@@ -7078,13 +9504,8 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationFailed => {
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
-            return;
-        },
-        else => return err,
-    };
+    // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -7183,10 +9604,10 @@ fn handleNonStreamingGeneration(
 
             // Reasoning is delivered whenever the model produced it — the
             // request's thinking flag shaped the prompt, not the delivery.
+            const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
             {
-                const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
                 if (tc_think_split.reasoning_content) |reasoning| {
                     const escaped_reasoning = try jsonEscape(allocator, reasoning);
                     tc_reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
@@ -7195,6 +9616,12 @@ fn handleNonStreamingGeneration(
                 }
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
+
+            // The same pre-markup text the stream flushes as a text delta.
+            const tc_preamble = visibleToolPreamble(tc_think_split.content);
+            const tc_content_esc = jsonEscapeOrEmpty(allocator, tc_preamble);
+            defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
+            const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
 
             const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
@@ -7208,11 +9635,12 @@ fn handleNonStreamingGeneration(
             defer allocator.free(tc_usage_obj);
 
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
                 nowMs(stream.io),
                 nowSecs(stream.io),
                 model_name,
+                tc_content_json,
                 tc_reasoning_json,
                 tc_buf.items,
                 toolCallFinishReason(finish_reason),
@@ -7428,7 +9856,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return .done;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         if (try self.next(allocator)) |t| return .{ .token = t };
@@ -7449,7 +9877,7 @@ const StreamingTokenStream = struct {
                     self.finished = true;
                     return null;
                 },
-                .err => return error.GenerationFailed,
+                .err => return slotFailure(s),
             }
         }
         // Drain any pending tokens from a previous speculative step FIRST,
@@ -7597,23 +10025,78 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
+pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
+
+/// The ONE request-level spec dispatch, shared by every surface x stream /
+/// non-stream. Priority: DFlash > MTP > gemma drafter > PLD, mirroring
+/// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
+/// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
+/// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
+/// false` hand the round back to MTP. The gemma cross-attention drafter
+/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
+/// already applied at every surface's parse site.
+pub fn requestSpecModes(
+    enable_pld: bool,
+    enable_drafter: bool,
+    enable_mtp: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
+    mtp_loaded: bool,
+    has_constraint: bool,
+    logprobs_n: u32,
+) RequestSpec {
+    const spec_ok = logprobs_n == 0 and !has_constraint;
+    const sidecar = spec_ok and enable_drafter and (gemma_drafter_loaded or dflash_loaded);
+    const use_dflash = sidecar and dflash_loaded;
+    const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
+    const use_drafter = use_dflash or (!use_mtp and sidecar);
+    return .{
+        .use_mtp = use_mtp,
+        .use_drafter = use_drafter,
+        .use_pld = !use_mtp and !use_drafter and spec_ok and enable_pld,
+    };
+}
+
 fn pickStreamMode(
     enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
-    drafter_loaded: bool,
+    gemma_drafter_loaded: bool,
+    dflash_loaded: bool,
     mtp_loaded: bool,
-    arch_blocks_sidecar: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
-    // Priority: MTP > drafter > PLD. The MTP head only loads when it binds
-    // to the trunk, so no extra arch gates here; the GDN/SSM rollback path
-    // it needs is the same one PLD uses.
-    if (enable_mtp and mtp_loaded and logprobs_n == 0 and !has_constraint) return .mtp;
-    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !arch_blocks_sidecar) return .drafter;
-    if (enable_pld and logprobs_n == 0 and !has_constraint) return .pld;
+    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    if (r.use_mtp) return .mtp;
+    if (r.use_drafter) return .drafter;
+    if (r.use_pld) return .pld;
     return .regular;
+}
+
+test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
+    // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
+    var r = requestSpecModes(true, true, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, true, false, 0));
+    // gemma drafter + mtp -> MTP keeps its rank.
+    r = requestSpecModes(true, true, true, true, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, false, true, false, 0));
+    // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
+    r = requestSpecModes(true, false, true, false, true, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    // logprobs / grammar disable every spec mode, dflash included.
+    r = requestSpecModes(true, true, true, false, true, true, false, 3);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    r = requestSpecModes(true, true, true, false, true, true, true, 0);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
+    // No sidecar loaded -> MTP; nothing loaded -> PLD.
+    r = requestSpecModes(true, true, true, false, false, true, false, 0);
+    try std.testing.expect(r.use_mtp and !r.use_drafter);
+    r = requestSpecModes(true, true, true, false, false, false, false, 0);
+    try std.testing.expect(r.use_pld and !r.use_mtp and !r.use_drafter);
 }
 
 fn handleStreamingGeneration(
@@ -7643,6 +10126,7 @@ fn handleStreamingGeneration(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -7680,7 +10164,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -7717,10 +10201,11 @@ fn handleStreamingGeneration(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -7730,17 +10215,7 @@ fn handleStreamingGeneration(
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("chat.completions");
+    try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     // Logprobs ride the chunks beside their deltas. Requesting them already
     // forced this stream off every speculative path (see `pickStreamMode`), so
@@ -7791,6 +10266,7 @@ fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var in_think_block = prompt_opened_think;
+    var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
     var think_closed = false; // a complete think block was already split+emitted this stream
     // Leading whitespace is suppressed until the first visible byte, so the
@@ -7809,7 +10285,9 @@ fn handleStreamingGeneration(
     // Muse-Glimmer: dropping a segment header in the plain arm — <|start|>
     // arms it, <|message|> disarms; the role+recipient text between them is
     // ordinary tokens that must never reach the client as content.
-    var muse_skip_header = false;
+    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
+    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
+    defer muse_head.deinit(allocator);
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
@@ -7820,6 +10298,8 @@ fn handleStreamingGeneration(
     // Generate tokens via the adapter — yields one decoded token id per call
     // regardless of whether the underlying decode is regular, PLD, or drafter.
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -7854,7 +10334,7 @@ fn handleStreamingGeneration(
 
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        const token_text = blk: {
+        var token_text = blk: {
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -7893,19 +10373,16 @@ fn handleStreamingGeneration(
             try text_buf.appendSlice(allocator, token_text);
         }
 
-        // Check stop sequences
+        // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            var hit_stop = false;
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq)) |_| {
-                    hit_stop = true;
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) {
+                    allocator.free(token_text);
                     break;
                 }
-            }
-            if (hit_stop) {
-                allocator.free(token_text);
-                stopped = true;
-                break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
         }
 
@@ -8131,17 +10608,10 @@ fn handleStreamingGeneration(
                 }
             }
 
-            // Check if reasoning budget exhausted
+            // A spent budget caps DELIVERY only: the tail stays withheld reasoning until the close tag.
             if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
                 budget_exhausted = true;
-                // Flush all buffered reasoning
-                if (think_buf.items.len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
-                }
-                think_buf.clearRetainingCapacity();
-                in_think_block = false;
                 log.info("  reasoning budget exhausted ({d}/{d} tokens)\n", .{ think_tokens, reasoning_budget });
-                continue;
             }
 
             // Check for the close tag — accept whichever appears first.
@@ -8203,7 +10673,7 @@ fn handleStreamingGeneration(
             };
 
             if (close_match) |m| {
-                if (m.pos > 0) {
+                if (m.pos > 0 and !budget_exhausted) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
@@ -8261,7 +10731,9 @@ fn handleStreamingGeneration(
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
+                    if (!budget_exhausted) {
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
+                    }
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -8275,12 +10747,32 @@ fn handleStreamingGeneration(
             const was_skipping = muse_skip_header;
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
             if (was_skipping or muse_skip_header) {
+                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
+                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
+                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
+                    in_think_block = true;
+                    saw_think_open = true;
+                    skipped_think_open = true;
+                    think_close_tag = "<|eom|>";
+                }
+                if (!muse_skip_header) muse_head.clearRetainingCapacity();
                 continue;
             }
             // Skip Gemma 4 channel tags that leak after thinking blocks
+            // A think block the MODEL opens: seeded like a template-injected one.
+            // Checked before the marker skip, which would swallow a bare `<think>`.
+            if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                channel_armed = false;
+                in_think_block = true;
+                saw_think_open = true;
+                try think_buf.appendSlice(allocator, opener);
+                continue;
+            };
             if (chat_mod.isChannelMarkerToken(token_text)) {
+                channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
                 continue;
             }
+            channel_armed = false;
             const vis_token_text = chat_mod.streamContentLead(token_text, content_started);
             if (vis_token_text.len == 0) {
                 lps.dropPending();
@@ -8313,7 +10805,9 @@ fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
+            if (!budget_exhausted) {
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
+            }
         } else {
             const vis_tail = chat_mod.streamContentLead(think_buf.items, content_started);
             if (vis_tail.len > 0) {
@@ -8812,6 +11306,26 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     logHttpBody("[http] response body", body);
 }
 
+/// The `Access-Control-Allow-Headers` value each SSE surface advertises.
+const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization";
+const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version";
+
+/// The one place a `text/event-stream` response head is written. Past this call a generation
+/// failure is an SSE `error` event; before it the stream answers like its non-streaming twin.
+fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8) !void {
+    try stream.writeAllNoFlush("HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: ");
+    try stream.writeAllNoFlush(allow_headers);
+    try stream.writeAll("\r\n\r\n");
+    stream.sse_headers_sent = true;
+    logHttpStreamStart(kind);
+}
+
 fn logHttpStreamStart(kind: []const u8) void {
     if (!log.isDebug()) return;
     log.debug("[http] <- 200 OK text/event-stream ({s})\n", .{kind});
@@ -8897,6 +11411,8 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // (ane.publishLive / deinit), so this is a lock-free read.
     ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
     ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
+    // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
+    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -9058,6 +11574,10 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         &mid_buf,
         parseModelFromRequest(body, content_type) orelse "",
     );
+    if (lan_mod.splitRemoteId(mid)) |rid| if (registry.peek(mid) == null) {
+        // A provider is the host owner's paid key: never reachable from the LAN.
+        if (g_providers) |p| if (p.isProvider(rid.peer)) return "Provider models are host-local";
+    };
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -9132,6 +11652,45 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
+}
+
+/// Proxy `<bare>@<provider>` to the provider's /v1/chat/completions. Only that
+/// surface exists upstream, so every other model-gated route is a named 400
+/// rather than a request the provider would reject in its own words.
+fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, full_id: []const u8) !void {
+    if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
+        return;
+    }
+    var canon_buf: [512]u8 = undefined;
+    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
+    var up = prov.lookup(allocator, canon) orelse {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No such provider", 404);
+        return;
+    };
+    defer up.deinit(allocator);
+    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, up.bare);
+    defer allocator.free(rewritten);
+    log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
+    providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
+        try sendErrorResponse(allocator, stream, "502 Bad Gateway", "provider_unreachable", "Provider did not answer", 502);
+    };
+}
+
+fn handleProvidersReload(allocator: std.mem.Allocator, stream: *Conn) !void {
+    const p = g_providers orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "providers_unavailable", "Providers are disabled on this server", 503);
+        return;
+    };
+    const n = p.reload() catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "providers.json could not be read: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{{\"providers\":{d}}}", .{n});
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
 }
 
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
@@ -9930,7 +12489,17 @@ fn formatPerfBracket(
     return s catch buf[0..0];
 }
 
+/// THE JSON string escaper for every response body. Every string here is model bytes
+/// somewhere and a token is a BPE fragment, so invalid UTF-8 is sanitized INSIDE the
+/// escaper (one U+FFFD per bad sequence); valid input passes through byte for byte.
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return jsonEscapeValid(allocator, input);
+    const clean = try chat_mod.utf8Sanitize(allocator, input);
+    defer allocator.free(clean);
+    return jsonEscapeValid(allocator, clean);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
@@ -9957,47 +12526,38 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
-/// `jsonEscape` for text that is NOT guaranteed to be valid UTF-8.
-///
-/// A single token is a BPE fragment, so it can carry only PART of a multi-byte
-/// character — the rest arrives in the next token. `jsonEscape` passes every
-/// byte >= 0x20 through verbatim, so those raw bytes landed in the JSON string
-/// and the WHOLE response body stopped being valid UTF-8: unparseable, not
-/// merely degraded. Live on Qwen3.6-27B, a `b"\xf0\x9f"` candidate (the first
-/// half of a 4-byte emoji) inside `top_logprobs`.
-///
-/// The `bytes` array beside it carries the exact bytes, so the string is the
-/// lossy view — one U+FFFD per invalid sequence, which is the shape OpenAI
-/// documents. Only the logprobs token strings need this: every other string we
-/// emit is complete decoded text, valid UTF-8 by construction.
-fn jsonEscapeLossy(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(input)) return jsonEscape(allocator, input);
+test "EVERY JSON string escaper survives bytes that are not valid UTF-8" {
+    // Class guard over the four escapers (OpenAI/Anthropic, Responses, the prompt
+    // render, Ollama NDJSON): one passing bytes through loses a whole reply.
+    const a = std.testing.allocator;
+    const cases = [_][]const u8{
+        "near\xe8\x91\xe4\xb8\x89 in", // 3-byte lead, one continuation, then another lead
+        "\xff\xfe", // never-valid lead bytes
+        "tail\xf0\x9f", // first half of a 4-byte emoji, cut by max_tokens
+    };
+    for (cases) |bad| {
+        const a1 = try jsonEscape(a, bad);
+        defer a.free(a1);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(a1));
 
-    const replacement = "\u{FFFD}";
-    var clean = std.ArrayList(u8).empty;
-    defer clean.deinit(allocator);
+        const a2 = try responses_mod.jsonEscape(a, bad);
+        defer a.free(a2);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(a2));
 
-    var i: usize = 0;
-    while (i < input.len) {
-        const len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
-            try clean.appendSlice(allocator, replacement);
-            i += 1;
-            continue;
-        };
-        if (i + len <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + len])) {
-            try clean.appendSlice(allocator, input[i .. i + len]);
-            i += len;
-            continue;
-        }
-        // Consume the lead plus the continuation bytes that follow it as ONE
-        // maximal subpart, so a character split across two tokens costs a
-        // single replacement rather than one per byte.
-        var j = i + 1;
-        while (j < input.len and j < i + len and input[j] & 0xC0 == 0x80) j += 1;
-        try clean.appendSlice(allocator, replacement);
-        i = j;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(a);
+        try chat_mod.appendJsonString(a, &buf, bad);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(buf.items));
+
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try ollama_mod.writeJsonString(&out.writer, bad);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(out.written()));
     }
-    return jsonEscape(allocator, clean.items);
+    // Valid input is passed through byte for byte.
+    const good = try jsonEscape(a, "héllo \u{1F600}");
+    defer a.free(good);
+    try std.testing.expectEqualStrings("\"héllo \u{1F600}\"", good);
 }
 
 /// Build logprobs JSON for a single token (for both streaming and non-streaming).
@@ -10016,7 +12576,7 @@ fn formatTokenLogprob(
     const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
     defer allocator.free(token_text);
 
-    const escaped_token = try jsonEscapeLossy(allocator, token_text);
+    const escaped_token = try jsonEscape(allocator, token_text);
     defer allocator.free(escaped_token);
 
     // Build bytes array
@@ -10040,7 +12600,7 @@ fn formatTokenLogprob(
 
         const tlp_text = try tok.decode(allocator, &[_]u32{tlp.token_id}, strip and false);
         defer allocator.free(tlp_text);
-        const escaped_tlp = try jsonEscapeLossy(allocator, tlp_text);
+        const escaped_tlp = try jsonEscape(allocator, tlp_text);
         defer allocator.free(escaped_tlp);
 
         // Bytes for this token
@@ -10109,7 +12669,7 @@ fn formatCompletionsLogprobs(
         }
         const text = try tok.decode(allocator, &[_]u32{token_ids[i]}, false);
         defer allocator.free(text);
-        const esc = try jsonEscapeLossy(allocator, text);
+        const esc = try jsonEscape(allocator, text);
         defer allocator.free(esc);
         try toks.appendSlice(allocator, esc);
 
@@ -10123,7 +12683,7 @@ fn formatCompletionsLogprobs(
             if (j > 0) try tops.appendSlice(allocator, ",");
             const ttext = try tok.decode(allocator, &[_]u32{t.token_id}, false);
             defer allocator.free(ttext);
-            const tesc = try jsonEscapeLossy(allocator, ttext);
+            const tesc = try jsonEscape(allocator, ttext);
             defer allocator.free(tesc);
             try tops.appendSlice(allocator, tesc);
             try tops.appendSlice(allocator, ":");
@@ -10229,23 +12789,7 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
 fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
-    switch (v) {
-        .string => |s| {
-            if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return transformer_mod.KVQuantConfig.dense;
-            if (std.mem.eql(u8, s, "4")) return transformer_mod.KVQuantConfig.affine(4);
-            if (std.mem.eql(u8, s, "8")) return transformer_mod.KVQuantConfig.affine(8);
-            if (std.mem.eql(u8, s, "turbo2")) return transformer_mod.KVQuantConfig.turboquant(2);
-            if (std.mem.eql(u8, s, "turbo4")) return transformer_mod.KVQuantConfig.turboquant(4);
-            return null;
-        },
-        .integer => |i| {
-            if (i == 0) return transformer_mod.KVQuantConfig.dense;
-            if (i == 4) return transformer_mod.KVQuantConfig.affine(4);
-            if (i == 8) return transformer_mod.KVQuantConfig.affine(8);
-            return null;
-        },
-        else => return null,
-    }
+    return transformer_mod.KVQuantConfig.fromJsonValue(v);
 }
 
 // ── Vision Processing ──
@@ -12129,11 +14673,13 @@ fn handleAnthropicMessages(
     }
     const root = parsed.value.object;
 
-    // max_tokens is required in Anthropic API
-    const max_tokens: u32 = if (root.get("max_tokens")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => 0,
-    } else 0;
+    // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
+    // value is an omission and the `--max-tokens` launch default reaches this surface too.
+    const req_max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), 0);
+    const max_tokens: u32 = if (req_max_tokens > 0) req_max_tokens else launchMaxTokensDefault();
+    // For the request log line only. This surface 400s on a missing budget, so
+    // the origin here is never `.auto`.
+    const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault());
     if (max_tokens == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
         return;
@@ -12369,6 +14915,20 @@ fn handleAnthropicMessages(
                 },
                 else => {},
             };
+        } else if (std.mem.eql(u8, role, "system")) {
+            // Claude Code puts SessionStart hook output here; dropping it is silent context loss.
+            const sys_text: []const u8 = if (content_val) |cv| switch (cv) {
+                .string => |s| s,
+                .array => |arr| blk: {
+                    const joined = try joinedTextParts(allocator, arr.items);
+                    if (joined.owned) try content_allocs.append(allocator, joined.text);
+                    break :blk joined.text;
+                },
+                else => "",
+            } else "";
+            if (sys_text.len > 0) {
+                try messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+            }
         }
     }
 
@@ -12384,10 +14944,7 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
     var tools_json: ?[]const u8 = null;
@@ -12462,7 +15019,7 @@ fn handleAnthropicMessages(
             }
             if (think_val.object.get("budget_tokens")) |bt| {
                 if (bt == .integer) {
-                    reasoning_budget = @intCast(bt.integer);
+                    reasoning_budget = clampJsonI32(bt.integer);
                     budget_explicit = true;
                 }
             }
@@ -12487,8 +15044,6 @@ fn handleAnthropicMessages(
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
     }
-    if (schemaMasksThinking(output_cfg.schema != null, has_tools)) enable_thinking = false;
-
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
 
@@ -12517,7 +15072,7 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -12556,11 +15111,6 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
-    });
-    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
-
     // Format chat template. Iteration 1 timing + Iteration 2 cache. The
     // `effective_tools_json` swap (`null` when has_tools is false) keeps
     // the cache key consistent with what the encoder actually sees.
@@ -12582,13 +15132,41 @@ fn handleAnthropicMessages(
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, effort_word, continue_final);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = output_cfg.schema != null and !has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        output_cfg.schema != null,
+        has_tools,
+        enable_thinking,
+        reasoning_budget >= 0,
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, false, effort_word, continue_final);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+
+    var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
+    });
+    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Vision encoder: encode any images on the last user message and splice
     // image tokens into the prompt at the model's configured image_token_id.
     // Phase A8: per-request ownership.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -12613,6 +15191,7 @@ fn handleAnthropicMessages(
     }
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
     if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
@@ -12623,8 +15202,8 @@ fn handleAnthropicMessages(
                 enable_pld = false;
             }
             // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance within a few rounds (~4 wasted verifies at
-            // worst), strictly better evidence than a prompt-time heuristic
+            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
+            // verifies at worst), strictly better evidence than a prompt-time heuristic
             // that cannot see output echo — and llmprobe/bench bodies cannot
             // carry enable_drafter:true. The gemma cross-attention drafter
             // (0.55x measured on novel) keeps the gate.
@@ -12646,10 +15225,13 @@ fn handleAnthropicMessages(
         return;
     }
 
-    // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
-
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
+    // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
@@ -12675,8 +15257,16 @@ fn handleAnthropicMessages(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
             }
@@ -12687,18 +15277,14 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
-            const err_data = std.fmt.allocPrint(allocator,
-                \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
-            , .{@errorName(err)}) catch return;
-            defer allocator.free(err_data);
-            sendAnthropicEvent(stream, "error", err_data) catch {};
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
-            log.err("  -> 500 ({s})\n", .{@errorName(err)});
-            sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+            log.err("  -> {s}\n", .{@errorName(err)});
+            sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     }
 }
@@ -12729,6 +15315,7 @@ fn handleAnthropicNonStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -12746,12 +15333,12 @@ fn handleAnthropicNonStreaming(
 
     var timer = Stopwatch.init(stream.io);
 
-    // Speculative decoding dispatch — same priority as chat-completions
-    // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
-    const config = lm.config.?;
-    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
-    const use_drafter = !use_mtp and enable_drafter and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-    const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
+    // Speculative decoding dispatch — same `requestSpecModes` as
+    // chat-completions (DFlash > MTP > drafter > PLD).
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
+    const use_mtp = spec.use_mtp;
+    const use_drafter = spec.use_drafter;
+    const use_pld = spec.use_pld;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -12764,10 +15351,8 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-        error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
-        else => return err,
-    };
+    // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -12859,6 +15444,20 @@ fn handleAnthropicNonStreaming(
             log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
+
+            // The same pre-markup text the stream flushes as a text delta.
+            const tu_preamble = visibleToolPreamble(chat_mod.trimLeakedToolMarkup(final_text));
+            if (tu_preamble.len > 0) {
+                if (block_count > 0) try content.append(allocator, ',');
+                const esc_pre = try jsonEscape(allocator, tu_preamble);
+                defer allocator.free(esc_pre);
+                const pre_block = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"text","text":{s}}}
+                , .{esc_pre});
+                defer allocator.free(pre_block);
+                try content.appendSlice(allocator, pre_block);
+                block_count += 1;
+            }
 
             // Emit tool_use content blocks
             for (tool_calls, 0..) |tc, i| {
@@ -12967,6 +15566,7 @@ fn handleAnthropicStreaming(
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
+    cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
@@ -12988,7 +15588,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null or lm.dflash != null, mtpCapable(lm), archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -13021,27 +15621,18 @@ fn handleAnthropicStreaming(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+        .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .vision_key = vision_key,
+        .cache_key = cache_key,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
     // SSE headers
-    const header =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
-        "Access-Control-Allow-Origin: *\r\n" ++
-        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-        "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n" ++
-        "\r\n";
-    try stream.writeAll(header);
-    logHttpStreamStart("anthropic.messages");
+    try sendSseHeaders(stream, "anthropic.messages", SSE_ALLOW_HEADERS_ANTHROPIC);
 
     // message_start
     {
@@ -13075,6 +15666,7 @@ fn handleAnthropicStreaming(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var in_think_block = prompt_opened_think;
+    var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
@@ -13082,7 +15674,9 @@ fn handleAnthropicStreaming(
     var think_closed = false;
     var content_started = false;
     // Muse-Glimmer plain-arm segment-header skip (<|start|>…<|message|>).
-    var muse_skip_header = false;
+    var muse_skip_header = promptOpensMuseHeader(allocator, lm, tok, prompt_ids);
+    var muse_head = std.ArrayList(u8).empty; // header bytes held while skipping
+    defer muse_head.deinit(allocator);
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>";
@@ -13108,6 +15702,8 @@ fn handleAnthropicStreaming(
     var utf8_carry_len: u8 = 0;
 
     while (true) {
+        // A stop cut resolved on the previous token ends the turn here.
+        if (stopped) break;
         const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => break,
@@ -13140,7 +15736,7 @@ fn handleAnthropicStreaming(
         const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
 
         // UTF-8 carry handling
-        const token_text = blk: {
+        var token_text = blk: {
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -13173,16 +15769,15 @@ fn handleAnthropicStreaming(
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            for (stop_sequences) |stop_seq| {
-                if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
-                    stopped = true;
-                    matched_stop_seq = stop_seq;
+            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+                stopped = true;
+                matched_stop_seq = cut.matched;
+                text_buf.shrinkRetainingCapacity(cut.index);
+                if (cut.token_keep == 0) {
+                    allocator.free(token_text);
                     break;
                 }
-            }
-            if (stopped) {
-                allocator.free(token_text);
-                break;
+                token_text = try allocator.realloc(token_text, cut.token_keep);
             }
         }
 
@@ -13283,11 +15878,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
@@ -13301,11 +15892,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
@@ -13318,11 +15905,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .analysis) {
@@ -13343,11 +15926,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.harmonyThinkOpenerAt(think_buf.items) == .growing) {
@@ -13370,11 +15949,7 @@ fn handleAnthropicStreaming(
                     allocator.free(remaining);
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 } else if (chat_mod.museThinkOpenerAt(think_buf.items) == .growing) {
@@ -13388,30 +15963,20 @@ fn handleAnthropicStreaming(
                     // Stay in the think block; close tag is detected dynamically.
                     skipped_think_open = true;
                     if (!thinking_block_open) {
-                        const sd = try std.fmt.allocPrint(allocator,
-                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
-                        , .{block_index});
-                        defer allocator.free(sd);
-                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
                         thinking_block_open = true;
                     }
                 }
             }
 
-            // Budget check
+            // A spent budget closes the DELIVERED thinking block; the tail is withheld, never text.
             if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
                 budget_exhausted = true;
-                if (thinking_block_open and think_buf.items.len > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
-                }
-                think_buf.clearRetainingCapacity();
                 if (thinking_block_open) {
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
                     thinking_block_open = false;
                     block_index += 1;
                 }
-                in_think_block = false;
-                continue;
             }
 
             // Check for the close tag — accept whichever appears first
@@ -13512,14 +16077,14 @@ fn handleAnthropicStreaming(
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
                 think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
-            } else if (skipped_think_open and thinking_block_open) {
+            } else if (skipped_think_open) {
                 // Hold back a still-growing partial close tag (suffixed forms
                 // included), then back off to a UTF-8 boundary — a cut mid-
                 // codepoint ships a lone continuation byte in the delta JSON.
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
-                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
+                    if (thinking_block_open) try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -13532,8 +16097,34 @@ fn handleAnthropicStreaming(
             // Muse segment-header skip: <|start|>…<|message|> is never content.
             const was_skipping = muse_skip_header;
             muse_skip_header = chat_mod.museHeaderSkipNext(muse_skip_header, token_text);
-            if (was_skipping or muse_skip_header) continue;
-            if (chat_mod.isChannelMarkerToken(token_text)) continue;
+            if (was_skipping or muse_skip_header) {
+                if (muse_skip_header) try muse_head.appendSlice(allocator, token_text);
+                // `<|message|>` resolved a header the model wrote: `to=self` is reasoning.
+                if (was_skipping and !muse_skip_header and !content_started and chat_mod.museHeaderOpensReasoning(muse_head.items)) {
+                    in_think_block = true;
+                    skipped_think_open = true;
+                    think_close_tag = "<|eom|>";
+                    if (!thinking_block_open) {
+                        try openAnthropicThinkingBlock(allocator, stream, block_index);
+                        thinking_block_open = true;
+                    }
+                }
+                if (!muse_skip_header) muse_head.clearRetainingCapacity();
+                continue;
+            }
+            // A think block the MODEL opens: seeded like a template-injected one.
+            // Checked before the marker skip, which would swallow a bare `<think>`.
+            if (!content_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                channel_armed = false;
+                in_think_block = true;
+                try think_buf.appendSlice(allocator, opener);
+                continue;
+            };
+            if (chat_mod.isChannelMarkerToken(token_text)) {
+                channel_armed = !content_started and std.mem.eql(u8, token_text, "<|channel>");
+                continue;
+            }
+            channel_armed = false;
             const vis_token = chat_mod.streamContentLead(token_text, content_started);
             if (vis_token.len == 0) continue;
             content_started = true;
@@ -13769,6 +16360,14 @@ fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: *Conn, index
 }
 
 /// Close a thinking block with a fake signature and content_block_stop.
+fn openAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, block_index: u32) !void {
+    const sd = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+    , .{block_index});
+    defer allocator.free(sd);
+    try sendAnthropicEvent(stream, "content_block_start", sd);
+}
+
 fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: *Conn, index: u32) !void {
     const sig = try std.fmt.allocPrint(allocator,
         \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"signature_delta","signature":"mlx-serve-local"}}}}
@@ -13954,11 +16553,31 @@ fn handleResponsesCompact(
     try sendResponse(stream, "200 OK", "application/json", out);
 }
 
+/// Route entry for `/v1/responses`: gives the handler an error arm (it was the one generative
+/// surface with no `catch` on its path) and owns the SSE sequence counter the terminal `error`
+/// event must carry.
 fn handleResponses(
     allocator: std.mem.Allocator,
     stream: *Conn,
     body: []const u8,
     lm: *LoadedModel,
+) !void {
+    var seq_num: u64 = 0;
+    handleResponsesInner(allocator, stream, body, lm, &seq_num) catch |err| {
+        // The WS transport keeps its error: it has its own terminal frame and cleanup.
+        if (stream.ws_mode != null) return err;
+        log.err("  -> responses error: {s}\n", .{@errorName(err)});
+        sendGenerationError(allocator, stream, err, .{ .responses = &seq_num }) catch {};
+    };
+}
+
+fn handleResponsesInner(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    body: []const u8,
+    lm: *LoadedModel,
+    /// Owned by `handleResponses` so its error arm can number the terminal `error` event.
+    seq_num: *u64,
 ) !void {
     // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
     // transformer; the only gates below use `config.has_hybrid_layers`.
@@ -14035,11 +16654,9 @@ fn handleResponses(
     // echo `null` (vs. our internal default) in the response envelope.
     const req_max_output_tokens: ?u32 = blk: {
         const v = root.get("max_output_tokens") orelse root.get("max_tokens");
-        // <= 0 is treated as "auto" (null here → context-pegged default below).
-        break :blk if (v) |val| switch (val) {
-            .integer => |i| if (i > 0) @as(?u32, @intCast(i)) else null,
-            else => null,
-        } else null;
+        // <= 0 is "auto" (the omitted-field default, the `--max-tokens` launch value when given).
+        const r = resolveRequestMaxTokens(v, 0);
+        break :blk if (r > 0) r else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
@@ -14092,10 +16709,7 @@ fn handleResponses(
         (if (v == .string) v.string else null)
     else
         null;
-    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
-        .integer => |i| @intCast(i),
-        else => null,
-    } else null;
+    const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // ── stop sequences ──
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -14147,8 +16761,6 @@ fn handleResponses(
     if (final_answer_mode and has_tools) {
         log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
     }
-    if (schemaMasksThinking(grammar_schema_val != null, active_has_tools)) enable_thinking = false;
-
     // ── model name ──
     const model_name = if (root.get("model")) |v|
         (if (v == .string) v.string else config.model_type)
@@ -14202,17 +16814,37 @@ fn handleResponses(
         }
     }
 
-    log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
-        pi.messages.items.len, max_tokens, temperature, is_stream, enable_thinking, prev_id,
-    });
-
     // ── format chat template ──
     // Iteration 1 timing + Iteration 2 cache. Responses sees the same
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort, false);
+    var schema_boundary_token: ?u32 = null;
+    const prompt_opens_bare_think = grammar_schema_val != null and !active_has_tools and enable_thinking and
+        promptOpensBareThink(allocator, lm, tok, prompt_ids_raw);
+    const atomic_think_close = if (prompt_opens_bare_think) tok.specialTokenId("</think>") else null;
+    switch (schemaMasksThinking(
+        grammar_schema_val != null,
+        active_has_tools,
+        enable_thinking,
+        false, // Responses parses reasoning.budget but does not enforce it.
+        prompt_opens_bare_think,
+        atomic_think_close,
+    )) {
+        .deferred => schema_boundary_token = atomic_think_close,
+        .fallback_thinking_off => {
+            allocator.free(prompt_ids_raw);
+            enable_thinking = false;
+            prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, false, reasoning_cfg.effort, false);
+            log.info("[grammar] {s}; rerendered with thinking off\n", .{if (prompt_opens_bare_think) "tokenizer has no atomic </think>" else "prompt does not end in bare <think>"});
+        },
+        .no_mask, .token_zero => {},
+    }
     const tokenize_ns = tokenize_sw.read();
+    log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
+        pi.messages.items.len, max_tokens, temperature, is_stream, enable_thinking, prev_id,
+    });
     const active_media = activeTurnMediaMessage(pi.messages.items, false);
 
     // ── vision encoder ──
@@ -14220,6 +16852,7 @@ fn handleResponses(
     // transferring the array to a scheduler slot.
     var local_ve: ?mlx.mlx_array = null;
     var vis_key: u64 = 0;
+    const cache_key = requestCacheKey(root);
     defer {
         if (local_ve) |arr| _ = mlx.mlx_array_free(arr);
     }
@@ -14254,8 +16887,12 @@ fn handleResponses(
     }
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
+    // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
+    // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
+
+    // Check if attention computation would exceed GPU memory.
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(local_ve != null))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -14276,8 +16913,16 @@ fn handleResponses(
             const tb = try lm.grammarTokenBytes(allocator, stream.io);
             if (sc.initFromValue(allocator, sv, tb)) {
                 sc_init = true;
+                const deferred = if (schema_boundary_token) |boundary| blk: {
+                    sc.deferUntilToken(boundary);
+                    break :blk true;
+                } else false;
                 sampling.constraint = &sc.constraint;
-                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                if (deferred) {
+                    log.info("[grammar] deferring JSON schema until the reasoning boundary (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                } else {
+                    log.info("[grammar] enforcing JSON schema from token 0 (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+                }
             } else |err| {
                 log.warn("[grammar] schema parse failed ({s})\n", .{@errorName(err)});
             }
@@ -14327,23 +16972,12 @@ fn handleResponses(
         .max_tool_calls = max_tool_calls_echo,
     };
 
-    // SSE event sequence counter (required field on every Responses streaming event).
-    var seq_num: u64 = 0;
+    // SSE event sequence counter, owned by the wrapper (see `handleResponses`).
 
     // ── streaming: send SSE headers + response.created + response.in_progress ──
     if (is_stream) {
         if (stream.ws_mode == null) {
-            const sse_headers =
-                "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: text/event-stream\r\n" ++
-                "Cache-Control: no-cache\r\n" ++
-                "Connection: close\r\n" ++
-                "Access-Control-Allow-Origin: *\r\n" ++
-                "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-                "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
-                "\r\n";
-            try stream.writeAll(sse_headers);
-            logHttpStreamStart("responses");
+            try sendSseHeaders(stream, "responses", SSE_ALLOW_HEADERS_DEFAULT);
         }
 
         // Skeleton envelope (status:in_progress, output:[])
@@ -14373,10 +17007,10 @@ fn handleResponses(
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
         defer allocator.free(created_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.created", created_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.created", created_payload);
         const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
         defer allocator.free(ip_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.in_progress", ip_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.in_progress", ip_payload);
     }
 
     // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
@@ -14418,8 +17052,9 @@ fn handleResponses(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+    enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -14444,7 +17079,7 @@ fn handleResponses(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null or lm.dflash != null, lm.mtp != null, archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null), sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -14477,9 +17112,10 @@ fn handleResponses(
             .mtp_depth = lm.mtp_depth,
             .vision_embeddings = slot_ve_resp,
             .vision_key = vis_key,
+            .cache_key = cache_key,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
-            .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
+            .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
@@ -14500,6 +17136,7 @@ fn handleResponses(
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
         var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids);
+        var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
@@ -14508,6 +17145,8 @@ fn handleResponses(
         var live_output_index: u32 = 0;
 
         while (true) {
+            // A stop cut resolved on the previous token ends the turn here.
+            if (stopped) break;
             const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
                 .done => break,
@@ -14540,7 +17179,7 @@ fn handleResponses(
             const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
 
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            const token_text = blk: {
+            var token_text = blk: {
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -14570,13 +17209,12 @@ fn handleResponses(
             try raw_buf.appendSlice(allocator, token_text);
 
             if (stop_sequences.items.len > 0) {
-                for (stop_sequences.items) |stop_seq| {
-                    if (std.mem.indexOf(u8, raw_buf.items, stop_seq) != null) {
-                        stopped = true;
-                        break;
-                    }
+                if (stopSequenceCut(raw_buf.items, token_text.len, stop_sequences.items)) |cut| {
+                    stopped = true;
+                    raw_buf.shrinkRetainingCapacity(cut.index);
+                    if (cut.token_keep == 0) break;
+                    token_text = try allocator.realloc(token_text, cut.token_keep);
                 }
-                if (stopped) break;
             }
 
             // Beat BEFORE the tool early-continue below: a tool-active request
@@ -14655,10 +17293,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, before);
                     }
                     if (streamed_reasoning_started) live_output_index += 1;
 
@@ -14677,10 +17315,10 @@ fn handleResponses(
                         if (!streamed_message_started) {
                             streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                             streamed_message_index = live_output_index;
-                            try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                            try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                             streamed_message_started = true;
                         }
-                        try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, content_after);
+                        try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, content_after);
                     }
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
@@ -14693,10 +17331,10 @@ fn handleResponses(
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                             streamed_reasoning_index = live_output_index;
-                            try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                            try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                             streamed_reasoning_started = true;
                         }
-                        try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
+                        try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items[0..safe_len]);
                         const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
@@ -14705,14 +17343,26 @@ fn handleResponses(
                 }
             } else {
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
-                if (chat_mod.isChannelMarkerToken(token_text)) continue;
+                // A think block the MODEL opens: seeded like a template-injected one.
+                // Checked before the marker skip, which would swallow a bare `<think>`.
+                if (!streamed_message_started) if (chat_mod.modelThinkOpener(channel_armed, token_text)) |opener| {
+                    channel_armed = false;
+                    in_think_block = true;
+                    try think_buf.appendSlice(allocator, opener);
+                    continue;
+                };
+                if (chat_mod.isChannelMarkerToken(token_text)) {
+                    channel_armed = !streamed_message_started and std.mem.eql(u8, token_text, "<|channel>");
+                    continue;
+                }
+                channel_armed = false;
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
-                    try emitResponsesMessageStart(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?);
+                    try emitResponsesMessageStart(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?);
                     streamed_message_started = true;
                 }
-                try emitResponsesMessageDelta(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, token_text);
+                try emitResponsesMessageDelta(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, token_text);
             }
         }
 
@@ -14721,10 +17371,10 @@ fn handleResponses(
             if (!streamed_reasoning_started) {
                 streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
                 streamed_reasoning_index = live_output_index;
-                try emitResponsesReasoningStart(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
                 streamed_reasoning_started = true;
             }
-            try emitResponsesReasoningDelta(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
+            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, think_buf.items);
         }
 
         ts.finalize();
@@ -14747,21 +17397,20 @@ fn handleResponses(
             .decode_tps = 0.0,
         };
     } else {
-        // Non-streaming Responses: spec-decode dispatch (drafter > PLD) so
-        // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_mtp = enable_mtp_resp and lm.mtp != null and sampling.constraint == null;
-        const use_drafter = !use_mtp and enable_drafter_resp and (lm.drafter != null or lm.dflash != null) and sampling.constraint == null and !archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null);
-        const use_pld = !use_mtp and !use_drafter and enable_pld_resp and sampling.constraint == null;
+        // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
+        // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0);
+        const use_mtp = spec.use_mtp;
+        const use_drafter = spec.use_drafter;
+        const use_pld = spec.use_pld;
         // Transfer vision ownership into the slot.
         const slot_ve_ns: ?mlx.mlx_array = blk: {
             const v = local_ve;
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
-            error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
-            else => return err,
-        };
+        // Propagates to `handleResponses`' one error arm, shared with the streaming half.
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -14823,13 +17472,13 @@ fn handleResponses(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
-            try emitResponsesReasoningEnd(allocator, stream, &seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
+            try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
             defer allocator.free(rid);
             try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
             if (is_stream) {
-                try emitResponsesReasoningEvents(allocator, stream, &seq_num, output_index, rid, rt);
+                try emitResponsesReasoningEvents(allocator, stream, seq_num, output_index, rid, rt);
             }
         }
         emitted += 1;
@@ -14859,7 +17508,7 @@ fn handleResponses(
             try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
             emitted += 1;
             if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, &seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
             }
             output_index += 1;
         }
@@ -14871,13 +17520,13 @@ fn handleResponses(
         if (is_stream and streamed_message_started) {
             // Live deltas already streamed; emit just the closing events.
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, streamed_message_id.?, visible_text);
-            try emitResponsesMessageEnd(allocator, stream, &seq_num, streamed_message_index, streamed_message_id.?, visible_text);
+            try emitResponsesMessageEnd(allocator, stream, seq_num, streamed_message_index, streamed_message_id.?, visible_text);
         } else {
             const mid = try responses_mod.makeId(stream.io, allocator, "msg");
             defer allocator.free(mid);
             try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
             if (is_stream) {
-                try emitResponsesMessageEvents(allocator, stream, &seq_num, output_index, mid, visible_text);
+                try emitResponsesMessageEvents(allocator, stream, seq_num, output_index, mid, visible_text);
             }
         }
         emitted += 1;
@@ -14931,7 +17580,7 @@ fn handleResponses(
     if (is_stream) {
         const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
         defer allocator.free(completed_payload);
-        try sendResponsesEvent(allocator, stream, &seq_num, "response.completed", completed_payload);
+        try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
         // `data: [DONE]` sentinel as chat completions; generic SSE middleware
         // keys stream end off it. The WS transport must NOT get one — its
@@ -15200,8 +17849,10 @@ fn handleResponsesWebSocket(
         bridge.reset();
         handleResponses(allocator, stream, body, lm) catch |err| {
             log.warn("WS handleResponses error: {s}\n", .{@errorName(err)});
-            // Best-effort error frame; connection may already be torn.
-            wsSendErrorTurn(allocator, &ws_conn, 500, "server_error", @errorName(err)) catch {};
+            // Best-effort error frame; same mapping as every HTTP surface.
+            var ws_err_buf: [192]u8 = undefined;
+            const ws_wire = mapGenerationError(err, &ws_err_buf);
+            wsSendErrorTurn(allocator, &ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message) catch {};
             // Restore borrowed prev entry back to local cache on failure.
             if (did_borrow_to_global and prev_id_owned != null) {
                 const store = getOrInitResponseStore(stream.io, allocator);
@@ -16377,6 +19028,105 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve > 1024);
 }
 
+test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
+    // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
+    // default sysctl keep the old expression byte for byte.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const mb: u64 = 1024 * 1024;
+    const total_ram: u64 = 131_072 * mb;
+    const working_set: u64 = 120_000 * mb;
+    const saved = wired_limit_mb_override;
+    defer wired_limit_mb_override = saved;
+    wired_limit_mb_override = 120_000;
+
+    try t.expectEqual(@as(u64, 111_808), wiredLimitFloor(120_000 * mb, total_ram) / mb);
+    // The macOS default (75% of RAM) and anything under it declares nothing; and however
+    // absurd the sysctl, never plan within the margin of physical RAM.
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(98_304 * mb, total_ram));
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(0, total_ram));
+    try t.expectEqual(@as(u64, 0), wiredLimitFloor(120_000 * mb, 0));
+    try t.expectEqual(total_ram - WIRED_LIMIT_MARGIN_BYTES, wiredLimitFloor(400 * (1 << 30), total_ram));
+
+    // Gated: every other arch takes floor 0, which is `physicalMemoryCeiling` exactly.
+    var cfg = qwen4ExpLive364kConfig();
+    try t.expect(wiredCeilingFloorForRam(&cfg, total_ram) > 0);
+    try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(null, total_ram));
+    for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "bailing_hybrid" }) |mt| {
+        var other = cfg;
+        other.model_type = mt;
+        try t.expect(!other.longCtxGated());
+        try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&other, total_ram));
+    }
+    const footprint: u64 = 87_722 * mb;
+    for ([_]u64{ 0, 12_934 * mb, 400 * (1 << 30) }) |free| {
+        try t.expectEqual(
+            physicalMemoryCeiling(working_set, footprint, free),
+            gpuCeilingWithWiredFloor(working_set, footprint, free, 0),
+        );
+    }
+
+    // A 448k warm append that the free-RAM term refused fits under the floor.
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const shared = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
+    try t.expectEqual(@as(u64, 13_450), needed / mb);
+    try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, 0) -| footprint);
+    const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
+    try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
+    try t.expect(needed <= lifted -| footprint);
+}
+
+test "a warm append is billed the rows it ALLOCATES, not the rows it already holds" {
+    // Bar: a checked-out restore credits the rows it holds even when the append outgrows the
+    // buffer; the grow bills the new capacity plus one eval window of old buffers.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const mb: u64 = 1024 * 1024;
+    const cfg = qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const matched: u64 = 448_531;
+    const chunk: u64 = 512;
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
+
+    // Pessimal reading of the entry: capacity exactly the rows it matched, so the append DOES
+    // grow every attention layer.
+    const grows = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = true };
+    const g = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, grows);
+    try t.expectEqual(matched *| kv_per_tok, g.shared_resident_bytes);
+    try t.expectEqual((reserved - matched) *| kv_per_tok, g.reserved_kv_bytes +| (seq - matched) *| kv_per_tok);
+    // ...plus one eval window of old buffers: qwen4_exp caches 12 of 48 layers, one per window.
+    try t.expectEqual(@as(u32, 1), attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS));
+    try t.expectEqual(@as(u64, 465), g.grow_coexist_bytes / mb);
+    // The bill at the narrowest and a wider width.
+    try t.expectEqual(@as(u64, 7_051), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, grows) / mb);
+    try t.expectEqual(@as(u64, 9_711), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 2048, grows) / mb);
+
+    // A buffer the previous turn sized above this prompt grows nothing, so no window at all.
+    const fits = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 450_048, .will_donate = true };
+    const f = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, fits);
+    try t.expectEqual(@as(u64, 0), f.grow_coexist_bytes);
+    try t.expectEqual(@as(u64, 6_469), prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, fits) / mb);
+
+    // Byte-identical arms: a SHARED restore is copied whole by the first append, so it credits
+    // nothing and bills no window either; a COLD prompt has nothing to credit.
+    const shared = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = matched, .will_donate = false };
+    const sh = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, shared);
+    try t.expectEqual(@as(u64, 0), sh.shared_resident_bytes);
+    try t.expectEqual(@as(u64, 0), sh.grow_coexist_bytes);
+    const cold = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+    try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
+    try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
+}
+
+
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
     const GB: u64 = 1 << 30;
     const static_max: u64 = 115 * GB; // Metal max_recommended_working_set_size, 128 GB Mac
@@ -16531,9 +19281,9 @@ test "aneGateHeadroom: reserves a usable context and scales with the chunk" {
     // The KV reserve is exactly MIN_CONTEXT_TOKENS worth — the guarantee that
     // an admitted offload leaves a usable context behind.
     try t.expect(narrow == ane_mod.GATE_BASELINE_BYTES +
-        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits()) * ane_mod.MIN_CONTEXT_TOKENS +
-        prefix_cache_mem_bytes +
-        prefillTransientReserve(&cfg, defaultKvBits(), 1024));
+        kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), defaultKvBits(&cfg)) * ane_mod.MIN_CONTEXT_TOKENS +
+        resolvedPrefixCacheMem() +
+        prefillTransientReserve(&cfg, defaultKvBits(&cfg), 1024));
 
     // A model that cannot reach the reserve context only reserves its own max.
     cfg.max_position_embeddings = 8192;
@@ -16602,6 +19352,114 @@ test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positiv
     try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .string = "999" }, auto));
     // A real positive cap is honored verbatim.
     try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
+}
+
+test "--max-tokens is the omitted-field default: unset is byte-identical, set wins" {
+    const t = std.testing;
+    // With no flag the omitted-field default is byte-for-byte what it was.
+    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefaultWith(32768, 0));
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefaultWith(0, 0));
+
+    // Flag set: the launch value outranks both fallbacks.
+    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(786_432, 65536));
+    try t.expectEqual(@as(u32, 65536), omittedMaxTokensDefaultWith(0, 65536));
+
+    // The context clamp still sits on top.
+    try t.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(omittedMaxTokensDefaultWith(32768, 65536), 1500, 32768));
+
+    // A request that sends max_tokens is untouched by the flag.
+    const auto = omittedMaxTokensDefaultWith(786_432, 65536);
+    try t.expectEqual(@as(u32, 128), resolveRequestMaxTokens(.{ .integer = 128 }, auto));
+    try t.expectEqual(@as(u32, 200_000), resolveRequestMaxTokens(.{ .integer = 200_000 }, auto));
+    try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, auto));
+
+    // The live wrapper reads the ServerConfig field through the one accessor.
+    const slot = &@field(server_config, "default_max_tokens");
+    const orig = slot.*;
+    defer slot.* = orig;
+    slot.* = 0;
+    try t.expectEqual(@as(u32, 0), launchMaxTokensDefault());
+    try t.expectEqual(@as(u32, std.math.maxInt(u32) / 4), omittedMaxTokensDefault(32768));
+    slot.* = 4096;
+    try t.expectEqual(@as(u32, 4096), launchMaxTokensDefault());
+    try t.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(32768));
+}
+
+test "describeMaxTokens: an omitted max_tokens logs as auto, never as the sentinel" {
+    const t = std.testing;
+    var buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
+
+    try t.expectEqualStrings("auto", describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .auto));
+
+    // With an unknown context the auto budget is a finite 4096 that really caps generation.
+    try t.expectEqualStrings("auto (4096)", describeMaxTokens(&buf, 4096, .auto));
+
+    // `--max-tokens N` filled an omitted field: the number is real, but it is
+    // the operator's, not the client's, and the line says whose it is.
+    try t.expectEqualStrings("65536 (launch default)", describeMaxTokens(&buf, 65536, .launch_default));
+
+    // A client that sent the field gets its own number back, unadorned.
+    try t.expectEqualStrings("4096", describeMaxTokens(&buf, 4096, .client));
+
+    // Origin comes from the SAME inputs `resolveRequestMaxTokens` reads, so
+    // the label can't disagree with the number beside it.
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(null, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = 0 }, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .integer = -5 }, 0));
+    try t.expectEqual(MaxTokensOrigin.auto, maxTokensOrigin(.{ .string = "999" }, 0));
+    try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(null, 65536));
+    try t.expectEqual(MaxTokensOrigin.launch_default, maxTokensOrigin(.{ .integer = 0 }, 65536));
+    // A sent field outranks the flag, so it is the CLIENT's number either way.
+    try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 65536));
+    try t.expectEqual(MaxTokensOrigin.client, maxTokensOrigin(.{ .integer = 128 }, 0));
+
+    try t.expectEqualStrings(
+        "1073741823 (launch default)",
+        describeMaxTokens(&buf, AUTO_MAX_TOKENS_SENTINEL, .launch_default),
+    );
+}
+
+test "the max_tokens squeeze warning is silent for the auto budget, loud for a real over-ask" {
+    const t = std.testing;
+
+    // A real over-ask: the client named a number and the window can't pay it.
+    // That is the warning's whole point (the tool-call truncation nudge).
+    try t.expect(maxTokensBudgetSqueezed(32768, 4000));
+    try t.expect(!maxTokensBudgetSqueezed(32768, 30000));
+
+    // The sentinel is always > 4x whatever remains; there is nothing to be short of.
+    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 4000));
+    try t.expect(!maxTokensBudgetSqueezed(AUTO_MAX_TOKENS_SENTINEL, 1));
+
+    try t.expect(autoBudgetWindowTight(4000, 32768));
+    try t.expect(!autoBudgetWindowTight(30000, 32768));
+    // A launch default is a real number and takes the real predicate.
+    try t.expect(maxTokensBudgetSqueezed(65536, 4000));
+}
+
+test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
+    const t = std.testing;
+    // The admission reservation reads the resolved budget, so the flag reaches it.
+    const KVCache = transformer_mod.KVCache;
+    const ctx: u64 = 786_432;
+    const seq: u64 = 400_000; // past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+
+    // No flag: the sentinel becomes the whole remaining window; only the headroom cap keeps that off the bill.
+    const no_flag = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 0), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, @intCast(ctx - seq)), no_flag);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, no_flag, chunk, ctx));
+
+    // Flag set below the headroom: the reservation is prompt + the flag.
+    const flagged = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 2048), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, 2048), flagged);
+    try t.expectEqual(seq + 2048 + chunk, KVCache.reservedTokens(seq, flagged, chunk, ctx));
+    try t.expect(KVCache.reservedTokens(seq, flagged, chunk, ctx) < KVCache.reservedTokens(seq, no_flag, chunk, ctx));
+
+    // A flag above the headroom bills only the headroom.
+    const big = clampMaxTokens(omittedMaxTokensDefaultWith(@intCast(ctx), 65536), seq, @intCast(ctx));
+    try t.expectEqual(@as(u32, 65536), big);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, KVCache.reservedTokens(seq, big, chunk, ctx));
 }
 
 test "StreamHeartbeat: a write resets the deadline, silence expires it" {
@@ -17154,6 +20012,64 @@ test "joinedTextParts: single text part borrows; empty and non-text parts ignore
     try testing.expectEqualStrings("", none.text);
 }
 
+fn cacheKeyOf(body: []const u8) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    return requestCacheKey(parsed.value.object);
+}
+
+test "canonicalRole: developer is the system turn; every other role is itself" {
+    try testing.expectEqualStrings("system", chat_mod.canonicalRole("developer"));
+    try testing.expectEqualStrings("system", chat_mod.canonicalRole("system"));
+    try testing.expectEqualStrings("tool", chat_mod.canonicalRole("tool"));
+    try testing.expectEqualStrings("assistant", chat_mod.canonicalRole("assistant"));
+}
+
+test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > anonymous" {
+    const sys_str = try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":"You are S."},{"role":"user","content":"hi"}]}
+    );
+    const sys_parts = try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":[{"type":"text","text":"You are S."}]}]}
+    );
+    const anth = try cacheKeyOf(
+        \\{"system":[{"type":"text","text":"You are S."}],"messages":[{"role":"user","content":"hi"}]}
+    );
+    const resp = try cacheKeyOf(
+        \\{"instructions":"You are S.","input":"hi"}
+    );
+    try testing.expect(sys_str != 0);
+    try testing.expectEqual(sys_str, sys_parts);
+    try testing.expectEqual(sys_str, anth);
+    try testing.expectEqual(sys_str, resp);
+    // OpenAI's reasoning-model spelling of the system turn (pi sends it).
+    try testing.expectEqual(sys_str, try cacheKeyOf(
+        \\{"messages":[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]}
+    ));
+    try testing.expect(sys_str != try cacheKeyOf(
+        \\{"messages":[{"role":"system","content":"You are T."}]}
+    ));
+
+    const uid = try cacheKeyOf(
+        \\{"metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
+    );
+    try testing.expect(uid != 0 and uid != sys_str);
+    const pck = try cacheKeyOf(
+        \\{"prompt_cache_key":"batch","metadata":{"user_id":"sess-1"},"messages":[{"role":"system","content":"You are S."}]}
+    );
+    try testing.expect(pck != 0 and pck != uid);
+    try testing.expectEqual(pck, try cacheKeyOf(
+        \\{"prompt_cache_key":"batch","prompt":"doc"}
+    ));
+
+    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
+        \\{"messages":[{"role":"user","content":"hi"}]}
+    ));
+    try testing.expectEqual(@as(u64, 0), try cacheKeyOf(
+        \\{"prompt_cache_key":"","prompt":"doc"}
+    ));
+}
+
 // --- /props payload regression ------------------------------------------------
 //
 // The `chat_template` field used to be emitted by /props for llama.cpp
@@ -17233,6 +20149,40 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     try testing.expectEqual(@as(i64, 112), rows_json.items[1].object.get("evals").?.integer);
 }
 
+test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
+    const none = try ngramWarmPropsJson(testing.allocator, 0, 0);
+    defer testing.allocator.free(none);
+    try testing.expectEqualStrings("", none);
+
+    const frag = try ngramWarmPropsJson(testing.allocator, 17_179_869_184, 54_975_581_388);
+    defer testing.allocator.free(frag);
+    try testing.expectEqualStrings(",\"ngram_warm\":{\"bytes\":17179869184,\"total\":54975581388}", frag);
+
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen4_exp";
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    defer testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const w = (parsed.value.object.get("ngram_warm") orelse return error.MissingNgramWarm).object;
+    try testing.expectEqual(@as(i64, 17_179_869_184), w.get("bytes").?.integer);
+    try testing.expectEqual(@as(i64, 54_975_581_388), w.get("total").?.integer);
+
+    // Both fragments splice at the same slot, so an ANE boot on a qwen4 pack
+    // must still parse.
+    const one = [_]AneUnitStat{.{ .instance = 0, .evals = 1, .eval_failures = 0 }};
+    const ane = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 1, &one);
+    defer testing.allocator.free(ane);
+    const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
+    defer testing.allocator.free(both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, both);
+    defer testing.allocator.free(body2);
+    var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
+    defer parsed2.deinit();
+    try testing.expect(parsed2.value.object.get("ane") != null);
+    try testing.expect(parsed2.value.object.get("ngram_warm") != null);
+}
+
 test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     var config = model_mod.ModelConfig{};
     config.model_type = "gemma4";
@@ -17310,7 +20260,7 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
-    try testing.expect(prefix_cache_mem_bytes > 0);
+    try testing.expect(resolvedPrefixCacheMem() > 0);
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -17917,14 +20867,29 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
     }
 }
 
-test "every JSON grammar mask site pairs with the schema thinking-off gate" {
-    // The gate lived only on /v1/messages while chat-completions and responses
-    // built the same token-0 mask against a prompt still inside <think>
-    // (issue #331). A NEW surface that builds a mask without consulting the
-    // gate re-ships the hole, so the pairing is pinned by count: one gate call
-    // per mask-enforcement site.
+test "schema thinking policy defers only a supported bare think boundary" {
+    const decide = schemaMasksThinking;
+    try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(false, false, true, false, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.no_mask, decide(true, true, true, true, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.token_zero, decide(true, false, false, true, false, null));
+    try std.testing.expectEqual(SchemaThinkingPolicy.deferred, decide(true, false, true, false, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, true, true, 42));
+    try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, true, null));
+
+    const unsupported_tails = [_][]const u8{
+        "<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>",
+        "<|channel|>analysis<|message|>",
+        "<|im_start|>assistant\n",
+    };
+    for (unsupported_tails) |tail| {
+        try std.testing.expect(!chat_mod.promptTailOpensBareThink(tail));
+        try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, chat_mod.promptTailOpensBareThink(tail), 42));
+    }
+}
+
+test "every JSON grammar mask site consults the fallback or deferral policy" {
     const src = @embedFile("server.zig");
-    const mask_line = "[grammar] enforcing JSON " ++ "schema";
+    const mask_line = "[grammar] enforcing JSON schema from " ++ "token 0";
     const call = "schemaMasks" ++ "Thinking(";
     const def = "fn schemaMasks" ++ "Thinking(";
     const masks = std.mem.count(u8, src, mask_line);
@@ -18199,8 +21164,8 @@ test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-widt
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
     // the envelope must use min(chunk, seq). Guard-tracks-reality rule.
-    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31, 0, 0);
-    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31, 0, 0);
+    const small = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 31, 31, 0, 0, .{});
+    const capped = prefillMemoryNeeded(31, 64, 8, 327680, 128, 128, 4096, 13312, 8, 8192, 31, 0, 0, .{});
     try std.testing.expectEqual(small, capped);
     // Sanity: the clamped estimate for the live 31-token case sits far below
     // the ~4 GB that was actually available. It is not zero — every prefill
@@ -18219,17 +21184,17 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // 4-bit: kv billed at (2*4+1)/16 bytes/elem (payload + group scale/bias)
     // = 6.912 GB, plus the 0.8192 GB per-layer dense dequant transient.
     try t.expectEqual(
         @as(u64, 11_798_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}),
     );
     // Direction: quantized admission must be under half the fp16 bill.
-    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0) * 2 <
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0));
+    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}) * 2 <
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}));
 }
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
@@ -18240,7 +21205,7 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
     // mlp 0.377 GB, x1.25 = ~13.1 GiB — admittable on a big Mac.
-    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144, 0, 0);
+    const needed = prefillMemoryNeeded(262_144, 16, 2, 81920, 256, 256, 2048, 15360, 4, 512, 262_144, 0, 0, .{});
     try t.expectEqual(@as(u64, 14_061_404_160 + 671_088_640), needed);
     try t.expect(needed < 16 << 30);
     // The retired seq-scaled envelope billed 8 x seq x ffn x 2 working bytes
@@ -18258,13 +21223,13 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
     // mlp 69.2 MB, x1.25.
     try t.expectEqual(
         @as(u64, 15_446_507_520 + 671_088_640),
-        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 122880, 128, 128, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // hd=256 adds the [heads, chunk, seq] score tensor (the guard must see
     // what the composed SDPA path actually allocates). Decomposition: the
     // hd-128 bill + the KV doubling from 128->256 (12.288 GB x1.25) + the
     // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
-    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0);
+    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{});
     try t.expectEqual(@as(u64, 15_446_507_520 + 671_088_640 + 15_360_000_000 + 2_048_000_000), with_scores);
 }
 
@@ -18280,8 +21245,8 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     const kv_per_tok: u64 = 6 * 16 * (192 + 128) * 2; // 6 caching layers of 24
     const stored: u64 = 128;
     const scored: u64 = 192;
-    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0);
-    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768, 0, 0);
+    const honest = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
+    const blind = prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, stored, stored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{});
     // The difference is exactly the score tensor: heads x chunk x seq x 2, x1.25.
     const score_bytes: u64 = 16 * 4096 * 32_768 * 2;
     try t.expectEqual(honest - blind, score_bytes * 5 / 4);
@@ -18290,7 +21255,7 @@ test "prefillMemoryNeeded: the SCORE width decides the score term, not the store
     // stored width touches nothing the score term reads.
     try t.expectEqual(
         honest,
-        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0),
+        prefillMemoryNeeded(32_768, 16, 16, kv_per_tok, scored, scored, 1536, 4608, 16, 4096, 32_768, 0, 0, .{}),
     );
 }
 
@@ -18303,25 +21268,22 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
     );
     // The quantized-KV dequant transient is a denseView property, NOT a score
     // property — it must survive the fused kernel (fires on every kv-quant
     // request regardless of head_dim).
     try t.expectEqual(
         @as(u64, 11_798_507_520 + 671_088_640 - 2_048_000_000),
-        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0),
+        prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 4, 512, 100_000, 0, 0, .{}),
     );
 }
 
 test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keeps it" {
     // The reserve at the widest chunk must never claim more than a quarter of
-    // what is left after the weights and the hot-cache budget. Numbers are the
-    // measured 16 GB profile: Metal's recommended working set on a 16 GB Mac is
-    // ~11.9 GiB, Mistral-7B-4bit sits at 3.80 GiB resident, the hot prefix
-    // cache reserves its default 2 GB. At chunk 8192 the transient reserve is
-    // 7.2 GiB against 6.1 GiB of budget — the case that reported a 1024-token
-    // context and 400'd a 10k-token prompt whose real peak is 2.39 GiB.
+    // what is left after the weights. Numbers are the measured 16 GB profile: Metal's working
+    // set ~11.9 GiB, Mistral-7B-4bit 3.80 GiB resident. The hot-cache budget is no longer an
+    // input; the former `2 * GiB` argument is the pinned-context KV bar and is 0 under auto-context.
     const t = std.testing;
     const GiB: u64 = 1024 * 1024 * 1024;
     var mistral = model_mod.ModelConfig{};
@@ -18337,19 +21299,23 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
 
     const ceiling_16: u64 = 11_918_000_000;
     const weights: u64 = 4_080_000_000;
-    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 2 * GiB);
+    const narrowed = resolvePrefillChunk(&mistral, 16, ceiling_16, weights, 0, 0);
     try t.expect(narrowed < 8192);
     try t.expect(narrowed >= 512);
     // It is the WIDEST rung that fits, not simply the floor.
     try t.expect(prefillTransientReserve(&mistral, 16, narrowed) <=
-        (ceiling_16 - weights - 2 * GiB) / 4);
+        (ceiling_16 - weights) / 4);
+    for (PREFILL_CHUNK_LADDER) |c| {
+        if (c <= narrowed) break;
+        try t.expect(prefillTransientReserve(&mistral, 16, c) > (ceiling_16 - weights) / 4);
+    }
 
     // Same model, a machine with room: nothing narrows.
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&mistral, 16, 95 * GiB, weights, 0, 0));
 
     // A model that barely fits gets the narrowest rung rather than a wide one
     // it cannot pay for — and never 0, which would read as "not pinned".
-    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 2 * GiB));
+    try t.expectEqual(@as(u32, 512), resolvePrefillChunk(&mistral, 16, weights + 64 * 1024 * 1024, weights, 0, 0));
 
     // Every rung is a real ladder entry, descending, floored at generate's own
     // minimum — a chunk generate would refuse is a chunk the bill cannot model.
@@ -18384,18 +21350,37 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
     transformer_mod.qsa_gather_override = true;
     defer transformer_mod.qsa_gather_override = null;
+    const saved_fused = transformer_mod.qsa_score_fused_override;
+    const saved_nax = transformer_mod.vqmm_nax_probe_override;
+    defer {
+        transformer_mod.qsa_score_fused_override = saved_fused;
+        transformer_mod.vqmm_nax_probe_override = saved_nax;
+    }
+    transformer_mod.vqmm_nax_probe_override = false;
+    transformer_mod.qsa_score_fused_override = true;
+    const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expect(gathered_composed > 0);
+    try t.expect(gathered_composed < 4 * 4096 * 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
+    transformer_mod.vqmm_nax_probe_override = null;
+    transformer_mod.qsa_score_fused_override = true;
+    const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
+    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
+    if (transformer_mod.qsaScoreFusedActive()) {
+        try t.expect(gathered_fused < gathered_composed);
+    }
+    transformer_mod.qsa_score_fused_override = false;
+    transformer_mod.vqmm_nax_probe_override = false;
     const gathered = qsaMaskBytes(&q4, 4096, 250_000);
-    try t.expect(gathered > 0);
-    try t.expect(gathered < 4 * 4096 * 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4), gathered);
+    try t.expectEqual(gathered_composed, gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);
     const q4_bill = prefillTransientReserve(&q4, 16, 8192);
     try t.expectEqual(twin_bill + qsaMaskBytes(&q4, 8192, 8192), q4_bill);
     // A ceiling whose quarter-share sits between the two bills at 8192.
     const weights: u64 = 70_000_000_000;
     const ceiling = weights + (twin_bill + q4_bill) / 2 * 4;
-    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0));
-    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0));
+    try t.expectEqual(@as(u32, 8192), resolvePrefillChunk(&twin, 16, ceiling, weights, 0, 0));
+    try t.expectEqual(@as(u32, 4096), resolvePrefillChunk(&q4, 16, ceiling, weights, 0, 0));
 }
 
 test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinned" {
@@ -18471,23 +21456,23 @@ test "prefillMemoryNeeded: every MEASURED prefill peak on the box is billed for"
     // 48 GatedDeltaNet layers x (2x16x128 + 48x128) elems x 2 B of stream.
     const q27_stream: u64 = 48 * (2 * 16 * 128 + 48 * 128) * 2;
     const q27_dq: u64 = 3 * 17408 * 5120 * 2;
-    try t.expect(prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 2048, 9320, q27_stream, q27_dq) >= 3_978_000_000);
-    try t.expect(prefillMemoryNeeded(9270, 24, 4, 65536, 256, 256, 5120, 17408, 16, 8192, 9270, q27_stream, q27_dq) >= 10_838_000_000);
+    try t.expect(prefillMemoryNeeded(9320, 24, 4, 65536, 256, 256, 5120, 17408, 16, 2048, 9320, q27_stream, q27_dq, .{}) >= 3_978_000_000);
+    try t.expect(prefillMemoryNeeded(9270, 24, 4, 65536, 256, 256, 5120, 17408, 16, 8192, 9270, q27_stream, q27_dq, .{}) >= 10_838_000_000);
     // qwen3_5 4B: hidden 2560, ffn 9216, 32 layers / 8 caching, 24 GDN layers.
     const q4_stream: u64 = 24 * (2 * 16 * 128 + 32 * 128) * 2;
     const q4_dq: u64 = 3 * 9216 * 2560 * 2;
-    try t.expect(prefillMemoryNeeded(9340, 16, 4, 32768, 256, 256, 2560, 9216, 16, 1024, 9340, q4_stream, q4_dq) >= 1_648_000_000);
-    try t.expect(prefillMemoryNeeded(9270, 16, 4, 32768, 256, 256, 2560, 9216, 16, 8192, 9270, q4_stream, q4_dq) >= 5_110_000_000);
+    try t.expect(prefillMemoryNeeded(9340, 16, 4, 32768, 256, 256, 2560, 9216, 16, 1024, 9340, q4_stream, q4_dq, .{}) >= 1_648_000_000);
+    try t.expect(prefillMemoryNeeded(9270, 16, 4, 32768, 256, 256, 2560, 9216, 16, 8192, 9270, q4_stream, q4_dq, .{}) >= 5_110_000_000);
     // gemma4 26B-A4B MoE: hidden 2816, top_k 8 x moe 704, 30 sliding layers.
     const g4_stream: u64 = 4 * 8 * 2 * (2816 + 704) * 2;
     const g4_dq: u64 = 3 * 5632 * 2816 * 2;
-    try t.expect(prefillMemoryNeeded(8204, 16, 8, 245760, 256, 256, 2816, 5632, 16, 4096, 8204, g4_stream, g4_dq) >= 3_960_000_000);
+    try t.expect(prefillMemoryNeeded(8204, 16, 8, 245760, 256, 256, 2816, 5632, 16, 4096, 8204, g4_stream, g4_dq, .{}) >= 3_960_000_000);
     // lfm2 2.6B conv hybrid at the narrowest chunk measured: no stream term,
     // and the forward is under the dequant route's minimum width.
-    try t.expect(prefillMemoryNeeded(10089, 32, 8, 16384, 64, 64, 2048, 10752, 16, 256, 10089, 0, 3 * 10752 * 2048 * 2) >= 782_000_000);
-    try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2) >= 2_527_000_000);
+    try t.expect(prefillMemoryNeeded(10089, 32, 8, 16384, 64, 64, 2048, 10752, 16, 256, 10089, 0, 3 * 10752 * 2048 * 2, .{}) >= 782_000_000);
+    try t.expect(prefillMemoryNeeded(10206, 32, 8, 16384, 64, 64, 2048, 10752, 16, 8192, 10206, 0, 3 * 10752 * 2048 * 2, .{}) >= 2_527_000_000);
     // muse_glimmer 30B dense: hidden 6656, ffn 19968, 52 layers, hd 128.
-    try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2) >= 2_178_000_000);
+    try t.expect(prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 3 * 19968 * 6656 * 2, .{}) >= 2_178_000_000);
 }
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
@@ -18500,9 +21485,9 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
 
     // The stream term is per CHUNK-TOKEN: it scales with the forward width and
     // not with the prompt, which is what the whole chunk-bounded model says.
-    const at2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, stream, 0);
-    const at8k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 8192, q27.seq, stream, 0);
-    const flat2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0);
+    const at2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, stream, 0, .{});
+    const at8k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 8192, q27.seq, stream, 0, .{});
+    const flat2k = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0, .{});
     const mlp2k: u64 = 8 * 2048 * q27.ffn * 2;
     const floor: u64 = 512 * 1024 * 1024;
     // The stream arm wins on this arch — that IS the fix — so the bill is one
@@ -18514,23 +21499,23 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
 
     // A longer prompt at the same chunk adds KV only — the stream term does
     // not move, or it would be the per-token multiplier this class is about.
-    const long = prefillMemoryNeeded(4 * q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, 4 * q27.seq, stream, 0);
+    const long = prefillMemoryNeeded(4 * q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, 4 * q27.seq, stream, 0, .{});
     try t.expectEqual(long - at2k, 3 * q27.seq * q27.kvpt * 5 / 4);
 
     // The dequant-weight term is chunk-INDEPENDENT (it is weights) but only
     // bills where the route can fire: at or above PREFILL_DQ_GEMM_MIN_M.
-    const dq_wide = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, dq);
+    const dq_wide = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, dq, .{});
     try t.expectEqual(dq_wide - flat2k, dq * 5 / 4);
-    const narrow_with = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, dq);
-    const narrow_without = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, 0);
+    const narrow_with = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, dq, .{});
+    const narrow_without = prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 1024, q27.seq, 0, 0, .{});
     try t.expectEqual(narrow_with, narrow_without);
     // A dense checkpoint passes 0 and is billed nothing for it (measured: a
     // bf16 lfm2 sits within 0.19 GB of the 8-bit one, which IS this term).
-    try t.expectEqual(flat2k, prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0));
+    try t.expectEqual(flat2k, prefillMemoryNeeded(q27.seq, q27.h, q27.kvh, q27.kvpt, q27.hd, q27.hd, q27.hidden, q27.ffn, 16, 2048, q27.seq, 0, 0, .{}));
 
     // An arch with neither keeps the 3-envelope bill it had, plus the floor —
     // no plain-attention arch's admission tightens by more than the floor.
-    const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0);
+    const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
 }
@@ -18614,13 +21599,13 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     // 8629 MB free. Pre-fix it billed 10277 MB — a dense 5806-wide key axis
     // PLUS the 15360 intermediate_size struct default — and 400'd.
     const available: u64 = 8629 * 1024 * 1024;
-    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806, 0, 0);
+    const before = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 15360, 8, 5632, 5806, 0, 0, .{});
     try t.expectEqual(@as(u64, 10277 + 640), before / (1024 * 1024));
     try t.expect(before > available);
     // Fixed: 641 keys (window 128 + top-512 + sink) and the width the config
     // actually states (top_k 6 x moe_intermediate 2048 = 12288, what
     // prefillFfnWidth resolves for this checkpoint) — 4848 MB, admitted.
-    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641, 0, 0);
+    const after = prefillMemoryNeeded(5806, 64, 1, 88064, 512, 512, 4096, 12288, 8, 5632, 641, 0, 0, .{});
     try t.expectEqual(@as(u64, 4848 + 640), after / (1024 * 1024));
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
@@ -18628,8 +21613,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
     try t.expectEqual(
-        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0),
-        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
+        prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),
     );
 }
 
@@ -18644,7 +21629,7 @@ test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, no
     // f32 gathered-K set (the very allocation PREFILL_SUB exists to bound).
     // The honest bill for the same request is ~2.3 GB — admitted with room.
     const available: u64 = 3610 * 1024 * 1024;
-    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641, 0, 0);
+    const generic = prefillMemoryNeeded(7514, 64, 1, 88064, 512, 512, 4096, 12288, 16, 4096, 641, 0, 0, .{});
     try t.expectEqual(@as(u64, 4069 + 640), generic / (1024 * 1024));
     try t.expect(generic > available);
     const honest = dsv4PrefillMemoryNeeded(7514, 43, 512, 4096, 12288, 512, 641);
@@ -18680,13 +21665,19 @@ test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
     // resident entry to `needed` again (the 138k-token false-400 regression).
     const t = std.testing;
     const src = @embedFile("server.zig");
-    const start = std.mem.indexOf(u8, src, "fn checkAttention" ++ "Memory(") orelse return error.CallSiteMoved;
+    // The bill and the headroom moved into `prefillAdmissionBill`.
+    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
     const tail = src[start..];
     const end = std.mem.indexOf(u8, tail, "\nextern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
     const body = tail[0..end];
     try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
     try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
     try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
+    // The hot cache appears once, as `evictable`, read as the published atomic.
+    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
+    try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
+    try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
+    try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
 }
 
 test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
@@ -18713,8 +21704,20 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // are the same class of parameter: derived from the CONFIG at the site, or
     // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
     // and a quantized checkpoint gets a dense one's.
-    try t.expect(std.mem.indexOf(u8, src, "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config));") != null);
-    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(chunk),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
+    // The per-request terms are seq-scaled and derived from the config at the site. Counted, not
+    // just found: the literal below is itself part of `src`.
+    const wired = "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))";
+    var wired_seen: usize = 0;
+    var wired_at: usize = 0;
+    while (std.mem.indexOfPos(u8, src, wired_at, wired)) |hit| {
+        wired_seen += 1;
+        wired_at = hit + 1;
+    }
+    try t.expectEqual(@as(usize, 2), wired_seen); // the call site + this literal
+    // The reserve half bills at an explicit KV length (`prefillTransientReserveAtKv`); `seq` must
+    // stay `@max(kv_len, chunk)`.
+    try t.expect(std.mem.indexOf(u8, src, "    const seq: u64 = @max(kv_len, chunk);\n") != null);
+    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(seq),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
 
     // Auto-context sizing reads the same helpers — the two must not drift.
     // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
@@ -18725,7 +21728,8 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // The prefill transient: the sizer RESERVES it once at the chunk width
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
-    try t.expect(std.mem.indexOf(u8, src, "prefix_cache_mem_bytes +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    // The sizer reserves the constant, not the ask or the resolved budget.
+    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -18745,10 +21749,25 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
             i = at + 1;
             // Skip the declaration itself.
             if (at >= 3 and std.mem.eql(u8, src[at - 3 .. at], "fn ")) continue;
+            // Skip test call sites: a hit belongs to a test when the nearest `test "` above it is
+            // nearer than the nearest function header.
+            const before = src[0..at];
+            const last_test = std.mem.lastIndexOf(u8, before, "\ntest \"");
+            const last_fn = std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0;
+            const last_pub_fn = std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0;
+            if (last_test) |lt| {
+                if (lt > @max(last_fn, last_pub_fn)) continue;
+            }
             const tail = src[at..@min(src.len, at + 512)];
             const end = std.mem.indexOf(u8, tail, "));") orelse
                 std.mem.indexOf(u8, tail, ");") orelse return error.CallSiteMoved;
-            try t.expect(std.mem.indexOf(u8, tail[0..end], "pinned_prefill_chunk") != null);
+            // `rung` is a candidate being priced and `chosen`/the ladder floor becomes the pin; all
+            // are billed by `prefillNeededAtChunk`. A bare launch-width argument still fails.
+            const args = tail[0..end];
+            try t.expect(std.mem.indexOf(u8, args, "pinned_prefill_chunk") != null or
+                std.mem.indexOf(u8, args, "rung") != null or
+                std.mem.indexOf(u8, args, "chosen") != null or
+                std.mem.indexOf(u8, args, "PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]") != null);
             sites += 1;
         }
     }
@@ -18761,7 +21780,10 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     // scheduler sources it from `slot.model.config` — the same object the
     // guard bills against.
     const sched = @embedFile("scheduler.zig");
-    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = if (slot.model.config) |c| c.pinned_prefill_chunk else 0,") != null);
+    // The width is chosen per request (`req_prefill_chunk`) and falls back to `cfg.pinned_prefill_chunk`.
+    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = req_prefill_chunk,") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {") != null);
+    try t.expect(std.mem.indexOf(u8, sched, "const pin = cfg.pinned_prefill_chunk;") != null);
     try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
 
     // And the width has to be frozen BEFORE anything is computed from it:
@@ -18772,7 +21794,7 @@ test "the chunk the guard BILLS is the chunk the forward will RUN" {
     const body = server_src[pin..@min(server_src.len, pin + 800)];
     const chunk_at = std.mem.indexOf(u8, body, "pinPrefillChunk(config)") orelse return error.PinMissing;
     const ctx_at = std.mem.indexOf(u8, body, "autoContextFor(config)") orelse return error.CallSiteMoved;
-    const ctxsize_at = std.mem.indexOf(u8, body, "server_config.max_context_size > 0") orelse return error.CallSiteMoved;
+    const ctxsize_at = std.mem.indexOf(u8, body, "manualContext(config) > 0") orelse return error.CallSiteMoved;
     try t.expect(chunk_at < ctx_at);
     try t.expect(chunk_at < ctxsize_at);
 }
@@ -18803,7 +21825,8 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
     const launch = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, 8192), per_tok, 32768);
     try t.expectEqual(@as(u32, 1024), launch); // the floor: nothing fits
 
-    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 2 * GiB);
+    // The hot-cache budget is no longer an input; auto-context means the pinned-context bar is 0.
+    const chunk = resolvePrefillChunk(&cfg, 16, ceiling, weights, 0, 0);
     const sized = safeContextForBudget(ceiling, weights, 2 * GiB +| prefillTransientReserve(&cfg, 16, chunk), per_tok, 32768);
     try t.expect(sized > 12_000);
 
@@ -18824,6 +21847,7 @@ test "resolvePrefillChunk: the 16 GB tier gets a working context instead of the 
         cfg.prefillAttnKeys(10_348),
         prefillStreamBytesPerToken(&cfg),
         prefillDequantWeightBytes(&cfg),
+        .{},
     );
     try t.expect(needed < ceiling - weights);
     // Still comfortably above the measured 2.391 GiB peak — narrowing the chunk
@@ -19000,6 +22024,63 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
     try testing.expectEqual(@as(usize, 2), n);
+}
+
+test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
+    // The 400/503 mapping existed only on the non-streaming arms; streaming arms wrote a bare `server_error` frame.
+    const t = std.testing;
+    const a = t.allocator;
+
+    var buf: [192]u8 = undefined;
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        try t.expectEqual(@as(u32, 503), w.code);
+        try t.expectEqualStrings("503 Service Unavailable", w.status_line);
+        try t.expectEqualStrings(GEN_OOM_MSG, w.message);
+        try t.expectEqualStrings("server_error", w.openai_type);
+        try t.expectEqualStrings("api_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.PrefillDoesNotFit, &buf);
+        try t.expectEqual(@as(u32, 400), w.code);
+        try t.expectEqualStrings(PREFILL_NOFIT_MSG, w.message);
+        try t.expectEqualStrings("invalid_request_error", w.openai_type);
+        try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    }
+    {
+        const w = mapGenerationError(error.GenerationFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("generation failed", w.message);
+    }
+    {
+        // Anything else keeps its name in the message, at a mapped status.
+        const w = mapGenerationError(error.WriteFailed, &buf);
+        try t.expectEqual(@as(u32, 500), w.code);
+        try t.expectEqualStrings("Internal server error: WriteFailed", w.message);
+    }
+
+    // The SSE bodies carry the same type and message, plus the surface's terminal marker.
+    {
+        const w = mapGenerationError(error.GenerationOutOfMemory, &buf);
+        const body = try buildOpenAiStreamError(a, w);
+        defer a.free(body);
+        try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
+        try t.expect(std.mem.indexOf(u8, body, GEN_OOM_MSG) != null);
+        try t.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"error\"") != null);
+
+        const anth = try buildAnthropicStreamError(a, w);
+        defer a.free(anth);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"api_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, anth, GEN_OOM_MSG) != null);
+
+        const resp = try buildResponsesStreamError(a, w);
+        defer a.free(resp);
+        try t.expect(std.mem.indexOf(u8, resp, "\"type\":\"error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
+        try t.expect(std.mem.indexOf(u8, resp, GEN_OOM_MSG) != null);
+    }
 }
 
 test "contextOverflowMessage: the 400 names both counts so a client can act on it" {
@@ -19309,4 +22390,1258 @@ test "the memory guard's vision billing routes through visionPrefillUnchunked at
         at = i + 1;
     }
     try std.testing.expectEqual(@as(usize, 3), n);
+}
+
+test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
+    const saved = generate_mod.max_mtp_ctx;
+    defer generate_mod.max_mtp_ctx = saved;
+
+    generate_mod.max_mtp_ctx = 0;
+    try std.testing.expect(admitMtpForCtx(true, 1_000_000));
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+
+    // Inclusive at the ceiling; an explicit `enable_mtp:true` loses to it.
+    generate_mod.max_mtp_ctx = 4096;
+    try std.testing.expect(admitMtpForCtx(true, 4096));
+    try std.testing.expect(!admitMtpForCtx(true, 4097));
+
+    // It never turns MTP on for a request that had it off for another reason.
+    try std.testing.expect(!admitMtpForCtx(false, 1));
+}
+
+/// The qwen4_exp shape of the live #353 report: Qwen3.8-Flash-Next mixed-4-8bit, `--ctx-size 1048576 --kv-quant 8`.
+fn qwen4ExpOomConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 48;
+    cfg.full_attention_interval = 4; // 12 caching layers, 36 GatedDeltaNet
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 2;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 640;
+    cfg.num_experts = 512;
+    cfg.num_experts_per_tok = 10;
+    cfg.shared_expert_intermediate_size = 640;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_num_value_heads = 48;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.indexer_budget = 512;
+    cfg.indexer_head_dim = 128;
+    cfg.indexer_compress_ratio = 4;
+    // Pinned: with nothing pinned `getEffectiveContextLength` reads live GPU memory and every
+    // expectation below depends on the box.
+    cfg.pinned_context = 1_048_576;
+    return cfg;
+}
+
+test "qwen4ExpOomConfig does not leak qsa_score_fused_override" {
+    const saved = transformer_mod.qsa_score_fused_override;
+    defer transformer_mod.qsa_score_fused_override = saved;
+    transformer_mod.qsa_score_fused_override = null;
+    _ = qwen4ExpOomConfig();
+    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+}
+
+test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    // A 458,832-token cold prefill was admitted against 26.6 GB of headroom and died mid-prefill.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 458_832;
+    const chunk: u64 = 4096;
+
+    // 1. SSM checkpoints: 36 GDN layers x (state + conv window), up to --ssm-checkpoint-max.
+    const per_cp = cfg.ssmCheckpointBytes();
+    // 36 x (1,572,864 + 61,440) B = 58.83 MB.
+    try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
+    const held = retainedSsmCheckpointBytes(&cfg, seq, 0, chunk);
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, held);
+    try t.expect(held > 1_800_000_000);
+    // It saturates: 393k holds the same 32 as 458k.
+    try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, 0, chunk));
+    // An arch with no linear layers is billed nothing.
+    var dense = model_mod.ModelConfig{};
+    dense.num_hidden_layers = 32;
+    dense.num_attention_heads = 32;
+    try t.expectEqual(@as(u64, 0), dense.ssmCheckpointBytes());
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&dense, seq, 0, chunk));
+
+    // 2. Reserved capacity: prompt + max_tokens + one chunk; the guard bills the headroom beyond
+    // the prompt's own rows, not a second copy of the cache.
+    const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    try t.expectEqual((2048 + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expect(terms.reserved_kv_bytes * 4 < seq * kv_per_tok); // headroom, not a copy
+    // The indexer history is billed at one copy plus the score bank (`statePerTokenBilled`).
+    try t.expectEqual(cfg.qsaHistoryBytesPerToken() + cfg.qsaScoreBankBytesPerToken(), statePerTokenBilled(&cfg));
+    try t.expectEqual((seq + 2048 + chunk) * statePerTokenBilled(&cfg), terms.state_bytes);
+    try t.expectEqual(held, terms.checkpoint_bytes);
+
+    // 3. The bill moved by more than 3 GB, toward a 503 instead of a corpse.
+    const with_terms = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms);
+    const without = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(&cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{});
+    try t.expect(with_terms > without + 3_000_000_000);
+    // The sentinel runs through the same path: an omitted max_tokens must not move the bill past the context.
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(@min(getEffectiveContextLength(&cfg), 1_048_576)));
+    const with_sentinel = prefillRequestTerms(&cfg, seq, sentinel, 8, chunk, .{});
+    const with_explicit = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
+    try t.expect(with_sentinel.reserved_kv_bytes < 8 * 1024 * 1024 * 1024);
+    try t.expect(with_sentinel.state_bytes < 4 * with_explicit.state_bytes);
+    try t.expectEqual(with_explicit.checkpoint_bytes, with_sentinel.checkpoint_bytes);
+
+    // A short prompt is untouched.
+    const short = prefillRequestTerms(&cfg, 4096, 2048, 8, chunk, .{});
+    try t.expectEqual(@as(u64, 0), short.reserved_kv_bytes);
+    try t.expectEqual(4096 * statePerTokenBilled(&cfg), short.state_bytes);
+}
+
+test "the reservation is bounded by the CONTEXT: an omitted max_tokens cannot bill 26 TB" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    // An omitted `max_tokens` is maxInt(u32)/4; the memory guard used to run before
+    // `clampMaxTokens`, so the reservation billed ~26 TB of KV and refused every long prompt.
+    const KVCache = transformer_mod.KVCache;
+    const ctx: u64 = 262_144;
+    const seq: u64 = 50_000;
+    const sentinel: u64 = omittedMaxTokensDefault(@intCast(ctx));
+    try t.expectEqual(@as(u64, std.math.maxInt(u32) / 4), sentinel);
+
+    // (1) The cache clamps: the reservation cannot exceed the context plus a chunk.
+    const reserved = KVCache.reservedTokens(seq, sentinel, 4096, ctx);
+    // Bounded twice: by the generation headroom first, by the context second.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, reserved);
+    try t.expect(reserved < ctx);
+    // (2) The four surfaces clamp first and hand the guard the clamped value.
+    const clamped: u64 = clampMaxTokens(@intCast(sentinel), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped);
+    try t.expectEqual(reserved, KVCache.reservedTokens(seq, clamped, 4096, ctx));
+
+    try t.expectEqual(seq + 2048 + 4096, KVCache.reservedTokens(seq, 2048, 4096, ctx));
+    // A caller that names no context is not context-clamped, but the headroom bound still applies.
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + 4096, KVCache.reservedTokens(seq, sentinel, 4096, 0));
+    try t.expectEqual(ctx + 4096, KVCache.reservedTokens(ctx, sentinel, 4096, ctx));
+
+    const cfg = qwen4ExpOomConfig();
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, 4096, .{});
+    try t.expect(terms.reserved_kv_bytes < 4 * 1024 * 1024 * 1024);
+}
+
+/// The generic admission bill for `qwen4ExpOomConfig`, minus the live-memory read a unit test cannot make.
+fn oomBillFor(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64, terms: PrefillRequestTerms) u64 {
+    return prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, prefillFfnWidth(cfg), 8, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(cfg), prefillDequantWeightBytes(cfg), terms) +
+        qsaMaskBytes(cfg, @min(chunk, @max(seq, 1)), seq);
+}
+
+test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the context" {
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    // A 383,067-token prompt with no `max_tokens` was admitted by eviction and then refused on
+    // the inference thread: `clampMaxTokens` made the reservation cover the whole context
+    // (~13 GB for a generation that would never run). The reservation exists to stop buffer
+    // coexistence during prefill, not to pre-buy a generation.
+    const KVCache = transformer_mod.KVCache;
+    const MB: u64 = 1024 * 1024;
+    const cfg = qwen4ExpOomConfig();
+    const ctx: u64 = getEffectiveContextLength(&cfg);
+    try t.expectEqual(@as(u64, 1_048_576), ctx);
+    const seq: u64 = 383_067;
+    const chunk: u64 = 4096;
+    const clamped: u64 = clampMaxTokens(@intCast(omittedMaxTokensDefault(@intCast(ctx))), @intCast(seq), @intCast(ctx));
+    try t.expectEqual(ctx - seq, clamped); // 665,509 — the live number
+
+    // The reservation is bounded by the headroom, not by the context.
+    const reserved = KVCache.reservedTokens(seq, clamped, chunk, ctx);
+    try t.expectEqual(seq + KVCache.RESERVE_GEN_HEADROOM + chunk, reserved);
+    try t.expect(reserved < seq + ctx / 8);
+    try t.expectEqual(seq + 512 + chunk, KVCache.reservedTokens(seq, 512, chunk, ctx));
+    try t.expectEqual(ctx + chunk, KVCache.reservedTokens(ctx - 16, clamped, chunk, ctx));
+
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
+    const terms = prefillRequestTerms(&cfg, seq, clamped, 8, chunk, .{});
+    try t.expectEqual((KVCache.RESERVE_GEN_HEADROOM + chunk) * kv_per_tok, terms.reserved_kv_bytes);
+    try t.expectEqual(reserved * statePerTokenBilled(&cfg), terms.state_bytes);
+
+    // ...and the whole bill drops by more than 10 GB, from above the live headroom to under it.
+    const ctx_bounded: PrefillRequestTerms = .{
+        .reserved_kv_bytes = (ctx + chunk - seq) * kv_per_tok,
+        .state_bytes = (ctx + chunk) * statePerTokenBilled(&cfg),
+        .checkpoint_bytes = terms.checkpoint_bytes,
+    };
+    const bill = oomBillFor(&cfg, seq, chunk, terms);
+    const old_bill = oomBillFor(&cfg, seq, chunk, ctx_bounded);
+    try t.expect(old_bill > bill + 10 * 1024 * MB);
+    try t.expect(old_bill > 37_000 * MB); // the live "needs ~37394MB"
+    try t.expect(bill < 30_000 * MB); // under the live "~37130MB available"
+}
+
+test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a restore will pin" {
+    const t = std.testing;
+    // The guard admitted on `available + evictable >= needed`, but the evictable 1,564 MB was
+    // the one entry this prompt then restored from; the provable credit is residency minus the largest entry.
+    const MB: u64 = 1024 * 1024;
+    var bill = AdmissionBill{ .needed = 37_394 * MB, .available = 37_130 * MB, .evictable = 1_564 * MB, .reclaimable = 0 };
+    try t.expect(!bill.fits());
+    try t.expect(!bill.fitsAfterEviction()); // it DID, before this fix
+    bill.reclaimable = 1_564 * MB;
+    try t.expect(bill.fitsAfterEviction());
+}
+
+test "the admission probe bills the request's OWN kv-quant and chunking, not the process defaults" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The probe used to hardcode `kv_override = null`, pricing a `kv_quant: 4` request at fp16 on the inference thread.
+    const t = std.testing;
+    const cfg = qwen4ExpOomConfig();
+    const seq: usize = 200_000;
+    const q4 = transformer_mod.KVQuantConfig.affine(4);
+    const q8 = transformer_mod.KVQuantConfig.affine(8);
+    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false, null, .{});
+    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false, null, .{});
+    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false, null, .{});
+    try t.expect(bill4.needed < bill8.needed);
+    try t.expect(bill8.needed < bill16.needed);
+}
+
+test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
+    const t = std.testing;
+    const cfg = qwen4ExpOomConfig();
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const one = cfg.qsaHistoryBytesPerToken();
+    const bank = cfg.qsaScoreBankBytesPerToken();
+    try t.expect(one > 0);
+    try t.expect(bank > 0 and bank < one);
+    defer transformer_mod.qsa_history_share_override = null;
+    transformer_mod.qsa_history_share_override = true;
+    try t.expectEqual(one + bank, statePerTokenBilled(&cfg));
+    transformer_mod.qsa_history_share_override = false;
+    try t.expectEqual(one * 2 + bank, statePerTokenBilled(&cfg));
+    transformer_mod.qsa_history_share_override = true;
+
+    const seq: u64 = 458_832;
+    const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
+    try t.expectEqual((seq + 2048 + 4096) * (one + bank), terms.state_bytes);
+
+    var dense = model_mod.ModelConfig{};
+    dense.num_hidden_layers = 32;
+    dense.num_attention_heads = 32;
+    try t.expectEqual(@as(u64, 0), statePerTokenBilled(&dense));
+}
+
+test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the floor" {
+    const t = std.testing;
+    const GB: u64 = 1 << 30;
+    // The 1M qwen4 case: 107.5 GB ceiling, ~70 GB weights, ~24 GB of 1M-ctx KV, ~3 GB reserve.
+    const ceiling: u64 = 107 * GB;
+    const weights: u64 = 70 * GB;
+    const ctx_kv: u64 = 24 * GB;
+    const transient: u64 = 3 * GB;
+
+    // RAM-first clamps the cache to the leftover: less than half an entry.
+    const ram_first = clampedPrefixCacheMem(0, ceiling, weights, ctx_kv, transient);
+    try t.expect(ram_first < ctx_kv);
+
+    // SSD-first floors at one entry and hands `--prefix-cache-mem` to idle entries on top.
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(0, ceiling, weights, ctx_kv, transient));
+    try t.expectEqual(ctx_kv + 4 * GB, ssdFirstPrefixCacheMem(4 * GB, ceiling, weights, ctx_kv, transient));
+    const huge = ssdFirstPrefixCacheMem(500 * GB, ceiling, weights, ctx_kv, transient);
+    try t.expectEqual(ctx_kv + (ceiling - weights - ctx_kv - transient), huge);
+    try t.expectEqual(ctx_kv, ssdFirstPrefixCacheMem(8 * GB, 80 * GB, weights, ctx_kv, transient));
+    try t.expect(ssdFirstPrefixCacheMem(0, 0, 0, 0, 0) >= 1);
+}
+
+/// The widest width the adaptive chooser may take for a prompt on this config.
+fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
+    return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
+}
+
+test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The down direction does not wait for a trend or a margin.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 1_048_576;
+    const kv: u64 = seq;
+    const cap = adaptCapFor(&cfg, seq);
+
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 2048, kv);
+        try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap, kv));
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
+        try t.expect(st.ratcheted);
+    }
+    // Several rungs in one call.
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const h = prefillChunkCost(&cfg, kv_bits, 512, kv);
+        try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
+    }
+    // No headroom at all: the ladder floor, never 0 (the loop reads 0 as "no change").
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const got = adaptivePrefillWidth(&cfg, kv_bits, kv, 0, cap, cap, &st);
+        try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), got);
+        try t.expect(got != 0);
+    }
+    {
+        var st: generate_mod.AdaptiveWidthState = .{};
+        const floor: u32 = @intCast(generate_mod.PREFILL_CHUNK_FLOOR);
+        try t.expectEqual(floor, adaptivePrefillWidth(&cfg, kv_bits, kv, 0, floor, cap, &st));
+    }
+}
+
+test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not second-guessed" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `prefillMemoryNeeded` already carries its own 5/4; a second 1.25 on the hold stepped the
+    // 768k prompt down from the width admission admitted.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 786_432;
+    const cap = adaptCapFor(&cfg, 786_432);
+    const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048, kv);
+
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k, 2048, cap, &st));
+    try t.expect(!st.ratcheted);
+    try t.expect(cost_2k * 5 / 4 > cost_2k);
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k * 5 / 4 - 1, 2048, cap, &st2));
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k - 1, 2048, cap, &st3) < 2048);
+}
+
+test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting probes" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // Holding is free, growing is a bet: two consecutive probes.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 524_288;
+    const cap = adaptCapFor(&cfg, 524_288);
+    const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
+
+    var st: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 1), st.supporting);
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
+
+    // Room for the wider chunk's bill but not its margin: never.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const between = cost_up * 5 / 4 - 1;
+    try t.expect(between >= cost_up);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st2));
+    }
+
+    // A single unsupporting probe resets the run.
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st3));
+    try t.expectEqual(@as(u8, 0), st3.supporting);
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+}
+
+test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `serve` installs `prefill_chunk_adapt` unconditionally, so `chunk_width_hook != null` is
+    // true on every arch and reading it as the gate put the scaled bound back everywhere. This
+    // builds the slot state the way `serve` does and asserts the two answers differ.
+    const t = std.testing;
+    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
+    defer scheduler_mod.prefill_chunk_adapt = null;
+    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
+    defer scheduler_mod.prefill_chunk_widen_ok = null;
+    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
+    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+
+    const hook_installed = scheduler_mod.prefill_chunk_adapt != null;
+    try t.expect(hook_installed);
+
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
+    try t.expect(!adaptive);
+    try t.expect(hook_installed != adaptive);
+
+    // A qwen3_5 slot keeps the flat bound, hook and all.
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptive));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, adaptive));
+    try t.expectEqual(@as(usize, 1), generate_mod.prefillChunkCount(812, 512, false, 0, 0, adaptive));
+
+    const cfg = qwen4RequestTestConfig();
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    if (unpinned) {
+        try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+        try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
+    }
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(null));
+    scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    try t.expect(!scheduler_mod.adaptiveChunkWidthFor(&cfg));
+    try t.expect(scheduler_mod.prefill_chunk_adapt != null); // ...with the hook still installed
+}
+
+test "the tail-merge bound scales ONLY where the per-chunk adaptive width is live" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // Every arch but an adaptive-width qwen4_exp keeps the flat `TAIL_MERGE_MAX` at every chunk width.
+    const t = std.testing;
+
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5";
+    try t.expect(!other.perRequestPrefillChunk());
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+    const off = adaptivePrefillChunkEnabled(&other);
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, off));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(2048, off));
+    try t.expectEqual(@as(usize, 812), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, off));
+
+    const cfg = qwen4RequestTestConfig();
+    try t.expect(cfg.perRequestPrefillChunk());
+    per_request_chunk_override = true;
+    defer per_request_chunk_override = null;
+    adaptive_chunk_override = true;
+    defer adaptive_chunk_override = null;
+    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
+    try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
+    // An operator pin turns the scaling back off.
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(generate_mod.TAIL_MERGE_MAX, generate_mod.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
+}
+
+test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const kv: u64 = 1_048_576;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    // Step down once, then hand it the whole machine: it stays (a re-widen would be a metronome).
+    var st: generate_mod.AdaptiveWidthState = .{};
+    const narrowed = adaptivePrefillWidth(&cfg, kv_bits, kv, prefillChunkCost(&cfg, kv_bits, 1024, kv), cap, cap, &st);
+    try t.expect(narrowed < cap);
+    try t.expect(st.ratcheted);
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(narrowed, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, narrowed, cap, &st));
+    }
+
+    // Nothing above the arch cap, ever.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, cap, cap, &st2));
+    }
+    // A cap of 0 (the unchunked vision arm) is "do not touch the width".
+    var st3: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, 0, 2048, 0, &st3));
+}
+
+test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small one never moves" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // Sweep: the width is the widest rung that fits, only narrows within one prefill, and is always forwardable.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const kv: u64 = 1_048_576;
+    const cap = adaptCapFor(&cfg, 1_048_576);
+
+    var st: generate_mod.AdaptiveWidthState = .{};
+    var width: u32 = cap;
+    var seen_narrower: usize = 0;
+    var headroom: u64 = 50 * 1024 * MiB; // the wired-limit box, quiet
+    var step: usize = 0;
+    while (step < 64) : (step += 1) {
+        const next = adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, width, cap, &st);
+        try t.expect(next <= width); // never widens after the first step-down
+        try t.expect(next >= @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        try t.expect(next <= cap);
+        try t.expect(prefillChunkCost(&cfg, kv_bits, next, kv) <= headroom or
+            next == @as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)));
+        if (next < width) seen_narrower += 1;
+        width = next;
+        headroom -|= 1024 * MiB; // a co-tenant, or the accreting state
+    }
+    try t.expect(seen_narrower >= 2);
+    try t.expectEqual(@as(u32, @intCast(generate_mod.PREFILL_CHUNK_FLOOR)), width);
+
+    // A 32k prompt on the same box: the width never moves.
+    var st2: generate_mod.AdaptiveWidthState = .{};
+    const cap32 = adaptCapFor(&cfg, 32_768);
+    var w32: u32 = cap32;
+    step = 0;
+    while (step < 16) : (step += 1) {
+        w32 = adaptivePrefillWidth(&cfg, kv_bits, 32_768, 50 * 1024 * MiB, w32, cap32, &st2);
+        try t.expectEqual(cap32, w32);
+    }
+    try t.expect(!st2.ratcheted);
+}
+
+test "prefillHeadroomNow subtracts the SSD writer's staged HOST bytes" {
+    // Staged host bytes come out of the same unified pool the widen bar reads.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    try t.expectEqual(90 * GiB, prefillHeadroomFrom(120 * GiB, 30 * GiB, 0));
+    try t.expectEqual(89 * GiB, prefillHeadroomFrom(120 * GiB, 30 * GiB, GiB));
+    // Saturating: a permit larger than the headroom refuses every widen.
+    try t.expectEqual(@as(u64, 0), prefillHeadroomFrom(120 * GiB, 119 * GiB, 8 * GiB));
+}
+
+test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not at one chunk" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // `prefillTransientReserve` bills the QSA sheet at `kv = chunk`; past the indexer budget the
+    // sheet costs its whole budget, so a widen decided on that number is unguarded.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const cap = adaptCapFor(&cfg, 786_432);
+    const short_kv: u64 = 4096;
+    const long_kv: u64 = 400_000;
+
+    // The bill is strictly larger at the live KV.
+    const at_short = prefillChunkCost(&cfg, kv_bits, cap, short_kv);
+    const at_long = prefillChunkCost(&cfg, kv_bits, cap, long_kv);
+    try t.expect(at_long > at_short);
+    // `prefillTransientReserve` is exactly the `kv = chunk` case.
+    try t.expectEqual(
+        prefillTransientReserve(&cfg, kv_bits, cap),
+        prefillTransientReserveAtKv(&cfg, kv_bits, cap, cap),
+    );
+
+    // Headroom that clears the short bill's 1.25 bar but not the long one: widen at 4k, refuse at 400k.
+    const headroom: u64 = at_short * 5 / 4 + 1;
+    try t.expect(headroom < at_long * 5 / 4);
+
+    var st_short: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+
+    var st_long: generate_mod.AdaptiveWidthState = .{};
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, 2048, cap, &st_long));
+    }
+    try t.expectEqual(@as(u8, 0), st_long.supporting);
+
+    // The hold keeps its margin-1.0 semantics at the live KV.
+    const hold = prefillChunkCost(&cfg, kv_bits, 2048, long_kv);
+    var st_hold: generate_mod.AdaptiveWidthState = .{};
+    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold, 2048, cap, &st_hold));
+    var st_down: generate_mod.AdaptiveWidthState = .{};
+    try t.expect(adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold - 1, 2048, cap, &st_down) < 2048);
+}
+
+test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned width" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    var other = qwen4RequestTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+    // Another arch never adapts; one switch disables both.
+    try t.expect(!adaptivePrefillChunkEnabled(&other));
+
+    per_request_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    per_request_chunk_override = null;
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+
+    adaptive_chunk_override = false;
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+    adaptive_chunk_override = null;
+
+    // An operator who pinned a width pinned every forward.
+    generate_mod.prefill_chunk_override = 4096;
+    generate_mod.prefill_chunk_explicit = true;
+    defer {
+        generate_mod.prefill_chunk_override = 8192;
+        generate_mod.prefill_chunk_explicit = false;
+    }
+    try t.expect(!adaptivePrefillChunkEnabled(&cfg));
+}
+
+test "resolvedContextForLoad: an auto boot bills the session it will serve, not the placeholder" {
+    // On an auto boot the effective-context accessor answered a 1024-token placeholder during the load.
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    // This box: ~28,909 MiB after the weights, 20,736 B/token at 1M/kv8, ~3 GiB transient.
+    const per_tok: u64 = 20_736;
+    const active: u64 = 70_000 * MiB;
+    const ceiling: u64 = active + 28_909 * MiB;
+    const transient: u64 = 3 * 1024 * MiB;
+    const cap: u32 = 1_048_576;
+
+    // Auto boot, nothing pinned: the session is what the machine can serve. `cache_reserve = 0`
+    // is a test isolation.
+    const auto = resolvedContextForLoad(0, 0, ceiling, active, 0, transient, per_tok, cap);
+    try t.expect(auto > 100_000);
+    try t.expect(auto <= cap);
+
+    // The placeholder bills ~26 MB of session and hands the idle allowance almost the whole machine.
+    const placeholder_kv: u64 = per_tok * 1024;
+    const real_kv: u64 = per_tok * auto;
+    try t.expect(placeholder_kv < 30 * MiB);
+    try t.expect(real_kv > 100 * placeholder_kv);
+    const ask: u64 = 24 * 1024 * MiB;
+    const bogus = ssdFirstPrefixCacheMem(ask, ceiling, active, placeholder_kv, transient);
+    const fixed = ssdFirstPrefixCacheMem(ask, ceiling, active, real_kv, transient);
+    try t.expect(bogus -| placeholder_kv == ask);
+    // Under the real session bill the same ask is clamped to what is left after the weights, one
+    // session and the transient (the helper's own contract, not a hand-picked byte count).
+    const idle_headroom: u64 = ceiling - (active + real_kv + transient);
+    try t.expectEqual(real_kv + idle_headroom, fixed);
+    try t.expect(fixed -| real_kv < ask);
+    try t.expect(fixed -| real_kv < (bogus -| placeholder_kv) / 2);
+
+    // An explicit --ctx-size wins outright, and a pinned context is used as-is.
+    try t.expectEqual(@as(u32, 262_144), resolvedContextForLoad(262_144, 0, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(@as(u32, 131_072), resolvedContextForLoad(0, 131_072, ceiling, active, 0, transient, per_tok, cap));
+    try t.expectEqual(cap, resolvedContextForLoad(0, 0, active + 900_000 * MiB, active, 0, transient, per_tok, cap));
+}
+
+test "the advertised context does not move with the cache ask" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // Sizing the context against the ask collapsed it (60GB ask -> 870 tokens); sizing against the
+    // resolved budget was a one-step loop. A constant reserve closes both.
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const MiB: u64 = 1 << 20;
+    const active: u64 = 69_827 * MiB;
+    const live_ceiling: u64 = 109_395 * MiB;
+    const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
+    const transient: u64 = prefillTransientReserve(&cfg, kv_bits, 4096);
+
+    // `max_pos` is 0: the checkpoint cap is applied by the caller after the margin.
+    const memory_ctx = safeContextForBudget(live_ceiling, active, CTX_SIZING_CACHE_RESERVE +| transient, per_tok, 0);
+    try t.expect(memory_ctx > 900_000);
+
+    // The two defect spellings.
+    const vs_ask = safeContextForBudget(live_ceiling, active, 60 * 1024 * MiB +| transient, per_tok, 0);
+    const vs_resolved = safeContextForBudget(live_ceiling, active, 48_673 * MiB +| transient, per_tok, 0);
+    try t.expect(vs_ask <= 1024);
+    try t.expect(vs_resolved <= 1024);
+
+    // The pair agrees at the advertised number: both sides go through `autoContextFrom`.
+    const advertised = autoContextFrom(memory_ctx, cfg.contextCap());
+    const clamp_ctx = resolvedContextForLoad(0, 0, live_ceiling, active, CTX_SIZING_CACHE_RESERVE, transient, per_tok, cfg.contextCap());
+    try t.expectEqual(advertised, clamp_ctx);
+}
+
+test "the published hot-cache budget is retired when the cache is dropped" {
+    // The budget is per model, the global is process-wide.
+    const t = std.testing;
+    publishResolvedPrefixCacheMem(4096);
+    try t.expectEqual(@as(u64, 4096), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    // Back to the ask, the honest pre-load answer.
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+
+    // A resolved zero is a real budget (`--prefix-cache-mem 0` under SSD-first); the sentinel is maxInt.
+    publishResolvedPrefixCacheMem(0);
+    try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    clearResolvedPrefixCacheMem();
+    try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+}
+
+test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {
+    const t = std.testing;
+    // Live: a 786,707-token warm turn restored its own 786,676-token entry and was then refused
+    // by name; the restore hands over the entry's buffers without a second copy, so those
+    // ~14.5 GB were already inside `mlx_get_active_memory` and `needed` billed them again.
+    const cfg = qwen4ExpOomConfig();
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const seq: u64 = 786_707;
+    const chunk: u64 = 512; // the width the ladder came down to that evening
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const mb: u64 = 1024 * 1024;
+    const available: u64 = 19_032 * mb;
+
+    // 13,056 B of 8-bit KV and 5,376 B of state per token (one history copy + the score bank).
+    // The credit prices KV only: the history is privatised on restore.
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    try t.expectEqual(@as(u64, 13_056), kv_per_tok);
+    try t.expectEqual(@as(u64, 3_840), cfg.qsaHistoryBytesPerToken());
+    try t.expectEqual(@as(u64, 5_376), statePerTokenBilled(&cfg));
+
+    // Cold: the refusal, reproduced.
+    const cold = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+    // 24,475 MB here (the live log printed 25,866 under the two-copy bill); a synthetic config
+    // can claim within 3%. The sign is what matters: still a refusal.
+    try t.expect(cold / mb > 24_000 and cold / mb < 25_000);
+    try t.expect(cold > available);
+
+    // Warm: the entry's buffers hold the capacity the previous turn reserved, which still covers
+    // this turn's reservation, so nothing grows.
+    const matched: u64 = 786_676;
+    const capacity: u64 = 787_456;
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(@as(u64, 787_419), reserved);
+    try t.expect(reserved <= capacity);
+
+    // `will_donate`: this restore checked out its entry, so the buffers are the slot's own.
+    const warm_prefix = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = capacity, .will_donate = true };
+    try t.expectEqual(matched, warm_prefix.creditedRows(reserved));
+
+    // The credit is the handed-over rows at this arch's KV width and nothing else, inside the 5/4.
+    const credit = matched * kv_per_tok;
+    try t.expectEqual(@as(u64, 786_676 * 13_056), credit);
+    try t.expect(credit < matched * (kv_per_tok + cfg.qsaHistoryBytesPerToken()));
+    const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, warm_prefix);
+    // Isolated against a shared restore of the same span: `checkpoint_bytes` follows `matched` too.
+    const shared_same_span = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = capacity });
+    try t.expect(shared_same_span < cold);
+    try t.expectEqual(shared_same_span - credit * 5 / 4, warm);
+
+    // The verdict flips: admitted outright, no eviction pass. Under-crediting is the safe direction.
+    try t.expect(warm < available);
+    try t.expect(warm / mb > 9_500 and warm / mb < 11_000);
+
+    // A cold prompt on the same box keeps the old refusal.
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) > available);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = 0, .capacity_tokens = capacity, .will_donate = true }) > available);
+}
+
+test "a chain extension that OUTGROWS the resident entry is credited the rows it holds" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    // Past the restored capacity the cache grows per layer: the resident rows stay credited and
+    // the grow bills the new capacity beyond the old plus one eval window of old buffers.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 1_047_556;
+    const chunk: u64 = 512;
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const capacity: u64 = 787_456; // what the 786k turn reserved
+
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(@as(u64, 1_048_268), reserved);
+    const extend = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = capacity, .will_donate = true };
+    try t.expect(reserved > capacity);
+    try t.expect(extend.grows(seq));
+    try t.expectEqual(@as(u64, 786_707), extend.creditedRows(reserved));
+    const per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const ext_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, extend);
+    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    try t.expectEqual(capacity * per_tok / cfg.attnCacheLayerCount() * window, ext_terms.grow_coexist_bytes);
+    try t.expectEqual(
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) -
+            (786_707 * per_tok - ext_terms.grow_coexist_bytes) * 5 / 4,
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, extend),
+    );
+
+    // A buffer that already covers the reservation credits the full shared prefix: the gate is capacity, not prompt length.
+    const roomy = WarmPrefix{ .matched_tokens = 786_707, .capacity_tokens = 1_048_576, .will_donate = true };
+    try t.expectEqual(@as(u64, 786_707), roomy.creditedRows(reserved));
+    const credit = 786_707 * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    try t.expectEqual(
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{}) - credit * 5 / 4,
+        prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, roomy),
+    );
+}
+
+/// The live 768k scenario's checkout inputs, as `prefix_cache.checkoutEligible` takes them.
+const CheckoutCase = struct {
+    ssd_first: bool = true,
+    move_enabled: bool = true,
+    pending_disk: bool = false,
+    entry_tokens: usize = 786_695,
+    shared: usize = 786_695,
+    prompt_len: usize = 786_707,
+    has_slot: bool = true,
+
+    /// The WarmPrefix the scheduler builds, with `will_donate` from restore-move's own predicate.
+    fn warm(self: CheckoutCase, matched: u64, capacity: u64) WarmPrefix {
+        return .{
+            .matched_tokens = matched,
+            .capacity_tokens = capacity,
+            .will_donate = prefix_cache_mod.HotPrefixCache.checkoutEligible(
+                self.ssd_first,
+                self.move_enabled,
+                self.pending_disk,
+                self.entry_tokens,
+                self.shared,
+                self.prompt_len,
+                self.has_slot,
+            ),
+        };
+    }
+};
+
+test "the warm KV credit fires ONLY where the restore checked its entry out" {
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    // `KVCache.restore` binds by refcount and mlx donates only at `use_count() == 1`, so on a
+    // shared restore the first `writeAtOffset` copies the whole prefix: the credited bytes are
+    // allocated. Only the checkout makes the credit true; it used to fire on `matched > 0` alone.
+    const cfg = qwen4ExpOomConfig();
+    const seq: u64 = 786_707;
+    const chunk: u64 = 512;
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 200;
+    const mb: u64 = 1024 * 1024;
+    const matched: u64 = 786_676;
+    const capacity: u64 = 787_456;
+    const reserved = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    const cold = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+
+    // (1) qwen4_exp, SSD-first, full-prefix hit, switch on: the credit is real.
+    const donating = (CheckoutCase{}).warm(matched, capacity);
+    try t.expect(donating.will_donate);
+    try t.expectEqual(matched, donating.creditedRows(reserved));
+    const warm = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, donating);
+    // Baseline = a shared restore of the same span, so the two credits are not folded into one comparison.
+    const shared_same_span = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, .{ .matched_tokens = matched, .capacity_tokens = capacity });
+    try t.expectEqual(shared_same_span - matched * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) * 5 / 4, warm);
+    try t.expect(warm / mb > 9_500 and warm / mb < 11_000);
+
+    // Every arm below is the same restore minus one conjunct of the checkout, and every one shares.
+    const shared_arms = [_]WarmPrefix{
+        // (2) a partial hit: the entry describes a prefix this prompt left.
+        (CheckoutCase{ .shared = 700_000 }).warm(matched, capacity),
+        // (3) a non-qwen4 arch: a checkout can never be taken there.
+        (CheckoutCase{ .ssd_first = false }).warm(matched, capacity),
+        // (4) `MLX_SERVE_RESTORE_MOVE=0`: the refcount share.
+        (CheckoutCase{ .move_enabled = false }).warm(matched, capacity),
+        // (5) a pending disk record shares the same buffers.
+        (CheckoutCase{ .pending_disk = true }).warm(matched, capacity),
+        // (6) no slot to hand the buffers to (the connection thread's shape).
+        (CheckoutCase{ .has_slot = false }).warm(matched, capacity),
+    };
+    for (shared_arms, 0..) |arm, i| {
+        errdefer std.debug.print("shared arm {d} credited\n", .{i});
+        try t.expect(!arm.will_donate);
+        try t.expectEqual(@as(u64, 0), arm.creditedRows(reserved));
+        try t.expectEqual(shared_same_span, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, arm));
+    }
+    // ...and `cold` is still the number a prompt with NO resident prefix pays,
+    // which is what the `.{}` arm above is for.
+    try t.expect(cold > shared_same_span);
+
+    // Capacity is a CEILING on the credit, not a switch: a buffer holding 700,000 rows donates
+    // them and the request is billed the growth on top.
+    const outgrown = (CheckoutCase{}).warm(matched, 700_000);
+    try t.expect(outgrown.will_donate);
+    try t.expectEqual(@as(u64, 700_000), outgrown.creditedRows(reserved));
+    try t.expect(outgrown.grows(seq));
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const og_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, outgrown);
+    // 31 tokens wide, BELOW `prefillEvalCadenceApplies`: one eval for the whole layer loop, so
+    // every old buffer is alive at once and the coexistence term cancels the credit exactly.
+    try t.expect(seq - matched < 32);
+    try t.expectEqual(700_000 * kv_per_tok, og_terms.grow_coexist_bytes);
+    try t.expectEqual(shared_same_span, prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, outgrown));
+    // An append wide enough to take the cadence pays ONE eval window instead, and that is the
+    // difference between the old bill and the new one.
+    const wide = WarmPrefix{ .matched_tokens = 700_000, .capacity_tokens = 700_000, .will_donate = true };
+    const wide_terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, wide);
+    const window = attnLayersPerEvalWindow(&cfg, transformer_mod.Transformer.MOE_EVAL_EVERY_N_LAYERS);
+    try t.expect(window < cfg.attnCacheLayerCount());
+    try t.expectEqual(700_000 * kv_per_tok / cfg.attnCacheLayerCount() * window, wide_terms.grow_coexist_bytes);
+    try t.expect(prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, wide) < shared_same_span);
+}
+
+test "pinnedResidentBytes names the entry a restore would share, and only that" {
+    const t = std.testing;
+    // Residency the eviction pass cannot return: the connection thread's one signal that this prompt is warm.
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 0, .reclaimable = 0 }));
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 4096, .reclaimable = 4096 }));
+    // The live 768k reading: 24,826 MB resident, 10,294 MB reclaimable.
+    const mb: u64 = 1024 * 1024;
+    try t.expectEqual(@as(u64, 14_532 * mb), pinnedResidentBytes(.{ .evictable = 24_826 * mb, .reclaimable = 10_294 * mb }));
+    // Saturating: the two numbers are published from different sites.
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(.{ .evictable = 1, .reclaimable = 2 }));
+}
+
+test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-only" {
+    // Both sizer changes (dropping the ask, the ctx bar) moved the prefill width on every arch;
+    // the ungated arithmetic is the previous `resolvePrefillChunk`.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const ceiling: u64 = 120 * GiB;
+    const weights: u64 = 69 * GiB;
+    const ask: u64 = 10 * GiB;
+    const ctx_kv: u64 = 20 * GiB;
+
+    // Every other arch: the ask is spoken for, the context is not, no HOT_CACHE_FLOOR.
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
+        var cfg = longCtxTestConfig();
+        cfg.model_type = mt;
+        const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, ctx_kv, ask));
+        try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, 48 * GiB, ask));
+        try t.expect(prefillChunkCap(&cfg, ceiling, weights, ctx_kv, 0) > baseline);
+    }
+
+    // qwen4_exp: the ask is ignored, and the ctx bar binds.
+    var q4 = longCtxTestConfig();
+    q4.model_type = "qwen4_exp";
+    const serving: u64 = ceiling - weights;
+    const share_bar: u64 = serving / PREFILL_RESERVE_BUDGET_SHARE;
+    const want: u64 = @min(share_bar, (serving - ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
+    try t.expectEqual(want, prefillChunkCap(&q4, ceiling, weights, ctx_kv, ask));
+    try t.expectEqual(
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 0),
+        prefillChunkCap(&q4, ceiling, weights, ctx_kv, 24 * GiB),
+    );
+    try t.expect(prefillChunkCap(&q4, ceiling, weights, 48 * GiB, ask) < share_bar);
+}
+
+test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // The allocator side of the reservation is gated (`generate.reservedPrefillTokens`); the
+    // guard side was not, so off qwen4_exp the bill charged headroom never reserved.
+    const t = std.testing;
+    const seq: u64 = 200_000; // well past RESERVE_MIN_TOKENS
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+
+    // A 27B-class GDN pack: `ssmCheckpointBytes()` is non-zero here.
+    var q35 = qwen4ExpOomConfig();
+    q35.model_type = "qwen3_5_moe";
+    try t.expect(q35.ssmCheckpointBytes() > 0);
+    try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
+
+    // Supplies the donating case so the qwen4_exp assertion below is falsifiable; the ungated loop reads 0 through `.{}`.
+    const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
+        var cfg = qwen4ExpOomConfig();
+        cfg.model_type = mt;
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
+        try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
+        try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        try t.expectEqual(@as(u64, 0), terms.state_bytes);
+        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
+        // `.{}` is the identity: the whole bill is the previous expression.
+        try t.expectEqual(
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms),
+        );
+    }
+
+    const q4 = qwen4ExpOomConfig();
+    const gated = prefillRequestTerms(&q4, seq, max_tokens, kv_bits, chunk, warm);
+    try t.expect(gated.reserved_kv_bytes > 0);
+    try t.expect(gated.checkpoint_bytes > 0);
+    try t.expect(gated.state_bytes > 0);
+    try t.expect(gated.shared_resident_bytes > 0);
+}
+
+test "ctxSizingCacheReserve: the advertised context is unchanged on every other arch" {
+    // The constant changes the advertised `context_length` at every ask except the 2 GiB default,
+    // and an agent CLI budgets against that number for a whole session.
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    const saved = prefix_cache_mem_bytes;
+    defer prefix_cache_mem_bytes = saved;
+
+    var q4 = longCtxTestConfig(); // declares qwen4_exp
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+
+    for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        try t.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&q4));
+        try t.expectEqual(ask, ctxSizingCacheReserve(&other));
+    }
+
+    // At the default ask the two agree: a default boot is unchanged on every arch.
+    prefix_cache_mem_bytes = CTX_SIZING_CACHE_RESERVE;
+    try t.expectEqual(ctxSizingCacheReserve(&q4), ctxSizingCacheReserve(&other));
+
+    // The reserve really moves the advertised context on the ungated arch.
+    const kv_bits: u64 = 8;
+    const per_tok = kvBytesPerTokenAtBits(other.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&other);
+    const ceiling: u64 = 120 * GiB;
+    const active: u64 = 69 * GiB;
+    const transient = prefillTransientReserve(&other, kv_bits, 4096);
+    const small = safeContextForBudget(ceiling, active, 2 * GiB +| transient, per_tok, 0);
+    const big = safeContextForBudget(ceiling, active, 40 * GiB +| transient, per_tok, 0);
+    try t.expect(big < small);
+}
+
+test "prefillAdmissionBill: the evict-to-admit credits are qwen4_exp-only" {
+    // Both admit arms are driven entirely by the two credits, so zeroing them restores the
+    // previous single `needed > available` refusal.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    const gated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 15 * MB };
+    try t.expect(!gated.fits());
+    try t.expect(gated.fitsAfterEviction()); // evict-and-admit
+    try t.expectEqual(AdmissionVerdict.evict, admissionVerdict(gated));
+
+    const deferral = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB, .evictable = 15 * MB, .reclaimable = 0 };
+    try t.expect(!deferral.fitsAfterEviction());
+    try t.expect(pinnedResidentBytes(deferral) > 0); // warm deferral
+
+    // Ungated the bill carries neither credit, and both arms go dead.
+    const ungated = AdmissionBill{ .needed = 30 * MB, .available = 20 * MB };
+    try t.expectEqual(ungated.fits(), ungated.fitsAfterEviction());
+    try t.expectEqual(@as(u64, 0), pinnedResidentBytes(ungated));
+    try t.expectEqual(AdmissionVerdict.refuse, admissionVerdict(ungated));
+    // A bill that fits still admits on both arms.
+    const roomy = AdmissionBill{ .needed = 10 * MB, .available = 20 * MB };
+    try t.expectEqual(AdmissionVerdict.admit, admissionVerdict(roomy));
+}
+
+test "memoryRefusalMessage: the 400 names the hot cache only where the bill carries it" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    // A non-qwen4 refusal read "the hot prefix cache holds ~0MB ..." on a box with a multi-GB resident cache.
+    const t = std.testing;
+    const MB: u64 = 1024 * 1024;
+
+    // Ungated: the previous sentence, byte for byte.
+    const bare = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, false);
+    defer t.allocator.free(bare);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB available. Reduce prompt size or use a smaller model.",
+        bare,
+    );
+
+    // Gated: the message quotes what the guard compared.
+    const rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, true);
+    defer t.allocator.free(rich);
+    try t.expect(std.mem.indexOf(u8, rich, "holds ~1500MB more") != null);
+    try t.expect(std.mem.indexOf(u8, rich, "(~900MB") != null);
+
+    // The gated arch reaches this arm with an empty cache too and keeps its bytes, zeroes and all.
+    const q4_cold = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{ .needed = 30 * MB, .available = 20 * MB }, true);
+    defer t.allocator.free(q4_cold);
+    try t.expectEqualStrings(
+        "Prompt (12000 tokens) requires ~4096MB GPU memory but only ~2048MB is available and the hot prefix cache holds ~0MB more, all of which can be reclaimed (~0MB — the shortfall is elsewhere), which is not enough. Reduce prompt size, lower --ctx-size, or use a smaller model.",
+        q4_cold,
+    );
+    const ungated_rich = try memoryRefusalMessage(t.allocator, 12_000, 4096, 2048, .{
+        .needed = 30 * MB,
+        .available = 20 * MB,
+        .evictable = 1500 * MB,
+        .reclaimable = 900 * MB,
+    }, false);
+    defer t.allocator.free(ungated_rich);
+    try t.expectEqualStrings(bare, ungated_rich);
+}
+
+/// The live 364k agent session: `qwen4ExpOomConfig` plus the deployed pack's indexer budget 2048,
+/// four indexer heads, affine-4 weights and `--ctx-size 786432`; reproduces the incident's bills to the MB.
+fn qwen4ExpLive364kConfig() model_mod.ModelConfig {
+    var cfg = qwen4ExpOomConfig();
+    cfg.pinned_context = 786_432;
+    cfg.indexer_budget = 2048;
+    cfg.indexer_n_heads = 4;
+    cfg.quant_bits = 4;
+    cfg.quant_mode = .affine;
+    cfg.max_position_embeddings = 1_048_576;
+    return cfg;
+}
+
+test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
+    // Turn B: prompt 368,208, restored 364,478 by move, refused by 290 MB at width 512. 1,795 MB
+    // of the bill was 32 SSM checkpoints; a warm prefill forwards a 3,730-token tail and captures
+    // at most one, and the entry's own checkpoints are already resident and merged at commit.
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const cfg = qwen4ExpLive364kConfig();
+    const mb: u64 = 1024 * 1024;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const seq: u64 = 368_208;
+    const matched: u64 = 364_478;
+    const chunk: u64 = 512;
+    // The stride follows the uncapped base chunk (`prefill_chunk_override`), not the adaptive width.
+    const saved_override = generate_mod.prefill_chunk_override;
+    defer generate_mod.prefill_chunk_override = saved_override;
+    generate_mod.prefill_chunk_override = 8192;
+    const stride: u64 = 8192;
+    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(ssm_checkpoint_stride, 8192));
+
+    // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
+    // Warm: a 3,730-token append at stride 8192 crosses no boundary, so the end snapshot is the whole of it.
+    try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
+    // A chain extension long enough to fill the ring still bills the cap: the
+    // credit is proportional to the SPAN, not a blanket warm discount.
+    try t.expectEqual(@as(u64, ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
+    // A span shorter than the backoff window snapshots nothing.
+    try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
+
+    // The bill term by term, from the same inputs `prefillMemoryNeeded` reads.
+    const kv_bits: u64 = 8;
+    const max_tokens: u32 = 418_224;
+    // The restored buffer is smaller than the reservation, so it grows and the rows it holds
+    // are still credited. This block keeps the original turn-B decomposition by pricing the
+    // SHARED restore of the same span, whose credit is zero for the other reason.
+    const turn_b_donating = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = true };
+    const turn_b = WarmPrefix{ .matched_tokens = matched, .capacity_tokens = 365_568, .will_donate = false };
+    const reserve_rows = reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg));
+    try t.expectEqual(seq + transformer_mod.KVCache.RESERVE_GEN_HEADROOM + chunk, reserve_rows);
+    try t.expect(reserve_rows > turn_b.capacity_tokens);
+    try t.expectEqual(@as(u64, 0), turn_b.creditedRows(reserve_rows));
+    try t.expectEqual(@as(u64, 364_478), turn_b_donating.creditedRows(reserve_rows));
+
+    const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+    const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
+    // On a GDN MoE the envelope is the stream arm, not 3 x MLP.
+    const mlp: u64 = 8 * chunk * @max(cfg.hidden_size, prefillFfnWidth(&cfg)) * 2;
+    const envelope: u64 = @max(3 * mlp, mlp + chunk * prefillStreamBytesPerToken(&cfg));
+    try t.expect(envelope > 3 * mlp);
+    const gross =
+        seq * kv_per_tok + // 4,584.6 MB  the prompt's own KV rows
+        terms.reserved_kv_bytes + //   108.4 MB  reservation headroom past the prompt
+        terms.state_bytes + // 1,932.4 MB  QSA key history + block-score bank
+        terms.checkpoint_bytes + //    56.1 MB  ONE new SSM checkpoint (was 1,795.5)
+        2 * seq * cfg.num_key_value_heads * cfg.head_dim * 2 + //   719.2 MB  KV dequant transient
+        envelope + //   665.0 MB  MLP envelope + the arch's own prefill streams
+        PREFILL_RUNTIME_FLOOR_BYTES; //   512.0 MB
+    // No score scratch (hd 256 is fused) and no dequant-GEMM weights (fwd 512
+    // is below PREFILL_DQ_GEMM_MIN_M) at this width.
+    try t.expect(transformer_mod.prefillHeadDimFused(@intCast(cfg.prefillScoreHeadDim())));
+    try t.expect(chunk < transformer_mod.PREFILL_DQ_GEMM_MIN_M);
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, chunk, turn_b);
+    try t.expectEqual(gross * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq), needed);
+
+    // AND THE VERDICT MOVES. 13,664 MB refused against 13,374 MB available;
+    // the honest checkpoint term brings it under, so the turn is served.
+    const available: u64 = 13_374 * mb;
+    try t.expect(needed < available);
+    try t.expectEqual(@as(u64, 11_490), needed / mb);
+    const before = gross - terms.checkpoint_bytes + @as(u64, ssm_checkpoint_max) * per_cp;
+    try t.expectEqual(@as(u64, 13_664), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
+    try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
+}
+
+test "the live 364k session's admission numbers reproduce, to the megabyte" {
+    // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints
+    // the incident's own numbers (Turn A admitted at 16,233 MB; Turn B refused at 13,664 MB).
+    const t = std.testing;
+    transformer_mod.qsa_score_fused_override = false;
+    defer transformer_mod.qsa_score_fused_override = null;
+    const cfg = qwen4ExpLive364kConfig();
+    const mb: u64 = 1024 * 1024;
+    const kv_bits: u64 = 8;
+    // Turn A, width 2048, prompt 364,509, max_gen 421,923.
+    try t.expectEqual(
+        @as(u64, 16_233),
+        prefillNeededAtChunk(&cfg, 364_509, 421_923, kv_bits, 2048, .{}) / mb,
+    );
+    try t.expectEqual(
+        @as(u64, 13_664),
+        prefillNeededAtChunk(&cfg, 368_208, 418_224, kv_bits, 512, .{}) / mb,
+    );
+}
+
+test "the MLX buffer pool is inside `available` by construction, so a refusal cannot buy it back" {
+    // `currentGpuMemoryCeiling` adds the pool to the footprint before the physical minimum, so on
+    // the physical arm `available` is `cache_bytes + free_system` and a clear moves it by zero.
+    const t = std.testing;
+    const wired: u64 = 120 << 30;
+    const active: u64 = 71_310 << 20;
+    const pool: u64 = 8_268 << 20;
+    const free_system: u64 = 12_546 << 20;
+    const ceiling = physicalMemoryCeiling(wired, active + pool, free_system);
+    try t.expect(ceiling < wired); // the physical arm, as on the box
+    try t.expectEqual(pool + free_system, ceiling - active);
+    const cleared = physicalMemoryCeiling(wired, active, free_system + pool);
+    try t.expectEqual(ceiling, cleared);
+}
+
+test "a request integer from a client is clamped, never blindly @intCast" {
+    // Bar: `seed: -1`, a 2^32 max_tokens and an out-of-range budget resolve without a cast.
+    const t = std.testing;
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
+    try t.expectEqual(@as(?u64, 0), parseRequestSeed(.{ .integer = 0 }));
+    try t.expectEqual(@as(?u64, 42), parseRequestSeed(.{ .integer = 42 }));
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "42" }));
+    try t.expectEqual(@as(?u64, null), parseRequestSeed(null));
+
+    try t.expectEqual(@as(u32, std.math.maxInt(u32)), resolveRequestMaxTokens(.{ .integer = 1 << 32 }, 7));
+    try t.expectEqual(@as(u32, 512), resolveRequestMaxTokens(.{ .integer = 512 }, 7));
+    try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 0 }, 7));
+
+    try t.expectEqual(@as(i32, std.math.maxInt(i32)), clampJsonI32(1 << 40));
+    try t.expectEqual(@as(i32, std.math.minInt(i32)), clampJsonI32(-(1 << 40)));
+    try t.expectEqual(@as(i32, -1), clampJsonI32(-1));
+    try t.expectEqual(@as(i32, 1024), clampJsonI32(1024));
+}
+
+test "a vanished client is not a token cap: the non-stream finish reason says so" {
+    // Bar: the non-streaming path reports what the three streaming paths do.
+    const t = std.testing;
+    try t.expectEqualStrings("client_disconnect", nonStreamFinishReason(true, "length"));
+    try t.expectEqualStrings("stop", nonStreamFinishReason(false, "stop"));
+    try t.expectEqualStrings("length", nonStreamFinishReason(false, "length"));
+}
+
+test "a tool-call answer keeps the model's visible preamble" {
+    // Bar: non-streamed content == what the stream flushes before the tool markup.
+    const t = std.testing;
+    const raw = "<think>pick a tool</think>Checking the weather.\n<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>";
+    const split = chat_mod.splitThinkBlock(raw, true, false);
+    try t.expectEqualStrings("Checking the weather.", visibleToolPreamble(split.content));
+    const bare = chat_mod.splitThinkBlock("<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>", true, false);
+    try t.expectEqualStrings("", visibleToolPreamble(bare.content));
+    try t.expectEqualStrings("", visibleToolPreamble("  \n "));
+}
+
+test "a streaming stop sequence cuts at the match, not at the token boundary" {
+    // Bar: the streamed bytes are the bytes non-streaming keeps (`text[0..idx]`).
+    const t = std.testing;
+    const stops = [_][]const u8{"\n\nHuman:"};
+    // The stop opens inside the token that completes it: the leading bytes of
+    // that token are answer text and must still be delivered.
+    const buf = "Paris.\n\nHuman:";
+    const cut = stopSequenceCut(buf, "s.\n\nHuman:".len, &stops).?;
+    try t.expectEqual(@as(usize, 6), cut.index);
+    try t.expectEqual(@as(usize, 2), cut.token_keep);
+    try t.expectEqualStrings("\n\nHuman:", cut.matched);
+    // Match entirely inside already-delivered bytes: nothing of this token survives.
+    const late = stopSequenceCut(buf, 1, &stops).?;
+    try t.expectEqual(@as(usize, 6), late.index);
+    try t.expectEqual(@as(usize, 0), late.token_keep);
+    // Earliest match wins, and a clean buffer cuts nothing.
+    const many = [_][]const u8{ "END", "N" };
+    try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
+    try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
 }

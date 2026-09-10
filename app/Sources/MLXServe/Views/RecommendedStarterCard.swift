@@ -124,10 +124,10 @@ struct RecommendedStarterCard: View {
     static func lead(for pick: RecommendedModelPick) -> String {
         let what: String
         switch pick.id {
-        case "gemma-4-e2b":     what = "A small, quick assistant"
         case "gemma-4-e4b":     what = "A fast, capable assistant"
         case "gemma-4-12b":     what = "A capable all-round assistant"
         case "qwen38-27b":      what = "A strong assistant, great at code"
+        case "qwen38-flash-next": what = "A frontier-class assistant, fast for its size"
         default:                what = "A local AI assistant"
         }
         return "\(what) · \(String(format: "%.1f GB", pick.sizeGB))"

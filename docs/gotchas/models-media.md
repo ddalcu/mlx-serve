@@ -2,6 +2,10 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
+
+Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).
+
 ### A reference-image editor that honors the requested size distorts every non-square edit (MageFlow Edit)
 MageFlow's edit path is in-context: each reference is VAE-encoded AT THE TARGET SIZE and its latent tokens are concatenated into the DiT image stream beside the denoising target, so target and references share one (lh, lw) grid. The port took (W,H) straight from the request, which defaults to 1024×1024 — and the app ALWAYS sends an explicit size from its resolution picker, so in practice every edit of a phone photo went through a 3:2 → 1:1 bicubic squash before the model ever saw it. Nothing errors; the output is a competent edit of a distorted picture, which reads as "the model is bad at faces" rather than as a preprocessing bug. The reference pipeline never has this problem because it resolves the target from the primary reference (`resolve_target_size(refs[0], …)`, /16 floor) instead of from a request field. Fix (`gen.fitAspect`, applied on the `editUsesRawBytes` path only): the primary reference's ASPECT wins, the requested size is reinterpreted as the pixel BUDGET it's fitted to, result rounded to /16 and logged (`edit: target 1024x1024 -> 1360x768 (primary reference is 1536x864)`). The FLUX edit path is untouched — its references keep their own aspect and its output grid is independent, which is the same principle reached a different way. Two robustness guards landed with it, both in the same "two independent paths must agree" shape: `encodeEdit` asserts the `<|image_pad|>` count equals the merged vision-feature rows (prompt templating and the ViT grid are computed separately; a mismatch dies inside `mlx_put_along_axis`, which is an uncatchable server kill, not an error), and `buildEditPromptIds` caps the templated prompt at `EDIT_DROP_TOKENS + TE_MAX_COND` exactly like the txt2img path — the LM's causal mask is materialized DENSE on the host, so a client prompt of 120k tokens asked for a ~57 GB allocation before a single matmul (live: that request now returns a normal image in 7 s).
 
@@ -1691,3 +1695,45 @@ Two things learned on the way:
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
 H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+
+## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
+
+`NgramHash.init` wrote `[MAX_HEADS]` and `[MAX_NGRAM_SIZE]` arrays from
+`heads_per_ngram` and `ngram_size` behind a `std.debug.assert`, which is
+compiled out of every ReleaseFast binary we ship: a config claiming 16 heads
+wrote 64 i64s into two 32-element arrays. The indexer's `compress_ratio` was
+never checked (a zero divisor is illegal behaviour, not a trap), the n-gram
+table header was read with bare `.?`/`.string`/`.array` unwraps on a 32 GB
+mmap the engine then slices with, and nothing proved the PLE was ever
+installed (placement is by exact equality against `ple_layer_idx`; an absent
+or out-of-trunk id built a trunk with no n-gram term that emitted plausible
+text). `model.validateQwen4Config` reads every bound strictly and refuses by
+NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
+reaching the client as `Model load failed: <name>`), `NgramTable.parse`
+checks every header field and proves every region sits inside the mapping,
+and a PLE the layer loop never installed is a load error.
+
+## Spark-X2.5 (`spark2_5`) port (2026-09-09)
+
+XHToken's 1.7B/4B dense models load from the community MLX packs
+(`abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`, mlx-lm layout, same weight names as
+the HF checkpoint) on the standard dense forward. What the arch adds over
+gemma3/muse: exact-erf GELU (`HiddenAct.gelu`, not the tanh approximation the
+compiled GeGLU runs), a fused `q_k_v_proj` row-sliced into q/k/v at load
+(`splitFusedQkvRows`, materialized; dense packs are transposed inside the
+split so the generic transpose pass skips them), an `out_proj` spelling, and
+a PER-HEAD sigmoid output gate (`g_proj` is `[heads, hidden]`, broadcast over
+head_dim in `attnOutGate` — muse's gate is per channel and the same helper
+serves both). Per-type RoPE (sliding: full rotary at 1e4; full: 25% rotary at
+5e6) and the 3:1 sliding(512)/full ladder were already generic
+(`layer_types` + `rope_parameters.{full,sliding}_attention`).
+
+Tokenizer trap: the pre_tokenizer is DeepSeek's (`\p{N}{1,3}` first) but a
+later `Digits(individual_digits)` rule re-splits every group, so the
+checkpoint is per-digit. `digitGroupFromPreTokenizer` used to stop at the
+first `{1,3}` and would have served 3-digit groups. Cross-checked against
+HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
+
+Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
+tool-response turn, 2.8k-token needle past the 512 window) and the HF
+reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).

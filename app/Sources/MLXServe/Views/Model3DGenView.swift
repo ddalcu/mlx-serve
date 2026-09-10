@@ -13,6 +13,7 @@ import UniformTypeIdentifiers
 struct Model3DGenView: View {
     @EnvironmentObject var service: Model3DGenService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For the model row's Download button (`MediaModelChooser`) — a completed
     /// transfer has to re-scan the models directory.
@@ -392,11 +393,7 @@ struct Model3DGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "3D generation log"
-        alert.informativeText = logText.isEmpty ? "(no output)" : logText
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }
 

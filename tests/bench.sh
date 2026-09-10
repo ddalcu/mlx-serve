@@ -57,16 +57,12 @@ OUT="$HOME/claude-tmp/bench-$TAG"
 mkdir -p "$OUT"
 
 # ── Model matrix: logical|path ──
-# qwen36-27b is oMLX's own oQ4e checkpoint with inline MTP weights, loaded
-# unmodified by us; qwen36-27b-mtplxopt is MTPLX's. A missing path skips the
-# row silently — a bench you can't run on this box isn't an error on the box
-# that can.
+# A missing path skips the row silently — a bench you can't run on this box
+# isn't an error on the box that can.
 MD="$HOME/.mlx-serve/models"
 LMS_DIR="$HOME/.lmstudio/models"
 GD="/Volumes/G Drive SSD"
-# Qwen3.6 is discontinued (packs removed): the 27B row is the Qwen3.8-27B
-# oQ4e pack from 2026-08-18 on — a NEW row in benchmarks.md, never diffed
-# against the old qwen36-27b cells. ANE=1 adds --ane-prefill to every boot
+# ANE=1 adds --ane-prefill to every boot
 # (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
 # ane-on cells are their own column, never diffed against ane-off ones.
 # qwen38-27b prefers the oQ4e pack on the external drive; without it the local
@@ -76,9 +72,9 @@ QWEN38_27B="$GD/models-dl/Jundot/Qwen3.8-27B-oQ4e-mtp"
 TARGETS=(
     "gemma4-e4b-4bit|$MD/mlx-community/gemma-4-e4b-it-4bit"
     "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit"
-    "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit"
+    "qwen36-35b-a3b|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
     "qwen38-27b|$QWEN38_27B"
-    "qwen38-flash-next|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit"
+    "qwen38-flash-next|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at

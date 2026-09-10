@@ -249,8 +249,6 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.gemmaCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
-            Family(id: "laguna", title: "Laguna", systemImage: "chevron.left.forwardslash.chevron.right", tint: .purple,
-                   picks: RecommendedModelPick.poolsideCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]
@@ -317,19 +315,41 @@ private struct RecommendedTableHeader: View {
 
 /// Two thin comparative bars — intelligence (blue) over speed (green) — the
 /// compact, table-cell form of the retired `CapabilityBars`. No number is
-/// drawn: the scores are a hand-maintained comparison between these picks (see
-/// `RecommendedModels.swift`'s header), and printing "62" would claim a
-/// precision they don't have. The tooltip names the two bars and flags an
-/// estimated intelligence score.
+/// drawn in the cell: the scores are a hand-maintained comparison between
+/// these picks (see `RecommendedModels.swift`'s header). Hovering floats a
+/// card that names each bar and prints its score — the bars alone cannot say
+/// which is which.
 private struct MiniCapability: View {
     let pick: RecommendedModelPick
+    @State private var hovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             bar(pick.intelligenceBar, .blue)
             bar(pick.speedBar, .green)
         }
-        .help("Top bar: intelligence\(pick.intelligenceIsEstimated ? " (our estimate)" : ""). Bottom bar: speed. Both relative to the models here.")
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottomLeading) {
+            if hovering {
+                tip.offset(y: -18).fixedSize()
+            }
+        }
+        .zIndex(hovering ? 1 : 0)
+    }
+
+    private var tip: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(CapabilityTip.lines(for: pick), id: \.self) { line in
+                Text(line).font(.caption)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+        .shadow(radius: 4, y: 2)
+        .allowsHitTesting(false)
     }
 
     private func bar(_ fill: Double, _ tint: Color) -> some View {
@@ -714,6 +734,9 @@ private struct DiscoverPane: View {
 private struct MyModelsPane: View {
     @Binding var filter: String
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var downloads: DownloadManager
+
+    @State private var freeDiskSpace: String = ""
 
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
@@ -791,11 +814,33 @@ private struct MyModelsPane: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !freeDiskSpace.isEmpty {
+                    Text("\(freeDiskSpace) available")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
         }
         .navigationTitle("My Models")
+        .onAppear {
+            updateDiskSpace()
+        }
+        .onChange(of: appState.localModels.count) { _, _ in
+            updateDiskSpace()
+        }
+        .onChange(of: downloads.modelsDir) { _, _ in
+            updateDiskSpace()
+        }
+    }
+
+    private func updateDiskSpace() {
+        let values = try? URL(fileURLWithPath: downloads.modelsDir)
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        freeDiskSpace = ModelBrowserMetrics.freeSpaceLabel(
+            availableBytes: values?.volumeAvailableCapacityForImportantUsage
+        )
     }
 }
 
@@ -1766,6 +1811,12 @@ private struct LocalModelRow: View {
     /// old dead badge was not worth anything.
     @State private var unlocked = false
     @State private var card: ModelCardRequest?
+    @State private var settings: ModelSettingsRequest?
+    @State private var hasOverrides = false
+
+    private var settingsRequest: ModelSettingsRequest {
+        ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
+    }
 
     /// nil for a bare folder that maps to no Hugging Face repo.
     private var cardRequest: ModelCardRequest? {
@@ -1785,6 +1836,10 @@ private struct LocalModelRow: View {
     /// safetensors checkpoint and the FILE for one GGUF quant, and
     /// `activateFileViewerSelecting` selects either — which is the behaviour
     /// you want: a quant row reveals its own file, not its repo folder.
+    private func refreshOverrides() {
+        hasOverrides = ModelSettingsFile.load().override(for: model.path)?.hasSettings ?? false
+    }
+
     private func revealInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
     }
@@ -1906,6 +1961,15 @@ private struct LocalModelRow: View {
                     // pane load it the way it always has.
                     UseMediaModelButton(modality: modality, name: model.name)
                 }
+                if model.isChatPickable {
+                    Button { settings = settingsRequest } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundStyle(hasOverrides ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
+                }
                 if ModelRowActions.showsLock(model, unlocked: unlocked) {
                     // Locked, not read-only. This slot used to hold an `Image`
                     // of an external-drive/cloud glyph nobody could read, which
@@ -1961,6 +2025,8 @@ private struct LocalModelRow: View {
             Text(ModelRowActions.deleteMessage(model))
         }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
+        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+        .onAppear(perform: refreshOverrides)
         .contextMenu {
             if model.isChatPickable, useState == .idle {
                 Button("Use This Model") {
@@ -1969,6 +2035,9 @@ private struct LocalModelRow: View {
             }
             if cardRequest != nil {
                 Button("Model Details\u{2026}") { card = cardRequest }
+            }
+            if model.isChatPickable {
+                Button("Model Settings\u{2026}") { settings = settingsRequest }
             }
             Button("Show in Finder", action: revealInFinder)
             Button("Copy Path") {

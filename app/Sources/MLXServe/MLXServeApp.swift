@@ -30,6 +30,9 @@ struct MLXCoreApp: App {
     }()
 
     @NSApplicationDelegateAdaptor(MLXCoreAppDelegate.self) private var appDelegate
+    /// The View ▸ Interface menu writes the same keys the Settings rows do.
+    @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
+    @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
     @Environment(\.openWindow) private var openWindow
@@ -287,6 +290,33 @@ struct MLXCoreApp: App {
             // the tray popover, reachable from the menu bar and Help-menu
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
+            // View ▸ Interface: the same `@AppStorage` keys the Settings rows
+            // write. `CommandGroup`, not `CommandMenu("View")`, which would
+            // build a second View menu beside the system one.
+            CommandGroup(after: .sidebar) {
+                Menu {
+                    ForEach(ChatColumnWidth.allCases) { width in
+                        Toggle(isOn: Binding(
+                            get: { chatColumnRaw == width.rawValue },
+                            set: { if $0 { chatColumnRaw = width.rawValue } }
+                        )) {
+                            Text("\(width.label) chat column")
+                        }
+                        .keyboardShortcut(width.menuShortcut, modifiers: [.command, .option])
+                    }
+
+                    Divider()
+
+                    // Never a bare Control combo: menu key equivalents run
+                    // before keyDown, so ⌃C would be stolen from the embedded
+                    // terminal.
+                    Toggle("Compact mode", isOn: $compactMode)
+                        .keyboardShortcut("c", modifiers: [.command, .option])
+                } label: {
+                    Label("Interface", systemImage: "paintbrush")
+                }
+            }
+
             CommandMenu("Tools") {
                 // ⌘L: the model switcher, over the same rows the composer's
                 // pill offers. A menu key equivalent so it works from every

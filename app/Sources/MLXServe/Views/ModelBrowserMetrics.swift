@@ -92,4 +92,14 @@ enum ModelBrowserMetrics {
     static var minDetailWidth: CGFloat {
         fixedWidth(for: .compact) + compactModelColumnMinWidth
     }
+
+    /// Formats a volume's available capacity for the My Models footer, or
+    /// `""` when the value couldn't be read (`resourceValues` failed). Split
+    /// out of `MyModelsPane` so the formatting is testable without a real
+    /// volume: the caller resolves `nil`/a byte count off whichever URL is
+    /// the actual download destination, this just renders it.
+    static func freeSpaceLabel(availableBytes: Int64?) -> String {
+        guard let availableBytes else { return "" }
+        return MemoryInfo.format(availableBytes)
+    }
 }

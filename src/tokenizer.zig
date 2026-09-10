@@ -1337,14 +1337,26 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
 fn digitGroupFromPreTokenizer(pt: std.json.Value) u8 {
     if (pt != .object) return 1;
     if (splitRegexIsDigits13(pt)) return 3;
+    var group: u8 = 1;
     if (pt.object.get("pretokenizers")) |list| {
         if (list == .array) {
             for (list.array.items) |sub| {
-                if (sub == .object and splitRegexIsDigits13(sub)) return 3;
+                if (sub != .object) continue;
+                if (splitRegexIsDigits13(sub)) group = 3;
+                // A later `Digits(individual_digits)` rule re-splits every
+                // group the {1,3} rule formed (Spark-X2.5).
+                if (isIndividualDigitsRule(sub)) group = 1;
             }
         }
     }
-    return 1;
+    return group;
+}
+
+fn isIndividualDigitsRule(node: std.json.Value) bool {
+    const t = node.object.get("type") orelse return false;
+    if (t != .string or !std.mem.eql(u8, t.string, "Digits")) return false;
+    const ind = node.object.get("individual_digits") orelse return false;
+    return ind == .bool and ind.bool;
 }
 
 /// Pre-tokenizer grammar from the tokenizer.json Split regex. The muse /
@@ -1926,6 +1938,20 @@ test "gpt2PreTokenize: {1,3} digit groups when the spec declares them (DSV4 clas
     try expectPreTokensG(testing.allocator, "v2", 3, &.{ "v", "2" });
     // group 1 keeps the Qwen behavior byte-identical
     try expectPreTokensG(testing.allocator, "1048576", 1, &.{ "1", "0", "4", "8", "5", "7", "6" });
+}
+
+test "tokenizer.json digit-group parse: a trailing Digits(individual) rule overrides {1,3} back to 1" {
+    // Spark-X2.5: DeepSeek's {1,3} Split followed by a `Digits` pretokenizer
+    // with individual_digits — the later rule re-splits every group.
+    const json =
+        \\{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"Digits","individual_digits":true},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 1), digitGroupFromPreTokenizer(parsed.value));
 }
 
 test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {

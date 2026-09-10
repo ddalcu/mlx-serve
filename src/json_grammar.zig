@@ -198,6 +198,21 @@ pub const Grammar = struct {
         return self.stack.items.len == 1 and self.stack.items[0].sub == .accepted;
     }
 
+    /// Bytes still admissible in the string body the next byte lands in
+    /// (content phase, no escape in flight): `maxLength` minus what was typed,
+    /// or `maxInt` when unbounded. Null in every other state.
+    pub fn stringBodyRoom(self: *const Grammar) ?u32 {
+        if (self.dead) return null;
+        const frame = self.topConst();
+        const s = switch (frame.sub) {
+            .in_string => |st| st,
+            else => return null,
+        };
+        if (s.phase != .content) return null;
+        const max = frame.schema.str_max_len orelse return std.math.maxInt(u32);
+        return max -| s.byte_count;
+    }
+
     /// Bitset of bytes that would be accepted by the grammar in its current state.
     /// Implemented by speculative trial: snapshot, try each byte, restore.
     pub fn allowedBytes(self: *Grammar) std.mem.Allocator.Error!ByteMask {

@@ -97,6 +97,38 @@ pub const KVQuantConfig = struct {
     pub fn isQuant(self: KVQuantConfig) bool {
         return self.scheme != .off;
     }
+
+    /// The wire vocabulary shared by the per-request `kv_quant` body field and
+    /// `model-settings.json`: "off"/0, "4", "8", "turbo2", "turbo4". Null = unrecognized.
+    pub fn fromJsonValue(v: std.json.Value) ?KVQuantConfig {
+        switch (v) {
+            .string => |s| {
+                if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return dense;
+                if (std.mem.eql(u8, s, "4")) return affine(4);
+                if (std.mem.eql(u8, s, "8")) return affine(8);
+                if (std.mem.eql(u8, s, "turbo2")) return turboquant(2);
+                if (std.mem.eql(u8, s, "turbo4")) return turboquant(4);
+                return null;
+            },
+            .integer => |i| {
+                if (i == 0) return dense;
+                if (i == 4) return affine(4);
+                if (i == 8) return affine(8);
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    /// The same vocabulary, for reporting (`/v1/models` `meta.kv_quant`).
+    pub fn wireName(self: KVQuantConfig) []const u8 {
+        return switch (self.scheme) {
+            .off => "off",
+            .affine => if (self.bits == 4) "4" else "8",
+            .turboquant_2 => "turbo2",
+            .turboquant_4 => "turbo4",
+        };
+    }
 };
 
 /// One quantized K or V triple. Layout for input shape `[..., D]`:

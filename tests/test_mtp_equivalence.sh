@@ -117,8 +117,10 @@ start_server() { # $1 = extra flags
     # prefix cache off (CLAUDE.md) — a warm restore re-runs the recurrence in
     # a different block size and legitimately flips near-tie argmaxes inside
     # the byte-compared prefix (the char-~116 drift noted above was this).
+    # --no-drafter: a pack shipping its own drafter/ would otherwise outrank
+    # the MTP head and this script would measure DFlash.
     # shellcheck disable=SC2086
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
+    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $1 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
         curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -348,7 +350,7 @@ echo "── fixed-depth server (MLX_SERVE_MTP_ADAPTIVE=0) ──"
 # cap) and zero chunk-B extensions on the same echo workload.
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
-MLX_SERVE_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level info >"$LOG" 2>&1 &
+MLX_SERVE_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --log-level info >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 120); do
     curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
