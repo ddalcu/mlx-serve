@@ -2042,6 +2042,20 @@ pub const Scheduler = struct {
     /// requests (refcount → 0), then hands the mlx free to the inference
     /// thread (stream-bound). Blocks until the free completes.
     pub fn unloadModel(self: *Scheduler, id_or_empty: []const u8) !void {
+        return self.unloadModelIfIdle(id_or_empty, null);
+    }
+
+    /// `unloadModel` with an optional idle precondition, re-checked under the
+    /// registry mutex at the moment we commit.
+    ///
+    /// The idle sweep picks a victim, drops the mutex, and only then calls in —
+    /// a request can arrive in that gap. Without this re-check the sweep would
+    /// mark a model that just started serving `.evicting`, and every OTHER
+    /// client of it blocks in `ensureLoaded`'s `.evicting` arm until the live
+    /// request finishes, followed by a cold reload of a model used seconds ago.
+    /// `planEvictionsLocked` picks and marks under one unbroken hold for the
+    /// same reason; the sweep cannot, because the unload itself is slow.
+    pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_ms: ?i64) !void {
         const entry = try self.registry.resolveEntry(id_or_empty);
         {
             self.registry.mutex.lockUncancelable(self.io);
@@ -2059,6 +2073,15 @@ pub const Scheduler = struct {
                         continue :wait;
                     },
                     .ready => break :wait,
+                }
+            }
+            if (idle_window_ms) |window_ms| {
+                const now_ms = io_util.nowMsMonotonic(self.io);
+                const still_idle = entry.refcount.load(.acquire) == 0 and
+                    now_ms - entry.last_used_ms.load(.acquire) >= window_ms;
+                if (!still_idle) {
+                    self.registry.mutex.unlock(self.io);
+                    return;
                 }
             }
             self.registry.markEvictingLocked(entry);
@@ -4148,6 +4171,15 @@ fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
         sch.unload_queue.items.len > 0;
+}
+
+/// Poll interval for the idle-eviction sweep, given the configured window.
+///
+/// A quarter of the window, so a model is evicted within ~1.25x the configured
+/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
+/// does not spin, capped at 30s so a long window still costs ~nothing.
+pub fn idleEvictTickMs(window_ms: i64) i64 {
+    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
@@ -6755,6 +6787,47 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "idleEvictTickMs: sweeps well inside the window without spinning" {
+    // A quarter of the window, so eviction lands near the configured time.
+    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
+    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
+    // ...until the 30s cap takes over. The default 900s window sweeps at 30s.
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
+    // Floor: a 1s window must not turn into a busy loop.
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
+    // Cap: an 8h window still checks twice an hour, not once per two hours.
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
+    // Never negative or zero, whatever it is handed.
+    try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "the idle-evict sweep is stopped and joined outside Scheduler.deinit" {
+    // Ordering invariant, pinned in source because no unit test can reach it.
+    // A sweep blocked inside `unloadModel` is waiting on the inference thread,
+    // and `deinit` only rescues orphaned unload requests AFTER joining that
+    // thread — so a join for the sweep placed inside `deinit` hangs forever.
+    // It must live at serve() scope with its own stop flag, like the gauge
+    // sampler, whose defers run before `scheduler.deinit()`.
+    const source = @embedFile("server.zig");
+    try testing.expect(std.mem.indexOf(u8, source, "idle_evict_stop.store(true, .monotonic)") != null);
+    try testing.expect(std.mem.indexOf(u8, source, "defer if (idle_evict_thread) |t| t.join();") != null);
+    // The loop must gate on its own flag, never on scheduler.shutdown.
+    const loop_start = std.mem.indexOf(u8, source, "fn idleEvictLoop(") orelse return error.MissingIdleEvictLoop;
+    const loop_end = std.mem.indexOfPos(u8, source, loop_start + 1, "\nfn ") orelse source.len;
+    const body = source[loop_start..loop_end];
+    try testing.expect(std.mem.indexOf(u8, body, "ctx.stop.load(.monotonic)") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "shutdown") == null);
+    // And it must go through the idle-checked entry point, never the bare one.
+    try testing.expect(std.mem.indexOf(u8, body, "unloadModelIfIdle") != null);
+
+    // Scheduler.deinit must not join it.
+    const deinit_start = std.mem.indexOf(u8, @embedFile("scheduler.zig"), "pub fn deinit(self: *Scheduler) void {") orelse
+        return error.MissingSchedulerDeinit;
+    const deinit_body = @embedFile("scheduler.zig")[deinit_start .. deinit_start + 2000];
+    try testing.expect(std.mem.indexOf(u8, deinit_body, "idle_evict") == null);
 }
 
 test "the inference loop parks without holding the sleep-inhibition assertion" {

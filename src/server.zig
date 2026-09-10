@@ -1430,6 +1430,22 @@ pub fn serve(
     defer if (sampler_thread) |t| t.join();
     defer sampler_stop.store(true, .monotonic);
 
+    // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
+    // and stopped + joined here rather than in `Scheduler.deinit` — see
+    // `IdleEvictCtx.stop`.
+    var idle_evict_thread: ?std.Thread = null;
+    var idle_evict_stop = std.atomic.Value(bool).init(false);
+    if (scheduler.registry.idle_evict_secs) |secs| {
+        idle_evict_thread = try std.Thread.spawn(.{}, idleEvictLoop, .{IdleEvictCtx{
+            .scheduler = scheduler,
+            .window_ms = @as(i64, secs) * 1000,
+            .stop = &idle_evict_stop,
+        }});
+        log.info("[registry] idle eviction ON — unloading models idle for {d}s\n", .{secs});
+    }
+    defer if (idle_evict_thread) |t| t.join();
+    defer idle_evict_stop.store(true, .monotonic);
+
     global_registry = scheduler.registry;
     defer global_registry = null;
 
@@ -10788,6 +10804,74 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // prefill chunk and returns to 0 the moment the prefill ends.
     ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
     ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
+}
+
+const IdleEvictCtx = struct {
+    scheduler: *scheduler_mod.Scheduler,
+    /// `--idle-evict-secs`, in ms.
+    window_ms: i64,
+    /// Dedicated stop flag, for the same reason `GaugeSamplerCtx` has one:
+    /// gating on `scheduler.shutdown` would never be observed, because
+    /// `scheduler.deinit()` (which sets it) is the FIRST-registered defer and
+    /// runs LAST, after this thread's join. Worse here than for the sampler —
+    /// a sweep blocked inside `unloadModel` is waiting on the inference thread,
+    /// and `deinit` only rescues orphaned unload requests AFTER joining it, so
+    /// a join placed inside `deinit` would hang forever.
+    stop: *std.atomic.Value(bool),
+};
+
+/// `--idle-evict-secs`: unload models that have served nothing for the window.
+///
+/// The flag has been accepted since multi-model support landed but never did
+/// anything — `main.zig` parses it, `ModelRegistry` stores it, and no code ever
+/// read it. The "inference thread's idle tick (Phase D)" its doc comment named
+/// was never wired up (ddalcu/mlx-serve#241). This is that sweep.
+///
+/// It only calls `Scheduler.unloadModelIfIdle`, the same path
+/// `POST /v1/unload-model` uses, so the eviction itself is unchanged: mark
+/// `.evicting`, drain refcount to 0, hand the mlx free to the inference thread.
+/// Nothing here touches mlx directly.
+fn idleEvictLoop(ctx: IdleEvictCtx) void {
+    const sch = ctx.scheduler;
+    const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);
+    // Wake every 500 ms to check the stop flag; sweep once per tick interval.
+    // `std.c.nanosleep` for the same reason as the gauge sampler: `std.time.sleep`
+    // is gone in Zig 0.16, and a blocking Io timer here could outlive the stop.
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    const ticks_per_sweep: u64 = @max(1, @as(u64, @intCast(@divTrunc(tick_ms, 500))));
+    var tick: u64 = 0;
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        tick += 1;
+        if (tick < ticks_per_sweep) continue;
+        tick = 0;
+        if (ctx.stop.load(.monotonic)) return;
+
+        // One victim per sweep. `unloadModelIfIdle` blocks on the inference
+        // thread, so holding the registry mutex across it would stall every
+        // request; the next sweep takes anything else that has gone idle.
+        const now_ms = io_util.nowMsMonotonic(sch.io);
+        sch.registry.mutex.lockUncancelable(sch.io);
+        const victim = sch.registry.pickIdleEvictable(now_ms, ctx.window_ms);
+        const id = if (victim) |v| v.id else null;
+        const idle_ms = if (victim) |v| now_ms - v.last_used_ms.load(.acquire) else 0;
+        const bytes = if (victim) |v| v.bytes_resident else 0;
+        sch.registry.mutex.unlock(sch.io);
+
+        if (id) |model_id| {
+            log.info("[registry] idle-evicting model id={s} ({d:.2} GB resident, idle {d}s)\n", .{
+                model_id,
+                @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0),
+                @divTrunc(idle_ms, 1000),
+            });
+            // The window is re-checked under the mutex inside, so a request
+            // arriving since the pick cancels the eviction instead of pinning
+            // the model in `.evicting` behind a live stream.
+            sch.unloadModelIfIdle(model_id, ctx.window_ms) catch |err| {
+                log.warn("[registry] idle eviction failed for {s}: {t}\n", .{ model_id, err });
+            };
+        }
+    }
 }
 
 fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
