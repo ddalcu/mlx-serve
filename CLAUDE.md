@@ -421,6 +421,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A kernel's dtype and its threadgroup BLOCK SIZE are ONE decision** (`gdnBlockTFor`; dtypes off the ARRAY; Metal has no implicit float→bfloat).
 - **Every KV buffer is sized from the OPERAND it stores; a scheme with a shape constraint refuses at LOAD**: K/V widths differ on MLA; TurboQuant needs pow2 → `initWithConfigAndHeadDim` checks `kvCacheKeyHeadDim()`.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object on the error path** — build first, then swap (`KVCache.reinit`). Scan-pinned: no `.cache = try` in transformer/scheduler/main.
+- **A handle freed before a fallible op is reset AT the free** (`updateDense` views, as `updateAffine` does): a write that failed after the free left freed views in the entry for the next `resetCache` to free again (SIGSEGV in `freeKVEntry`). Guard: the `KVCache dense update` fault sweep.
 - **An MLA cache is billed per ATTENTION head** (`kvBytesPerToken`): the latent decompresses to all heads; only an asymmetric config tells the spellings apart.
 - **A gate's LOWER BOUND may REPLACE the formula, not clamp it** (KDA: `g = exp(bound·σ(…))`); two arms means the arm is SELECTED (`kdaUsesBoundedGate`): absent bound = softplus arm, never bound 0. Read the reference KERNEL's arms.
 - **Per-head vs per-channel gating is an INDEXING contract**: one recurrence generated for both (`gdnKernelSource(vectorized, capture_seq)`); other-shape kernels DECLINE; test = per-channel gate held UNIFORM must match the scalar kernel EXACTLY.

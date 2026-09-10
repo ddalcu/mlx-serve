@@ -4904,3 +4904,17 @@ and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the
 lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
 still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
 (`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
+
+## A failed dense KV write left freed view handles in the entry (2026-09-10)
+
+`KVCache.updateDense` frees the previous `key_view`/`value_view` first, so the buffer can be
+donated, and assigned the handles fresh only after the grow and the writes. When one of those
+failed (an MLX error, catchable since #353), the entry kept both freed handles and the next
+`resetCache` or `deinit` of that cache freed them again: SIGSEGV in `freeKVEntry`. Seen live when
+Qwen3-Embedding sub-batches shared the cache and a write failed on the batch dimension
+(`broadcast_shapes`). `updateAffine` already reset its handles at the free, and
+`updateTurboQuant` goes through it. Fix: reset the handles at the free; `writeAtOffset` releases
+its result on the error path. A grow that fails after K but before V can leave their capacities
+apart; the error aborts that forward and the next request's reset restores a coherent pair.
+Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
+in-capacity and a growing update.
