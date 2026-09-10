@@ -54,7 +54,10 @@ extension AppState {
             maxTokens: maxTokens,
             voice: globalVoice,
             wakePhrase: WakeWord.normalizePhrase(serverOptions.wakePhrase) ?? WakeWord.defaultPhrase,
-            reasoningEffort: reasoningEffort)
+            reasoningEffort: reasoningEffort,
+            // Read here, not passed by each surface: a turn answered on-device
+            // is clamped whoever asked for it.
+            appleModel: useAppleModel)
         return AgentResolution.resolve(agent: agents.agent(id: agentId), defaults: defaults)
     }
 

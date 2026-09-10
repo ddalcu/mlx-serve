@@ -1952,7 +1952,8 @@ struct ChatDetailView: View {
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
             inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
-            agentLock: agentModeLock)
+            agentLock: agentModeLock,
+            apple: appState.useAppleModel)
     }
 
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
@@ -1977,7 +1978,9 @@ struct ChatDetailView: View {
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
             status: server.status,
-            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+            // Nothing to start for the on-device model — it needs no server.
+            hasStartableModel: !appState.useAppleModel
+                && (!appState.selectedModelPath.isEmpty || server.lanChatModelId != nil)
         )
         if control != .hidden {
             Button {
@@ -2090,13 +2093,19 @@ struct ChatDetailView: View {
     /// as the tool menu's "not in <agent>'s capabilities" rows.
     @ViewBuilder
     private func lockedModeMenu(_ agentName: String) -> some View {
-        Text("Set by \(agentName)")
-        Button("Edit Agent…") {
-            // ON that agent — the window otherwise opens on whoever sorts
-            // first, which is the wrong one every time you got here from a card
-            // that just named a different name.
-            guard let id = activeAgent?.id else { return }
-            appState.openAgentSettings(id, using: openWindow)
+        if agentName == AppleFoundationChat.displayName {
+            // Not an agent, and nothing to edit: the on-device model simply
+            // does not have these.
+            Text("Not available on \(AppleFoundationChat.displayName)")
+        } else {
+            Text("Set by \(agentName)")
+            Button("Edit Agent…") {
+                // ON that agent — the window otherwise opens on whoever sorts
+                // first, which is the wrong one every time you got here from a
+                // card that just named a different name.
+                guard let id = activeAgent?.id else { return }
+                appState.openAgentSettings(id, using: openWindow)
+            }
         }
     }
 
@@ -2207,7 +2216,13 @@ struct ChatDetailView: View {
 
     /// What the tab's agent permits at all; everything when there's no agent.
     private var agentAllowedTools: Set<AgentToolKind> {
-        activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        let fromAgent = activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        // The on-device model's 4k window cannot hold the rest of the tool
+        // definitions; `AgentResolution` clamps the turn, this keeps the menu
+        // from offering what the clamp would drop.
+        return appState.useAppleModel
+            ? fromAgent.intersection(AppleFoundationChat.allowedTools)
+            : fromAgent
     }
 
     private var disabledToolSet: Set<AgentToolKind> {
@@ -2233,9 +2248,14 @@ struct ChatDetailView: View {
     /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
+        if appState.useAppleModel {
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+        }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
+            let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
+            if !tools.isEmpty {
             Section(group.title) {
-                ForEach(group.tools, id: \.self) { tool in
+                ForEach(tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
                     Button {
                         setTool(tool, enabled: !isToolEnabled(tool))
@@ -2252,6 +2272,7 @@ struct ChatDetailView: View {
                     }
                     .disabled(!allowed || isExternalBridgeSession)
                 }
+            }
             }
         }
 
@@ -2364,7 +2385,7 @@ struct ChatDetailView: View {
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
-                                                    serverRunning: server.status == .running) {
+                                                    serverRunning: canAnswer) {
                 Text(subtitle)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -2923,7 +2944,7 @@ struct ChatDetailView: View {
                           onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
-            .disabled(server.status != .running)
+            .disabled(!canAnswer)
             // The placeholder stands in for the first character you type, so it
             // has to sit exactly where that character lands — which is three
             // insets in, not one (`ComposerTextMetrics`). It was a literal 9
@@ -3015,7 +3036,7 @@ struct ChatDetailView: View {
         // Stop is always tappable for the owning chat. Otherwise: Send,
         // disabled when the server is down or when this chat has nothing to
         // send. Another chat's turn blocks nothing — the engine is multi-turn.
-        .disabled(server.status != .running
+        .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
@@ -3402,7 +3423,8 @@ struct ChatDetailView: View {
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }
@@ -3438,7 +3460,8 @@ struct ChatDetailView: View {
             liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
             contextLength: usage?.contextLength
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                      modelContextLength: server.chatModelInfo?.contextLength),
+                                                      modelContextLength: server.chatModelInfo?.contextLength,
+                                                      apple: appState.useAppleModel),
             overflow: lastOverflowNotice)
     }
 
@@ -3531,7 +3554,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -3584,7 +3607,7 @@ struct ChatDetailView: View {
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+              composerState != .generatingHere, canAnswer else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
@@ -3619,11 +3642,20 @@ struct ChatDetailView: View {
             resolved, documentIndex: appState.documentIndexes[sessionId])
     }
 
+    /// Whether this chat can answer at all. Apple's on-device model needs no
+    /// server, so "the server is down" is not the same question as "nothing
+    /// can answer" — every composer gate asks THIS, or the composer locks on a
+    /// model that was ready to reply.
+    private var canAnswer: Bool {
+        ChatTurnEngine.canRunTurn(serverRunning: server.status == .running,
+                                  apple: appState.useAppleModel)
+    }
+
     /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
     /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
     /// the last user turn and resubmits it fresh.
     private var canRegenerate: Bool {
-        server.status == .running && composerState != .generatingHere
+        canAnswer && composerState != .generatingHere
             && session?.isExternalBridge != true
             && (session?.messages.contains { $0.role == .user } ?? false)
     }
@@ -4491,12 +4523,14 @@ struct ChatModeToggles: Equatable {
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
                         inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
-                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+                        agentLock: AgentModeLock? = nil,
+                        /// Chat is answered by Apple's on-device model.
+                        apple: Bool = false) -> ChatModeToggles {
         let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
-        guard let lock = agentLock else { return base }
-        return ChatModeToggles(
+        guard let lock = agentLock else { return applyingApple(base, apple: apple) }
+        return applyingApple(ChatModeToggles(
             // Thinking is the one an agent may leave unset, and `AgentResolution`
             // falls back to the surface's own value there — so locking it anyway
             // would take away a control nobody is deciding for you.
@@ -4505,7 +4539,21 @@ struct ChatModeToggles: Equatable {
             mcp: lock.mcp,
             thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
             toolsLockedBy: lock.name,
-            mcpLockedBy: lock.name)
+            mcpLockedBy: lock.name), apple: apple)
+    }
+
+    /// The on-device model has no thinking mode at all, and its 4k window has
+    /// no room for MCP's tool definitions — so both read locked, with it named
+    /// as the owner. The tool LOOP still switches; the tool SET is clamped in
+    /// `AgentResolution`, which is where capabilities are decided.
+    private static func applyingApple(_ t: ChatModeToggles, apple: Bool) -> ChatModeToggles {
+        guard apple else { return t }
+        var out = t
+        out.thinking = false
+        out.thinkingLockedBy = AppleFoundationChat.displayName
+        out.mcp = false
+        out.mcpLockedBy = AppleFoundationChat.displayName
+        return out
     }
 }
 

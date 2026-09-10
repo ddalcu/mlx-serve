@@ -29,6 +29,12 @@ final class CLILauncher: ObservableObject {
     /// (same CLIs, same order) by `CLISetupInstructionsTests`.
     nonisolated static var candidateIds: [String] { candidates.map(\.id) }
 
+    /// What the "On this Mac" section shows: the detected CLIs plus the plain
+    /// shell, which has nothing to detect.
+    nonisolated static func offered(detected: [LauncherCLI]) -> [LauncherCLI] {
+        detected + [.shell]
+    }
+
     init() {
         Task { await refresh() }
     }
@@ -42,7 +48,7 @@ final class CLILauncher: ObservableObject {
             return
         }
         let found = await Self.detectInstalled()
-        self.available = found
+        self.available = Self.offered(detected: found)
         self.hasScanned = true
     }
 
@@ -157,6 +163,9 @@ struct LauncherCLI: Identifiable, Equatable {
     /// desktop app bundles (codex inside ChatGPT.app/Codex.app). `~` is not
     /// expanded here; entries may start with `$HOME`, expanded at probe time.
     var fallbackPaths: [String] = []
+    /// A row that talks to mlx-serve refuses to start while the server is
+    /// down; the plain shell does not.
+    var requiresServer: Bool = true
     /// Shell body that sets env vars and execs the CLI. Does NOT include the
     /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
     /// it into its inline config; pi/Claude Code ignore it — pi's list is
@@ -413,6 +422,25 @@ extension LauncherCLI {
             """
         }
     )
+
+    /// A plain login shell in the terminal pane. No config, no server: the
+    /// script only cds and hands the row an INTERACTIVE zsh — without the
+    /// exec the script would end and the row would close on open.
+    static let shell = LauncherCLI(
+        id: "shell",
+        displayName: "Shell",
+        binaryName: "zsh",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: nil,
+        requiresServer: false,
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(cdLine)
+            exec /bin/zsh -i
+            """
+        }
+    )
 }
 
 // MARK: - UI
@@ -443,6 +471,7 @@ struct CLILauncherButton: View {
     let openHostCLI: (LauncherCLI) -> Void
 
     @StateObject private var detector = CLILauncher()
+    @State private var hovering = false
 
     var body: some View {
         Group {
@@ -459,19 +488,20 @@ struct CLILauncherButton: View {
                                          openSandboxAgent: openSandboxAgent,
                                          openHostCLI: openHostCLI)
                 } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "terminal")
-                        Text("Code")
-                    }
-                    .frame(maxWidth: .infinity)
+                    // The tray tile's own face (`TrayTileFace`), so the Code
+                    // menu matches its Chat / Tasks / Quit siblings and the
+                    // Media Generation row above them.
+                    TrayTileFace(icon: "terminal", title: "Code",
+                                 hovering: hovering, isEnabled: isEnabled)
                 }
-                // Standard bordered-button chrome so the menu is visually
-                // identical to its sibling Chat/Tasks buttons — the previous
-                // hand-rolled stroke + material background rendered as an
-                // odd-one-out outlined pill in the tray footer.
+                // `.button` (not `.borderlessButton`, which throws the custom
+                // label away and draws a plain menu title) + a plain button so
+                // the tile face IS the control.
                 .menuStyle(.button)
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
+                .frame(maxWidth: .infinity)
+                .onHover { hovering = $0 }
                 .disabled(!isEnabled)
                 .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
