@@ -108,6 +108,32 @@ pub fn shouldWarnOpenBind(host_explicit: bool, lan_share: bool, host: []const u8
         std.mem.eql(u8, host, "localhost"));
 }
 
+test "ollamaTagEntryOf: reads config unless the entry is mid-load" {
+    // Bar: a `.loading` entry's retained CPU state can be freed off-mutex, so it must not be read.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("m", "/path/to/m", 1024, "arch-hint");
+
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.model_type = "from-config";
+    e.config = &cfg;
+
+    // Unloaded but retained: still fully listable, which is the retention contract.
+    e.state = .unloaded;
+    try std.testing.expectEqualStrings("from-config", ollamaTagEntryOf(io, e).family);
+
+    e.state = .ready;
+    try std.testing.expectEqualStrings("from-config", ollamaTagEntryOf(io, e).family);
+
+    // Mid-load: the pointer may be freed under us, so fall back to the hint.
+    e.state = .loading;
+    try std.testing.expectEqualStrings("arch-hint", ollamaTagEntryOf(io, e).family);
+
+    e.config = null; // borrowed stack config must not be freed by deinit
+    e.state = .unloaded;
+}
+
 test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
     // Default bind (0.0.0.0, nobody asked) → warn: a first-launch user is
     // serving whatever network the laptop joins.
@@ -2413,7 +2439,11 @@ fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: 
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
 /// the registry mutex; id/arch_hint slices are entry-owned and stable.
 fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
-    const family: []const u8 = if (e.config) |c| c.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
+    // A reload frees the retained CPU state off-mutex, so the mutex alone does
+    // not make these reads safe; `.loading` is the only state it is freed in.
+    // Not `== .ready`: an unloaded entry must stay fully listable.
+    const ready = e.state != .loading;
+    const family: []const u8 = if (ready and e.config != null) e.config.?.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
     // arch_hint "gguf" covers unloaded discovery stubs whose PATH is a
     // directory of .gguf files (issue #59) — no engine yet, no .gguf suffix.
     const is_gguf = e.ds4_engine != null or e.llama_engine != null or
@@ -2520,15 +2550,20 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
         }
         if (ollama_mod.resolveName(requested, ids_buf[0..n])) |idx| {
             const e = entry_buf[idx];
-            const template: []const u8 = if (e.chat_config) |cc| cc.chat_template else "";
-            const is_encoder = if (e.config) |c| c.is_encoder_only else std.mem.eql(u8, e.arch_hint, "bert");
+            // Same `.ready` gate as `ollamaTagEntryOf` — and it matters more
+            // here, because `chat_template` is copied into the response body.
+            // Same predicate as `ollamaTagEntryOf`; `chat_template` is copied
+            // into the response body, so a stale read would be served.
+            const e_ready = e.state != .loading;
+            const template: []const u8 = if (e_ready and e.chat_config != null) e.chat_config.?.chat_template else "";
+            const is_encoder = if (e_ready and e.config != null) e.config.?.is_encoder_only else std.mem.eql(u8, e.arch_hint, "bert");
             // Embedding capability is wider than encoder-ness: a pooling-
             // contracted decoder (Qwen3-Embedding) reports it too (issue #116).
-            const has_embedding = if (e.config) |c| c.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
+            const has_embedding = if (e_ready and e.config != null) e.config.?.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
             const has_chat = !is_encoder;
             rendered = try ollama_mod.renderShowJson(allocator, .{
                 .tag = ollamaTagEntryOf(stream.io, e),
-                .context_length = if (e.config) |c| getEffectiveContextLength(c) else 0,
+                .context_length = if (e_ready and e.config != null) getEffectiveContextLength(e.config.?) else 0,
                 .template = template,
                 .has_chat = has_chat,
                 .has_tools = has_chat,
@@ -10822,15 +10857,9 @@ const IdleEvictCtx = struct {
 
 /// `--idle-evict-secs`: unload models that have served nothing for the window.
 ///
-/// The flag has been accepted since multi-model support landed but never did
-/// anything — `main.zig` parses it, `ModelRegistry` stores it, and no code ever
-/// read it. The "inference thread's idle tick (Phase D)" its doc comment named
-/// was never wired up (ddalcu/mlx-serve#241). This is that sweep.
-///
-/// It only calls `Scheduler.unloadModelIfIdle`, the same path
-/// `POST /v1/unload-model` uses, so the eviction itself is unchanged: mark
-/// `.evicting`, drain refcount to 0, hand the mlx free to the inference thread.
-/// Nothing here touches mlx directly.
+/// Goes through `Scheduler.unloadModelIfIdle`, the same path
+/// `POST /v1/unload-model` uses, so the eviction itself is unchanged and
+/// nothing here touches mlx directly.
 fn idleEvictLoop(ctx: IdleEvictCtx) void {
     const sch = ctx.scheduler;
     const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);

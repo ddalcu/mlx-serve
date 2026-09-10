@@ -370,9 +370,9 @@ pub const LoadedModel = struct {
             self.chat_config = null;
         }
         if (self.config) |c| {
-            // ModelConfig has no allocator-owned fields (all by-value, plus
-            // borrowed-static `model_type`/`weight_prefix`) so a plain
-            // destroy suffices.
+            // `ngram_table_path` is allocPrint'd at load; everything else is
+            // by-value or borrowed-static (`model_type`/`weight_prefix`).
+            if (c.ngram_table_path) |ntp| self.allocator.free(ntp);
             self.allocator.destroy(c);
             self.config = null;
         }
@@ -389,6 +389,42 @@ pub const LoadedModel = struct {
         if (self.arch_hint.len > 0) self.allocator.free(self.arch_hint);
         self.allocator.free(self.id);
         self.allocator.free(self.path);
+    }
+
+    /// Free the CPU-only state `unloadResident` deliberately RETAINS —
+    /// `token_bytes`, `tokenizer`, `chat_config`, `config`, `tokenize_cache`.
+    ///
+    /// A reload builds a fresh set and installs it over the retained one, so
+    /// every install site must call this first or the previous generation is
+    /// orphaned. Idempotent, and safe on an entry that never loaded.
+    ///
+    /// Order matches `deinit`: `token_bytes` is decoded from the tokenizer's
+    /// vocabulary, so it must never outlive the ids it describes.
+    pub fn releaseRetainedCpuState(self: *LoadedModel) void {
+        if (self.token_bytes) |*tb| {
+            tb.deinit();
+            self.token_bytes = null;
+        }
+        if (self.tokenizer) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+            self.tokenizer = null;
+        }
+        if (self.chat_config) |cc| {
+            cc.deinit();
+            self.allocator.destroy(cc);
+            self.chat_config = null;
+        }
+        if (self.config) |c| {
+            // Mirrors `deinit`: `ngram_table_path` is the one allocated field.
+            if (c.ngram_table_path) |ntp| self.allocator.free(ntp);
+            self.allocator.destroy(c);
+            self.config = null;
+        }
+        if (self.tokenize_cache) |*tc| {
+            tc.deinit();
+            self.tokenize_cache = null;
+        }
     }
 
     /// Free only the mlx-allocating state (weights/transformer/vision/
@@ -1323,6 +1359,52 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     defer reg.deinit();
     try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
     try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
+}
+
+test "LoadedModel: a reload frees the CPU state the previous load left behind" {
+    // Bar: a reload must not orphan the previous generation (testing.allocator fails on leak).
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/path/to/m", 1024);
+
+    // First load installs CPU state. `ngram_table_path` is the one allocated
+    // field on ModelConfig, so it is what proves the release frees the struct's
+    // contents and not just the struct.
+    try attachTestTokenizer(entry, &.{ .{ 0, "a" }, .{ 1, "b" } });
+    entry.config = try testing.allocator.create(model_mod.ModelConfig);
+    entry.config.?.* = std.mem.zeroes(model_mod.ModelConfig);
+    entry.config.?.ngram_table_path = try testing.allocator.dupe(u8, "/m/ngram_table.bin");
+
+    // Unload retains it by contract.
+    entry.unloadResident();
+    try testing.expect(entry.tokenizer != null);
+    try testing.expect(entry.config != null);
+
+    // `token_bytes` is decoded from the tokenizer's vocabulary, so order matters.
+    _ = try entry.grammarTokenBytes(testing.allocator, reg.io);
+    entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(testing.allocator, 4);
+    try testing.expect(entry.token_bytes != null);
+
+    // Reload: release the old generation, then install a fresh one.
+    entry.releaseRetainedCpuState();
+    try testing.expect(entry.tokenizer == null);
+    try testing.expect(entry.config == null);
+    try testing.expect(entry.token_bytes == null);
+    try testing.expect(entry.tokenize_cache == null);
+    try attachTestTokenizer(entry, &.{ .{ 0, "c" }, .{ 1, "d" } });
+    entry.config = try testing.allocator.create(model_mod.ModelConfig);
+    entry.config.?.* = std.mem.zeroes(model_mod.ModelConfig);
+    entry.config.?.ngram_table_path = try testing.allocator.dupe(u8, "/m/ngram_table.bin");
+}
+
+test "LoadedModel: releaseRetainedCpuState is safe on an entry that never loaded" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/path/to/m", 1024);
+    // Bar: the first load calls this too, so a never-loaded entry is a no-op.
+    entry.releaseRetainedCpuState();
+    entry.releaseRetainedCpuState();
+    try testing.expect(entry.tokenizer == null);
 }
 
 test "ModelRegistry: pickIdleEvictable picks past the window, ignores inside it" {

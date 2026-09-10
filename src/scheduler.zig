@@ -1285,9 +1285,6 @@ pub const Scheduler = struct {
     draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
-    config: *const ModelConfig,
-    tok: *const Tokenizer,
-    chat_config: *const ChatConfig,
     drafter_path: []const u8,
 
     /// Phase A6 → Plan 05: per-model hot prefix cache. Pre-Plan-05 this was
@@ -1467,13 +1464,6 @@ pub const Scheduler = struct {
             .primary_model_dir = params.model_dir,
             .draft_block_size = params.draft_block_size,
             .draft_block_size_explicit = params.draft_block_size_explicit,
-            // Initial borrowed-view refs point at the (heap-allocated) CPU
-            // state carried on LoadParams; once the inference thread
-            // installs them on `entry`, the views still resolve to the
-            // same addresses (we store pointers, so the moves are no-ops).
-            .config = params.config,
-            .tok = params.tok,
-            .chat_config = params.chat_config,
             .drafter_path = params.drafter_dir,
             .hot_prefix_cache = null,
             .max_concurrent = cap,
@@ -2680,6 +2670,8 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    the MLX path's invariant about the per-ptr errdefers above).
     const entry = params.entry;
     entry.ds4_engine = engine;
+    // Every install must free the generation it replaces; see the fn's doc.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2753,6 +2745,8 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     const entry = params.entry;
     entry.llama_engine = engine;
+    // Every install must free the generation it replaces; see the fn's doc.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -2894,6 +2888,8 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
+    // Every install must free the generation it replaces; see the fn's doc.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
@@ -3953,6 +3949,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Transfer ownership of the heap-allocated CPU state from `params` to
     // the entry. The caller (main.zig) MUST NOT free these — `LoadedModel.deinit`
     // walks them in the same `*X` pointer form they came in.
+    // Every install must free the generation it replaces; see the fn's doc.
+    entry.releaseRetainedCpuState();
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
