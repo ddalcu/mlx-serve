@@ -10528,6 +10528,9 @@ pub fn computeEmbeddingsBatch(
     }
     var start: usize = 0;
     while (start < seqs.len) {
+        // A decoder-arch embedder (Qwen3-Embedding) forwards through the KV
+        // cache: without a reset, a sub-batch attends to earlier sub-batches' rows.
+        try xfm.resetCache();
         const sub = seqs[start..embedSubBatchEnd(seqs, start, EMBED_MAX_BATCH, EMBED_TOKEN_BUDGET)];
         var pb = try buildPaddedBatch(allocator, sub);
         defer pb.deinit(allocator);

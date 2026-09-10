@@ -6957,9 +6957,8 @@ fn handleEmbeddings(
     // Phase A: route through scheduler when available so the encoder
     // forward pass runs on the inference thread (mlx 0.31.2 thread-local
     // streams). Falls back to a direct call only in the offline path
-    // where no scheduler exists. Cache reset is handled inside the
-    // scheduler's `runEmbedRequest` (or here for the fallback) —
-    // encoder-only embeddings carry no cross-request state.
+    // where no scheduler exists. `computeEmbeddingsBatch` resets the KV
+    // cache before every sub-batch on both paths.
     const embeddings = if (global_scheduler) |sch| blk: {
         var req = scheduler_mod.EmbedRequest{
             .model = lm,
@@ -6981,7 +6980,6 @@ fn handleEmbeddings(
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
             return;
         };
-        try xfm.resetCache();
         break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
             log.err("  embedding error: {}\n", .{err});
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);

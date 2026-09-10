@@ -312,6 +312,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A llama session trim is FALLIBLE on recurrent/hybrid GGUFs** (#286 + #287; `mlx_llama_session_trim` returns 1 = cleared): `llama_memory_seq_rm` refuses a partial tail past the recurrent snapshot window and mutates NOTHING — a trimmed mirror over an untrimmed KV served the PREVIOUS request's tool calls. Cold-prefill on refusal.
 - **A READY model never advertises LESS capability than its stub** (`readyHasChat` counts embedded engines; app `lanAdvertises` tolerates empty caps).
 - **Default bind is 0.0.0.0 and serve mode WARNS** (`server.shouldWarnOpenBind`); flips to 127.0.0.1 in a future release. The app always passes `--host` explicitly.
+- **An embedding SUB-BATCH is its own forward** (`computeEmbeddingsBatch` resets the cache before every sub-batch, not the request): a decoder-arch embedder (Qwen3-Embedding) forwards through the KV cache, so a later sub-batch attended to the earlier rows and answered wrong vectors. Guard: `tests/test_embeddings.sh` [4c].
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
