@@ -174,6 +174,9 @@ fn printUsage(io: std.Io) void {
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
+        \\                        --kv-quant (default OFF: the head keeps
+        \\                        dense bf16 KV).
         \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
         \\                        default: the stages cost ~11 GB resident; the
         \\                        memory fit-gate still applies at load). For a
@@ -268,10 +271,13 @@ fn printUsage(io: std.Io) void {
         \\                        weights; see --prefill-chunk.
         \\  --ssm-checkpoint-max <n>
         \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 32). The first stride-aligned position
+        \\                        (default: 16). The first stride-aligned position
         \\                        is always kept; beyond the cap the oldest are
         \\                        dropped. 0 = unlimited, bounded only by the
         \\                        prefix cache's byte budget.
+        \\  --wired-margin-gib <n>
+        \\                      How far under iogpu.wired_limit_mb a plan may
+        \\                        reach (default: 8, integers 2..32).
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -502,6 +508,7 @@ pub fn main(init: std.process.Init) !void {
     // ships a sidecar is otherwise unreachable from clients that never send
     // `enable_mtp:true` (llmprobe, Claude Code, curl).
     var force_mtp = false;
+    var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
@@ -687,6 +694,8 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
+            mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
@@ -791,7 +800,13 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
-            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 32;
+            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
+            i += 1;
+            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+                log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
             // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
             // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`
@@ -909,6 +924,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+
+    transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
@@ -1351,6 +1368,7 @@ pub fn main(init: std.process.Init) !void {
             .drafter_dir = drafter_dir orelse "",
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
+            .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = mtp_depth,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
@@ -1413,6 +1431,7 @@ pub fn main(init: std.process.Init) !void {
         if (kv_quant_config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config, config.kvCacheKeyHeadDim());
         }
+        try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
@@ -1890,6 +1909,7 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .kv_quant_config = kv_quant_config,
+        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which

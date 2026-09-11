@@ -120,6 +120,7 @@ pub const LoadParams = struct {
     no_drafter: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
+    mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
@@ -170,7 +171,7 @@ pub const LoadParams = struct {
     /// `main.zig` overrides via `--ssm-checkpoint-stride` for the serve path.
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: cap on snapshots retained per request.
-    ssm_checkpoint_max: u32 = 32,
+    ssm_checkpoint_max: u32 = 16,
     /// Iteration 2 (perf-plan Phase 4 #3): per-LoadedModel LRU cache
     /// of chat-template render+tokenize results. 0 disables the cache
     /// (useful for ablation benches / debugging). Default 4 matches
@@ -305,11 +306,11 @@ pub const SubmitParams = struct {
 /// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
 /// arguments are the restored rows, their capacity, and whether the restore checked the
 /// entry out (the only restore whose rows the request will not allocate).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
-pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) u32 = null;
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -363,7 +364,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) void = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) void = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -1106,6 +1107,7 @@ pub const LoadRequest = struct {
     ds4_dspark: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
+    mtp_head_kv_quant: bool = false,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
@@ -1134,7 +1136,7 @@ pub const LoadRequest = struct {
     /// Phase 1: maximum checkpoints retained per request. Older ones are
     /// dropped front-first when the buffer would grow past this. 0 = no cap
     /// beyond the prefix-cache byte budget.
-    ssm_checkpoint_max: u32 = 32,
+    ssm_checkpoint_max: u32 = 16,
     /// Iteration 2: tokenize cache LRU capacity. Mirrored on
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
@@ -1257,6 +1259,7 @@ pub const Scheduler = struct {
     /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
     /// these flags on every on-demand load and model switch.
     mtp_enabled: bool,
+    mtp_head_kv_quant: bool,
     mtp_depth: u32,
     llama_cache_entries: u32,
     llama_kv_type_k: i32,
@@ -1372,6 +1375,9 @@ pub const Scheduler = struct {
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
     inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Post-cache tail the in-flight prefill will forward, same scale as
+    /// `inflight_prefill_tokens`; 0 when none is running.
+    inflight_prefill_expected: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
     /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
@@ -1449,6 +1455,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
             .mtp_enabled = params.mtp_enabled,
+            .mtp_head_kv_quant = params.mtp_head_kv_quant,
             .mtp_depth = params.mtp_depth,
             .llama_cache_entries = params.llama_cache_entries,
             .llama_kv_type_k = params.llama_kv_type_k,
@@ -1481,6 +1488,7 @@ pub const Scheduler = struct {
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_expected = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -1940,6 +1948,7 @@ pub const Scheduler = struct {
             // --llama-cache-entries / --llama-kv-quant were silently dropped
             // on every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
+            .mtp_head_kv_quant = self.mtp_head_kv_quant,
             .mtp_depth = self.mtp_depth,
             .llama_cache_entries = self.llama_cache_entries,
             .llama_kv_type_k = self.llama_kv_type_k,
@@ -3077,7 +3086,8 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     inline for (.{
         "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
         "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
-        "mtp_enabled",             "mtp_depth",                 "llama_cache_entries",
+        "mtp_enabled",             "mtp_head_kv_quant",         "mtp_depth",
+        "llama_cache_entries",
         "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
         "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
         "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
@@ -3439,6 +3449,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config, params.config.kvCacheKeyHeadDim());
     }
+    Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
+    try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -4381,7 +4393,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                             break :prefill;
                         }
                         if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                            if (sch.hot_prefix_cache) |hc| _ = hc.dropLastRestored();
+                            if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                             if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
                             if (slot.model.transformer) |xf| {
                                 slot.cache.truncate(0, xf.s) catch {};
@@ -5799,6 +5811,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
         sch.inflight_prefill_tokens.store(0, .monotonic);
+        sch.inflight_prefill_expected.store(0, .monotonic);
     };
 
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
@@ -5906,7 +5919,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     if (slot.model.prefix_cache) |*hc| {
-        if (slot.skip_prefix_cache) hc.skip_prefix_cache = true;
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -5928,7 +5940,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
-            const lookup = hc.lookupAndRestoreForSlot(
+            const lookup = hc.lookupAndRestoreWithMedia(
                 &slot.cache,
                 &slot.moe_seq_offset,
                 slot.ssm_entries,
@@ -5940,6 +5952,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
                 @intFromPtr(slot),
+                slot.skip_prefix_cache,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
@@ -6008,10 +6021,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 warm_capacity: u64,
                 /// Only a checked-out restore is credited: a refcount share is copied by the first append.
                 warm_will_donate: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool) bool,
+                enable_mtp: bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate);
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
                 }
             };
             var probe = Probe{
@@ -6023,12 +6037,13 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
+                .enable_mtp = slot.enable_mtp,
                 .fits = fits_fn,
             };
             if (!Probe.call(&probe)) {
                 // The width admission was billed at, read before anything is evicted.
                 if (prefill_request_chunk) |pick_pre| {
-                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
@@ -6043,7 +6058,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (prefill_admission_refused_log) |report_fn| {
-                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate);
+                        report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -6067,6 +6082,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             hot_matched,
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
+            slot.enable_mtp,
         );
         const decision = postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
         if (decision.widened) {
@@ -6163,6 +6179,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // restore hybrids too.
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else

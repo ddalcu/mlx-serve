@@ -4878,3 +4878,29 @@ Measured: gather 2.06x at kv 4k, 1.93x at 65k, 1.64x at 262k (it is not flat in 
 K/V reads from a larger buffer); live 162k prefill 1480 -> 1667 tok/s (+12.6%). Default on
 where eligible, `MLX_SERVE_QSA_NAX=0` restores the stock gather. Guards: the `gatherQsa256 NAX`
 tests, the eligibility-predicate test, the precision probe, `tests/test_qsa_nax_prefill.py`.
+
+## A 3-row conv_state view pinned the whole prefill chunk input (2026-09-10, found by Nikolai V., #366)
+
+`conv1dWithCache` stored the GDN conv state as `mlx_slice(conv_input, last kernel-1 rows)`. A slice is a
+view, and the residual's cadence eval materialises `conv_input` (`[B, k-1+T, conv_dim]` bf16) because
+`conv_out` depends on it, so every conv-cached layer kept its whole chunk input alive until that layer's
+next forward: 36 x 4096 x 10240 x 2 B = 3.0 GB on qwen4_exp at width 4096 (7.5 GB on the 27B at 8192).
+The design point that made the first attempt a null: a lazy `materializedOwnedCopy` stored into
+`conv_state` is NOT in the residual's graph, so a plain `mlx_array_eval(h)` leaves it lazy and the copy
+still holds the parent; only the post-chunk eval would evaluate it, which lowers post-chunk bytes and not
+the peak. The copy has to be named in the cadence eval vector inside the layer loop (`evalCadencePoint`),
+which leaves at most `cadence + 1` parents alive. Measured on the production pack: peak -2.5 GB at width
+4096 (the 8192 pin is clamped on qwen4_exp), -2.8 GB at the 128k rung, greedy byte-identical, llmprobe
+4k-128k neutral. The copy is gated on a chunk-wide parent (T >= 32) so composed decode on lfm2/nemotron/KDA
+pays nothing. Guards: the retention tests (active bytes after `mlx_clear_cache`), the on/off identity
+tests through `compact_conv_state_override`, and a cadence test that fails with the cadence sites reverted
+(it pins that every layer's tail is copied and named in an in-loop eval; the peak itself is only measurable
+live, a tiny fixture's peak is dominated by the gated-conv internals). A final partial chunk narrower than
+32 rows keeps the view: its pin is at most `(T + k - 1) x conv_dim x 2` per layer, a few MB. The identity
+tests use `mlx_array_equal`, which cannot see the `-0.0 -> +0.0` flip of the `x + 0` copy idiom; the live
+greedy byte identity is what covers that. The admission bill followed: `prefillStreamBytesPerToken` charged every linear layer's stream
+(737 KB/token here) because that term WAS this pin; it now bills `min(linear_layers, cadence + 1)` layers,
+and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the exact pin bytes. Rule: a
+lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
+still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
+(`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
