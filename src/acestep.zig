@@ -2250,6 +2250,19 @@ pub const Engine = struct {
 
         // ── text encoder (full forward) + lyric embeds (table lookup) ──
         const te = try self.ensureTextEncoder();
+        // Per-stage clock: whole-request wall hides which stage a change moved
+        // (a low-mem box reloads the 1.1 GB text encoder EVERY request, and a
+        // slow VAE decode is 39% of wall on an M4 base — both dilute a
+        // DiT-only speedup out of visibility). The clock starts ABOVE the
+        // encoder load so no work sits outside a stage.
+        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
+        const stageMs = struct {
+            fn f(io: std.Io, t0: *std.Io.Timestamp) u64 {
+                const ns = t0.untilNow(io, .awake).nanoseconds;
+                t0.* = std.Io.Timestamp.now(io, .awake);
+                return @intCast(@divTrunc(ns, 1_000_000));
+            }
+        }.f;
         const text_hidden = try self.encodeTextPrompt(allocator, te, instruction, req, metas, s);
         defer _ = mlx.mlx_array_free(text_hidden);
         const lyric_embeds = try qwenEmbedLookup(te, lyric_ids, s);
@@ -2273,20 +2286,12 @@ pub const Engine = struct {
         else
             try self.silenceSlice(self.cfg.timbre_fix_frame, s);
         defer _ = mlx.mlx_array_free(timbre);
-        // Per-stage clock: whole-request wall hides which stage a change moved
-        // (a low-mem box reloads the 1.1 GB text encoder EVERY request, and on
-        // a slow GPU that dilutes a DiT-only speedup out of visibility).
-        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
-        const stageMs = struct {
-            fn f(io: std.Io, t0: *std.Io.Timestamp) u64 {
-                const ns = t0.untilNow(io, .awake).nanoseconds;
-                t0.* = std.Io.Timestamp.now(io, .awake);
-                return @intCast(@divTrunc(ns, 1_000_000));
-            }
-        }.f;
-        const cond_ms = stageMs(self.io, &stage_t0);
         const cond2048 = try buildConditioning(self, allocator, text_hidden, lyric_embeds, timbre, s);
         defer _ = mlx.mlx_array_free(cond2048);
+        // mlx is lazy: without this the conditioning graph computes inside the
+        // denoise loop and lands in the WRONG stage.
+        _ = mlx.mlx_array_eval(cond2048);
+        const cond_ms = stageMs(self.io, &stage_t0);
         const cond2048_2: ?mlx.mlx_array = if (text_hidden2) |th2| try buildConditioning(self, allocator, th2, lyric_embeds, timbre, s) else null;
         defer if (cond2048_2) |x| {
             _ = mlx.mlx_array_free(x);
@@ -2415,7 +2420,7 @@ pub const Engine = struct {
         const diffuse_ms = stageMs(self.io, &stage_t0);
         const samples = try vaeDecodeChunked(self, allocator, xt, progress, s);
         const decode_ms = stageMs(self.io, &stage_t0);
-        log.info("[acestep] stages: conditioning {d} ms, diffusion {d} ms ({d} steps), vae decode {d} ms\n", .{ cond_ms, diffuse_ms, NUM_STEPS, decode_ms });
+        log.info("[acestep] stages: text+conditioning {d} ms, diffusion {d} ms ({d} steps), vae decode {d} ms\n", .{ cond_ms, diffuse_ms, NUM_STEPS, decode_ms });
         defer allocator.free(samples);
         peakNormalize(samples, NORMALIZE_DB);
         return wav_mod.encodePcm16(allocator, samples, self.cfg.sample_rate, 2);
