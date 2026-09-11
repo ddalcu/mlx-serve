@@ -556,10 +556,8 @@ pub const SchemaConstraint = struct {
     /// the caller keeps alive (the Constraint borrows it).
     pub fn deferWithProtocol(self: *SchemaConstraint, proto: *const rp_mod.Protocol) void {
         self.constraint.proto = proto;
-        self.constraint.pstate = if (proto.openerText() == null)
-            rp_mod.State.initPromptOpened()
-        else
-            rp_mod.State.initChoice();
+        self.constraint.pstate = proto.startState();
+        if (self.constraint.pstate.phase == .json_body) self.constraint.pending_span = .{ .token_index = 0, .byte_offset = 0 };
     }
 };
 
@@ -3130,7 +3128,7 @@ pub const Generator = struct {
                 }
                 return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint, proto) };
             },
-            .reasoning => {
+            .reasoning, .header => {
                 if (self.has_pending_logits) {
                     _ = mlx.mlx_array_free(self.pending_logits);
                     self.has_pending_logits = false;
@@ -3154,6 +3152,10 @@ pub const Generator = struct {
     /// scheduler tick while `pstate.recovering` drains.
     fn commitForcedConstraintToken(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !u32 {
         _ = proto;
+        if (self.has_pending_logits) {
+            _ = mlx.mlx_array_free(self.pending_logits);
+            self.has_pending_logits = false;
+        }
         const seq = constraint.pstate.pending[0..constraint.pstate.pending_len];
         const tok = seq[constraint.pstate.forced_cursor];
         constraint.pstate.forced_cursor += 1;
@@ -8881,9 +8883,8 @@ pub const Generator = struct {
     /// Sample one token while the reasoning protocol has not reached the JSON
     /// body: drain a forced recovery sequence, work the unresolved opener
     /// choice under the union mask, or sample unconstrained reasoning while
-    /// the close-delimiter matcher watches. Keeping these beside (not inside)
-    /// the active-grammar path below leaves the established constrained step
-    /// unchanged.
+    /// the close-delimiter matcher watches. The active JSON phase reuses the
+    /// existing grammar mask builder.
     fn nextReasoningStep(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !?u32 {
         // Recovery drain: at most one canonical transition token per tick,
         // through the same forward/accounting path as a sampled token.
@@ -8891,7 +8892,7 @@ pub const Generator = struct {
             return try self.commitForcedConstraintToken(allocator, constraint, proto);
         }
         switch (constraint.pstate.phase) {
-            .choice => return self.nextChoiceStep(allocator, constraint, proto),
+            .choice, .header => return self.nextChoiceStep(allocator, constraint, proto),
             .reasoning => {},
             .json_body => unreachable,
         }
@@ -8915,15 +8916,15 @@ pub const Generator = struct {
             try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.s);
             break :blk self.sampleLazy(masked_logits);
         };
+        defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-        _ = mlx.mlx_array_free(lazy);
         const token: u32 = @intCast(val);
         self.next_token_id = token;
 
         for (self.eos_token_ids) |eos_id| {
-            if (token == eos_id) {
+            if (token == eos_id and (proto.closer_atomic == null or token != proto.closer_atomic.?)) {
                 _ = mlx.mlx_array_free(step_logits);
                 owns_step_logits = false;
                 switch (try self.forceConstraintTransition(allocator)) {
@@ -8963,18 +8964,17 @@ pub const Generator = struct {
         }
 
         const token_bytes = if (token < constraint.token_bytes.bytes.len) constraint.token_bytes.bytes[token] else null;
-        const payload_suffix = rp_mod.observeReasoningToken(proto, &constraint.pstate, token, token_bytes);
+        const payload_suffix = rp_mod.observeProtocolToken(proto, &constraint.pstate, token, token_bytes);
+        if (constraint.pstate.invalid) return error.InvalidProtocolTransition;
         if (payload_suffix) |suffix| {
             // The close delimiter completed inside this token; any bytes after
             // it are the first payload bytes. The pre-sample mask validated
-            // every crossing candidate's suffix, so acceptance here is
-            // expected; the degrade below is a defensive last resort.
+            // every crossing candidate's suffix. A mismatch is an internal
+            // error and must never disable the constraint.
             for (suffix) |b| {
                 const ok = try constraint.grammar.acceptByte(b);
                 if (!ok) {
-                    log.warn("[grammar] payload bytes sharing the close token were rejected — disabling further mask enforcement\n", .{});
-                    constraint.grammar.dead = true;
-                    break;
+                    return error.InvalidProtocolPayload;
                 }
             }
             constraint.pstate.phase = .json_body;
@@ -9020,11 +9020,12 @@ pub const Generator = struct {
     fn nextChoiceStep(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !?u32 {
         const s = self.xfm.s;
 
-        const allowed = try rp_mod.applyChoiceMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+        const allowed = if (constraint.pstate.phase == .header)
+            try rp_mod.applyHeaderMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf)
+        else
+            try rp_mod.applyChoiceMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
         if (allowed == 0) {
-            log.warn("[grammar] no token satisfies the channel choice — disabling further mask enforcement\n", .{});
-            constraint.grammar.dead = true;
-            @memset(constraint.mask_buf, true);
+            return error.NoValidProtocolToken;
         }
 
         const step_logits = self.pending_logits;
@@ -9049,7 +9050,7 @@ pub const Generator = struct {
         // pad tokens carry no admissible bytes; stop the way the constrained
         // path does if one is sampled anyway.
         for (self.eos_token_ids) |eos_id| {
-            if (token == eos_id) {
+            if (token == eos_id and constraint.pstate.phase != .header) {
                 self.done = true;
                 self.finish_reason = "stop";
                 return null;
@@ -9066,26 +9067,33 @@ pub const Generator = struct {
             self.consecutive_pad = 0;
         }
 
-        switch (rp_mod.observeChoice(proto, &constraint.pstate, token, token_bytes)) {
+        const outcome: rp_mod.ChoiceOutcome = if (constraint.pstate.phase == .header) blk: {
+            const suffix = rp_mod.observeProtocolToken(proto, &constraint.pstate, token, token_bytes);
+            if (constraint.pstate.invalid) return error.InvalidProtocolTransition;
+            if (suffix) |bytes| break :blk .{ .payload = bytes };
+            break :blk if (constraint.pstate.phase == .reasoning) .opened else .progress;
+        } else rp_mod.observeChoice(proto, &constraint.pstate, token, token_bytes);
+        switch (outcome) {
             .progress => {},
             .opened => {
                 self.loop_guard_start = self.generated_ids.items.len;
                 log.info("[grammar] reasoning opener generated; reasoning unconstrained\n", .{});
             },
-            .json => {
-                // Direct answer: every byte of this token is grammar input.
-                if (token_bytes) |bytes| {
+            .json, .payload => {
+                const payload = if (outcome == .payload) outcome.payload else token_bytes;
+                if (payload) |bytes| {
                     for (bytes) |b| {
                         const ok = try constraint.grammar.acceptByte(b);
                         if (!ok) {
-                            log.warn("[grammar] direct-answer token rejected by the schema — disabling further mask enforcement\n", .{});
-                            constraint.grammar.dead = true;
-                            break;
+                            return error.InvalidProtocolPayload;
                         }
                     }
                 }
                 constraint.pstate.phase = .json_body;
-                constraint.pending_span = .{ .token_index = @intCast(self.generated_ids.items.len), .byte_offset = 0 };
+                constraint.pending_span = .{
+                    .token_index = @intCast(self.generated_ids.items.len + @as(usize, if (token_bytes == null) 1 else 0)),
+                    .byte_offset = if (outcome == .payload) rp_mod.payloadByteOffset(token_bytes, outcome.payload) else 0,
+                };
                 self.loop_guard_start = self.generated_ids.items.len;
             },
         }
@@ -9138,26 +9146,21 @@ pub const Generator = struct {
         }
         const s = self.xfm.s;
 
-        const allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
+        var allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
+        // The tokenizer's EOS is not necessarily the model's only stop id.
+        if (constraint.grammar.isComplete()) {
+            for (self.eos_token_ids) |eos_id| {
+                if (eos_id < constraint.mask_buf.len and !constraint.mask_buf[eos_id]) {
+                    constraint.mask_buf[eos_id] = true;
+                    allowed += 1;
+                }
+            }
+        }
         if (allowed == 0) {
-            // No legal token: every logit would be -inf and argmax over that
-            // row returns id 0, whose bytes then fail `acceptByte` and switch
-            // enforcement off anyway — one garbage token later, and with the
-            // grammar bug reported as model output. Say so and degrade here.
+            if (constraint.proto != null) return error.NoValidProtocolToken;
             log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
             constraint.grammar.dead = true;
             @memset(constraint.mask_buf, true);
-        }
-
-        // Also allow every stop-id the generator recognises once the grammar is
-        // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
-        // but models often have additional stop tokens (e.g. `<|im_end|>` for
-        // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
-        // this, the model can never stop.
-        if (constraint.grammar.isComplete()) {
-            for (self.eos_token_ids) |eos_id| {
-                if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
-            }
         }
 
         const step_logits = self.pending_logits;
@@ -9223,6 +9226,7 @@ pub const Generator = struct {
                 for (bytes) |b| {
                     const ok = try constraint.grammar.acceptByte(b);
                     if (!ok) {
+                        if (constraint.proto != null) return error.InvalidProtocolPayload;
                         log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
                         constraint.grammar.dead = true;
                         break;

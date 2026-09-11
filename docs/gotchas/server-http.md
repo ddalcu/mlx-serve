@@ -2056,3 +2056,19 @@ sequence with one U+FFFD. Valid input is byte-identical.
 
 Guard: `EVERY JSON string escaper survives bytes that are not valid UTF-8`
 (server.zig), one invariant over all four.
+
+
+## Constrained JSON routing and buffer lifetimes
+
+A reasoning marker inside schema-valid JSON is data. The generator publishes the
+first payload token and byte offset; `reasoning_protocol.Delivery` is shared by
+streaming and batch HTTP responses and never reparses bytes after that boundary.
+This also applies with thinking disabled and to apparent tool-call markup.
+
+Keep both normalization and delivery buffers alive until the response is serialized.
+Assigning `final_text` from a router inside Anthropic's thinking-block scope and
+deinitializing that router at the closing brace caused invalid UTF-8 in the later
+text block. The live marker regression caught it even though the protocol tests
+passed. Guards: `tests/test_json_schema_protocol_routing.py` (all three APIs,
+streaming and non-streaming), the constrained JSON format-corpus invariant, and
+the split/UTF-8/stop tests in `src/reasoning_protocol.zig`.

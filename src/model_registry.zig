@@ -87,17 +87,55 @@ pub const LoadState = enum {
 /// (weights/transformer/vision_encoder/drafter) are optional so a stub
 /// entry can exist for `unloaded`/`error_state`/`loading` without faking
 /// half-built mlx state.
-/// Cached token-id list keyed by the marker text it was built for (opener
-/// prefixes/completions, or closer-span tokens — see
-/// `LoadedModel.reasoningOpenerCandidates` / `reasoningCloserSpanCandidates`).
-pub const OpenerCandidates = struct {
-    opener: [32]u8,
-    opener_len: u8,
-    ids: []const u32,
+/// Immutable tokenizer-dependent data, owned by the loaded model. A marker
+/// has one lifetime even when different rendered prompts select it.
+pub const ReasoningMarker = struct {
     arena: std.heap.ArenaAllocator,
+    text: []const u8,
+    atomic: ?u32,
+    open_candidates: []const u32,
+    close_candidates: []const u32,
+    suffix: []const rp_mod.SuffixRun,
+    tokens: []const u32,
 
-    fn matches(self: *const OpenerCandidates, opener: []const u8) bool {
-        return self.opener_len == opener.len and std.mem.eql(u8, self.opener[0..self.opener_len], opener);
+    fn init(gpa: std.mem.Allocator, tok: *const Tokenizer, tb: *const token_mask_mod.TokenBytes, marker: []const u8) !ReasoningMarker {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var open: std.ArrayList(u32) = .empty;
+        var close: std.ArrayList(u32) = .empty;
+        for (tb.bytes, 0..) |maybe, id| {
+            const bytes = maybe orelse continue;
+            if (tb.eos_id != null and id == tb.eos_id.?) continue;
+            if (rp_mod.openerCandidateBytesMatch(marker, bytes)) try open.append(a, @intCast(id));
+            if (std.mem.indexOf(u8, bytes, marker) != null) try close.append(a, @intCast(id));
+        }
+        const suffixes = try a.alloc(rp_mod.SuffixRun, marker.len);
+        @memset(suffixes, .{ .offset = 0, .len = 0 });
+        var tokens: std.ArrayList(u32) = .empty;
+        for (0..marker.len) |k| {
+            const ids = try tok.encode(gpa, marker[k..]);
+            defer gpa.free(ids);
+            if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) continue;
+            const decoded = try tok.decode(gpa, ids, false);
+            defer gpa.free(decoded);
+            if (!std.mem.eql(u8, decoded, marker[k..])) continue;
+            suffixes[k] = .{ .offset = @intCast(tokens.items.len), .len = @intCast(ids.len) };
+            try tokens.appendSlice(a, ids);
+        }
+        const owned_text = try a.dupe(u8, marker);
+        const open_ids = try open.toOwnedSlice(a);
+        const close_ids = try close.toOwnedSlice(a);
+        const owned_tokens = try tokens.toOwnedSlice(a);
+        return .{
+            .arena = arena,
+            .text = owned_text,
+            .atomic = tok.specialTokenId(marker),
+            .open_candidates = open_ids,
+            .close_candidates = close_ids,
+            .suffix = suffixes,
+            .tokens = owned_tokens,
+        };
     }
 };
 
@@ -181,15 +219,9 @@ pub const LoadedModel = struct {
     token_bytes: ?token_mask_mod.TokenBytes = null,
     token_bytes_mutex: std.Io.Mutex = .init,
 
-    /// Reasoning-protocol opener candidate index: ordinary token ids whose
-    /// bytes are a prefix of `opener_text` or complete it, built once per
-    /// model under the same lock as the token-byte table. See
-    /// `reasoningOpenerCandidates`.
-    opener_candidates: ?OpenerCandidates = null,
-    /// Same shape, for the close-delimiter: ids whose bytes CONTAIN the
-    /// full delimiter (the boundary-crossing candidates the reasoning mask
-    /// validates). See `reasoningCloserSpanCandidates`.
-    closer_candidates: ?OpenerCandidates = null,
+    /// Stable marker indexes and exact recovery encodings, built lazily under
+    /// the token-byte lock and retained until model teardown.
+    reasoning_markers: std.ArrayList(*ReasoningMarker) = .empty,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -295,107 +327,23 @@ pub const LoadedModel = struct {
         return &self.token_bytes.?;
     }
 
-    /// Ordinary token ids whose bytes are a prefix of `opener` or complete it
-    /// — the candidate set the choice-phase union mask admits alongside the
-    /// schema-legal tokens. Built once per model (the opener is a property of
-    /// the chat template, not the request); EOS is never a candidate.
-    pub fn reasoningOpenerCandidates(
-        self: *LoadedModel,
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        opener: []const u8,
-    ) ![]const u32 {
-        if (opener.len == 0 or opener.len > 32) return &.{};
+    /// Intern tokenizer-dependent marker data without invalidating references
+    /// held by other requests. All entries share the loaded model's lifetime.
+    pub fn reasoningMarker(self: *LoadedModel, gpa: std.mem.Allocator, io: std.Io, text: []const u8) !*const ReasoningMarker {
+        if (text.len == 0 or text.len > rp_mod.MAX_MARKER_BYTES) return error.UnsupportedReasoningMarker;
         self.token_bytes_mutex.lockUncancelable(io);
         defer self.token_bytes_mutex.unlock(io);
-        if (self.opener_candidates) |*c| {
-            if (c.matches(opener)) return c.ids;
+        for (self.reasoning_markers.items) |marker| {
+            if (std.mem.eql(u8, marker.text, text)) return marker;
         }
-        if (self.closer_candidates) |*c| {
-            if (c.matches(opener)) return c.ids;
-        }
-        const tb = blk: {
-            if (self.token_bytes) |*t| break :blk t;
-            const tok = self.tokenizer orelse return error.NoTokenizer;
-            self.token_bytes = try token_mask_mod.build(gpa, tok);
-            break :blk &self.token_bytes.?;
-        };
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-        var ids: std.ArrayList(u32) = .empty;
-        errdefer ids.deinit(arena.allocator());
-        for (tb.bytes, 0..) |maybe, id| {
-            const b = maybe orelse continue;
-            if (tb.eos_id) |eos| {
-                if (id == eos) continue;
-            }
-            // Shared with the protocol tests so the production list and the
-            // tested list can never drift (a list missing continuation
-            // tokens starves the choice mask and disables constraints).
-            if (rp_mod.openerCandidateBytesMatch(opener, b)) {
-                try ids.append(arena.allocator(), @intCast(id));
-            }
-        }
-        const owned = try arena.allocator().dupe(u32, ids.items);
-        var buf: [32]u8 = undefined;
-        @memcpy(buf[0..opener.len], opener);
-        self.opener_candidates = .{
-            .opener = buf,
-            .opener_len = @intCast(opener.len),
-            .ids = owned,
-            .arena = arena,
-        };
-        return owned;
-    }
-
-    /// Ordinary token ids whose bytes CONTAIN the full `closer` text — the
-    /// only tokens able to complete the close from match state 0, so the set
-    /// the reasoning-phase mask validates before sampling. Built once per
-    /// model+delimiter; EOS is never a candidate.
-    pub fn reasoningCloserSpanCandidates(
-        self: *LoadedModel,
-        gpa: std.mem.Allocator,
-        io: std.Io,
-        closer: []const u8,
-    ) ![]const u32 {
-        if (closer.len == 0 or closer.len > 32) return &.{};
-        self.token_bytes_mutex.lockUncancelable(io);
-        defer self.token_bytes_mutex.unlock(io);
-        if (self.opener_candidates) |*c| {
-            if (c.matches(closer)) return c.ids;
-        }
-        if (self.closer_candidates) |*c| {
-            if (c.matches(closer)) return c.ids;
-        }
-        const tb = blk: {
-            if (self.token_bytes) |*t| break :blk t;
-            const tok = self.tokenizer orelse return error.NoTokenizer;
-            self.token_bytes = try token_mask_mod.build(gpa, tok);
-            break :blk &self.token_bytes.?;
-        };
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
-        var ids: std.ArrayList(u32) = .empty;
-        errdefer ids.deinit(arena.allocator());
-        for (tb.bytes, 0..) |maybe, id| {
-            const b = maybe orelse continue;
-            if (tb.eos_id) |eos| {
-                if (id == eos) continue;
-            }
-            if (std.mem.indexOf(u8, b, closer) != null) {
-                try ids.append(arena.allocator(), @intCast(id));
-            }
-        }
-        const owned = try arena.allocator().dupe(u32, ids.items);
-        var buf: [32]u8 = undefined;
-        @memcpy(buf[0..closer.len], closer);
-        self.closer_candidates = .{
-            .opener = buf,
-            .opener_len = @intCast(closer.len),
-            .ids = owned,
-            .arena = arena,
-        };
-        return owned;
+        const tok = self.tokenizer orelse return error.NoTokenizer;
+        if (self.token_bytes == null) self.token_bytes = try token_mask_mod.build(gpa, tok);
+        const marker = try self.allocator.create(ReasoningMarker);
+        errdefer self.allocator.destroy(marker);
+        marker.* = try ReasoningMarker.init(self.allocator, tok, &self.token_bytes.?, text);
+        errdefer marker.arena.deinit();
+        try self.reasoning_markers.append(self.allocator, marker);
+        return marker;
     }
 
     /// Free all owned state. Safe to call regardless of `state` — null
@@ -478,14 +426,11 @@ pub const LoadedModel = struct {
             tb.deinit();
             self.token_bytes = null;
         }
-        if (self.opener_candidates) |*c| {
-            c.arena.deinit();
-            self.opener_candidates = null;
+        for (self.reasoning_markers.items) |marker| {
+            marker.arena.deinit();
+            self.allocator.destroy(marker);
         }
-        if (self.closer_candidates) |*c| {
-            c.arena.deinit();
-            self.closer_candidates = null;
-        }
+        self.reasoning_markers.deinit(self.allocator);
         if (self.tokenizer) |tok| {
             tok.deinit();
             self.allocator.destroy(tok);

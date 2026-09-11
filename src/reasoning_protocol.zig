@@ -1,48 +1,27 @@
-//! Reasoning-protocol state machine for grammar-constrained generation.
-//!
-//! A schema-constrained request may not start sampling JSON immediately: the
-//! chat protocol can place generation inside (or in front of) a reasoning
-//! segment first. This module is the ONE bounded recognizer shared by every
-//! reasoning format the chat parser understands — per format it resolves the
-//! opener (when the prompt did not already commit one), the close delimiter,
-//! and the canonical forced-recovery sequence, and it tracks per-request
-//! phase state:
-//!
-//!   choice    — the model may open reasoning or answer directly; the mask is
-//!               the UNION of opener-prefix candidates and schema-legal JSON.
-//!   reasoning — body text is unconstrained; a bounded incremental matcher
-//!               watches for the close delimiter.
-//!   json_body — the existing JSON grammar masks every token (unchanged).
-//!
-//! Direct answers are constrained from their FIRST byte: while the channel is
-//! unresolved only opener prefixes and JSON-legal tokens are admissible, and
-//! once opener bytes are in flight the opener must complete. A close
-//! delimiter may share a token with the first payload bytes; the recognizer
-//! returns that payload suffix so the caller can feed the grammar (an invalid
-//! suffix degrades the same way an invalid sampled token does elsewhere).
-//!
-//! Model-level token candidate indexes live on `LoadedModel` (built once per
-//! model); everything here is per-request with fixed-size buffers. `Protocol`
-//! borrows its own internal arrays, so it must not be moved after resolution
-//! (the same lifetime rule as `SchemaConstraint`).
+//! Bounded reasoning-protocol recognition for JSON-constrained generation.
+//! Choice masks admit either an opener or JSON; header masks admit structural
+//! channel transitions; reasoning is free except for tokens crossing into JSON.
+//! Every payload suffix is validated before sampling. Generation publishes the
+//! authoritative payload boundary for the shared streaming/batch Delivery router.
+//! Tokenizer indexes and recovery encodings are immutable model-owned data.
 
 const std = @import("std");
 const json_grammar = @import("json_grammar.zig");
 const token_mask = @import("token_mask.zig");
 
-/// Longest reasoning delimiter this module recognizes (the 19-byte
-/// `</think:opensource>` shape plus slack).
-pub const MAX_MARKER_BYTES = 32;
+/// Bound for a delimiter or a complete assistant channel header.
+pub const MAX_MARKER_BYTES = 128;
 /// Canonical token encoding of the longest delimiter.
 pub const MAX_FORCED_TOKENS = MAX_MARKER_BYTES;
-/// A full recovery transition: opener remainder + close delimiter.
-pub const MAX_TRANSITION_TOKENS = 2 * MAX_FORCED_TOKENS;
+/// Recovery: remaining header + close delimiter + final header.
+pub const MAX_TRANSITION_TOKENS = 3 * MAX_FORCED_TOKENS;
 /// Flat storage for one delimiter's per-suffix canonical encodings (the
 /// remainder after each possible partial match). Worst case every suffix
 /// needs the full token budget.
 pub const SUFFIX_TABLE_BYTES = MAX_MARKER_BYTES * MAX_FORCED_TOKENS;
 
 pub const SuffixRun = struct { offset: u32, len: u8 };
+const empty_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 });
 
 /// Where the constrained JSON payload begins in the generated stream, for
 /// response routing: `token_index` is the index of the generated token that
@@ -69,6 +48,8 @@ pub fn payloadByteOffset(token_bytes: ?[]const u8, suffix: []const u8) u32 {
 /// builder and the tests so the two can never drift.
 pub fn openerCandidateBytesMatch(opener: []const u8, bytes: []const u8) bool {
     if (bytes.len == 0) return false;
+    const without_lead = std.mem.trimStart(u8, bytes, " \t\r\n");
+    if (without_lead.len > 0 and (std.mem.startsWith(u8, opener, without_lead) or std.mem.startsWith(u8, without_lead, opener))) return true;
     for (0..opener.len) |k| {
         const rest = opener[k..];
         if (std.mem.startsWith(u8, rest, bytes) or std.mem.startsWith(u8, bytes, rest)) return true;
@@ -95,12 +76,33 @@ pub const Kind = enum {
     /// by whichever opener resolved (prompt-injected) and the close must
     /// carry the SAME suffix; think tags with other suffixes are body text.
     suffixed_think,
+    gemma,
+    inkling,
+    harmony,
+    muse,
 };
 
 pub const BARE_THINK_OPENER = "<think>";
 pub const BARE_THINK_CLOSER = "</think>";
 
+pub const Header = struct {
+    text: []const u8,
+    target: Phase,
+    candidates: []const u32 = &.{},
+    suffix: []const SuffixRun = &empty_suffix,
+    tokens: []const u32 = &.{},
+};
+pub const Special = struct { id: u32, text: []const u8 };
+
 pub const Protocol = struct {
+    headers: [16]Header = undefined,
+    header_len: u8 = 0,
+    specials: [16]Special = undefined,
+    special_len: u8 = 0,
+    direct_json: bool = false,
+    initial_phase: ?Phase = null,
+    initial_cursor: u8 = 0,
+    initial_candidates: u32 = 0,
     kind: Kind,
     /// Special-token id whose text equals the opener, when the tokenizer has
     /// one. Special tokens keep their identity: `TokenBytes.bytes` is null
@@ -123,16 +125,162 @@ pub const Protocol = struct {
     /// `closer_buf[k..]` in ordinary bytes. `len == 0` marks an unencodable
     /// suffix — forced recovery from that partial state is refused (safe
     /// stop), never approximated.
-    closer_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 }),
-    closer_suffix_buf: [SUFFIX_TABLE_BYTES]u32 = undefined,
+    closer_suffix: []const SuffixRun = &empty_suffix,
+    closer_suffix_buf: []const u32 = &.{},
     /// Same for the opener (choice state): entry k spells `opener_buf[k..]`.
-    opener_suffix: [MAX_MARKER_BYTES]SuffixRun = @splat(.{ .offset = 0, .len = 0 }),
-    opener_suffix_buf: [SUFFIX_TABLE_BYTES]u32 = undefined,
+    opener_suffix: []const SuffixRun = &empty_suffix,
+    opener_suffix_buf: []const u32 = &.{},
     /// Model-level candidate set (borrowed from `LoadedModel`): ordinary
     /// tokens whose bytes CONTAIN the full close delimiter — the only tokens
     /// that can complete the close from match state 0. The reasoning-phase
     /// mask validates their payload suffixes before they can be sampled.
     closer_span_candidates: []const u32 = &.{},
+
+    pub fn jsonOnly() Protocol {
+        var p = Protocol{ .kind = .bare_think, .initial_phase = .json_body };
+        _ = p.setCloser(BARE_THINK_CLOSER);
+        return p;
+    }
+
+    /// Keep the rendered prefix but make reasoning unreachable. If a
+    /// template already committed analysis, finish its structural header,
+    /// close the empty segment, and enter a final header under the mask.
+    /// The caller interns the temporary rule text in its model cache.
+    pub fn finalOnly(self: *Protocol, buffer: []u8) bool {
+        const state = self.startState();
+        if (state.phase == .json_body) return true;
+        if (state.phase == .choice) {
+            self.initial_phase = .json_body;
+            return true;
+        }
+        var final: []const u8 = "";
+        for (self.headers[0..self.header_len]) |rule| {
+            if (rule.target == .json_body) {
+                final = rule.text;
+                break;
+            }
+        }
+        if (state.phase == .header) {
+            var finals: u32 = 0;
+            for (self.headers[0..self.header_len], 0..) |rule, i| {
+                if (rule.target == .json_body) finals |= @as(u32, 1) << @intCast(i);
+            }
+            if (state.header_candidates & finals != 0) {
+                self.initial_candidates = state.header_candidates & finals;
+                return true;
+            }
+        }
+        var prefix: []const u8 = "";
+        if (state.phase == .header) {
+            for (self.headers[0..self.header_len], 0..) |rule, i| {
+                if (state.header_candidates & (@as(u32, 1) << @intCast(i)) != 0) {
+                    prefix = rule.text;
+                    break;
+                }
+            }
+        }
+        const text = std.fmt.bufPrint(buffer, "{s}{s}{s}", .{ prefix, self.closerText(), final }) catch return false;
+        self.header_len = 0;
+        self.addHeader(text, .json_body);
+        self.initial_phase = .header;
+        self.initial_cursor = if (state.phase == .header) state.header_cursor else 0;
+        self.initial_candidates = 1;
+        self.direct_json = false;
+        return true;
+    }
+
+    pub fn configureChannels(self: *Protocol) void {
+        switch (self.kind) {
+            .bare_think, .suffixed_think => return,
+            .gemma => {
+                _ = self.setCloser("<channel|>");
+                self.direct_json = true;
+                self.addHeader("<|channel>thought\n", .reasoning);
+                self.addHeader("<|channel>thought", .reasoning);
+                self.addHeader("<|channel>\n", .json_body);
+            },
+            .inkling => {
+                _ = self.setCloser("<|end_message|>");
+                self.addHeader("<|message_model|><|content_thinking|>", .reasoning);
+                self.addHeader("<|message_model|><|content_text|>", .json_body);
+                self.addHeader("<|content_thinking|>", .reasoning);
+                self.addHeader("<|content_text|>", .json_body);
+            },
+            .harmony => {
+                _ = self.setCloser("<|end|>");
+                inline for (.{ "<|start|>assistant", "" }) |prefix| {
+                    self.addHeader(prefix ++ "<|channel|>analysis<|message|>", .reasoning);
+                    self.addHeader(prefix ++ "<|channel|>final<|message|>", .json_body);
+                    self.addHeader(prefix ++ "<|channel|>commentary<|message|>", .json_body);
+                    self.addHeader(prefix ++ " to=user<|channel|>final<|message|>", .json_body);
+                    self.addHeader(prefix ++ "<|channel|>final to=user<|message|>", .json_body);
+                }
+            },
+            .muse => {
+                _ = self.setCloser("<|eom|>");
+                inline for (.{ "<|start|>assistant", "" }) |prefix| {
+                    self.addHeader(prefix ++ " to=self<|message|>", .reasoning);
+                    self.addHeader(prefix ++ " to=user<|message|>", .json_body);
+                    self.addHeader(prefix ++ "<|message|>", .json_body);
+                }
+            },
+        }
+    }
+
+    fn addHeader(self: *Protocol, text: []const u8, target: Phase) void {
+        std.debug.assert(self.header_len < self.headers.len and text.len <= MAX_MARKER_BYTES);
+        self.headers[self.header_len] = .{ .text = text, .target = target };
+        self.header_len += 1;
+    }
+
+    fn allHeaders(self: *const Protocol) u32 {
+        return (@as(u32, 1) << @intCast(self.header_len)) - 1;
+    }
+
+    pub fn startState(self: *const Protocol) State {
+        if (self.initial_phase) |phase| return .{
+            .phase = phase,
+            .header_cursor = self.initial_cursor,
+            .header_candidates = self.initial_candidates,
+        };
+        return if (self.openerText() == null) State.initPromptOpened() else State.initChoice();
+    }
+
+    /// Find the longest header prefix at the rendered prompt tail. Prompt
+    /// decisions are request-local, while rule/tokenizer data is immutable.
+    pub fn startFromPrompt(self: *Protocol, tail: []const u8) bool {
+        var longest: usize = 0;
+        var candidates: u32 = 0;
+        var completed: ?Phase = null;
+        for (self.headers[0..self.header_len], 0..) |rule, i| {
+            var k: usize = 1;
+            while (k <= rule.text.len) : (k += 1) {
+                if (!std.mem.endsWith(u8, tail, rule.text[0..k])) continue;
+                if (k > longest) {
+                    longest = k;
+                    candidates = 0;
+                    completed = null;
+                }
+                if (k == longest) {
+                    candidates |= @as(u32, 1) << @intCast(i);
+                    if (k == rule.text.len) completed = rule.target;
+                }
+            }
+        }
+        if (longest == 0 and !self.direct_json) return false;
+        self.initial_phase = completed orelse .header;
+        self.initial_cursor = if (completed != null) 0 else @intCast(longest);
+        self.initial_candidates = if (longest == 0) self.allHeaders() else candidates;
+        return true;
+    }
+
+    pub fn tokenText(self: *const Protocol, id: u32, ordinary: ?[]const u8) ?[]const u8 {
+        if (ordinary) |bytes| return bytes;
+        for (self.specials[0..self.special_len]) |special| {
+            if (id == special.id) return special.text;
+        }
+        return null;
+    }
 
     /// The opener literal; null when the prompt already opened the block and
     /// generation starts inside reasoning. Delimiters live in this struct's
@@ -198,6 +346,17 @@ pub const Protocol = struct {
     /// delimiter bytes are never approximated).
     pub fn planRecovery(self: *const Protocol, state: *const State, out: *[MAX_TRANSITION_TOKENS]u32) ?usize {
         var n: usize = 0;
+        if (state.phase == .header) {
+            var selected: ?usize = null;
+            for (self.headers[0..self.header_len], 0..) |rule, i| {
+                if (state.header_candidates & (@as(u32, 1) << @intCast(i)) == 0) continue;
+                if (selected == null or rule.target == .json_body) selected = i;
+                if (rule.target == .json_body) break;
+            }
+            const rule = self.headers[selected orelse return null];
+            n = appendRecovery(rule.suffix, rule.tokens, state.header_cursor, out, n) orelse return null;
+            if (rule.target == .json_body) return n;
+        }
         if (state.phase == .choice and state.open_cursor > 0) {
             const cursor: usize = state.open_cursor;
             if (cursor < self.opener_len) {
@@ -224,16 +383,35 @@ pub const Protocol = struct {
             @memcpy(out[n..][0..full.len], full);
             n += full.len;
         }
+        if (self.header_len > 0) {
+            for (self.headers[0..self.header_len]) |rule| {
+                if (rule.target == .json_body) {
+                    return appendRecovery(rule.suffix, rule.tokens, 0, out, n);
+                }
+            }
+            return null;
+        }
         return n;
     }
 };
 
-pub const Phase = enum { choice, reasoning, json_body };
+fn appendRecovery(table: []const SuffixRun, tokens: []const u32, cursor: usize, out: []u32, n: usize) ?usize {
+    if (cursor >= table.len) return null;
+    const run = table[cursor];
+    if (run.len == 0 or n + run.len > out.len) return null;
+    @memcpy(out[n..][0..run.len], tokens[run.offset..][0..run.len]);
+    return n + run.len;
+}
+
+pub const Phase = enum { choice, header, reasoning, json_body };
 
 /// Mutable per-request state. Bounded: memory does not grow with reasoning
 /// length (the close matcher keeps only the last `MAX_MARKER_BYTES` bytes).
 pub const State = struct {
     phase: Phase = .json_body,
+    header_cursor: u8 = 0,
+    header_candidates: u32 = 0,
+    invalid: bool = false,
     /// Bytes of the opener matched so far (choice phase).
     open_cursor: u8 = 0,
     /// Trailing bytes currently matching a prefix of the closer (reasoning).
@@ -247,8 +425,8 @@ pub const State = struct {
     /// composed sequence (opener remainder + close delimiter) is planned once
     /// and consumed by cursor.
     recovering: bool = false,
-    forced_cursor: u8 = 0,
-    pending_len: u8 = 0,
+    forced_cursor: u16 = 0,
+    pending_len: u16 = 0,
     pending: [MAX_TRANSITION_TOKENS]u32 = undefined,
 
     pub fn initPromptOpened() State {
@@ -299,6 +477,8 @@ pub const ChoiceOutcome = union(enum) {
     progress,
     /// Token completed the opener; everything after it is reasoning.
     opened,
+    /// The opener and closer completed in this token; only this suffix is JSON.
+    payload: []const u8,
     /// Token is ordinary JSON: ALL its bytes are grammar input.
     json,
 };
@@ -310,16 +490,22 @@ pub fn observeChoice(p: *const Protocol, state: *State, token_id: u32, bytes: ?[
             return .opened;
         }
     }
-    const b = bytes orelse {
+    const raw = bytes orelse {
         state.phase = .json_body;
         return .json;
     };
+    const b = if (state.open_cursor == 0) std.mem.trimStart(u8, raw, " \t\r\n") else raw;
     // JSON-legal whitespace does not resolve the choice: an opener or a JSON
     // value can both follow. Stay ambiguous (the cursor is untouched — the
     // opener match is byte-exact) and keep the grammar unfed.
     if (isJsonWhitespaceRun(b)) return .progress;
     if (openerCompletedBy(p, state.open_cursor, b)) {
+        const rest = openerRemainingText(p, state.open_cursor);
         state.phase = .reasoning;
+        if (observeReasoningToken(p, state, std.math.maxInt(u32), b[rest.len..])) |suffix| {
+            state.phase = .json_body;
+            return .{ .payload = suffix };
+        }
         return .opened;
     }
     if (openerContinuesFrom(p, state.open_cursor, b)) {
@@ -357,18 +543,19 @@ pub fn applyChoiceMask(
     } else {
         @memset(mask, false);
     }
-    const closer = p.closerText();
     for (p.opener_candidates) |id| {
         if (id >= mask.len or mask[id]) continue;
-        const bytes = tb.bytes[id] orelse continue;
+        const raw = tb.bytes[id] orelse continue;
+        const bytes = if (state.open_cursor == 0) std.mem.trimStart(u8, raw, " \t\r\n") else raw;
+        if (bytes.len == 0) continue;
         if (tb.eos_id) |eos| {
             if (id == eos) continue;
         }
-        // A candidate whose bytes contain the close delimiter would emit the
-        // BOUNDARY as opener progress; it is never a legal choice token.
-        if (std.mem.indexOf(u8, bytes, closer) != null) continue;
         const cursor = state.open_cursor;
         if (openerContinuesFrom(p, cursor, bytes) or openerCompletedBy(p, cursor, bytes)) {
+            var trial = state.*;
+            const outcome = observeChoice(p, &trial, id, raw);
+            if (outcome == .payload and !try acceptsSuffix(grammar, outcome.payload)) continue;
             mask[id] = true;
             allowed += 1;
         }
@@ -444,14 +631,15 @@ pub fn observeReasoningToken(p: *const Protocol, state: *State, token_id: u32, b
     if (p.closer_atomic) |aid| {
         // An atomic close has no bytes: the payload it carries is empty by
         // definition, whatever the tokenizer's decode says.
-        if (token_id == aid) return "";
+        if (token_id == aid) return afterClose(p, state, "");
     }
     const b = bytes orelse return null;
     var sim = CloseSim.init(p.closerText(), state.close_match, state.tail[0..state.tail_len]);
     for (b, 0..) |c, i| {
         if (sim.feed(c)) {
             state.close_match = 0;
-            return b[i + 1 ..];
+            state.tail_len = 0;
+            return afterClose(p, state, b[i + 1 ..]);
         }
     }
     state.close_match = sim.match;
@@ -460,17 +648,123 @@ pub fn observeReasoningToken(p: *const Protocol, state: *State, token_id: u32, b
     return null;
 }
 
-/// Upper bound on tokens masked out in one reasoning step (the candidate
-/// sets are tiny; the cap only bounds a pathological vocabulary).
-const MAX_MASKED_OUT = 256;
+fn afterClose(p: *const Protocol, state: *State, suffix: []const u8) ?[]const u8 {
+    state.close_match = 0;
+    state.tail_len = 0;
+    if (p.header_len == 0) {
+        state.phase = .json_body;
+        return suffix;
+    }
+    state.phase = .header;
+    state.header_cursor = 0;
+    state.header_candidates = p.allHeaders();
+    return observeHeader(p, state, suffix);
+}
 
-/// Reasoning-phase pre-sample validation: among the boundary-sensitive
-/// candidates — tokens containing the full close delimiter, plus, while a
-/// partial match is open, tokens beginning with the remaining delimiter
-/// bytes — those whose payload suffix the grammar REJECTS are masked out
-/// BEFORE sampling, so a close-sharing token can never bypass the schema by
-/// degrading enforcement afterwards. Returns the number of masked-out ids;
-/// 0 means nothing was excluded and the caller may sample unconstrained.
+fn observeHeader(p: *const Protocol, state: *State, bytes: []const u8) ?[]const u8 {
+    for (bytes, 0..) |b, offset| {
+        var matches: u32 = 0;
+        var completed: ?Phase = null;
+        for (p.headers[0..p.header_len], 0..) |rule, i| {
+            const bit = @as(u32, 1) << @intCast(i);
+            if (state.header_candidates & bit == 0) continue;
+            if (state.header_cursor < rule.text.len and rule.text[state.header_cursor] == b) {
+                matches |= bit;
+                if (state.header_cursor + 1 == rule.text.len) completed = rule.target;
+            }
+        }
+        if (matches == 0) {
+            if (state.header_cursor == 0 and p.direct_json) {
+                if (isJsonWhitespaceRun(bytes[offset..][0..1])) continue;
+                state.phase = .json_body;
+                return bytes[offset..];
+            }
+            state.invalid = true;
+            return null;
+        }
+        state.header_candidates = matches;
+        state.header_cursor += 1;
+        if (completed) |phase| {
+            state.phase = phase;
+            state.header_cursor = 0;
+            state.close_match = 0;
+            state.tail_len = 0;
+            if (phase == .json_body) return bytes[offset + 1 ..];
+            return observeReasoningToken(p, state, std.math.maxInt(u32), bytes[offset + 1 ..]);
+        }
+    }
+    return null;
+}
+
+/// The same transition drives candidate validation and selected-token
+/// observation. Null means no payload; state.invalid rejects a malformed
+/// header. Only the returned suffix belongs to the JSON grammar.
+pub fn observeProtocolToken(p: *const Protocol, state: *State, id: u32, ordinary: ?[]const u8) ?[]const u8 {
+    switch (state.phase) {
+        .reasoning => return observeReasoningToken(p, state, id, ordinary),
+        .header => {
+            const bytes = p.tokenText(id, ordinary) orelse {
+                state.invalid = true;
+                return null;
+            };
+            return observeHeader(p, state, bytes);
+        },
+        .json_body => return ordinary,
+        .choice => {
+            const outcome = observeChoice(p, state, id, ordinary);
+            return switch (outcome) {
+                .json => ordinary,
+                .payload => |bytes| bytes,
+                else => null,
+            };
+        },
+    }
+}
+
+fn allowHeaderToken(p: *const Protocol, state: *const State, grammar: *json_grammar.Grammar, tb: *const token_mask.TokenBytes, mask: []bool, id: u32) !bool {
+    if (id >= mask.len or mask[id]) return false;
+    var trial = state.*;
+    const suffix = observeProtocolToken(p, &trial, id, tb.bytes[id]);
+    if (trial.invalid) return false;
+    if (suffix) |bytes| {
+        if (!try acceptsSuffix(grammar, bytes)) return false;
+    }
+    mask[id] = true;
+    return true;
+}
+
+pub fn applyHeaderMask(p: *const Protocol, state: *const State, grammar: *json_grammar.Grammar, tb: *const token_mask.TokenBytes, mask: []bool) !u32 {
+    var allowed: u32 = 0;
+    if (p.direct_json and state.header_cursor == 0) {
+        const base = try token_mask.buildMask(grammar, tb, mask);
+        allowed = base.allowed;
+    } else @memset(mask, false);
+    for (p.headers[0..p.header_len], 0..) |rule, i| {
+        if (state.header_candidates & (@as(u32, 1) << @intCast(i)) == 0) continue;
+        for (rule.candidates) |id| {
+            if (try allowHeaderToken(p, state, grammar, tb, mask, id)) allowed += 1;
+        }
+    }
+    for (p.specials[0..p.special_len]) |special| {
+        if (try allowHeaderToken(p, state, grammar, tb, mask, special.id)) allowed += 1;
+    }
+    return allowed;
+}
+
+/// Trial only the bytes that enter the JSON body. Ordinary reasoning and
+/// empty boundary suffixes take no grammar snapshot and allocate nothing.
+fn acceptsSuffix(grammar: *json_grammar.Grammar, suffix: []const u8) !bool {
+    if (suffix.len == 0) return true;
+    const snap = try grammar.snapshot();
+    defer grammar.discardSnapshot(snap);
+    defer grammar.restoreFrom(snap) catch unreachable; // original stack capacity is retained
+    for (suffix) |c| if (!try grammar.acceptByteFast(c)) return false;
+    return true;
+}
+
+/// Mask boundary-crossing candidates in place, without a cap on exclusions.
+/// The model index covers whole closers; the first-byte bucket covers the
+/// remainder of a closer split across tokens. Both use the same recognizer.
 pub fn applyReasoningMask(
     p: *const Protocol,
     state: *const State,
@@ -478,68 +772,131 @@ pub fn applyReasoningMask(
     tb: *const token_mask.TokenBytes,
     mask: []bool,
 ) std.mem.Allocator.Error!usize {
-    if (grammar.isDead()) return 0;
     std.debug.assert(mask.len == tb.bytes.len);
-    var invalid: [MAX_MASKED_OUT]u32 = undefined;
     var n: usize = 0;
-
-    const snap = try grammar.snapshot();
-    defer grammar.discardSnapshot(snap);
-
-    if (p.closer_span_candidates.len > 0) {
-        for (p.closer_span_candidates) |id| {
-            if (id >= mask.len) continue;
+    const rest = p.closerText()[state.close_match..];
+    const partial = if (state.close_match > 0) tb.by_first[rest[0]] else &.{};
+    for ([_][]const u32{ p.closer_span_candidates, partial }) |candidates| {
+        for (candidates) |id| {
+            if (id >= mask.len or (n > 0 and !mask[id])) continue;
             const bytes = tb.bytes[id] orelse continue;
-            if (tb.eos_id) |eos| {
-                if (id == eos) continue;
-            }
-            if (probeCloseCompletion(p, state, bytes)) |end| {
-                const suffix = bytes[end..];
-                try grammar.restoreFrom(snap);
-                var ok = true;
-                for (suffix) |c| {
-                    if (!try grammar.acceptByteFast(c)) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (!ok and n < invalid.len) {
-                    invalid[n] = id;
+            if (probeCloseCompletion(p, state, bytes) != null) {
+                var trial = state.*;
+                const payload = observeProtocolToken(p, &trial, id, bytes);
+                if (trial.invalid or (payload != null and !try acceptsSuffix(grammar, payload.?))) {
+                    if (n == 0) @memset(mask, true);
+                    mask[id] = false;
                     n += 1;
                 }
             }
         }
     }
-    if (state.close_match > 0 and state.close_match < p.closer_len) {
-        const rest = p.closerText()[state.close_match..];
-        // Any token beginning with the remaining delimiter bytes completes
-        // the close at its first bytes; only a schema-valid suffix may ride
-        // along. The by_first bucket bounds the scan to plausible starters.
-        for (tb.by_first[rest[0]]) |id| {
-            if (id >= mask.len) continue;
-            const bytes = tb.bytes[id] orelse continue;
-            if (!std.mem.startsWith(u8, bytes, rest)) continue;
-            const suffix = bytes[rest.len..];
-            try grammar.restoreFrom(snap);
-            var ok = true;
-            for (suffix) |c| {
-                if (!try grammar.acceptByteFast(c)) {
-                    ok = false;
-                    break;
-                }
+    return n;
+}
+
+/// Shared constrained-response router. The generator's token/byte boundary
+/// is authoritative; payload bytes are never scanned for markup. Only an
+/// unresolved opener and a possible closing delimiter are held back.
+/// Output buffers are reused across calls. Call noteToken before HTTP UTF8
+/// carry handling, then feed only complete decoded chunks.
+pub const Delivery = struct {
+    proto: *const Protocol,
+    header_state: State,
+    token_index: u32 = 0,
+    raw_bytes: usize = 0,
+    consumed_bytes: usize = 0,
+    payload_byte: ?usize = null,
+    opener_cursor: usize = 0,
+    opened: bool,
+    pending: [MAX_MARKER_BYTES]u8 = undefined,
+    pending_len: usize = 0,
+    reasoning_started: bool = false,
+    content_started: bool = false,
+    reasoning: std.ArrayList(u8) = .empty,
+    content: std.ArrayList(u8) = .empty,
+
+    pub fn init(proto: *const Protocol) Delivery {
+        return .{ .proto = proto, .header_state = proto.startState(), .opened = proto.openerText() == null };
+    }
+
+    pub fn deinit(self: *Delivery, allocator: std.mem.Allocator) void {
+        self.reasoning.deinit(allocator);
+        self.content.deinit(allocator);
+    }
+
+    pub fn noteToken(self: *Delivery, len: usize, span: ?ConstraintSpan) void {
+        if (span) |s| {
+            if (s.token_index == self.token_index) self.payload_byte = self.raw_bytes + s.byte_offset;
+        }
+        self.raw_bytes += len;
+        self.token_index += 1;
+    }
+
+    fn emitReasoning(self: *Delivery, allocator: std.mem.Allocator, b: u8) !void {
+        if (!self.reasoning_started and (b == ' ' or b == '\n')) return;
+        self.reasoning_started = true;
+        try self.reasoning.append(allocator, b);
+    }
+
+    fn flushPending(self: *Delivery, allocator: std.mem.Allocator) !void {
+        if (!std.mem.eql(u8, self.pending[0..self.pending_len], self.proto.closerText())) {
+            for (self.pending[0..self.pending_len]) |b| try self.emitReasoning(allocator, b);
+        }
+        self.pending_len = 0;
+    }
+
+    pub fn feed(self: *Delivery, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        self.reasoning.clearRetainingCapacity();
+        self.content.clearRetainingCapacity();
+        for (bytes) |b| {
+            const is_content = if (self.payload_byte) |pb| self.consumed_bytes >= pb else false;
+            self.consumed_bytes += 1;
+            if (is_content) {
+                try self.flushPending(allocator);
+                if (!self.content_started and (b == ' ' or b == '\n')) continue;
+                self.content_started = true;
+                try self.content.append(allocator, b);
+                continue;
             }
-            if (!ok and n < invalid.len) {
-                invalid[n] = id;
-                n += 1;
+            if (self.proto.header_len > 0 and self.header_state.phase == .header) {
+                _ = observeHeader(self.proto, &self.header_state, &.{b});
+                if (self.header_state.invalid) return error.InvalidProtocolTransition;
+                continue;
+            }
+            if (!self.opened) {
+                const opener = self.proto.openerText().?;
+                if (self.opener_cursor == 0 and (b == ' ' or b == '\n' or b == '\r' or b == '\t')) continue;
+                // A direct answer's whitespace and a truncated header never
+                // become reasoning. The generator admits only exact openers.
+                if (b != opener[self.opener_cursor]) continue;
+                self.opener_cursor += 1;
+                self.opened = self.opener_cursor == opener.len;
+                continue;
+            }
+            if (self.pending_len == self.pending.len) try self.flushPending(allocator);
+            self.pending[self.pending_len] = b;
+            self.pending_len += 1;
+            while (self.pending_len > 0 and !std.mem.startsWith(u8, self.proto.closerText(), self.pending[0..self.pending_len])) {
+                try self.emitReasoning(allocator, self.pending[0]);
+                std.mem.copyForwards(u8, self.pending[0 .. self.pending_len - 1], self.pending[1..self.pending_len]);
+                self.pending_len -= 1;
+            }
+            if (self.proto.header_len > 0 and std.mem.eql(u8, self.pending[0..self.pending_len], self.proto.closerText())) {
+                self.pending_len = 0;
+                _ = afterClose(self.proto, &self.header_state, "");
             }
         }
     }
-    try grammar.restoreFrom(snap);
-    if (n == 0) return 0;
-    @memset(mask, true);
-    for (invalid[0..n]) |id| mask[id] = false;
-    return n;
-}
+
+    pub fn clearOutput(self: *Delivery) void {
+        self.reasoning.clearRetainingCapacity();
+        self.content.clearRetainingCapacity();
+    }
+
+    pub fn finish(self: *Delivery, allocator: std.mem.Allocator) !void {
+        try self.flushPending(allocator);
+    }
+};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -577,7 +934,7 @@ const Vocab = struct {
         const al = arena.allocator();
         var list: std.ArrayList(?[]const u8) = .empty;
         const words = [_]?[]const u8{
-            "<think", ">", BARE_THINK_CLOSER, null, "{", "}", " ", "hello", "<", null,
+            "<think",                 ">",  BARE_THINK_CLOSER,        null, "{", "}", " ", "hello", "<", null,
             BARE_THINK_CLOSER ++ "{", ">x", BARE_THINK_CLOSER ++ "x", "\n",
         };
         for (words) |w| try list.append(al, if (w) |s| try al.dupe(u8, s) else null);
@@ -750,7 +1107,7 @@ test "reasoning: a token that completes the close carries a validated payload su
     var state = State.initPromptOpened();
     const closed = observeReasoningToken(&proto, &state, Vocab.span_close_json, tb.bytes[Vocab.span_close_json]).?;
     try testing.expectEqualStrings("{", closed); // "{" is the payload suffix; the caller feeds the grammar
-    try testing.expectEqual(Phase.reasoning, state.phase); // the CALLER flips the phase after feeding
+    try testing.expectEqual(Phase.json_body, state.phase); // the transition owns the phase
 }
 
 test "recovery composes the exact byte remainder after a partial close" {
@@ -767,8 +1124,8 @@ test "recovery composes the exact byte remainder after a partial close" {
         table[k] = .{ .offset = off, .len = @intCast(run_len) };
         off += run_len;
     }
-    proto.closer_suffix = table;
-    proto.closer_suffix_buf = buf;
+    proto.closer_suffix = &table;
+    proto.closer_suffix_buf = &buf;
     const ids = [_]u32{50};
     try testing.expect(proto.setForced(&ids));
 
@@ -799,8 +1156,8 @@ test "recovery after partial atomic-close bytes forces the byte remainder" {
     const rest = BARE_THINK_CLOSER[k..];
     for (0..rest.len) |i| buf[i] = @intCast(200 + i);
     table[k] = .{ .offset = 0, .len = @intCast(rest.len) };
-    proto.closer_suffix = table;
-    proto.closer_suffix_buf = buf;
+    proto.closer_suffix = &table;
+    proto.closer_suffix_buf = &buf;
 
     var state = State.initPromptOpened();
     state.close_match = @intCast(k);
@@ -839,8 +1196,8 @@ test "recovery completes a partial generated opener before closing" {
     otable[5] = .{ .offset = 1, .len = 2 };
     obuf[1] = 9;
     obuf[2] = 10;
-    proto.opener_suffix = otable;
-    proto.opener_suffix_buf = obuf;
+    proto.opener_suffix = &otable;
+    proto.opener_suffix_buf = &obuf;
 
     var state = State.initChoice();
     state.open_cursor = 6;
@@ -856,8 +1213,8 @@ test "recovery completes a partial generated opener before closing" {
     state2.open_cursor = 1;
     otable[1] = .{ .offset = 3, .len = 6 };
     for (0..6) |i| obuf[3 + i] = @intCast(20 + i);
-    proto.opener_suffix = otable;
-    proto.opener_suffix_buf = obuf;
+    proto.opener_suffix = &otable;
+    proto.opener_suffix_buf = &obuf;
     const n2 = proto.planRecovery(&state2, &out).?;
     try testing.expectEqual(@as(usize, 7), n2);
     try testing.expectEqual(@as(u32, 20), out[0]);
@@ -894,7 +1251,7 @@ test "marker bytes beyond the matcher window cannot desync the tail" {
     var proto = makeProtocol(null, BARE_THINK_CLOSER, &.{});
     var state = State.initPromptOpened();
     // Flood past MAX_MARKER_BYTES with prose, then close normally.
-    const flood: [64]u8 = @splat('x');
+    const flood: [2 * MAX_MARKER_BYTES]u8 = @splat('x');
     try testing.expect(observeReasoningToken(&proto, &state, 300, &flood) == null);
     try testing.expect(state.tail_len == MAX_MARKER_BYTES);
     try testing.expect(observeReasoningToken(&proto, &state, 301, "</think>") != null);
@@ -1109,4 +1466,407 @@ test "reasoning mask validates partial-close continuations from the live match s
 
 fn freshReasoningState() State {
     return State.initPromptOpened();
+}
+
+test "all invalid crossing tokens must be masked" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+    const words = try a.alloc(?[]const u8, 257);
+    var ids: [257]u32 = undefined;
+    for (words, 0..) |*w, i| {
+        w.* = try std.fmt.allocPrint(a, "</think>x{d}", .{i});
+        ids[i] = @intCast(i);
+    }
+    var tb = try token_mask.TokenBytes.init(arena, words, null);
+    defer tb.deinit();
+    var p = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    p.closer_atomic = null;
+    p.closer_span_candidates = &ids;
+    var s = State.initPromptOpened();
+    var mask: [257]bool = undefined;
+    _ = try applyReasoningMask(&p, &s, &g, &tb, &mask);
+    try testing.expect(!mask[256]);
+}
+
+test "opener completion must observe its trailing partial closer" {
+    var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+    defer schema.deinit();
+    var g = try json_grammar.Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    const a = arena.allocator();
+    const words = try a.alloc(?[]const u8, 2);
+    words[0] = "<think>x</th";
+    words[1] = "ink>{";
+    var tb = try token_mask.TokenBytes.init(arena, words, null);
+    defer tb.deinit();
+    var p = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, &.{0});
+    p.closer_atomic = null;
+    var s = State.initChoice();
+    var mask: [2]bool = undefined;
+    _ = try applyChoiceMask(&p, &s, &g, &tb, &mask);
+    try testing.expect(mask[0]);
+    _ = observeChoice(&p, &s, 0, words[0]);
+    const payload = observeReasoningToken(&p, &s, 1, words[1]);
+    try testing.expect(payload != null);
+}
+
+test "delivery uses byte spans after whitespace and preserves marker strings" {
+    var p = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, &.{});
+    var d = Delivery.init(&p);
+    defer d.deinit(testing.allocator);
+    d.noteToken(1, null);
+    try d.feed(testing.allocator, " ");
+    try testing.expectEqualStrings("", d.reasoning.items);
+    const json = "{\"tag\":\"<think>\"}";
+    d.noteToken(json.len, .{ .token_index = 1, .byte_offset = 0 });
+    try d.feed(testing.allocator, json);
+    try testing.expectEqualStrings(json, d.content.items);
+    try testing.expectEqualStrings("", d.reasoning.items);
+}
+
+test "delivery holds exact delimiters across chunks and honors partial completion" {
+    var p = makeProtocol(null, "</think:opensource>", &.{});
+    var d = Delivery.init(&p);
+    defer d.deinit(testing.allocator);
+    const body = "reason </think:legacy> still reasoning";
+    d.noteToken(body.len, null);
+    try d.feed(testing.allocator, body);
+    try testing.expectEqualStrings(body, d.reasoning.items);
+    d.noteToken(6, null);
+    try d.feed(testing.allocator, "</thin");
+    try testing.expectEqualStrings("", d.reasoning.items);
+    const end = "k:opensource>{}";
+    d.noteToken(end.len, .{ .token_index = 2, .byte_offset = end.len - 2 });
+    try d.feed(testing.allocator, end);
+    try testing.expectEqualStrings("{}", d.content.items);
+    try testing.expectEqualStrings("", d.reasoning.items);
+}
+
+test "delivery token offsets survive a UTF8 carry and producer read-ahead" {
+    var p = makeProtocol(null, BARE_THINK_CLOSER, &.{});
+    var d = Delivery.init(&p);
+    defer d.deinit(testing.allocator);
+    // First byte is held by the HTTP decoder; the producer already knows a
+    // future boundary. It must not switch the consumer's channel early.
+    const span = ConstraintSpan{ .token_index = 1, .byte_offset = 9 };
+    d.noteToken(1, span);
+    d.noteToken(11, span); // second UTF8 byte + </think> + {}
+    try d.feed(testing.allocator, "\xc3\xa9</think>{}");
+    try testing.expectEqualStrings("\xc3\xa9", d.reasoning.items);
+    try testing.expectEqualStrings("{}", d.content.items);
+}
+
+test "constrained split clips a stop before payload and preserves unrelated tags" {
+    var p = makeProtocol(null, "</think:opensource>", &.{});
+    const text = "r </think:legacy> then stop";
+    var delivery = Delivery.init(&p);
+    defer delivery.deinit(testing.allocator);
+    delivery.payload_byte = text.len + 10;
+    try delivery.feed(testing.allocator, text);
+    try delivery.finish(testing.allocator);
+    try testing.expectEqualStrings(text, delivery.reasoning.items);
+    try testing.expectEqualStrings("", delivery.content.items);
+    var choice = makeProtocol(BARE_THINK_OPENER, BARE_THINK_CLOSER, &.{});
+    var partial = Delivery.init(&choice);
+    defer partial.deinit(testing.allocator);
+    try partial.feed(testing.allocator, " <thi");
+    try partial.finish(testing.allocator);
+    try testing.expectEqualStrings("", partial.reasoning.items);
+    try testing.expectEqualStrings("", partial.content.items);
+}
+
+test "channel formats require their final header before JSON" {
+    const cases = .{
+        .{ Kind.gemma, "<|turn>model\n<|channel>thought\n", "work<channel|><|channel>\n{}" },
+        .{ Kind.inkling, "<|message_model|><|content_thinking|>", "work<|end_message|><|message_model|><|content_text|>{}" },
+        .{ Kind.harmony, "<|start|>assistant<|channel|>analysis<|message|>", "work<|end|><|start|>assistant<|channel|>final<|message|>{}" },
+        .{ Kind.muse, "<|start|>assistant to=self<|message|>", "work<|eom|><|start|>assistant to=user<|message|>{}" },
+    };
+    inline for (cases) |case| {
+        var p = Protocol{ .kind = case[0] };
+        p.configureChannels();
+        try testing.expect(p.startFromPrompt(case[1]));
+        var state = p.startState();
+        try testing.expectEqual(Phase.reasoning, state.phase);
+        for (case[2], 0..) |_, i| {
+            const bytes = case[2][i..][0..1];
+            const suffix = observeProtocolToken(&p, &state, std.math.maxInt(u32), bytes);
+            try testing.expect(!state.invalid);
+            if (suffix) |json| {
+                // Header completion may return an empty payload at its end.
+                try testing.expect(json.len == 0 or json[0] == '{' or json[0] == '}');
+            }
+            if (i < case[2].len - 3) try testing.expect(state.phase != .json_body);
+        }
+        try testing.expectEqual(Phase.json_body, state.phase);
+    }
+}
+
+fn indexTestProtocol(a: std.mem.Allocator, p: *Protocol, tb: *const token_mask.TokenBytes) !void {
+    var closers: std.ArrayList(u32) = .empty;
+    for (tb.bytes, 0..) |maybe, id| {
+        const bytes = maybe orelse continue;
+        if (std.mem.indexOf(u8, bytes, p.closerText()) != null) try closers.append(a, @intCast(id));
+    }
+    p.closer_span_candidates = try closers.toOwnedSlice(a);
+    for (p.headers[0..p.header_len]) |*rule| {
+        var candidates: std.ArrayList(u32) = .empty;
+        for (tb.bytes, 0..) |maybe, id| {
+            if (maybe) |bytes| {
+                if (openerCandidateBytesMatch(rule.text, bytes)) try candidates.append(a, @intCast(id));
+            }
+        }
+        rule.candidates = try candidates.toOwnedSlice(a);
+    }
+}
+
+fn expectRoutedAtEverySplit(kind: Kind, prompt: []const u8, text: []const u8, expected_reasoning: []const u8, expected_json: []const u8) !void {
+    for (1..text.len) |split| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = Protocol{ .kind = kind };
+        p.configureChannels();
+        try testing.expect(p.startFromPrompt(prompt));
+        var token_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        const words = try token_arena.allocator().alloc(?[]const u8, 2);
+        words[0] = text[0..split];
+        words[1] = text[split..];
+        var tb = try token_mask.TokenBytes.init(token_arena, words, null);
+        defer tb.deinit();
+        try indexTestProtocol(a, &p, &tb);
+        var schema = try parseSchema(testing.allocator, "{\"type\":\"object\",\"properties\":{\"note\":{\"type\":\"string\"}}}");
+        defer schema.deinit();
+        var grammar = try json_grammar.Grammar.init(testing.allocator, &schema);
+        defer grammar.deinit();
+        var state = p.startState();
+        var delivery = Delivery.init(&p);
+        defer delivery.deinit(testing.allocator);
+        var reasoning: std.ArrayList(u8) = .empty;
+        var content: std.ArrayList(u8) = .empty;
+        var span: ?ConstraintSpan = null;
+        for (words, 0..) |word, i| {
+            var mask: [2]bool = undefined;
+            switch (state.phase) {
+                .header => {
+                    _ = try applyHeaderMask(&p, &state, &grammar, &tb, &mask);
+                    if (!mask[i]) std.debug.print("header mask: kind={s} split={d} token={d} cursor={d} text={s}\n", .{ @tagName(kind), split, i, state.header_cursor, word.? });
+                    try testing.expect(mask[i]);
+                },
+                .reasoning => {
+                    const n = try applyReasoningMask(&p, &state, &grammar, &tb, &mask);
+                    try testing.expect(n == 0 or mask[i]);
+                },
+                .json_body => {
+                    _ = try token_mask.buildMask(&grammar, &tb, &mask);
+                    try testing.expect(mask[i]);
+                },
+                .choice => unreachable,
+            }
+            const before = state.phase;
+            const payload = observeProtocolToken(&p, &state, @intCast(i), word);
+            try testing.expect(!state.invalid);
+            if (payload) |bytes| {
+                if (before != .json_body) span = .{ .token_index = @intCast(i), .byte_offset = @intCast(word.?.len - bytes.len) };
+                for (bytes) |b| try testing.expect(try grammar.acceptByte(b));
+            }
+            delivery.noteToken(word.?.len, span);
+            try delivery.feed(testing.allocator, word.?);
+            try reasoning.appendSlice(a, delivery.reasoning.items);
+            try content.appendSlice(a, delivery.content.items);
+        }
+        delivery.clearOutput();
+        try delivery.finish(testing.allocator);
+        try reasoning.appendSlice(a, delivery.reasoning.items);
+        try testing.expectEqualStrings(expected_reasoning, reasoning.items);
+        try testing.expectEqualStrings(expected_json, content.items);
+        // The same router must reconstruct the same channels in one batch.
+        var batch = Delivery.init(&p);
+        defer batch.deinit(testing.allocator);
+        batch.payload_byte = delivery.payload_byte;
+        try batch.feed(testing.allocator, text);
+        try batch.finish(testing.allocator);
+        try testing.expectEqualStrings(expected_reasoning, batch.reasoning.items);
+        try testing.expectEqualStrings(expected_json, batch.content.items);
+    }
+}
+
+test "channel routing and masks agree at every token split, including repeated reasoning" {
+    const json = "{\"note\":\"<think> and <|channel|> are data\"}";
+    try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>thought\nfirst<channel|><|channel>thought\nsecond<channel|><|channel>\n" ++ json, "first\nsecond", json);
+    try expectRoutedAtEverySplit(.inkling, "<|message_model|>", "<|content_thinking|>first<|end_message|><|message_model|><|content_thinking|>second<|end_message|><|message_model|><|content_text|>" ++ json, "firstsecond", json);
+    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>analysis<|message|>first<|end|><|start|>assistant<|channel|>analysis<|message|>second<|end|><|start|>assistant<|channel|>final<|message|>" ++ json, "firstsecond", json);
+    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=self<|message|>first<|eom|><|start|>assistant to=self<|message|>second<|eom|><|start|>assistant to=user<|message|>" ++ json, "firstsecond", json);
+}
+
+test "channel formats allow direct answers through their content headers" {
+    try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>\n{}", "", "{}");
+    try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "  {}", "", "{}");
+    try expectRoutedAtEverySplit(.inkling, "<|message_model|>", "<|content_text|>{}", "", "{}");
+    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>final<|message|>{}", "", "{}");
+    try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>commentary<|message|>{}", "", "{}");
+    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", " to=user<|message|>{}", "", "{}");
+    try expectRoutedAtEverySplit(.muse, "<|start|>assistant", "<|message|>{}", "", "{}");
+}
+
+fn asciiRecovery(a: std.mem.Allocator, text: []const u8) !struct { table: []SuffixRun, tokens: []u32 } {
+    const table = try a.alloc(SuffixRun, text.len);
+    var tokens: std.ArrayList(u32) = .empty;
+    for (0..text.len) |k| {
+        table[k] = .{ .offset = @intCast(tokens.items.len), .len = @intCast(text.len - k) };
+        for (text[k..]) |b| try tokens.append(a, b);
+    }
+    return .{ .table = table, .tokens = try tokens.toOwnedSlice(a) };
+}
+
+test "every channel header prefix recovers to JSON without duplicating partial headers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]Kind{ .gemma, .inkling, .harmony, .muse }) |kind| {
+        var p = Protocol{ .kind = kind };
+        p.configureChannels();
+        const close = try asciiRecovery(a, p.closerText());
+        p.closer_suffix = close.table;
+        p.closer_suffix_buf = close.tokens;
+        try testing.expect(p.setForced(close.tokens[0..p.closer_len]));
+        for (p.headers[0..p.header_len]) |*rule| {
+            const data = try asciiRecovery(a, rule.text);
+            rule.suffix = data.table;
+            rule.tokens = data.tokens;
+        }
+        for (p.headers[0..p.header_len]) |rule| {
+            for (0..rule.text.len) |k| {
+                var state = State{ .phase = .header, .header_candidates = p.allHeaders() };
+                _ = observeProtocolToken(&p, &state, std.math.maxInt(u32), rule.text[0..k]);
+                try testing.expect(!state.invalid);
+                var plan: [MAX_TRANSITION_TOKENS]u32 = undefined;
+                const count = p.planRecovery(&state, &plan) orelse return error.RecoveryRefused;
+                for (plan[0..count]) |id| {
+                    const bytes = [_]u8{@intCast(id)};
+                    _ = observeProtocolToken(&p, &state, id, &bytes);
+                    try testing.expect(!state.invalid);
+                }
+                try testing.expectEqual(Phase.json_body, state.phase);
+            }
+        }
+        for (0..p.closer_len) |k| {
+            var state = State.initPromptOpened();
+            _ = observeProtocolToken(&p, &state, std.math.maxInt(u32), p.closerText()[0..k]);
+            var plan: [MAX_TRANSITION_TOKENS]u32 = undefined;
+            const count = p.planRecovery(&state, &plan) orelse return error.RecoveryRefused;
+            for (plan[0..count]) |id| {
+                _ = observeProtocolToken(&p, &state, id, &.{@intCast(id)});
+                try testing.expect(!state.invalid);
+            }
+            try testing.expectEqual(Phase.json_body, state.phase);
+        }
+    }
+}
+
+test "thinking off constrains final headers even after a prompt committed analysis" {
+    for ([_]Kind{ .gemma, .inkling, .harmony, .muse }) |kind| {
+        var p = Protocol{ .kind = kind };
+        p.configureChannels();
+        const reasoning_header = p.headers[0].text;
+        for (0..reasoning_header.len + 1) |k| {
+            var configured = p;
+            if (k == 0) {
+                configured.initial_phase = .header;
+                configured.initial_candidates = configured.allHeaders();
+            } else try testing.expect(configured.startFromPrompt(reasoning_header[0..k]));
+            var buffer: [MAX_MARKER_BYTES]u8 = undefined;
+            try testing.expect(configured.finalOnly(&buffer));
+            var state = configured.startState();
+            if (state.phase == .json_body) continue;
+            var final: ?Header = null;
+            for (configured.headers[0..configured.header_len], 0..) |rule, i| {
+                if (state.header_candidates & (@as(u32, 1) << @intCast(i)) != 0) {
+                    try testing.expectEqual(Phase.json_body, rule.target);
+                    final = rule;
+                }
+            }
+            const rule = final orelse return error.NoFinalHeader;
+            _ = observeProtocolToken(&configured, &state, std.math.maxInt(u32), rule.text[state.header_cursor..]);
+            try testing.expectEqual(Phase.json_body, state.phase);
+            try testing.expect(!state.invalid);
+        }
+    }
+}
+
+test "special-token channel headers preserve identity and never become JSON input" {
+    var p = Protocol{ .kind = .harmony };
+    p.configureChannels();
+    try testing.expect(p.startFromPrompt("<|start|>assistant"));
+    const specials = [_]Special{
+        .{ .id = 0, .text = "<|channel|>" },
+        .{ .id = 1, .text = "<|message|>" },
+        .{ .id = 2, .text = "<|end|>" },
+        .{ .id = 3, .text = "<|start|>" },
+    };
+    @memcpy(p.specials[0..specials.len], &specials);
+    p.special_len = specials.len;
+    p.closer_atomic = 2;
+    var state = p.startState();
+    _ = observeProtocolToken(&p, &state, 0, null);
+    _ = observeProtocolToken(&p, &state, 100, "analysis");
+    _ = observeProtocolToken(&p, &state, 1, null);
+    try testing.expectEqual(Phase.reasoning, state.phase);
+    _ = observeProtocolToken(&p, &state, 100, "reason");
+    _ = observeProtocolToken(&p, &state, 2, null);
+    try testing.expectEqual(Phase.header, state.phase);
+    _ = observeProtocolToken(&p, &state, 3, null);
+    _ = observeProtocolToken(&p, &state, 100, "assistant");
+    _ = observeProtocolToken(&p, &state, 0, null);
+    _ = observeProtocolToken(&p, &state, 100, "final");
+    try testing.expectEqualStrings("", observeProtocolToken(&p, &state, 1, null).?);
+    try testing.expectEqual(Phase.json_body, state.phase);
+    try testing.expect(!state.invalid);
+}
+
+test "channel masks reject malformed transitions and invalid crossing payloads" {
+    inline for (.{ Kind.gemma, Kind.inkling, Kind.harmony, Kind.muse }) |kind| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var p = Protocol{ .kind = kind };
+        p.configureChannels();
+        const final = for (p.headers[0..p.header_len]) |rule| {
+            if (rule.target == .json_body) break rule.text;
+        } else unreachable;
+        const good = try std.fmt.allocPrint(a, "{s}{s}{{}}", .{ p.closerText(), final });
+        const bad = try std.fmt.allocPrint(a, "{s}{s}garbage", .{ p.closerText(), final });
+        const malformed = try std.fmt.allocPrint(a, "{s}<invalid-header>{{}}", .{p.closerText()});
+        var ta = std.heap.ArenaAllocator.init(testing.allocator);
+        const words = try ta.allocator().alloc(?[]const u8, 4);
+        @memcpy(words, &[_]?[]const u8{ good, bad, malformed, "ordinary reasoning" });
+        var tb = try token_mask.TokenBytes.init(ta, words, null);
+        defer tb.deinit();
+        try indexTestProtocol(a, &p, &tb);
+        var schema = try parseSchema(testing.allocator, "{\"type\":\"object\"}");
+        defer schema.deinit();
+        var grammar = try json_grammar.Grammar.init(testing.allocator, &schema);
+        defer grammar.deinit();
+        var state = State.initPromptOpened();
+        var mask: [4]bool = undefined;
+        try testing.expectEqual(@as(u32, 2), try applyReasoningMask(&p, &state, &grammar, &tb, &mask));
+        try testing.expectEqualSlices(bool, &.{ true, false, false, true }, &mask);
+        try testing.expectEqual(Phase.reasoning, state.phase);
+        // Candidate validation must not mutate the JSON grammar.
+        try testing.expect(try grammar.acceptByte('{'));
+        try testing.expect(try grammar.acceptByte('}'));
+        try testing.expect(grammar.isComplete());
+    }
+}
+
+test "Gemma prompt can end immediately after the thought channel name" {
+    var p = Protocol{ .kind = .gemma };
+    p.configureChannels();
+    try testing.expect(p.startFromPrompt("<|turn>model\n<|channel>thought"));
+    try testing.expectEqual(Phase.reasoning, p.startState().phase);
 }

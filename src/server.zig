@@ -1081,61 +1081,25 @@ fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *c
     return chat_mod.promptTailOpensMuseHeader(tail);
 }
 
-/// Resolve the reasoning protocol for a schema-constrained request from the
-/// rendered prompt tail, the tokenizer, and the chat template — never from a
-/// checkpoint name. Returns null when capability checks cannot establish safe
-/// support; callers keep the thinking-off fallback in that case.
-///
-/// Three resolutions:
-///  • the tail ends in a bare `<think>` → generation starts inside reasoning;
-///    the close is the bare `</think>` (atomic when the tokenizer has it);
-///  • the tail ends in a complete `<think:S>` → same, with the close bound to
-///    the SAME suffix (`</think:S>`) — other suffixes are body text;
-///  • otherwise, when the template itself is a think-tag template (a channel
-///    family model has no think tags in its template and must keep the
-///    fallback until its own format is supported), generation starts at the
-///    unresolved opener choice: the model may open reasoning or answer
-///    directly, and the choice mask keeps both legal until it decides.
-/// Fill a delimiter's per-suffix canonical encodings: entry k spells
-/// `text[k..]` in ordinary tokens whose bytes concatenate exactly. A suffix
-/// the tokenizer cannot spell keeps `len == 0` — forced recovery refuses at
-/// that partial state instead of approximating the delimiter.
-fn fillSuffixTable(
-    alloc: std.mem.Allocator,
-    tok: *const Tokenizer,
-    tb: *const token_mask.TokenBytes,
-    text: []const u8,
-    table: []rp_mod.SuffixRun,
-    buf: []u32,
-) void {
-    var off: u32 = 0;
-    for (0..text.len) |k| {
-        const suffix = text[k..];
-        const ids = tok.encode(alloc, suffix) catch continue;
-        defer alloc.free(ids);
-        if (ids.len == 0 or off + ids.len > buf.len) continue;
-        var consumed: usize = 0;
-        var ok = true;
-        for (ids) |id| {
-            const b = tb.bytes[id] orelse {
-                ok = false;
-                break;
-            };
-            if (consumed + b.len > suffix.len or
-                !std.mem.eql(u8, b, suffix[consumed..consumed + b.len]))
-            {
-                ok = false;
-                break;
-            }
-            consumed += b.len;
+/// A generated tag needs one unambiguous literal spelling in the template.
+/// Dynamic or conflicting spellings retain the unsupported-format fallback.
+fn templateThinkOpener(template: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, template, offset, "<think")) |start| {
+        const len = chat_mod.thinkOpenTagLenAt(template[start..]) orelse return null;
+        const tag = template[start..][0..len];
+        if (found) |previous| {
+            if (!std.mem.eql(u8, previous, tag)) return null;
         }
-        if (!ok or consumed != suffix.len) continue;
-        @memcpy(buf[off..][0..ids.len], ids);
-        table[k] = .{ .offset = off, .len = @intCast(ids.len) };
-        off += @intCast(ids.len);
+        found = tag;
+        offset = start + len;
     }
+    return found;
 }
 
+/// Resolve a reasoning protocol from the rendered prompt and template. Tokenizer
+/// indexes and exact recovery suffixes are cached on the loaded model.
 fn resolveReasoningProtocol(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1144,71 +1108,93 @@ fn resolveReasoningProtocol(
     chat_config: *const chat_mod.ChatConfig,
     prompt_ids: []const u32,
     proto_out: *rp_mod.Protocol,
+    allow_reasoning: bool,
 ) bool {
-    if (prompt_ids.len == 0) return false;
-    const tail_n = @min(prompt_ids.len, 12);
+    if (prompt_ids.len == 0 or lm.transformer == null) return false;
+    const tail_n = @min(prompt_ids.len, 64);
     const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - tail_n ..], false) catch return false;
     defer allocator.free(tail);
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
 
-    proto_out.* = .{ .kind = .bare_think };
+    const template = chat_config.chat_template;
+    const kind: rp_mod.Kind = if (std.mem.indexOf(u8, template, "<|content_thinking|>") != null)
+        .inkling
+    else if (std.mem.indexOf(u8, template, "<|channel|>") != null)
+        .harmony
+    else if (std.mem.indexOf(u8, template, "<|eom|>") != null)
+        .muse
+    else if (std.mem.indexOf(u8, template, "<|channel>") != null)
+        .gemma
+    else
+        .bare_think;
+    proto_out.* = .{ .kind = kind };
     const proto = proto_out;
-    switch (chat_mod.promptThinkTailClass(trimmed)) {
-        .bare => {
-            proto.kind = .bare_think;
-            if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
-        },
-        .suffixed => |suffix| {
-            proto.kind = .suffixed_think;
-            var closer_buf: [32]u8 = undefined;
-            const closer = std.fmt.bufPrint(&closer_buf, "</think:{s}>", .{suffix}) catch return false;
-            if (!proto.setCloser(closer)) return false;
-        },
-        .none => {
-            // The prompt did not commit a channel. Only a think-tag TEMPLATE
-            // can hand the choice to this resolver; channel-family templates
-            // carry no think tags and keep the fallback.
-            if (std.mem.indexOf(u8, chat_config.chat_template, "<think") == null) return false;
-            proto.kind = .bare_think;
-            if (!proto.setOpener(chat_mod.BARE_THINK_OPENER)) return false;
-            if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
-        },
-    }
-
-    // The close must be samplable: an atomic special token, or ordinary bytes
-    // whose canonical encoding reproduces the delimiter exactly. The
-    // per-suffix recovery table is filled either way — a partial close
-    // always recovers through the remaining BYTES, atomic or not.
-    const tb = lm.grammarTokenBytes(allocator, io) catch return false;
-    fillSuffixTable(allocator, tok, tb, proto.closerText(), &proto.closer_suffix, &proto.closer_suffix_buf);
-    proto.closer_atomic = tok.specialTokenId(proto.closerText());
-    if (proto.closer_atomic == null) {
-        const ids = tok.encode(allocator, proto.closerText()) catch return false;
-        defer allocator.free(ids);
-        if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) return false;
-        var joined: std.ArrayList(u8) = .empty;
-        defer joined.deinit(allocator);
-        for (ids) |id| {
-            const b = tb.bytes[id] orelse return false; // a special id cannot be forced or masked
-            joined.appendSlice(allocator, b) catch return false;
+    if (kind != .bare_think) {
+        proto.configureChannels();
+        if (!proto.startFromPrompt(tail)) return false;
+    } else {
+        switch (chat_mod.promptThinkTailClass(trimmed)) {
+            .bare => {
+                proto.kind = .bare_think;
+                if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
+            },
+            .suffixed => |suffix| {
+                proto.kind = .suffixed_think;
+                var closer_buf: [32]u8 = undefined;
+                const closer = std.fmt.bufPrint(&closer_buf, "</think:{s}>", .{suffix}) catch return false;
+                if (!proto.setCloser(closer)) return false;
+            },
+            .none => {
+                const opener = templateThinkOpener(template) orelse return false;
+                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER)) .bare_think else .suffixed_think;
+                var closer_buf: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
+                const close = std.fmt.bufPrint(&closer_buf, "</{s}", .{opener[1..]}) catch return false;
+                if (!proto.setOpener(opener) or !proto.setCloser(close)) return false;
+            },
         }
-        if (!std.mem.eql(u8, joined.items, proto.closerText())) return false;
-        if (!proto.setForced(ids)) return false;
     }
 
-    // Boundary-crossing candidates for the reasoning-phase pre-sample mask:
-    // tokens whose bytes contain the full close delimiter.
-    proto.closer_span_candidates = lm.reasoningCloserSpanCandidates(allocator, io, proto.closerText()) catch &.{};
+    var final_header: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
+    if (!allow_reasoning and !proto.finalOnly(&final_header)) return false;
 
-    // The choice state needs opener candidates (model-level index) and the
-    // opener's own suffix table for partial-opener recovery.
-    if (proto.openerText()) |opener| {
-        fillSuffixTable(allocator, tok, tb, opener, &proto.opener_suffix, &proto.opener_suffix_buf);
-        proto.opener_atomic = tok.specialTokenId(opener);
-        if (proto.opener_atomic == null) {
-            const cands = lm.reasoningOpenerCandidates(allocator, io, opener) catch return false;
-            if (cands.len == 0) return false;
-            proto.opener_candidates = cands;
+    const closer = lm.reasoningMarker(allocator, io, proto.closerText()) catch return false;
+    proto.closer_atomic = closer.atomic;
+    proto.closer_suffix = closer.suffix;
+    proto.closer_suffix_buf = closer.tokens;
+    proto.closer_span_candidates = closer.close_candidates;
+    if (closer.atomic == null) {
+        const run = closer.suffix[0];
+        if (run.len == 0 or !proto.setForced(closer.tokens[run.offset..][0..run.len])) return false;
+    }
+    if (proto.openerText()) |text| {
+        const opener = lm.reasoningMarker(allocator, io, text) catch return false;
+        proto.opener_atomic = opener.atomic;
+        proto.opener_suffix = opener.suffix;
+        proto.opener_suffix_buf = opener.tokens;
+        proto.opener_candidates = opener.open_candidates;
+        if (opener.atomic == null and opener.open_candidates.len == 0) return false;
+    }
+    for (proto.headers[0..proto.header_len]) |*rule| {
+        const marker = lm.reasoningMarker(allocator, io, rule.text) catch return false;
+        if (marker.suffix[0].len == 0) return false;
+        rule.text = marker.text;
+        rule.candidates = marker.open_candidates;
+        rule.suffix = marker.suffix;
+        rule.tokens = marker.tokens;
+    }
+    // Structural special ids remain separate from JSON token bytes.
+    if (proto.closer_atomic) |id| {
+        proto.specials[proto.special_len] = .{ .id = id, .text = closer.text };
+        proto.special_len += 1;
+    }
+    for ([_][]const u8{
+        "<|start|>",         "<|channel|>",          "<|message|>",      "<|channel>",      "<channel|>",
+        "<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|end_message|>", "<|end|>",
+        "<|eom|>",
+    }) |text| {
+        if (tok.specialTokenId(text)) |id| {
+            proto.specials[proto.special_len] = .{ .id = id, .text = text };
+            proto.special_len += 1;
         }
     }
     return true;
@@ -8111,7 +8097,7 @@ fn handleChatCompletions(
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !has_tools and enable_thinking and reasoning_budget < 0) {
-        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto);
+        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, true);
     }
     switch (schemaMasksThinking(
         grammar_schema_val != null,
@@ -8129,6 +8115,12 @@ fn handleChatCompletions(
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
+    }
+    if (grammar_schema_val != null and !has_tools and !enable_thinking and lm.transformer != null) {
+        if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
+            schema_proto = rp_mod.Protocol.jsonOnly();
+        }
+        schema_proto_active = true;
     }
     const tokenize_ns = tokenize_sw.read();
 
@@ -8269,7 +8261,7 @@ fn handleChatCompletions(
                 var deferred = false;
                 if (schema_proto_active) {
                     sc.deferWithProtocol(&schema_proto);
-                    deferred = true;
+                    deferred = schema_proto.startState().phase != .json_body;
                 }
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
@@ -8962,7 +8954,7 @@ fn nonStreamingViaScheduler(
     const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
     const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
 
-    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null);
     // A loop cut is a truncation, and the degenerate span is the part the
     // client must not get: an agent re-sends the cut turn as history, the
     // model reads its own loop back and resumes it — five loop-stops in a
@@ -9025,30 +9017,79 @@ fn nonStreamingViaScheduler(
 /// UNREParsed. A standalone re-scan of the payload would read marker text
 /// inside JSON string data ("the close delimiter") as protocol structure and
 /// truncate valid JSON. Without a boundary the existing parser applies.
-fn constrainedThinkSplit(
-    text: []const u8,
-    payload_byte: ?usize,
-    keep_markup: bool,
-    opened_by_template: bool,
-) chat_mod.ThinkSplit {
-    if (payload_byte) |pb| {
-        // The reasoning side ends right at the boundary; strip the delimiter
-        // bytes (close at the end, a generated opener at the start) the same
-        // way the text-based split does, then apply the shared whitespace
-        // policy so streaming and non-streaming agree byte for byte.
-        var reasoning_raw = text[0..pb];
-        if (chat_mod.thinkOpenTagLenAt(reasoning_raw)) |olen| reasoning_raw = reasoning_raw[olen..];
-        const reasoning = std.mem.trim(u8, chat_mod.trimTrailingThinkClosers(reasoning_raw), "\n ");
-        const content = std.mem.trimStart(u8, text[pb..], "\n ");
-        return .{
-            .reasoning_content = if (reasoning.len > 0) reasoning else null,
-            .content = content,
-        };
+fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []const u8, lps: *StreamLogprobs, d: *rp_mod.Delivery) !void {
+    if (d.reasoning.items.len > 0) {
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{});
     }
-    return if (keep_markup)
-        chat_mod.splitThinkBlockKeepingMarkup(text, true, opened_by_template)
-    else
-        chat_mod.splitThinkBlock(text, true, opened_by_template);
+    if (d.content.items.len > 0) {
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+    } else lps.dropPending();
+}
+
+fn emitConstrainedAnthropic(a: std.mem.Allocator, stream: *Conn, index: *u32, thinking_open: *bool, text_open: *bool, d: *rp_mod.Delivery) !void {
+    if (d.reasoning.items.len > 0) {
+        if (!thinking_open.*) {
+            const data = try std.fmt.allocPrint(a,
+                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+            , .{index.*});
+            defer a.free(data);
+            try sendAnthropicEvent(stream, "content_block_start", data);
+            thinking_open.* = true;
+        }
+        try emitAnthropicThinkingDelta(a, stream, index.*, d.reasoning.items);
+    }
+    if (d.content.items.len > 0) {
+        if (thinking_open.*) {
+            try closeAnthropicThinkingBlock(a, stream, index.*);
+            thinking_open.* = false;
+            index.* += 1;
+        }
+        if (!text_open.*) {
+            const data = try std.fmt.allocPrint(a,
+                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+            , .{index.*});
+            defer a.free(data);
+            try sendAnthropicEvent(stream, "content_block_start", data);
+            text_open.* = true;
+        }
+        try emitAnthropicTextDelta(a, stream, index.*, d.content.items);
+    }
+}
+
+fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, reasoning_id: *?[]u8, reasoning_index: *u32, reasoning_started: *bool, message_id: *?[]u8, message_index: *u32, message_started: *bool, d: *rp_mod.Delivery) !void {
+    if (d.reasoning.items.len > 0) {
+        if (!reasoning_started.*) {
+            reasoning_id.* = try responses_mod.makeId(stream.io, a, "rs");
+            reasoning_index.* = 0;
+            try emitResponsesReasoningStart(a, stream, seq, reasoning_index.*, reasoning_id.*.?);
+            reasoning_started.* = true;
+        }
+        try emitResponsesReasoningDelta(a, stream, seq, reasoning_index.*, reasoning_id.*.?, d.reasoning.items);
+    }
+    if (d.content.items.len > 0) {
+        if (!message_started.*) {
+            message_id.* = try responses_mod.makeId(stream.io, a, "msg");
+            message_index.* = if (reasoning_started.*) 1 else 0;
+            try emitResponsesMessageStart(a, stream, seq, message_index.*, message_id.*.?);
+            message_started.* = true;
+        }
+        try emitResponsesMessageDelta(a, stream, seq, message_index.*, message_id.*.?, d.content.items);
+    }
+}
+
+fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+    if (sampling.constraint) |c| {
+        if (c.proto) |p| {
+            routed.* = rp_mod.Delivery.init(p);
+            const d = &routed.*.?;
+            d.payload_byte = payload_byte;
+            try d.feed(allocator, text);
+            try d.finish(allocator);
+            const reasoning = std.mem.trim(u8, d.reasoning.items, "\n ");
+            return .{ .reasoning_content = if (reasoning.len == 0) null else reasoning, .content = d.content.items };
+        }
+    }
+    return if (keep_markup) chat_mod.splitThinkBlockKeepingMarkup(text, true, opened) else chat_mod.splitThinkBlock(text, true, opened);
 }
 
 fn handleNonStreamingGeneration(
@@ -9138,9 +9179,9 @@ fn handleNonStreamingGeneration(
     // mid-turn). A span-routed constrained response skips this: its payload
     // is authoritative and marker text inside it is DATA.
     var normalized_text: ?[]u8 = null;
-    if (result.constraint_payload_byte == null) {
+    defer if (normalized_text) |n| allocator.free(n);
+    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
         normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        defer if (normalized_text) |n| allocator.free(n);
         if (normalized_text) |n| final_text = n;
     }
 
@@ -9277,7 +9318,9 @@ fn handleNonStreamingGeneration(
     // Split thinking content from response. Always the think-capable split:
     // whatever reasoning was generated ships as reasoning_content, never
     // stripped (tokens we discarded still counted against tok/s).
-    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, false, opens_think);
+    var routed: ?rp_mod.Delivery = null;
+    defer if (routed) |*d| d.deinit(allocator);
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
     const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
@@ -9880,15 +9923,16 @@ fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
+    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
     // the content arm when the generator reports a DIRECT answer — the whole
     // point is that no reasoning block exists to scan for.
     const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
-    var in_think_block = prompt_opened_think or constrained_proto;
-    var payload_started = false;
+    var in_think_block = prompt_opened_think and !constrained_proto;
+    var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
+    defer if (delivery) |*d| d.deinit(allocator);
     var think_closed = false; // a complete think block was already split+emitted this stream
     // Leading whitespace is suppressed until the first visible byte, so the
     // stream reaches the same content bytes as splitThinkBlock's own
@@ -9952,6 +9996,7 @@ fn handleStreamingGeneration(
         try lps.note(token_id);
         const strip = tok.tok_type == .sentencepiece_bpe;
         const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
 
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
@@ -9990,12 +10035,6 @@ fn handleStreamingGeneration(
         };
 
         // Accumulate for stop sequence and tool call detection
-        if (constrained_proto and !payload_started) {
-            if (slot_handle.?.constraintPayloadStart()) |ps| {
-                payload_started = true;
-                if (ps.token_index == 0 and in_think_block) in_think_block = false;
-            }
-        }
 
         if (gated_stream or stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
@@ -10012,6 +10051,14 @@ fn handleStreamingGeneration(
                 }
                 token_text = try allocator.realloc(token_text, cut.token_keep);
             }
+        }
+
+        if (delivery) |*d| {
+            defer allocator.free(token_text);
+            try d.feed(allocator, token_text);
+            try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
+            try beatStreamKeepalive(stream, .sse_comment);
+            continue;
         }
 
         if (gated_stream) {
@@ -10421,6 +10468,14 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         };
+    }
+
+    if (!client_gone) {
+        if (delivery) |*d| {
+            d.clearOutput();
+            try d.finish(allocator);
+            try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
+        }
     }
 
     // Flush any remaining think buffer
@@ -14764,7 +14819,7 @@ fn handleAnthropicMessages(
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (output_cfg.schema != null and !has_tools and enable_thinking and reasoning_budget < 0) {
-        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto);
+        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, true);
     }
     switch (schemaMasksThinking(
         output_cfg.schema != null,
@@ -14782,6 +14837,12 @@ fn handleAnthropicMessages(
             log.info("[grammar] {s}; rerendered with thinking off\n", .{if (reasoning_budget >= 0) "finite reasoning budget" else "reasoning protocol unsupported for this model/prompt"});
         },
         .no_mask, .token_zero => schema_proto_active = false,
+    }
+    if (output_cfg.schema != null and !has_tools and !enable_thinking and lm.transformer != null) {
+        if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
+            schema_proto = rp_mod.Protocol.jsonOnly();
+        }
+        schema_proto_active = true;
     }
     const tokenize_ns = tokenize_sw.read();
 
@@ -14890,7 +14951,7 @@ fn handleAnthropicMessages(
                 var deferred = false;
                 if (schema_proto_active) {
                     sc.deferWithProtocol(&schema_proto);
-                    deferred = true;
+                    deferred = schema_proto.startState().phase != .json_body;
                 }
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
@@ -15006,9 +15067,9 @@ fn handleAnthropicNonStreaming(
     // mid-turn). A span-routed constrained response skips this: its payload
     // is authoritative and marker text inside it is DATA.
     var normalized_text: ?[]u8 = null;
-    if (result.constraint_payload_byte == null) {
+    defer if (normalized_text) |n| allocator.free(n);
+    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
         normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        defer if (normalized_text) |n| allocator.free(n);
         if (normalized_text) |n| final_text = n;
     }
 
@@ -15030,8 +15091,10 @@ fn handleAnthropicNonStreaming(
     // (`chat_mod.trimLeakedToolMarkup`), which is where the leak matters.
     // Reasoning the model generated is always delivered as a thinking block —
     // the request's thinking flag shaped the prompt, never the delivery.
+    var routed: ?rp_mod.Delivery = null;
+    defer if (routed) |*d| d.deinit(allocator);
     {
-        const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = chat_mod.trimLeakedToolMarkup(r);
@@ -15114,7 +15177,7 @@ fn handleAnthropicNonStreaming(
             // No tool calls — emit text block. Nothing parsed, so any tool
             // markup still in here is unparsed wreckage: cut it at emission.
             if (block_count > 0) try content.append(allocator, ',');
-            const esc_text = try jsonEscape(allocator, chat_mod.trimLeakedToolMarkup(final_text));
+            const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
             defer allocator.free(esc_text);
             const text_block = try std.fmt.allocPrint(allocator,
                 \\{{"type":"text","text":{s}}}
@@ -15125,7 +15188,7 @@ fn handleAnthropicNonStreaming(
     } else {
         // No tools — emit text block
         if (block_count > 0) try content.append(allocator, ',');
-        const esc_text = try jsonEscape(allocator, chat_mod.trimLeakedToolMarkup(final_text));
+        const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
         defer allocator.free(esc_text);
         const text_block = try std.fmt.allocPrint(allocator,
             \\{{"type":"text","text":{s}}}
@@ -15302,15 +15365,16 @@ fn handleAnthropicStreaming(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or std.mem.eql(u8, config.model_type, "gpt_oss");
+    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
     // the content arm when the generator reports a DIRECT answer — the whole
     // point is that no reasoning block exists to scan for.
     const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
-    var in_think_block = prompt_opened_think or constrained_proto;
-    var payload_started = false;
+    var in_think_block = prompt_opened_think and !constrained_proto;
+    var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
+    defer if (delivery) |*d| d.deinit(allocator);
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
@@ -15377,6 +15441,7 @@ fn handleAnthropicStreaming(
         }
         const strip = tok.tok_type == .sentencepiece_bpe;
         const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
 
         // UTF-8 carry handling
         var token_text = blk: {
@@ -15410,12 +15475,6 @@ fn handleAnthropicStreaming(
         // generated token 0) leaves the think arm before it can buffer
         // anything; a later boundary is confirmed after the close scan has
         // already routed the transition.
-        if (constrained_proto and !payload_started) {
-            if (slot_handle.?.constraintPayloadStart()) |ps| {
-                payload_started = true;
-                if (ps.token_index == 0 and in_think_block) in_think_block = false;
-            }
-        }
 
         if (gated_stream or stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
@@ -15434,6 +15493,14 @@ fn handleAnthropicStreaming(
                 }
                 token_text = try allocator.realloc(token_text, cut.token_keep);
             }
+        }
+
+        if (delivery) |*d| {
+            defer allocator.free(token_text);
+            try d.feed(allocator, token_text);
+            try emitConstrainedAnthropic(allocator, stream, &block_index, &thinking_block_open, &text_block_open, d);
+            try beatStreamKeepalive(stream, .anthropic_ping);
+            continue;
         }
 
         if (gated_stream) {
@@ -15803,6 +15870,14 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         };
+    }
+
+    if (!client_gone) {
+        if (delivery) |*d| {
+            d.clearOutput();
+            try d.finish(allocator);
+            try emitConstrainedAnthropic(allocator, stream, &block_index, &thinking_block_open, &text_block_open, d);
+        }
     }
 
     // Flush remaining think buffer
@@ -16478,7 +16553,7 @@ fn handleResponsesInner(
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
     if (grammar_schema_val != null and !active_has_tools and enable_thinking) {
-        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto);
+        schema_proto_active = resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, true);
     }
     switch (schemaMasksThinking(
         grammar_schema_val != null,
@@ -16496,6 +16571,12 @@ fn handleResponsesInner(
             log.info("[grammar] reasoning protocol unsupported for this model/prompt; rerendered with thinking off\n", .{});
         },
         .no_mask, .token_zero => schema_proto_active = false,
+    }
+    if (grammar_schema_val != null and !active_has_tools and !enable_thinking and lm.transformer != null) {
+        if (!resolveReasoningProtocol(allocator, stream.io, lm, tok, chat_config, prompt_ids_raw, &schema_proto, false)) {
+            schema_proto = rp_mod.Protocol.jsonOnly();
+        }
+        schema_proto_active = true;
     }
     const tokenize_ns = tokenize_sw.read();
     log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
@@ -16579,7 +16660,7 @@ fn handleResponsesInner(
                 var deferred = false;
                 if (schema_proto_active) {
                     sc.deferWithProtocol(&schema_proto);
-                    deferred = true;
+                    deferred = schema_proto.startState().phase != .json_body;
                 }
                 sampling.constraint = &sc.constraint;
                 if (deferred) {
@@ -16794,8 +16875,9 @@ fn handleResponsesInner(
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
         const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
-        var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids) or constrained_proto;
-        var payload_started = false;
+        var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids) and !constrained_proto;
+        var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
+        defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
@@ -16837,6 +16919,7 @@ fn handleResponsesInner(
             }
             try token_ids_buf.append(allocator, token_id);
             const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
 
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
             var token_text = blk: {
@@ -16867,12 +16950,6 @@ fn handleResponsesInner(
             defer allocator.free(token_text);
 
             // Constrained routing — see the chat streaming arm.
-            if (constrained_proto and !payload_started) {
-                if (slot_handle.?.constraintPayloadStart()) |ps| {
-                    payload_started = true;
-                    if (ps.token_index == 0 and in_think_block) in_think_block = false;
-                }
-            }
 
             try raw_buf.appendSlice(allocator, token_text);
 
@@ -16899,6 +16976,12 @@ fn handleResponsesInner(
             // Tool-active requests buffer entirely — we cannot emit text deltas
             // before knowing whether the output is a tool call.
             if (active_has_tools) continue;
+
+            if (delivery) |*d| {
+                try d.feed(allocator, token_text);
+                try emitConstrainedResponses(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, &streamed_message_id, &streamed_message_index, &streamed_message_started, d);
+                continue;
+            }
 
             if (in_think_block) {
                 try think_buf.appendSlice(allocator, token_text);
@@ -17034,6 +17117,14 @@ fn handleResponsesInner(
             }
         }
 
+        if (!client_gone) {
+            if (delivery) |*d| {
+                d.clearOutput();
+                try d.finish(allocator);
+                try emitConstrainedResponses(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, &streamed_message_id, &streamed_message_index, &streamed_message_started, d);
+            }
+        }
+
         // Flush any remaining think buffer (no close tag found) as reasoning.
         if (!client_gone and in_think_block and think_buf.items.len > 0 and !active_has_tools) {
             if (!streamed_reasoning_started) {
@@ -17056,6 +17147,7 @@ fn handleResponsesInner(
         }
 
         result = .{
+            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
             .text = try raw_buf.toOwnedSlice(allocator),
             .token_ids = try token_ids_buf.toOwnedSlice(allocator),
             .prompt_tokens = ts.prompt_tokens,
@@ -17101,9 +17193,9 @@ fn handleResponsesInner(
     // mid-turn). A span-routed constrained response skips this: its payload
     // is authoritative and marker text inside it is DATA.
     var normalized_text: ?[]u8 = null;
-    if (result.constraint_payload_byte == null) {
+    defer if (normalized_text) |n| allocator.free(n);
+    if (sampling.constraint == null or sampling.constraint.?.proto == null) {
         normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
-        defer if (normalized_text) |n| allocator.free(n);
         if (normalized_text) |n| final_text = n;
     }
 
@@ -17111,7 +17203,9 @@ fn handleResponsesInner(
     // Reasoning the model actually generated is always delivered — the
     // request's thinking flag shaped the PROMPT (chat.noThinkTailSuffix),
     // never the delivery.
-    const think_split = constrainedThinkSplit(final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids));
+    var routed: ?rp_mod.Delivery = null;
+    defer if (routed) |*d| d.deinit(allocator);
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids));
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
@@ -18816,7 +18910,6 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
     try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
 }
-
 
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
     const GB: u64 = 1 << 30;
@@ -20578,33 +20671,6 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     for (unsupported_tails) |tail| {
         try std.testing.expectEqual(SchemaThinkingPolicy.fallback_thinking_off, decide(true, false, true, false, chat_mod.promptThinkTailClass(tail) != .none));
     }
-}
-
-test "constrained span split routes by the generator boundary, never re-parses the payload" {
-    const OPEN = chat_mod.BARE_THINK_OPENER;
-    const CLOSE = chat_mod.BARE_THINK_CLOSER;
-    // Legitimate reasoning, a real close, then JSON that CONTAINS the close
-    // spelling inside a string: the text-based split would cut or strip the
-    // embedded delimiter; the span cut must keep the JSON intact as DATA.
-    const payload = "{\\\"note\\\":\\\"use " ++ CLOSE ++ " here\\\",\\\"v\\\":2}";
-    const text = "18*2 = 36." ++ CLOSE ++ payload;
-    const pb = text.len - payload.len;
-    const split = constrainedThinkSplit(text, pb, false, true);
-    try std.testing.expectEqualStrings("18*2 = 36.", split.reasoning_content orelse "");
-    try std.testing.expectEqualStrings(payload, split.content);
-
-    // Direct answer: everything is content (leading whitespace trimmed to
-    // match the streaming suppression).
-    const direct = constrainedThinkSplit("  {\\\"a\\\":1}", 0, false, false);
-    try std.testing.expect(direct.reasoning_content == null);
-    try std.testing.expectEqualStrings("{\\\"a\\\":1}", direct.content);
-
-    // A generated opener at the start of the reasoning side is stripped.
-    const with_opener = OPEN ++ "thinking" ++ CLOSE ++ "{\\\"a\\\":1}";
-    const pb2 = (OPEN ++ "thinking" ++ CLOSE).len;
-    const split2 = constrainedThinkSplit(with_opener, pb2, false, false);
-    try std.testing.expectEqualStrings("thinking", split2.reasoning_content orelse "");
-    try std.testing.expectEqualStrings("{\\\"a\\\":1}", split2.content);
 }
 
 test "every JSON grammar mask site consults the fallback or deferral policy" {
@@ -23439,4 +23505,12 @@ test "a streaming stop sequence cuts at the match, not at the token boundary" {
     const many = [_][]const u8{ "END", "N" };
     try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
     try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
+}
+
+test "generated think tags require an unambiguous literal template opener" {
+    try std.testing.expectEqualStrings("<think>", templateThinkOpener("{{ '<think>' }} <think>").?);
+    try std.testing.expectEqualStrings("<think:opensource>", templateThinkOpener("{{ '<think:opensource>' }}").?);
+    try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
+    try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
+    try std.testing.expect(templateThinkOpener("assistant") == null);
 }

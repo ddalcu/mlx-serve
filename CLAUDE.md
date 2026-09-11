@@ -28,6 +28,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |
 | `transformer.zig` | Forward pass, arch dispatch (attention/MLP/MoE/GatedDeltaNet), quant resolution, custom kernels (`msv_attn_p256`, `verifyQmm` lanes incl. NAX) |
 | `generate.zig` | Generation, sampling, PLD/drafter/MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers |
+| `reasoning_protocol.zig` | Bounded reasoning/header masks, recovery, and authoritative JSON response routing (see `docs/reasoning-protocols.md`) |
 | `chat.zig` | Chat templates (ChatML/Gemma/Llama-3/Jinja2), thinking tags, tool-call parsing/repair/coercion |
 | `vision.zig` / `qwen_vision.zig` + `mrope.zig` | Gemma SigLIP / Qwen3-VL ViT + M-RoPE |
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
@@ -82,6 +83,8 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
+
+- Constrained JSON payload offsets are authoritative: do not run markup cleanup on that content. Response routing/normalization buffers must outlive response serialization (including Anthropic's inner thinking block). See `docs/gotchas/server-http.md`.
 
 ## Testing — TDD is mandatory
 

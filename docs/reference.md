@@ -501,3 +501,12 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **A pinned second ANE is DEFAULT on M3 Ultra (+7.1%), opt-in elsewhere; a SILENTLY ignored affinity hint is undetectable in-process** (`MLX_SERVE_ANE_DUAL`): `kANEFAneInstanceHint` AND `kANEFProcedureVariantHint` together at compile+load+eval; instance 0 keeps `@{}`; verify with `macpow --dump | grep ANE0_`. Per-unit planes; input packed once then memcpy'd.
 - **The ANE program is a procedure BANK (runtime caps ~121 handles)**: symbol indices READ from `procedureInfoForProcedureIndex:` on the `_ANEModel` behind `-model` (NOT `inputSymbolIndicesForProcedureIndex:`, which answers 0 and fails every procedure >0 as a swallowed slowdown; `eval_failures` is the tell). Cap `MLX_SERVE_ANE_BANK_MAX_BYTES` 2 GiB, halves down a ladder; never a coverage decision.
 - **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.
+
+
+## Reasoning with constrained JSON
+
+`src/reasoning_protocol.zig` owns format descriptions, incremental recognition,
+pre-sample boundary validation, recovery planning, and shared HTTP delivery.
+`model_registry.zig` caches immutable tokenizer indexes; `generate.zig` owns
+sampling and the hard token cap. See [reasoning-protocols.md](reasoning-protocols.md)
+for supported spellings, fallback behavior, and the deterministic/live matrix.
