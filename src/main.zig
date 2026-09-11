@@ -1165,6 +1165,10 @@ pub fn main(init: std.process.Init) !void {
     // error-return path, so pairing it with an errdefer that has the same body
     // frees the resource twice on error (double-free / SIGSEGV). The runtime
     // `owned_by_registry` guard makes the single defer correct on every exit.
+    // `create` hands back UNINITIALIZED memory and the defer below READS a
+    // field, so the struct gets a valid value before that defer can ever run:
+    // a `parseConfig` failure would otherwise free a garbage pointer.
+    config_storage.* = std.mem.zeroes(model_mod.ModelConfig);
     defer if (!config_owned_by_registry) {
         config_storage.deinit(allocator);
         allocator.destroy(config_storage);
