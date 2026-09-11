@@ -240,10 +240,9 @@ pub const LoadedModel = struct {
     /// `boot`-clock milliseconds at the last `release` (or `markReady` for an
     /// entry that has served nothing yet). `last_used_ns` is a bare ordering
     /// counter and cannot answer "how long has this been idle", which is what
-    /// the idle sweep needs. Atomic for the same reason `refcount` is: the
-    /// sweep reads it without taking the registry mutex. The `boot` clock
-    /// counts across pmset sleep, so a model idle when the lid closed is
-    /// evictable on wake rather than starting its window over.
+    /// the idle sweep needs. The `boot` clock counts across pmset sleep, so a
+    /// model idle when the lid closed is evictable on wake rather than starting
+    /// its window over.
     last_used_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
@@ -370,9 +369,7 @@ pub const LoadedModel = struct {
             self.chat_config = null;
         }
         if (self.config) |c| {
-            // `ngram_table_path` is allocPrint'd at load; everything else is
-            // by-value or borrowed-static (`model_type`/`weight_prefix`).
-            if (c.ngram_table_path) |ntp| self.allocator.free(ntp);
+            c.deinit(self.allocator);
             self.allocator.destroy(c);
             self.config = null;
         }
@@ -392,15 +389,28 @@ pub const LoadedModel = struct {
     }
 
     /// Free the CPU-only state `unloadResident` deliberately RETAINS —
-    /// `token_bytes`, `tokenizer`, `chat_config`, `config`, `tokenize_cache`.
+    /// `token_bytes`, `tokenizer`, `chat_config`, `config`, `tokenize_cache`. A
+    /// reload installs a fresh set over the retained one, so every install site
+    /// calls this first or the previous generation is orphaned. Idempotent.
     ///
-    /// A reload builds a fresh set and installs it over the retained one, so
-    /// every install site must call this first or the previous generation is
-    /// orphaned. Idempotent, and safe on an entry that never loaded.
+    /// READER CONTRACT: this runs on the inference thread, OFF the registry
+    /// mutex, with the entry `.loading`. So the mutex alone does not make a
+    /// read of these five fields safe — a reader holding no refcount must take
+    /// the mutex AND skip them while `.loading`.
     ///
     /// Order matches `deinit`: `token_bytes` is decoded from the tokenizer's
-    /// vocabulary, so it must never outlive the ids it describes.
+    /// vocabulary, so it must never outlive the ids it describes. What
+    /// serialises this against `grammarTokenBytes` and the tokenize cache is
+    /// the REFCOUNT, not their own mutexes — a reload cannot begin until every
+    /// borrower has released.
     pub fn releaseRetainedCpuState(self: *LoadedModel) void {
+        // The reader contract is only sound while one of these holds: the entry
+        // is mid-reload, or it has never published CPU state at all (the boot
+        // load installs into a fresh stub before the listener binds, where this
+        // is a no-op). Anything that later reloads an entry without claiming
+        // `.loading` would make every guarded reader a use-after-free, so fail
+        // loudly here rather than silently there.
+        std.debug.assert(self.state == .loading or self.config == null);
         if (self.token_bytes) |*tb| {
             tb.deinit();
             self.token_bytes = null;
@@ -416,8 +426,7 @@ pub const LoadedModel = struct {
             self.chat_config = null;
         }
         if (self.config) |c| {
-            // Mirrors `deinit`: `ngram_table_path` is the one allocated field.
-            if (c.ngram_table_path) |ntp| self.allocator.free(ntp);
+            c.deinit(self.allocator);
             self.allocator.destroy(c);
             self.config = null;
         }
@@ -838,9 +847,21 @@ pub const ModelRegistry = struct {
     /// the id is unknown. Callers that intend to use the entry for
     /// inference MUST go through `ensureLoaded` instead — this is for read-
     /// only paths (e.g. `/v1/models` listing, log lines).
+    ///
+    /// The lock is dropped before this returns, so the RESULT is only good
+    /// for id/path identity. Reading the entry's retained CPU state needs
+    /// `peekLocked` under one unbroken hold — see
+    /// `LoadedModel.releaseRetainedCpuState`.
     pub fn peek(self: *ModelRegistry, id: []const u8) ?*LoadedModel {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.peekLocked(id);
+    }
+
+    /// `peek` for a caller that already holds `mutex` and must read the
+    /// entry's `state` and its retained CPU state without the two drifting
+    /// apart. Caller holds `mutex`.
+    pub fn peekLocked(self: *ModelRegistry, id: []const u8) ?*LoadedModel {
         return self.entries.get(id);
     }
 
@@ -1018,22 +1039,28 @@ pub const ModelRegistry = struct {
         return best;
     }
 
-    /// Pick one `.ready`, refcount-0 entry that has been idle for at least
-    /// `window_ms`, oldest first. Null when nothing qualifies. Caller holds
-    /// `mutex`. Returns one entry per call so the caller can drop the mutex
-    /// to do the (slow, stream-bound) unload and re-ask.
+    /// Is this entry idle-evictable right now: resident, nobody holding it,
+    /// and untouched for at least `window_ms`. The sweep's pick and its commit
+    /// both ask THIS, so the two can never drift apart. Caller holds `mutex`.
+    pub fn idleEvictable(entry: *LoadedModel, now_ms: i64, window_ms: i64) bool {
+        if (entry.state != .ready) return false;
+        if (entry.refcount.load(.acquire) != 0) return false;
+        // `now_ms - used` and not `used < deadline`: the boot clock's epoch
+        // is arbitrary, so the subtraction is the only meaningful form.
+        return now_ms - entry.last_used_ms.load(.acquire) >= window_ms;
+    }
+
+    /// Pick one idle-evictable entry, oldest first. Null when nothing
+    /// qualifies. Caller holds `mutex`. One entry per call, so the caller can
+    /// drop the mutex for the (slow, stream-bound) unload and re-ask.
     pub fn pickIdleEvictable(self: *ModelRegistry, now_ms: i64, window_ms: i64) ?*LoadedModel {
         var best: ?*LoadedModel = null;
         var best_used: i64 = std.math.maxInt(i64);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
-            if (entry.state != .ready) continue;
-            if (entry.refcount.load(.acquire) != 0) continue;
+            if (!idleEvictable(entry, now_ms, window_ms)) continue;
             const used = entry.last_used_ms.load(.acquire);
-            // `now_ms - used` and not `used < deadline`: the boot clock's epoch
-            // is arbitrary, so the subtraction is the only meaningful form.
-            if (now_ms - used < window_ms) continue;
             if (used < best_used) {
                 best_used = used;
                 best = entry;
@@ -1385,7 +1412,9 @@ test "LoadedModel: a reload frees the CPU state the previous load left behind" {
     entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(testing.allocator, 4);
     try testing.expect(entry.token_bytes != null);
 
-    // Reload: release the old generation, then install a fresh one.
+    // Reload: `.loading` is the precondition the reader contract rests on, so
+    // the test claims it the way `tryBeginLoadLocked` does.
+    entry.state = .loading;
     entry.releaseRetainedCpuState();
     try testing.expect(entry.tokenizer == null);
     try testing.expect(entry.config == null);
@@ -1415,15 +1444,38 @@ test "ModelRegistry: pickIdleEvictable picks past the window, ignores inside it"
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
 
-    // Fresh: markReadyLocked stamped last_used_ms, so nothing is due yet. This
-    // is the control — the sweep evicting a model the instant it finished
-    // loading is the failure this stamp exists to prevent.
+    // Bar: a model that just finished loading is not due. An UNSTAMPED entry
+    // reads 0 and is instantly due against the real clock, so assert the stamp
+    // itself before asking — reading the baseline off the stamp under test
+    // would hold whether or not markReadyLocked ever wrote it.
     const now = a.last_used_ms.load(.acquire);
-    try testing.expect(reg.pickIdleEvictable(now, 900_000) == null);
+    try testing.expect(now > 0);
+    try testing.expect(reg.pickIdleEvictable(io_util.nowMsMonotonic(reg.io), 900_000) == null);
     try testing.expect(reg.pickIdleEvictable(now + 899_999, 900_000) == null);
 
     // One millisecond past the window it is due.
     try testing.expect(reg.pickIdleEvictable(now + 900_000, 900_000).? == a);
+}
+
+test "ModelRegistry: idleEvictable refuses a borrowed or freshly-used entry" {
+    // Bar: the sweep's commit re-check asks this after dropping the mutex, so
+    // a request that landed in that gap must cancel the eviction.
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, 900);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 1024);
+    const used = a.last_used_ms.load(.acquire);
+
+    try testing.expect(ModelRegistry.idleEvictable(a, used + 900_000, 900_000));
+    // Borrowed right now: age must never override the refcount.
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    try testing.expect(!ModelRegistry.idleEvictable(a, used + 10_000_000, 900_000));
+    _ = a.refcount.fetchSub(1, .acq_rel);
+    // Inside the window.
+    try testing.expect(!ModelRegistry.idleEvictable(a, used + 899_999, 900_000));
+    // Not resident: nothing to free.
+    a.state = .unloaded;
+    try testing.expect(!ModelRegistry.idleEvictable(a, used + 900_000, 900_000));
+    a.state = .ready;
 }
 
 test "ModelRegistry: pickIdleEvictable never picks an entry with a live request" {
@@ -1442,13 +1494,19 @@ test "ModelRegistry: pickIdleEvictable never picks an entry with a live request"
         try testing.expect(reg.pickIdleEvictable(base + 10_000_000, 900_000) == null);
     }
 
-    // Released → due on the next sweep. `release` restamps last_used_ms, so
-    // ask from the new stamp rather than the old one.
+    // Released → due again, but `release` RESTAMPS: a model that just finished
+    // serving is the newest, not the oldest. Backdate first so the restamp is
+    // observable — without it `after` would equal `stale` and every assertion
+    // below would hold anyway.
+    const stale = a.last_used_ms.load(.acquire) - 10_000_000;
+    a.last_used_ms.store(stale, .release);
     reg.release(a);
     {
         reg.mutex.lockUncancelable(reg.io);
         defer reg.mutex.unlock(reg.io);
         const after = a.last_used_ms.load(.acquire);
+        try testing.expect(after > stale);
+        try testing.expect(reg.pickIdleEvictable(stale + 900_000, 900_000) == null);
         try testing.expect(reg.pickIdleEvictable(after + 900_000, 900_000).? == a);
     }
 }
@@ -1651,8 +1709,8 @@ test "ModelRegistry: snapshot places default first then most-recent" {
     defer testing.allocator.free(snap);
 
     try testing.expectEqual(@as(usize, 3), snap.len);
-    try testing.expectEqualStrings("b", snap[0].id);     // default first
-    try testing.expectEqualStrings("c", snap[1].id);     // most-recent of rest
+    try testing.expectEqualStrings("b", snap[0].id); // default first
+    try testing.expectEqualStrings("c", snap[1].id); // most-recent of rest
     try testing.expectEqualStrings("a", snap[2].id);
     try testing.expect(snap[0].loaded);
     try testing.expectEqual(@as(u64, 200), snap[0].bytes_resident);

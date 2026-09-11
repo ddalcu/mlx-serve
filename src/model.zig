@@ -1246,6 +1246,15 @@ pub const ModelConfig = struct {
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
         });
     }
+
+    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
+    pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
+        if (self.ngram_table_path) |p| allocator.free(p);
+        self.ngram_table_path = null;
+    }
 };
 
 /// Pick the user-turn prefix string for a model based on what its chat template

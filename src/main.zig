@@ -1165,7 +1165,10 @@ pub fn main(init: std.process.Init) !void {
     // error-return path, so pairing it with an errdefer that has the same body
     // frees the resource twice on error (double-free / SIGSEGV). The runtime
     // `owned_by_registry` guard makes the single defer correct on every exit.
-    defer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    defer if (!config_owned_by_registry) {
+        config_storage.deinit(allocator);
+        allocator.destroy(config_storage);
+    };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));

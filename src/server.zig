@@ -118,6 +118,11 @@ test "ollamaTagEntryOf: reads config unless the entry is mid-load" {
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "from-config";
     e.config = &cfg;
+    // A borrowed stack config must not reach `reg.deinit`, failure or not.
+    defer {
+        e.config = null;
+        e.state = .unloaded;
+    }
 
     // Unloaded but retained: still fully listable, which is the retention contract.
     e.state = .unloaded;
@@ -129,9 +134,36 @@ test "ollamaTagEntryOf: reads config unless the entry is mid-load" {
     // Mid-load: the pointer may be freed under us, so fall back to the hint.
     e.state = .loading;
     try std.testing.expectEqualStrings("arch-hint", ollamaTagEntryOf(io, e).family);
+}
 
-    e.config = null; // borrowed stack config must not be freed by deinit
+test "textGenTargetOf: reads config unless the entry is mid-load" {
+    // Bar: a `.loading` entry's retained CPU state can be freed off-mutex, so
+    // the encoder-only flag must not come from `config` in that state.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try model_registry_mod.ModelRegistry.init(std.testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("m", "/path/to/m", 1024, "");
+
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    cfg.is_encoder_only = true;
+    e.config = &cfg;
+    defer {
+        e.config = null;
+        e.state = .unloaded;
+    }
+
+    // Resident, and retained across an unload: the pre-load 400 still fires.
+    e.state = .ready;
+    try std.testing.expect(textGenTargetOf(e).is_encoder_only);
     e.state = .unloaded;
+    try std.testing.expect(textGenTargetOf(e).is_encoder_only);
+    try std.testing.expect(textGenRejectReason(textGenTargetOf(e)) != null);
+
+    // Mid-load: no config read at all, so the route falls through to
+    // `ensureLoaded` and the authoritative post-load check.
+    e.state = .loading;
+    try std.testing.expect(!textGenTargetOf(e).is_encoder_only);
+    try std.testing.expect(textGenRejectReason(textGenTargetOf(e)) == null);
 }
 
 test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
@@ -1457,8 +1489,7 @@ pub fn serve(
     defer sampler_stop.store(true, .monotonic);
 
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
-    // and stopped + joined here rather than in `Scheduler.deinit` — see
-    // `IdleEvictCtx.stop`.
+    // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
     var idle_evict_thread: ?std.Thread = null;
     var idle_evict_stop = std.atomic.Value(bool).init(false);
     if (scheduler.registry.idle_evict_secs) |secs| {
@@ -2117,8 +2148,17 @@ fn handleConnection(
     // authoritative crash barrier (this peek can't see `--model` primaries
     // with no arch hint until they're resident).
     if (requested_model_id.len > 0 and isTextGenRoute(method, path)) {
-        if (registry.peek(requested_model_id)) |peeked| {
-            if (textGenRejectReason(textGenTargetOf(peeked))) |reason| {
+        // Entry and snapshot under ONE hold — plain `peek` unlocks before it
+        // returns. `arch_hint` outlives the unlock: entry-owned, freed in
+        // `deinit`.
+        const target: ?TextGenTarget = blk: {
+            registry.mutex.lockUncancelable(stream.io);
+            defer registry.mutex.unlock(stream.io);
+            const peeked = registry.peekLocked(requested_model_id) orelse break :blk null;
+            break :blk textGenTargetOf(peeked);
+        };
+        if (target) |t| {
+            if (textGenRejectReason(t)) |reason| {
                 if (std.mem.eql(u8, path, "/v1/messages")) {
                     try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
                 } else if (std.mem.startsWith(u8, path, "/api/")) {
@@ -2439,9 +2479,8 @@ fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: 
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
 /// the registry mutex; id/arch_hint slices are entry-owned and stable.
 fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
-    // A reload frees the retained CPU state off-mutex, so the mutex alone does
-    // not make these reads safe; `.loading` is the only state it is freed in.
-    // Not `== .ready`: an unloaded entry must stay fully listable.
+    // `releaseRetainedCpuState`'s reader contract. Not `== .ready`: an
+    // unloaded entry retains its config and must stay fully listable.
     const ready = e.state != .loading;
     const family: []const u8 = if (ready and e.config != null) e.config.?.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
     // arch_hint "gguf" covers unloaded discovery stubs whose PATH is a
@@ -2550,10 +2589,8 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
         }
         if (ollama_mod.resolveName(requested, ids_buf[0..n])) |idx| {
             const e = entry_buf[idx];
-            // Same `.ready` gate as `ollamaTagEntryOf` — and it matters more
-            // here, because `chat_template` is copied into the response body.
-            // Same predicate as `ollamaTagEntryOf`; `chat_template` is copied
-            // into the response body, so a stale read would be served.
+            // Same contract as `ollamaTagEntryOf`, and it matters more here:
+            // `chat_template` is copied into the response body.
             const e_ready = e.state != .loading;
             const template: []const u8 = if (e_ready and e.chat_config != null) e.chat_config.?.chat_template else "";
             const is_encoder = if (e_ready and e.config != null) e.config.?.is_encoder_only else std.mem.eql(u8, e.arch_hint, "bert");
@@ -5799,8 +5836,12 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
 }
 
 fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
+    // `releaseRetainedCpuState`'s reader contract. Skipping the config costs
+    // the pre-load 400 for the duration of one reload; the post-load
+    // `text_gen_reject` is the authoritative barrier either way.
+    const cpu_state_stable = lm.state != .loading;
     return .{
-        .is_encoder_only = if (lm.config) |c| c.is_encoder_only else false,
+        .is_encoder_only = cpu_state_stable and lm.config != null and lm.config.?.is_encoder_only,
         .arch_hint = lm.arch_hint,
         .has_image_engine = lm.image_engine != null,
         .has_audio_engine = lm.audio_engine != null,
@@ -10882,22 +10923,21 @@ fn idleEvictLoop(ctx: IdleEvictCtx) void {
         const now_ms = io_util.nowMsMonotonic(sch.io);
         sch.registry.mutex.lockUncancelable(sch.io);
         const victim = sch.registry.pickIdleEvictable(now_ms, ctx.window_ms);
-        const id = if (victim) |v| v.id else null;
         const idle_ms = if (victim) |v| now_ms - v.last_used_ms.load(.acquire) else 0;
         const bytes = if (victim) |v| v.bytes_resident else 0;
         sch.registry.mutex.unlock(sch.io);
 
-        if (id) |model_id| {
+        if (victim) |entry| {
             log.info("[registry] idle-evicting model id={s} ({d:.2} GB resident, idle {d}s)\n", .{
-                model_id,
+                entry.id,
                 @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0),
                 @divTrunc(idle_ms, 1000),
             });
-            // The window is re-checked under the mutex inside, so a request
-            // arriving since the pick cancels the eviction instead of pinning
-            // the model in `.evicting` behind a live stream.
-            sch.unloadModelIfIdle(model_id, ctx.window_ms) catch |err| {
-                log.warn("[registry] idle eviction failed for {s}: {t}\n", .{ model_id, err });
+            // Age and refcount are re-checked under the mutex inside, so a
+            // request arriving since the pick cancels the eviction instead of
+            // pinning the model in `.evicting` behind a live stream.
+            sch.unloadModelIfIdle(entry.id, ctx.window_ms) catch |err| {
+                log.warn("[registry] idle eviction failed for {s}: {t}\n", .{ entry.id, err });
             };
         }
     }
@@ -18591,7 +18631,6 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
     try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
 }
-
 
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
     const GB: u64 = 1 << 30;
