@@ -1268,6 +1268,21 @@ private struct ServerSectionContent: View {
                 }
             }
         }
+        if let m = meta["idleEvictSecs"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.idleEvictSecs)
+            ) {
+                let secs = appState.serverOptions.idleEvictSecs
+                snappingSlider(
+                    presets: ServerOptions.idleEvictPresets,
+                    current: secs,
+                    set: { appState.serverOptions.idleEvictSecs = $0 },
+                    label: ServerOptions.idleEvictLabel(secs)
+                )
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,

@@ -197,6 +197,12 @@ struct ServerOptions: Codable, Equatable {
     /// oldest gets evicted. Set to 1 to keep exactly one model loaded at a
     /// time — every switch unloads the previous model first.
     var maxResidentModels: Int = 3
+    /// Idle-eviction window (`--idle-evict-secs`), in seconds. 0 = off, the
+    /// server's own default. The registry unloads a model that has served
+    /// nothing for this long; the next request pays a cold load. Seconds off a
+    /// snap ladder, not typed text — `main.zig` reads an unparseable value as
+    /// off, so a typo would silently disable it.
+    var idleEvictSecs: Int = 0
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -515,6 +521,7 @@ struct ServerOptions: Codable, Equatable {
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
         maxResidentModels == other.maxResidentModels &&
+        idleEvictSecs == other.idleEvictSecs &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -553,6 +560,17 @@ struct ServerOptions: Codable, Equatable {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
         return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Snap points for the idle-eviction slider, in seconds. Off first; every
+    /// step is a whole number of minutes or hours so the label never rounds.
+    static let idleEvictPresets: [Int] = [0, 300, 600, 900, 1800, 3600, 7200, 14400]
+
+    /// The slider's readout — seconds are the flag's unit, not the reader's.
+    static func idleEvictLabel(_ secs: Int) -> String {
+        if secs <= 0 { return "Off" }
+        if secs < 3600 { return "\(secs / 60) min" }
+        return "\(secs / 3600) hr"
     }
 
     static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
@@ -708,6 +726,10 @@ struct ServerOptions: Codable, Equatable {
         if maxResidentModels != 3 {
             args += ["--max-resident-models", "\(maxResidentModels)"]
         }
+        // Omitted at 0: that IS the server default.
+        if idleEvictSecs > 0 {
+            args += ["--idle-evict-secs", "\(idleEvictSecs)"]
+        }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
         // (it never opens an llama session). Keeping them in argv for
@@ -858,6 +880,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -1089,6 +1112,10 @@ extension ServerOptions {
         "maxResidentModels": .init(
             title: "Max models loaded at once",
             explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
+            needsRestart: true),
+        "idleEvictSecs": .init(
+            title: "Unload idle models",
+            explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
