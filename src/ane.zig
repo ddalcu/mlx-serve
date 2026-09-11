@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const mlx = @import("mlx.zig");
 
 // ── C ABI (lib/ane/ane_mlp.h) ──
 
@@ -115,6 +116,15 @@ pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
     if (rows > chunk_rows - 16) rows = (chunk_rows - 16) - (chunk_rows - 16) % 32;
     if (rows < ANE_MIN_ROWS) return 0;
     return rows;
+}
+
+/// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
+/// consume this must treat 0 as "unknown", never as "tiny machine").
+pub fn totalMemBytes() u64 {
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    return mem;
 }
 
 /// Chip name via sysctl ("Apple M3 Ultra"); empty on failure — callers fall
@@ -1015,6 +1025,138 @@ pub const AnePrefill = struct {
         });
     }
 };
+
+// ── Seam plane I/O ──
+//
+// Shared by every offload seam (LM prefill in transformer.zig, media DiT
+// blocks in the backends): the planes are fp16 CHANNEL-major, so a [1,R,W]
+// activation transposes to [W][R] going in and back on the way out.
+
+/// Pack a [1, R, W] activation into an ANE input plane. bf16→fp16 is exact in
+/// fp16's normal range and the graph computes fp16 anyway. Blocks on the eval:
+/// the caller is the sole MLX caller and the plane must be filled before kick.
+pub fn packPlane(s: mlx.mlx_stream, x_rows: mlx.mlx_array, plane: [*]f16) !void {
+    const sh = mlx.getShape(x_rows); // [1, R, W]
+    const rows = sh[1];
+    const width = sh[2];
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    {
+        var x2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2d);
+        const shape2 = [_]c_int{ rows, width };
+        try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, s));
+        var xt_view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xt_view);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, s));
+        var xf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xf);
+        try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, s));
+        const flat_shape = [_]c_int{width * rows};
+        try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, s));
+    }
+    try mlx.check(mlx.mlx_array_eval(x_flat));
+    const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
+    const count: usize = @intCast(width * rows);
+    @memcpy(plane[0..count], src[0..count]);
+}
+
+/// Read an ANE output plane ([width][R] fp16 channel-major) back as a
+/// [1, R, width] tensor in `dtype`.
+pub fn readPlane(s: mlx.mlx_stream, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const t_shape = [_]c_int{ width, rows };
+    // mlx_array_new_data COPIES at construction, so the plane is free for the
+    // next program the moment this returns.
+    const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(y_f16);
+    var y_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_t);
+    const perm = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, s));
+    var y_cast = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_cast);
+    try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape3 = [_]c_int{ 1, rows, width };
+    try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, s));
+    return out;
+}
+
+/// The ANE program computes in fp16 throughout, so both its INTERNAL
+/// activation (`silu(gate) * up`) and its output plane must stay under 65504.
+/// The `up` half of the ANE's weight copy is divided by this at build time and
+/// the read-back partial multiplied back: `up` is linear into the product, so
+/// `act` and the down-conv output both scale by it exactly, while `silu(gate)`
+/// is untouched. EXACT — per-row int8 quantization folds the factor into the
+/// row scale, and a power of two is exact in fp16.
+///
+/// Measured on H3's DiT (864x480, 21f): the fc2 partial peaks at ~1.7M and
+/// `act` at 52k, so an unscaled seam saturates to INF from block 36 on and the
+/// video renders BLACK. 256 leaves ~10x headroom over that peak; entries it
+/// pushes subnormal sit 7+ orders below the max and are already fp16 noise.
+pub const OUT_PLANE_SCALE: f32 = 256.0;
+
+/// Dequantize an affine-packed weight to host f32 [out_dim, in_dim] row-major
+/// — the layout `quantizeRowsInt8` expects. THE dequant for every seam.
+pub fn dequantToHostF32(
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+) ![]f32 {
+    if (scales.ctx == null) return error.AneDenseBf16Unsupported;
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(
+        &deq,
+        w,
+        scales,
+        biases,
+        mlx.mlx_optional_int.some(@intCast(group_size)),
+        mlx.mlx_optional_int.some(@intCast(bits)),
+        "affine",
+        .{}, // global_scale
+        .{ .value = .float32, .has_value = true },
+        s,
+    ));
+    const sh = mlx.getShape(deq);
+    if (sh.len != 2 or sh[0] != @as(c_int, @intCast(out_dim)) or sh[1] != @as(c_int, @intCast(in_dim))) return error.AneWeightShape;
+    const n: c_int = @intCast(out_dim * in_dim);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const fs = [_]c_int{n};
+    try mlx.check(mlx.mlx_reshape(&flat, deq, &fs, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const ptr = mlx.mlx_array_data_float32(flat) orelse return error.AneDequantRead;
+    const out = try allocator.alloc(f32, @intCast(n));
+    @memcpy(out, ptr[0..@intCast(n)]);
+    return out;
+}
+
+/// Fill every unit's input plane with the same packed activation. The pack is
+/// done ONCE and memcpy'd into the other units (~1.7 ms on the 27B against a
+/// ~20 ms eval); MLX_SERVE_ANE_DUAL_SHARE_INPUT=1 shares one surface and skips
+/// the copy. The wait stays BLOCKING and on this thread: oMLX measured that
+/// moving it to a worker, or launching the ANE from the Metal completion
+/// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
+pub fn packUnitPlanes(s: mlx.mlx_stream, eng: *AnePrefill, x: mlx.mlx_array) !void {
+    const first = eng.units[0].inputBase() orelse return error.AnePlaneMissing;
+    try packPlane(s, x, first);
+    if (eng.units.len == 1) return;
+    const count: usize = @as(usize, eng.hidden) * eng.rows;
+    for (eng.units[1..]) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        if (plane == first) continue; // shared surface
+        @memcpy(plane[0..count], first[0..count]);
+    }
+}
 
 // ── Tests ──
 

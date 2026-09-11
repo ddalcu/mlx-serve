@@ -148,6 +148,11 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.
 - Endpoint/field/backend detail: `docs/reference.md`. Guards: `tests/test_unified_gen.sh` + per-modality scripts; parity via env-gated cos oracles (`tests/dump_*_fixtures.py`).
+- **A denoise step is the ANE case the LM prefill seam never was** (opt-in, LOSSY: `MLX_SERVE_ANE_IMAGE=1` Krea, `MLX_SERVE_ANE_VIDEO=1` H3): batch job at the compute roofline, constant token count so ONE compiled tile serves every step. M4 Max: Krea 1024²/8-step 91.8 -> 70.5 s (1.30x); H3 864x480/22f 9.07 -> 7.32 s per denoise step (1.24x).
+- The seam is the channel-mode one (`ane.packUnitPlanes`/`readPlane`/`dequantToHostF32` shared with `transformer.zig`): ANE holds gate/up channels [0..k) + the matching down K-slabs, GPU the complement, partials ADD. H3's fc1 is FUSED, so its complement is TWO row views (`aneBuildRest`).
+- **The ANE graph is fp16 END TO END, so a partial-sum seam must SCALE** (`ane.OUT_PLANE_SCALE` 256, folded into the `up` copy at build time, multiplied back on read — exact: per-row int8 puts it in the row scale, and `up` is linear into `silu(gate)*up`). Unscaled, H3 saturated to INF from block 36 and rendered BLACK; Krea only lost precision (cos vs GPU 0.996 -> 0.9993).
+- **A LoRA-attached block DECLINES** (`aneBlockEligible` in both): the adapter is summed at forward from the FULL activation, half of which never leaves the ANE program. Turbo binds `blocks.N.mlp.fc1/fc2`, so H3's fast path is GPU-only until the LoRA is folded into the int8 snapshot.
+- **H3 stages the DiT per REQUEST, so the ANE build is paid per request** (cold 32 s, warm 8 s + a 4.9 GB int8 copy): noise against a 275 s/step dense render, dominant on a short one. Caching the engine across requests is owed.
 
 ## HTTP APIs
 

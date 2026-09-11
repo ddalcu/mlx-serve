@@ -1029,6 +1029,45 @@ value and warns `Ignoring --include since filenames have been explicitly set`
 first pass. Pass filenames POSITIONALLY.
 
 
+## The ANE seam is fp16 end to end, and H3's DiT rendered BLACK (2026-09-10)
+
+Wiring the channel-mode ANE MLP offload into H3's video DiT gave a clean
+1.24x on the denoise step and an all-zero video. The seam MATH was never
+wrong — a per-block parity probe read cos 0.99999 / rms_ratio 1.0000 against
+the plain `mlpForward` at blocks 0-2. The output was NaN from block 36 on.
+
+**Cause**: the compiled ANE program computes in fp16 from input plane to
+output plane, and H3's DiT partials do not fit. Measured at 864x480/22f: the
+fc2 partial peaks at ~1.7M and the intermediate `act = silu(gate)*up` at 52k,
+against an fp16 max of 65504. The plane saturated to INF, the residual stream
+went NaN, and the VAE decoded zeros.
+
+**The fix is a scale, and WHERE it goes is the whole point.** Dividing the
+`up` half of the ANE's weight copy by `ane.OUT_PLANE_SCALE` (256) and
+multiplying the read-back partial by it is EXACT: `up` is linear into the
+product, so `act` and the down-conv output both scale with it, while
+`silu(gate)` is untouched; per-row int8 quantization folds the factor into the
+row scale so the codes are unchanged; and a power of two is exact in fp16.
+Scaling `gate` instead would be wrong (it sits under a nonlinearity), and
+scaling fc2 alone bounds the output but not `act` — that arm was measured and
+still hit INF at block 49.
+
+**Two false starts worth keeping**: scaling fc2 by 16 (output bounded, `act`
+still overflowed); then 64 (same, and the parity probe read 0.92 because it
+was comparing the scaled partial against an unscaled reference — a probe that
+does not follow the fix reports the fix as a regression).
+
+**The class lesson**: the LM prefill seam never hit this because a normed
+decoder hidden is O(1) and its MLP output is O(100). A DiT residual stream is
+not, and neither is any other backend we might point this seam at. The scale
+is now unconditional in both seams. Krea had shipped without it and looked
+correct — it was silently losing precision at the top of the fp16 range: mean
+|diff| vs the GPU arm 5.68/255 -> 2.00 and cos 0.9962 -> 0.9993 once scaled.
+A correct-looking image is not evidence of range headroom.
+
+**Guard**: `ane.OUT_PLANE_SCALE` carries the measured peaks in its doc
+comment; the bar is perceived content plus a finite-output check, never bytes.
+
 ## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
 
 The third cause above, closed. `vae_diffusion_decoder.safetensors` is four

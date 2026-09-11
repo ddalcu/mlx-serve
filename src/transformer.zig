@@ -6614,10 +6614,7 @@ const ane_offload = @import("ane.zig");
 /// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
 /// consume this must treat 0 as "unknown", never as "tiny machine").
 fn totalMemBytes() u64 {
-    var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
-    return mem;
+    return ane_offload.totalMemBytes();
 }
 
 const ModelConfig = model_mod.ModelConfig;
@@ -22781,52 +22778,13 @@ pub const Transformer = struct {
     /// flattened 1-D to force a row-major materialization (the raw-read
     /// contiguity rule), then one contiguous memcpy.
     fn anePackPlane(self: *Transformer, x_rows: mlx.mlx_array, plane: [*]f16) !void {
-        const sh = mlx.getShape(x_rows); // [1, R, H]
-        const rows = sh[1];
-        const h_dim = sh[2];
-        var x_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_flat);
-        {
-            var x2d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x2d);
-            const shape2 = [_]c_int{ rows, h_dim };
-            try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, self.s));
-            var xt_view = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(xt_view);
-            const perm = [_]c_int{ 1, 0 };
-            try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, self.s));
-            var xf = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(xf);
-            try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, self.s));
-            const flat_shape = [_]c_int{h_dim * rows};
-            try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, self.s));
-        }
-        try mlx.check(mlx.mlx_array_eval(x_flat));
-        const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
-        const count: usize = @intCast(h_dim * rows);
-        @memcpy(plane[0..count], src[0..count]);
+        return ane_offload.packPlane(self.s, x_rows, plane);
     }
 
     /// Read an ANE output plane ([width][R] fp16 channel-major) back as a
     /// [1, R, width] tensor in `dtype`.
     fn aneReadPlane(self: *Transformer, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
-        const t_shape = [_]c_int{ width, rows };
-        // mlx_array_new_data COPIES at construction, so the plane is free
-        // for the next program the moment this returns.
-        const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
-        defer _ = mlx.mlx_array_free(y_f16);
-        var y_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y_t);
-        const perm = [_]c_int{ 1, 0 };
-        try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, self.s));
-        var y_cast = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y_cast);
-        try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, self.s));
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        const shape3 = [_]c_int{ 1, rows, width };
-        try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, self.s));
-        return out;
+        return ane_offload.readPlane(self.s, plane, width, rows, dtype);
     }
 
     // ── ANE channel-split (A1, MLX_SERVE_ANE_MODE=channel) ──
@@ -22884,23 +22842,8 @@ pub const Transformer = struct {
         return out;
     }
 
-    /// Fill every unit's ANE input plane with the same packed hidden. The
-    /// pack is done ONCE and memcpy'd into the other units (~1.7 ms on the
-    /// 27B against a ~20 ms eval); MLX_SERVE_ANE_DUAL_SHARE_INPUT=1 makes
-    /// the units share one surface and skips the copy. The wait for the
-    /// pack stays BLOCKING and on this thread: oMLX measured that moving it
-    /// to a worker, or launching the ANE from the Metal completion
-    /// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
     fn anePackUnitPlanes(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array) !void {
-        const first = eng.units[0].inputBase() orelse return error.AnePlaneMissing;
-        try self.anePackPlane(x, first);
-        if (eng.units.len == 1) return;
-        const count: usize = @as(usize, eng.hidden) * eng.rows;
-        for (eng.units[1..]) |*u| {
-            const plane = u.inputBase() orelse return error.AnePlaneMissing;
-            if (plane == first) continue; // shared surface
-            @memcpy(plane[0..count], first[0..count]);
-        }
+        return ane_offload.packUnitPlanes(self.s, eng, x);
     }
 
     /// GDN projections through explicit weight arrays (the channel rest
