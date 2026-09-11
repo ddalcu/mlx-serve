@@ -1159,12 +1159,6 @@ pub fn aneBlockEligible(rows: u32, quantized: bool, lora_bound: bool) bool {
     return rows >= ane.ANE_MIN_ROWS;
 }
 
-/// Rows the compiled tile covers: the fp16 plane pitch is a 32-row contract,
-/// so a ragged sequence keeps its `< 32`-row tail on the GPU.
-pub fn aneTileRows(seq_len: u32) u32 {
-    return seq_len - (seq_len % 32);
-}
-
 fn aneRowsView(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(x);
     var start = [_]c_int{ lo, 0 };
@@ -1228,6 +1222,39 @@ fn aneBuildRest(mw: *const MlpW, k: u32, ffn: u32, s: S) !AneRestMlp {
     rest.fc2 = try aneRestFc2(f2, k, s);
     return rest;
 }
+
+/// What `ane.planMediaOffload` calibrates on: block 0 built alone.
+const AneCalib = struct {
+    m: *Model,
+    io: std.Io,
+    rows: u32,
+    s: S,
+    dtype: mlx.mlx_dtype,
+    pub fn buildBlock0(self: AneCalib, k: u32, units: u32, share: f32) !*ane.AnePrefill {
+        try self.m.aneBuildInner(self.io, self.rows, k, units, share, self.s, 1);
+        return self.m.ane_eng.?;
+    }
+    pub fn complement(self: AneCalib, x: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(&self.m.ane_rest[0], x, self.s);
+    }
+    pub fn teardown(self: AneCalib) void {
+        self.m.aneDeinit();
+    }
+};
+
+/// What `ane.mediaMlp` runs on the GPU: the complement channels, or the whole
+/// MLP for the tail and the fallback.
+const AneSeam = struct {
+    mw: *const MlpW,
+    rest: *const AneRestMlp,
+    s: S,
+    pub fn complement(self: AneSeam, head: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(self.rest, head, self.s);
+    }
+    pub fn full(self: AneSeam, x: mlx.mlx_array) !mlx.mlx_array {
+        return mlpForward(self.mw, x, self.s);
+    }
+};
 
 /// The GPU partial: silu(gate_rest(x)) * up_rest(x) -> fc2_rest, i.e. the same
 /// SwiGLU over the complement channels. Its fc2 output is a PARTIAL sum.
@@ -2155,8 +2182,6 @@ pub const Model = struct {
     /// count is known and torn down with the model.
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AneRestMlp = &.{},
-    /// The 32-aligned head the compiled tile covers; a shorter tail runs GPU.
-    ane_rows: u32 = 0,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
         var m: Model = undefined;
@@ -2167,7 +2192,6 @@ pub const Model = struct {
         m.sparse_policy = .off;
         m.ane_eng = null;
         m.ane_rest = &.{};
-        m.ane_rows = 0;
 
         const f32t = mlx.mlx_dtype.float32;
         // These stay fp32 because the CHECKPOINT stores them fp32 — the patch
@@ -2237,7 +2261,7 @@ pub const Model = struct {
             log.warn("[ane] video offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
         }
-        const rows = aneTileRows(seq_len);
+        const rows = ane.mediaTileRows(seq_len);
         const lora_bound = for (self.blocks) |*b| {
             if (b.mlp.fc1_lora.active().len > 0 or b.mlp.fc2_lora.active().len > 0) break true;
         } else false;
@@ -2249,20 +2273,21 @@ pub const Model = struct {
         const hidden = self.cfg.hidden_size;
         const ffn = self.cfg.ffn_hidden_size;
         const probe: ane.QuantWeight = .{ .w = fc1.w, .scales = fc1.scales, .biases = fc1.biases, .bits = fc1.bits, .group_size = fc1.group_size, .in_dim = hidden, .out_dim = 2 * ffn };
-        const plan = ane.planMediaOffload(io, s, "video", self.blocks.len, hidden, ffn, rows, probe) orelse return;
-        self.aneBuildInner(io, rows, plan.k, plan.units, plan.share, s) catch |err| {
+        const plan = ane.planMediaOffload(io, s, "video", self.blocks.len, hidden, ffn, rows, probe, AneCalib{ .m = self, .io = io, .rows = rows, .s = s, .dtype = self.dtype }) orelse return;
+        self.aneBuildInner(io, rows, plan.k, plan.units, plan.share, s, self.blocks.len) catch |err| {
             log.warn("[ane] video offload build failed ({s}) — GPU only\n", .{@errorName(err)});
             self.aneDeinit();
         };
     }
 
-    fn aneBuildInner(self: *Model, io: std.Io, rows: u32, k: u32, units: u32, share: f32, s: S) !void {
+    /// Builds blocks [0, n); fewer than all is the calibration build.
+    fn aneBuildInner(self: *Model, io: std.Io, rows: u32, k: u32, units: u32, share: f32, s: S, n: usize) !void {
         const a = self.allocator;
         const hidden = self.cfg.hidden_size;
         const ffn = self.cfg.ffn_hidden_size;
         const eng = try ane.AnePrefill.init(a, io, self.blocks.len, hidden, k, rows, rows, 0, 0, .channel, units);
         errdefer eng.deinit();
-        const rests = try a.alloc(AneRestMlp, self.blocks.len);
+        const rests = try a.alloc(AneRestMlp, n);
         errdefer a.free(rests);
         var built: usize = 0;
         errdefer for (rests[0..built]) |*r| r.deinit();
@@ -2273,7 +2298,7 @@ pub const Model = struct {
         defer a.free(fc2_slice);
         const up_slice = try a.alloc(f32, kh);
         defer a.free(up_slice);
-        for (self.blocks, 0..) |*b, i| {
+        for (self.blocks[0..n], 0..) |*b, i| {
             rests[i] = try aneBuildRest(&b.mlp, k * units, ffn, s);
             built = i + 1;
             // fc1 is [2*ffn, hidden]: gate rows [0..ffn), up rows [ffn..2*ffn).
@@ -2302,8 +2327,7 @@ pub const Model = struct {
         eng.publishLive(share, int8_bytes);
         self.ane_eng = eng;
         self.ane_rest = rests;
-        self.ane_rows = rows;
-        log.info("[ane] video offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, ready, self.blocks.len, eng.compiledBanks(), rows, k * units, ffn, share, int8_bytes / (1024 * 1024), secs });
+        if (n == self.blocks.len) log.info("[ane] video offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, ready, self.blocks.len, eng.compiledBanks(), rows, k * units, ffn, share, int8_bytes / (1024 * 1024), secs });
     }
 
     /// Force-materialize every weight in ONE eval. Without this the load is
@@ -2548,89 +2572,25 @@ pub const Model = struct {
         }
     };
 
-    /// One denoising forward over the packed sequence.
-    ///
-    /// `video_rows` covers EVERY video-stream row in packed order (condition
-    /// rows included), likewise `audio_rows`; the caller composes them from the
-    /// noisy latents and the clean conditions using `layout.img_update`.
-    /// The MLP with the ANE channel split when this block has a program. The
-    /// ragged tail (< 32 rows) runs the plain GPU MLP and concatenates.
+    /// The MLP with the ANE channel split when this block has a program.
     fn mlpMaybeAne(self: *const Model, mw: *const MlpW, x: mlx.mlx_array, idx: usize, s: S) !mlx.mlx_array {
         const eng = self.ane_eng orelse return mlpForward(mw, x, s);
         if (!eng.mlpReady(idx) or idx >= self.ane_rest.len) return mlpForward(mw, x, s);
         if (mw.fc1_lora.active().len > 0 or mw.fc2_lora.active().len > 0) return mlpForward(mw, x, s);
         const sh = mlx.getShape(x);
-        if (sh.len != 2 or sh[1] != @as(c_int, @intCast(eng.hidden)) or sh[0] < @as(c_int, @intCast(self.ane_rows))) return mlpForward(mw, x, s);
-        return self.mlpAneChannel(eng, mw, x, idx, s) catch |err| {
+        if (sh.len != 2 or sh[1] != @as(c_int, @intCast(eng.hidden))) return mlpForward(mw, x, s);
+        return ane.mediaMlp(s, eng, idx, "video", x, AneSeam{ .mw = mw, .rest = &self.ane_rest[idx], .s = s }) catch |err| {
             // An ANE failure is never a request failure — the block runs on GPU.
             log.warn("[ane] video block {d} split failed ({s}) — GPU fallback\n", .{ idx, @errorName(err) });
             return mlpForward(mw, x, s);
         };
     }
 
-    fn mlpAneChannel(self: *const Model, eng: *ane.AnePrefill, mw: *const MlpW, x: mlx.mlx_array, idx: usize, s: S) !mlx.mlx_array {
-        const rows: c_int = @intCast(self.ane_rows);
-        const width: c_int = @intCast(eng.hidden);
-        const seq = mlx.getShape(x)[0];
-
-        const head = try aneRowsView(x, 0, rows, s);
-        defer _ = mlx.mlx_array_free(head);
-        // packPlane wants [1, R, W]; the DiT streams are 2-D.
-        const head3 = try reshape(head, &[_]c_int{ 1, rows, width }, s);
-        defer _ = mlx.mlx_array_free(head3);
-        try ane.packUnitPlanes(s, eng, head3);
-        eng.kickMlp(idx);
-        var waited = false;
-        errdefer if (!waited) {
-            _ = eng.waitAll();
-        };
-        // Build AND submit the GPU partial so it computes while the ANE runs.
-        const y_gpu = try aneRestForward(&self.ane_rest[idx], head, s);
-        defer _ = mlx.mlx_array_free(y_gpu);
-        {
-            const ev = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(ev);
-            _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
-            _ = mlx.mlx_async_eval(ev);
-        }
-        const ok = eng.waitAll();
-        waited = true;
-        // A subset of the partials is not an answer — the block recomputes.
-        if (!ok) return mlpForward(mw, x, s);
-
-        const dt = mlx.mlx_array_dtype(y_gpu);
-        var acc3 = try ane.readPlane(s, eng.units[0].mlpOutputBase() orelse return error.AnePlaneMissing, width, rows, dt);
-        errdefer _ = mlx.mlx_array_free(acc3);
-        for (eng.units[1..]) |*u| {
-            const y = try ane.readPlane(s, u.mlpOutputBase() orelse return error.AnePlaneMissing, width, rows, dt);
-            defer _ = mlx.mlx_array_free(y);
-            var sum = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&sum, acc3, y, s));
-            _ = mlx.mlx_array_free(acc3);
-            acc3 = sum;
-        }
-        const acc2 = try reshape(acc3, &[_]c_int{ rows, width }, s);
-        _ = mlx.mlx_array_free(acc3);
-        defer _ = mlx.mlx_array_free(acc2);
-        // Undo the build-time `up` scale that keeps the fp16 graph in range.
-        const sc = try scalarLike(ane.OUT_PLANE_SCALE, y_gpu, s);
-        defer _ = mlx.mlx_array_free(sc);
-        const acc = try mulA(acc2, sc, s);
-        defer _ = mlx.mlx_array_free(acc);
-        var head_out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(head_out);
-        try mlx.check(mlx.mlx_add(&head_out, acc, y_gpu, s));
-        eng.logEngagedOnce("video");
-        if (seq == rows) return head_out;
-
-        defer _ = mlx.mlx_array_free(head_out);
-        const tail_in = try aneRowsView(x, rows, seq, s);
-        defer _ = mlx.mlx_array_free(tail_in);
-        const tail_out = try mlpForward(mw, tail_in, s);
-        defer _ = mlx.mlx_array_free(tail_out);
-        return concat(&[_]mlx.mlx_array{ head_out, tail_out }, 0, s);
-    }
-
+    /// One denoising forward over the packed sequence.
+    ///
+    /// `video_rows` covers EVERY video-stream row in packed order (condition
+    /// rows included), likewise `audio_rows`; the caller composes them from the
+    /// noisy latents and the clean conditions using `layout.img_update`.
     pub fn forward(
         self: *const Model,
         layout: *const PackedLayout,
@@ -6988,10 +6948,7 @@ test "minimax h3: turbo lora — runtime bypass equals a W_eff-folded forward" {
     }
 }
 
-test "aneTileRows / aneBlockEligible: 32-row tile, quantized only, never under a LoRA" {
-    // A ragged sequence keeps its sub-32 tail on the GPU.
-    try testing.expectEqual(@as(u32, 10208), aneTileRows(10211));
-    try testing.expectEqual(@as(u32, 10208), aneTileRows(10208));
+test "aneBlockEligible: quantized only, never under a LoRA" {
     try testing.expect(aneBlockEligible(10208, true, false));
     // Turbo binds blocks.N.mlp.fc1/fc2, and fc2's delta needs the FULL act —
     // half of which never leaves the ANE program.

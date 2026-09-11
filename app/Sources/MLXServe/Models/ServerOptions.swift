@@ -1060,17 +1060,17 @@ extension ServerOptions {
             title: "Neural Engine image boost",
             explainer: "Runs part of image generation on the Neural Engine alongside the GPU. Measured 1.30x on an M4 Max and 1.77x on an M1 Pro with Krea — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. The split is solved per Mac and model at the first request, which adds a one-time compile of about a minute. Off by default; the server declines by name when this Mac cannot hold it.",
             needsRestart: true,
-            cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB for each different image size you generate; the same size reuses it."),
+            cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB once; every image size shares it."),
         "aneVideo": .init(
             title: "Neural Engine video boost",
             explainer: "Runs part of video generation on the Neural Engine alongside the GPU. Measured 1.22x per denoise step on an M4 Max with MiniMax-H3. The split is solved per Mac and model; H3 rebuilds it per request (about 30 s cold, 8 s warm), so it pays on long renders. Blocks that carry a LoRA (the Turbo recipe) stay on the GPU. Off by default; the server declines by name when this Mac cannot hold it.",
             needsRestart: true,
-            cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB for each different resolution and frame count you generate; the same combination reuses it."),
+            cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB once; every resolution and frame count shares it."),
         "aneAudio": .init(
             title: "Neural Engine music boost",
             explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
             needsRestart: true,
-            cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB for each different song length you generate; the same length reuses it."),
+            cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",

@@ -1087,6 +1087,32 @@ log-STFT cosine (≥ 0.994). Anything normalized by a single sample is out.
 normalizer's anchor, not the signal. Check for one before trusting any
 whole-track scalar on a generated audio arm.
 
+## A GPU tail built after the ANE wait is serial, and a small one is launch latency (2026-09-11)
+
+The media seam moved to one fixed 256-row tile looped over every request (`ane.mediaMlp`), so a new image size, canvas or song length stops compiling and storing another 1.3-4.9 GB program set. Its first version ran the rows past the last full tile through the full GPU MLP AFTER the tile loop and trailed the whole-request tile by 3-4% on ACE-Step and H3.
+
+The tail was not costing its rows. The whole-request tile had the same shape with a sub-32-row tail, and moving that 23-row tail to go out with the GPU complement, before the first ANE wait, took ACE 30 s whole@0.60 diffusion from 1982 to 1836 ms. Three small matmuls are dispatch latency, and built after a blocking wait nothing overlaps them; built before it they land in whatever GPU slack the ANE-critical block leaves.
+
+Fix: `ane.mediaMlp` async-evals every GPU piece (complement and tail) before the loop. A partial last tile rides the ANE zero-padded when `tail > T x (1 - share)` (`ane.mediaTilePlan`), the balance point where padding the ANE costs less than the tail on the GPU. M4 Max, T = 256: ACE 180 s pads (12.4 s vs 13.6 s unpadded), H3's 116 rows stay on the GPU (7.44 s/step vs 7.64 padded), ACE 30 s ties. Against the whole-request tile: Krea -0.6%, ACE 180 s tie, H3 -1..2%/step, ACE 30 s -7% (140 ms of 2 s).
+
+Guard: the `mediaTilePlan` test; live, the `[ane] <what> offload engaged: tiled N x 256 rows (P padded), tail R on GPU` line.
+
+## A parameter that keys a compiled artifact must not be re-derived per request (2026-09-11)
+
+The media share decides which ANE program set a build compiles, and the lineage prune keeps one share per model. It was re-solved at every build from a GPU probe timed at the request's own row count, so the fixed 256-row tile still recompiled: a 50 s song solved 0.50 where a 30 s one had solved 0.60, and H3 builds on every request. A sweep showed the size was not even the main problem: at 256-4096 rows the M4 Max probe reads 11.2-13.5 TFLOPS on all three models, so the raw share sits at 0.47-0.51, and Krea and H3 straddle the 0.475 rounding line (two consecutive H3 probes at 1024 rows: 0.468, 0.477). Any re-solve can land on the other side and cost a full compile plus a prune.
+
+Fix: the probe runs at a fixed `MEDIA_PROBE_ROWS` (4096), and a model reuses the share of its most recently used compiled set (`ane.cachedShare` over `msv_ane_cache_variant`), tagged `calibrated share=X`. An explicit `--ane-split` tags plain `share=X` and is never reused, and a cache hit re-tags the entry with the current lineage, so a set built by an older binary becomes reusable. The same sweep showed last round's ACE "0.60 match" was an outlier probe (7.8 TFLOPS): the solve cannot tell ACE from Krea or H3 on M4 Max.
+
+Guard: the `shareVariant` test; live, `[ane] <what> offload share X (reused from its compiled set)` on every build after the first.
+
+## A calibration timed on the wrong dtype aims low (2026-09-11)
+
+The media share is calibrated on block 0: its ANE program over one 4096-row run, its GPU complement over the same rows, balanced. The first version fed the complement bf16 ones (the weight-scale dtype) and aimed ACE at 0.50 and H3 at 0.40, below the measured bests of 0.60 and 0.45. Sustained ANE runs (clock ramp) and running both sides at once (bandwidth and power contention) each moved the timings by under 3%. A throwaway seam probe found the gap: at 0.50 ACE's real GPU complement took ~18 ms per block against the 12.9 ms calibration predicted, so every block was GPU-bound. ACE's DiT stream is float32 and so is its complement; Krea's is float32 cast to bf16 inside each linear; only H3's is bf16.
+
+Fix: each backend's calibrator names the dtype its MLP sees (`AneCalib.dtype`), and the complement is timed on that. ACE now calibrates at 0.57 (GPU 32.9 vs 25.9 ms). H3's remaining 0.42 vs 0.45 is its bench canvas's 116-row GPU tail, a per-request cost a per-model share cannot carry.
+
+Guard: the `calibratedShare` test; live, `[ane] <what> offload share calibrated X in Ns: …`.
+
 ## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
 
 The third cause above, closed. `vae_diffusion_decoder.safetensors` is four

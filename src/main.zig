@@ -176,11 +176,11 @@ fn printUsage(io: std.Io) void {
         \\  --ane-image         Run a share of each image DiT block's MLP on the
         \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
         \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
-        \\                        share is solved per Mac and model from a GPU
-        \\                        probe; the server declines by name where the
-        \\                        copy does not fit.
+        \\                        share is calibrated once per Mac and model on
+        \\                        the first request (~1 s) and reused; the server
+        \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
-        \\                        of solving it (MLX_SERVE_ANE_SPLIT is the same).
+        \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is

@@ -423,11 +423,6 @@ const AceRest = struct {
     }
 };
 
-/// The 32-row fp16 plane pitch; a shorter tail runs on the GPU.
-pub fn aneTileRows(seq_len: u32) u32 {
-    return seq_len - (seq_len % 32);
-}
-
 fn aneQFromKey(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32) !AceQ {
     const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
     defer a.free(wk);
@@ -504,6 +499,40 @@ fn aneRestCols(q: *const AceQ, k: u32, s: S) !AceQ {
     return .{ .w = w, .scales = sc, .biases = bi, .bits = q.bits, .gs = q.gs };
 }
 
+/// What `ane.planMediaOffload` calibrates on: block 0 built alone.
+const AneCalib = struct {
+    e: *Engine,
+    rows: u32,
+    /// The DiT stream the MLP sees is f32.
+    dtype: mlx.mlx_dtype = .float32,
+    pub fn buildBlock0(self: AneCalib, k: u32, units: u32, share: f32) !*ane.AnePrefill {
+        try self.e.aneBuildInner(self.rows, k, units, share, 1);
+        return self.e.ane_eng.?;
+    }
+    pub fn complement(self: AneCalib, x: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(&self.e.ane_rest[0], x, self.e.s);
+    }
+    pub fn teardown(self: AneCalib) void {
+        self.e.aneDeinit();
+    }
+};
+
+/// What `ane.mediaMlp` runs on the GPU: the complement channels, or the whole
+/// MLP for the tail and the fallback.
+const AneSeam = struct {
+    a: std.mem.Allocator,
+    w: *const Weights,
+    pfx: []const u8,
+    rest: *const AceRest,
+    s: S,
+    pub fn complement(self: AneSeam, head: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(self.rest, head, self.s);
+    }
+    pub fn full(self: AneSeam, x: mlx.mlx_array) !mlx.mlx_array {
+        return aceMlpGpu(self.a, self.w, self.pfx, x, self.s);
+    }
+};
+
 /// The GPU partial: the same SwiGLU over the complement channels; its down
 /// output is a PARTIAL sum that adds with the ANE's.
 fn aneRestForward(rest: *const AceRest, x: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -519,7 +548,7 @@ fn aneRestForward(rest: *const AceRest, x: mlx.mlx_array, s: S) !mlx.mlx_array {
 }
 
 /// The block MLP: plain GPU SwiGLU, or the ANE channel split when this block
-/// has a compiled program. A ragged tail (< 32 rows) runs on the GPU.
+/// has a compiled program.
 fn aceMlpGpu(a: std.mem.Allocator, w: *const Weights, pfx: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const gate = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.mlp.gate_proj", .{pfx}), s);
     defer _ = mlx.mlx_array_free(gate);
@@ -539,85 +568,12 @@ fn aceMlpMaybeAne(e: *const Engine, a: std.mem.Allocator, w: *const Weights, pfx
     const sh = mlx.getShape(x);
     // [1, T, hidden] or [T, hidden]; a batched (CFG) forward declines.
     const rank_ok = (sh.len == 3 and sh[0] == 1) or sh.len == 2;
-    const seq: c_int = if (sh.len == 3) sh[1] else sh[0];
-    if (!rank_ok or sh[sh.len - 1] != @as(c_int, @intCast(eng.hidden)) or seq < @as(c_int, @intCast(e.ane_rows)))
-        return aceMlpGpu(a, w, pfx, x, s);
-    return aceMlpAneChannel(e, a, w, pfx, eng, idx, x, seq, s) catch |err| {
+    if (!rank_ok or sh[sh.len - 1] != @as(c_int, @intCast(eng.hidden))) return aceMlpGpu(a, w, pfx, x, s);
+    return ane.mediaMlp(s, eng, idx, "audio", x, AneSeam{ .a = a, .w = w, .pfx = pfx, .rest = &e.ane_rest[idx], .s = s }) catch |err| {
         // An ANE failure is never a request failure — the block runs on GPU.
         log.warn("[ane] audio block {d} split failed ({s}) — GPU fallback\n", .{ idx, @errorName(err) });
         return aceMlpGpu(a, w, pfx, x, s);
     };
-}
-
-fn aceMlpAneChannel(e: *const Engine, a: std.mem.Allocator, w: *const Weights, pfx: []const u8, eng: *ane.AnePrefill, idx: usize, x: mlx.mlx_array, seq: c_int, s: S) !mlx.mlx_array {
-    const rows: c_int = @intCast(e.ane_rows);
-    const width: c_int = @intCast(eng.hidden);
-    const x2 = try reshape(x, &[_]c_int{ seq, width }, s);
-    defer _ = mlx.mlx_array_free(x2);
-    const head = try aneRowsView(x2, 0, rows, s);
-    defer _ = mlx.mlx_array_free(head);
-    const head3 = try reshape(head, &[_]c_int{ 1, rows, width }, s);
-    defer _ = mlx.mlx_array_free(head3);
-
-    try ane.packUnitPlanes(s, eng, head3);
-    eng.kickMlp(idx);
-    var waited = false;
-    errdefer if (!waited) {
-        _ = eng.waitAll();
-    };
-    // Build AND submit the GPU partial so it computes while the ANE runs.
-    const y_gpu = try aneRestForward(&e.ane_rest[idx], head, s);
-    defer _ = mlx.mlx_array_free(y_gpu);
-    {
-        const ev = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(ev);
-        _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
-        _ = mlx.mlx_async_eval(ev);
-    }
-    const ok = eng.waitAll();
-    waited = true;
-    if (!ok) return aceMlpGpu(a, w, pfx, x, s);
-
-    const dt = mlx.mlx_array_dtype(y_gpu);
-    var acc3 = try ane.readPlane(s, eng.units[0].mlpOutputBase() orelse return error.AnePlaneMissing, width, rows, dt);
-    errdefer _ = mlx.mlx_array_free(acc3);
-    for (eng.units[1..]) |*u| {
-        const y = try ane.readPlane(s, u.mlpOutputBase() orelse return error.AnePlaneMissing, width, rows, dt);
-        defer _ = mlx.mlx_array_free(y);
-        var sum = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&sum, acc3, y, s));
-        _ = mlx.mlx_array_free(acc3);
-        acc3 = sum;
-    }
-    const acc2 = try reshape(acc3, &[_]c_int{ rows, width }, s);
-    _ = mlx.mlx_array_free(acc3);
-    defer _ = mlx.mlx_array_free(acc2);
-    // Undo the build-time `up` scale that keeps the fp16 graph in range.
-    const sc_f32 = mlx.mlx_array_new_float(ane.OUT_PLANE_SCALE);
-    defer _ = mlx.mlx_array_free(sc_f32);
-    var sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc);
-    try mlx.check(mlx.mlx_astype(&sc, sc_f32, dt, s));
-    const acc = try mulA(acc2, sc, s);
-    defer _ = mlx.mlx_array_free(acc);
-
-    var head_out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(head_out);
-    try mlx.check(mlx.mlx_add(&head_out, acc, y_gpu, s));
-    eng.logEngagedOnce("audio");
-    if (seq == rows) {
-        const shaped = try reshape(head_out, mlx.getShape(x), s);
-        _ = mlx.mlx_array_free(head_out);
-        return shaped;
-    }
-    defer _ = mlx.mlx_array_free(head_out);
-    const tail_in = try aneRowsView(x2, rows, seq, s);
-    defer _ = mlx.mlx_array_free(tail_in);
-    const tail_out = try aceMlpGpu(a, w, pfx, tail_in, s);
-    defer _ = mlx.mlx_array_free(tail_out);
-    const joined = try concat2(head_out, tail_out, 0, s);
-    defer _ = mlx.mlx_array_free(joined);
-    return reshape(joined, mlx.getShape(x), s);
 }
 
 /// Bidirectional band mask for sliding-window layers: additive [1,1,T,T] bf16,
@@ -1894,7 +1850,6 @@ pub const Engine = struct {
     /// count is known; torn down with the engine.
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AceRest = &.{},
-    ane_rows: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, low_mem: bool) !*Engine {
         const self = try allocator.create(Engine);
@@ -1903,7 +1858,6 @@ pub const Engine = struct {
         self.io = io;
         self.ane_eng = null;
         self.ane_rest = &.{};
-        self.ane_rows = 0;
         self.s = mlx.mlx_default_gpu_stream_new();
         self.cfg = Cfg{}; // single-member family; converted config mirrors these
         self.low_mem = low_mem;
@@ -2107,7 +2061,7 @@ pub const Engine = struct {
             log.warn("[ane] audio offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
         }
-        const rows = aneTileRows(seq_len);
+        const rows = ane.mediaTileRows(seq_len);
         if (rows < ane.ANE_MIN_ROWS) {
             log.warn("[ane] audio offload declined: {d} rows (seq {d}) is under the {d}-row floor — GPU only\n", .{ rows, seq_len, ane.ANE_MIN_ROWS });
             return;
@@ -2120,21 +2074,22 @@ pub const Engine = struct {
         };
         defer g0.deinit();
         const probe: ane.QuantWeight = .{ .w = g0.w, .scales = g0.scales, .biases = g0.biases, .bits = g0.bits, .group_size = g0.gs, .in_dim = hidden, .out_dim = ffn };
-        const plan = ane.planMediaOffload(self.io, self.s, "audio", self.cfg.layers, hidden, ffn, rows, probe) orelse return;
-        self.aneBuildInner(rows, plan.k, plan.units, plan.share) catch |err| {
+        const plan = ane.planMediaOffload(self.io, self.s, "audio", self.cfg.layers, hidden, ffn, rows, probe, AneCalib{ .e = self, .rows = rows }) orelse return;
+        self.aneBuildInner(rows, plan.k, plan.units, plan.share, self.cfg.layers) catch |err| {
             log.warn("[ane] audio offload build failed ({s}) — GPU only\n", .{@errorName(err)});
             self.aneDeinit();
         };
     }
 
-    fn aneBuildInner(self: *Engine, rows: u32, k: u32, units: u32, share: f32) !void {
+    /// Builds blocks [0, n); fewer than all is the calibration build.
+    fn aneBuildInner(self: *Engine, rows: u32, k: u32, units: u32, share: f32, n: usize) !void {
         const a = self.allocator;
         const s = self.s;
         const hidden = self.cfg.hidden;
         const ffn = self.cfg.intermediate;
         const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, .channel, units);
         errdefer eng.deinit();
-        const rests = try a.alloc(AceRest, self.cfg.layers);
+        const rests = try a.alloc(AceRest, n);
         errdefer a.free(rests);
         var built: usize = 0;
         errdefer for (rests[0..built]) |*r| r.deinit();
@@ -2146,7 +2101,7 @@ pub const Engine = struct {
         const up_slice = try a.alloc(f32, kh);
         defer a.free(up_slice);
         var buf: [96]u8 = undefined;
-        for (0..self.cfg.layers) |i| {
+        for (0..n) |i| {
             const gq = try aneQFromKey(&self.w, a, try std.fmt.bufPrint(&buf, "decoder.layers.{d}.mlp.gate_proj", .{i}), hidden);
             var gq_m = gq;
             defer gq_m.deinit();
@@ -2190,8 +2145,7 @@ pub const Engine = struct {
         eng.publishLive(share, int8_bytes);
         self.ane_eng = eng;
         self.ane_rest = rests;
-        self.ane_rows = rows;
-        log.info("[ane] audio offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, ready, self.cfg.layers, eng.compiledBanks(), rows, k * units, ffn, share, int8_bytes / (1024 * 1024), secs });
+        if (n == self.cfg.layers) log.info("[ane] audio offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, ready, self.cfg.layers, eng.compiledBanks(), rows, k * units, ffn, share, int8_bytes / (1024 * 1024), secs });
     }
 
     pub fn generateWav(self: *Engine, allocator: std.mem.Allocator, req: MusicRequest, progress: ?sse.Progress) ![]u8 {

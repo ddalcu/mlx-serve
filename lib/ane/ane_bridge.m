@@ -158,6 +158,16 @@ void msv_ane_cache_lineage(const char *group, const char *variant) {
     snprintf(lineage_variant, sizeof lineage_variant, "%s", variant ? variant : "");
 }
 
+/* Tag an entry with the current lineage (no-op when untagged). A build that
+ * restores a set built under another tag re-tags it, so the tag always names
+ * the build that last used it. */
+static void bridge_cache_tag(NSString *entry) {
+    if (!lineage_group[0]) return;
+    [[NSString stringWithFormat:@"%s\n%s\n", lineage_group, lineage_variant]
+        writeToFile:[entry stringByAppendingPathComponent:@"lineage"]
+         atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 static unsigned long long bridge_cache_cap_bytes(void) {
     const char *env = getenv("MLX_SERVE_ANE_CACHE_CAP_GB");
     long gb = env ? atol(env) : 40;
@@ -180,6 +190,25 @@ static NSArray<NSString *> *bridge_entry_lineage(NSString *path) {
         encoding:NSUTF8StringEncoding error:nil];
     NSArray<NSString *> *parts = [text componentsSeparatedByString:@"\n"];
     return parts.count >= 2 ? parts : nil;
+}
+
+void msv_ane_cache_variant(const char *group, char *out, int out_len) {
+    @autoreleasepool {
+        out[0] = 0;
+        NSString *root = [bridge_cache_root() stringByAppendingPathComponent:@"entries"];
+        NSFileManager *files = [NSFileManager defaultManager];
+        NSDate *newest = nil;
+        for (NSString *name in [files contentsOfDirectoryAtPath:root error:nil]) {
+            NSString *path = [root stringByAppendingPathComponent:name];
+            NSArray<NSString *> *lineage = bridge_entry_lineage(path);
+            if (!lineage || ![lineage[0] isEqualToString:@(group)]) continue;
+            NSDate *date = [[files attributesOfItemAtPath:path error:nil]
+                fileModificationDate] ?: [NSDate distantPast];
+            if (newest && [date compare:newest] != NSOrderedDescending) continue;
+            newest = date;
+            snprintf(out, out_len, "%s", lineage[1].UTF8String);
+        }
+    }
 }
 
 static void bridge_cache_prune(void) {
@@ -244,10 +273,7 @@ static void bridge_cache_store(NSString *identifier, NSString *directory) {
             if (![files copyItemAtPath:from toPath:to error:nil]) return;
         }
     }
-    if (lineage_group[0])
-        [[NSString stringWithFormat:@"%s\n%s\n", lineage_group, lineage_variant]
-            writeToFile:[entry stringByAppendingPathComponent:@"lineage"]
-             atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    bridge_cache_tag(entry);
     [[NSData data] writeToFile:
         [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
 }
@@ -398,6 +424,7 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
         NSFileManager *files = [NSFileManager defaultManager];
         bool cache = msv_ane_cache_enabled();
         bool cached = cache && bridge_cache_restore(identifier, directory);
+        if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
         if (!cached) bridge_write_sources(directory, program, weights);
         [[NSString stringWithFormat:@"%d", getpid()]
             writeToFile:[directory stringByAppendingPathComponent:@"msv-ane.pid"]
