@@ -309,6 +309,8 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A llama session trim is FALLIBLE on recurrent/hybrid GGUFs** (#286 + #287; `mlx_llama_session_trim` returns 1 = cleared): `llama_memory_seq_rm` refuses a partial tail past the recurrent snapshot window and mutates NOTHING — a trimmed mirror over an untrimmed KV served the PREVIOUS request's tool calls. Cold-prefill on refusal.
 - **A READY model never advertises LESS capability than its stub** (`readyHasChat` counts embedded engines; app `lanAdvertises` tolerates empty caps).
 - **Default bind is 0.0.0.0 and serve mode WARNS** (`server.shouldWarnOpenBind`); flips to 127.0.0.1 in a future release. The app always passes `--host` explicitly.
+- **A reload FREES the CPU state `unloadResident` retains, so the registry mutex alone does not make a read of it safe**: `config`/`chat_config`/`tokenizer`/`token_bytes`/`tokenize_cache` are freed off-mutex while the entry is `.loading` (`releaseRetainedCpuState`, asserted). A reader holding no refcount takes the mutex AND skips them while `.loading` — not `== .ready`, an unloaded entry keeps them by contract.
+- **A status route must never reach `ensureLoaded`**: `GET /props` cold-loaded the model, so a 3s tray poll retook the memory idle eviction had just handed back. Nothing resident → answer from the counters (`handlePropsNoModel`).
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
