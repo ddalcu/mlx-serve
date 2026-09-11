@@ -609,7 +609,7 @@ fn aceMlpAneChannel(e: *const Engine, a: std.mem.Allocator, w: *const Weights, p
     var head_out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(head_out);
     try mlx.check(mlx.mlx_add(&head_out, acc, y_gpu, s));
-    eng.logEngagedOnce();
+    eng.logEngagedOnce("audio");
     if (seq == rows) {
         const shaped = try reshape(head_out, mlx.getShape(x), s);
         _ = mlx.mlx_array_free(head_out);
@@ -2273,6 +2273,18 @@ pub const Engine = struct {
         else
             try self.silenceSlice(self.cfg.timbre_fix_frame, s);
         defer _ = mlx.mlx_array_free(timbre);
+        // Per-stage clock: whole-request wall hides which stage a change moved
+        // (a low-mem box reloads the 1.1 GB text encoder EVERY request, and on
+        // a slow GPU that dilutes a DiT-only speedup out of visibility).
+        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
+        const stageMs = struct {
+            fn f(io: std.Io, t0: *std.Io.Timestamp) u64 {
+                const ns = t0.untilNow(io, .awake).nanoseconds;
+                t0.* = std.Io.Timestamp.now(io, .awake);
+                return @intCast(@divTrunc(ns, 1_000_000));
+            }
+        }.f;
+        const cond_ms = stageMs(self.io, &stage_t0);
         const cond2048 = try buildConditioning(self, allocator, text_hidden, lyric_embeds, timbre, s);
         defer _ = mlx.mlx_array_free(cond2048);
         const cond2048_2: ?mlx.mlx_array = if (text_hidden2) |th2| try buildConditioning(self, allocator, th2, lyric_embeds, timbre, s) else null;
@@ -2400,7 +2412,10 @@ pub const Engine = struct {
         // ── VAE decode → normalize → WAV ──
         // Decode is the pipeline's memory peak; start it from a drained cache.
         if (self.low_mem) _ = mlx.mlx_clear_cache();
+        const diffuse_ms = stageMs(self.io, &stage_t0);
         const samples = try vaeDecodeChunked(self, allocator, xt, progress, s);
+        const decode_ms = stageMs(self.io, &stage_t0);
+        log.info("[acestep] stages: conditioning {d} ms, diffusion {d} ms ({d} steps), vae decode {d} ms\n", .{ cond_ms, diffuse_ms, NUM_STEPS, decode_ms });
         defer allocator.free(samples);
         peakNormalize(samples, NORMALIZE_DB);
         return wav_mod.encodePcm16(allocator, samples, self.cfg.sample_rate, 2);

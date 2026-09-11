@@ -22646,7 +22646,7 @@ pub const Transformer = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("prefill");
         return out;
     }
 
@@ -22838,7 +22838,7 @@ pub const Transformer = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, acc, y_gpu, self.s));
         _ = mlx.mlx_array_free(acc);
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("prefill");
         return out;
     }
 

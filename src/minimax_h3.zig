@@ -2645,7 +2645,7 @@ pub const Model = struct {
         var head_out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(head_out);
         try mlx.check(mlx.mlx_add(&head_out, acc, y_gpu, s));
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("video");
         if (seq == rows) return head_out;
 
         defer _ = mlx.mlx_array_free(head_out);

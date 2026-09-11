@@ -996,10 +996,14 @@ pub const AnePrefill = struct {
     /// One-shot engagement lines, one PER SEAM — a built-but-never-
     /// dispatched program is exactly the dispatch-hole class, so each seam
     /// proves its own dispatch in the log (the expectNoSpec rule).
-    pub fn logEngagedOnce(self: *AnePrefill) void {
+    /// `what` names the CALLER's surface ("prefill", "image", "video",
+    /// "audio"): one engine serves all of them, and a media seam logging
+    /// "prefill offload engaged (--ane-prefill)" reads as a flag nobody
+    /// passed.
+    pub fn logEngagedOnce(self: *AnePrefill, what: []const u8) void {
         if (self.engaged_logged) return;
         self.engaged_logged = true;
-        log.info("[ane] prefill offload engaged: mode={s} units={d} mlp={d} rows={d}/{d} (--ane-prefill; MLX_SERVE_ANE_SPLIT sets the share)\n", .{ @tagName(self.mode), self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
+        log.info("[ane] {s} offload engaged: mode={s} units={d} mlp={d} rows={d}/{d} (MLX_SERVE_ANE_SPLIT sets the share)\n", .{ what, @tagName(self.mode), self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
     }
 
     pub fn logGdnEngagedOnce(self: *AnePrefill) void {

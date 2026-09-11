@@ -1436,7 +1436,7 @@ pub const Dit = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, scaled, y_gpu, s));
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("image");
         return out;
     }
 
