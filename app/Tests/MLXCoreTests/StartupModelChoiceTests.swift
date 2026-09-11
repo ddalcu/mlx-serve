@@ -1,0 +1,209 @@
+import XCTest
+@testable import MLXCore
+
+/// The launch gate: what auto-start actually starts, and which model — if any —
+/// comes up with it.
+///
+/// The bug this pins (issue #214): "Auto-start on launch" passed `--model`,
+/// which the server treats as an eager, blocking load, so one checkbox labelled
+/// *start* read tens of gigabytes off disk at login. Splitting the two
+/// decisions is only safe if the split itself is checkable — the gate is a
+/// single branch in `AppState.init` that nobody can watch run.
+final class StartupModelChoiceTests: XCTestCase {
+
+    private let installed = ["/models/qwen", "/models/gemma"]
+
+    private func scratchDefaults(_ name: String = #function) -> UserDefaults {
+        let suite = "StartupModelChoiceTests.\(name)"
+        UserDefaults().removePersistentDomain(forName: suite)
+        return UserDefaults(suiteName: suite)!
+    }
+
+    // MARK: - Start the server vs load a model
+
+    func testAutoStartOffStartsNothing() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: false,
+                                      loadModelAtStart: true,
+                                      mode: .pinned,
+                                      pinnedPath: "/models/qwen",
+                                      lastUsed: "/models/qwen",
+                                      installedPaths: installed),
+            .doNothing)
+    }
+
+    /// The whole point of the change: auto-start alone brings the server up
+    /// WITHOUT a model. If this ever goes back to `.load`, login is slow again.
+    func testAutoStartAloneIsHeadless() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: false,
+                                      mode: .pinned,
+                                      pinnedPath: "/models/qwen",
+                                      lastUsed: "/models/gemma",
+                                      installedPaths: installed),
+            .headless)
+    }
+
+    func testPinnedModeLoadsThePinnedModel() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .pinned,
+                                      pinnedPath: "/models/gemma",
+                                      lastUsed: "/models/qwen",
+                                      installedPaths: installed),
+            .load(path: "/models/gemma"))
+    }
+
+    /// A pin is a pin: what has been used since must not move it.
+    func testPinnedModeIgnoresTheLastUsedModel() {
+        XCTAssertEqual(
+            StartupModelChoice.resolved(mode: .pinned,
+                                        pinnedPath: "/models/gemma",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed),
+            "/models/gemma")
+    }
+
+    /// "Always this model" selected before anything was pinned.
+    func testPinnedModeWithNothingPinnedResolvesToNothing() {
+        XCTAssertNil(
+            StartupModelChoice.resolved(mode: .pinned,
+                                        pinnedPath: "",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed))
+    }
+
+    // MARK: - "Last model used" is a MODE, not a magic path
+
+    /// Resolved at START time, so the same stored preference gives a different
+    /// answer as the last-used model moves. Nothing about the stored value
+    /// changes between these two cases.
+    func testLastUsedModeResolvesAtStartTime() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
+                                      lastUsed: "/models/qwen",
+                                      installedPaths: installed),
+            .load(path: "/models/qwen"))
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
+                                      lastUsed: "/models/gemma",
+                                      installedPaths: installed),
+            .load(path: "/models/gemma"))
+    }
+
+    /// The mode wins over a pin that happens to still be stored — the pinned
+    /// path is inert data under `.lastUsed`, not a fallback.
+    func testLastUsedModeIgnoresAStoredPin() {
+        XCTAssertEqual(
+            StartupModelChoice.resolved(mode: .lastUsed,
+                                        pinnedPath: "/models/gemma",
+                                        lastUsed: "/models/qwen",
+                                        installedPaths: installed),
+            "/models/qwen")
+    }
+
+    /// No mode is spelled as a path, so no path can be mistaken for a mode.
+    /// A raw value that collides with an absolute path would put the sentinel
+    /// straight back.
+    func testNoModeIsSpelledAsAPath() {
+        for mode in StartupModelChoice.Mode.allCases {
+            XCTAssertFalse(mode.rawValue.hasPrefix("/"), "\(mode) reads as a path")
+            XCTAssertFalse(mode.rawValue.isEmpty, "\(mode) reads as an absent value")
+        }
+    }
+
+    func testTheDefaultModeIsLastUsed() {
+        XCTAssertEqual(StartupModelChoice.Mode.default, .lastUsed)
+    }
+
+    // MARK: - Nothing to load
+
+    /// Fresh install. Not an error, and emphatically not "pick one for them" —
+    /// a startup that loads a model the user never chose is worse than one that
+    /// loads none.
+    func testNoLastUsedStartsHeadlessRatherThanPickingSomething() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
+                                      lastUsed: nil,
+                                      installedPaths: installed),
+            .headless)
+    }
+
+    /// The model was uninstalled between launches. `--model <gone>` is an
+    /// instant FileNotFound, which is the failure this change exists to avoid.
+    func testUninstalledLastUsedStartsHeadless() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
+                                      lastUsed: "/models/deleted",
+                                      installedPaths: installed),
+            .headless)
+    }
+
+    func testUninstalledPinStartsHeadless() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .pinned,
+                                      pinnedPath: "/models/deleted",
+                                      lastUsed: "/models/qwen",
+                                      installedPaths: installed),
+            .headless)
+    }
+
+    /// A Mac with nothing chat-pickable at all.
+    func testEmptyLibraryStartsHeadless() {
+        XCTAssertEqual(
+            StartupModelChoice.launch(autoStart: true,
+                                      loadModelAtStart: true,
+                                      mode: .lastUsed,
+                                      pinnedPath: nil,
+                                      lastUsed: "/models/qwen",
+                                      installedPaths: []),
+            .headless)
+    }
+
+    // MARK: - Recording the last model used
+
+    func testNothingRecordedYetReadsAsNil() {
+        XCTAssertNil(StartupModelChoice.lastUsed(defaults: scratchDefaults()))
+    }
+
+    func testRecordedLoadIsReadBack() {
+        let d = scratchDefaults()
+        StartupModelChoice.recordLoaded(path: "/models/qwen", defaults: d)
+        XCTAssertEqual(StartupModelChoice.lastUsed(defaults: d), "/models/qwen")
+    }
+
+    func testTheMostRecentLoadWins() {
+        let d = scratchDefaults()
+        StartupModelChoice.recordLoaded(path: "/models/qwen", defaults: d)
+        StartupModelChoice.recordLoaded(path: "/models/gemma", defaults: d)
+        XCTAssertEqual(StartupModelChoice.lastUsed(defaults: d), "/models/gemma")
+    }
+
+    /// A registry id is a directory BASENAME (for a Hugging Face snapshot, a
+    /// commit hash) and a LAN id names another Mac's model. Neither can be
+    /// handed to `--model`, so neither may become the last model used.
+    func testNonPathIdsAreNotRecorded() {
+        let d = scratchDefaults()
+        StartupModelChoice.recordLoaded(path: "/models/qwen", defaults: d)
+        StartupModelChoice.recordLoaded(path: "lan:some-peer-model", defaults: d)
+        StartupModelChoice.recordLoaded(path: "a1b2c3d4", defaults: d)
+        StartupModelChoice.recordLoaded(path: "", defaults: d)
+        XCTAssertEqual(StartupModelChoice.lastUsed(defaults: d), "/models/qwen")
+    }
+}
