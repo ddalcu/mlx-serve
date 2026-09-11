@@ -492,10 +492,11 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **The ANE tile is sized by `effectivePrefillChunk`, never the pin alone** (scan-pinned) — a bare-pin tile is built-but-never-dispatched. **ANE prefill is M4-AND-BELOW** (`anePrefillAllowed`; M5 Max measured a LOSS; `MLX_SERVE_ANE_FORCE=1`).
 - **Channel mode is the default split** (`MLX_SERVE_ANE_MODE`, shares channel 0.45 / row 0.40): output-channel slices at ffn'=k, GPU rest via axis-0 packed VIEWS (bit-exact), boundaries on `CHANNEL_ALIGN` 128, down partials ADD at the seam. A failed channel eval recomputes the WHOLE layer.
 - **ANE I/O planes shared per SHAPE CLASS within a unit** (evals serial; 3 surfaces replace 224; never memset at bind). **MoE gets GDN-ONLY coverage** (shared expert ~5% ceiling; +3.9% at 16k).
-- **Media gen offloads through the SAME channel seam, opt-in** (`MLX_SERVE_ANE_IMAGE=1` `krea.aneEnsure`; `MLX_SERVE_ANE_VIDEO=1` `Model.buildAne`): built once the run's row count is known (it is per-request), ONE tile for the whole run, a sub-32-row tail stays on the GPU (`aneTileRows`). Bar = perceived content, never bytes (Krea cos 0.9993 same fox; H3 cos 0.9987 same shot).
+- **Media gen offloads through the SAME channel seam, opt-in** (`--ane-image` `krea.aneEnsure`; `--ane-video` `Model.buildAne`; `--ane-audio` `Engine.buildAne`; all read `ane.media_offload`, decided by `ane.planMediaOffload`): built once the run's row count is known (it is per-request), ONE tile for the whole run, a sub-32-row tail stays on the GPU (`aneTileRows`). Bar = perceived content, never bytes (Krea cos 0.9993 same fox; H3 cos 0.9987 same shot). Share tables: "Media offload share" below.
 - **The fp16 range scale is the load-bearing part** (`ane.OUT_PLANE_SCALE` 256): the ANE graph computes fp16 throughout, so `act = silu(gate)*up` AND the down-conv output must stay under 65504. Fold it into the `up` copy (linear into the product, exact through per-row int8) and multiply back on read — never into `gate`, which sits under a nonlinearity.
-- **A per-request staged model rebuilds the engine per request** (H3: cold 32 s / warm 8 s, 4.9 GB int8). The compile cache grows ~5 GB per (model, row count) and the 40 GB LRU cap is above what a full internal disk tolerates — a full disk drops layers silently (`ready: N/M`).
-- **An ANE build under 1 GiB internal free disk is REFUSED** (`BUILD_DISK_FLOOR_BYTES`, probe `/private/tmp`). **Compile cache has LRU pruning** (`MLX_SERVE_ANE_CACHE_CAP_GB` 40) — a full disk ships SILENT PARTIAL COVERAGE (`ready: N/M` under-count is the tell).
+- **A per-request staged model rebuilds the engine per request** (H3: cold 32 s / warm 8 s, 4.9 GB int8). The compile cache grows ~5 GB per (model, row count, share).
+- **An ANE build under 1 GiB internal free disk is REFUSED** (`BUILD_DISK_FLOOR_BYTES`, probe `/private/tmp`). **The compile cache prunes by LINEAGE then by BYTES** (`bridge_cache_prune`): the builder names its group (seam + layers×hidden×ffn) and variant (share) via `msv_ane_cache_lineage`; same-group other-variant entries go first (a share sweep once stacked 7.9 GB for five values), then LRU past a cap = min(`MLX_SERVE_ANE_CACHE_CAP_GB` 40, volume free + cache − `CACHE_DISK_RESERVE` 8 GB). A fixed cap above free space was no cap: a full disk ships SILENT PARTIAL COVERAGE (`ready: N/M` under-count is the tell).
+- **The media gate bills the BUILD PEAK too** (`mediaGateRefusal`: total-RAM bill, then int8 copy + `buildPeakBytes` = 4 × hidden × ffn × f32 against what is available now under a 4 GB `SWAP_FLOOR_BYTES`). The total-RAM gate alone admitted 6.8 GB on a 32 GB M1 Pro beside a 14.7 GB pack and swapped ~380 MB inside the ranked request with nothing logged.
 - **A compile session's budget is the INTERNAL free disk at boot (~260 MB/program); in-session retries are futile** — a cold build CONVERGES across boots (converge-then-measure).
 - **A killed ANE server leaks staging (8–20 GB/boot); the framework OWNS `$TMPDIR/<identifier>`**: `msv-ane.pid` markers, first create reaps dead owners; deleting a LIVE program's staging is unsafe (only weights blob + MIL text deletable post-load). Guard: `tests/test_ane_prefill.sh`.
 - **fp16 planes are 1-ulp different from f32; byte-identity is not the ANE bar** — per-program cos/rms parity + perceived-content greedy equivalence.
@@ -504,3 +505,42 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **A pinned second ANE is DEFAULT on M3 Ultra (+7.1%), opt-in elsewhere; a SILENTLY ignored affinity hint is undetectable in-process** (`MLX_SERVE_ANE_DUAL`): `kANEFAneInstanceHint` AND `kANEFProcedureVariantHint` together at compile+load+eval; instance 0 keeps `@{}`; verify with `macpow --dump | grep ANE0_`. Per-unit planes; input packed once then memcpy'd.
 - **The ANE program is a procedure BANK (runtime caps ~121 handles)**: symbol indices READ from `procedureInfoForProcedureIndex:` on the `_ANEModel` behind `-model` (NOT `inputSymbolIndicesForProcedureIndex:`, which answers 0 and fails every procedure >0 as a swallowed slowdown; `eval_failures` is the tell). Cap `MLX_SERVE_ANE_BANK_MAX_BYTES` 2 GiB, halves down a ladder; never a coverage decision.
 - **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.
+
+### Media offload share (2026-09-10)
+
+The LM prefill share is a per-silicon table because the seam races a live decode; a denoise step is a batch job, and its optimum is per **(chip, workload)**. Balance point `s* = A / (A + G)`: A = the ANE's rate on our int8/fp16 MLP program (11.8 TFLOPS, the same 16-core engine on every M1–M4), G = the GPU's EFFECTIVE rate at this model's MLP shape, which `ane.probeGpuTflops` times with one quantized matmul before any program is built. `solveShare` clamps to [0.25, 0.85]; `channelSliceWidthUnits` floors to `CHANNEL_ALIGN`. The plateau near the peak is ~6% wide (M4 base), so landing near is enough. Unknown silicon (M5+, unreadable brand) keeps 0.45. `--ane-split` / `MLX_SERVE_ANE_SPLIT` always wins.
+
+The four measured optima the solve reproduces (`test "solveShare"`):
+
+| box / model | optimum | implied G |
+|---|---|---|
+| M4 base / ACE-Step | 0.85 | 0.18·A |
+| M1 Pro / ACE-Step | 0.75 | 0.33·A |
+| M4 Max / ACE-Step | 0.60 | 0.67·A |
+| M4 Max / H3 | 0.45 | 1.22·A |
+
+H3's higher G is the model working, not noise: bigger matmuls get better GPU utilisation, so the same chip wants a lower share for video than for audio.
+
+ACE-Step, diffusion stage, warm reps (rep 1 excluded — the build lands inside it):
+
+| share | M4 Max | M4 base 16 GB | M1 Pro 32 GB |
+|---|---|---|---|
+| 0.45 | 1.236x | 1.23x | 1.242x |
+| 0.60 | **1.328x** | 1.34x | 1.335x |
+| 0.75 | 1.293x (rolls over) | 1.49x | 1.491x |
+| 0.85 | — | **1.58x** (ABBA-confirmed) | — |
+| 0.90 | — | 1.52x | — |
+
+Krea 1024²/8-step, wall, warm:
+
+| share | M4 Max | M1 Pro 32 GB |
+|---|---|---|
+| 0.45 | **1.30x** (3.6 GB int8) | 1.385x |
+| 0.60 | 1.23x (4.8 GB) | 1.571x |
+| 0.75 | 1.08x (6.0 GB) | **1.77x**, still climbing |
+
+H3 864x480/22f, per denoise step, M4 Max: 0.25 1.09x | 0.35 1.14x | **0.45 1.22x** | 0.60 1.12x (6.6 GB) | 0.75 1.05x (8.3 GB). Bracketed.
+
+Setting the share wrong costs speed AND memory (Krea on the Max: 0.75 is 1.08x for 6 GB against 1.30x for 3.6 GB at 0.45). Memory per share on ACE-Step: 0.45 1.0 GB int8, 0.60 1.35 GB, 0.75 1.7 GB — the GPU's `down`/`fc2` complement slices sit beside it.
+
+Fidelity (vs the GPU arm, every arm bit-exact across requests): image cos ≥ 0.9991 at every share, same fox, a ≤0.6% background tone shift at 0.75; audio +1.9%/+2.8% robust energy (0.45/0.75, 3 seeds), log-STFT cos ≥ 0.994. Raw RMS and crest factor are NOT valid measures for ACE-Step — peak-normalization trap, `docs/gotchas/models-media.md`.

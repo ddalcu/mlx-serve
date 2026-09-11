@@ -29,6 +29,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const mlx = @import("mlx.zig");
+const status = @import("status.zig");
 
 // ── C ABI (lib/ane/ane_mlp.h) ──
 
@@ -37,6 +38,7 @@ pub const MsvAneBank = opaque {};
 pub const MsvAnePlane = opaque {};
 extern fn msv_ane_available() c_int;
 extern fn msv_ane_internal_free_disk() u64;
+extern fn msv_ane_cache_lineage(group: [*:0]const u8, variant: [*:0]const u8) void;
 extern fn msv_ane_plane_create(bytes: usize) ?*MsvAnePlane;
 extern fn msv_ane_plane_free(p: ?*MsvAnePlane) void;
 extern fn msv_ane_plane_base(p: ?*MsvAnePlane) ?[*]f16;
@@ -201,11 +203,170 @@ pub fn dualDefault(chip: []const u8) bool {
 /// chunk token rows). MLX_SERVE_ANE_SPLIT overrides; the default is per
 /// (mode, silicon) — see `defaultShare`.
 pub fn splitShare() f32 {
-    const def = defaultShare(splitMode(), chipBrand());
-    const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return def;
-    const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return def;
-    if (!(v > 0) or v > 1) return def;
+    return explicitShareEnv() orelse defaultShare(splitMode(), chipBrand());
+}
+
+// ── Media offload (image / video / audio DiTs) ──
+
+/// The three media seams' switches and the explicit share, set ONCE in
+/// `main()` from `--ane-image/--ane-video/--ane-audio` + `--ane-split` (or
+/// MLX_SERVE_ANE_SPLIT). The seams sit under gen.zig with no server config
+/// in reach, so this is process-global like `applyMlxCacheLimit`.
+pub const MediaOffload = struct {
+    image: bool = false,
+    video: bool = false,
+    audio: bool = false,
+    share: ?f32 = null,
+};
+pub var media_offload: MediaOffload = .{};
+
+/// MLX_SERVE_ANE_SPLIT parsed; null when unset or outside (0, 1].
+pub fn explicitShareEnv() ?f32 {
+    const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return null;
+    const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return null;
+    if (!(v > 0) or v > 1) return null;
     return v;
+}
+
+/// The share a media seam falls back to when nothing can be solved.
+pub const DEFAULT_MEDIA_SHARE: f32 = 0.45;
+
+/// One 16-core ANE's measured rate on our int8/fp16 MLP program (the
+/// Stage-A harness in the file header). M1 through M4 all ship that engine.
+pub const ANE_TFLOPS_M1_M4: f64 = 11.8;
+
+/// Total ANE rate for `units` engines, or null on silicon nobody measured
+/// (M5+ NAX-class GPUs, an unreadable brand): the caller keeps the default
+/// rather than guessing. Token-exact family match, never a substring.
+pub fn aneTflopsFor(chip: []const u8, units: u32) ?f64 {
+    var it = std.mem.splitScalar(u8, chip, ' ');
+    while (it.next()) |tok| {
+        for ([_][]const u8{ "M1", "M2", "M3", "M4" }) |fam| {
+            if (std.mem.eql(u8, tok, fam)) return ANE_TFLOPS_M1_M4 * @as(f64, @floatFromInt(units));
+        }
+    }
+    return null;
+}
+
+/// Balance point of a split where both units work the same rows:
+/// s* = A / (A + G), A the ANE's rate, G the GPU's EFFECTIVE rate at this
+/// model's MLP shape. Clamped to the measured sweep range and rounded to its
+/// 0.05 grid: the plateau near the peak is ~6% wide, and a finer answer lets
+/// probe jitter pick a new slice width (a cold compile) on every boot. A
+/// degenerate probe answers the default.
+pub fn solveShare(a_tflops: f64, g_tflops: f64) f32 {
+    if (!(a_tflops > 0) or !(g_tflops > 0)) return DEFAULT_MEDIA_SHARE;
+    const s = std.math.clamp(a_tflops / (a_tflops + g_tflops), 0.25, 0.85);
+    return @floatCast(@round(s * 20) / 20);
+}
+
+/// One affine-quantized weight [out_dim, in_dim] the GPU probe times.
+pub const QuantWeight = struct {
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+};
+
+/// The GPU's effective rate at this model's MLP shape: the best of three
+/// timed quantized matmuls `[rows, in] x [in, out]^T` on the real block-0
+/// weight after one warm-up. No ANE compile is involved, so the solve
+/// happens before the programs are built.
+pub fn probeGpuTflops(io: std.Io, s: mlx.mlx_stream, rows: u32, qw: QuantWeight) !f64 {
+    const shape = [_]c_int{ @intCast(rows), @intCast(qw.in_dim) };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &shape, 2, mlx.mlx_array_dtype(qw.scales), s));
+    try mlx.check(mlx.mlx_array_eval(x));
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (0..4) |i| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        var o = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_quantized_matmul(&o, x, qw.w, qw.scales, qw.biases, true, mlx.mlx_optional_int.some(@intCast(qw.group_size)), mlx.mlx_optional_int.some(@intCast(qw.bits)), "affine", s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        const ns: u64 = @intCast(t0.untilNow(io, .awake).nanoseconds);
+        if (i > 0) best_ns = @min(best_ns, ns);
+    }
+    if (best_ns == 0) return error.AneProbeClock;
+    const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(qw.in_dim)) * @as(f64, @floatFromInt(qw.out_dim));
+    return flops / @as(f64, @floatFromInt(best_ns)) * 1e-3;
+}
+
+/// An explicit share wins; otherwise the solve over a GPU probe and the
+/// silicon's ANE row; unknown silicon or a failed probe keeps the default.
+/// Every outcome is one log line naming why.
+pub fn resolveMediaShare(io: std.Io, s: mlx.mlx_stream, what: []const u8, rows: u32, qw: QuantWeight, units: u32) f32 {
+    if (media_offload.share) |v| {
+        log.info("[ane] {s} offload share {d:.2} (explicit)\n", .{ what, v });
+        return v;
+    }
+    const a = aneTflopsFor(chipBrand(), units) orelse {
+        log.info("[ane] {s} offload share {d:.2} (default: no ANE rate row for '{s}')\n", .{ what, DEFAULT_MEDIA_SHARE, chipBrand() });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const g = probeGpuTflops(io, s, rows, qw) catch |err| {
+        log.warn("[ane] {s} offload share {d:.2} (default: GPU probe failed {s})\n", .{ what, DEFAULT_MEDIA_SHARE, @errorName(err) });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const share = solveShare(a, g);
+    log.info("[ane] {s} offload share solved {d:.2}: gpu {d:.1} TFLOPS at [{d} x {d}] x [{d} x {d}], ane {d:.1} TFLOPS ({d} unit(s))\n", .{ what, share, g, rows, qw.in_dim, qw.in_dim, qw.out_dim, a, units });
+    return share;
+}
+
+/// The host-side peak of one layer's build: gate/up/down (or fused fc1 +
+/// fc2) dequantized to f32 and alive together, plus the MLX-side f32
+/// dequant transient of the weight in flight.
+pub fn buildPeakBytes(hidden: u64, ffn: u64) u64 {
+    return 4 * hidden * ffn * 4;
+}
+
+pub const MediaPlan = struct { share: f32, units: u32, k: u32 };
+
+/// Everything a media seam decides before its build: units, share, the
+/// per-unit slice, the memory gate and the disk floor. Every decline is one
+/// named `[ane] <what> offload …` line; null = GPU only.
+pub fn planMediaOffload(io: std.Io, s: mlx.mlx_stream, what: []const u8, layers: usize, hidden: u32, ffn: u32, rows: u32, probe: QuantWeight) ?MediaPlan {
+    const gib = 1024 * 1024 * 1024;
+    const units = unitCount(.channel, chipBrand(), dualEnabled());
+    const share = resolveMediaShare(io, s, what, rows, probe, units);
+    const k = channelSliceWidthUnits(ffn, share, units);
+    if (k == 0) {
+        log.warn("[ane] {s} offload: share {d:.2} of ffn {d} over {d} unit(s) leaves no usable slice — GPU only\n", .{ what, share, ffn, units });
+        return null;
+    }
+    const bill = engineBillBytes(layers, 0, hidden, k, 0, 0, rows, units);
+    const peak = buildPeakBytes(hidden, ffn);
+    var resident: usize = 0;
+    _ = mlx.mlx_get_active_memory(&resident);
+    const avail_mem = status.getAvailableMemBytes();
+    if (mediaGateRefusal(totalMemBytes(), avail_mem, resident, bill, peak)) |why| {
+        switch (why) {
+            .total_ram => log.warn("[ane] {s} offload bills ~{d:.1} GB on top of {d:.1} GB resident, over {d} GB total RAM — GPU only\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(resident)) / gib, totalMemBytes() / gib }),
+            .swap_floor => log.warn("[ane] {s} offload: ~{d:.1} GB int8 + ~{d:.1} GB build transient would leave {d:.1} GB available under the {d} GB swap floor — GPU only\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(peak)) / gib, @as(f64, @floatFromInt(avail_mem)) / gib, SWAP_FLOOR_BYTES / gib }),
+        }
+        return null;
+    }
+    const free_disk = internalFreeDiskBytes();
+    if (free_disk > 0 and free_disk < BUILD_DISK_FLOOR_BYTES) {
+        log.warn("[ane] {s} offload: under the {d} GB internal-disk build floor, where compiles fail bare — GPU only\n", .{ what, BUILD_DISK_FLOOR_BYTES / gib });
+        return null;
+    }
+    setCacheLineage(what, layers, hidden, ffn, share);
+    return .{ .share = share, .units = units, .k = k };
+}
+
+/// Tag the entries the coming build will store so a share sweep prunes its
+/// predecessors instead of stacking one program set per value.
+pub fn setCacheLineage(what: []const u8, layers: usize, hidden: u32, ffn: u32, share: f32) void {
+    var gb: [96]u8 = undefined;
+    var vb: [16]u8 = undefined;
+    const group = std.fmt.bufPrintSentinel(&gb, "{s}:{d}x{d}x{d}", .{ what, layers, hidden, ffn }, 0) catch return;
+    const variant = std.fmt.bufPrintSentinel(&vb, "share={d:.2}", .{share}, 0) catch return;
+    msv_ane_cache_lineage(group.ptr, variant.ptr);
 }
 
 /// ANE prefill is for M4-and-below: on NAX-class GPUs (M5+) the GPU prefill
@@ -368,6 +529,24 @@ pub const MIN_CONTEXT_TOKENS: u32 = 32768;
 pub fn gateAllows(total_mem: u64, resident: u64, bill: u64, headroom: u64) bool {
     if (total_mem == 0) return true;
     return resident +| bill +| headroom <= total_mem;
+}
+
+pub const GateRefusal = enum { total_ram, swap_floor };
+
+/// What the offload must leave the SYSTEM after its build: under this macOS
+/// is already compressing and the next allocation swaps. The total-RAM gate
+/// alone admitted a 6.8 GB copy on a 32 GB M1 Pro beside a 14.7 GB pack and
+/// the ranked request churned ~380 MB of swap with nothing logged.
+pub const SWAP_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The media seams' gate: the total-RAM bill first, then the resident copy
+/// plus the build's f32 transient against what is available now. An unknown
+/// `avail_mem` (probe failure) is no information.
+pub fn mediaGateRefusal(total_mem: u64, avail_mem: u64, resident: u64, bill: u64, build_peak: u64) ?GateRefusal {
+    if (!gateAllows(total_mem, resident, bill, GATE_BASELINE_BYTES)) return .total_ram;
+    if (avail_mem == 0) return null;
+    if (avail_mem < bill +| build_peak +| SWAP_FLOOR_BYTES) return .swap_floor;
+    return null;
 }
 
 /// The hard floor for starting an ANE build at all: below this much free
@@ -1390,4 +1569,51 @@ test "quantizeRowsInt8: round-trip, per-row scales, zero row" {
             try testing.expect(@abs(deq - w[i * 4 + j]) <= rq.s[i] * 0.5 + 1e-9);
         }
     }
+}
+
+test "solveShare: lands on the four measured optima, clamps, degenerate probe = default" {
+    const a = ANE_TFLOPS_M1_M4;
+    // (implied GPU rate, measured optimum) from the 2026-09-10 sweeps.
+    const rows = [_]struct { g: f64, want: f32 }{
+        .{ .g = 0.18 * a, .want = 0.85 }, // M4 base / ACE-Step
+        .{ .g = 0.33 * a, .want = 0.75 }, // M1 Pro / ACE-Step
+        .{ .g = 0.67 * a, .want = 0.60 }, // M4 Max / ACE-Step
+        .{ .g = 1.22 * a, .want = 0.45 }, // M4 Max / H3
+    };
+    for (rows) |r| {
+        try testing.expectEqual(r.want, solveShare(a, r.g));
+        // A few % of probe jitter must not move it: a new share is a cold compile.
+        try testing.expectEqual(r.want, solveShare(a, r.g * 0.97));
+        try testing.expectEqual(r.want, solveShare(a, r.g * 1.03));
+    }
+    try testing.expectEqual(@as(f32, 0.85), solveShare(a, 0.01 * a));
+    try testing.expectEqual(@as(f32, 0.25), solveShare(a, 10 * a));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(a, 0));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(0, a));
+}
+
+test "aneTflopsFor: one row for M1-M4 per unit, unknown silicon is no row" {
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M1 Pro", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M4", 1));
+    try testing.expectEqual(@as(?f64, 2 * ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M3 Ultra", 2));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M5 Max", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M45", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("", 1));
+}
+
+test "mediaGateRefusal: total-RAM bill, then the build peak against a swap floor" {
+    const gib = 1024 * 1024 * 1024;
+    // Fits total RAM and leaves the floor: admitted.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(128 * gib, 60 * gib, 40 * gib, 4 * gib, 2 * gib));
+    // The old gate: resident + bill + baseline over total.
+    try testing.expectEqual(@as(?GateRefusal, .total_ram), mediaGateRefusal(32 * gib, 20 * gib, 26 * gib, 5 * gib, 1 * gib));
+    // The M1 Pro case: passes total RAM, but the int8 copy + the build's f32
+    // transient would leave the system under the swap floor.
+    try testing.expectEqual(@as(?GateRefusal, .swap_floor), mediaGateRefusal(32 * gib, 10 * gib, 15 * gib, 7 * gib, 2 * gib));
+    // Unknown available (probe failed) is no information.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(32 * gib, 0, 15 * gib, 7 * gib, 2 * gib));
+}
+
+test "buildPeakBytes: three host f32 copies plus the MLX dequant transient" {
+    try testing.expectEqual(@as(u64, 4 * 4 * 8 * 4), buildPeakBytes(4, 8));
 }

@@ -384,7 +384,7 @@ fn lin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []cons
     return o;
 }
 
-// ── ANE MLP offload (MLX_SERVE_ANE_AUDIO=1, opt-in, LOSSY) ──
+// ── ANE MLP offload (`--ane-audio`, opt-in, LOSSY) ──
 //
 // Same channel seam as the image/video DiTs: the ANE holds output channels
 // [0..k) of gate/up plus the matching down K-slabs (a PARTIAL down sum), the
@@ -422,11 +422,6 @@ const AceRest = struct {
         self.down.deinit();
     }
 };
-
-fn aneAudioEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_AUDIO") orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-}
 
 /// The 32-row fp16 plane pitch; a shorter tail runs on the GPU.
 pub fn aneTileRows(seq_len: u32) u32 {
@@ -1895,7 +1890,7 @@ pub const Engine = struct {
     /// 8 GB iPhone 16 Pro (2026-07-06).
     low_mem: bool,
 
-    /// ANE MLP offload (`MLX_SERVE_ANE_AUDIO=1`), built once the run's token
+    /// ANE MLP offload (`--ane-audio`), built once the run's token
     /// count is known; torn down with the engine.
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AceRest = &.{},
@@ -2107,7 +2102,7 @@ pub const Engine = struct {
     /// Build the per-DiT-block ANE programs for a run of `seq_len` tokens.
     /// Never fails the request: every refusal is a NAMED `[ane]` line.
     pub fn buildAne(self: *Engine, seq_len: u32) void {
-        if (self.ane_eng != null or !aneAudioEnabled()) return;
+        if (self.ane_eng != null or !ane.media_offload.audio) return;
         if (!ane.available()) {
             log.warn("[ane] audio offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
@@ -2119,29 +2114,14 @@ pub const Engine = struct {
         }
         const hidden = self.cfg.hidden;
         const ffn = self.cfg.intermediate;
-        const share = ane.splitShare();
-        const units = ane.unitCount(.channel, ane.chipBrand(), ane.dualEnabled());
-        const k = ane.channelSliceWidthUnits(ffn, share, units);
-        if (k == 0) {
-            log.warn("[ane] audio offload: share {d:.2} of ffn {d} leaves no usable slice — GPU only\n", .{ share, ffn });
+        var g0 = aneQFromKey(&self.w, self.allocator, "decoder.layers.0.mlp.gate_proj", hidden) catch |err| {
+            log.warn("[ane] audio offload declined: layer 0 gate unreadable ({s}) — GPU only\n", .{@errorName(err)});
             return;
-        }
-        const bill = ane.engineBillBytes(self.cfg.layers, 0, hidden, k, 0, 0, rows, units);
-        var resident: usize = 0;
-        _ = mlx.mlx_get_active_memory(&resident);
-        const gib = 1024 * 1024 * 1024;
-        if (!ane.gateAllows(ane.totalMemBytes(), resident, bill, ane.GATE_BASELINE_BYTES)) {
-            log.warn("[ane] audio offload bills ~{d:.1} GB on top of {d:.1} GB resident — GPU only\n", .{
-                @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(resident)) / gib,
-            });
-            return;
-        }
-        const free_disk = ane.internalFreeDiskBytes();
-        if (free_disk > 0 and free_disk < ane.BUILD_DISK_FLOOR_BYTES) {
-            log.warn("[ane] audio offload: under the {d} GB internal-disk build floor — GPU only\n", .{ane.BUILD_DISK_FLOOR_BYTES / gib});
-            return;
-        }
-        self.aneBuildInner(rows, k, units, share) catch |err| {
+        };
+        defer g0.deinit();
+        const probe: ane.QuantWeight = .{ .w = g0.w, .scales = g0.scales, .biases = g0.biases, .bits = g0.bits, .group_size = g0.gs, .in_dim = hidden, .out_dim = ffn };
+        const plan = ane.planMediaOffload(self.io, self.s, "audio", self.cfg.layers, hidden, ffn, rows, probe) orelse return;
+        self.aneBuildInner(rows, plan.k, plan.units, plan.share) catch |err| {
             log.warn("[ane] audio offload build failed ({s}) — GPU only\n", .{@errorName(err)});
             self.aneDeinit();
         };

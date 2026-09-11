@@ -147,6 +147,14 @@ struct ServerOptions: Codable, Equatable {
     /// per-machine (M5-family GPUs carry NAX cores that raise the GPU's own
     /// prefill baseline, shrinking the ANE's edge — see AnePrefillAdvice).
     var anePrefill: Bool = false
+    /// `--ane-image` / `--ane-video` / `--ane-audio`: a share of each media
+    /// DiT block's MLP runs on the Neural Engine beside the GPU (Krea,
+    /// MiniMax-H3, ACE-Step). Off to mirror the server default; the server
+    /// solves the share per Mac and declines by name where the int8 copy
+    /// does not fit.
+    var aneImage: Bool = false
+    var aneVideo: Bool = false
+    var aneAudio: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -507,6 +515,9 @@ struct ServerOptions: Codable, Equatable {
         mtpOnMoE == other.mtpOnMoE &&
         enableDSpark == other.enableDSpark &&
         anePrefill == other.anePrefill &&
+        aneImage == other.aneImage &&
+        aneVideo == other.aneVideo &&
+        aneAudio == other.aneAudio &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -664,6 +675,10 @@ struct ServerOptions: Codable, Equatable {
         if anePrefill {
             args += ["--ane-prefill"]
         }
+        // Media offloads: server default OFF, so only ON emits.
+        if aneImage { args += ["--ane-image"] }
+        if aneVideo { args += ["--ane-video"] }
+        if aneAudio { args += ["--ane-audio"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
         // explicit choice emits its flag, and the positive form is what opts
@@ -850,6 +865,9 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .mtpOnMoE) { mtpOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -952,6 +970,9 @@ struct ServerOptionField {
     let title: String
     let explainer: String
     let needsRestart: Bool
+    /// What turning the setting on costs in memory and disk, shown under the
+    /// explainer and emphasized while the setting is on.
+    var cost: String? = nil
 }
 
 extension ServerOptions {
@@ -1032,8 +1053,24 @@ extension ServerOptions {
             needsRestart: true),
         "anePrefill": .init(
             title: "Neural Engine prefill boost",
-            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The Neural Engine keeps its own copy of part of the model's math — roughly 11 GB extra for a 27B, around 1 GB for a small model — and the server checks that exact fit at load, declining by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
-            needsRestart: true),
+            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The server checks the exact fit at load and declines by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
+            needsRestart: true,
+            cost: "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy."),
+        "aneImage": .init(
+            title: "Neural Engine image boost",
+            explainer: "Runs part of image generation on the Neural Engine alongside the GPU. Measured 1.30x on an M4 Max and 1.77x on an M1 Pro with Krea — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. The split is solved per Mac and model at the first request, which adds a one-time compile of about a minute. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB for each different image size you generate; the same size reuses it."),
+        "aneVideo": .init(
+            title: "Neural Engine video boost",
+            explainer: "Runs part of video generation on the Neural Engine alongside the GPU. Measured 1.22x per denoise step on an M4 Max with MiniMax-H3. The split is solved per Mac and model; H3 rebuilds it per request (about 30 s cold, 8 s warm), so it pays on long renders. Blocks that carry a LoRA (the Turbo recipe) stay on the GPU. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB for each different resolution and frame count you generate; the same combination reuses it."),
+        "aneAudio": .init(
+            title: "Neural Engine music boost",
+            explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB for each different song length you generate; the same length reuses it."),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",

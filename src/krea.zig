@@ -912,7 +912,7 @@ fn swigluDim(features: u32, multiplier: u32) u32 {
     return ((base + 127) / 128) * 128;
 }
 
-// ── ANE MLP offload (MLX_SERVE_ANE_IMAGE=1, opt-in, LOSSY) ──
+// ── ANE MLP offload (`--ane-image`, opt-in, LOSSY) ──
 //
 // A denoising step is a batch job at the COMPUTE roofline, which is the case
 // the LM prefill seam was never able to be: no live decode waits on it, the
@@ -930,11 +930,6 @@ pub fn aneBlockEligible(rows: u32, quantized: bool, lora_count: u8) bool {
     if (!quantized or lora_count > 0) return false;
     if (rows < ane.ANE_MIN_ROWS or rows % 32 != 0) return false;
     return true;
-}
-
-fn aneImageEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_IMAGE") orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
 }
 
 /// Dequantize one MixedLinear to host f32 [out_dim, in_dim] (`ane` owns the op).
@@ -1289,7 +1284,7 @@ pub const Dit = struct {
     fn aneEnsure(self: *Dit, rows: u32, s: S) void {
         if (self.ane_tried) return;
         self.ane_tried = true;
-        if (!aneImageEnabled()) return;
+        if (!ane.media_offload.image) return;
         if (!ane.available()) {
             log.warn("[ane] image offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
@@ -1301,30 +1296,9 @@ pub const Dit = struct {
         }
         const feat = self.cfg.features;
         const mlpdim = swigluDim(feat, self.cfg.multiplier);
-        const share = ane.splitShare();
-        const units = ane.unitCount(.channel, ane.chipBrand(), ane.dualEnabled());
-        const k = ane.channelSliceWidthUnits(mlpdim, share, units);
-        if (k == 0) {
-            log.warn("[ane] image offload: share {d:.2} of mlp {d} over {d} unit(s) leaves no usable slice — GPU only\n", .{ share, mlpdim, units });
-            return;
-        }
-        const bill = ane.engineBillBytes(self.blocks.len, 0, feat, k, 0, 0, rows, units);
-        var resident: usize = 0;
-        _ = mlx.mlx_get_active_memory(&resident);
-        if (!ane.gateAllows(ane.totalMemBytes(), resident, bill, ane.GATE_BASELINE_BYTES)) {
-            const gib = 1024 * 1024 * 1024;
-            log.warn("[ane] image offload bills ~{d:.1} GB on top of {d:.1} GB resident — GPU only\n", .{
-                @as(f64, @floatFromInt(bill)) / gib,
-                @as(f64, @floatFromInt(resident)) / gib,
-            });
-            return;
-        }
-        const free_disk = ane.internalFreeDiskBytes();
-        if (free_disk > 0 and free_disk < ane.BUILD_DISK_FLOOR_BYTES) {
-            log.warn("[ane] image offload: under the {d} GB internal-disk build floor, where compiles fail bare — GPU only\n", .{ane.BUILD_DISK_FLOOR_BYTES / (1024 * 1024 * 1024)});
-            return;
-        }
-        self.aneBuild(rows, k, units, feat, mlpdim, share, s) catch |err| {
+        const probe: ane.QuantWeight = .{ .w = b0.gate.w, .scales = b0.gate.scales, .biases = b0.gate.biases, .bits = b0.gate.bits, .group_size = b0.gate.group_size, .in_dim = feat, .out_dim = mlpdim };
+        const plan = ane.planMediaOffload(self.io, s, "image", self.blocks.len, feat, mlpdim, rows, probe) orelse return;
+        self.aneBuild(rows, plan.k, plan.units, feat, mlpdim, plan.share, s) catch |err| {
             log.warn("[ane] image offload build failed ({s}) — GPU only\n", .{@errorName(err)});
             self.aneDeinit();
         };

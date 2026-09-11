@@ -23158,6 +23158,7 @@ pub const Transformer = struct {
                 });
                 return;
             }
+            ane_offload.setCacheLineage("prefill", cfg.num_hidden_layers, hidden, ffn, share);
             const cold_budget: u64 = @as(u64, cfg.num_hidden_layers) * 3 * hidden * eng_ffn * units;
             if (free_disk > 0 and free_disk < cold_budget) {
                 log.info("[ane] internal free disk {d:.1} GB is under a fully-cold build's ~{d:.1} GB compiler-scratch budget — a cold build will converge across boots (warm cache entries are unaffected)\n", .{

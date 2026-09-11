@@ -1068,6 +1068,25 @@ A correct-looking image is not evidence of range headroom.
 **Guard**: `ane.OUT_PLANE_SCALE` carries the measured peaks in its doc
 comment; the bar is perceived content plus a finite-output check, never bytes.
 
+## ACE-Step peak-normalizes, so raw RMS cannot measure the ANE arm (2026-09-10)
+
+The first ANE-vs-GPU audio comparison reported a "loudness lift" of +0.7 to
++1.1 dB RMS that changed SIGN across seeds. It was not energy the offload
+added. `generate()` ends with `peakNormalize(samples, -1 dBFS)`: one global
+max sample sets the gain for the whole 180 s track. In the GPU track that
+peak is an isolated spike (the runner-up frame sits at 0.853 of it); the ANE
+arm rounds that one sample differently, the spike shrinks, and the whole
+track is scaled up to put a different sample at -1 dBFS. Raw RMS and crest
+factor then measure the spike, not the audio.
+
+**Valid measures**: a ROBUST energy (per-frame RMS, trimmed of the top
+percentiles — +1.9%/+2.8% at 0.45/0.75 over 3 seeds, consistent in sign) and
+log-STFT cosine (≥ 0.994). Anything normalized by a single sample is out.
+
+**The class**: a metric taken AFTER a global normalization step measures the
+normalizer's anchor, not the signal. Check for one before trusting any
+whole-track scalar on a generated audio arm.
+
 ## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
 
 The third cause above, closed. `vae_diffusion_decoder.safetensors` is four

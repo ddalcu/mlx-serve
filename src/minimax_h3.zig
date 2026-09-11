@@ -1130,7 +1130,7 @@ const MlpW = struct {
     }
 };
 
-// ── ANE MLP offload (MLX_SERVE_ANE_VIDEO=1, opt-in, LOSSY) ──
+// ── ANE MLP offload (`--ane-video`, opt-in, LOSSY) ──
 //
 // Same channel seam as the LM prefill and the image DiT: the ANE holds output
 // channels [0..k) of gate/up plus the matching fc2 K-slabs (a PARTIAL fc2
@@ -1149,11 +1149,6 @@ const AneRestMlp = struct {
         self.fc2.deinit();
     }
 };
-
-fn aneVideoEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_VIDEO") orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-}
 
 /// A LoRA-attached block DECLINES: the adapter is summed at forward from the
 /// FULL activation, and the seam never materializes it (fc2's delta needs the
@@ -2156,7 +2151,7 @@ pub const Model = struct {
     audio_out_w: mlx.mlx_array,
     audio_out_b: mlx.mlx_array,
 
-    /// ANE MLP offload (`MLX_SERVE_ANE_VIDEO=1`), built once the run's row
+    /// ANE MLP offload (`--ane-video`), built once the run's row
     /// count is known and torn down with the model.
     ane_eng: ?*ane.AnePrefill = null,
     ane_rest: []AneRestMlp = &.{},
@@ -2237,7 +2232,7 @@ pub const Model = struct {
     /// fails the request: every refusal is a NAMED `[ane]` line and the DiT
     /// runs GPU-only. Called after LoRA attach, so a Turbo run declines.
     pub fn buildAne(self: *Model, io: std.Io, seq_len: u32, s: S) void {
-        if (self.ane_eng != null or !aneVideoEnabled()) return;
+        if (self.ane_eng != null or !ane.media_offload.video) return;
         if (!ane.available()) {
             log.warn("[ane] video offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
@@ -2246,36 +2241,16 @@ pub const Model = struct {
         const lora_bound = for (self.blocks) |*b| {
             if (b.mlp.fc1_lora.active().len > 0 or b.mlp.fc2_lora.active().len > 0) break true;
         } else false;
-        if (!aneBlockEligible(rows, self.blocks[0].mlp.fc1.quantized, lora_bound)) {
-            log.warn("[ane] video offload declined: {d} rows (seq {d}), quantized={}, lora={} — GPU only\n", .{ rows, seq_len, self.blocks[0].mlp.fc1.quantized, lora_bound });
+        const fc1 = &self.blocks[0].mlp.fc1;
+        if (!aneBlockEligible(rows, fc1.quantized, lora_bound)) {
+            log.warn("[ane] video offload declined: {d} rows (seq {d}), quantized={}, lora={} — GPU only\n", .{ rows, seq_len, fc1.quantized, lora_bound });
             return;
         }
         const hidden = self.cfg.hidden_size;
         const ffn = self.cfg.ffn_hidden_size;
-        const share = ane.splitShare();
-        const units = ane.unitCount(.channel, ane.chipBrand(), ane.dualEnabled());
-        const k = ane.channelSliceWidthUnits(ffn, share, units);
-        if (k == 0) {
-            log.warn("[ane] video offload: share {d:.2} of ffn {d} over {d} unit(s) leaves no usable slice — GPU only\n", .{ share, ffn, units });
-            return;
-        }
-        const bill = ane.engineBillBytes(self.blocks.len, 0, hidden, k, 0, 0, rows, units);
-        var resident: usize = 0;
-        _ = mlx.mlx_get_active_memory(&resident);
-        const gib = 1024 * 1024 * 1024;
-        if (!ane.gateAllows(ane.totalMemBytes(), resident, bill, ane.GATE_BASELINE_BYTES)) {
-            log.warn("[ane] video offload bills ~{d:.1} GB on top of {d:.1} GB resident — GPU only\n", .{
-                @as(f64, @floatFromInt(bill)) / gib,
-                @as(f64, @floatFromInt(resident)) / gib,
-            });
-            return;
-        }
-        const free_disk = ane.internalFreeDiskBytes();
-        if (free_disk > 0 and free_disk < ane.BUILD_DISK_FLOOR_BYTES) {
-            log.warn("[ane] video offload: under the {d} GB internal-disk build floor — GPU only\n", .{ane.BUILD_DISK_FLOOR_BYTES / gib});
-            return;
-        }
-        self.aneBuildInner(io, rows, k, units, share, s) catch |err| {
+        const probe: ane.QuantWeight = .{ .w = fc1.w, .scales = fc1.scales, .biases = fc1.biases, .bits = fc1.bits, .group_size = fc1.group_size, .in_dim = hidden, .out_dim = 2 * ffn };
+        const plan = ane.planMediaOffload(io, s, "video", self.blocks.len, hidden, ffn, rows, probe) orelse return;
+        self.aneBuildInner(io, rows, plan.k, plan.units, plan.share, s) catch |err| {
             log.warn("[ane] video offload build failed ({s}) — GPU only\n", .{@errorName(err)});
             self.aneDeinit();
         };

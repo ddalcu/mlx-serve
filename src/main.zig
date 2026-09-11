@@ -26,6 +26,7 @@ const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
+const ane_mod = @import("ane.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -57,6 +58,9 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
+// offload, published as ONE value (`ane.media_offload`) after the parse.
+var ane_media: ane_mod.MediaOffload = .{};
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
 
@@ -169,6 +173,14 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --ane-image         Run a share of each image DiT block's MLP on the
+        \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
+        \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
+        \\                        share is solved per Mac and model from a GPU
+        \\                        probe; the server declines by name where the
+        \\                        copy does not fit.
+        \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
+        \\                        of solving it (MLX_SERVE_ANE_SPLIT is the same).
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is
@@ -693,6 +705,20 @@ pub fn main(init: std.process.Init) !void {
             // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
             // the row share.
             ane_prefill = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-image")) {
+            ane_media.image = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-video")) {
+            ane_media.video = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-audio")) {
+            ane_media.audio = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-split") and i + 1 < args.len) {
+            i += 1;
+            const v = std.fmt.parseFloat(f32, args[i]) catch 0;
+            if (!(v > 0) or v > 1) {
+                log.err("--ane-split must be in (0, 1], got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            ane_media.share = v;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -910,6 +936,11 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+
+    // One value for the three media seams (they run under gen.zig with no
+    // server config in reach); the env stays the benching override.
+    if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
+    ane_mod.media_offload = ane_media;
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models

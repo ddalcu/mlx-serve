@@ -88,13 +88,20 @@ enum SettingsReset {
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
-                f("anePrefill") { $0.anePrefill = $1.anePrefill },
                 f("decodeAttnQuantChoice") { $0.decodeAttnQuantChoice = $1.decodeAttnQuantChoice },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("enablePrefixCacheDisk") { $0.enablePrefixCacheDisk = $1.enablePrefixCacheDisk },
                 f("prefixCacheDisk") { $0.prefixCacheDisk = $1.prefixCacheDisk },
+            ]
+
+        case .neuralEngine:
+            return [
+                f("anePrefill") { $0.anePrefill = $1.anePrefill },
+                f("aneImage") { $0.aneImage = $1.aneImage },
+                f("aneVideo") { $0.aneVideo = $1.aneVideo },
+                f("aneAudio") { $0.aneAudio = $1.aneAudio },
             ]
 
         case .ggufPerformance:
