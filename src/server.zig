@@ -2182,6 +2182,22 @@ fn handleConnection(
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
         return;
     }
+    // `GET /props` is a STATUS read, and falling into `ensureLoaded` makes a
+    // poll cold-load the model. With idle eviction on that is a loop: the sweep
+    // hands the memory back and the next poll takes it straight again (the app's
+    // tray polls every 3s). Nothing resident means nothing to report — the same
+    // body the `NoDefaultModel` arm below already sends.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        const resident = if (registry.resolveEntry(requested_model_id)) |e| blk: {
+            registry.mutex.lockUncancelable(stream.io);
+            defer registry.mutex.unlock(stream.io);
+            break :blk e.state == .ready;
+        } else |_| false;
+        if (!resident) {
+            try handlePropsNoModel(allocator, stream);
+            return;
+        }
+    }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
