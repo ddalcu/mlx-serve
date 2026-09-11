@@ -395,7 +395,6 @@ pub const HotPrefixCache = struct {
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
     last_restored_disk_id: ?u64 = null,
-    skip_prefix_cache: bool = false,
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
@@ -1002,6 +1001,7 @@ pub const HotPrefixCache = struct {
             dflash_target,
             mtp_target,
             null,
+            false,
         );
     }
 
@@ -1032,6 +1032,7 @@ pub const HotPrefixCache = struct {
             dflash_target,
             mtp_target,
             slot_id,
+            false,
         );
     }
 
@@ -1050,11 +1051,11 @@ pub const HotPrefixCache = struct {
         /// Restore by move: non-null opts this request into the checkout (the caller promises
         /// `releaseCheckout` on every path that ends the slot).
         slot_id: ?usize,
+        skip: bool,
     ) !LookupResult {
         self.last_restored_used = null;
         self.last_restored_disk_id = null;
-        if (self.skip_prefix_cache) {
-            self.skip_prefix_cache = false;
+        if (skip) {
             try target_cache.truncate(0, s);
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
@@ -1138,16 +1139,6 @@ pub const HotPrefixCache = struct {
                 const ms = sw.read() / std.time.ns_per_ms;
                 log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
                 const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
-                _ = restore_dump.dumpRestoreIfEnabled(target_cache, ssm_entries, s, .{
-                    .kind = "restore",
-                    .pos = restored,
-                    .cp = disk_cp,
-                    .bank_from = disk_cp,
-                    .source = "disk",
-                    .entry_idx = hm.idx + 1,
-                    .entry_count = d.entryCount(),
-                    .mtp_base = disk_mtp,
-                });
                 return .{
                     .matched = restored,
                     .full_match = false,
@@ -1182,16 +1173,6 @@ pub const HotPrefixCache = struct {
             const ms = sw.read() / std.time.ns_per_ms;
             log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
             const disk_mtp = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp);
-            _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, .{
-                .kind = "restore",
-                .pos = final_len,
-                .cp = final_len,
-                .bank_from = final_len,
-                .source = "disk",
-                .entry_idx = dm.idx + 1,
-                .entry_count = d.entryCount(),
-                .mtp_base = disk_mtp,
-            });
             return .{
                 .matched = final_len,
                 .full_match = full_match,
@@ -1268,9 +1249,7 @@ pub const HotPrefixCache = struct {
         // the effective matched length to that position. KV is positionally
         // trimmable; SSM is only restorable at the snapshotted positions.
         // The two MUST stay in sync, so we rewind KV further too.
-        var dump_cp: usize = 0;
-        var dump_bank: usize = 0;
-        var dump_src: []const u8 = "own";
+        var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
         var effective_matched: usize = restore_cap;
         if (target_ssm_entries) |entries| {
             if (e.ssm_checkpoints) |cps| {
@@ -1279,7 +1258,7 @@ pub const HotPrefixCache = struct {
                     effective_matched = cp.pos;
                     const bank = qsaHistorySource(cps, cp);
                     if (bank) |src| {
-                        try applyQsaHistoryAt(entries, src, cp.pos, s);
+                        try applyQsaHistoryAt(entries, src, cp.pos, s, false);
                     }
                     const ring_rows: c_int = blk: {
                         for (entries) |*ent| {
@@ -1289,15 +1268,17 @@ pub const HotPrefixCache = struct {
                         }
                         break :blk 0;
                     };
-                    dump_cp = cp.pos;
-                    dump_bank = if (bank) |b| b.pos else cp.pos;
-                    dump_src = if (bank == null) "own" else "donor";
+                    dump.cp = cp.pos;
+                    dump.bank_from = if (bank) |b| b.pos else cp.pos;
+                    dump.source = if (bank == null) "own" else "donor";
+                    dump.entry_idx = m.idx + 1;
+                    dump.entry_count = self.entries.items.len;
                     log.debug("  [hot-cache] restore pos={d} cp={d} bank_from=cp@{d} ring_rows={d} source={s}\n", .{
                         effective_matched,
-                        dump_cp,
-                        dump_bank,
+                        dump.cp,
+                        dump.bank_from,
                         ring_rows,
-                        dump_src,
+                        dump.source,
                     });
                     if (self.qsa_history_required and !(entriesHaveQsaHistory(entries) and qsaRestoreSatisfiesForward(entries, effective_matched))) {
                         resetSsmEntries(entries);
@@ -1350,46 +1331,28 @@ pub const HotPrefixCache = struct {
         // token id, so the match can never reach into it — discarding it is correct.
         try target_cache.truncate(final_len, s);
 
-        if (full_match and effective_matched > 1) {
-            target_moe_seq_offset.* = effective_matched - 1;
-            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ effective_matched - 1, prompt_ids.len });
-            const full_mtp = restoreMtp(e, mtp_target, effective_matched - 1, s);
-            _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, .{
-                .kind = "restore",
-                .pos = effective_matched - 1,
-                .cp = dump_cp,
-                .bank_from = dump_bank,
-                .source = dump_src,
-                .entry_idx = m.idx + 1,
-                .entry_count = self.entries.items.len,
-                .mtp_base = full_mtp,
-            });
-            return .{
-                .matched = effective_matched - 1,
-                .full_match = true,
-                .dflash_base = restoreDflash(e, dflash_target, effective_matched - 1, s),
-                .mtp_base = full_mtp,
-            };
+        const full_reuse = full_match and effective_matched > 1;
+        const matched = if (full_reuse) effective_matched - 1 else effective_matched;
+        if (full_reuse) {
+            target_moe_seq_offset.* = matched;
+            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ matched, prompt_ids.len });
+        } else {
+            log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
         }
-
-        log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
         var res: LookupResult = .{
-            .matched = effective_matched,
+            .matched = matched,
             .full_match = full_match,
-            .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
-            .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
+            .dflash_base = restoreDflash(e, dflash_target, matched, s),
+            .mtp_base = restoreMtp(e, mtp_target, matched, s),
         };
-        res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
-        _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, .{
-            .kind = "restore",
-            .pos = res.matched,
-            .cp = dump_cp,
-            .bank_from = dump_bank,
-            .source = dump_src,
-            .entry_idx = m.idx + 1,
-            .entry_count = self.entries.items.len,
-            .mtp_base = res.mtp_base,
-        });
+        if (!full_reuse) {
+            res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
+        }
+        dump.pos = res.matched;
+        dump.mtp_base = res.mtp_base;
+        dump.entry_idx = m.idx + 1;
+        dump.entry_count = self.entries.items.len;
+        _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, dump);
         return res;
     }
 
@@ -1811,12 +1774,8 @@ pub const HotPrefixCache = struct {
             else
                 self.max_kv_bytes - new_bytes;
             const donor_cps = self.entries.items[donor.idx].ssm_checkpoints.?;
-            const donor_toks = self.entries.items[donor.idx].tokens;
-            var div: usize = 0;
-            const max_div = @min(donor_toks.len, eff_tokens.len);
-            while (div < max_div and donor_toks[div] == eff_tokens[div]) div += 1;
             const prompt_cap = @min(if (prompt_len == 0) eff_tokens.len else prompt_len, eff_tokens.len);
-            const inherit_limit = @min(@min(donor.shared, div), prompt_cap);
+            const inherit_limit = @min(donor.shared, prompt_cap);
             const cloned = (cloneCheckpointsUpTo(self.allocator, donor_cps, inherit_limit, budget) catch |err| {
                 log.warn("  [hot-cache] checkpoint inheritance failed: {s}\n", .{@errorName(err)});
                 break :inherit;
@@ -2655,6 +2614,11 @@ pub const HotPrefixCache = struct {
         return dropped;
     }
 
+    pub fn dropQsaGapEntry(slot_cache: ?*HotPrefixCache) bool {
+        if (slot_cache) |hc| return hc.dropLastRestored();
+        return false;
+    }
+
     fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
         var evicted = self.entries.swapRemove(lru_idx);
         const tokens_len = evicted.tokens.len;
@@ -3394,7 +3358,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
         var c2 = try KVCache.init(testing.allocator, 2);
         defer c2.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreWithMedia(&c2, &moe, null, s, &tokens, false, 0, null, null, null, null);
+        const res = try hc.lookupAndRestoreWithMedia(&c2, &moe, null, s, &tokens, false, 0, null, null, null, null, false);
         try testing.expectEqual(@as(usize, 400), res.matched);
     }
     // A different-image request caps at ITS media boundary (500 > 400 here,
@@ -3403,7 +3367,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
         var c3 = try KVCache.init(testing.allocator, 2);
         defer c3.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreWithMedia(&c3, &moe, null, s, &tokens, false, 0xFFFF, 500, null, null, null);
+        const res = try hc.lookupAndRestoreWithMedia(&c3, &moe, null, s, &tokens, false, 0xFFFF, 500, null, null, null, false);
         try testing.expectEqual(@as(usize, 400), res.matched);
     }
 
@@ -3464,7 +3428,7 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, null, null, null);
+        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, null, null, null, false);
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 400), res.matched);
         try testing.expectEqual(@as(usize, 400), cache2.step);
@@ -3775,6 +3739,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         null,
         null,
         null,
+        false,
     );
 
     try testing.expectEqual(media_start, result.matched);
@@ -3892,6 +3857,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
         null,
         null,
         null,
+        false,
     );
     try testing.expectEqual(@as(usize, 10), restored.matched);
 
@@ -3926,6 +3892,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
         null,
         null,
         null,
+        false,
     );
     try testing.expectEqual(@as(usize, 10), result.matched);
     try testing.expectEqual(@as(usize, 10), later_cache.step);
@@ -5757,6 +5724,58 @@ test "HotPrefixCache: dropLastRestored removes the restored entry so the next lo
     try testing.expectEqual(@as(usize, 0), second.matched);
 }
 
+test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibling cache" {
+    const s = mlx.gpuStream();
+    const tokens_a = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const tokens_b = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+
+    var last_loaded = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer last_loaded.deinit();
+    last_loaded.qsa_history_required = true;
+    var cache_a = try KVCache.init(testing.allocator, 3);
+    defer cache_a.deinit();
+    try testFillCache(&cache_a, s, 3, tokens_a.len);
+    var live_a = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live_a);
+    const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps_a, &live_a, s);
+    _ = try last_loaded.commitWithState(&cache_a, &tokens_a, false, 0, cps_a, null, null);
+
+    var slot_hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer slot_hc.deinit();
+    slot_hc.qsa_history_required = true;
+    var cache_b = try KVCache.init(testing.allocator, 3);
+    defer cache_b.deinit();
+    try testFillCache(&cache_b, s, 3, tokens_b.len);
+    var live_b = pcBuildQsaHybrid(s, 10, 200.0);
+    defer pcFreeQsaHybrid(&live_b);
+    const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps_b, &live_b, s);
+    _ = try slot_hc.commitWithState(&cache_b, &tokens_b, false, 0, cps_b, null, null);
+
+    var tgt_a = try KVCache.init(testing.allocator, 3);
+    defer tgt_a.deinit();
+    var ssm_a = pcEmptySsm();
+    defer pcFreeQsaHybrid(&ssm_a);
+    var moe_a: usize = 0;
+    const ra = try last_loaded.lookupAndRestore(&tgt_a, &moe_a, &ssm_a, s, &tokens_a, false, 0, null, null);
+    try testing.expect(ra.matched > 0);
+
+    var tgt_b = try KVCache.init(testing.allocator, 3);
+    defer tgt_b.deinit();
+    var ssm_b = pcEmptySsm();
+    defer pcFreeQsaHybrid(&ssm_b);
+    var moe_b: usize = 0;
+    const rb = try slot_hc.lookupAndRestore(&tgt_b, &moe_b, &ssm_b, s, &tokens_b, false, 0, null, null);
+    try testing.expect(rb.matched > 0);
+
+    try testing.expect(HotPrefixCache.dropQsaGapEntry(&slot_hc));
+    try testing.expectEqual(@as(usize, 0), slot_hc.entryCount());
+    try testing.expectEqual(@as(usize, 1), last_loaded.entryCount());
+}
+
 test "HotPrefixCache: inherited checkpoints never exceed the shared prefix" {
     const s = mlx.gpuStream();
     var prefix: [18]u32 = undefined;
@@ -5847,7 +5866,7 @@ fn pcCaptureFed(
     return transformer_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
 }
 
-test "HotPrefixCache: inherit does not clone checkpoints past token divergence" {
+test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const P: usize = 20;
@@ -6025,7 +6044,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     var from_full = pcEmptySsm();
     defer pcFreeQsaHybrid(&from_full);
     try transformer_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
-    transformer_mod.applyQsaHistoryAt(&from_full, &cps[1], B, s) catch |err| {
+    transformer_mod.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
         std.debug.print("sliced-apply residue fail K=full field=apply {s}\n", .{@errorName(err)});
         return err;
     };
@@ -6048,7 +6067,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
         var from_sliced = pcEmptySsm();
         defer pcFreeQsaHybrid(&from_sliced);
         try transformer_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
-        transformer_mod.applyQsaHistoryAt(&from_sliced, &sliced, B, s) catch |err| {
+        transformer_mod.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
             std.debug.print("sliced-apply residue fail K={d} field=apply {s}\n", .{ K, @errorName(err) });
             return err;
         };
@@ -6272,6 +6291,38 @@ test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a l
     try testing.expect(target[0].qsa_pooled.ctx != null);
 }
 
+test "HotPrefixCache: skip set on the cache without a lookup does not poison the next request" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null, null, null, true);
+    try testing.expectEqual(@as(usize, 0), skipped.matched);
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var target2 = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target2);
+    var moe2: usize = 0;
+    const leaked = try hc.lookupAndRestoreWithMedia(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null, null, null, false);
+    try testing.expect(leaked.matched > 0);
+}
+
 test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entry exists" {
     const s = mlx.gpuStream();
     const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
@@ -6288,15 +6339,13 @@ test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entr
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
-    hc.skip_prefix_cache = true;
     var target_cache = try KVCache.init(testing.allocator, 3);
     defer target_cache.deinit();
     var target = pcEmptySsm();
     defer pcFreeQsaHybrid(&target);
     var moe_off: usize = 0;
-    const skipped = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
+    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null, null, null, true);
     try testing.expectEqual(@as(usize, 0), skipped.matched);
-    try testing.expect(!hc.skip_prefix_cache);
 
     var target2 = pcEmptySsm();
     defer pcFreeQsaHybrid(&target2);
@@ -6323,13 +6372,12 @@ test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache
     try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
     _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
 
-    hc.skip_prefix_cache = true;
     var skipped_cache = try KVCache.init(testing.allocator, 3);
     defer skipped_cache.deinit();
     var skipped_ssm = pcEmptySsm();
     defer pcFreeQsaHybrid(&skipped_ssm);
     var skip_off: usize = 7;
-    const skipped = try hc.lookupAndRestore(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, 0, null, null);
+    const skipped = try hc.lookupAndRestoreWithMedia(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, 0, null, null, null, null, true);
 
     var cold = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
     defer cold.deinit();
@@ -6857,7 +6905,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     var ssm = pcEmptySsm();
     defer pcFreeHybrid(&ssm);
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, null, null, 0xF5);
+    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, null, null, 0xF5, false);
 
     // The outcome: nothing delivered.
     try t.expectEqual(@as(usize, 0), hit.matched);

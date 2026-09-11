@@ -19,13 +19,19 @@ pub const RestoreDumpMeta = struct {
 
 pub var dump_restore_override: ?[]const u8 = null;
 var dump_seq: std.atomic.Value(u64) = .init(0);
+var dump_dir_cached: ?[]const u8 = null;
+var dump_dir_read: bool = false;
 
 pub fn dumpRestoreDir() ?[]const u8 {
     if (dump_restore_override) |d| {
         if (d.len == 0 or d[0] == '0') return null;
         return d;
     }
-    return dumpRestoreDirFromEnv(std.c.getenv("MLX_SERVE_DUMP_RESTORE"));
+    if (!dump_dir_read) {
+        dump_dir_cached = dumpRestoreDirFromEnv(std.c.getenv("MLX_SERVE_DUMP_RESTORE"));
+        dump_dir_read = true;
+    }
+    return dump_dir_cached;
 }
 
 pub fn dumpRestoreDirFromEnv(raw: ?[*:0]const u8) ?[]const u8 {

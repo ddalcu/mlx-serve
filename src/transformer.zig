@@ -7482,6 +7482,21 @@ pub const KVCache = struct {
         return entry.offset;
     }
 
+    pub fn appendEvalArrays(self: *const KVCache, vec: mlx.mlx_vector_array) void {
+        const affine = self.config.scheme != .off;
+        for (self.entries) |*entry| {
+            if (!entry.initialized) continue;
+            _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
+            _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            if (affine) {
+                _ = mlx.mlx_vector_array_append_value(vec, entry.keys_scales);
+                _ = mlx.mlx_vector_array_append_value(vec, entry.keys_biases);
+                _ = mlx.mlx_vector_array_append_value(vec, entry.values_scales);
+                _ = mlx.mlx_vector_array_append_value(vec, entry.values_biases);
+            }
+        }
+    }
+
     /// Evaluate all KV cache entries to materialize them on GPU.
     /// Called after prefill to ensure the cache is in optimal memory layout for decode.
     pub fn evalState(self: *KVCache) void {
@@ -7489,14 +7504,8 @@ pub const KVCache = struct {
         // This matches mlx_lm's `mx.eval([c.state for c in cache])` pattern.
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
-        var count: usize = 0;
-        for (self.entries) |*entry| {
-            if (!entry.initialized) continue;
-            _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-            _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-            count += 1;
-        }
-        if (count > 0) {
+        self.appendEvalArrays(vec);
+        if (mlx.mlx_vector_array_size(vec) > 0) {
             _ = mlx.mlx_eval(vec);
         }
     }
@@ -7525,7 +7534,7 @@ pub const KVCache = struct {
             _ = mlx.mlx_array_free(entry.value_view);
             entry.key_view = mlx.mlx_array_new();
             entry.value_view = mlx.mlx_array_new();
-            if (self.config.scheme == .affine) {
+            if (self.config.scheme != .off) {
                 _ = mlx.mlx_array_free(entry.key_scales_view);
                 _ = mlx.mlx_array_free(entry.key_biases_view);
                 _ = mlx.mlx_array_free(entry.value_scales_view);
@@ -7541,7 +7550,7 @@ pub const KVCache = struct {
                 _ = mlx.mlx_array_free(entry.values);
                 entry.keys = mlx.mlx_array_new();
                 entry.values = mlx.mlx_array_new();
-                if (self.config.scheme == .affine) {
+                if (self.config.scheme != .off) {
                     _ = mlx.mlx_array_free(entry.keys_scales);
                     _ = mlx.mlx_array_free(entry.keys_biases);
                     _ = mlx.mlx_array_free(entry.values_scales);
@@ -7572,7 +7581,7 @@ pub const KVCache = struct {
             const val_shape = mlx.getShape(entry.values);
             const val_stop = [_]c_int{ val_shape[0], val_shape[1], seq_end, val_shape[3] };
             try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &val_stop, 4, &v_strides, 4, s));
-            if (self.config.scheme == .affine) {
+            if (self.config.scheme != .off) {
                 // K and V scale/bias groups are as wide as their OWN payload —
                 // an MLA cache's V is narrower than its K, so the value views
                 // cannot be sliced against the key scales' shape.
@@ -8558,7 +8567,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
     var dest_arr = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest_arr[0]);
     try restoreSsmCheckpoint(&dest_arr, &cps[0]);
-    try applyQsaHistoryAt(&dest_arr, &cps[1], @intCast(pos), s);
+    try applyQsaHistoryAt(&dest_arr, &cps[1], @intCast(pos), s, false);
 
     // The restore carries the raw rows of the block `pos` reopened, and nothing else.
     const tail: c_int = @mod(pos, ratio);
@@ -9163,6 +9172,15 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
     return out;
 }
 
+/// Test seams (inference thread only): the copy/eval counters let the retention and cadence tests see what the loop did.
+pub var compact_conv_state_override: ?bool = null;
+pub var compact_conv_state_copy_count: u64 = 0;
+pub var cadence_conv_eval_count: u64 = 0;
+
+pub fn compactConvStateEnabled() bool {
+    return compact_conv_state_override orelse true;
+}
+
 /// A second owner for `cp`'s state: fresh handles and a fresh layer slice,
 /// refcount-SHARING every underlying buffer (`mlx_array_set`, the same idiom
 /// `ssmSnapshot` and `KVCache.snapshot` use). Both checkpoints then free
@@ -9674,7 +9692,7 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         if (!ssmAuxIsQsaHistory(&src)) continue;
         const materialize = switch (mode) {
             .copy => true,
-            .share => qsaHandoffMustMaterialize(&src, keep),
+            .share => qsaHandoffMustMaterialize(&src, keep) or src.qsa_pooled_buf.ctx == null,
         };
         if (src.qsa_pooled.ctx != null) {
             if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
@@ -9753,7 +9771,10 @@ pub fn entriesHaveQsaHistory(entries: []const SSMCacheEntry) bool {
 /// onto `entries` already restored to `pos`. Slices aux to `pos` rows and
 /// pooled to `pos/ratio` blocks. No-op on PLE/GDN layers (they already
 /// hold the per-position window from `restoreSsmCheckpoint`).
-pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream) !void {
+/// `materialize` false = the destination holds a slice of `src_cp`'s bank (safe when the
+/// checkpoint outlives the slot's first append); true = an owned copy, required when the
+/// source is a transient such as the SSD tier's overlay.
+pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint, pos: usize, s: mlx.mlx_stream, materialize: bool) !void {
     if (entries.len != src_cp.layers.len) return error.SsmCheckpointLayerMismatch;
     const keep: c_int = @intCast(pos);
     for (entries, src_cp.layers) |*dst, src| {
@@ -9774,9 +9795,13 @@ pub fn applyQsaHistoryAt(entries: []SSMCacheEntry, src_cp: *const SSMCheckpoint,
             const ps = mlx.getShape(src.qsa_pooled);
             const need_blocks = @divTrunc(keep, ratio);
             if (ps.len < 2 or ps[1] < need_blocks) return error.QsaHistoryGap;
-            dst.qsa_pooled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
-            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, true);
+            if (materialize) {
+                dst.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
+            } else {
+                dst.qsa_pooled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+            }
+            try truncatePooled(&dst.qsa_pooled, keep, ratio, s, materialize);
         }
         const from_src = try qsaLeftoverAt(src.aux_state, src_hist, keep, ratio, s);
         if (from_src.ctx != null) {
@@ -14666,6 +14691,17 @@ pub const Transformer = struct {
             const strides = [_]c_int{ 1, 1, 1 };
             var new_conv_state = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_slice(&new_conv_state, conv_input, &start, 3, &stop, 3, &strides, 3, self.s));
+            errdefer _ = mlx.mlx_array_free(new_conv_state);
+            // The tail must be an OWNED copy: a slice of the chunk-wide `conv_input` keeps
+            // the whole chunk alive in this layer until its next forward. Only a chunk-wide
+            // parent is worth the copy; at decode width the parent is already tiny.
+            const t_rows = ci_len - (kernel - 1);
+            if (compactConvStateEnabled() and t_rows >= PREFILL_EVAL_MIN_SEQ) {
+                const owned = try materializedOwnedCopy(self.s, new_conv_state);
+                _ = mlx.mlx_array_free(new_conv_state);
+                new_conv_state = owned;
+                compact_conv_state_copy_count += 1;
+            }
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = new_conv_state;
             ssm.initialized = true;
@@ -14795,7 +14831,10 @@ pub const Transformer = struct {
     // ── Forward dispatch ──
 
     const EVAL_EVERY_N_LAYERS: u32 = 48;
-    pub const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
+    /// One value for the prefill loops AND the admission bill: at most `cadence + 1`
+    /// linear layers hold a chunk-wide stream between cadence points.
+    pub const PREFILL_EVAL_CADENCE_DEFAULT: u32 = 4;
+    pub const MOE_EVAL_EVERY_N_LAYERS: u32 = PREFILL_EVAL_CADENCE_DEFAULT;
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
     /// Per-layer prefill transient (bytes) above which the layer loop eval()s
@@ -14835,6 +14874,30 @@ pub const Transformer = struct {
     /// width? (True = real prefill chunk; false = decode/spec-verify shape.)
     pub fn prefillEvalCadenceApplies(seq_len: c_int) bool {
         return seq_len >= PREFILL_EVAL_MIN_SEQ;
+    }
+
+    /// The cadence eval must NAME every conv_state beside `h`: the owned tail copy is
+    /// not in the residual's graph, so `mlx_array_eval(h)` alone would leave it lazy
+    /// and still holding its chunk parent. Re-appending an evaluated array is free.
+    fn evalCadencePoint(h: mlx.mlx_array, ssm_entries: ?[]SSMCacheEntry) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, h);
+        var extra: u64 = 0;
+        if (ssm_entries) |entries| {
+            for (entries) |*e| {
+                if (e.initialized and e.conv_state.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(vec, e.conv_state);
+                    extra += 1;
+                }
+            }
+        }
+        if (extra == 0) {
+            try mlx.check(mlx.mlx_array_eval(h));
+            return;
+        }
+        cadence_conv_eval_count += extra;
+        try mlx.check(mlx.mlx_eval(vec));
     }
 
     /// Decode-side intra-step async-eval ladder.
@@ -16025,8 +16088,8 @@ pub const Transformer = struct {
                 }
             }
 
-            if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % std_eval_cadence == 0) {
-                try mlx.check(mlx.mlx_array_eval(h));
+            if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % std_eval_cadence == 0 or layer_idx + 1 == @as(usize, cfg.num_hidden_layers))) {
+                try evalCadencePoint(h, ctx.ssm_entries);
             }
             self.ladderStep(h, layer_idx, seq_len);
             dt.layer(h, layer_idx);
@@ -18164,6 +18227,36 @@ pub const Transformer = struct {
         if (enable_mtp) self.qwen4MtpReset() catch {};
     }
 
+    /// `--mtp-head-kv-quant` opts the qwen4 MTP head's KV into `--kv-quant`; the default
+    /// stays dense bf16 (the head is a lossy draft and short prompts dequantize under the
+    /// fused-kernel floor). Set once at parse; the override is a test seam.
+    pub var mtp_head_kv_quant_override: ?bool = null;
+    pub var mtp_head_kv_quant_flag: bool = false;
+
+    pub fn mtpHeadKvQuantEnabled() bool {
+        if (mtp_head_kv_quant_override) |v| return v;
+        return mtp_head_kv_quant_flag;
+    }
+
+    /// The head's KV scheme: dense unless `--mtp-head-kv-quant` is set, then the trunk's.
+    /// Fixed at load at both construction sites, so a session never mixes schemes and the
+    /// bill prices the head at THIS scheme, never at a request's kv_quant override.
+    pub fn qwen4MtpHeadKvConfig(trunk: KVQuantConfig) KVQuantConfig {
+        if (mtpHeadKvQuantEnabled()) return trunk;
+        return KVQuantConfig.dense;
+    }
+
+    /// Re-creates the head cache under the chosen scheme with the HEAD's own geometry
+    /// (layers + 1, its key head dim). Acceptance measured within noise of dense at
+    /// 4k-128k; 960 B/token saved with MTP on.
+    pub fn qwen4MtpApplyKvQuant(self: *Transformer, trunk: KVQuantConfig) !void {
+        const m = &(self.qwen4_mtp orelse return);
+        const cfg = qwen4MtpHeadKvConfig(trunk);
+        const n_layers: u32 = self.config.num_hidden_layers + 1;
+        if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
+        try m.cache.reinit(n_layers, cfg, self.config.kvCacheKeyHeadDim());
+    }
+
     test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
         const t = std.testing;
         var xfm: Transformer = undefined;
@@ -18608,7 +18701,7 @@ pub const Transformer = struct {
         });
 
         const eval_cadence = prefillEvalCadence(
-            MOE_EVAL_EVERY_N_LAYERS,
+            PREFILL_EVAL_CADENCE_DEFAULT,
             cfg.head_dim,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
@@ -18684,8 +18777,8 @@ pub const Transformer = struct {
                     }
                 }
             }
-            if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % eval_cadence == 0) {
-                try mlx.check(mlx.mlx_array_eval(h));
+            if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+                try evalCadencePoint(h, ctx.ssm_entries);
             }
             dt.layer(h, layer_idx);
         }
@@ -18817,7 +18910,7 @@ pub const Transformer = struct {
         // transients are large (unfused head_dim > 128 at long ctx, or a
         // quantized cache's dense rebuild) — see prefillEvalCadence.
         const moe_eval_cadence = prefillEvalCadence(
-            MOE_EVAL_EVERY_N_LAYERS,
+            PREFILL_EVAL_CADENCE_DEFAULT,
             cfg.head_dim,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
@@ -18993,8 +19086,8 @@ pub const Transformer = struct {
                 }
             }
 
-            if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % moe_eval_cadence == 0) {
-                try mlx.check(mlx.mlx_array_eval(h));
+            if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+                try evalCadencePoint(h, ctx.ssm_entries);
             }
             self.ladderStep(h, layer_idx, seq_len);
             dt.layer(h, layer_idx);
@@ -19460,7 +19553,7 @@ pub const Transformer = struct {
         // fused head dims, but a quantized KV cache's dense rebuild (and a
         // future head_dim-256 hybrid like qwen3_next) still counts.
         const hybrid_eval_cadence = prefillEvalCadence(
-            MOE_EVAL_EVERY_N_LAYERS,
+            PREFILL_EVAL_CADENCE_DEFAULT,
             cfg.head_dim,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
@@ -19519,8 +19612,8 @@ pub const Transformer = struct {
                 }
             }
 
-            if (prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % hybrid_eval_cadence == 0) {
-                try mlx.check(mlx.mlx_array_eval(h));
+            if (prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % hybrid_eval_cadence == 0 or layer_idx + 1 == @as(usize, cfg.num_hidden_layers))) {
+                try evalCadencePoint(h, ctx.ssm_entries);
             }
             self.ladderStep(h, layer_idx, seq_len);
             dt.layer(h, layer_idx);
@@ -32084,6 +32177,27 @@ test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
     try mlx.check(mlx.mlx_array_eval(cache.entries[0].value_view));
 }
 
+test "KVCache.truncate recreates turbo scale/bias views" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.initWithConfigAndHeadDim(testing.allocator, 1, kv_quant.KVQuantConfig.turboquant(2), 128);
+    defer cache.deinit();
+    {
+        const k = testKVWide(5, 128, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKVWide(5, 128, s);
+        defer _ = mlx.mlx_array_free(v);
+        var dv = try cache.update(0, k, v, s, 0);
+        defer dv.deinit();
+    }
+    try testing.expectEqual(@as(usize, 5), cache.entries[0].offset);
+    try cache.truncate(3, s);
+    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
+    try testing.expectEqual(@as(c_int, 3), mlx.getShape(cache.entries[0].key_scales_view)[2]);
+    try testing.expectEqual(@as(c_int, 3), mlx.getShape(cache.entries[0].value_scales_view)[2]);
+    try mlx.check(mlx.mlx_array_eval(cache.entries[0].key_scales_view));
+    try mlx.check(mlx.mlx_array_eval(cache.entries[0].value_scales_view));
+}
+
 test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
     // The QUANTIZED write path solved every buffer's packed and scale widths
     // from K's head dim, so at K 192 / V 128 the value buffer was 24 u32 wide
@@ -33391,6 +33505,414 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
     try testing.expect(cp.layers[0].ssm_state.ctx == null);
 }
 
+fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int) !usize {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const saved = compact_conv_state_override;
+    compact_conv_state_override = true;
+    defer compact_conv_state_override = saved;
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.spec_capture_ssm = false;
+
+    var prng = std.Random.DefaultPrng.init(0xC0A1_7A11);
+    const x = try attn256RandBf16(prng.random(), &[_]c_int{ batch, seq, cdim }, s);
+    var x_live = true;
+    defer if (x_live) {
+        _ = mlx.mlx_array_free(x);
+    };
+    var w = mlx.mlx_array_new();
+    var w_live = true;
+    defer if (w_live) {
+        _ = mlx.mlx_array_free(w);
+    };
+    const wshape = [_]c_int{ cdim, kernel, 1 };
+    try mlx.check(mlx.mlx_ones(&w, &wshape, 3, .bfloat16, s));
+
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    };
+    defer {
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+    }
+
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var baseline: usize = 0;
+    _ = mlx.mlx_get_active_memory(&baseline);
+
+    const out = try xfm.conv1dWithCache(x, w, null, &entry, batch, cdim, kernel, false);
+    var out_live = true;
+    defer if (out_live) {
+        _ = mlx.mlx_array_free(out);
+    };
+    try mlx.check(mlx.mlx_array_eval(out));
+    try mlx.check(mlx.mlx_array_eval(entry.conv_state));
+    out_live = false;
+    x_live = false;
+    w_live = false;
+    _ = mlx.mlx_array_free(out);
+    _ = mlx.mlx_array_free(x);
+    _ = mlx.mlx_array_free(w);
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    const delta = if (after > baseline) after - baseline else 0;
+    try t.expect(entry.initialized);
+    const keep = kernel - 1;
+    const sh = mlx.getShape(entry.conv_state);
+    try t.expectEqual(@as(c_int, batch), sh[0]);
+    try t.expectEqual(keep, sh[1]);
+    try t.expectEqual(cdim, sh[2]);
+    return delta;
+}
+
+// Bar: after the conv, freeing the chunk input leaves only the tail resident.
+test "conv1dWithCache tail drops the prefill chunk parent" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const batch: c_int = 1;
+    const seq: c_int = 4096;
+    const cdim: c_int = 256;
+    const kernel: c_int = 4;
+    const delta = try conv1dTailRetentionDelta(batch, seq, cdim, kernel);
+    const chunk: usize = @as(usize, @intCast(batch)) * @as(usize, @intCast(seq)) * @as(usize, @intCast(cdim)) * 2;
+    if (delta >= 64 * 1024) std.debug.print("retention delta={d} chunk={d}\n", .{ delta, chunk });
+    try t.expect(delta < 64 * 1024);
+}
+
+// Bar: same as above with a strided batch-2 parent.
+test "conv1dWithCache tail drops a batch-2 strided prefill parent" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const batch: c_int = 2;
+    const seq: c_int = 4096;
+    const cdim: c_int = 256;
+    const kernel: c_int = 4;
+    const delta = try conv1dTailRetentionDelta(batch, seq, cdim, kernel);
+    const chunk: usize = @as(usize, @intCast(batch)) * @as(usize, @intCast(seq)) * @as(usize, @intCast(cdim)) * 2;
+    if (delta >= 64 * 1024) std.debug.print("retention delta={d} chunk={d}\n", .{ delta, chunk });
+    try t.expect(delta < 64 * 1024);
+}
+
+fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
+    const saved = compact_conv_state_override;
+    compact_conv_state_override = compact;
+    defer compact_conv_state_override = saved;
+
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.spec_capture_ssm = false;
+    var prng = std.Random.DefaultPrng.init(0xB17E_C0DE);
+    const x = try attn256RandBf16(prng.random(), &[_]c_int{ batch, seq, cdim }, s);
+    defer _ = mlx.mlx_array_free(x);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    const wshape = [_]c_int{ cdim, kernel, 1 };
+    try mlx.check(mlx.mlx_ones(&w, &wshape, 3, .bfloat16, s));
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    };
+    errdefer _ = mlx.mlx_array_free(entry.conv_state);
+    defer _ = mlx.mlx_array_free(entry.ssm_state);
+    const out = try xfm.conv1dWithCache(x, w, null, &entry, batch, cdim, kernel, true);
+    return .{ .out = out, .conv_state = entry.conv_state };
+}
+
+fn conv1dTwoChunk(batch: c_int, t1: c_int, t2: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
+    const saved = compact_conv_state_override;
+    compact_conv_state_override = compact;
+    defer compact_conv_state_override = saved;
+
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.spec_capture_ssm = false;
+    var prng = std.Random.DefaultPrng.init(0xA11C_EDED);
+    const x1 = try attn256RandBf16(prng.random(), &[_]c_int{ batch, t1, cdim }, s);
+    defer _ = mlx.mlx_array_free(x1);
+    const x2 = try attn256RandBf16(prng.random(), &[_]c_int{ batch, t2, cdim }, s);
+    defer _ = mlx.mlx_array_free(x2);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    const wshape = [_]c_int{ cdim, kernel, 1 };
+    try mlx.check(mlx.mlx_ones(&w, &wshape, 3, .bfloat16, s));
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    };
+    errdefer _ = mlx.mlx_array_free(entry.conv_state);
+    defer _ = mlx.mlx_array_free(entry.ssm_state);
+    const out1 = try xfm.conv1dWithCache(x1, w, null, &entry, batch, cdim, kernel, true);
+    _ = mlx.mlx_array_free(out1);
+    const out2 = try xfm.conv1dWithCache(x2, w, null, &entry, batch, cdim, kernel, true);
+    return .{ .out = out2, .conv_state = entry.conv_state };
+}
+
+fn conv1dExpectBitEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    try mlx.check(mlx.mlx_array_eval(eq));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try std.testing.expect(ok);
+}
+
+// Bar: output and stored state byte-equal with the copy on and off.
+test "conv1dWithCache compact conv_state is bit-identical on and off" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const kernel: c_int = 4;
+    const cdim: c_int = 32;
+    const cases = [_][2]c_int{
+        .{ 1, 1 },
+        .{ 1, 5 },
+        .{ 1, 4096 },
+        .{ 2, 1 },
+        .{ 2, 5 },
+        .{ 2, 4096 },
+    };
+    for (cases) |c| {
+        const batch = c[0];
+        const seq = c[1];
+        const off = try conv1dBitCopy(batch, seq, cdim, kernel, false, s);
+        defer {
+            _ = mlx.mlx_array_free(off.out);
+            _ = mlx.mlx_array_free(off.conv_state);
+        }
+        const on = try conv1dBitCopy(batch, seq, cdim, kernel, true, s);
+        defer {
+            _ = mlx.mlx_array_free(on.out);
+            _ = mlx.mlx_array_free(on.conv_state);
+        }
+        try conv1dExpectBitEqual(off.out, on.out, s);
+        try conv1dExpectBitEqual(off.conv_state, on.conv_state, s);
+    }
+}
+
+// Bar: below the chunk bar the tail stays a view (no copy kernel per decode step).
+test "conv1dWithCache decode width does not copy the tail" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    const saved = compact_conv_state_override;
+    defer compact_conv_state_override = saved;
+    compact_conv_state_override = true;
+    compact_conv_state_copy_count = 0;
+    const on = try conv1dBitCopy(1, 1, 32, 4, true, s);
+    defer {
+        _ = mlx.mlx_array_free(on.out);
+        _ = mlx.mlx_array_free(on.conv_state);
+    }
+    try t.expectEqual(@as(u64, 0), compact_conv_state_copy_count);
+    const off = try conv1dBitCopy(1, 1, 32, 4, false, s);
+    defer {
+        _ = mlx.mlx_array_free(off.out);
+        _ = mlx.mlx_array_free(off.conv_state);
+    }
+    try conv1dExpectBitEqual(on.out, off.out, s);
+    try conv1dExpectBitEqual(on.conv_state, off.conv_state, s);
+}
+
+// Bar: the compacted state prepended to the next chunk gives byte-equal results.
+test "conv1dWithCache compact conv_state is bit-identical across two chunks" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const off = try conv1dTwoChunk(1, 64, 64, 32, 4, false, s);
+    defer {
+        _ = mlx.mlx_array_free(off.out);
+        _ = mlx.mlx_array_free(off.conv_state);
+    }
+    const on = try conv1dTwoChunk(1, 64, 64, 32, 4, true, s);
+    defer {
+        _ = mlx.mlx_array_free(on.out);
+        _ = mlx.mlx_array_free(on.conv_state);
+    }
+    try conv1dExpectBitEqual(off.out, on.out, s);
+    try conv1dExpectBitEqual(off.conv_state, on.conv_state, s);
+}
+
+// Bar: every layer's tail is copied and named in a cadence eval inside the loop (the peak itself is measured live, not on a tiny fixture).
+test "hybrid prefill: the cadence eval names every conv_state inside the layer loop" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const s = mlx.gpuStream();
+    const n_layers: u32 = 16;
+    const seq: c_int = 512;
+    const H: c_int = 64;
+    const kernel: c_int = 3;
+
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(weights: *Weights, alloc: std.mem.Allocator, name: []const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const vals = try alloc.alloc(f32, n);
+            defer alloc.free(vals);
+            @memset(vals, 0.5);
+            const f32_arr = mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var bf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+            try weights.map.put(try alloc.dupe(u8, name), bf);
+        }
+    }.add;
+    const P = "model";
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var pre_buf: [64]u8 = undefined;
+        const pre = try std.fmt.bufPrint(&pre_buf, "{s}.layers.{d}.", .{ P, li });
+        var name_buf2: [96]u8 = undefined;
+        const n1 = try std.fmt.bufPrint(&name_buf2, "{s}norm.weight", .{pre});
+        try put(&w, allocator, n1, &.{H}, s);
+        const n2 = try std.fmt.bufPrint(&name_buf2, "{s}conv.in_proj.weight", .{pre});
+        try put(&w, allocator, n2, &.{ 3 * H, H }, s);
+        const n3 = try std.fmt.bufPrint(&name_buf2, "{s}conv.conv.weight", .{pre});
+        try put(&w, allocator, n3, &.{ H, kernel, 1 }, s);
+        const n4 = try std.fmt.bufPrint(&name_buf2, "{s}conv.out_proj.weight", .{pre});
+        try put(&w, allocator, n4, &.{ H, H }, s);
+    }
+
+    var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = P };
+    config.has_hybrid_layers = true;
+    config.num_hidden_layers = n_layers;
+    config.hidden_size = @intCast(H);
+    config.quant_bits = 0;
+    config.has_final_norm = false;
+    config.lfm_conv_kernel = @intCast(kernel);
+    config.head_dim = 64;
+    config.num_attention_heads = 1;
+    config.num_key_value_heads = 1;
+    config.vocab_size = 8;
+    for (0..n_layers) |i| config.layer_block_types[i] = .gated_conv;
+
+    var name_buf: [256]u8 = undefined;
+    const hl = try initHybridLayers(allocator, config, &w, &name_buf, s);
+    defer {
+        allocator.free(hl.hybrid_layers);
+        for (hl.ssm_entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(hl.ssm_entries);
+        for (hl.owned_bf16) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(hl.owned_bf16);
+    }
+
+    var emb_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb_w);
+    const emb_shape = [_]c_int{ 8, H };
+    try mlx.check(mlx.mlx_ones(&emb_w, &emb_shape, 2, .bfloat16, s));
+    var cache = try KVCache.init(allocator, n_layers);
+    defer cache.deinit();
+
+    var xfm = Transformer{
+        .config = config,
+        .cache = cache,
+        .s = s,
+        .allocator = allocator,
+        .emb_w = emb_w,
+        .emb_s = mlx.mlx_array_new(),
+        .emb_b = mlx.mlx_array_new(),
+        .emb_scale = null,
+        .final_norm = mlx.mlx_array_new(),
+        .lm_head_w = mlx.mlx_array_new(),
+        .lm_head_s = mlx.mlx_array_new(),
+        .lm_head_b = mlx.mlx_array_new(),
+        .layers = &.{},
+        .owns_lm_head = false,
+        .owns_norms = false,
+        .embedding_mode = true,
+        .gelu_coeff = null,
+        .gelu_inner = null,
+        .half = mlx.mlx_array_new(),
+        .one = mlx.mlx_array_new(),
+        .three = null,
+        .neg_one = null,
+        .ple_emb_w = mlx.mlx_array_new(),
+        .ple_emb_s = mlx.mlx_array_new(),
+        .ple_emb_b = mlx.mlx_array_new(),
+        .ple_proj_w = mlx.mlx_array_new(),
+        .ple_proj_s = mlx.mlx_array_new(),
+        .ple_proj_b = mlx.mlx_array_new(),
+        .ple_proj_norm = mlx.mlx_array_new(),
+        .ple_proj_quantized = false,
+        .softcap_scalar = null,
+        .v_norm_weight = null,
+        .v_norm_weight_global = null,
+        .rope_freqs_global = null,
+        .bert_layers = null,
+        .bert_pos_w = mlx.mlx_array_new(),
+        .bert_pos_s = mlx.mlx_array_new(),
+        .bert_pos_b = mlx.mlx_array_new(),
+        .bert_toktype_w = mlx.mlx_array_new(),
+        .bert_toktype_s = mlx.mlx_array_new(),
+        .bert_toktype_b = mlx.mlx_array_new(),
+        .bert_emb_norm_w = mlx.mlx_array_new(),
+        .bert_emb_norm_b = mlx.mlx_array_new(),
+        .moe_layers = null,
+        .ssm_entries = hl.ssm_entries,
+        .moe_seq_offset = 0,
+        .hybrid_layers = hl.hybrid_layers,
+        .embedding_norm = null,
+        .prompt_cache = null,
+    };
+    defer {
+        _ = mlx.mlx_array_free(xfm.emb_s);
+        _ = mlx.mlx_array_free(xfm.emb_b);
+        _ = mlx.mlx_array_free(xfm.final_norm);
+        _ = mlx.mlx_array_free(xfm.lm_head_w);
+        _ = mlx.mlx_array_free(xfm.lm_head_s);
+        _ = mlx.mlx_array_free(xfm.lm_head_b);
+        _ = mlx.mlx_array_free(xfm.half);
+        _ = mlx.mlx_array_free(xfm.one);
+        _ = mlx.mlx_array_free(xfm.ple_emb_w);
+        _ = mlx.mlx_array_free(xfm.ple_emb_s);
+        _ = mlx.mlx_array_free(xfm.ple_emb_b);
+        _ = mlx.mlx_array_free(xfm.ple_proj_w);
+        _ = mlx.mlx_array_free(xfm.ple_proj_s);
+        _ = mlx.mlx_array_free(xfm.ple_proj_b);
+        _ = mlx.mlx_array_free(xfm.ple_proj_norm);
+        _ = mlx.mlx_array_free(xfm.bert_pos_w);
+        _ = mlx.mlx_array_free(xfm.bert_pos_s);
+        _ = mlx.mlx_array_free(xfm.bert_pos_b);
+        _ = mlx.mlx_array_free(xfm.bert_toktype_w);
+        _ = mlx.mlx_array_free(xfm.bert_toktype_s);
+        _ = mlx.mlx_array_free(xfm.bert_toktype_b);
+        _ = mlx.mlx_array_free(xfm.bert_emb_norm_w);
+        _ = mlx.mlx_array_free(xfm.bert_emb_norm_b);
+    }
+
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    const id_shape = [_]c_int{ 1, seq };
+    try mlx.check(mlx.mlx_zeros(&ids, &id_shape, 2, .int32, s));
+
+    compact_conv_state_copy_count = 0;
+    const warm = try xfm.forward(ids);
+    _ = mlx.mlx_array_free(warm);
+    xfm.moe_seq_offset = 0;
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+
+    compact_conv_state_copy_count = 0;
+    cadence_conv_eval_count = 0;
+    const out = try xfm.forward(ids);
+    try mlx.check(mlx.mlx_array_eval(out));
+    _ = mlx.mlx_array_free(out);
+    try t.expectEqual(@as(u64, n_layers), compact_conv_state_copy_count);
+    try t.expect(cadence_conv_eval_count >= 8);
+}
+
 test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     const s = mlx.gpuStream();
     const n: c_int = 64;
@@ -33461,7 +33983,7 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     }};
     defer ssmFreeQsaState(&dest[0]);
     try restoreSsmCheckpoint(&dest, &cps[2]);
-    try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 46, s);
+    try applyQsaHistoryAt(&dest, &cps[positions.len - 1], 46, s, false);
     // The leftover is the checkpoint's own raw rows 44 and 45, not the newest ring's overlap.
     try testing.expectEqual(@as(c_int, 2), mlx.getShape(dest[0].aux_state)[1]);
     {
@@ -33661,7 +34183,7 @@ test "attachQsaHistoryToLatest is one copy; applyQsaHistoryAt slices to pos" {
     }};
     defer ssmFreeQsaState(&dest_arr[0]);
     try restoreSsmCheckpoint(&dest_arr, &cps[0]);
-    try applyQsaHistoryAt(&dest_arr, &cps[1], 16, s);
+    try applyQsaHistoryAt(&dest_arr, &cps[1], 16, s, false);
     try testing.expect(dest_arr[0].aux_state.ctx == null);
     try testing.expectEqual(@as(c_int, 4), dest_arr[0].qsa_pooled_blocks);
 
@@ -33765,8 +34287,8 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
 }
 
 test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the trim's slice is a real copy" {
-    // Restore: the first append re-seeds a private buffer, so a materialized slice was a second
-    // transient copy. Trim: it drops the source next, so its slice must own its bytes.
+    // Restore: the slot appends into qsa_pooled_buf via seedCapBuf, so a view of the entry is not written through.
+    // Trim: the inherit slice must own its rows; a view would pin the donor's full bank.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const n: c_int = 32;
@@ -33790,14 +34312,36 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     var dest = [_]SSMCacheEntry{.{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true }};
     defer ssmFreeQsaState(&dest[0]);
     try restoreSsmCheckpoint(&dest, &cps[0]);
-    try applyQsaHistoryAt(&dest, &cps[0], 16, s);
+    try applyQsaHistoryAt(&dest, &cps[0], 16, s, false);
     try testing.expectEqual(@as(c_int, 4), dest[0].qsa_pooled_blocks);
+    try mlx.check(mlx.mlx_array_eval(dest[0].qsa_pooled));
+    try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+    const dest_ptr = mlx.mlx_array_data_float32(dest[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    const src_ptr = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(src_ptr, dest_ptr);
+
+    var t: Transformer = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    var extra = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(extra);
+    try mlx.check(mlx.mlx_ones(&extra, &[_]c_int{ 1, 1, 8 }, 3, .float32, s));
+    try t.qsaAppendPooled(&dest[0], extra, dest[0].qsa_pooled_blocks);
+    try mlx.check(mlx.mlx_array_eval(dest[0].qsa_pooled));
+    try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+    const after_ptr = mlx.mlx_array_data_float32(dest[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    const src_after = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(src_ptr, src_after);
+    try testing.expect(after_ptr != src_ptr);
 
     var kept = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, 16, s)};
     defer kept[0].deinit(testing.allocator);
     try sliceQsaHistoryOntoCheckpoint(&kept[0], &cps[0], 16, s);
     try testing.expect(kept[0].layers[0].aux_state.ctx == null);
     try testing.expect(kept[0].layers[0].qsa_pooled.ctx != null);
+    try mlx.check(mlx.mlx_array_eval(kept[0].layers[0].qsa_pooled));
+    const trim_ptr = mlx.mlx_array_data_float32(kept[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
+    try testing.expect(trim_ptr != src_ptr);
 }
 
 test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {
@@ -47911,6 +48455,125 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     }
 }
 
+test "qwen4 MTP head KV scheme follows the trunk under kv-quant 8" {
+    const t = std.testing;
+    const saved = Transformer.mtp_head_kv_quant_override;
+    defer Transformer.mtp_head_kv_quant_override = saved;
+    Transformer.mtp_head_kv_quant_override = false;
+    var xfm: Transformer = undefined;
+    xfm.config = .{};
+    xfm.config.num_hidden_layers = 4;
+    xfm.config.head_dim = 64;
+    xfm.allocator = t.allocator;
+    var head: Qwen4Mtp = undefined;
+    const head_cache = try KVCache.init(t.allocator, xfm.config.num_hidden_layers + 1);
+    head.cache = head_cache;
+    xfm.qwen4_mtp = head;
+    defer xfm.qwen4_mtp.?.cache.deinit();
+    try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
+    const trunk = kv_quant.KVQuantConfig.affine(8);
+    try xfm.qwen4MtpApplyKvQuant(trunk);
+    try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
+    Transformer.mtp_head_kv_quant_override = true;
+    try xfm.qwen4MtpApplyKvQuant(trunk);
+    try t.expectEqual(trunk.scheme, xfm.qwen4_mtp.?.cache.config.scheme);
+    try t.expectEqual(trunk.bits, xfm.qwen4_mtp.?.cache.config.bits);
+}
+
+test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    if (xfm.qwen4_mtp == null) return error.SkipZigTest;
+    xfm.compileQwen4Hc();
+    xfm.compileMoeRouting();
+
+    const saved = Transformer.mtp_head_kv_quant_override;
+    defer Transformer.mtp_head_kv_quant_override = saved;
+    Transformer.mtp_head_kv_quant_override = true;
+
+    const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
+    const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
+    const S: usize = 4;
+    const keep: usize = 2;
+    const host = try allocator.alloc(f32, S * hcH);
+    defer allocator.free(host);
+    var rs: u64 = 0x9E3779B97F4A7C15;
+    for (host) |*x| {
+        rs = rs *% 6364136223846793005 +% 1442695040888963407;
+        x.* = (@as(f32, @floatFromInt((rs >> 40) & 0xFFFF)) / 32768.0) - 1.0;
+    }
+    const hshape = [_]c_int{ 1, @intCast(S), @intCast(hcH) };
+    const sp_f32 = mlx.mlx_array_new_data(host.ptr, &hshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp_f32);
+    var stream_prev = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stream_prev);
+    try mlx.check(mlx.mlx_astype(&stream_prev, sp_f32, dt, s));
+    var id_buf: [4]i32 = .{ 7, 20, 33, 46 };
+    const ishape = [_]c_int{ 1, @intCast(S) };
+    const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
+    defer _ = mlx.mlx_array_free(ids);
+
+    const Run = struct {
+        fn lastLogits(xf: *Transformer, st: mlx.mlx_stream, alloc: std.mem.Allocator, stream: mlx.mlx_array, tok: mlx.mlx_array, kkeep: usize) ![]f32 {
+            try xf.qwen4MtpReset();
+            const full = try xf.qwen4MtpForward(stream, tok, 1, null, .all_rows);
+            defer _ = mlx.mlx_array_free(full.logits);
+            defer _ = mlx.mlx_array_free(full.stream);
+            try xf.qwen4MtpTruncate(kkeep);
+            const sh = mlx.getShape(stream);
+            var tail = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tail);
+            try mlx.check(mlx.mlx_slice(&tail, stream, &[_]c_int{ 0, @intCast(kkeep), 0 }, 3, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, st));
+            const tsh = mlx.getShape(tok);
+            var ttail = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ttail);
+            try mlx.check(mlx.mlx_slice(&ttail, tok, &[_]c_int{ 0, @intCast(kkeep) }, 2, &[_]c_int{ tsh[0], tsh[1] }, 2, &[_]c_int{ 1, 1 }, 2, st));
+            const more = try xf.qwen4MtpForward(tail, ttail, @intCast(kkeep + 1), null, .last_row);
+            defer _ = mlx.mlx_array_free(more.logits);
+            defer _ = mlx.mlx_array_free(more.stream);
+            return qwen4ReadF32(alloc, more.logits, st);
+        }
+        fn argmaxGap(row: []const f32) struct { id: usize, gap: f32 } {
+            var b0: usize = 0;
+            var b1: usize = 0;
+            for (row, 0..) |x, i| {
+                if (x > row[b0]) {
+                    b1 = b0;
+                    b0 = i;
+                } else if (i != b0 and (b1 == b0 or x > row[b1])) {
+                    b1 = i;
+                }
+            }
+            return .{ .id = b0, .gap = row[b0] - row[b1] };
+        }
+    };
+
+    const dense_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
+    defer allocator.free(dense_l);
+    try xfm.qwen4MtpApplyKvQuant(kv_quant.KVQuantConfig.affine(8));
+    try testing.expectEqual(kv_quant.Scheme.affine, xfm.qwen4_mtp.?.cache.config.scheme);
+    try testing.expectEqual(@as(u8, 8), xfm.qwen4_mtp.?.cache.config.bits);
+    const quant_l = try Run.lastLogits(&xfm, s, allocator, stream_prev, ids, keep);
+    defer allocator.free(quant_l);
+    try testing.expectEqual(dense_l.len, quant_l.len);
+    const d = Run.argmaxGap(dense_l);
+    const q = Run.argmaxGap(quant_l);
+    if (d.id != q.id) {
+        try testing.expect(d.gap <= 0.15);
+    }
+}
+
 test "qwen4MtpForward owns its stream once: exactly one errdefer frees `h`" {
     // `h` is created once and reassigned in place by every hcWrite (and by the
     // `.last_row` slice, which frees the old handle itself), so ONE errdefer
@@ -48444,7 +49107,7 @@ test "ssm checkpoint carries the qwen4_exp aux state (key history, pooled keys, 
         ssmFreeQsaState(e);
     };
     try restoreSsmCheckpoint(&dst, cp);
-    try applyQsaHistoryAt(&dst, cp, 37, s);
+    try applyQsaHistoryAt(&dst, cp, 37, s, false);
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].aux_state, cp.layers[0].aux_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[0].qsa_pooled, src_e[0].qsa_pooled, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(dst[1].aux_state, src_e[1].aux_state, s));

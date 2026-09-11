@@ -813,16 +813,27 @@ pub const ModelConfig = struct {
         return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
-    /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
-    /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
-    /// layer. Not kv-quantized. Zero on archs without an indexer. ONE copy; the billed
-    /// width (copies + score bank) is `server.statePerTokenBilled`.
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
+    /// blocks `[kv/ratio, idx_hd]` per full-attn layer. The raw keys are a fixed
+    /// ring (`qsaRingBytes`, billed once per slot), not per token. Not
+    /// kv-quantized. Zero on archs without an indexer. ONE copy; the billed width
+    /// (copies + score bank) is `server.statePerTokenBilled`.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
-        return n * hd * 2 + n * hd * 2 / ratio;
+        return n * hd * 2 / ratio;
+    }
+
+    /// The raw indexer keys every live slot holds: `QSA_RING_ROWS` rows per
+    /// full-attn layer, context-independent, billed once per slot.
+    pub fn qsaRingBytes(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        return n * rows * hd * 2;
     }
 
     /// f32 bytes per token of the QSA block-score operand a live slot holds
@@ -6665,7 +6676,8 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
-    try testing.expectEqual(@as(u64, 12 * 128 * 2 + 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
