@@ -58,6 +58,7 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
+        XCTAssertEqual(d.idleEvictMinutes, 0)         // main.zig idle_evict_secs (off)
         // Deliberate divergence from main.zig's metrics_enabled=false: the tray
         // reads /metrics.json for its throughput rows.
         XCTAssertEqual(d.enableMetrics, true)
@@ -70,7 +71,7 @@ final class ServerOptionsTests: XCTestCase {
         for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
                      "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
                      "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
-                     "--ssd-streaming", "--top-k", "--drafter"] {
+                     "--ssd-streaming", "--idle-evict-secs", "--top-k", "--drafter"] {
             XCTAssertFalse(args.contains(flag),
                 "\(flag) appeared at default — its Swift default or emit-guard drifted from the server")
         }
@@ -611,6 +612,7 @@ extension ServerOptionsTests {
         o.kvQuant = .int8
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
+        o.idleEvictMinutes = 10
         o.skipMemPreflight = true
         o.ssdStreaming = true
         o.llamaKvQuant = .q8
@@ -1103,6 +1105,29 @@ extension ServerOptionsTests {
 
         opts.maxResidentMemGB = 48
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--max-resident-mem", value: "48GB"))
+    }
+
+    func testIdleEvictionIsOffByDefaultAndEmitsSeconds() {
+        var opts = ServerOptions()
+        XCTAssertEqual(opts.idleEvictMinutes, 0)
+        XCTAssertFalse(opts.toCLIArgs().contains("--idle-evict-secs"))
+
+        opts.idleEvictMinutes = 10
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--idle-evict-secs", value: "600"))
+
+        opts.idleEvictMinutes = Int(UInt32.max) / 60 + 1
+        XCTAssertFalse(opts.toCLIArgs().contains("--idle-evict-secs"))
+        guard let field = ServerOptions.serverFlagFields["idleEvictMinutes"] else {
+            return XCTFail("idleEvictMinutes metadata missing — the Settings control would disappear")
+        }
+        XCTAssertTrue(field.needsRestart)
+    }
+
+    func testIdleEvictionChangeTriggersRestart() {
+        let original = ServerOptions()
+        var changed = original
+        changed.idleEvictMinutes = 10
+        XCTAssertFalse(original.serverLaunchEquals(changed))
     }
 
     /// The slider's snap points. `main.zig` EXITS on a value it cannot parse,

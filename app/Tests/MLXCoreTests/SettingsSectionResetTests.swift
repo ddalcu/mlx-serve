@@ -40,6 +40,7 @@ final class SettingsSectionResetTests: XCTestCase {
         o.enableMTP = false; o.mtpDepth = 6
         o.maxConcurrent = 8; o.kvQuant = .int4; o.prefixCacheEntries = 99
         o.prefixCacheMem = "9GB"; o.enablePrefixCacheDisk = true; o.prefixCacheDisk = "99GB"
+        o.idleEvictMinutes = 10
         o.llamaKvQuant = .q4; o.llamaCacheEntries = 9
         o.ssdStreaming = true
         o.tokenizeCacheEntries = 9
