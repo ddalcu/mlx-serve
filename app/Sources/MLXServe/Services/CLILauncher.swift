@@ -175,6 +175,14 @@ struct LauncherCLI: Identifiable, Equatable {
     var resolvedPath: String = ""
 
     static func == (lhs: LauncherCLI, rhs: LauncherCLI) -> Bool { lhs.id == rhs.id }
+
+    /// Effective Codex home: `${CODEX_HOME:-$HOME/.codex}`, empty = unset.
+    /// Mirrors launch.zig `codexHome()`; the profile is written here and the
+    /// launched codex inherits the same environment, so the two agree.
+    nonisolated static func codexHome() -> String {
+        if let v = ProcessInfo.processInfo.environment["CODEX_HOME"], !v.isEmpty { return v }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
+    }
 }
 
 extension LauncherCLI {
@@ -270,10 +278,12 @@ extension LauncherCLI {
         }
     )
 
-    /// codex (https://github.com/openai/codex) — Responses-wire only; config
-    /// rides a dedicated CODEX_HOME (the dir must exist before codex runs).
-    /// The script resolves the binary itself (PATH, then the desktop app's
-    /// bundled CLI) so a ChatGPT.app-only install still launches.
+    /// codex (https://github.com/openai/codex) — Responses-wire only; the
+    /// generated settings ride the `--profile mlx-serve` layer inside the
+    /// user's own Codex home (`${CODEX_HOME:-$HOME/.codex}`), never a
+    /// dedicated CODEX_HOME. The script resolves the binary itself (PATH,
+    /// then the desktop app's bundled CLI) so a ChatGPT.app-only install
+    /// still launches.
     static let codex = LauncherCLI(
         id: "codex",
         displayName: "Codex",
@@ -281,11 +291,13 @@ extension LauncherCLI {
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
         prepareConfig: { baseURL, model, budget, _ in
-            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
+            let dir = LauncherCLI.codexHome()
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            try? AgentConfigs.codexConfigTOML(baseURL: baseURL, model: model, budget: budget)
-                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
-                       atomically: true, encoding: .utf8)
+            let profilePath = (dir as NSString).appendingPathComponent("mlx-serve.config.toml")
+            let existing = (try? String(contentsOfFile: profilePath, encoding: .utf8)) ?? ""
+            try? AgentConfigs.codexConfigTOML(baseURL: baseURL, model: model, budget: budget,
+                                              existing: existing)
+                .write(toFile: profilePath, atomically: true, encoding: .utf8)
         },
         fallbackPaths: [
             "/Applications/ChatGPT.app/Contents/Resources/codex",
@@ -295,10 +307,9 @@ extension LauncherCLI {
         ],
         scriptBody: { _, _, cdLine, _, _ in
             """
-            export CODEX_HOME="$HOME/.mlx-serve/codex"
             \(AgentConfigs.codexBinResolver)
             \(cdLine)
-            "$CODEX_BIN"
+            "$CODEX_BIN" --profile mlx-serve
             """
         }
     )

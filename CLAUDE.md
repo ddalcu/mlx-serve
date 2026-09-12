@@ -22,7 +22,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 |---|---|
 | `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
 | `cli.zig` | Ollama-grade CLI: alias → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
-| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider): reads `/v1/models` (models + ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, starts the app if the server is down. Swift `CLILauncher`+`AgentConfigs` is the twin (omp `PI_CODING_AGENT_DIR`, codex Responses-only `CODEX_HOME`, hermes `HERMES_HOME`; opencode2 `XDG_CONFIG_HOME` + monitor plugin) |
+| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider): reads `/v1/models` (models + ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, starts the app if the server is down. Swift `CLILauncher`+`AgentConfigs` is the twin (omp `PI_CODING_AGENT_DIR`, codex Responses-only `--profile mlx-serve` in the user's real `${CODEX_HOME:-$HOME/.codex}`, hermes `HERMES_HOME`; opencode2 `XDG_CONFIG_HOME` + monitor plugin) |
 | `mlx.zig` | mlx-c FFI |
 | `model.zig` | Config parse + safetensors loading |
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |

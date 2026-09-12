@@ -8,7 +8,8 @@
 #   [3] launch omp --print against a live server: script exports the pi-spelled
 #       agent dir var, targets the served model, and the written models.yml
 #       carries the server's ADVERTISED context (never a hardcoded one)
-#   [4] launch codex --print: config.toml targets our /v1/responses
+#   [4] launch codex --print: the generated --profile mlx-serve layer
+#       ($CODEX_HOME/mlx-serve.config.toml) targets our /v1/responses
 #       (wire_api = "responses") with the advertised context
 #   [5] launch claude --print: env-only script, no config file, ADVERTISED
 #       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
@@ -18,10 +19,28 @@
 #   [7] launch opencode2 --print: XDG_CONFIG_HOME under the dedicated dir,
 #       cli.json carries metricsUrl = base + /metrics.json, plugin has tui.tsx
 #
-# The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
+# Most configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
+# codex is the exception: it writes only mlx-serve.config.toml into the
+# effective CODEX_HOME (default ~/.codex) and launches with --profile
+# mlx-serve, so the user's MCP/plugins/auth survive.
+#
+# CODEX_HOME is force-set for the WHOLE run: if this ever regresses to
+# writing a bare config.toml into the effective home, the trap below catches
+# it with a loud fail instead of silently clobbering the user's real
+# ~/.codex. A temp home is used either way so the real profile is untouched.
 
 set -u
+
+export CODEX_HOME=${TEST_CODEX_HOME:-$(mktemp -d)}
+printf '; sentinel\n' > "$CODEX_HOME/config.toml"
+codex_home_guard() {
+    if [ -f "$CODEX_HOME/config.toml" ] && ! grep -q "^; sentinel$" "$CODEX_HOME/config.toml" 2>/dev/null; then
+        echo "FAIL: $CODEX_HOME/config.toml was modified — a writer is ignoring the profile"
+        exit 1
+    fi
+    rm -rf "$CODEX_HOME"
+}
 
 MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8097}
@@ -66,10 +85,10 @@ echo "Starting server..."
 "$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >/tmp/mlx-serve-launch-test.log 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
+trap 'cleanup; codex_home_guard' EXIT
 for i in $(seq 1 40); do
     curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; exit 1; }
+    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; codex_home_guard; exit 1; }
     sleep 1
 done
 
@@ -93,20 +112,25 @@ else
     run_test "omp script + models.yml carry the advertised context" FAIL "$OUT"
 fi
 
-# ── [4] codex --print ──
+# ── [4] codex --print ── (CODEX_HOME already exported for the whole run)
 OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
 OK=1
-echo "$OUT" | grep -q 'export CODEX_HOME="$HOME/.mlx-serve/codex"' || OK=0
+# no dedicated home export: the user's CODEX_HOME survives into the launch
+echo "$OUT" | grep -q 'export CODEX_HOME=' && OK=0
+# the launch line rides the generated profile layer
+echo "$OUT" | grep -q -- '--profile mlx-serve' || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
-grep -q 'wire_api = "responses"' ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "model_context_window = $ADV_CTX" ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "base_url = \"$BASE/v1\"" ~/.mlx-serve/codex/config.toml || OK=0
+grep -q 'wire_api = "responses"' "$CODEX_HOME/mlx-serve.config.toml" || OK=0
+grep -q "model_context_window = $ADV_CTX" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
+grep -q "base_url = \"$BASE/v1\"" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
+# the user's own config.toml is never written
+grep -q "^; sentinel$" "$CODEX_HOME/config.toml" || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "codex config targets /v1/responses with the advertised context" PASS
+    run_test "codex profile targets /v1/responses with the advertised context" PASS
 else
-    run_test "codex config targets /v1/responses with the advertised context" FAIL "$OUT"
+    run_test "codex profile targets /v1/responses with the advertised context" FAIL "$OUT"
 fi
 
 # ── [5] claude --print ──
@@ -127,7 +151,7 @@ fi
 
 # ── [6] passthrough args ──
 OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
-if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
+if echo "$OUT" | grep -q -- "\"\$CODEX_BIN\" --profile mlx-serve 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"
