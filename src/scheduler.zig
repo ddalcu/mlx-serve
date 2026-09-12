@@ -492,6 +492,10 @@ pub const Slot = struct {
     kv_attn_fused: bool,
     cached_tokens: u32,
     logprobs_n: u32,
+    serial_reason_logged: bool = false,
+    /// This tick decodes plain (batched) although the slot's MTP head is armed: the
+    /// batched forward captures its hidden so the next solo tick can resume speculating.
+    mtp_plain_tick: bool = false,
 
     // ── State + output channel. ──
     state: SlotState,
@@ -718,6 +722,7 @@ pub const Slot = struct {
             .cache = &slot.cache,
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
+            .ssm_member_gen = transformer_mod.nextSsmMemberGen(),
             .vision_embeddings = slot.vision_embeddings,
             .mrope_pos = slot.mrope_pos,
             .mrope_total = slot.mrope_total,
@@ -727,11 +732,6 @@ pub const Slot = struct {
         };
 
         return slot;
-    }
-
-    /// This slot's attention KV length for the batched group; never `cache.step` (0 forever on a linear-layer-0 trunk).
-    pub fn batchKvLen(self: *const Slot) u32 {
-        return batchKvLenOf(&self.cache, self.model.config);
     }
 
     /// Free everything the slot owns. Only safe to call when no thread can
@@ -760,6 +760,7 @@ pub const Slot = struct {
         self.cancelled_prefill.deinit();
         self.cache.deinit();
         if (self.ssm_entries) |entries| {
+            if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
@@ -2201,25 +2202,61 @@ pub const Scheduler = struct {
     /// D: the gate reads off the slot's own model config — multi-model
     /// means the scheduler's startup config is no longer authoritative.
     fn batchable(self: *const Scheduler, slot: *const Slot) bool {
+        return self.batchVerdict(slot) == .ok;
+    }
+
+    /// Why a slot does or does not ride the batched kernel. `.ok` batches; every
+    /// other arm decodes serial this tick and is what the `[batched] serial` line
+    /// and `decode_serial_total{reason}` name.
+    fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
         _ = self;
-        if (!slotTicksRegular(slot)) return false;
+        if (!slotTicksRegular(slot)) return .spec_active;
         // A slot whose module-head release is armed but not landed still holds the head.
-        if (slotReleasePending(slot)) return false;
-        if (slot.sampling.constraint != null) return false;
-        if (slot.logprobs_n > 0) return false;
+        if (slotReleasePending(slot)) return .head_release_pending;
+        if (slot.sampling.constraint != null) return .grammar;
+        if (slot.logprobs_n > 0) return .logprobs;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
-        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
-        const cfg = slot.model.config orelse return false;
-        if (modelBatchable(cfg)) return true;
+        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return .embedded_engine;
+        const cfg = slot.model.config orelse return .arch;
+        if (modelBatchable(cfg)) return .ok;
         // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
         // a hybrid), but has its own batched kernel. Ask the transformer, never
         // name the arch here — same rule as `modelExclusiveDecode`.
-        const t = slot.model.transformer orelse return false;
-        return t.supportsBatchedGdnDecode();
+        const t = slot.model.transformer orelse return .arch;
+        return if (t.supportsBatchedGdnDecode()) .ok else .arch;
     }
 };
+
+/// Slots one batched forward can carry; the tail decodes serial this tick.
+pub const MAX_BATCH_GROUP = 32;
+
+pub const BatchVerdict = enum {
+    ok,
+    spec_active,
+    head_release_pending,
+    grammar,
+    logprobs,
+    embedded_engine,
+    arch,
+    pad_waste,
+};
+
+/// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
+/// shared with `/props`, `/v1/models` and the serve-mode startup line.
+pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
+    return modelBatchable(cfg) or cfg.supportsBatchedGdnDecode();
+}
+
+/// One line per slot the first time it decodes serial beside live company;
+/// the counter moves every tick so the rate is visible under `--metrics`.
+fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
+    if (sch.metrics) |m| m.decode_serial_total[@backingInt(why)].inc();
+    if (slot.serial_reason_logged) return;
+    slot.serial_reason_logged = true;
+    log.info("[batched] slot serial: {s} (model={s})\n", .{ @tagName(why), slot.model.id });
+}
 
 /// Batched decode pads every slot's KV to the group's LONGEST (`padAndStackBatchedKV`),
 /// so the tensor it builds is `N x kv_max`, not `sum(kv_len)`. A group mixing one
@@ -2273,11 +2310,32 @@ pub fn batchedPadWaste(kv_lens_asc: []const u32) f64 {
 /// KDA) it is 0 forever and the pad-waste cap never fired. `KVCache.kvLenForBatching` reads
 /// the first attention layer's own offset there.
 pub fn batchKvLenOf(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig) u32 {
+    return batchKvLenOfWith(cache, cfg, 1, false);
+}
+
+pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfig, seq_len: c_int, any_mrope: bool) u32 {
     // Arch gate: the multi-stream batched wins on the 27B were measured with the cap dead,
     // so every other arch keeps `cache.step` (and the dead cap) pending a measurement.
     const c = cfg orelse return @intCast(cache.step);
     if (!c.longCtxGated()) return @intCast(cache.step);
-    return @intCast(cache.kvLenForBatching());
+    const raw: u32 = @intCast(cache.kvLenForBatching());
+    const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len, any_mrope);
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len));
+    return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
+}
+
+pub fn fillGroupPadWasteKvLens(
+    caches: []const *const KVCache,
+    cfg: ?*const model_mod.ModelConfig,
+    seq_len: c_int,
+    mrope: []const bool,
+    out: []u32,
+) void {
+    var any_mrope = false;
+    for (mrope) |m| if (m) {
+        any_mrope = true;
+    };
+    for (caches, 0..) |c, i| out[i] = batchKvLenOfWith(c, cfg, seq_len, any_mrope);
 }
 
 /// Pure-config predicate: is this model's architecture compatible with the
@@ -3084,14 +3142,14 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
-        "mtp_enabled",             "mtp_head_kv_quant",         "mtp_depth",
-        "llama_cache_entries",
-        "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
-        "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
-        "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",      "ane_headroom_resolver",     "prefix_cache_mem_resolver",
+        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
+        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
+        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
+        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
+        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
+        "prefix_cache_mem_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4933,6 +4991,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             break :blk null;
         };
         // The qwen4_exp in-checkpoint head also commits its QSA half.
+        mc.activate();
         const head = mc.head();
         // Its row count IS its cache's step (`KVCache.update` never advances a non-zero
         // layer index); a snapshot whose step disagrees is refused, and says why.
@@ -5837,6 +5896,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // deepseek_v4: PLD/drafter/qwen-MTP verify passes through forwardWith
     // would APPEND draft tokens to module-owned state and corrupt every later
@@ -6276,18 +6336,64 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     // share a transformer. We partition `batchable` by `slot.model` and
     // emit one batched call per model. The non-batchable bucket doesn't
     // care — each slot runs against its own `slot.model.transformer.?`.
-    var batchable_buf: [32]*Slot = undefined;
+    var batchable_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var batchable_n: usize = 0;
+    var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
+    var mtp_n: usize = 0;
     for (active) |s| {
-        if (sch.batchable(s) and batchable_n < batchable_buf.len) {
+        const why = sch.batchVerdict(s);
+        if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;
+        } else if (why == .spec_active and slotMtpGroupable(s) and mtp_n < mtp_buf.len) {
+            mtp_buf[mtp_n] = s;
+            mtp_n += 1;
         } else {
             // legacy single-slot for spec / grammar / overflow
+            noteSerial(sch, s, why);
             try runSingleDecodeTick(sch, s);
         }
     }
-    if (batchable_n == 0) return;
+    // A crowded MTP group (measured past 3 slots on the 27B) beats its sub-grouped verify
+    // rounds with ONE plain batched tick; those slots keep their head resumable by
+    // capturing the hidden the tick forwards (`mtp_plain_tick`).
+    var mtp_group_n: usize = 0;
+    {
+        std.sort.pdq(*Slot, mtp_buf[0..mtp_n], {}, struct {
+            fn lt(_: void, a: *Slot, b: *Slot) bool {
+                return @intFromPtr(a.model) < @intFromPtr(b.model);
+            }
+        }.lt);
+        var i: usize = 0;
+        while (i < mtp_n) {
+            var j = i + 1;
+            while (j < mtp_n and mtp_buf[j].model == mtp_buf[i].model) j += 1;
+            if (j - i >= mtpCrowdThresholdFor(mtp_buf[i]) and batchable_n + (j - i) <= batchable_buf.len) {
+                for (mtp_buf[i..j]) |slot| {
+                    const gen = &slot.legacy_gen.?;
+                    gen.mtpDetachHead(slot.allocator, true) catch |e| {
+                        slot.markError(@errorName(e));
+                        continue;
+                    };
+                    gen.mtp_group_cap = 0;
+                    slot.mtp_plain_tick = true;
+                    batchable_buf[batchable_n] = slot;
+                    batchable_n += 1;
+                }
+            } else {
+                for (mtp_buf[i..j]) |slot| {
+                    mtp_buf[mtp_group_n] = slot;
+                    mtp_group_n += 1;
+                }
+            }
+            i = j;
+        }
+    }
+    try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
+    if (batchable_n == 0) {
+        if (sch.metrics) |m| m.batched_group_size.set(0);
+        return;
+    }
 
     // Group batchable slots by model pointer (in-place partition by sort).
     // The order of slots within a model doesn't matter for batched decode;
@@ -6315,7 +6421,13 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             // The stable insertion sort is part of the change: `std.sort.pdq` is unstable and
             // off qwen4_exp every key is `cache.step` == 0, so the sort decides the ordering.
             if (gate_batch_kv_len) {
-                for (group, 0..) |g, i| kv_lens[i] = g.batchKvLen();
+                var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+                var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+                for (group, 0..) |g, i| {
+                    caches_buf[i] = &g.cache;
+                    mrope_buf[i] = g.mrope_pos != null;
+                }
+                fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 1, mrope_buf[0..group.len], kv_lens[0..group.len]);
                 // Stable insertion sort, ascending, slots and lengths moving together.
                 var i: usize = 1;
                 while (i < group.len) : (i += 1) {
@@ -6349,13 +6461,17 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
                         kv_lens[group.len - 1],
                     });
                 }
-                for (group[keep..]) |s| try runSingleDecodeTick(sch, s);
+                for (group[keep..]) |s| {
+                    noteSerial(sch, s, .pad_waste);
+                    try runSingleDecodeTick(sch, s);
+                }
                 group = group[0..keep];
             }
         }
         // Honor force_batched even when only one slot is batchable so the
         // test hook actually exercises forwardBatchedDecode at N=1.
         if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
+            if (sch.metrics) |m| m.batched_group_size.set(group.len);
             try runBatchedDecodeTick(sch, group);
         } else if (group.len == 1) {
             try runSingleDecodeTick(sch, group[0]);
@@ -6525,6 +6641,48 @@ fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens
 
 /// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
 /// attributed to the slot whose forward raised it instead of the next request's prefill.
+/// The repetition-loop guard every decode tick runs first. True = the slot was finished here.
+fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    // Stop a runaway repetition loop before generating more. Some models (seen
+    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
+    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
+    // with no repeat penalty by default and a generous max_tokens, nothing else
+    // halts it until the cap. Checked here, before this tick's step, so it
+    // covers the regular, PLD, and drafter paths uniformly.
+    const loop_guard_start = gen.loopGuardStart();
+    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+        if (gen.canForceDeferredConstraintBoundary()) {
+            const boundary = try gen.forceDeferredConstraintBoundary(slot.allocator) orelse {
+                // The hard completion cap won the race with recovery. Preserve
+                // ordinary truncation rather than treating this as an error.
+                finishSlot(sch, slot, "length");
+                return true;
+            };
+            slot.pushToken(boundary);
+            slot.completion_tokens += 1;
+            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+            if (boundary != 0) slot.was_pad_only = false;
+            log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
+            return true;
+        }
+        var stop = relative_stop;
+        stop.trim_start += loop_guard_start;
+        // Never cut silently: the 2026-07-14 php.html post-mortem took log
+        // archaeology because this guard left no trace of having fired. The
+        // tier and the trim point are logged too — five cuts in a row is a
+        // different diagnosis from one, and the trim is what breaks the chain.
+        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
+            gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
+            @tagName(stop.tier),         stop.trim_start,
+        });
+        slot.finish_details = stop.finish_details;
+        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
+        finishSlot(sch, slot, stop.finish_reason);
+        return true;
+    }
+    return false;
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| {
@@ -6556,43 +6714,8 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         return;
     };
 
-    // Stop a runaway repetition loop before generating more. Some models (seen
-    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
-    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
-    // with no repeat penalty by default and a generous max_tokens, nothing else
-    // halts it until the cap. Checked here, before this tick's step, so it
-    // covers the regular, PLD, and drafter paths uniformly.
-    const loop_guard_start = gen.loopGuardStart();
-    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
-        if (gen.canForceDeferredConstraintBoundary()) {
-            const boundary = try gen.forceDeferredConstraintBoundary(slot.allocator) orelse {
-                // The hard completion cap won the race with recovery. Preserve
-                // ordinary truncation rather than treating this as an error.
-                finishSlot(sch, slot, "length");
-                return;
-            };
-            slot.pushToken(boundary);
-            slot.completion_tokens += 1;
-            std.debug.assert(slot.completion_tokens == gen.completion_tokens);
-            if (boundary != 0) slot.was_pad_only = false;
-            log.warn("[grammar] reasoning boundary forced after repetition loop at {d} generated tokens\n", .{gen.generated_ids.items.len - 1});
-            return;
-        }
-        var stop = relative_stop;
-        stop.trim_start += loop_guard_start;
-        // Never cut silently: the 2026-07-14 php.html post-mortem took log
-        // archaeology because this guard left no trace of having fired. The
-        // tier and the trim point are logged too — five cuts in a row is a
-        // different diagnosis from one, and the trim is what breaks the chain.
-        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
-            gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
-            @tagName(stop.tier),         stop.trim_start,
-        });
-        slot.finish_details = stop.finish_details;
-        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
-        finishSlot(sch, slot, stop.finish_reason);
-        return;
-    }
+    if (try loopGuardTick(sch, slot, gen)) return;
+    if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally, and `nextPld`'s
@@ -6620,6 +6743,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
     if (tick_mode == .mtp) {
+        gen.mtp_group_cap = 0;
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -6991,6 +7115,286 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// token we just committed to cache via the forward), and load the new
 /// sampled id back into next_token_id.
 /// Batched sibling: a batched group shares one forward, so a failure belongs to every slot in it.
+/// Can this MTP slot's verify ride one batched trunk forward with its neighbours?
+/// Per-request head (never qwen4's module-owned one), a GDN trunk with per-slot state
+/// the batched path merges, and a round that is actually speculating this tick.
+fn slotMtpGroupable(slot: *const Slot) bool {
+    if (!mtpGroupEnabled()) return false;
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
+    if (gen.mtp.?.moduleOwned()) return false;
+    if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
+    if (gen.ctx.ssm_entries == null) return false;
+    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
+    const t = slot.model.transformer orelse return false;
+    if (!t.supportsBatchedGdnDecode()) return false;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
+}
+
+var mtp_group_env: ?bool = null;
+fn mtpGroupEnabled() bool {
+    if (mtp_group_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
+    mtp_group_env = on;
+    return on;
+}
+
+/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
+/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
+var mtp_batched_qwen4_env: ?bool = null;
+fn mtpBatchedQwen4Enabled() bool {
+    if (mtp_batched_qwen4_env) |v| return v;
+    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
+    mtp_batched_qwen4_env = on;
+    return on;
+}
+
+fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
+    return has_qwen4 and !env_on;
+}
+
+fn mtpRoundsStaySolo(slot: *const Slot) bool {
+    const t = slot.model.transformer orelse return true;
+    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
+}
+
+fn mtpCrowdThresholdFor(slot: *const Slot) usize {
+    return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
+}
+
+/// Group MTP slots by model (pad-waste capped like the plain group) and run one
+/// batched verify per group; a group of one takes the solo round.
+fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
+    if (slots.len == 0) return;
+    std.sort.pdq(*Slot, slots, {}, struct {
+        fn lt(_: void, a: *Slot, b: *Slot) bool {
+            return @intFromPtr(a.model) < @intFromPtr(b.model);
+        }
+    }.lt);
+    var start: usize = 0;
+    while (start < slots.len) {
+        var end = start + 1;
+        while (end < slots.len and slots[end].model == slots[start].model) end += 1;
+        var group = slots[start..end];
+        if (mtpRoundsStaySolo(group[0])) {
+            for (group) |slot| try runSingleDecodeTick(sch, slot);
+            start = end;
+            continue;
+        }
+        if (group.len >= 2) {
+            var kv_lens: [MAX_BATCH_GROUP]u32 = undefined;
+            var caches_buf: [MAX_BATCH_GROUP]*const KVCache = undefined;
+            var mrope_buf: [MAX_BATCH_GROUP]bool = undefined;
+            for (group, 0..) |g, i| {
+                caches_buf[i] = &g.cache;
+                mrope_buf[i] = g.mrope_pos != null;
+            }
+            fillGroupPadWasteKvLens(caches_buf[0..group.len], group[0].model.config, 2, mrope_buf[0..group.len], kv_lens[0..group.len]);
+            var i: usize = 1;
+            while (i < group.len) : (i += 1) {
+                const slot_i = group[i];
+                const len_i = kv_lens[i];
+                var j = i;
+                while (j > 0 and kv_lens[j - 1] > len_i) : (j -= 1) {
+                    group[j] = group[j - 1];
+                    kv_lens[j] = kv_lens[j - 1];
+                }
+                group[j] = slot_i;
+                kv_lens[j] = len_i;
+            }
+            const keep = batchedKvKeepCount(kv_lens[0..group.len]);
+            for (group[keep..]) |s| {
+                noteSerial(sch, s, .pad_waste);
+                try runSingleDecodeTick(sch, s);
+            }
+            group = group[0..keep];
+        }
+        // Sub-groups sized to the verify lane's row budget; the leftover slot rounds solo.
+        var g0: usize = 0;
+        while (g0 < group.len) {
+            const rem = group.len - g0;
+            const size = mtpSubGroupSize(rem, mtpGroupRowCap());
+            const sub = group[g0 .. g0 + size];
+            if (size >= 2) {
+                const cap = mtpGroupRowCap() / @as(u32, @intCast(size)) - 1;
+                for (sub) |slot| slot.legacy_gen.?.mtp_group_cap = cap;
+                try runBatchedMtpTick(sch, sub);
+            } else {
+                sub[0].legacy_gen.?.mtp_group_cap = 0;
+                try runSingleDecodeTick(sch, sub[0]);
+            }
+            g0 += size;
+        }
+        start = end;
+    }
+}
+
+/// Rows one batched verify may carry: past 7 the projections leave the split-K lane for
+/// stock kernels; the NAX m16 tile carries 16.
+fn mtpGroupRowCap() u32 {
+    return if (dflash_mod.wideVerifyLaneAvailable()) 16 else 7;
+}
+
+/// MTP slots on one model at or past this count decode on the plain batched tick instead:
+/// sub-grouped verify rounds lose to one plain tick there.
+fn mtpCrowdThreshold() usize {
+    return mtpSubGroupSize(std.math.maxInt(usize), mtpGroupRowCap()) + 1;
+}
+
+/// Slots in the next sub-group: two at depth 2 or three at depth 1 fill 7 rows; four is
+/// better as 2+2 than 3+1.
+pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
+    if (remaining < 2) return remaining;
+    if (row_cap >= 16) return @min(remaining, 4);
+    if (remaining == 3 or remaining >= 5) return 3;
+    return 2;
+}
+
+fn runBatchedMtpTick(sch: *Scheduler, group: []*Slot) !void {
+    var inner_err: ?anyerror = null;
+    runBatchedMtpTickInner(sch, group) catch |e| {
+        inner_err = e;
+    };
+    mlx.checkErrorDecode() catch |mlx_err| {
+        log.err("[scheduler] batched verify aborted: MLX failure mid-generation ({s}) — failing these requests, the server keeps serving\n", .{@errorName(mlx_err)});
+        for (group) |slot| slot.markError(@errorName(mlx_err));
+        return;
+    };
+    if (inner_err) |e| return e;
+}
+
+/// One speculative round for a group: every slot drafts on its own head, the trunk
+/// verifies all of them in ONE `[N, S]` forward (rows padded to the widest draft),
+/// every slot accepts and rolls back on its own row.
+fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
+    const allocator = sch.allocator;
+    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var live: [MAX_BATCH_GROUP]*Slot = undefined;
+    var n: usize = 0;
+    defer for (states[0..n], live[0..n]) |*st, slot| {
+        st.deinit(slot.allocator);
+    };
+
+    for (group) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
+            slot.markError(@errorName(e));
+            continue;
+        };
+        switch (begun) {
+            .done => |r| publishMtpResult(sch, slot, gen, r),
+            .verify => |st| {
+                states[n] = st;
+                live[n] = slot;
+                n += 1;
+            },
+        }
+    }
+    if (n == 0) return;
+    if (n == 1) {
+        const gen = &live[0].legacy_gen.?;
+        try gen.mtpRoundVerify(&states[0]);
+        const r = try gen.mtpRoundFinish(live[0].allocator, &states[0]);
+        publishMtpResult(sch, live[0], gen, r);
+        return;
+    }
+
+    const xfm = live[0].model.transformer.?;
+    const s_stream = xfm.s;
+    var width: u32 = 0;
+    for (states[0..n]) |*st| width = @max(width, st.verify_len);
+    const ctxs = try allocator.alloc(*ForwardCtx, n);
+    defer allocator.free(ctxs);
+    const rope_offsets = try allocator.alloc(u32, n);
+    defer allocator.free(rope_offsets);
+    for (live[0..n], 0..) |slot, i| {
+        ctxs[i] = &slot.legacy_gen.?.ctx;
+        rope_offsets[i] = @intCast(slot.moe_seq_offset);
+    }
+    if (!xfm.batchedGdnReady(ctxs)) {
+        // No recurrent state to merge yet: every round solo this tick.
+        for (states[0..n], live[0..n]) |*st, slot| {
+            const gen = &slot.legacy_gen.?;
+            try gen.mtpRoundVerify(st);
+            const r = try gen.mtpRoundFinish(slot.allocator, st);
+            publishMtpResult(sch, slot, gen, r);
+        }
+        return;
+    }
+
+    // [N, width] rows: each verify input right-padded with token 0 (never read past 1+m).
+    const rows_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(rows_vec);
+    var padded: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var padded_n: usize = 0;
+    defer for (padded[0..padded_n]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (states[0..n]) |*st| {
+        const pad: c_int = @intCast(width - st.verify_len);
+        var row = mlx.mlx_array_new();
+        if (pad > 0) {
+            const axes = [_]c_int{1};
+            const low = [_]c_int{0};
+            const high = [_]c_int{pad};
+            const zero = mlx.mlx_array_new_int(0);
+            defer _ = mlx.mlx_array_free(zero);
+            try mlx.check(mlx.mlx_pad(&row, st.verify_input, &axes, 1, &low, 1, &high, 1, zero, "constant", s_stream));
+        } else {
+            try mlx.check(mlx.mlx_array_set(&row, st.verify_input));
+        }
+        padded[padded_n] = row;
+        padded_n += 1;
+        _ = mlx.mlx_vector_array_append_value(rows_vec, row);
+    }
+    var token_arr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(token_arr);
+    try mlx.check(mlx.mlx_concatenate_axis(&token_arr, rows_vec, 0, s_stream));
+
+    var hidden_last = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden_last);
+    var hidden_all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden_all);
+    const logits = try xfm.forwardMoeBatchedVerify(token_arr, ctxs, rope_offsets, &hidden_last, &hidden_all);
+    defer _ = mlx.mlx_array_free(logits);
+    // The batched forward moved only its scratch offset; the solo forward would have
+    // advanced every slot by the rows it ran, and the finish rolls back from there.
+    for (live[0..n]) |slot| slot.moe_seq_offset += width;
+
+    const logit_rows = try Transformer.sliceBatchRows(allocator, s_stream, logits, n);
+    defer allocator.free(logit_rows);
+    const last_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_last, n);
+    defer allocator.free(last_rows);
+    const all_rows = try Transformer.sliceBatchRows(allocator, s_stream, hidden_all, n);
+    defer allocator.free(all_rows);
+    for (states[0..n], 0..) |*st, i| {
+        st.verify_logits = logit_rows[i];
+        st.new_hidden = last_rows[i];
+        st.verify_hidden_all = all_rows[i];
+        st.verify_len = width;
+    }
+    if (sch.metrics) |m| m.batched_group_size.set(n);
+    for (states[0..n], live[0..n]) |*st, slot| {
+        const gen = &slot.legacy_gen.?;
+        const r = gen.mtpRoundFinish(slot.allocator, st) catch |e| {
+            slot.markError(@errorName(e));
+            continue;
+        };
+        publishMtpResult(sch, slot, gen, r);
+    }
+}
+
+fn publishMtpResult(sch: *Scheduler, slot: *Slot, gen: *Generator, result: ?Generator.DrafterStepResult) void {
+    const r = result orelse {
+        finishSlot(sch, slot, gen.finish_reason);
+        return;
+    };
+    defer slot.allocator.free(r.tokens);
+    publishSpeculativeBlock(sch, slot, gen, r.tokens);
+}
+
 fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var inner_err: ?anyerror = null;
     runBatchedDecodeTickInner(sch, active) catch |e| {
@@ -7098,35 +7502,61 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (batch) |s| try runSingleDecodeTick(sch, s);
         return;
     }
+    var want_hidden = false;
+    for (batch) |slot| want_hidden = want_hidden or slot.mtp_plain_tick;
+    var hidden_rows: ?[]mlx.mlx_array = null;
+    defer if (hidden_rows) |rows| {
+        for (rows) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(rows);
+    };
     const logits_arr = if (use_gdn)
-        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets)
+        try xfm_ptr.forwardMoeBatchedDecode(next_tokens, ctxs, rope_offsets, if (want_hidden) &hidden_rows else null)
     else
         try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
     defer {
         for (logits_arr) |a| _ = mlx.mlx_array_free(a);
         allocator.free(logits_arr);
     }
+    if (hidden_rows) |rows| {
+        for (batch, 0..) |slot, i| {
+            if (!slot.mtp_plain_tick) continue;
+            slot.mtp_plain_tick = false;
+            const gen = &slot.legacy_gen.?;
+            if (gen.has_last_hidden) _ = mlx.mlx_array_free(gen.last_hidden);
+            gen.last_hidden = rows[i];
+            rows[i] = mlx.mlx_array_new();
+            gen.has_last_hidden = true;
+        }
+    }
+    for (batch) |slot| slot.mtp_plain_tick = false;
     // The batched forward advances only its scratch offset; each slot's own
     // position moves here so a slot leaving the batch resumes serial from
     // the right place (qwen4's QSA reads it for kv length + tail rule).
     for (batch) |slot| slot.moe_seq_offset += 1;
 
+    // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
+    // the initWithOptions chokepoint and carries the model's
+    // reserved-token suppression mask; the slot's copy is the raw
+    // request params.
+    var sample_params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
+    var sample_rows: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var sample_ids: [MAX_BATCH_GROUP]i32 = undefined;
+    std.debug.assert(live_n == logits_arr.len);
+    std.debug.assert(live_n <= sample_params.len);
+    for (batch, 0..) |slot, i| {
+        sample_params[i] = slot.legacy_gen.?.sampling;
+        sample_rows[i] = logits_arr[i];
+    }
+    if (live_n > 0) {
+        try generate_mod.sampleRows(sample_ids[0..live_n], sample_rows[0..live_n], sample_params[0..live_n], xfm_ptr.s);
+        for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
+    }
+
     // Sample per slot, emit prev id, set new next_token_id.
     for (batch, 0..) |slot, i| {
         const gen = &slot.legacy_gen.?;
         const act = batchedTickAction(slot.cancelled.load(.acquire));
-        // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
-        // the initWithOptions chokepoint and carries the model's
-        // reserved-token suppression mask; the slot's copy is the raw
-        // request params.
-        const sampled: ?i32 = if (act.publish) blk: {
-            const lazy = gen.sampleLazy(logits_arr[i]);
-            try mlx.check(mlx.mlx_array_eval(lazy));
-            var val: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
-            _ = mlx.mlx_array_free(lazy);
-            break :blk val;
-        } else null;
+        const sampled: ?i32 = if (act.publish) sample_ids[i] else null;
 
         const emit = gen.next_token_id;
         gen.generated_ids.append(slot.allocator, emit) catch |err| {
@@ -7285,7 +7715,7 @@ test "the batched group is capped by padding waste before it is dispatched" {
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
     // ...and the dropped slots must still be ticked, or they never advance.
-    try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| try runSingleDecodeTick") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
@@ -7348,6 +7778,182 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
     );
 }
 
+test "batchKvLenOf bills qwen4 selected length when the gather arm is on" {
+    const prev = transformer_mod.qsa_batched_gather_override;
+    defer transformer_mod.qsa_batched_gather_override = prev;
+    transformer_mod.qsa_batched_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOf(&cache, &q4));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &q4));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    cache.step = 162_000;
+    cache.entries[0].initialized = true;
+    cache.entries[0].offset = 162_000;
+    transformer_mod.qsa_batched_gather_override = true;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOf(&cache, &llama));
+}
+
+test "batchKvLenOf bills raw when any gather switch is off or the slot is vision" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, true));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, true));
+    transformer_mod.qsa_batched_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = false;
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    transformer_mod.qsa_decode_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = false;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "grouping a 300k text slot beside a 1k vision slot is not admitted on the sparse bill" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_d = transformer_mod.qsa_decode_gather_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_decode_gather_override = prev_d;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_decode_gather_override = true;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var caches: [2]KVCache = undefined;
+    var built: usize = 0;
+    defer for (caches[0..built]) |*c| c.deinit();
+    caches[0] = try KVCache.init(testing.allocator, 32);
+    built = 1;
+    caches[0].entries[3].initialized = true;
+    caches[0].entries[3].offset = 300_000;
+    caches[1] = try KVCache.init(testing.allocator, 32);
+    built = 2;
+    caches[1].entries[3].initialized = true;
+    caches[1].entries[3].offset = 1_000;
+    const ptrs = [_]*const KVCache{ &caches[0], &caches[1] };
+    var billed: [2]u32 = undefined;
+    fillGroupPadWasteKvLens(&ptrs, &q4, 1, &.{ false, true }, &billed);
+    try testing.expectEqual(@as(u32, 300_000), billed[0]);
+    try testing.expectEqual(@as(u32, 1_000), billed[1]);
+    var billed_asc = billed;
+    std.mem.sort(u32, &billed_asc, {}, std.sort.asc(u32));
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&billed_asc));
+    const per_slot = [_]u32{
+        batchKvLenOfWith(&caches[1], &q4, 1, true),
+        batchKvLenOfWith(&caches[0], &q4, 1, false),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&per_slot));
+}
+
+test "S>=2 pad-waste floor is max of gather and verify mins" {
+    const prev_b = transformer_mod.qsa_batched_gather_override;
+    const prev_g = transformer_mod.qsa_gather_override;
+    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_gm = transformer_mod.qsa_gather_min_kv_override;
+    const prev_vm = transformer_mod.qsa_verify_gather_min_kv_override;
+    defer {
+        transformer_mod.qsa_batched_gather_override = prev_b;
+        transformer_mod.qsa_gather_override = prev_g;
+        transformer_mod.qsa_verify_gather_override = prev_v;
+        transformer_mod.qsa_gather_min_kv_override = prev_gm;
+        transformer_mod.qsa_verify_gather_min_kv_override = prev_vm;
+    }
+    transformer_mod.qsa_batched_gather_override = true;
+    transformer_mod.qsa_gather_override = true;
+    transformer_mod.qsa_verify_gather_override = true;
+    transformer_mod.qsa_gather_min_kv_override = 20_000;
+    transformer_mod.qsa_verify_gather_min_kv_override = 16_384;
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    var cache = try KVCache.init(testing.allocator, 32);
+    defer cache.deinit();
+    cache.entries[3].initialized = true;
+    cache.entries[3].offset = 18_000;
+    try testing.expectEqual(@as(u32, 18_000), batchKvLenOfWith(&cache, &q4, 4, false));
+    cache.entries[3].offset = 162_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+}
+
+test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw kv" {
+    var q4 = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .indexer_budget = 2048,
+        .indexer_compress_ratio = 4,
+    };
+    const min_kv: u32 = 8192;
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(162_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 2052), q4.batchedEffectiveKvLen(64_000, true, min_kv));
+    try testing.expectEqual(@as(u32, 8000), q4.batchedEffectiveKvLen(8000, true, min_kv));
+    try testing.expectEqual(@as(u32, 162_000), q4.batchedEffectiveKvLen(162_000, false, min_kv));
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    try testing.expectEqual(@as(u32, 162_000), llama.batchedEffectiveKvLen(162_000, true, min_kv));
+    var q35 = model_mod.ModelConfig{ .model_type = "qwen3_5" };
+    try testing.expectEqual(@as(u32, 162_000), q35.batchedEffectiveKvLen(162_000, true, min_kv));
+
+    const billed = [_]u32{
+        q4.batchedEffectiveKvLen(16_384, true, min_kv),
+        q4.batchedEffectiveKvLen(162_000, true, min_kv),
+    };
+    try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&billed));
+    const raw_pair = [_]u32{ 16_384, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
+    const other = [_]u32{ 1_000, 162_000 };
+    try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
+}
+
+test "mtpQwen4StaySolo is opt-in" {
+    try testing.expect(mtpQwen4StaySolo(true, false));
+    try testing.expect(!mtpQwen4StaySolo(true, true));
+    try testing.expect(!mtpQwen4StaySolo(false, false));
+    try testing.expect(!mtpQwen4StaySolo(false, true));
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
@@ -7369,11 +7975,8 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
     // the GDN predicate has to be consulted beside it.
     try testing.expect(!modelBatchable(&cfg));
 
-    // The server's clamp condition, transcribed: it must NOT fire here.
-    const server_would_clamp = !cfg.supportsBatchedGdnDecode() and
-        (cfg.has_hybrid_layers or cfg.full_attention_interval > 0 or
-            cfg.is_encoder_only or cfg.isMoe());
-    try testing.expect(!server_would_clamp);
+    // The server's startup line, /props and /v1/models read this one predicate.
+    try testing.expect(configBatchesDecode(&cfg));
 }
 
 test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
@@ -7403,7 +8006,7 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
     // are the REQUEST's wish; specTickMode is what the tick actually
     // dispatches, and spec_disabled_runtime is what recovered the throughput.
     const src = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, src, "fn batchable(self: *const Scheduler") orelse return error.MissingBatchable;
+    const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
     const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
@@ -7431,7 +8034,7 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
     // a kernel that never modelled its state.
     {
         var moe = std.mem.zeroes(model_mod.ModelConfig);
-        moe.model_type = "qwen3_5_moe";
+        moe.model_type = "hy_v3";
         moe.full_attention_interval = 4;
         moe.num_experts = 128;
         moe.num_experts_per_tok = 8;
@@ -8146,4 +8749,17 @@ test "a cancel mid batched tick keeps generated_ids level with the KV rows" {
         if (cancelled) try testing.expect(!act.publish);
     }
     try testing.expectEqual(kv_rows, prompt_len + ids);
+}
+
+test "mtpSubGroupSize fills the verify lane's row budget" {
+    // 7 rows off-NAX: pairs at depth 2, triples at depth 1, four as 2+2, one rounds solo.
+    try testing.expectEqual(@as(usize, 1), mtpSubGroupSize(1, 7));
+    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(2, 7));
+    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(3, 7));
+    try testing.expectEqual(@as(usize, 2), mtpSubGroupSize(4, 7));
+    try testing.expectEqual(@as(usize, 3), mtpSubGroupSize(5, 7));
+    try testing.expectEqual(@as(usize, 4), mtpSubGroupSize(9, 16));
+    // The depth each sub-group gets: floor(rows / size) - 1.
+    try testing.expectEqual(@as(u32, 2), 7 / @as(u32, 2) - 1);
+    try testing.expectEqual(@as(u32, 1), 7 / @as(u32, 3) - 1);
 }

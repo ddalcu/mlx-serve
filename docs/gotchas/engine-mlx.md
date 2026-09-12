@@ -4814,6 +4814,29 @@ see every narrower sample refused against a stale wider cell. Uniform
 contamination across a bucket is invisible to any ratio; that table wants
 deleting. Guard: the #382 parse test in `round_cost.zig`.
 
+### Batched MTP verify: 8 rows fall off the split-K lane; a crowd beats sub-groups
+
+Two MTP users on the dense 27B decoded slower together than one alone: every
+spec slot left the batched group and took turns (53 tok/s aggregate for two,
+45 plain). The round was split into begin / verify / finish (`MtpRoundState`)
+so a group verifies in ONE `[N, S]` trunk forward (rows padded to the widest
+draft, per-row SSM capture split back to each slot, KV + SSM clamped to
+`1 + m` on every padded row). The first cut was 2x SLOWER at depth 3: N*S = 8
+rows leave the split-K verify-qmm lane (M 2..7) for stock kernels, so the group
+is capped at 7 rows off-NAX (`mtpGroupRowCap`: pairs at depth 2, triples at
+depth 1) and the cap clamps each slot's plan (`mtp_group_cap`). Past three
+slots the sub-grouped rounds lose to one plain batched tick, so a crowd decodes
+plain with hidden capture (`mtp_plain_tick`) and resumes speculating when the
+group thins. Flash Next's head kept per-request state on the module
+(`Qwen4Mtp.cache/entry/seq_offset/...`), which is why its MTP slot was
+exclusive and a second user queued; the state is now a per-request
+`Qwen4MtpState` swapped onto the module before every head touch
+(`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
+better than solo rounds, so it stays opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
+solo, two interleave, three go plain. Bars: `tests/test_mtp_batched.sh` (fixed
+depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
+`tests/bench_concurrency_ladder.sh` (the numbers).
+
 ## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
 
 `msv_qsa_select` ran one threadgroup per query row: right for a 4096-row prefill chunk, wrong for

@@ -1116,7 +1116,7 @@ extension ServerOptions {
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",
-            explainer: "Continuous batching: how many chat requests share one forward pass. 1 = serial. 2 is a good default for dense models (~1.5× throughput, ~33% per-request latency cost). MoE and hybrid SSM models stay serial regardless.",
+            explainer: "Queue depth for in-flight chat requests. Concurrent requests always decode together; whether they share one forward pass depends on the loaded model (shown below). Dense and Qwen3.5/3.8 models batch, other MoE and hybrid models take turns.",
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",

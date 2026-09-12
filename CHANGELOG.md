@@ -43,6 +43,8 @@
 - **Structured (JSON schema) output at full speed.** Constrained decoding used to crawl at about one token per second on Flash Next; it now runs at the model's normal speed. (#380)
 - **The chat reads the way you want.** Pick Narrow, Medium or Wide from Settings or F1 to F3. Your own messages get the same hover actions as replies, photos lay out in a grid, the reasoning block collapses out of the way and shows how long the model thought, tables no longer squeeze their headers, and numbered lists, quotes and inline code render properly. (#339, thanks @lojza3d)
 - **My Models shows how much disk space is left.** (#328, thanks @justinluque)
+- **Several people can use speculative decoding at once.** On dense Qwen 3.5/3.8 models, concurrent users' draft checks now run in one pass (two users: 64 tok/s combined instead of 48; three: 73), and with four or more the server switches them to plain batching, which is faster there. On Flash Next a second MTP user no longer waits for the first to finish. Concurrent output is unchanged: at a fixed draft depth it is byte-identical on Flash Next and within kernel rounding on the batched path.
+- **Concurrent users on Qwen 3.5 and 3.8 MoE models share one decode pass** instead of taking turns, the same batching dense models and Flash Next already had. You can now see whether your model batches: Settings > Concurrent requests says so, `/props` carries a `batching` object, `/v1/models` rows carry `batched_decode`, and the log names the reason whenever a request has to decode on its own (speculative decoding, JSON schema, logprobs). Running two servers on one Mac for two users was never needed; the log line at boot now says so at every `--max-concurrent` value.
 
 ### Fixes
 

@@ -1543,21 +1543,14 @@ pub fn serve(
     // `Scheduler.batchable` so two DSV4 slots fall through to per-slot
     // `runSingleDecodeTick` — sequential through the inference thread,
     // safe).
-    if (max_concurrent > 1) {
-        // A dense GatedDeltaNet trunk (qwen3_5 family) has its OWN batched
-        // kernel since `forwardMoeBatchedDecode`, so it is no longer part of
-        // the hybrid clamp — ask the shared predicate rather than re-deriving
-        // the arch list here, or this site silently disables batching that
-        // the scheduler is willing to do.
-        if (!config.supportsBatchedGdnDecode() and
-            (config.has_hybrid_layers or config.full_attention_interval > 0 or config.is_encoder_only or config.isMoe()))
-        {
-            log.info("Concurrency: requested {d} but model is hybrid/MoE/encoder; falling back to 1\n", .{max_concurrent});
-            max_concurrent = 1;
-        } else {
-            log.info("Concurrency: --max-concurrent={d} (continuous batching enabled)\n", .{max_concurrent});
-            if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
-        }
+    // `--max-concurrent` sizes the submit queue; requests decode together at
+    // any value. Whether they share ONE forward is the model's answer, printed
+    // at every value so a default-1 boot does not read as "one at a time".
+    if (scheduler_mod.configBatchesDecode(config)) {
+        log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
+        if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+    } else {
+        log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
     global_port = port;
     // Install signal handlers for graceful shutdown
@@ -6051,7 +6044,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6063,6 +6056,7 @@ fn renderModelEntry(
             // defaults when absent (issue #188).
             ctx_str,
             ctx_str,
+            if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
             mods.items,
             config.model_type,
@@ -6696,6 +6690,24 @@ fn renderPropsBody(
     });
 }
 
+/// The model-level half of `Scheduler.batchVerdict`: does this loaded model
+/// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
+fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
+    if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
+    const cfg = entry.config orelse return .arch;
+    return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
+}
+
+/// The /props "batching" object: whether the loaded model rides the batched
+/// decode kernel, and why not when it does not.
+fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdict) ![]u8 {
+    return std.fmt.allocPrint(allocator, ",\"batching\":{{\"supported\":{s},\"reason\":\"{s}\",\"max_group\":{d}}}", .{
+        if (why == .ok) "true" else "false",
+        @tagName(why),
+        scheduler_mod.MAX_BATCH_GROUP,
+    });
+}
+
 /// The /props "ngram_warm" object; absent when no table is warming.
 fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
     if (total == 0) return allocator.dupe(u8, "");
@@ -6799,7 +6811,9 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // whenever no table is warming, so the object is absent off qwen4_exp.
     const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
     defer allocator.free(ngram_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}", .{ ane_json, ngram_json });
+    const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
+    defer allocator.free(batching_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ ane_json, ngram_json, batching_json });
     defer allocator.free(extra_json);
 
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
@@ -6818,8 +6832,8 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}}}}
-    , .{ active_mem, peak_mem, available_mem });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
+    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

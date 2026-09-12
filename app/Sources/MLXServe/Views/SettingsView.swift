@@ -1683,9 +1683,16 @@ private struct PerformanceSectionContent: View {
                 explainer: m.explainer,
                 isDirty: dirty.dirty(\.maxConcurrent)
             ) {
-                Stepper(value: opts.maxConcurrent, in: 1...8) {
-                    Text("\(appState.serverOptions.maxConcurrent)")
-                        .font(.body.monospacedDigit())
+                VStack(alignment: .trailing, spacing: 4) {
+                    Stepper(value: opts.maxConcurrent, in: 1...8) {
+                        Text("\(appState.serverOptions.maxConcurrent)")
+                            .font(.body.monospacedDigit())
+                    }
+                    if let b = server.batching {
+                        Text(b.label)
+                            .font(.caption)
+                            .foregroundStyle(b.supported ? .secondary : Color.orange)
+                    }
                 }
             }
         }
