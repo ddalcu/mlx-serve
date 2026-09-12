@@ -11,7 +11,7 @@
 //! Flow: probe the server; if it's down, start the MLX Core app (`open -g -a`)
 //! and wait — no app installed means instructions, not a mystery. Then read
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
-//! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
+//! (AgentBudget's formula: output = clamp(ctx/4, 1024, 65536) — never a
 //! hardcoded window), write the agent's config, and exec it through a login
 //! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
@@ -28,14 +28,7 @@ pub const FALLBACK_BUDGET = Budget{ .context = 32768, .output = 8192 };
 /// Mirrors Swift `AgentBudget.forServerContext`.
 pub fn budgetForContext(ctx: u64) Budget {
     if (ctx == 0) return FALLBACK_BUDGET;
-    return .{ .context = ctx, .output = @min(65536, @max(1024, ctx / 2)) };
-}
-
-/// Room an agent keeps free before compacting, and what it keeps after: a
-/// quarter of the window, capped where pi's and opencode2's own 20000-token
-/// defaults (sized for 200k windows) take over.
-pub fn compactionReserve(ctx: u64) u64 {
-    return @min(20000, @max(1024, ctx / 4));
+    return .{ .context = ctx, .output = @min(65536, @max(1024, ctx / 4)) };
 }
 
 /// One chat-capable /v1/models row as declared to an agent CLI.
@@ -160,30 +153,11 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
 /// the user's own config, no file writes). Single-quoted in the script, so
 /// the JSON must stay single-quote-free.
-/// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
-/// `--model` flag, so the config is the only place to select one.
-/// `limit.output` is the room opencode keeps free before compacting (it
-/// never sends max_tokens), so it carries the reserve, not the response cap.
-/// `compaction` (opencode2) scales its global buffer/keep to the pinned
-/// model's window: the defaults compact a 24k window before its first reply.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry, pin_model: ?[]const u8, compaction: bool) ![]u8 {
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
-    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
-    if (compaction) {
-        var ctx: u64 = FALLBACK_BUDGET.context;
-        for (entries) |e| {
-            if (pin_model == null or std.mem.eql(u8, e.id, pin_model.?)) {
-                ctx = e.budget.context;
-                break;
-            }
-        }
-        const reserve = compactionReserve(ctx);
-        try out.print(allocator, "\"compaction\": {{\"buffer\": {d}, \"keep\": {{\"tokens\": {d}}}}}, ", .{ reserve, @min(15000, reserve) });
-    }
     try out.print(allocator,
-        \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
+        \\{{"$schema": "https://opencode.ai/config.json", "provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
         try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}}}", .{
@@ -192,7 +166,7 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
             e.id,
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
-            compactionReserve(e.budget.context),
+            e.budget.output,
         });
     }
     try out.appendSlice(allocator, "}}}}");
@@ -291,44 +265,45 @@ pub fn mergeOpencode2CliJson(
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
-/// pi `settings.json`: compaction numbers scaled to the window, everything
-/// else (theme, packages, the user's own `enabled`) kept. pi compacts when
-/// context exceeds window - reserveTokens and keeps keepRecentTokens; its
-/// defaults (16384 / 20000) never compact a 24k window while max_tokens
-/// shrinks to 1.
-pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, ctx: u64) ![]u8 {
-    const trimmed = std.mem.trim(u8, existing, " \t\r\n");
-    const body = if (trimmed.len == 0) "{}" else existing;
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
-        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
-    if (parsed.value != .object) {
-        parsed.deinit();
-        parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+/// The user's real Codex home: `${CODEX_HOME:-$HOME/.codex}`, empty = unset.
+/// The profile writes there and the launched codex inherits the same value
+/// (never overwritten), so the two always agree.
+fn codexHome() []const u8 {
+    if (std.c.getenv("CODEX_HOME")) |v| {
+        const s = std.mem.span(v);
+        if (s.len > 0) return s;
     }
-    defer parsed.deinit();
-    const a = parsed.arena.allocator();
-
-    var compaction: std.json.ObjectMap = .empty;
-    if (parsed.value.object.get("compaction")) |c| {
-        if (c == .object) compaction = c.object;
-    }
-    const reserve = compactionReserve(ctx);
-    try compaction.put(a, "reserveTokens", .{ .integer = @intCast(@min(16384, reserve + 4096)) });
-    try compaction.put(a, "keepRecentTokens", .{ .integer = @intCast(reserve) });
-
-    var obj = parsed.value.object;
-    try obj.put(a, "compaction", .{ .object = compaction });
-    parsed.value = .{ .object = obj };
-    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    return std.fmt.allocPrint(std.heap.page_allocator, "{s}/.codex", .{homeDir()}) catch "/tmp/.codex";
 }
 
-/// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
-/// variant), pointing at our /v1/responses. Keyless: no `env_key` and
-/// `requires_openai_auth` unset means codex skips login; the loopback server
-/// ignores keys anyway.
-pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
+/// True for the top-level tables codex itself writes back into the profile
+/// file — `[projects."<cwd>"]` holds `trust_level`, which codex persists
+/// wherever it last saw a trust prompt answered, profile layer included.
+fn isCodexOwnedTable(header: []const u8) bool {
+    const after = std.mem.trim(u8, header[1..], " \t");
+    return std.mem.startsWith(u8, after, "projects.");
+}
+
+/// codex `mlx-serve.config.toml` — the `--profile mlx-serve` layer the
+/// launcher adds, merged over the user's own config.toml. Responses wire API
+/// only (codex-rs `WireApi` has one variant), pointing at our /v1/responses.
+/// Keyless: no `env_key` and `requires_openai_auth` unset means codex skips
+/// login; the loopback server ignores keys anyway.
+///
+/// `existing` is the file already on disk (empty when there is none): the
+/// generated keys are regenerated verbatim, but codex's OWN `[projects.*]`
+/// trust tables are carried over at the tail — codex persists `trust_level`
+/// into this profile layer, and dropping them would make it re-ask directory
+/// trust on every launch.
+pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget, existing: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator,
+        \\# Generated by mlx-serve. Regenerated on each launch (your [projects.*]
+        \\# trust entries survive; put personal settings in config.toml).
+        \\
+    );
+    try out.print(allocator,
         \\model = "{s}"
         \\model_provider = "mlx"
         \\model_context_window = {d}
@@ -339,6 +314,33 @@ pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model
         \\wire_api = "responses"
         \\
     , .{ model, budget.context, base_url });
+    var rest = existing;
+    while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+        const line = rest[0 .. nl + 1];
+        rest = rest[nl + 1 ..];
+        if (line[0] != '[') continue;
+        if (isCodexOwnedTable(line)) {
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, line);
+            var body_end: usize = 0;
+            while (body_end < rest.len) {
+                const nl2 = std.mem.indexOfScalar(u8, rest[body_end..], '\n') orelse break;
+                const next = rest[body_end .. body_end + nl2];
+                if (next.len > 0 and next[0] == '[') break;
+                if (std.mem.trim(u8, next, " \t\r").len == 0) {
+                    if (body_end > 0) break;
+                    body_end += nl2 + 1;
+                    continue;
+                }
+                body_end += nl2 + 1;
+            }
+            while (body_end > 0 and std.mem.trim(u8, rest[body_end - 1 ..], " \t\r\n").len == 0) body_end -= 1;
+            if (body_end > 0 and body_end < rest.len) body_end += 1;
+            try out.appendSlice(allocator, rest[0..body_end]);
+            rest = rest[body_end..];
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -429,23 +431,9 @@ fn appendExtras(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: [
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
 /// prepareConfig / scriptBody.
-/// Below this the agent's own fixed prompt leaves every turn compacting or
-/// truncated: Claude Code sends 40-70k before the first word (tool + MCP
-/// schemas, skills catalogue), opencode ~8k, pi ~2k.
-pub fn contextFloor(kind: AgentKind) u64 {
-    return switch (kind) {
-        .claude => 65536,
-        .opencode, .opencode2 => 32768,
-        else => 16384,
-    };
-}
-
 pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_config: ?[]const u8, extras: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    if (budget.context > 0 and budget.context < contextFloor(kind)) {
-        try out.print(allocator, "echo 'mlx-serve: the model advertises a {d}-token context; {s} needs {d}+ to work well (raise --ctx-size or Settings > Server > Context size).' >&2\n", .{ budget.context, @tagName(kind), contextFloor(kind) });
-    }
     switch (kind) {
         .claude => {
             try out.print(allocator,
@@ -492,17 +480,18 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export OPENCODE_CONFIG_CONTENT='{s}'
                 \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
                 \\if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
-                \\opencode2 --standalone
-            , .{opencode_config.?});
+                \\opencode2 --model mlx/{s}
+            , .{ opencode_config.?, model });
         },
         .codex => {
-            // PATH first, then the CLI the desktop app bundles (codex's
-            // rebranded app installs as ChatGPT.app or Codex.app, bundle id
-            // com.openai.codex, CLI at Contents/Resources/codex) — a
-            // desktop-app-only user has no codex on PATH. Mirrors the Swift
-            // AgentConfigs.codexBinResolver.
+            // No CODEX_HOME export: the user's own home (MCP servers, plugins,
+            // auth) is used as-is, and the mlx-serve provider rides the
+            // generated `--profile mlx-serve` layer. PATH first, then the CLI
+            // the desktop app bundles (codex's rebranded app installs as
+            // ChatGPT.app or Codex.app, bundle id com.openai.codex, CLI at
+            // Contents/Resources/codex) — a desktop-app-only user has no codex
+            // on PATH. Mirrors the Swift AgentConfigs.codexBinResolver.
             try out.appendSlice(allocator,
-                \\export CODEX_HOME="$HOME/.mlx-serve/codex"
                 \\CODEX_BIN="$(command -v codex)"
                 \\if [ -z "$CODEX_BIN" ]; then
                 \\  for app in "/Applications/ChatGPT.app" "/Applications/Codex.app" "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
@@ -510,7 +499,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\  done
                 \\fi
                 \\if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
-                \\"$CODEX_BIN"
+                \\"$CODEX_BIN" --profile mlx-serve
             );
         },
         .hermes => {
@@ -679,6 +668,29 @@ fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, 
     try dir.writeFile(io, .{ .sub_path = name, .data = content });
 }
 
+/// codex gets NO dedicated home: the profile lands as `mlx-serve.config.toml`
+/// (the file `--profile mlx-serve` layers over the user's config.toml) inside
+/// the effective CODEX_HOME, which the launch inherits unchanged. The
+/// generated keys are rewritten on every launch; codex's own `[projects.*]`
+/// trust tables in the existing file are carried over. The user's
+/// config.toml is never written.
+fn writeCodexProfile(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8, model: []const u8, budget: Budget) !void {
+    const home = codexHome();
+    try std.Io.Dir.cwd().createDirPath(io, home);
+    var dir = try std.Io.Dir.openDirAbsolute(io, home, .{});
+    defer dir.close(io);
+    const existing = dir.readFileAlloc(io, "mlx-serve.config.toml", allocator, .limited(1 << 20)) catch
+        try allocator.dupe(u8, "");
+    defer allocator.free(existing);
+    const toml = try codexConfigToml(allocator, base_url, model, budget, existing);
+    defer allocator.free(toml);
+    // Atomic replace: a half-written profile is a parse error for codex.
+    var file = try dir.createFileAtomic(io, "mlx-serve.config.toml", .{ .replace = true });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, toml);
+    try file.replace(io);
+}
+
 fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const dir = std.mem.span(xdg);
@@ -709,25 +721,13 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             const json = try piModelsJson(allocator, base_url, entries);
             defer allocator.free(json);
             try writeAgentFile(allocator, io, "pi", "models.json", json);
-            const settings_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/pi/settings.json", .{homeDir()});
-            defer allocator.free(settings_path);
-            const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(1 << 20)) catch
-                try allocator.dupe(u8, "{}");
-            defer allocator.free(existing);
-            const settings = try mergePiSettingsJson(allocator, existing, budget.context);
-            defer allocator.free(settings);
-            try writeAgentFile(allocator, io, "pi", "settings.json", settings);
         },
         .omp => {
             const yml = try ompModelsYml(allocator, base_url, entries);
             defer allocator.free(yml);
             try writeAgentFile(allocator, io, "omp", "models.yml", yml);
         },
-        .codex => {
-            const toml = try codexConfigToml(allocator, base_url, model, budget);
-            defer allocator.free(toml);
-            try writeAgentFile(allocator, io, "codex", "config.toml", toml);
-        },
+        .codex => try writeCodexProfile(allocator, io, base_url, model, budget),
         .hermes => {
             const yaml = try hermesConfigYaml(allocator, base_url, model, entries);
             defer allocator.free(yaml);
@@ -892,7 +892,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
-        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null, parsed.kind == .opencode2)
+        try opencodeJson(allocator, base_url, models.entries)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
@@ -939,14 +939,22 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
 const t = std.testing;
 
-test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = fallback" {
-    // Thinking shares the response cap: a 24k window at ctx/4 gave pi 6144,
-    // which one xhigh design turn on Qwen3.8 spent entirely on thinking.
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
+    _ = setenv(name, value, 1);
+}
+
+fn restoreEnv(name: [*:0]const u8, value: ?[*:0]const u8) void {
+    if (value) |v| setEnv(name, v) else _ = unsetenv(name);
+}
+
+test "budgetForContext mirrors AgentBudget: ctx/4 clamped to [1024, 65536], 0 = fallback" {
     try t.expectEqual(FALLBACK_BUDGET, budgetForContext(0));
-    try t.expectEqual(Budget{ .context = 4096, .output = 2048 }, budgetForContext(4096));
+    try t.expectEqual(Budget{ .context = 4096, .output = 1024 }, budgetForContext(4096));
     try t.expectEqual(Budget{ .context = 2048, .output = 1024 }, budgetForContext(2048));
-    try t.expectEqual(Budget{ .context = 24576, .output = 12288 }, budgetForContext(24576));
-    try t.expectEqual(Budget{ .context = 90112, .output = 45056 }, budgetForContext(90112));
+    try t.expectEqual(Budget{ .context = 90112, .output = 22528 }, budgetForContext(90112));
     try t.expectEqual(Budget{ .context = 1048576, .output = 65536 }, budgetForContext(1048576));
 }
 
@@ -966,12 +974,142 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
 }
 
 test "codex config: responses wire API, keyless, context at the root" {
-    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 22528 });
+    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 22528 }, "");
     defer t.allocator.free(toml);
     try t.expect(std.mem.indexOf(u8, toml, "wire_api = \"responses\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "model_context_window = 90112") != null);
     try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:11234/v1\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
+    try t.expect(std.mem.startsWith(u8, toml, "# Generated by mlx-serve. Regenerated on each launch (your [projects.*]\n# trust entries survive; put personal settings in config.toml).\n"));
+}
+
+test "codex config: codex-owned [projects.*] tables survive the rewrite" {
+    const existing =
+        \\# Generated by mlx-serve. Regenerated on each launch (your [projects.*]
+        \\# trust entries survive; put personal settings in config.toml).
+        \\model = "old"
+        \\model_provider = "mlx"
+        \\model_context_window = 4096
+        \\
+        \\[model_providers.mlx]
+        \\name = "MLX Serve (local)"
+        \\base_url = "http://x:1/v1"
+        \\wire_api = "responses"
+        \\
+        \\[projects."/work/one"]
+        \\trust_level = "trusted"
+        \\
+        \\[projects."/work/two"]
+        \\trust_level = "untrusted"
+        \\
+    ;
+    const toml = try codexConfigToml(t.allocator, "http://x:2", "m2", .{ .context = 8192, .output = 2048 }, existing);
+    defer t.allocator.free(toml);
+    try t.expect(std.mem.indexOf(u8, toml, "[projects.\"/work/one\"]\ntrust_level = \"trusted\"") != null);
+    try t.expect(std.mem.indexOf(u8, toml, "[projects.\"/work/two\"]\ntrust_level = \"untrusted\"") != null);
+    // generated keys regenerate from the new launch, not from `existing`
+    try t.expect(std.mem.indexOf(u8, toml, "model = \"m2\"") != null);
+    try t.expect(std.mem.indexOf(u8, toml, "model = \"old\"") == null);
+    try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://x:2/v1\"") != null);
+    try t.expect(std.mem.indexOf(u8, toml, "http://x:1") == null);
+    // the trust tables ride exactly once each
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, toml, "[projects.\"/work/"));
+}
+
+test "codex config: foreign tables in the profile are not kept" {
+    const existing =
+        \\model = "old"
+        \\
+        \\[model_providers.mlx]
+        \\base_url = "http://x:1/v1"
+        \\
+        \\[mcp_servers.thing]
+        \\command = "x"
+        \\
+    ;
+    const toml = try codexConfigToml(t.allocator, "http://x:2", "m2", .{ .context = 8192, .output = 2048 }, existing);
+    defer t.allocator.free(toml);
+    try t.expect(std.mem.indexOf(u8, toml, "mcp_servers") == null);
+}
+
+test "codex home: CODEX_HOME wins, empty falls back to ~/.codex" {
+    const old = std.c.getenv("CODEX_HOME");
+    const old_home = std.c.getenv("HOME");
+    defer restoreEnv("CODEX_HOME", old);
+    defer restoreEnv("HOME", old_home);
+
+    setEnv("CODEX_HOME", "/custom/codex");
+    try t.expectEqualStrings("/custom/codex", codexHome());
+
+    setEnv("CODEX_HOME", "");
+    setEnv("HOME", "/h");
+    try t.expectEqualStrings("/h/.codex", codexHome());
+
+    _ = unsetenv("CODEX_HOME");
+    try t.expectEqualStrings("/h/.codex", codexHome());
+}
+
+test "codex profile file lands in the effective home, base config untouched" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try dir.dir.realPath(std.testing.io, &root_buf);
+    var home_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const home_z = try std.fmt.bufPrint(&home_buf, "{s}/cx", .{root_buf[0..root_len]});
+    home_buf[home_z.len] = 0;
+    const home: [*:0]const u8 = &home_buf;
+
+    const old = std.c.getenv("CODEX_HOME");
+    defer restoreEnv("CODEX_HOME", old);
+    setEnv("CODEX_HOME", home);
+
+    try writeCodexProfile(t.allocator, std.testing.io, "http://x:1", "m1", .{ .context = 4096, .output = 1024 });
+    const written = try dir.dir.readFileAlloc(std.testing.io, "cx/mlx-serve.config.toml", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(written);
+    const expected = try codexConfigToml(t.allocator, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, "");
+    defer t.allocator.free(expected);
+    try t.expectEqualStrings(expected, written);
+    // Overwrite at the next launch works the same way.
+    try writeCodexProfile(t.allocator, std.testing.io, "http://x:2", "m2", .{ .context = 8192, .output = 2048 });
+    const rewritten = try dir.dir.readFileAlloc(std.testing.io, "cx/mlx-serve.config.toml", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(rewritten);
+    try t.expect(std.mem.indexOf(u8, rewritten, "base_url = \"http://x:2/v1\"") != null);
+    try t.expect(std.mem.indexOf(u8, rewritten, "http://x:1") == null);
+    // The base config is never written.
+    try t.expect(dir.dir.access(std.testing.io, "cx/config.toml", .{}) == error.FileNotFound);
+}
+
+test "codex profile write carries codex's trust tables across relaunches" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try dir.dir.realPath(std.testing.io, &root_buf);
+    var home_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const home_z = try std.fmt.bufPrint(&home_buf, "{s}/cx", .{root_buf[0..root_len]});
+    home_buf[home_z.len] = 0;
+    const home: [*:0]const u8 = &home_buf;
+
+    const old = std.c.getenv("CODEX_HOME");
+    defer restoreEnv("CODEX_HOME", old);
+    setEnv("CODEX_HOME", home);
+
+    try writeCodexProfile(t.allocator, std.testing.io, "http://x:1", "m1", .{ .context = 4096, .output = 1024 });
+    // codex answers a trust prompt: it persists into the profile layer.
+    const before = try dir.dir.readFileAlloc(std.testing.io, "cx/mlx-serve.config.toml", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(before);
+    const trusted = try std.fmt.allocPrint(t.allocator, "{s}\n[projects.\"/work/a\"]\ntrust_level = \"trusted\"\n", .{before});
+    defer t.allocator.free(trusted);
+    {
+        var d = try std.Io.Dir.openDirAbsolute(std.testing.io, home[0..std.mem.len(home)], .{});
+        defer d.close(std.testing.io);
+        try d.writeFile(std.testing.io, .{ .sub_path = "mlx-serve.config.toml", .data = trusted });
+    }
+    try writeCodexProfile(t.allocator, std.testing.io, "http://x:2", "m2", .{ .context = 8192, .output = 2048 });
+    const after = try dir.dir.readFileAlloc(std.testing.io, "cx/mlx-serve.config.toml", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(after);
+    try t.expect(std.mem.indexOf(u8, after, "[projects.\"/work/a\"]\ntrust_level = \"trusted\"") != null);
+    try t.expect(std.mem.indexOf(u8, after, "base_url = \"http://x:2/v1\"") != null);
+    try t.expectEqual(@as(usize, 1), std.mem.count(u8, after, "[projects.\""));
 }
 
 test "pi models.json and opencode config parse as JSON and stay single-quote-free" {
@@ -979,76 +1117,14 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = true, .loaded = true },
         .{ .id = "m2", .budget = .{ .context = 8192, .output = 2048 }, .vision = false, .loaded = false },
     };
-    const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", &entries);
-    defer t.allocator.free(pi_json);
-    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
-    defer t.allocator.free(oc_json);
-    for ([_][]const u8{ pi_json, oc_json }) |json| {
+    inline for (.{ piModelsJson, opencodeJson }) |builder| {
+        const json = try builder(t.allocator, "http://127.0.0.1:11234", &entries);
+        defer t.allocator.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
         defer parsed.deinit();
         // opencode's config rides single-quoted inside the launch script.
         try t.expect(std.mem.indexOf(u8, json, "'") == null);
     }
-}
-
-test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {
-    // pi keeps 20000 recent tokens and opencode2 reserves a 20000 buffer by
-    // default; both assume a 200k window. A 24k window compacted before its
-    // first reply (opencode2) or never (pi).
-    try t.expectEqual(@as(u64, 6144), compactionReserve(24576));
-    try t.expectEqual(@as(u64, 2048), compactionReserve(8192));
-    try t.expectEqual(@as(u64, 1024), compactionReserve(2048));
-    try t.expectEqual(@as(u64, 20000), compactionReserve(262144));
-}
-
-test "pi settings.json merge scales compaction to the window and keeps the rest" {
-    const existing =
-        \\{"theme":"dark","defaultProvider":"mlx","compaction":{"enabled":false,"reserveTokens":1}}
-    ;
-    const json = try mergePiSettingsJson(t.allocator, existing, 24576);
-    defer t.allocator.free(json);
-    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    try t.expectEqualStrings("dark", obj.get("theme").?.string);
-    const c = obj.get("compaction").?.object;
-    // The user's own enabled flag survives; the numbers are ours.
-    try t.expectEqual(false, c.get("enabled").?.bool);
-    try t.expectEqual(@as(i64, 10240), c.get("reserveTokens").?.integer);
-    try t.expectEqual(@as(i64, 6144), c.get("keepRecentTokens").?.integer);
-
-    // A big window keeps pi's own defaults (16384 / 20000); an empty file is fine.
-    const big = try mergePiSettingsJson(t.allocator, "", 262144);
-    defer t.allocator.free(big);
-    const bp = try std.json.parseFromSlice(std.json.Value, t.allocator, big, .{});
-    defer bp.deinit();
-    const bc = bp.value.object.get("compaction").?.object;
-    try t.expectEqual(@as(i64, 16384), bc.get("reserveTokens").?.integer);
-    try t.expectEqual(@as(i64, 20000), bc.get("keepRecentTokens").?.integer);
-}
-
-test "opencode config: limit.output is the compaction reserve, opencode2 gets a scaled compaction block" {
-    // opencode never sends max_tokens; `limit.output` is only the room it
-    // keeps free before compacting, and opencode2 compacts at
-    // context - max(min(output, 32000), buffer) with buffer defaulting to 20000.
-    const entries = [_]Entry{
-        .{ .id = "m1", .budget = budgetForContext(24576), .vision = false, .loaded = true },
-    };
-    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null, false);
-    defer t.allocator.free(v1);
-    const p1 = try std.json.parseFromSlice(std.json.Value, t.allocator, v1, .{});
-    defer p1.deinit();
-    const limit = p1.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get("m1").?.object.get("limit").?.object;
-    try t.expectEqual(@as(i64, 6144), limit.get("output").?.integer);
-    try t.expect(p1.value.object.get("compaction") == null);
-
-    const v2 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
-    defer t.allocator.free(v2);
-    const p2 = try std.json.parseFromSlice(std.json.Value, t.allocator, v2, .{});
-    defer p2.deinit();
-    const c = p2.value.object.get("compaction").?.object;
-    try t.expectEqual(@as(i64, 6144), c.get("buffer").?.integer);
-    try t.expectEqual(@as(i64, 6144), c.get("keep").?.object.get("tokens").?.integer);
 }
 
 test "aider metadata: litellm keys per openai/<id> entry" {
@@ -1079,8 +1155,8 @@ test "launch args: passthrough after --, unknown agent named, url trailing slash
 test "script assembly: extras are shell-quoted onto the invocation line" {
     const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{ "resume", "it's" });
     defer t.allocator.free(script);
-    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" 'resume' 'it'\\''s'") != null);
-    try t.expect(std.mem.indexOf(u8, script, "export CODEX_HOME=\"$HOME/.mlx-serve/codex\"") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" --profile mlx-serve 'resume' 'it'\\''s'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
 test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebrand)" {
@@ -1093,6 +1169,17 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
     // Never exec an empty resolution — refuse with the install hint.
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "\n\"$CODEX_BIN\"") != null);
+}
+
+test "codex script always requests the mlx-serve profile, never a dedicated home" {
+    // The invocation carries the profile request itself — NOT a CODEX_PROFILE
+    // environment variable, which a user's own export (or the app's env-less
+    // GUI process) could silently change or lose.
+    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" --profile mlx-serve") != null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_PROFILE") == null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
 test "AgentKind.fromName recognizes opencode2" {
@@ -1194,24 +1281,10 @@ test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and inv
     defer t.allocator.free(script);
     try t.expect(std.mem.indexOf(u8, script, "export XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
     try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"provider\":{}}'") != null);
-    // v2 has no root --model flag and resolves models in a SHARED background
-    // service that never sees our env: --standalone, model pinned in the config.
-    try t.expect(std.mem.indexOf(u8, script, "opencode2 --standalone") != null);
-    try t.expect(std.mem.indexOf(u8, script, "--model") == null);
+    try t.expect(std.mem.indexOf(u8, script, "opencode2 --model mlx/m1") != null);
     try t.expect(std.mem.indexOf(u8, script, "npm install -g @opencode/cli") != null);
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "'resume' 'it'\\''s'") != null);
-}
-
-test "opencodeJson pins the default model only when asked" {
-    const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = false }};
-    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null, false);
-    defer t.allocator.free(plain);
-    try t.expect(std.mem.indexOf(u8, plain, "\"model\"") == null);
-
-    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
-    defer t.allocator.free(pinned);
-    try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
 }
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {
