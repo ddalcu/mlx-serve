@@ -3333,6 +3333,12 @@ pub fn gatherQsa256(
         gqa,
         qs[2],
     );
+    if (use_nax and @import("qsa_pair.zig").enabled()) {
+        if (try @import("qsa_pair.zig").apply(s, q, k, v, scale, blocks, ratio)) |out| {
+            qsa_gather_used_nax = true;
+            return out;
+        }
+    }
     const kernel = blk: {
         if (use_nax) {
             break :blk getQsaNaxKernel() catch {
@@ -16920,6 +16926,15 @@ pub const Transformer = struct {
     fn hcReadFusedFor(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
         const hc: c_int = @intCast(self.config.hc_count);
         const hidden: c_int = @intCast(self.config.hidden_size);
+        const hp = @import("hc_prefill.zig");
+        if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size)) {
+            if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
+                defer n.deinit();
+                var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, n.raw_inject);
+                errdefer read.deinit();
+                return .{ .stream = try standinRef(n.stream), .mixed = read.mixed, .inj = read.inj };
+            }
+        }
         if (batch * seq_len > HC_FUSED_MAX_ROWS or w.down_s.ctx == null or w.up_s.ctx == null or (w.inject_w.ctx != null and w.inject_flat.ctx == null)) return null;
         const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
         const uqp = self.quantParamsFor(w.up_w, w.up_s);
@@ -16931,7 +16946,8 @@ pub const Transformer = struct {
     /// take it (decode/verify/batched widths); otherwise write now.
     fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
         std.debug.assert(pending.* == null);
-        if (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled() and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
+        const prefill = @import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size);
+        if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled())) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
             var pd: HcPending = undefined;
             pd.out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(pd.out);
@@ -16974,11 +16990,18 @@ pub const Transformer = struct {
     /// Qwen4ExpTextGatedResidual.forward: the block input is a sigmoid-mixed
     /// mean of the normalized streams; the write gates are `2·σ(inject/hc)`.
     fn hcRead(self: *Transformer, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int) !HcRead {
-        const hc: c_int = @intCast(self.config.hc_count);
-        const hidden: c_int = @intCast(self.config.hidden_size);
-        if (try self.hcReadFusedFor(stream, w, batch, seq_len, null)) |o| return .{ .mixed = o.mixed, .inj = o.inj };
+        if (try self.hcReadFusedFor(stream, w, batch, seq_len, null)) |o| {
+            if (o.stream.ctx != null) _ = mlx.mlx_array_free(o.stream);
+            return .{ .mixed = o.mixed, .inj = o.inj };
+        }
         const n4 = try self.hcGroupNorm(stream, w.norm_w, batch, seq_len);
         defer _ = mlx.mlx_array_free(n4);
+        return self.hcReadNormed(n4, w, batch, seq_len, null);
+    }
+
+    fn hcReadNormed(self: *Transformer, n4: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, raw_inject: ?mlx.mlx_array) !HcRead {
+        const hc: c_int = @intCast(self.config.hc_count);
+        const hidden: c_int = @intCast(self.config.hidden_size);
         const flat_shape = [_]c_int{ batch, seq_len, hc * hidden };
         var n_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(n_flat);
@@ -16996,7 +17019,10 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(up4);
         try mlx.check(mlx.mlx_reshape(&up4, up, &shape4, 4, self.s));
         var mixed: mlx.mlx_array = undefined;
-        if (try applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
+        const prefill_mix = if (@import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size)) try @import("hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len) else null;
+        if (prefill_mix) |m| {
+            mixed = m;
+        } else if (try applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
             mixed = m;
         } else {
             var mix = mlx.mlx_array_new();
@@ -17012,7 +17038,7 @@ pub const Transformer = struct {
 
         var inj = mlx.mlx_array_new();
         if (w.inject_w.ctx != null) {
-            const raw = try self.qmatmul(n_flat, w.inject_w, w.inject_s, w.inject_b);
+            const raw = if (raw_inject) |r| try standinRef(r) else try self.qmatmul(n_flat, w.inject_w, w.inject_s, w.inject_b);
             defer _ = mlx.mlx_array_free(raw);
             const g = (try applyClosure(self.compiled_hc_inj, &.{raw})) orelse blk: {
                 var sig = mlx.mlx_array_new();
@@ -17913,7 +17939,14 @@ pub const Transformer = struct {
         // the selection too: `qsaVerifyGatherAttn` reads the UNION of the
         // rows' selections instead of the whole cache. Its own kv floor is
         // higher than the prefill/decode one — the union is fixed-size.
-        const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
+        const pair = @import("qsa_pair.zig");
+        const pair_early = pair.enabled() and pair.supports(batch, seq_len, kv, ratio, block_topk) and
+            qsaNaxEnabled() and cfg.num_key_value_heads > 0 and
+            qsaNaxEligible(mlx.mlx_array_dtype(qk), .bfloat16, .bfloat16, @intCast(cfg.head_dim), @intCast(cfg.num_attention_heads / cfg.num_key_value_heads), seq_len) and
+            qsa_gather_min_kv_override == null and std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV") == null;
+        // The old unshared gather crossover needlessly excludes the first paired-prefill chunk.
+        const gather_floor = if (pair_early) @min(qsaGatherMinKv(), budget + ratio - 1) else qsaGatherMinKv();
+        const want_blocks = batch == 1 and kv > gather_floor and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
                 (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKv()));
         if (want_blocks) {
@@ -18781,6 +18814,7 @@ pub const Transformer = struct {
                 }
             }
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
+                try self.hcFlush(&h, batch, seq_len, &pending);
                 try evalCadencePoint(h, ctx.ssm_entries);
             }
             dt.layer(h, layer_idx);
@@ -42847,6 +42881,113 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
         const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
         defer _ = mlx.mlx_array_free(out);
         try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
+    }
+}
+
+test "hc prefill: pending write, normalized streams, inject mapping and BF16 mix across shapes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const hp = @import("hc_prefill.zig");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x91831);
+    const rnd = prng.random();
+    const w = try attn256RandBf16(rnd, &.{ 4, 2560 }, s);
+    defer _ = mlx.mlx_array_free(w);
+    var inject: [40960]f32 = @splat(0);
+    const cols = [_]u32{ 123, 2683, 5243, 7803 };
+    for (cols, 0..) |col, c| inject[col * 4 + c] = 1;
+    const iw32 = mlx.mlx_array_new_data(&inject, &[_]c_int{ 10240, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(iw32);
+    var iw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(iw);
+    try mlx.check(mlx.mlx_astype(&iw, iw32, .bfloat16, s));
+    const ids = mlx.mlx_array_new_data(&cols, &[_]c_int{4}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    const ones = try standinOnes(&.{2560}, s);
+    defer _ = mlx.mlx_array_free(ones);
+    for ([_][2]c_int{ .{ 2, 17 }, .{ 1, 65 } }) |shape| {
+        const b = shape[0];
+        const seq = shape[1];
+        const x = try attn256RandBf16(rnd, &.{ b, seq, 4, 2560 }, s);
+        defer _ = mlx.mlx_array_free(x);
+        const wo = try attn256RandBf16(rnd, &.{ b, seq, 1, 2560 }, s);
+        defer _ = mlx.mlx_array_free(wo);
+        const wi = try attn256RandBf16(rnd, &.{ b, seq, 4, 1 }, s);
+        defer _ = mlx.mlx_array_free(wi);
+        var delta = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(delta);
+        try mlx.check(mlx.mlx_multiply(&delta, wo, wi, s));
+        var written = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(written);
+        try mlx.check(mlx.mlx_add(&written, x, delta, s));
+        for ([_]bool{ false, true }) |pending| {
+            const stream = if (pending) written else x;
+            const n = (try hp.norm(s, x, w, iw, eps, b, seq, if (pending) .{ .out = wo, .inj = wi } else null)) orelse return error.HcFusedDeclined;
+            defer n.deinit();
+            var state = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(state);
+            try mlx.check(mlx.mlx_reshape(&state, n.stream, &[_]c_int{ b, seq, 4, 2560 }, 4, s));
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(state, stream, s));
+            var rms = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(rms);
+            try mlx.check(mlx.mlx_fast_rms_norm(&rms, stream, ones, 1e-6, s));
+            var normed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(normed);
+            try mlx.check(mlx.mlx_multiply(&normed, rms, w, s));
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.normalized, normed, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, normed, &[_]c_int{ b, seq, 10240 }, 3, s));
+            var raw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw);
+            try mlx.check(mlx.mlx_take_axis(&raw, flat, ids, 2, s));
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.raw_inject, raw, s));
+            var sig = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sig);
+            try mlx.check(mlx.mlx_sigmoid(&sig, x, s));
+            var prod = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(prod);
+            try mlx.check(mlx.mlx_multiply(&prod, sig, normed, s));
+            var expected = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(expected);
+            try mlx.check(mlx.mlx_mean_axis(&expected, prod, 2, false, s));
+            const mixed = (try hp.mix(s, x, normed, b, seq)) orelse return error.HcFusedDeclined;
+            defer _ = mlx.mlx_array_free(mixed);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(mixed, expected, s));
+        }
+    }
+}
+
+test "qsa pair: Zig dispatch preserves outputs across batch and sequence shape changes" {
+    if (!verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x71818);
+    const rnd = prng.random();
+    for ([_][4]c_int{ .{ 1, 17, 37, 6 }, .{ 2, 65, 159, 31 }, .{ 1, 128, 257, 32 } }) |sh| {
+        const q = try attn256RandBf16(rnd, &.{ sh[0], 24, sh[1], 256 }, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try attn256RandBf16(rnd, &.{ sh[0], 2, sh[2], 256 }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &.{ sh[0], 2, sh[2], 256 }, s);
+        defer _ = mlx.mlx_array_free(v);
+        var fx = try QsaBlockFixture.build(rnd, sh[1], sh[2], sh[3], 4);
+        defer fx.deinit();
+        var blocks = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(blocks);
+        try mlx.check(mlx.mlx_tile(&blocks, fx.blocks, &[_]c_int{ sh[0], 1, 1 }, 3, s));
+        const stock = qsaGatherProbeDispatch(s, q, k, v, 1.0 / 16.0, blocks, 4, true) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(stock);
+        const reference = if (sh[0] == 1)
+            try qsaGatherF32Reference(q, k, v, 1.0 / 16.0, blocks, 4, s)
+        else
+            try standinRef(stock);
+        defer _ = mlx.mlx_array_free(reference);
+        const paired = (try @import("qsa_pair.zig").apply(s, q, k, v, 1.0 / 16.0, blocks, 4)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(paired);
+        const stock_error = try attn256MaxDiff(stock, reference, s);
+        const pair_error = try attn256MaxDiff(paired, reference, s);
+        try std.testing.expect(pair_error <= @max(1.5 * stock_error, 4.9e-4));
     }
 }
 
