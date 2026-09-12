@@ -41,6 +41,7 @@ final class ChatModelSelectionTests: XCTestCase {
             switch ChatModelSelection.action(for: tag) {
             case .selectLan(let id): XCTAssertEqual(id, lan)
             case .selectLocal(let p): XCTAssertEqual(p, path)
+            case .selectApple: XCTFail("no apple tag was built")
             }
         }
     }
@@ -378,5 +379,27 @@ final class ChatSurfaceModelSourceTests: XCTestCase {
         }
         XCTAssertTrue(offenders.isEmpty,
                       "route through server.chatModelId — a media model would be handed to a chat CLI: \(offenders)")
+    }
+
+    // MARK: - Apple Intelligence
+
+    /// The on-device model is neither a path nor a peer, so it rides its own
+    /// tag — a local folder literally named "apple" must still load locally.
+    func testAppleTagRoundTrips() {
+        XCTAssertEqual(ChatModelSelection.tag(localPath: "/m", lanChatModelId: nil, apple: true),
+                       ChatModelSelection.appleTag)
+        XCTAssertEqual(ChatModelSelection.action(for: ChatModelSelection.appleTag), .selectApple)
+        XCTAssertEqual(ChatModelSelection.action(for: "apple"), .selectLocal("apple"))
+    }
+
+    /// It wins the pill the way a LAN pick does: the local selection is still
+    /// set underneath, and naming it would name a model that isn't answering.
+    func testApplePillNamesItselfAndNeverLoads() {
+        let state = ChatModelSelection.pillState(lanChatModelId: nil, apple: true,
+                                                 residentName: "some-resident",
+                                                 loadingPath: "/loading",
+                                                 selectedPath: "/m", models: [])
+        XCTAssertEqual(state.name, AppleFoundationChat.displayName)
+        XCTAssertFalse(state.isLoading)
     }
 }

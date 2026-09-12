@@ -2,6 +2,18 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Idle eviction: a reload that leaked, three readers it could free underneath, and a status poll that undid it
+
+`--idle-evict-secs` parsed into `ModelRegistry` and nothing ever swept, so the flag was documented and inert. Adding the sweep surfaced two things the on-demand unload path had been hiding.
+
+First, a leak. `unloadResident` deliberately RETAINS the CPU-side state (`config`, `chat_config`, `tokenizer`, `token_bytes`, `tokenize_cache`) so an unloaded entry stays listable, and the four reload install sites overwrote those pointers without freeing what was there. Nothing noticed while unloads were manual; with a sweep running every few minutes the server grew by the size of its CPU state on every cycle (~196 MB per cycle on Qwen3.8-Flash-Next). `releaseRetainedCpuState` is the one free, called at each install site. `ModelConfig` turned out to own one allocation of its own (`ngram_table_path`), which `freeCpuState` was also dropping on every failed cold load — hence `ModelConfig.deinit`, paired with every `destroy` of a parsed config.
+
+Second, fixing the leak turned three pre-existing benign races into use-after-free. `/api/tags`, `/api/show` and the pre-load text-gen gate in `handleConnection` all read that retained state holding no refcount, and the free runs on the inference thread OUTSIDE the registry mutex — so taking the mutex is necessary but not sufficient. `.loading` is the only state the free can run in (`tryBeginLoadLocked` is its sole writer, under the mutex), so a reader that takes the mutex and observes a non-`.loading` state has a real happens-before edge to the install. The predicate is `!= .loading` rather than `== .ready`: an unloaded entry retains everything and must stay fully listable. The boot load installs into a fresh stub without claiming `.loading`, which is why the precondition is asserted as `state == .loading or config == null` rather than assumed.
+
+Third, the feature did not survive contact with its own clients. `GET /props` fell through to `ensureLoaded`, so a status poll cold-loaded the model — the app's tray polls it every 3 s, and the local status tooling and the OpenCode plugin do too. Eviction worked perfectly and the next poll took the memory straight back, which reads exactly like eviction being broken. A status route answers from the counters when nothing is resident.
+
+Guards: `tests/test_idle_evict.sh` (evicts when idle, reloads under all three concurrent readers, RSS flat across cycles that all end with nothing resident, and still resident with the flag off), `testing.allocator` on the reload-frees test, and behavioural tests on each `.loading` predicate. The locking itself is comment-pinned — a source scan is the obvious guard and this repo bans them.
+
 ### Historical images decoded on every text-only continuation (2026-08-30)
 
 The active-turn media fix stopped the vision tower from re-encoding images behind the latest assistant boundary, but both chat parsers still eagerly base64-decoded, JPEG-decoded, resized, normalized and patchified every attachment before that selector ran. A Harness session retaining 24 images therefore logged 24 image decodes on every later text-only request. Qwen's 44x44 patch grid retains about 8.7 MiB of preprocessed float data per image until the request ends, so the request also carried roughly 200 MiB of avoidable transient buffers. Warm prefix reuse hid most of the latency at 24 images, but the CPU and allocation work grew linearly with conversation history and multiplied under concurrency.
@@ -2072,3 +2084,18 @@ text block. The live marker regression caught it even though the protocol tests
 passed. Guards: `tests/test_json_schema_protocol_routing.py` (all three APIs,
 streaming and non-streaming), the constrained JSON format-corpus invariant, and
 the split/UTF-8/stop tests in `src/reasoning_protocol.zig`.
+## Qwen3-Embedding sub-batches shared one KV cache (2026-09-10)
+
+A `/v1/embeddings` request splits into sub-batches once rows x longest input passes
+`EMBED_TOKEN_BUDGET` (64 x 512): 64 inputs with one over 512 tokens is enough. BERT and the
+EmbeddingGemma encoder hold no KV state, but Qwen3-Embedding runs the ordinary decoder forward,
+which appends to `xfm.cache`, and the cache was reset once per REQUEST (`runEmbedRequest`), not
+per sub-batch as issue #116 asked. Sub-batch 2 wrote its keys after sub-batch 1's, so its rows
+attended causally to sub-batch 1's rows of the same index at shifted RoPE positions. Where the
+cache write could carry those rows into the new shape (typically a second sub-batch no larger
+than the first) the request answered 200 with wrong vectors; otherwise it failed with
+`broadcast_shapes` and a 500, and the model's next embeddings request crashed in `freeKVEntry`
+(a separate `updateDense` defect). Fix: the reset moved from `runEmbedRequest` into
+`computeEmbeddingsBatch`, before every sub-batch. Guard: `tests/test_embeddings.sh` [4c] (the
+later of two equal sub-batches matches the same inputs sent alone, a second sub-batch with more
+rows answers 200, the server still answers afterwards).

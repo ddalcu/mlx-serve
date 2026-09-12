@@ -147,6 +147,14 @@ struct ServerOptions: Codable, Equatable {
     /// per-machine (M5-family GPUs carry NAX cores that raise the GPU's own
     /// prefill baseline, shrinking the ANE's edge — see AnePrefillAdvice).
     var anePrefill: Bool = false
+    /// `--ane-image` / `--ane-video` / `--ane-audio`: a share of each media
+    /// DiT block's MLP runs on the Neural Engine beside the GPU (Krea,
+    /// MiniMax-H3, ACE-Step). Off to mirror the server default; the server
+    /// solves the share per Mac and declines by name where the int8 copy
+    /// does not fit.
+    var aneImage: Bool = false
+    var aneVideo: Bool = false
+    var aneAudio: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -197,6 +205,12 @@ struct ServerOptions: Codable, Equatable {
     /// oldest gets evicted. Set to 1 to keep exactly one model loaded at a
     /// time — every switch unloads the previous model first.
     var maxResidentModels: Int = 3
+    /// Idle-eviction window (`--idle-evict-secs`), in seconds. 0 = off, the
+    /// server's own default. The registry unloads a model that has served
+    /// nothing for this long; the next request pays a cold load. Seconds off a
+    /// snap ladder, not typed text — `main.zig` reads an unparseable value as
+    /// off, so a typo would silently disable it.
+    var idleEvictSecs: Int = 0
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -507,6 +521,9 @@ struct ServerOptions: Codable, Equatable {
         mtpOnMoE == other.mtpOnMoE &&
         enableDSpark == other.enableDSpark &&
         anePrefill == other.anePrefill &&
+        aneImage == other.aneImage &&
+        aneVideo == other.aneVideo &&
+        aneAudio == other.aneAudio &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -515,6 +532,7 @@ struct ServerOptions: Codable, Equatable {
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
         maxResidentModels == other.maxResidentModels &&
+        idleEvictSecs == other.idleEvictSecs &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -553,6 +571,17 @@ struct ServerOptions: Codable, Equatable {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
         return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
+    }
+
+    /// Snap points for the idle-eviction slider, in seconds. Off first; every
+    /// step is a whole number of minutes or hours so the label never rounds.
+    static let idleEvictPresets: [Int] = [0, 300, 600, 900, 1800, 3600, 7200, 14400]
+
+    /// The slider's readout — seconds are the flag's unit, not the reader's.
+    static func idleEvictLabel(_ secs: Int) -> String {
+        if secs <= 0 { return "Off" }
+        if secs < 3600 { return "\(secs / 60) min" }
+        return "\(secs / 3600) hr"
     }
 
     static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
@@ -664,6 +693,10 @@ struct ServerOptions: Codable, Equatable {
         if anePrefill {
             args += ["--ane-prefill"]
         }
+        // Media offloads: server default OFF, so only ON emits.
+        if aneImage { args += ["--ane-image"] }
+        if aneVideo { args += ["--ane-video"] }
+        if aneAudio { args += ["--ane-audio"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
         // explicit choice emits its flag, and the positive form is what opts
@@ -707,6 +740,10 @@ struct ServerOptions: Codable, Equatable {
         }
         if maxResidentModels != 3 {
             args += ["--max-resident-models", "\(maxResidentModels)"]
+        }
+        // Omitted at 0: that IS the server default.
+        if idleEvictSecs > 0 {
+            args += ["--idle-evict-secs", "\(idleEvictSecs)"]
         }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
@@ -850,6 +887,9 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .mtpOnMoE) { mtpOnMoE = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .anePrefill) { anePrefill = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -858,6 +898,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -952,6 +993,9 @@ struct ServerOptionField {
     let title: String
     let explainer: String
     let needsRestart: Bool
+    /// What turning the setting on costs in memory and disk, shown under the
+    /// explainer and emphasized while the setting is on.
+    var cost: String? = nil
 }
 
 extension ServerOptions {
@@ -1032,8 +1076,24 @@ extension ServerOptions {
             needsRestart: true),
         "anePrefill": .init(
             title: "Neural Engine prefill boost",
-            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The Neural Engine keeps its own copy of part of the model's math — roughly 11 GB extra for a 27B, around 1 GB for a small model — and the server checks that exact fit at load, declining by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
-            needsRestart: true),
+            explainer: "Runs part of long-prompt processing on the Apple Neural Engine in parallel with the GPU, so big prompts start answering sooner — measured 19–26% faster prompt processing at 16k–32k tokens on an M4 Max with Qwen family models (4, 6 and 8-bit builds alike). Reply speed is unchanged. The server checks the exact fit at load and declines by name when this Mac can't hold it. First load of a model adds a one-time compile of about 1–2 minutes. Models it can't accelerate simply serve normally. Not recommended on M5-family Macs yet: their GPUs carry neural accelerator (NAX) cores that already speed up prompt processing, so the Neural Engine's extra help shrinks to little or nothing there.",
+            needsRestart: true,
+            cost: "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy."),
+        "aneImage": .init(
+            title: "Neural Engine image boost",
+            explainer: "Runs part of image generation on the Neural Engine alongside the GPU. Measured 1.30x on an M4 Max and 1.77x on an M1 Pro with Krea — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. The split is solved per Mac and model at the first request, which adds a one-time compile of about a minute. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 5–7 GB more while Krea is loaded, plus up to 4 GB during the one-time build. Disk: 3.5–6.6 GB once; every image size shares it."),
+        "aneVideo": .init(
+            title: "Neural Engine video boost",
+            explainer: "Runs part of video generation on the Neural Engine alongside the GPU. Measured 1.22x per denoise step on an M4 Max with MiniMax-H3. The split is solved per Mac and model; H3 rebuilds it per request (about 30 s cold, 8 s warm), so it pays on long renders. Blocks that carry a LoRA (the Turbo recipe) stay on the GPU. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 7–10 GB more while MiniMax-H3 is loaded, plus up to 3.6 GB while it builds, on every request. Disk: 5–9 GB once; every resolution and frame count shares it."),
+        "aneAudio": .init(
+            title: "Neural Engine music boost",
+            explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
+            needsRestart: true,
+            cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",
@@ -1056,7 +1116,7 @@ extension ServerOptions {
             needsRestart: true),
         "maxConcurrent": .init(
             title: "Concurrent requests",
-            explainer: "Continuous batching: how many chat requests share one forward pass. 1 = serial. 2 is a good default for dense models (~1.5× throughput, ~33% per-request latency cost). MoE and hybrid SSM models stay serial regardless.",
+            explainer: "Queue depth for in-flight chat requests. Concurrent requests always decode together; whether they share one forward pass depends on the loaded model (shown below). Dense and Qwen3.5/3.8 models batch, other MoE and hybrid models take turns.",
             needsRestart: true),
         "decodeAttnQuant": .init(
             title: "Fast decode for bf16-attention models (recommended)",
@@ -1089,6 +1149,10 @@ extension ServerOptions {
         "maxResidentModels": .init(
             title: "Max models loaded at once",
             explainer: "How many models the server keeps resident before it evicts the least-recently-used one to make room for the next. Switching models in the composer's picker never explicitly unloads the old one — it relies on this cap. Set to 1 so every switch unloads the previous model first, freeing its memory immediately. Passes --max-resident-models.",
+            needsRestart: true),
+        "idleEvictSecs": .init(
+            title: "Unload idle models",
+            explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

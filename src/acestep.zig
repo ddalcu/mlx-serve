@@ -37,6 +37,7 @@ const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const wav_mod = @import("wav.zig");
 const sse = @import("gen_sse.zig");
+const ane = @import("ane.zig");
 
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
@@ -381,6 +382,198 @@ fn lin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []cons
         o = r;
     }
     return o;
+}
+
+// ── ANE MLP offload (`--ane-audio`, opt-in, LOSSY) ──
+//
+// Same channel seam as the image/video DiTs: the ANE holds output channels
+// [0..k) of gate/up plus the matching down K-slabs (a PARTIAL down sum), the
+// GPU the complement, and the two partials ADD. ACE-Step's weights live in a
+// name-keyed map rather than per-layer structs, so the GPU complement slices
+// are materialized once into `Engine.ane_rest`.
+
+/// One quantized weight the seam holds directly (the map's `lin` solves these
+/// from the key; a sliced complement has no key).
+const AceQ = struct {
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    gs: u32,
+    fn deinit(self: *AceQ) void {
+        _ = mlx.mlx_array_free(self.w);
+        _ = mlx.mlx_array_free(self.scales);
+        _ = mlx.mlx_array_free(self.biases);
+    }
+    fn forward(self: *const AceQ, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.gs)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+        return o;
+    }
+};
+
+const AceRest = struct {
+    gate: AceQ,
+    up: AceQ,
+    down: AceQ,
+    fn deinit(self: *AceRest) void {
+        self.gate.deinit();
+        self.up.deinit();
+        self.down.deinit();
+    }
+};
+
+fn aneQFromKey(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32) !AceQ {
+    const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
+    defer a.free(wk);
+    const sk = try std.fmt.allocPrint(a, "{s}.scales", .{prefix});
+    defer a.free(sk);
+    const bk = try std.fmt.allocPrint(a, "{s}.biases", .{prefix});
+    defer a.free(bk);
+    const scales = w.get(sk) orelse return error.AneDenseBf16Unsupported;
+    const wq = try getW(w, wk);
+    const qb = try getW(w, bk);
+    const w_cols: u32 = @intCast(mlx.getShape(wq)[1]);
+    const s_cols: u32 = @intCast(mlx.getShape(scales)[1]);
+    // `getW` BORROWS from the map — an AceQ owns every handle it holds, so
+    // each one is retained here (freeing a borrowed weight is a SIGSEGV).
+    var ow = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ow);
+    try mlx.check(mlx.mlx_array_set(&ow, wq));
+    var sc = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_array_set(&sc, scales));
+    var ob = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ob);
+    try mlx.check(mlx.mlx_array_set(&ob, qb));
+    return .{
+        .w = ow,
+        .scales = sc,
+        .biases = ob,
+        .bits = @divExact(32 * w_cols, in_features),
+        .gs = @divExact(in_features, s_cols),
+    };
+}
+
+fn aneRowsView(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    var start = [_]c_int{ lo, 0 };
+    var stop = [_]c_int{ hi, @intCast(shp[1]) };
+    var step = [_]c_int{ 1, 1 };
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 2, &stop, 2, &step, 2, s));
+    return o;
+}
+
+fn aneColsCopy(x: mlx.mlx_array, from: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    var start = [_]c_int{ 0, from };
+    var stop = [_]c_int{ @intCast(shp[0]), @intCast(shp[1]) };
+    var step = [_]c_int{ 1, 1 };
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 2, &stop, 2, &step, 2, s));
+    var c = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&c, o, false, s));
+    return c;
+}
+
+/// Rest-channel rows [k..) of gate/up (axis-0 views), and fc/down columns
+/// [k..) MATERIALIZED (a lazy view into a packed weight computes wrong).
+fn aneRestRows(q: *const AceQ, from: c_int, s: S) !AceQ {
+    const w = try aneRowsView(q.w, from, @intCast(mlx.getShape(q.w)[0]), s);
+    errdefer _ = mlx.mlx_array_free(w);
+    const sc = try aneRowsView(q.scales, from, @intCast(mlx.getShape(q.scales)[0]), s);
+    errdefer _ = mlx.mlx_array_free(sc);
+    const bi = try aneRowsView(q.biases, from, @intCast(mlx.getShape(q.biases)[0]), s);
+    return .{ .w = w, .scales = sc, .biases = bi, .bits = q.bits, .gs = q.gs };
+}
+
+fn aneRestCols(q: *const AceQ, k: u32, s: S) !AceQ {
+    const w = try aneColsCopy(q.w, @intCast(k * q.bits / 32), s);
+    errdefer _ = mlx.mlx_array_free(w);
+    const g: c_int = @intCast(k / q.gs);
+    const sc = try aneColsCopy(q.scales, g, s);
+    errdefer _ = mlx.mlx_array_free(sc);
+    const bi = try aneColsCopy(q.biases, g, s);
+    return .{ .w = w, .scales = sc, .biases = bi, .bits = q.bits, .gs = q.gs };
+}
+
+/// What `ane.planMediaOffload` calibrates on: block 0 built alone.
+const AneCalib = struct {
+    e: *Engine,
+    rows: u32,
+    /// The DiT stream the MLP sees is f32.
+    dtype: mlx.mlx_dtype = .float32,
+    pub fn buildBlock0(self: AneCalib, k: u32, units: u32, share: f32) !*ane.AnePrefill {
+        try self.e.aneBuildInner(self.rows, k, units, share, 1);
+        return self.e.ane_eng.?;
+    }
+    pub fn complement(self: AneCalib, x: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(&self.e.ane_rest[0], x, self.e.s);
+    }
+    pub fn teardown(self: AneCalib) void {
+        self.e.aneDeinit();
+    }
+};
+
+/// What `ane.mediaMlp` runs on the GPU: the complement channels, or the whole
+/// MLP for the tail and the fallback.
+const AneSeam = struct {
+    a: std.mem.Allocator,
+    w: *const Weights,
+    pfx: []const u8,
+    rest: *const AceRest,
+    s: S,
+    pub fn complement(self: AneSeam, head: mlx.mlx_array) !mlx.mlx_array {
+        return aneRestForward(self.rest, head, self.s);
+    }
+    pub fn full(self: AneSeam, x: mlx.mlx_array) !mlx.mlx_array {
+        return aceMlpGpu(self.a, self.w, self.pfx, x, self.s);
+    }
+};
+
+/// The GPU partial: the same SwiGLU over the complement channels; its down
+/// output is a PARTIAL sum that adds with the ANE's.
+fn aneRestForward(rest: *const AceRest, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const g_raw = try rest.gate.forward(x, s);
+    defer _ = mlx.mlx_array_free(g_raw);
+    const g = try silu(g_raw, s);
+    defer _ = mlx.mlx_array_free(g);
+    const u = try rest.up.forward(x, s);
+    defer _ = mlx.mlx_array_free(u);
+    const act = try mulA(g, u, s);
+    defer _ = mlx.mlx_array_free(act);
+    return rest.down.forward(act, s);
+}
+
+/// The block MLP: plain GPU SwiGLU, or the ANE channel split when this block
+/// has a compiled program.
+fn aceMlpGpu(a: std.mem.Allocator, w: *const Weights, pfx: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const gate = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.mlp.gate_proj", .{pfx}), s);
+    defer _ = mlx.mlx_array_free(gate);
+    const up = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.mlp.up_proj", .{pfx}), s);
+    defer _ = mlx.mlx_array_free(up);
+    const gact = try silu(gate, s);
+    defer _ = mlx.mlx_array_free(gact);
+    const gu = try mulA(gact, up, s);
+    defer _ = mlx.mlx_array_free(gu);
+    return lin(w, a, gu, try std.fmt.allocPrint(a, "{s}.mlp.down_proj", .{pfx}), s);
+}
+
+fn aceMlpMaybeAne(e: *const Engine, a: std.mem.Allocator, w: *const Weights, pfx: []const u8, li: u32, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const eng = e.ane_eng orelse return aceMlpGpu(a, w, pfx, x, s);
+    const idx: usize = li;
+    if (!eng.mlpReady(idx) or idx >= e.ane_rest.len) return aceMlpGpu(a, w, pfx, x, s);
+    const sh = mlx.getShape(x);
+    // [1, T, hidden] or [T, hidden]; a batched (CFG) forward declines.
+    const rank_ok = (sh.len == 3 and sh[0] == 1) or sh.len == 2;
+    if (!rank_ok or sh[sh.len - 1] != @as(c_int, @intCast(eng.hidden))) return aceMlpGpu(a, w, pfx, x, s);
+    return ane.mediaMlp(s, eng, idx, "audio", x, AneSeam{ .a = a, .w = w, .pfx = pfx, .rest = &e.ane_rest[idx], .s = s }) catch |err| {
+        // An ANE failure is never a request failure — the block runs on GPU.
+        log.warn("[ane] audio block {d} split failed ({s}) — GPU fallback\n", .{ idx, @errorName(err) });
+        return aceMlpGpu(a, w, pfx, x, s);
+    };
 }
 
 /// Bidirectional band mask for sliding-window layers: additive [1,1,T,T] bf16,
@@ -852,15 +1045,7 @@ fn ditLayer(e: *const Engine, a: std.mem.Allocator, li: u32, h_in: mlx.mlx_array
     defer _ = mlx.mlx_array_free(m1);
     const mx_in = try addA(m1, chunks[3], s); // + c_shift_msa
     defer _ = mlx.mlx_array_free(mx_in);
-    const gate = try lin(w, a, mx_in, try std.fmt.allocPrint(a, "{s}.mlp.gate_proj", .{pfx}), s);
-    defer _ = mlx.mlx_array_free(gate);
-    const up = try lin(w, a, mx_in, try std.fmt.allocPrint(a, "{s}.mlp.up_proj", .{pfx}), s);
-    defer _ = mlx.mlx_array_free(up);
-    const gact = try silu(gate, s);
-    defer _ = mlx.mlx_array_free(gact);
-    const gu = try mulA(gact, up, s);
-    defer _ = mlx.mlx_array_free(gu);
-    const down = try lin(w, a, gu, try std.fmt.allocPrint(a, "{s}.mlp.down_proj", .{pfx}), s);
+    const down = try aceMlpMaybeAne(e, a, w, pfx, li, mx_in, s);
     defer _ = mlx.mlx_array_free(down);
     const fgated = try mulA(down, chunks[5], s); // × c_gate_msa
     defer _ = mlx.mlx_array_free(fgated);
@@ -1661,11 +1846,18 @@ pub const Engine = struct {
     /// 8 GB iPhone 16 Pro (2026-07-06).
     low_mem: bool,
 
+    /// ANE MLP offload (`--ane-audio`), built once the run's token
+    /// count is known; torn down with the engine.
+    ane_eng: ?*ane.AnePrefill = null,
+    ane_rest: []AceRest = &.{},
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, low_mem: bool) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.io = io;
+        self.ane_eng = null;
+        self.ane_rest = &.{};
         self.s = mlx.mlx_default_gpu_stream_new();
         self.cfg = Cfg{}; // single-member family; converted config mirrors these
         self.low_mem = low_mem;
@@ -1694,6 +1886,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        self.aneDeinit();
         self.w.deinit();
         self.vae_w.deinit();
         if (self.fsq_w) |*f| f.deinit();
@@ -1852,6 +2045,109 @@ pub const Engine = struct {
 
     /// prompt/lyrics (+ source clip for cover/complete) → 48 kHz stereo PCM16
     /// WAV bytes (owned).
+    fn aneDeinit(self: *Engine) void {
+        if (self.ane_eng) |e| e.deinit();
+        self.ane_eng = null;
+        for (self.ane_rest) |*r| r.deinit();
+        if (self.ane_rest.len > 0) self.allocator.free(self.ane_rest);
+        self.ane_rest = &.{};
+    }
+
+    /// Build the per-DiT-block ANE programs for a run of `seq_len` tokens.
+    /// Never fails the request: every refusal is a NAMED `[ane]` line.
+    pub fn buildAne(self: *Engine, seq_len: u32) void {
+        if (self.ane_eng != null or !ane.media_offload.audio) return;
+        if (!ane.available()) {
+            log.warn("[ane] audio offload: AppleNeuralEngine framework not present — GPU only\n", .{});
+            return;
+        }
+        const rows = ane.mediaTileRows(seq_len);
+        if (rows < ane.ANE_MIN_ROWS) {
+            log.warn("[ane] audio offload declined: {d} rows (seq {d}) is under the {d}-row floor — GPU only\n", .{ rows, seq_len, ane.ANE_MIN_ROWS });
+            return;
+        }
+        const hidden = self.cfg.hidden;
+        const ffn = self.cfg.intermediate;
+        var g0 = aneQFromKey(&self.w, self.allocator, "decoder.layers.0.mlp.gate_proj", hidden) catch |err| {
+            log.warn("[ane] audio offload declined: layer 0 gate unreadable ({s}) — GPU only\n", .{@errorName(err)});
+            return;
+        };
+        defer g0.deinit();
+        const probe: ane.QuantWeight = .{ .w = g0.w, .scales = g0.scales, .biases = g0.biases, .bits = g0.bits, .group_size = g0.gs, .in_dim = hidden, .out_dim = ffn };
+        const plan = ane.planMediaOffload(self.io, self.s, "audio", self.cfg.layers, hidden, ffn, rows, probe, AneCalib{ .e = self, .rows = rows }) orelse return;
+        self.aneBuildInner(rows, plan.k, plan.units, plan.share, self.cfg.layers) catch |err| {
+            log.warn("[ane] audio offload build failed ({s}) — GPU only\n", .{@errorName(err)});
+            self.aneDeinit();
+        };
+    }
+
+    /// Builds blocks [0, n); fewer than all is the calibration build.
+    fn aneBuildInner(self: *Engine, rows: u32, k: u32, units: u32, share: f32, n: usize) !void {
+        const a = self.allocator;
+        const s = self.s;
+        const hidden = self.cfg.hidden;
+        const ffn = self.cfg.intermediate;
+        const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, .channel, units);
+        errdefer eng.deinit();
+        const rests = try a.alloc(AceRest, n);
+        errdefer a.free(rests);
+        var built: usize = 0;
+        errdefer for (rests[0..built]) |*r| r.deinit();
+
+        const start = std.Io.Timestamp.now(self.io, .awake);
+        const kh: usize = @as(usize, k) * hidden;
+        const down_slice = try a.alloc(f32, @as(usize, hidden) * k);
+        defer a.free(down_slice);
+        const up_slice = try a.alloc(f32, kh);
+        defer a.free(up_slice);
+        var buf: [96]u8 = undefined;
+        for (0..n) |i| {
+            const gq = try aneQFromKey(&self.w, a, try std.fmt.bufPrint(&buf, "decoder.layers.{d}.mlp.gate_proj", .{i}), hidden);
+            var gq_m = gq;
+            defer gq_m.deinit();
+            const uq = try aneQFromKey(&self.w, a, try std.fmt.bufPrint(&buf, "decoder.layers.{d}.mlp.up_proj", .{i}), hidden);
+            var uq_m = uq;
+            defer uq_m.deinit();
+            const dq = try aneQFromKey(&self.w, a, try std.fmt.bufPrint(&buf, "decoder.layers.{d}.mlp.down_proj", .{i}), ffn);
+            var dq_m = dq;
+            defer dq_m.deinit();
+            if (dq.gs == 0 or (k * units) % dq.gs != 0 or ((k * units) * dq.bits) % 32 != 0) return error.AneChanAlignment;
+
+            rests[i] = .{
+                .gate = try aneRestRows(&gq, @intCast(k * units), s),
+                .up = try aneRestRows(&uq, @intCast(k * units), s),
+                .down = try aneRestCols(&dq, k * units, s),
+            };
+            built = i + 1;
+
+            const gate = try ane.dequantToHostF32(a, s, gq.w, gq.scales, gq.biases, gq.bits, gq.gs, hidden, ffn);
+            defer a.free(gate);
+            const up = try ane.dequantToHostF32(a, s, uq.w, uq.scales, uq.biases, uq.bits, uq.gs, hidden, ffn);
+            defer a.free(up);
+            const down = try ane.dequantToHostF32(a, s, dq.w, dq.scales, dq.biases, dq.bits, dq.gs, ffn, hidden);
+            defer a.free(down);
+            for (0..units) |u| {
+                const c0: usize = u * @as(usize, k);
+                for (0..hidden) |r| @memcpy(down_slice[r * k ..][0..k], down[r * ffn + c0 ..][0..k]);
+                // `up` carries the fp16 range scale for the whole program.
+                for (up_slice, up[u * kh ..][0..kh]) |*d, v| d.* = v / ane.OUT_PLANE_SCALE;
+                eng.addMlpLayer(u, i, gate[u * kh ..][0..kh], up_slice, down_slice) catch |err| {
+                    log.warn("[ane] block {d} unit {d} enqueue failed ({s})\n", .{ i, u, @errorName(err) });
+                    break;
+                };
+            }
+        }
+        eng.finishPending();
+        const ready = eng.coveredLayers();
+        if (ready == 0) return error.AneNoProgram;
+        const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(start.untilNow(self.io, .awake).nanoseconds)))) / 1e9;
+        const int8_bytes: u64 = @as(u64, ready) * 3 * hidden * k * units;
+        eng.publishLive(share, int8_bytes);
+        self.ane_eng = eng;
+        self.ane_rest = rests;
+        if (n == self.cfg.layers) log.info("[ane] audio offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, ready, self.cfg.layers, eng.compiledBanks(), rows, k * units, ffn, share, int8_bytes / (1024 * 1024), secs });
+    }
+
     pub fn generateWav(self: *Engine, allocator: std.mem.Allocator, req: MusicRequest, progress: ?sse.Progress) ![]u8 {
         const s = self.s;
         if (progress) |p| p.emit("encode", 0, 1);
@@ -1888,6 +2184,19 @@ pub const Engine = struct {
 
         // ── text encoder (full forward) + lyric embeds (table lookup) ──
         const te = try self.ensureTextEncoder();
+        // Per-stage clock: whole-request wall hides which stage a change moved
+        // (a low-mem box reloads the 1.1 GB text encoder EVERY request, and a
+        // slow VAE decode is 39% of wall on an M4 base — both dilute a
+        // DiT-only speedup out of visibility). The clock starts ABOVE the
+        // encoder load so no work sits outside a stage.
+        var stage_t0 = std.Io.Timestamp.now(self.io, .awake);
+        const stageMs = struct {
+            fn f(io: std.Io, t0: *std.Io.Timestamp) u64 {
+                const ns = t0.untilNow(io, .awake).nanoseconds;
+                t0.* = std.Io.Timestamp.now(io, .awake);
+                return @intCast(@divTrunc(ns, 1_000_000));
+            }
+        }.f;
         const text_hidden = try self.encodeTextPrompt(allocator, te, instruction, req, metas, s);
         defer _ = mlx.mlx_array_free(text_hidden);
         const lyric_embeds = try qwenEmbedLookup(te, lyric_ids, s);
@@ -1913,6 +2222,10 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(timbre);
         const cond2048 = try buildConditioning(self, allocator, text_hidden, lyric_embeds, timbre, s);
         defer _ = mlx.mlx_array_free(cond2048);
+        // mlx is lazy: without this the conditioning graph computes inside the
+        // denoise loop and lands in the WRONG stage.
+        _ = mlx.mlx_array_eval(cond2048);
+        const cond_ms = stageMs(self.io, &stage_t0);
         const cond2048_2: ?mlx.mlx_array = if (text_hidden2) |th2| try buildConditioning(self, allocator, th2, lyric_embeds, timbre, s) else null;
         defer if (cond2048_2) |x| {
             _ = mlx.mlx_array_free(x);
@@ -1998,6 +2311,9 @@ pub const Engine = struct {
         var switched = false;
         var cur_ctx = ctx;
         var cur_cross: *const CrossKv = &cross;
+        // ANE MLP offload for this run's DiT token count (patch_size folds
+        // `frames` down); opt-in, declines by name.
+        self.buildAne(@intCast(frames / self.cfg.patch_size));
         for (start_step..NUM_STEPS) |step| {
             if (progress) |p| {
                 if (p.cancelled()) return error.Cancelled;
@@ -2035,7 +2351,10 @@ pub const Engine = struct {
         // ── VAE decode → normalize → WAV ──
         // Decode is the pipeline's memory peak; start it from a drained cache.
         if (self.low_mem) _ = mlx.mlx_clear_cache();
+        const diffuse_ms = stageMs(self.io, &stage_t0);
         const samples = try vaeDecodeChunked(self, allocator, xt, progress, s);
+        const decode_ms = stageMs(self.io, &stage_t0);
+        log.info("[acestep] stages: text+conditioning {d} ms, diffusion {d} ms ({d} steps), vae decode {d} ms\n", .{ cond_ms, diffuse_ms, NUM_STEPS, decode_ms });
         defer allocator.free(samples);
         peakNormalize(samples, NORMALIZE_DB);
         return wav_mod.encodePcm16(allocator, samples, self.cfg.sample_rate, 2);

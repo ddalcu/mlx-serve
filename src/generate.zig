@@ -15,6 +15,7 @@ const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const round_cost = @import("round_cost.zig");
 const ane_mod = @import("ane.zig");
+const scheduler_mod = @import("scheduler.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -256,7 +257,8 @@ pub const MtpHeadRef = union(enum) {
     pub fn moduleOwned(self: MtpHeadRef) bool {
         return switch (self) {
             .qwen => false,
-            .qwen4 => true,
+            // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
+            .qwen4 => false,
         };
     }
 
@@ -264,8 +266,11 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
             .qwen4 => |t| blk: {
-                try t.qwen4MtpReset();
-                break :blk .{ .qwen4 = t };
+                const st = try allocator.create(transformer_mod.Transformer.Qwen4MtpState);
+                errdefer allocator.destroy(st);
+                st.* = try t.qwen4MtpStateNew();
+                t.qwen4MtpActivate(st);
+                break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
         };
     }
@@ -304,7 +309,10 @@ pub const MtpHeadRef = union(enum) {
     ) !mtp_mod.StepOut {
         return switch (self) {
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
-            .qwen4 => |t| qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx),
+            .qwen4 => |t| blk: {
+                cache.activate();
+                break :blk qwen4Step(t, id_arr, hidden, rope_offset, want, mrope_ctx);
+            },
         };
     }
 
@@ -328,6 +336,7 @@ pub const MtpHeadRef = union(enum) {
                 const shape = [_]c_int{@intCast(token_ids.len)};
                 const id_arr = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 1, .int32);
                 defer _ = mlx.mlx_array_free(id_arr);
+                cache.activate();
                 const out = try qwen4Step(t, id_arr, hidden, rope_offset, .none, mrope_ctx);
                 _ = mlx.mlx_array_free(out.hidden_next);
             },
@@ -426,12 +435,26 @@ pub fn mtpHeadPersistEnabled() bool {
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
-    qwen4: *Transformer,
+    qwen4: Qwen4Ref,
+
+    /// The in-checkpoint head plus this request's own half of it.
+    pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
+
+    /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
+    pub fn activate(self: *const MtpCacheRef) void {
+        switch (self.*) {
+            .qwen => {},
+            .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
+        }
+    }
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
             .qwen => |*c| c.step,
-            .qwen4 => |t| t.qwen4_mtp.?.seq_offset,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk r.t.qwen4_mtp.?.seq_offset;
+            },
         };
     }
 
@@ -441,7 +464,10 @@ pub const MtpCacheRef = union(enum) {
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
             .qwen => |*c| c,
-            .qwen4 => |t| if (mtpHeadPersistEnabled()) &t.qwen4_mtp.?.cache else null,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
+            },
         };
     }
 
@@ -449,21 +475,31 @@ pub const MtpCacheRef = union(enum) {
     pub fn head(self: *MtpCacheRef) ?*Transformer {
         return switch (self.*) {
             .qwen => null,
-            .qwen4 => |t| if (mtpHeadPersistEnabled()) t else null,
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                break :blk if (mtpHeadPersistEnabled()) r.t else null;
+            },
         };
     }
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
             .qwen => |*c| try c.truncate(len, s),
-            .qwen4 => |t| try t.qwen4MtpTruncate(len),
+            .qwen4 => |r| {
+                r.t.qwen4MtpActivate(r.st);
+                try r.t.qwen4MtpTruncate(len);
+            },
         }
     }
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
             .qwen => |*c| c.deinit(),
-            .qwen4 => {},
+            .qwen4 => |r| {
+                r.t.qwen4MtpRelease(r.st);
+                r.st.deinit();
+                r.allocator.destroy(r.st);
+            },
         }
     }
 
@@ -473,7 +509,10 @@ pub const MtpCacheRef = union(enum) {
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
             .qwen => |*c| c.appendEvalArrays(vec),
-            .qwen4 => |t| t.qwen4_mtp.?.cache.appendEvalArrays(vec),
+            .qwen4 => |r| {
+                r.t.qwen4MtpActivate(r.st);
+                r.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
+            },
         }
     }
 };
@@ -1048,7 +1087,7 @@ test "every speculative decoder caps accepted drafts before commit" {
         "nextPld",
         "nextDrafter",
         "nextDflash",
-        "nextMtp",
+        "mtpRoundFinish",
     };
     for (names) |name| {
         const signature = try std.fmt.allocPrint(testing.allocator, "    pub fn {s}", .{name});
@@ -1317,6 +1356,9 @@ pub const Generator = struct {
     /// stops feeding the kv-term learner rather than teaching it a lie.
     /// Set per tick by the scheduler.
     spec_cost_solo: bool = true,
+    /// Draft-depth cap while this slot verifies inside a batched group (0 = none):
+    /// the group's rows must stay on the split-K verify lane (`scheduler.mtpGroupRowCap`).
+    mtp_group_cap: u32 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
     mtp_trace: MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
@@ -2307,6 +2349,7 @@ pub const Generator = struct {
             );
             ctx.cache.reserve(@intCast(reserved_tokens));
             // The arch's own per-request buffers reserve at the same length.
+            if (mtp_cache) |*mc| mc.activate();
             transformer_mod.reserveQsaHistoryWithHead(
                 ctx.ssm_entries,
                 if (xfm.qwen4_mtp) |*m| &m.entry else null,
@@ -2510,6 +2553,9 @@ pub const Generator = struct {
                     };
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) {
+                        mtp_cache.?.activate();
+                    }
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
@@ -2626,6 +2672,9 @@ pub const Generator = struct {
                     };
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
+                    if (mtp_active) {
+                        mtp_cache.?.activate();
+                    }
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
@@ -5593,7 +5642,7 @@ pub const Generator = struct {
 
     /// Leave the head cleanly for a serial block; `apply_stash` applies the deferred history
     /// stash so the head history is complete up to the block. Idempotent.
-    fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
+    pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
         if (self.mtp_pre_draft) |*pd| {
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
@@ -5780,8 +5829,51 @@ pub const Generator = struct {
         return try mtpSerialOneToken(allocator, token);
     }
 
+    /// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
+    /// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
+    /// three verify outputs, `mtpRoundFinish` consumes them.
+    pub const MtpRoundState = struct {
+        chain: MtpPreDraft,
+        tracing: bool,
+        ph: io_util.Stopwatch,
+        livecost: bool,
+        round_watch: io_util.Stopwatch,
+        kv_step_snap: usize,
+        kv_snap: ?transformer_mod.KVCacheSnapshot,
+        moe_seq_offset_snap: usize,
+        /// `[1, 1+m]` int32.
+        verify_input: mlx.mlx_array,
+        /// Positions the verify forward ran; `1 + m` solo, the group's widest row batched.
+        verify_len: u32,
+        verify_logits: mlx.mlx_array = .{ .ctx = null },
+        new_hidden: mlx.mlx_array = .{ .ctx = null },
+        verify_hidden_all: mlx.mlx_array = .{ .ctx = null },
+
+        pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
+            self.chain.deinit(allocator);
+            if (self.kv_snap) |*snap| snap.deinit();
+            _ = mlx.mlx_array_free(self.verify_input);
+            if (self.verify_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_logits);
+            if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
+            if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
+        }
+    };
+
+    pub const MtpRoundBegin = union(enum) { done: ?DrafterStepResult, verify: MtpRoundState };
+
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (self.done) return null;
+        var st = switch (try self.mtpRoundBegin(allocator)) {
+            .done => |r| return r,
+            .verify => |v| v,
+        };
+        defer st.deinit(allocator);
+        try self.mtpRoundVerify(&st);
+        return self.mtpRoundFinish(allocator, &st);
+    }
+
+    /// Phases 0–2: serial-block dispatch, the draft chain, rollback anchors, the verify input.
+    pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBegin {
+        if (self.done) return .{ .done = null };
         std.debug.assert(self.mtp != null);
         std.debug.assert(self.mtp_cache != null);
         std.debug.assert(self.has_last_hidden);
@@ -5842,10 +5934,10 @@ pub const Generator = struct {
         if (self.spec_disabled_runtime or self.mtp_serial_left > 0 or self.mtp_serial_exit != .none) {
             try self.mtpDetachHead(allocator, self.mtpSerialMayResume());
             self.mtpMaybeReleaseModuleHead();
-            return try self.mtpSerialTick(allocator);
+            return .{ .done = try self.mtpSerialTick(allocator) };
         }
 
-        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
+        if (try self.checkStop()) return .{ .done = null }; // t1 is this block's first emit: stop before drafting
 
         const xfm = self.xfm;
         const s = xfm.s;
@@ -5878,7 +5970,7 @@ pub const Generator = struct {
         // Always-on round wall-clock for the live-cost round EMA (the
         // denominator of the sync fraction). Read at both commit exits.
         const livecost = mtpLiveCostEnabled();
-        var round_watch = io_util.Stopwatch.init(self.timer.io);
+        const round_watch = io_util.Stopwatch.init(self.timer.io);
 
         // ── Phase 0/1: acquire this round's draft chain ──
         // Round plan: fixed mode (and EV warmup) is a single chunk at the
@@ -5913,12 +6005,15 @@ pub const Generator = struct {
             if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
             break :blk c;
         };
-        defer chain.deinit(allocator);
+        errdefer chain.deinit(allocator);
         const plan = chain.plan;
-        const m_lo: u32 = plan.m_lo;
-        const m_max: u32 = plan.m_hi;
-        const t1: u32 = chain.t1;
-        const mtp_off0: usize = chain.off0;
+        // A chain pre-drafted before this slot joined a group may be wider than the
+        // cap: use its first `cap` drafts (the head's tail past them is truncated at
+        // the next consume, like any rejected draft).
+        const cap: u32 = if (self.mtp_group_cap > 0) self.mtp_group_cap else mtp_mod.MAX_DEPTH;
+        const m_lo: u32 = @min(plan.m_lo, cap);
+        const m_max: u32 = @min(plan.m_hi, cap);
+        chain.m = @min(chain.m, cap);
         if (tracing) {
             self.mtp_trace.add(.draft, ph.read());
             ph.reset();
@@ -5960,9 +6055,7 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(h);
             chain.h_chain = null;
         }
-        const drafts = chain.drafts;
         const draft_arrs = chain.draft_arrs;
-        const q_probs = chain.q_probs;
 
         // ── Phase 2: record rollback anchors (NO snapshot on the GDN path) ──
         // A KVCache.snapshot() refcount-shares the KV buffers, which forces
@@ -5975,9 +6068,8 @@ pub const Generator = struct {
         // snapshot is taken at all. A hypothetical pure-attention target
         // (ssm_entries == null) keeps the proven snapshot + re-forward path.
         const kv_step_snap = self.ctx.cache.step;
-        const gdn_trunk = self.ctx.ssm_entries != null;
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (gdn_trunk) null else try self.ctx.cache.snapshot();
-        defer if (kv_snap) |*snap| snap.deinit();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null) null else try self.ctx.cache.snapshot();
+        errdefer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 3: verify input [t1, drafts...] as one [1, 1+m] tensor ──
@@ -5987,7 +6079,7 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_reshape(&t1_2d, chain.t1_arr, &reshape_2d, 2, s));
 
         var verify_input = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_input);
+        errdefer _ = mlx.mlx_array_free(verify_input);
         {
             const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
             var drafts_2d_n: usize = 0;
@@ -6007,10 +6099,29 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
         }
 
+        return .{ .verify = .{
+            .chain = chain,
+            .tracing = tracing,
+            .ph = ph,
+            .livecost = livecost,
+            .round_watch = round_watch,
+            .kv_step_snap = kv_step_snap,
+            .kv_snap = kv_snap,
+            .moe_seq_offset_snap = moe_seq_offset_snap,
+            .verify_input = verify_input,
+            .verify_len = 1 + m,
+        } };
+    }
+
+    /// Phase 3 of a solo round: the trunk verify forward over `[t1, drafts…]`.
+    /// A batched group replaces this with one forward for every slot (`mtpGroupVerify`).
+    pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
+        const xfm = self.xfm;
+        const tracing = st.tracing;
         var new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(new_hidden);
         var verify_hidden_all = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_hidden_all);
+        errdefer _ = mlx.mlx_array_free(verify_hidden_all);
         // Enable per-position SSM capture for the verify pass on a GDN trunk
         // so partial accept can roll back without re-forwarding the accepted
         // prefix (mirrors nextPld — the re-forward re-runs the 48-layer
@@ -6022,9 +6133,9 @@ pub const Generator = struct {
         // chain, rollback, commit) and `verify` the forward alone.
         if (tracing and std.c.getenv("MLX_SERVE_MTP_TRACE_SYNC") != null) {
             var sync_watch = io_util.Stopwatch.init(self.timer.io);
-            try mlx.check(mlx.mlx_array_eval(verify_input));
+            try mlx.check(mlx.mlx_array_eval(st.verify_input));
             self.mtp_trace.add(.sync, sync_watch.read());
-            ph.reset();
+            st.ph.reset();
         }
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
@@ -6036,7 +6147,7 @@ pub const Generator = struct {
         // chain runs, then sync ONCE (`flushDeferredPle`, below) before Phase
         // 4 evaluates anything. Other arches never set `ple_pending`.
         self.ctx.ple_defer = true;
-        var verify_logits = xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all) catch |e| {
+        const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
             xfm.discardDeferredPle(&self.ctx);
@@ -6045,6 +6156,50 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.ple_defer = false;
         self.ctx.capture_ssm_seq = false;
+        if (tracing) {
+            self.mtp_trace.add(.verify, st.ph.read());
+            st.ph.reset();
+        }
+        // Fill the deferred PLE leaf: the one host read of the verify ids, and
+        // the point at which the entry's n-gram history + `spec_ple_tokens`
+        // advance. Must precede BOTH the first eval of anything downstream of
+        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
+        errdefer xfm.discardDeferredPle(&self.ctx);
+        try xfm.flushDeferredPle(&self.ctx);
+        st.verify_logits = verify_logits;
+        st.new_hidden = new_hidden;
+        st.verify_hidden_all = verify_hidden_all;
+    }
+
+    /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
+    /// `st.verify_len` may exceed `1 + m` when a batched group padded the row;
+    /// then even a full accept takes the rollback arm (KV + SSM clamp to `1 + m`).
+    pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRoundState) !?DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const tracing = st.tracing;
+        const livecost = st.livecost;
+        var ph = st.ph;
+        var round_watch = st.round_watch;
+        const chain = &st.chain;
+        const plan = chain.plan;
+        const m_lo: u32 = plan.m_lo;
+        const m_max: u32 = plan.m_hi;
+        const m: u32 = chain.m;
+        const t1: u32 = chain.t1;
+        const mtp_off0: usize = chain.off0;
+        const drafts = chain.drafts;
+        const draft_arrs = chain.draft_arrs;
+        const q_probs = chain.q_probs;
+        const kv_step_snap = st.kv_step_snap;
+        const moe_seq_offset_snap = st.moe_seq_offset_snap;
+        var verify_logits = st.verify_logits;
+        st.verify_logits = .{ .ctx = null };
+        errdefer _ = mlx.mlx_array_free(verify_logits);
+        var new_hidden = st.new_hidden;
+        st.new_hidden = .{ .ctx = null };
+        errdefer _ = mlx.mlx_array_free(new_hidden);
+        const verify_hidden_all = st.verify_hidden_all;
         // Always free the transient capture buffers before returning, however
         // we exit this round (full accept, partial accept, or error).
         defer if (self.ctx.ssm_entries) |entries| {
@@ -6052,15 +6207,6 @@ pub const Generator = struct {
         };
         self.mtp_attempted += 1;
         self.mtp_drafted_tokens += m;
-        if (tracing) {
-            self.mtp_trace.add(.verify, ph.read());
-            ph.reset();
-        }
-        // Fill the deferred PLE leaf: the one host read of the verify ids, and
-        // the point at which the entry's n-gram history + `spec_ple_tokens`
-        // advance. Must precede BOTH the first eval of anything downstream of
-        // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
-        try xfm.flushDeferredPle(&self.ctx);
 
         // ── Phase 4: decide longest accepted prefix ──
         // Stochastic path is fully BATCHED: accept probabilities for every
@@ -6397,7 +6543,7 @@ pub const Generator = struct {
         }
 
         // ── Phase 5b: commit / rollback the trunk ──
-        if (accepted == m) {
+        if (accepted == m and st.verify_len == 1 + m) {
             const tokens = try allocator.alloc(u32, 1 + m);
             tokens[0] = t1;
             for (drafts[0..m], 0..) |d, idx| tokens[1 + idx] = d;
@@ -6461,7 +6607,7 @@ pub const Generator = struct {
             // the restore-based fallback (same rule as nextPld).
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
-            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
+            try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
 
             const vh_shape = mlx.getShape(verify_hidden_all);
@@ -6469,7 +6615,7 @@ pub const Generator = struct {
             const stop = [_]c_int{ 1, @as(c_int, @intCast(accepted)) + 1, vh_shape[2] };
             const strides = [_]c_int{ 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&re_new_hidden, verify_hidden_all, &start, 3, &stop, 3, &strides, 3, s));
-        } else if (kv_snap) |*snap| {
+        } else if (st.kv_snap) |*snap| {
             try self.ctx.cache.restore(snap);
             self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
@@ -8338,8 +8484,9 @@ pub const Generator = struct {
         const mc = &self.mtp_cache.?;
         return switch (mc.*) {
             .qwen => 0,
-            .qwen4 => |t| blk: {
-                const m = &(t.qwen4_mtp orelse break :blk 0);
+            .qwen4 => |r| blk: {
+                r.t.qwen4MtpActivate(r.st);
+                const m = &(r.t.qwen4_mtp orelse break :blk 0);
                 const off0 = mtpRoundOff0(self.mtp_hist_stash, mc.step());
                 break :blk mtpHeadPositionDrift(@intCast(m.pos_base), m.seq_offset, @intCast(off0 + 1));
             },
@@ -8439,6 +8586,15 @@ pub const Generator = struct {
 
     /// One debug line per planned round with every input the planner read.
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
+        var plan = self.mtpRoundPlanTraced();
+        if (self.mtp_group_cap > 0) {
+            plan.m_lo = @min(plan.m_lo, self.mtp_group_cap);
+            plan.m_hi = @min(plan.m_hi, self.mtp_group_cap);
+        }
+        return plan;
+    }
+
+    fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
         if (!log.isDebug()) return self.mtpRoundPlanInner();
         const disabled_before = self.spec_disabled_runtime;
         const serial_left_before = self.mtp_serial_left;
@@ -9317,6 +9473,7 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
         return e;
     };
     xfm.flushDeferredPle(ctx) catch |e| {
+        xfm.discardDeferredPle(ctx);
         _ = mlx.mlx_array_free(logits);
         return e;
     };
@@ -9762,6 +9919,201 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     _ = mlx.mlx_array_free(current);
 
     return sampled; // Shape [1], lazy
+}
+
+pub var sample_rows_evals: u64 = 0;
+
+/// One sampling eval for every row of a batched tick. Homogeneous unseeded rows
+/// draw over one stacked `[N, V]` graph (one argmax or one categorical draw);
+/// a seed, mixed filters or a lone row take the per-row arm, whose parts are
+/// reshaped to `[1]` before the concat because a greedy draw is `[1, 1]` and a
+/// categorical draw is `[1]`. Every row advances its `draw` before the eval, so
+/// a failed eval never replays a key.
+pub fn sampleRows(out: []i32, row_logits: []const mlx.mlx_array, params: []SamplingParams, s: mlx.mlx_stream) !void {
+    std.debug.assert(out.len == row_logits.len and out.len == params.len);
+    const n = row_logits.len;
+    if (n == 0) return;
+    const lazy = try sampleRowsLazy(row_logits, params, s);
+    defer _ = mlx.mlx_array_free(lazy);
+    for (params) |*p| p.draw +%= 1;
+    sample_rows_evals += 1;
+    try mlx.check(mlx.mlx_array_eval(lazy));
+    if (n == 1) {
+        try mlx.check(mlx.mlx_array_item_int32(&out[0], lazy));
+        return;
+    }
+    const data = mlx.mlx_array_data_uint32(lazy) orelse return error.MlxError;
+    for (out, data[0..n]) |*dst, v| dst.* = @intCast(v);
+}
+
+/// Rows may share one stacked graph only when every filter matches; a seed
+/// always takes the per-row arm so its key stays per row.
+fn sampleRowsHomogeneous(params: []const SamplingParams) bool {
+    const p0 = params[0];
+    for (params[1..]) |p| {
+        if (p.temperature != p0.temperature or p.top_k != p0.top_k or p.top_p != p0.top_p) return false;
+        const m0 = p0.suppress_mask;
+        const m1 = p.suppress_mask;
+        if (m0 == null and m1 == null) continue;
+        if (m0 == null or m1 == null) return false;
+        if (m0.?.ctx != m1.?.ctx) return false;
+    }
+    return true;
+}
+
+fn sampleRowsAllGreedy(params: []const SamplingParams) bool {
+    for (params) |p| {
+        if (p.temperature >= 0.01) return false;
+    }
+    return true;
+}
+
+fn concatLogitRows(rows: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (rows.len == 1) {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&out, rows[0]));
+        return out;
+    }
+    const vec = mlx.mlx_vector_array_new_data(rows.ptr, rows.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
+}
+
+fn logitsAsNV(logits: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(logits);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (sh.len == 2) {
+        try mlx.check(mlx.mlx_array_set(&out, logits));
+        return out;
+    }
+    if (sh.len != 3 or sh[0] != n) return error.BadShape;
+    if (sh[1] == 1) {
+        const sq = [_]c_int{ n, sh[2] };
+        try mlx.check(mlx.mlx_reshape(&out, logits, &sq, 2, s));
+        return out;
+    }
+    const start = [_]c_int{ 0, sh[1] - 1, 0 };
+    const stop = [_]c_int{ n, sh[1], sh[2] };
+    const strides = [_]c_int{ 1, 1, 1 };
+    var sliced = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sliced);
+    try mlx.check(mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s));
+    const sq = [_]c_int{ n, sh[2] };
+    try mlx.check(mlx.mlx_reshape(&out, sliced, &sq, 2, s));
+    return out;
+}
+
+fn sampleRowsLazyConcat(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var parts: [scheduler_mod.MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    const n = row_logits.len;
+    if (n > parts.len) return error.BatchTooWide;
+    var n_parts: usize = 0;
+    // One release on every exit: the concat output holds its own references.
+    defer {
+        for (parts[0..n_parts]) |a| _ = mlx.mlx_array_free(a);
+    }
+    const one = [_]c_int{1};
+    for (row_logits, params) |logits, p| {
+        const raw = sampleTokenLazy(logits, p, s);
+        defer _ = mlx.mlx_array_free(raw);
+        parts[n_parts] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&parts[n_parts], raw, &one, 1, s));
+        n_parts += 1;
+    }
+    return concatLogitRows(parts[0..n_parts], s);
+}
+
+fn sampleRowsAnySeed(params: []const SamplingParams) bool {
+    for (params) |p| {
+        if (p.seed != null) return true;
+    }
+    return false;
+}
+
+fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n: c_int = @intCast(row_logits.len);
+    if (row_logits.len == 1 or !sampleRowsHomogeneous(params) or sampleRowsAnySeed(params)) {
+        return sampleRowsLazyConcat(row_logits, params, s);
+    }
+    const stacked = try concatLogitRows(row_logits, s);
+    defer _ = mlx.mlx_array_free(stacked);
+    var current = try logitsAsNV(stacked, n, s);
+    var owned = true;
+    errdefer if (owned) {
+        _ = mlx.mlx_array_free(current);
+    };
+    const p0 = params[0];
+
+    var suppressed: mlx.mlx_array = .{ .ctx = null };
+    defer if (suppressed.ctx != null) {
+        _ = mlx.mlx_array_free(suppressed);
+    };
+    if (p0.suppress_mask) |m| {
+        suppressed = mlx.mlx_array_new();
+        applySuppressMask(&suppressed, current, m, s) catch {
+            _ = mlx.mlx_array_free(suppressed);
+            suppressed = .{ .ctx = null };
+        };
+        if (suppressed.ctx != null) {
+            _ = mlx.mlx_array_free(current);
+            current = suppressed;
+            suppressed = .{ .ctx = null };
+        }
+    }
+
+    if (sampleRowsAllGreedy(params)) {
+        var result = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_argmax_axis(&result, current, -1, false, s));
+        _ = mlx.mlx_array_free(current);
+        owned = false;
+        return result;
+    }
+
+    if (p0.temperature != 1.0) {
+        const temp_arr = mlx.mlx_array_new_float(p0.temperature);
+        defer _ = mlx.mlx_array_free(temp_arr);
+        var next = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_divide(&next, current, temp_arr, s)) catch |err| {
+            _ = mlx.mlx_array_free(next);
+            return err;
+        };
+        _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if (p0.top_k > 0) {
+        var next = mlx.mlx_array_new();
+        applyTopK(&next, current, p0.top_k, s) catch {
+            _ = mlx.mlx_array_free(next);
+            next = current;
+            current = mlx.mlx_array_new();
+        };
+        if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+    if (p0.top_p < 1.0) {
+        var next = mlx.mlx_array_new();
+        applyTopP(&next, current, p0.top_p, s) catch {
+            _ = mlx.mlx_array_free(next);
+            next = current;
+            current = mlx.mlx_array_new();
+        };
+        if (current.ctx != null) _ = mlx.mlx_array_free(current);
+        current = next;
+    }
+
+    const key = seedKey(p0);
+    defer _ = mlx.mlx_array_free(key);
+    var sampled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sampled);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
+    _ = mlx.mlx_array_free(current);
+    owned = false;
+    return sampled;
 }
 
 /// PRNG key for one draw: `seed` mixed with the draw index, so a seeded
@@ -10749,6 +11101,9 @@ pub fn computeEmbeddingsBatch(
     }
     var start: usize = 0;
     while (start < seqs.len) {
+        // A decoder-arch embedder (Qwen3-Embedding) forwards through the KV
+        // cache: without a reset, a sub-batch attends to earlier sub-batches' rows.
+        try xfm.resetCache();
         const sub = seqs[start..embedSubBatchEnd(seqs, start, EMBED_MAX_BATCH, EMBED_TOKEN_BUDGET)];
         var pb = try buildPaddedBatch(allocator, sub);
         defer pb.deinit(allocator);
@@ -11616,6 +11971,143 @@ test "seeded lazy sampling replays the same draws and advances per draw" {
     var all_same = true;
     for (runs[0][1..]) |v| all_same = all_same and v == runs[0][0];
     try testing.expect(!all_same);
+}
+
+test "batched greedy ids equal two solo ids and one sampling eval" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, greedy, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ greedy, greedy };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+}
+
+test "batched mixed greedy and sampled rows produce two ids" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const sampled = SamplingParams{ .temperature = 0.7 };
+    const solo_g = try evalLazyToken(sampleTokenLazy(r0, greedy, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ greedy, sampled };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo_g)), ids[0]);
+    try testing.expect(ids[1] >= 0 and ids[1] < 4);
+}
+
+test "batched stacked seedless top_k top_p rows equal solo draws" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 0.5, 0.6, 9.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p, p };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+}
+
+test "batched stacked seedless rows honour a suppress mask" {
+    const s = mlx.gpuStream();
+    const mask = try buildSuppressMask(&[_]u32{1}, 0, 4, s);
+    defer _ = mlx.mlx_array_free(mask);
+    const data = [_]f32{
+        0.1, 5.0, 0.2, 0.3,
+        0.4, 9.0, 0.5, 0.6,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p = SamplingParams{ .temperature = 0.7, .top_k = 1, .top_p = 0.9, .suppress_mask = mask };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p, p };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+    try testing.expect(ids[0] != 1);
+    try testing.expect(ids[1] != 1);
+}
+
+test "batched seeded draws keep per-row keys" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+    };
+    const row_shape = [_]c_int{ 1, 1, 4 };
+    const r0 = mlx.mlx_array_new_data(&data[0], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r0);
+    const r1 = mlx.mlx_array_new_data(&data[4], &row_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(r1);
+
+    const p0 = SamplingParams{ .temperature = 1.0, .seed = 7, .draw = 2 };
+    const p1 = SamplingParams{ .temperature = 1.0, .seed = 99, .draw = 5 };
+    const solo0 = try evalLazyToken(sampleTokenLazy(r0, p0, s));
+    const solo1 = try evalLazyToken(sampleTokenLazy(r1, p1, s));
+
+    sample_rows_evals = 0;
+    var ids: [2]i32 = undefined;
+    var params = [_]SamplingParams{ p0, p1 };
+    const rows = [_]mlx.mlx_array{ r0, r1 };
+    try sampleRows(&ids, &rows, &params, s);
+    try testing.expectEqual(@as(u64, 1), sample_rows_evals);
+    try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
+    try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+    try testing.expectEqual(p0.draw +% 1, params[0].draw);
+    try testing.expectEqual(p1.draw +% 1, params[1].draw);
 }
 
 test "sampleToken from prefill logits (seq_len > 1)" {
@@ -14683,7 +15175,7 @@ test "MTP verify forward defers the PLE gather" {
     // it (the round's one host sync) before Phase 4 evaluates anything or
     // Phase 5 rolls the n-gram history back.
     const src = @embedFile("generate.zig");
-    const build = "xfm.forwardWithCaptureAll(&self.ctx, verify" ++ "_input, &new_hidden, &verify_hidden_all)";
+    const build = "xfm.forwardWithCaptureAll(&self.ctx, st.verify" ++ "_input, &new_hidden, &verify_hidden_all)";
     const at = std.mem.indexOf(u8, src, build) orelse return error.VerifyBuildMissing;
 
     // Armed immediately before the build, disarmed right after it.
@@ -15116,9 +15608,11 @@ test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is t
     try testing.expectEqual(@as(u8, 0), w.serial_probes[b]);
 }
 
-test "S21: a to_serial on a MODULE-OWNED head is sticky, and the release is a one-shot" {
+test "S21: a to_serial on a per-request head is not sticky; the release stays a one-shot" {
     const G = Generator;
-    try testing.expect(G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
+    // The qwen4 head keeps per-request state now (`Qwen4MtpState`), so a serial switch
+    // no longer has to give the module back.
+    try testing.expect(!G.stickyOnSerialSwitch(MtpHeadRef{ .qwen4 = undefined }));
 
     var a = G.MtpAdaptive{};
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, a.round(0, 3, .serial, 1));

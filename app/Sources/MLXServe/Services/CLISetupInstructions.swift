@@ -152,18 +152,20 @@ struct CLISetupInstructionsButton: View {
     let isEnabled: Bool
 
     @State private var showPanel = false
+    @State private var hovering = false
 
     var body: some View {
         Button {
             showPanel = true
         } label: {
-            HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                Image(systemName: "terminal")
-                Text("Code")
-            }
-            .frame(maxWidth: .infinity)
+            // The tray tile's own face, same as its Chat / Tasks / Quit
+            // siblings and the DMG build's launcher.
+            TrayTileFace(icon: "terminal", title: "Code",
+                         hovering: hovering, isEnabled: isEnabled)
         }
-        .buttonStyle(.bordered)
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .onHover { hovering = $0 }
         .disabled(!isEnabled)
         .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run")
         .popover(isPresented: $showPanel, arrowEdge: .bottom) {

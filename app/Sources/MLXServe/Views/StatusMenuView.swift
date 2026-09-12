@@ -2,14 +2,6 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Shared geometry for the tray footer's Chat / Tasks / Code buttons —
-/// they live in three files (StatusMenuView, CLILauncher,
-/// CLISetupInstructions), and with inlined values the icon-to-text gap
-/// drifted (Chat/Tasks at the 8pt HStack default, Code at an explicit 6).
-enum TrayFooterMetrics {
-    static let iconSpacing: CGFloat = 6
-}
-
 /// Claude logo icon from the official Claude AI symbol SVG.
 struct ClaudeIcon: View {
     var size: CGFloat = 14
@@ -362,6 +354,11 @@ struct StatusMenuView: View {
                     }
                 }
             }
+            if case .available = AppleFoundationChat.availability {
+                Section(ModelPalette.onDeviceSection) {
+                    Text(AppleFoundationChat.displayName).tag(ChatModelSelection.appleTag)
+                }
+            }
         }
         .labelsHidden()
         .pickerStyle(.menu)
@@ -570,33 +567,17 @@ struct StatusMenuView: View {
     // MARK: - Footer
 
     /// Chat, Tasks, Claude Code & Quit — the panel's exits, on their own bar so
-    /// they read as chrome rather than as one more section.
+    /// they read as chrome rather than as one more section. Same tiles as the
+    /// Media Generation row: one shape for everything you can open from here.
     private var footer: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 8) {
-                Button {
-                    openChat()
-                } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                        Text("Chat")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+            HStack(spacing: 6) {
+                TrayTile(icon: "bubble.left.and.bubble.right", title: "Chat",
+                         help: "Open the chat window") { openChat() }
 
-                Button {
-                    openTasks()
-                } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "clock.badge.checkmark")
-                        Text("Tasks")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help("Scheduled Tasks")
+                TrayTile(icon: "clock.badge.checkmark", title: "Tasks",
+                         help: "Scheduled Tasks") { openTasks() }
 
                 // The App Store build can't detect or launch other apps'
                 // CLIs, so its Code button shows copy-paste terminal
@@ -611,7 +592,7 @@ struct StatusMenuView: View {
                         models: server.allModels,
                         isEnabled: server.status == .running,
                         openSandboxAgent: { appState.startTerminal(agentId: $0) },
-                    openHostCLI: { appState.startTerminal(hostCLI: $0) }
+                        openHostCLI: { appState.startTerminal(hostCLI: $0) }
                     )
                 } else {
                     CLISetupInstructionsButton(
@@ -622,14 +603,14 @@ struct StatusMenuView: View {
                     )
                 }
 
-                Button {
+                // Named and red: the bare power glyph read as "stop the
+                // server", which is the control directly above it.
+                TrayTile(icon: "power", title: "Quit",
+                         help: "Quit MLX Core — stops the server and closes the app",
+                         tint: .red) {
                     server.stop()
                     NSApplication.shared.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
                 }
-                .buttonStyle(.bordered)
-                .help("Quit MLX Core")
             }
             .padding(.horizontal, TrayMetrics.gutter)
             .padding(.vertical, 10)
@@ -658,7 +639,8 @@ struct StatusMenuView: View {
     private var trayModelSelection: Binding<String> {
         Binding(
             get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
-                                          lanChatModelId: server.lanChatModelId) },
+                                          lanChatModelId: server.lanChatModelId,
+                                          apple: appState.useAppleModel) },
             // Applying a pick is `AppState.applyChatModelPick` — one method,
             // shared with the chat window's pill and the ⌘L palette.
             set: { picked in appState.applyChatModelPick(picked) }

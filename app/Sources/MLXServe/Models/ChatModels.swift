@@ -625,6 +625,34 @@ enum ServerEngine: String, CaseIterable {
     }
 }
 
+/// The `/props` "batching" object: does the loaded model share one decode
+/// forward across concurrent requests, and why not when it does not.
+struct BatchingInfo: Equatable {
+    var supported: Bool
+    var reason: String
+    var maxGroup: Int
+
+    static func parse(_ json: [String: Any]) -> BatchingInfo? {
+        guard let obj = json["batching"] as? [String: Any],
+              let supported = obj["supported"] as? Bool else { return nil }
+        return BatchingInfo(
+            supported: supported,
+            reason: obj["reason"] as? String ?? "",
+            maxGroup: obj["max_group"] as? Int ?? 0
+        )
+    }
+
+    /// One line for the settings row. Reasons are the server's `BatchVerdict` tags.
+    var label: String {
+        if supported { return "Loaded model batches decode (up to \(maxGroup) requests share one forward)." }
+        switch reason {
+        case "no_model": return "No model loaded."
+        case "embedded_engine": return "Loaded model runs on an embedded GGUF engine: concurrent requests take turns."
+        default: return "Loaded model's architecture does not batch: concurrent requests take turns."
+        }
+    }
+}
+
 /// What the server's measured spec-decode cost model resolved for this load
 /// (`/props` `"spec_cost"`, absent when `MLX_SERVE_SPEC_COST_PROBE=0` or the
 /// probe declined — then the per-silicon tables applied instead).

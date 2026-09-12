@@ -20,6 +20,7 @@ const sse = @import("gen_sse.zig");
 const png = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const lora_mod = @import("lora.zig");
+const ane = @import("ane.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -911,6 +912,134 @@ fn swigluDim(features: u32, multiplier: u32) u32 {
     return ((base + 127) / 128) * 128;
 }
 
+// ── ANE MLP offload (`--ane-image`, opt-in, LOSSY) ──
+//
+// A denoising step is a batch job at the COMPUTE roofline, which is the case
+// the LM prefill seam was never able to be: no live decode waits on it, the
+// token count is constant for a run so one compiled tile covers every step,
+// and the seam cost amortizes over a whole DiT block. Geometry, split and
+// parity bar are the channel-mode seam's (transformer.zig) — the ANE holds
+// output channels [0..k) of gate/up plus the matching down K-slabs (a PARTIAL
+// down sum), the GPU the complement, and the two partials ADD.
+
+/// Whether one DiT block's SwiGLU may ride the ANE this run. Rows are the
+/// compiled tile (`ane.mediaTileRows`), baked into the program. A
+/// LoRA-attached block DECLINES: the int8 copy was quantized before the
+/// adapter existed, so an offloaded slice would drop it silently.
+pub fn aneBlockEligible(rows: u32, quantized: bool, lora_count: u8) bool {
+    if (!quantized or lora_count > 0) return false;
+    if (rows < ane.ANE_MIN_ROWS or rows % 32 != 0) return false;
+    return true;
+}
+
+fn mlpLoraCount(m: *const SwiGLU) u8 {
+    return @max(@max(m.gate.lora_count, m.up.lora_count), m.down.lora_count);
+}
+
+/// What `ane.planMediaOffload` calibrates on: block 0 built alone.
+const AneCalib = struct {
+    d: *Dit,
+    rows: u32,
+    /// The DiT stream the MLP sees is f32 (each linear casts it to bf16).
+    dtype: mlx.mlx_dtype = .float32,
+    feat: u32,
+    mlpdim: u32,
+    s: S,
+    pub fn buildBlock0(self: AneCalib, k: u32, units: u32, share: f32) !*ane.AnePrefill {
+        try self.d.aneBuild(self.rows, k, units, self.feat, self.mlpdim, share, self.s, 1);
+        return self.d.ane_eng.?;
+    }
+    pub fn complement(self: AneCalib, x: mlx.mlx_array) !mlx.mlx_array {
+        return self.d.ane_rest[0].forward(x, self.s);
+    }
+    pub fn teardown(self: AneCalib) void {
+        self.d.aneDeinit();
+    }
+};
+
+/// What `ane.mediaMlp` runs on the GPU: the complement channels, or the whole
+/// MLP for the tail and the fallback.
+const AneSeam = struct {
+    mlp: *const SwiGLU,
+    rest: *const SwiGLU,
+    s: S,
+    pub fn complement(self: AneSeam, head: mlx.mlx_array) !mlx.mlx_array {
+        return self.rest.forward(head, self.s);
+    }
+    pub fn full(self: AneSeam, x: mlx.mlx_array) !mlx.mlx_array {
+        return self.mlp.forward(x, self.s);
+    }
+};
+
+/// Dequantize one MixedLinear to host f32 [out_dim, in_dim] (`ane` owns the op).
+fn aneDequantHostF32(a: std.mem.Allocator, ml: *const MixedLinear, in_dim: u32, out_dim: u32, s: S) ![]f32 {
+    if (!ml.quantized) return error.AneDenseBf16Unsupported;
+    return ane.dequantToHostF32(a, s, ml.w, ml.scales, ml.biases, ml.bits, ml.group_size, in_dim, out_dim);
+}
+
+/// Non-owning row view [from..) of a packed axis-0 tensor (gate/up rest).
+fn aneRowsFrom(x: mlx.mlx_array, from: c_int, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    return sliceAxis(x, 0, from, sh[0], s);
+}
+
+/// Materialized column slice [from..) of an axis-1 tensor (down rest): a view
+/// into a packed weight computes wrong at scale, so it is copied.
+fn aneColsFrom(x: mlx.mlx_array, from: c_int, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const v = try sliceAxis(x, 1, from, sh[1], s);
+    defer _ = mlx.mlx_array_free(v);
+    return contig(v, s);
+}
+
+/// One rest-channel MixedLinear: an axis-0 row VIEW [from..) of a packed
+/// weight (gate/up — the ANE holds rows [0..from)).
+fn aneRestRows(ml: *const MixedLinear, from: c_int, s: S) !MixedLinear {
+    const w = try aneRowsFrom(ml.w, from, s);
+    errdefer _ = mlx.mlx_array_free(w);
+    const sc = try aneRowsFrom(ml.scales, from, s);
+    errdefer _ = mlx.mlx_array_free(sc);
+    const bi = try aneRowsFrom(ml.biases, from, s);
+    return .{ .quantized = true, .w = w, .scales = sc, .biases = bi, .bits = ml.bits, .group_size = ml.group_size };
+}
+
+/// The down rest: an axis-1 K-slice, MATERIALIZED — a lazy view into a packed
+/// weight computes wrong at scale (`splitPackedGateUp`'s rule).
+fn aneRestCols(ml: *const MixedLinear, k: u32, s: S) !MixedLinear {
+    const w = try aneColsFrom(ml.w, @intCast(k * ml.bits / 32), s);
+    errdefer _ = mlx.mlx_array_free(w);
+    const g: c_int = @intCast(k / ml.group_size);
+    const sc = try aneColsFrom(ml.scales, g, s);
+    errdefer _ = mlx.mlx_array_free(sc);
+    const bi = try aneColsFrom(ml.biases, g, s);
+    errdefer _ = mlx.mlx_array_free(bi);
+    var add: ?mlx.mlx_array = null;
+    if (ml.add_bias) |b| {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&o, b));
+        add = o;
+    }
+    return .{ .quantized = true, .w = w, .scales = sc, .biases = bi, .add_bias = add, .bits = ml.bits, .group_size = ml.group_size };
+}
+
+/// The GPU complement of one block. `k` is the TOTAL width the ANE units hold:
+/// gate/up keep rows [k..), down keeps K-columns [k..), and the down partials
+/// sum at the seam.
+fn aneBuildMlpRest(m: *const SwiGLU, k: u32, s: S) !SwiGLU {
+    const d = &m.down;
+    if (d.group_size == 0 or k % d.group_size != 0 or (k * d.bits) % 32 != 0) return error.AneChanAlignment;
+    // The ANE program carries no bias term, so a biased gate/up cannot split.
+    if (m.gate.add_bias != null or m.up.add_bias != null) return error.AneBiasedProjection;
+    const kk: c_int = @intCast(k);
+    var rest: SwiGLU = undefined;
+    rest.gate = try aneRestRows(&m.gate, kk, s);
+    errdefer rest.gate.deinit();
+    rest.up = try aneRestRows(&m.up, kk, s);
+    errdefer rest.up.deinit();
+    rest.down = try aneRestCols(d, k, s);
+    return rest;
+}
+
 const Block = struct {
     mod_lin: mlx.mlx_array, // [6*features] bf16
     prenorm: mlx.mlx_array, // (1+scale)
@@ -989,8 +1118,15 @@ pub const Dit = struct {
     last_norm: mlx.mlx_array, // (1+scale)
     last_lin: MixedLinear, // features → 64 (+bias)
     last_mod: mlx.mlx_array, // [2, features] bf16
+    io: std.Io,
+    /// ANE MLP offload, built lazily at the first forward (the token count is
+    /// a per-request property and the compiled tile is fixed).
+    ane_eng: ?*ane.AnePrefill,
+    ane_rest: []SwiGLU,
+    ane_tried: bool,
 
     pub fn deinit(self: *Dit) void {
+        self.aneDeinit();
         self.first.deinit();
         for (self.blocks) |*b| b.deinit();
         self.allocator.free(self.blocks);
@@ -1006,6 +1142,14 @@ pub const Dit = struct {
         _ = mlx.mlx_array_free(self.last_norm);
         self.last_lin.deinit();
         _ = mlx.mlx_array_free(self.last_mod);
+    }
+
+    fn aneDeinit(self: *Dit) void {
+        if (self.ane_eng) |e| e.deinit();
+        self.ane_eng = null;
+        for (self.ane_rest) |*r| r.deinit();
+        if (self.ane_rest.len > 0) self.allocator.free(self.ane_rest);
+        self.ane_rest = &.{};
     }
 
     /// timestep embed (B=1): [cos(args), sin(args)] of dim tdim, period 1e4,
@@ -1081,8 +1225,9 @@ pub const Dit = struct {
         var combined = try concat(&[_]mlx.mlx_array{ ctx, img_e }, 1, s);
         defer _ = mlx.mlx_array_free(combined);
 
-        for (self.blocks) |*b| {
-            const nb = try self.blockForward(combined, b, tv.tvec, cos, sin, full_mask, s);
+        self.aneEnsure(@intCast(txtlen + img_len), s);
+        for (self.blocks, 0..) |*b, bi| {
+            const nb = try self.blockForward(combined, b, bi, tv.tvec, cos, sin, full_mask, s);
             _ = mlx.mlx_array_free(combined);
             combined = nb;
         }
@@ -1130,7 +1275,7 @@ pub const Dit = struct {
         return self.txtmlp3.forward(g, s); // (1,L,features)
     }
 
-    fn blockForward(self: *Dit, x: mlx.mlx_array, b: *const Block, tvec: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
+    fn blockForward(self: *Dit, x: mlx.mlx_array, b: *const Block, idx: usize, tvec: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
         const feat: c_int = @intCast(self.cfg.features);
         // mod = tvec + lin; split 6 → prescale,preshift,pregate,postscale,postshift,postgate
         const mod = try addA(tvec, b.mod_lin, s);
@@ -1164,11 +1309,102 @@ pub const Dit = struct {
         defer _ = mlx.mlx_array_free(qn);
         const qm = try modulate(qn, postscale, postshift, s);
         defer _ = mlx.mlx_array_free(qm);
-        const m = try b.mlp.forward(qm, s);
+        const m = try self.mlpMaybeAne(qm, b, idx, s);
         defer _ = mlx.mlx_array_free(m);
         const gm = try mulA(postgate, m, s);
         defer _ = mlx.mlx_array_free(gm);
         return addA(x1, gm, s);
+    }
+
+    /// Build the per-block ANE programs once the run's token count is known.
+    /// Never fails the request: every refusal is a NAMED `[ane]` line and the
+    /// DiT runs GPU-only.
+    fn aneEnsure(self: *Dit, seq: u32, s: S) void {
+        if (self.ane_tried) return;
+        if (!ane.media_offload.image) return;
+        if (!ane.available()) {
+            self.ane_tried = true;
+            log.warn("[ane] image offload: AppleNeuralEngine framework not present — GPU only\n", .{});
+            return;
+        }
+        const rows = ane.mediaTileRows(seq);
+        const b0 = &self.blocks[0].mlp;
+        const loras = mlpLoraCount(b0);
+        if (!aneBlockEligible(rows, b0.gate.quantized, loras)) {
+            // A LoRA or a short request declines this request only; a bf16 pack never qualifies.
+            self.ane_tried = !b0.gate.quantized;
+            log.warn("[ane] image offload declined: {d} rows, quantized={}, loras={d} — GPU only\n", .{ rows, b0.gate.quantized, loras });
+            return;
+        }
+        self.ane_tried = true;
+        const feat = self.cfg.features;
+        const mlpdim = swigluDim(feat, self.cfg.multiplier);
+        const probe: ane.QuantWeight = .{ .w = b0.gate.w, .scales = b0.gate.scales, .biases = b0.gate.biases, .bits = b0.gate.bits, .group_size = b0.gate.group_size, .in_dim = feat, .out_dim = mlpdim };
+        const plan = ane.planMediaOffload(self.io, s, "image", self.blocks.len, feat, mlpdim, rows, probe, AneCalib{ .d = self, .rows = rows, .feat = feat, .mlpdim = mlpdim, .s = s }) orelse return;
+        self.aneBuild(rows, plan.k, plan.units, feat, mlpdim, plan.share, s, self.blocks.len) catch |err| {
+            log.warn("[ane] image offload build failed ({s}) — GPU only\n", .{@errorName(err)});
+            self.aneDeinit();
+        };
+    }
+
+    /// Builds blocks [0, n); fewer than all is the calibration build.
+    fn aneBuild(self: *Dit, rows: u32, k: u32, units: u32, feat: u32, mlpdim: u32, share: f32, s: S, n: usize) !void {
+        const a = self.allocator;
+        const eng = try ane.AnePrefill.init(a, self.io, self.blocks.len, feat, k, rows, rows, 0, 0, .channel, units);
+        errdefer eng.deinit();
+        const rests = try a.alloc(SwiGLU, n);
+        errdefer a.free(rests);
+        var built_rests: usize = 0;
+        errdefer for (rests[0..built_rests]) |*r| r.deinit();
+
+        const start = std.Io.Timestamp.now(self.io, .awake);
+        const kh: usize = @as(usize, k) * feat;
+        const down_slice = try a.alloc(f32, @as(usize, feat) * k);
+        defer a.free(down_slice);
+        const up_slice = try a.alloc(f32, kh);
+        defer a.free(up_slice);
+        for (self.blocks[0..n], 0..) |*b, i| {
+            rests[i] = try aneBuildMlpRest(&b.mlp, k * units, s);
+            built_rests = i + 1;
+            const gate = try aneDequantHostF32(a, &b.mlp.gate, feat, mlpdim, s);
+            defer a.free(gate);
+            const up = try aneDequantHostF32(a, &b.mlp.up, feat, mlpdim, s);
+            defer a.free(up);
+            const down = try aneDequantHostF32(a, &b.mlp.down, mlpdim, feat, s);
+            defer a.free(down);
+            for (0..units) |u| {
+                const c0: usize = u * @as(usize, k);
+                for (0..feat) |r| @memcpy(down_slice[r * k ..][0..k], down[r * mlpdim + c0 ..][0..k]);
+                // `up` carries the fp16 range scale for the whole program.
+                for (up_slice, up[u * kh ..][0..kh]) |*d, v| d.* = v / ane.OUT_PLANE_SCALE;
+                eng.addMlpLayer(u, i, gate[u * kh ..][0..kh], up_slice, down_slice) catch |err| {
+                    log.warn("[ane] block {d} unit {d} enqueue failed ({s})\n", .{ i, u, @errorName(err) });
+                    break;
+                };
+            }
+        }
+        eng.finishPending();
+        const built = eng.coveredLayers();
+        if (built == 0) return error.AneNoProgram;
+        const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(start.untilNow(self.io, .awake).nanoseconds)))) / 1e9;
+        const int8_bytes: u64 = @as(u64, built) * 3 * feat * k * units;
+        eng.publishLive(share, int8_bytes);
+        self.ane_eng = eng;
+        self.ane_rest = rests;
+        if (n == self.blocks.len) log.info("[ane] image offload ready: units={d} {d}/{d} blocks in {d} banks, rows={d}, k={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, built, self.blocks.len, eng.compiledBanks(), rows, k * units, mlpdim, share, int8_bytes / (1024 * 1024), secs });
+    }
+
+    fn mlpMaybeAne(self: *Dit, x: mlx.mlx_array, b: *const Block, idx: usize, s: S) !mlx.mlx_array {
+        const eng = self.ane_eng orelse return b.mlp.forward(x, s);
+        if (!eng.mlpReady(idx) or idx >= self.ane_rest.len) return b.mlp.forward(x, s);
+        if (mlpLoraCount(&b.mlp) > 0) return b.mlp.forward(x, s);
+        const sh = mlx.getShape(x);
+        if (sh.len != 3 or sh[0] != 1 or sh[2] != @as(c_int, @intCast(eng.hidden))) return b.mlp.forward(x, s);
+        return ane.mediaMlp(s, eng, idx, "image", x, AneSeam{ .mlp = &b.mlp, .rest = &self.ane_rest[idx], .s = s }) catch |err| {
+            // An ANE failure is never a request failure — the block runs on GPU.
+            log.warn("[ane] image block {d} split failed ({s}) — GPU fallback\n", .{ idx, @errorName(err) });
+            return b.mlp.forward(x, s);
+        };
     }
 
     fn lastLayer(self: *Dit, x: mlx.mlx_array, t_emb: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -1292,6 +1528,10 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     d.last_norm = try kreaNorm(&w, "last.norm.scale", s);
     d.last_lin = try MixedLinear.load(&w, allocator, "last.linear", feat, s);
     d.last_mod = try normBf16(&w, "last.modulation.lin", s);
+    d.io = io;
+    d.ane_eng = null;
+    d.ane_rest = &.{};
+    d.ane_tried = false;
     return d;
 }
 
@@ -2873,4 +3113,14 @@ test "krea end-to-end pipeline matches reference image" {
 test "swigluDim matches reference roundup" {
     try testing.expectEqual(@as(u32, 16384), swigluDim(6144, 4));
     try testing.expectEqual(@as(u32, 6912), swigluDim(2560, 4));
+}
+
+test "aneBlockEligible: fp16 plane grid, quantized only, never under a LoRA" {
+    try testing.expect(aneBlockEligible(4608, true, 0)); // 512 text + 4096 img
+    // A LoRA-attached block stays on the GPU: the int8 ANE copy was
+    // quantized before the adapter existed, so an offload drops it silently.
+    try testing.expect(!aneBlockEligible(4608, true, 1));
+    try testing.expect(!aneBlockEligible(4608, false, 0)); // bf16 pack
+    try testing.expect(!aneBlockEligible(4600, true, 0)); // off the 32-row pitch
+    try testing.expect(!aneBlockEligible(128, true, 0)); // under the engagement floor
 }

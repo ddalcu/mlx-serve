@@ -8,10 +8,25 @@
 - **`--mtp-head-kv-quant` lets Flash Next's speculative head keep its KV at the model's `--kv-quant` precision** (about 1 KB per token of context with MTP on, 1 GB at 1M). Off by default: the head stays dense bf16 as before. Acceptance measured within noise of dense from 4k to 128k with the flag on; the head's KV is now counted in admission either way, and a cached conversation whose speculative snapshot was saved at the other precision is re-saved on its next turn.
 - **`--wired-margin-gib <n>`** sets how far under a raised `iogpu.wired_limit_mb` the planner may reach (default 8, the previous fixed value). A 96 GB Mac running the limit at 90 or 96 GB can take 6 and gain 2 GB of admissible context.
 - **`--ssm-checkpoint-max` now defaults to 16** (was 32): it halves the checkpoint bytes a cached session holds (about 57 MB each on Flash Next), and at 256k tokens still leaves a checkpoint every 16k tokens for a diverging turn to resume from.
+- **A model can hand its memory back when nobody is using it.** `--idle-evict-secs N` unloads a model that has served nothing for N seconds, and the next request reloads it; in the app it is Settings ▸ Server ▸ "Unload idle models", off by default. The flag previously had no effect, and a status poll to `/props` no longer cold-loads a model just to answer it.
+- **Reloading a model no longer leaks the tokenizer, config and chat template it replaces.** A server that loaded and unloaded the same model repeatedly grew by the size of its CPU-side state on every cycle.
 - **Spark-X2.5 (XHToken, 1.7B and 4B) is served natively.** `mlx-serve pull spark` fetches the 4B MLX pack; thinking, tool calls and 1M-token context all ride the model's own template.
 - **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
 - **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
 - **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
+- **Image, video and music generation can borrow the Neural Engine.** Turn on `--ane-image`, `--ane-video` or `--ane-audio` (Settings ▸ Neural Engine) and Krea, MiniMax-H3 or ACE-Step split each denoise step between the GPU and the Neural Engine; the split is solved per Mac and model at the first request. Off by default, and the server declines by name when the Mac cannot hold it.
+- The Neural Engine compile cache is capped by the free space on the internal disk, so a full disk no longer ships a silently half-built offload.
+- **Chat with Apple's built-in on-device model.** Pick Apple Intelligence in the model picker and the conversation is answered by macOS itself: nothing to download and no server running. Tools work, but the model's window is a fixed 4k that macOS does not let anyone raise, so keep the tool list short. No thinking mode: the framework does not have one. The row appears only when Apple Intelligence is turned on in System Settings.
+
+## Changes
+
+- The launcher offers a plain Shell beside the coding agents, on this Mac and in the sandbox.
+- Terminals open on click. The sandbox and host terminals no longer ask which folder to work in first; they use the working folder from Settings.
+
+## Fixes
+
+- OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
+- An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
 
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
@@ -28,6 +43,8 @@
 - **Structured (JSON schema) output at full speed.** Constrained decoding used to crawl at about one token per second on Flash Next; it now runs at the model's normal speed. (#380)
 - **The chat reads the way you want.** Pick Narrow, Medium or Wide from Settings or F1 to F3. Your own messages get the same hover actions as replies, photos lay out in a grid, the reasoning block collapses out of the way and shows how long the model thought, tables no longer squeeze their headers, and numbered lists, quotes and inline code render properly. (#339, thanks @lojza3d)
 - **My Models shows how much disk space is left.** (#328, thanks @justinluque)
+- **Several people can use speculative decoding at once.** On dense Qwen 3.5/3.8 models, concurrent users' draft checks now run in one pass (two users: 64 tok/s combined instead of 48; three: 73), and with four or more the server switches them to plain batching, which is faster there. On Flash Next a second MTP user no longer waits for the first to finish. Concurrent output is unchanged: at a fixed draft depth it is byte-identical on Flash Next and within kernel rounding on the batched path.
+- **Concurrent users on Qwen 3.5 and 3.8 MoE models share one decode pass** instead of taking turns, the same batching dense models and Flash Next already had. You can now see whether your model batches: Settings > Concurrent requests says so, `/props` carries a `batching` object, `/v1/models` rows carry `batched_decode`, and the log names the reason whenever a request has to decode on its own (speculative decoding, JSON schema, logprobs). Running two servers on one Mac for two users was never needed; the log line at boot now says so at every `--max-concurrent` value.
 
 ### Fixes
 

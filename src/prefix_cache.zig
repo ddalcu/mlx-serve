@@ -621,6 +621,7 @@ pub const HotPrefixCache = struct {
             transformer_mod.ssmFreeQsaState(ssm);
             ssm.ple_prev_valid = false;
         }
+        transformer_mod.ssmDetachFromGroup(entries);
     }
 
     /// Pure-attention + DSV4 are eligible by default. Hybrid recurrent-state

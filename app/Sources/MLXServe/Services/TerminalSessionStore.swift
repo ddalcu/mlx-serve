@@ -111,7 +111,7 @@ final class TerminalSessionStore: ObservableObject {
         if let cli = hostSpecs[id] {
             // Same wording as the sandbox preflight, so the row offers the
             // same Start Server fix.
-            guard server.status == .running else {
+            guard !cli.requiresServer || server.status == .running else {
                 sessions.markFailed(id, message: "the server isn't running — load a model first; \(cli.displayName) talks to it")
                 return
             }

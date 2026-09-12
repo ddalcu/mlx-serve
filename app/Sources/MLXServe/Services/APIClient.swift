@@ -394,6 +394,7 @@ class APIClient {
         /// nil when the server published no measured curve (the per-silicon
         /// tables applied), which the UI reads as "nothing to show".
         let specCost: SpecCostInfo?
+        let batching: BatchingInfo?
     }
 
     func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
@@ -401,7 +402,7 @@ class APIClient {
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
-        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json))
+        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
     }
 
     /// Live throughput feed. 503s when the server was launched without

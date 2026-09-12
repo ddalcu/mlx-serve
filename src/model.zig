@@ -938,6 +938,14 @@ pub const ModelConfig = struct {
         return self.isQwen4();
     }
 
+    pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
+        if (!self.isQwen4() or !gather_on) return kv;
+        if (kv <= gather_min_kv) return kv;
+        const cap = self.indexer_budget + self.indexer_compress_ratio;
+        if (cap == 0) return kv;
+        return @min(kv, cap);
+    }
+
     /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
         return self.longCtxGated();
@@ -977,7 +985,9 @@ pub const ModelConfig = struct {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
-        if (self.isMoe() and !self.isQwen4()) return false; // routed experts: only qwen4_exp's per-slot state is modelled
+        // Routed experts are row-generic; a MoE trunk batches when its per-slot
+        // state is what the path merges (GDN pair, qwen4's PLE window + QSA keys).
+        if (self.isMoe() and !self.isQwen4() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
@@ -1256,6 +1266,15 @@ pub const ModelConfig = struct {
         log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
         });
+    }
+
+    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
+    pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
+        if (self.ngram_table_path) |p| allocator.free(p);
+        self.ngram_table_path = null;
     }
 };
 
@@ -6039,6 +6058,27 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
+    // Bar: routed experts are row-generic (the sorted gather path takes B*S rows),
+    // so a qwen3_5 MoE batches like the dense trunk; MoE trunks with other
+    // per-slot state (hy3, laguna, lfm2_moe, bailing) stay refused.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {"hidden_size": 2048, "num_experts": 256, "full_attention_interval": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.isMoe());
+    try testing.expect(config.supportsBatchedGdnDecode());
+
+    var laguna = std.mem.zeroes(ModelConfig);
+    laguna.model_type = "laguna";
+    laguna.num_experts = 64;
+    laguna.full_attention_interval = 4;
+    try testing.expect(!laguna.supportsBatchedGdnDecode());
 }
 
 test "parseConfigFromJson rejects affine bits MLX has no kernels for" {

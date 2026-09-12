@@ -4814,6 +4814,29 @@ see every narrower sample refused against a stale wider cell. Uniform
 contamination across a bucket is invisible to any ratio; that table wants
 deleting. Guard: the #382 parse test in `round_cost.zig`.
 
+### Batched MTP verify: 8 rows fall off the split-K lane; a crowd beats sub-groups
+
+Two MTP users on the dense 27B decoded slower together than one alone: every
+spec slot left the batched group and took turns (53 tok/s aggregate for two,
+45 plain). The round was split into begin / verify / finish (`MtpRoundState`)
+so a group verifies in ONE `[N, S]` trunk forward (rows padded to the widest
+draft, per-row SSM capture split back to each slot, KV + SSM clamped to
+`1 + m` on every padded row). The first cut was 2x SLOWER at depth 3: N*S = 8
+rows leave the split-K verify-qmm lane (M 2..7) for stock kernels, so the group
+is capped at 7 rows off-NAX (`mtpGroupRowCap`: pairs at depth 2, triples at
+depth 1) and the cap clamps each slot's plan (`mtp_group_cap`). Past three
+slots the sub-grouped rounds lose to one plain batched tick, so a crowd decodes
+plain with hidden capture (`mtp_plain_tick`) and resumes speculating when the
+group thins. Flash Next's head kept per-request state on the module
+(`Qwen4Mtp.cache/entry/seq_offset/...`), which is why its MTP slot was
+exclusive and a second user queued; the state is now a per-request
+`Qwen4MtpState` swapped onto the module before every head touch
+(`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
+better than solo rounds, so it stays opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
+solo, two interleave, three go plain. Bars: `tests/test_mtp_batched.sh` (fixed
+depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
+`tests/bench_concurrency_ladder.sh` (the numbers).
+
 ## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
 
 `msv_qsa_select` ran one threadgroup per query row: right for a 4096-row prefill chunk, wrong for
@@ -4904,3 +4927,17 @@ and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the
 lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
 still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
 (`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
+
+## A failed dense KV write left freed view handles in the entry (2026-09-10)
+
+`KVCache.updateDense` frees the previous `key_view`/`value_view` first, so the buffer can be
+donated, and assigned the handles fresh only after the grow and the writes. When one of those
+failed (an MLX error, catchable since #353), the entry kept both freed handles and the next
+`resetCache` or `deinit` of that cache freed them again: SIGSEGV in `freeKVEntry`. Seen live when
+Qwen3-Embedding sub-batches shared the cache and a write failed on the batch dimension
+(`broadcast_shapes`). `updateAffine` already reset its handles at the free, and
+`updateTurboQuant` goes through it. Fix: reset the handles at the free; `writeAtOffset` releases
+its result on the error path. A grow that fails after K but before V can leave their capacities
+apart; the error aborts that forward and the next request's reset restores a coherent pair.
+Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
+in-capacity and a growing update.
