@@ -6280,9 +6280,10 @@ pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_h
     if (ratio == 0) return 0;
     const nb = kv / ratio;
     const pair = @import("qsa_pair.zig");
-    // The bill covers an earlier eligible chunk even when the final KV exceeds the cap.
+    // Bill the largest tail-coalesced chunk, including an earlier eligible chunk
+    // when the final KV exceeds the cap.
     const planner = if (pair.enabled() and ratio == 4 and fwd >= 16)
-        pair.plannerBytes(1, @min(fwd, 8192), @min(nb, 512))
+        pair.plannerBytes(1, @min(fwd + @import("qwen4_prefill_limits.zig").tail_slack, @import("qwen4_prefill_limits.zig").max_seq), @min(nb, 512))
     else
         0;
     const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
@@ -28536,7 +28537,7 @@ var gdn_prefill_fused_override: ?bool = null;
 var gdn_prefill_engaged = false;
 
 fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
-    if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@as(c_int, 8192), batch)) return false;
+    if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("qwen4_prefill_limits.zig").max_seq, batch)) return false;
     if (gdn_prefill_fused_override) |on| return on;
     const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED") orelse return true;
     return !std.mem.eql(u8, std.mem.span(raw), "0");
@@ -42937,7 +42938,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     const rnd = prng.random();
     const eps = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps);
-    for ([_][4]c_int{ .{ 2, 17, 4, 2560 }, .{ 1, 65, 4, 2560 }, .{ 1, 513, 4, 2560 }, .{ 1, 33, 2, 1536 } }) |shape| {
+    for ([_][4]c_int{ .{ 2, 17, 4, 2560 }, .{ 1, 65, 4, 2560 }, .{ 1, 513, 4, 2560 }, .{ 1, 33, 2, 1536 }, .{ 1, 33, 3, 1536 }, .{ 1, 33, 8, 1536 }, .{ 1, 8703, 4, 2560 } }) |shape| {
         const b = shape[0];
         const seq = shape[1];
         const hc = shape[2];
@@ -43000,7 +43001,9 @@ test "qsa pair: planner allocation is billed and context reaches one million" {
     pair.enabled_override = false;
     const without = qsaPrefillTransientBytes(4, 8192, 65_536, 4, 128);
     pair.enabled_override = true;
-    try testing.expectEqual(without + one, qsaPrefillTransientBytes(4, 8192, 65_536, 4, 128));
+    try testing.expectEqual(without + pair.plannerBytes(1, 8703, 512), qsaPrefillTransientBytes(4, 8192, 65_536, 4, 128));
+    try testing.expect(pair.supports(1, 8703, 65_536, 4, 512));
+    try testing.expect(!pair.supports(1, 8704, 65_536, 4, 512));
 }
 
 test "qsa pair: Zig dispatch preserves outputs across batch and sequence shape changes" {
@@ -46091,7 +46094,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
     const dt_bias = try attn256RandBf16(rnd, &hv_shape, s);
     defer _ = mlx.mlx_array_free(dt_bias);
 
-    for ([_]c_int{ 1, 2, 3, 5, 9, 17, 65, 513 }) |seq| {
+    for ([_]c_int{ 1, 2, 3, 5, 9, 17, 65, 513, 8703 }) |seq| {
         const qkv_shape = [_]c_int{ 1, seq, c_dim };
         const qkv = try attn256RandBf16(rnd, &qkv_shape, s);
         defer _ = mlx.mlx_array_free(qkv);
@@ -46394,7 +46397,7 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
     const eps_arr = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    for ([_]c_int{ 1, 4, 9, 17, 65, 513 }) |seq| {
+    for ([_]c_int{ 1, 4, 9, 17, 65, 513, 8703 }) |seq| {
         const y_shape = [_]c_int{ 1, seq, hv, dv };
         const y = try attn256RandBf16Scaled(rnd, &y_shape, 8.0, s);
         defer _ = mlx.mlx_array_free(y);

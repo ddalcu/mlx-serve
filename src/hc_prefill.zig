@@ -16,7 +16,7 @@ pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32) bool {
 }
 
 fn geometry(batch: c_int, seq: c_int) bool {
-    return batch >= 1 and batch <= 2 and seq > 16 and seq <= 8192;
+    return batch >= 1 and batch <= 2 and seq > 16 and seq <= @import("qwen4_prefill_limits.zig").max_seq;
 }
 
 pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };

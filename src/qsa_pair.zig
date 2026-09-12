@@ -17,7 +17,7 @@ pub fn enabled() bool {
 }
 
 pub fn supports(batch: c_int, seq: c_int, kv: c_int, ratio: c_int, kb: c_int) bool {
-    return ratio == 4 and kb > 0 and kb <= 512 and seq >= 16 and seq <= 8192 and
+    return ratio == 4 and kb > 0 and kb <= 512 and seq >= 16 and seq <= @import("qwen4_prefill_limits.zig").max_seq and
         batch >= 1 and batch <= 2 and kv >= seq and kv <= MAX_KV;
 }
 

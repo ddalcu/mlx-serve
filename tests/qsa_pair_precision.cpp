@@ -32,7 +32,7 @@ int main(int argc,char**) {
   auto candidate=mx::fast::metal_kernel("pair_oracle_new",{"q","k","v","scl","blocks","tilepos","tilemask"},{"out"},f32store(read_file("src/kernels/qsa_pair.metal")),header,false);
   auto planner=mx::fast::metal_kernel("pair_oracle_plan",{"blocks","kvlen"},{"tilepos","tilemask"},read_file("src/kernels/qsa_pair_plan.metal"),"",false);
   struct C{int B,S,KV,KB;};
-  auto shapes=argc>1?std::vector<C>{{1,8192,8192,512}}:std::vector<C>{{2,17,17,512},{2,65,65599,512},{2,130,159,31},{1,17,200003,512},{1,17,1048576,512},{1,8192,65536,512}};
+  auto shapes=argc>1?std::vector<C>{{1,8192,8192,512}}:std::vector<C>{{2,17,17,512},{2,65,65599,512},{2,130,159,31},{1,17,200003,512},{1,17,1048576,512},{1,8192,65536,512},{1,8703,65536,512}};
   for(auto sh:shapes) {
     auto [B,S,KV,KB]=sh;int NG=(S+1)/2,NT=2*((KB+1)*4+31)/32+3;
     std::vector<int> ids(size_t(B)*S*KB,2147483647);

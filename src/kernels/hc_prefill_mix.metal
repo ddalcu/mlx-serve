@@ -8,4 +8,6 @@ for(int h=0;h<HC;h++) {
   T product=T(float(sig)*float(normed[off]));
   value=h==0 ? product : T(float(product)+float(value));
 }
-out[idx]=T(float(value)/float(HC));
+// MLX mean materializes its reciprocal in the input dtype before multiply.
+// The rounding matters for HC=3/5/6/7; FP32 division is a different operation.
+out[idx]=T(float(value)*float(T(1.0f/float(HC))));

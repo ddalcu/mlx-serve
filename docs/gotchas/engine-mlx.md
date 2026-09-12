@@ -4910,3 +4910,7 @@ still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was st
 HC/GDN tests must compare with the closures compiled by the Transformer: MLX compilation can alter rounding, so an eager graph is insufficient. HC retains native inject matmul and compares pending write/mix against the production closures. GDN compares its gate against `computeGdnGate`; these are finite fixture checks, not a proof for every possible activation.
 
 Paired QSA changes reduction order, so it retains an explicit opt-in and a float64 error bar. The planner stores one base position per four-key block and a mask per tile; admission bills both buffers, including an earlier eligible chunk when later context falls back. Supports extends through 1,048,576 KV rows; declines are logged once. The HTTP smoke is launched by `tests/test_qsa_pair_prefill.sh`; its default pack is mixed-4-8bit.
+
+
+- **An 8192-token chunk can execute S8703 after tail coalescing.** HC/GDN/QSA prefill specializations use `qwen4_prefill_limits.max_seq`, and QSA admission reserves the largest eligible coalesced planner. Checking only S<=8192 quietly disabled every fusion around an 8K prompt; the fallback log exposed it. `generate.nextChunkEnd` tests tie the specialization limit to the real merge rule.
+- **HC mean uses a BF16 reciprocal.** Dividing the BF16 sum by an FP32 HC count matches HC4 but fails HC3. Materialize `T(1.f/HC)` before multiply and compare with the production compiled HC closure. Keep HC3 among the geometry fixtures when changing this kernel.

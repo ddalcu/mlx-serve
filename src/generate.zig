@@ -12007,6 +12007,10 @@ test "the scaled tail-merge bound is gated on the per-chunk adaptive width" {
 }
 
 test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
+    const fused_max: usize = @intCast(@import("qwen4_prefill_limits.zig").max_seq);
+    try testing.expectEqual(8192 + TAIL_MERGE_MAX - 1, fused_max);
+    try testing.expectEqual(fused_max, nextChunkEnd(0, fused_max, 8192, false, 0, 0, false));
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, fused_max + 1, 8192, false, 0, 0, false));
     // A chat-templated prompt often lands a token or two past the chunk size
     // (8192-target prompts tokenize to 8193). A 1-token trailing chunk pays a
     // FULL graph + eval-barrier + cache-clear for one token — pure overhead.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run against a disposable server, MLX_SERVE_QSA_PAIR=1, cache off; check two shapes."""
+"""Run against a disposable server, MLX_SERVE_QSA_PAIR=1, cache off; check tail-coalesced and multi-chunk shapes."""
 import argparse
 import json
 import re
@@ -18,7 +18,8 @@ args = p.parse_args()
 log_offset = args.log.stat().st_size if args.log.exists() else 0
 source = (Path(__file__).resolve().parents[1] / 'src/transformer.zig').read_text()
 corpus = '\n'.join(source.splitlines()[100:900])
-for nonce, size in [('81492017', 40000), ('52839106', 47000)]:
+first_prefill = None
+for nonce, size in [('90163827', 25000), ('81492017', 40000), ('52839106', 47000)]:
     prompt = (f'Nonce {nonce}. Remember the passphrase MAGNOLIA-7731.\n'
               + (corpus * 4)[:size]
               + '\nWhat was the passphrase? Answer with the passphrase only.')
@@ -32,6 +33,9 @@ for nonce, size in [('81492017', 40000), ('52839106', 47000)]:
         result = json.load(response)
     usage = result['usage']
     assert usage['prompt_tokens'] > 8192, usage
+    if first_prefill is None:
+        first_prefill = usage['prompt_tokens'] - 1
+        assert 8192 < first_prefill <= 8703, ('tail fixture drifted', usage)
     assert usage.get('prompt_tokens_details', {}).get('cached_tokens', 0) == 0, usage
     answer = result['choices'][0]['message']['content']
     assert 'MAGNOLIA-7731' in answer, result
@@ -42,7 +46,7 @@ expected = ('[qsa-pair] engaged:' if args.pair == 'on'
 assert expected in log, f'Missing engagement: {expected}'
 if args.first_chunk:
     assert args.pair == 'on'
-    assert re.search(r'\[qsa-pair\] engaged: S=8192 kv=8192 ', log), 'First chunk used the old mask arm'
+    assert re.search(rf'\[qsa-pair\] engaged: S={first_prefill} kv={first_prefill} ', log), 'First chunk used the old mask arm'
 if args.pair == 'off':
     assert '[qsa-pair] engaged:' not in log
 if args.hc == 'on':
@@ -50,7 +54,7 @@ if args.hc == 'on':
 if args.hc == 'off':
     assert '[hc-prefill] engaged:' not in log
 if args.gdn == 'on':
-    assert re.search(r'\[gdn-prefill\] engaged: S=8192 B=1 cold=true', log), 'Missing cold GDN prefill engagement'
+    assert re.search(rf'\[gdn-prefill\] engaged: S={first_prefill} B=1 cold=true', log), 'Missing cold GDN prefill engagement'
 if args.gdn == 'off':
     assert '[gdn-prefill] engaged:' not in log
 print('PASS: long prefill answers and expected QSA arm')
