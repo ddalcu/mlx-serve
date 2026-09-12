@@ -52,6 +52,7 @@ const supported_model_types = [_][]const u8{
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
+    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the

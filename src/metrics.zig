@@ -97,6 +97,9 @@ pub const Metrics = struct {
     // the sampler from `Scheduler.inflight_prefill_tokens` (published once per
     // prefill CHUNK, never per token).
     prefill_tokens_live: Gauge,
+    /// Post-cache tail the in-flight prefill will forward, same scale as
+    /// `prefill_tokens_live`; 0 when idle.
+    prefill_tokens_expected: Gauge,
     // Slots currently in prefill. Flips as soon as prefill starts, so the panel
     // can name the phase without waiting for the first chunk's token count.
     requests_prefilling: Gauge,
@@ -144,6 +147,7 @@ pub const Metrics = struct {
             .memory_mb = Gauge.init(),
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
+            .prefill_tokens_expected = Gauge.init(),
             .requests_prefilling = Gauge.init(),
             .mlx_active_bytes = Gauge.init(),
             .mlx_cache_bytes = Gauge.init(),
@@ -259,6 +263,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:memory_mb", "Server physical memory footprint in megabytes (phys_footprint)", m.memory_mb.load());
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
+    try writeGauge(w, "mlx_serve:prefill_tokens_expected", "Total tokens the in-flight prefill will forward, post-cache tail on the same scale as prefill_tokens_live (0 when idle; the bar's real target)", m.prefill_tokens_expected.load());
     try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
     try writeGauge(w, "mlx_serve:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
     try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
@@ -309,6 +314,7 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"memory_mb\":{d}," ++
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
+            "\"prefill_tokens_expected\":{d}," ++
             "\"requests_prefilling\":{d}," ++
             "\"mlx_active_bytes\":{d}," ++
             "\"mlx_cache_bytes\":{d}," ++
@@ -332,6 +338,7 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.memory_mb.load(),
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
+            m.prefill_tokens_expected.load(),
             m.requests_prefilling.load(),
             m.mlx_active_bytes.load(),
             m.mlx_cache_bytes.load(),
@@ -612,6 +619,7 @@ test "prefill progress is exposed live, not only at request completion" {
     // the in-flight prefill, 0 when none is running.
     var m = Metrics.init();
     m.prefill_tokens_live.set(16384);
+    m.prefill_tokens_expected.set(48000);
 
     var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -619,15 +627,19 @@ test "prefill progress is exposed live, not only at request completion" {
     const out = w.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_tokens_live gauge") != null);
     try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_tokens_live 16384") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_tokens_expected 48000") != null);
 
     var jbuf: [8192]u8 = undefined;
     var jw = std.Io.Writer.fixed(&jbuf);
     try renderJson(&m, &jw);
     try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"prefill_tokens_live\":16384") != null);
+    try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"prefill_tokens_expected\":48000") != null);
 
-    // At rest it is zero — "prefilling" must mean exactly that.
+    // At rest both gauges are zero.
     m.prefill_tokens_live.set(0);
+    m.prefill_tokens_expected.set(0);
     try testing.expectEqual(@as(u64, 0), m.prefill_tokens_live.load());
+    try testing.expectEqual(@as(u64, 0), m.prefill_tokens_expected.load());
 
     // The phase flag is separate from the token count: it flips at prefill
     // START, so the panel isn't blind for the ~40 s a 27B takes to finish its

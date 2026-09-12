@@ -151,7 +151,7 @@ pub const LoadedModel = struct {
     /// `LoadParams.ssm_checkpoint_stride`.
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: per-request cap on snapshots retained.
-    ssm_checkpoint_max: u32 = 32,
+    ssm_checkpoint_max: u32 = 16,
 
     /// Iteration 2 (perf-plan Phase 4 #3): LRU cache of chat-template
     /// render+tokenize results, keyed by a digest of (messages, tools,

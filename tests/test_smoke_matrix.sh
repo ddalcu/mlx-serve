@@ -45,6 +45,7 @@ ARCHES=(
     "mistral|no|$GD/models/mlx-community/Mistral-7B-Instruct-v0.3-4bit"
     "nemotron_h|yes|$GD/models-dl/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     "muse_glimmer|yes|$MD/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
+    "spark2_5|yes|$MD/abenzerps/Spark-X2.5-4B-MLX-8bit"
     "laguna|yes|$GD/models/poolside/Laguna-XS-2.1-NVFP4-mlx"
     "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
     "qwen4_exp|yes|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
@@ -180,7 +181,9 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
 
     # 6. max_tokens cap, then logprobs (entries describe message.content, so they need a finished answer)
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":5,\"temperature\":0}")
-    check "max_tokens 5: finish_reason length, <=5 tokens" "$([[ "$(echo "$r" | J 'd["choices"][0]["finish_reason"]')" == length && "$(echo "$r" | J 'd["usage"]["completion_tokens"]')" -le 5 ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
+    # A model that finishes under the cap (Spark: "Blue") reports stop; the invariant is the cap.
+    fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]')
+    check "max_tokens 5: <=5 tokens, finish_reason length|stop" "$([[ ( "$fr" == length || "$fr" == stop ) && "$(echo "$r" | J 'd["usage"]["completion_tokens"]')" -le 5 ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":600,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":2,\"enable_thinking\":false}")
     c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
     if [[ -z "$c" ]]; then skip "logprobs: entries with top_logprobs" "no content to describe"; else

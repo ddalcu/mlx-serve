@@ -16,14 +16,20 @@ enum ChatModelSelection {
     enum Action: Equatable {
         case selectLan(String)
         case selectLocal(String)
+        /// Apple's on-device model — no path, no peer, no server.
+        case selectApple
     }
 
     private static let lanPrefix = "lan:"
+    /// Prefixed like the LAN rows so a local folder named "apple" still loads
+    /// locally.
+    static let appleTag = "apple:foundation"
 
     /// The tag the picker should show as selected. A LAN model wins: the local
     /// `selectedModelPath` is still set underneath while chatting over the
     /// network, and ticking it would point at a model that isn't answering.
-    static func tag(localPath: String, lanChatModelId: String?) -> String {
+    static func tag(localPath: String, lanChatModelId: String?, apple: Bool = false) -> String {
+        if apple { return appleTag }
         if let lanChatModelId { return lanPrefix + lanChatModelId }
         return localPath
     }
@@ -31,6 +37,7 @@ enum ChatModelSelection {
     /// Decode a picked tag. Only the PREFIX marks a network row, so a local
     /// folder whose path happens to contain "lan:" still loads locally.
     static func action(for tag: String) -> Action {
+        if tag == appleTag { return .selectApple }
         guard tag.hasPrefix(lanPrefix) else { return .selectLocal(tag) }
         return .selectLan(String(tag.dropFirst(lanPrefix.count)))
     }
@@ -59,10 +66,14 @@ enum ChatModelSelection {
     /// pick, beside a green dot — while the menu's checkmark has already moved.
     /// An in-flight load therefore names its OWN model and reports loading.
     static func pillState(lanChatModelId: String?,
+                          apple: Bool = false,
                           residentName: String?,
                           loadingPath: String?,
                           selectedPath: String,
                           models: [LocalModel]) -> ChatModelPillState {
+        // The on-device model loads nothing and needs no server, so it wins
+        // the pill outright — same reason a LAN pick does.
+        if apple { return ChatModelPillState(name: AppleFoundationChat.displayName, isLoading: false) }
         // A LAN model is answering from another Mac and loads nothing here, so
         // it is never in flight — see `tag`, same reason it wins there.
         if let lanChatModelId, !lanChatModelId.isEmpty {

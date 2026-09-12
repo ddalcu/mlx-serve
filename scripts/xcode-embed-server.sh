@@ -29,9 +29,9 @@ ICON_DIR=$(mktemp -d)
 ICONSET="$ICON_DIR/AppIcon.iconset"
 mkdir -p "$ICONSET"
 for size in 16 32 64 128 256 512; do
-    sips -z $size $size "$APPDIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+    sips -z $size $size "$APPDIR/appicon.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
     double=$((size * 2))
-    sips -z $double $double "$APPDIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+    sips -z $double $double "$APPDIR/appicon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
 done
 iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns" 2>/dev/null \
     || echo "warning: iconutil failed — app ships without AppIcon.icns" >&2

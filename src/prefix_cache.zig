@@ -22,6 +22,7 @@ const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
+const restore_dump = @import("restore_dump.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -30,9 +31,11 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
 const applyQsaHistoryAt = transformer_mod.applyQsaHistoryAt;
 const checkpointHasQsaPooled = transformer_mod.checkpointHasQsaPooled;
+const checkpointListHasQsaPooled = transformer_mod.checkpointListHasQsaPooled;
 const sliceQsaHistoryOntoCheckpoint = transformer_mod.sliceQsaHistoryOntoCheckpoint;
 const keepOnlyLatestQsaHistory = transformer_mod.keepOnlyLatestQsaHistory;
 const entriesHaveQsaHistory = transformer_mod.entriesHaveQsaHistory;
+const qsaRestoreSatisfiesForward = transformer_mod.qsaRestoreSatisfiesForward;
 const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
@@ -391,6 +394,7 @@ pub const HotPrefixCache = struct {
     disk_dirty: bool = false,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
+    last_restored_disk_id: ?u64 = null,
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
@@ -556,6 +560,17 @@ pub const HotPrefixCache = struct {
         return picked;
     }
 
+    fn highestCoveringCheckpoint(cps: []const SSMCheckpoint, limit: usize) ?*const SSMCheckpoint {
+        var cap = limit;
+        while (highestCheckpointAtOrBelow(cps, cap)) |cp| {
+            const src = qsaHistorySource(cps, cp) orelse cp;
+            if (transformer_mod.checkpointQsaCoversPos(cp, src, cp.pos)) return cp;
+            if (cp.pos == 0) break;
+            cap = cp.pos - 1;
+        }
+        return null;
+    }
+
     /// Index of `highestCheckpointAtOrBelow(cps, boundary)`. An entry's media boundary is a
     /// KNOWN future divergence point — a later text-only turn is capped there — so this is the
     /// one checkpoint thinning must protect.
@@ -596,7 +611,7 @@ pub const HotPrefixCache = struct {
     /// Reset every SSM entry to the uninitialized (cold) state. Used on every
     /// miss / failed-restore path so a subsequent prefill starts from a clean
     /// recurrent state instead of stale conv/ssm buffers.
-    fn resetSsmEntries(entries: []SSMCacheEntry) void {
+    pub fn resetSsmEntries(entries: []SSMCacheEntry) void {
         for (entries) |*ssm| {
             _ = mlx.mlx_array_free(ssm.conv_state);
             _ = mlx.mlx_array_free(ssm.ssm_state);
@@ -987,6 +1002,7 @@ pub const HotPrefixCache = struct {
             dflash_target,
             mtp_target,
             null,
+            false,
         );
     }
 
@@ -1017,6 +1033,7 @@ pub const HotPrefixCache = struct {
             dflash_target,
             mtp_target,
             slot_id,
+            false,
         );
     }
 
@@ -1035,8 +1052,16 @@ pub const HotPrefixCache = struct {
         /// Restore by move: non-null opts this request into the checkout (the caller promises
         /// `releaseCheckout` on every path that ends the slot).
         slot_id: ?usize,
+        skip: bool,
     ) !LookupResult {
         self.last_restored_used = null;
+        self.last_restored_disk_id = null;
+        if (skip) {
+            try target_cache.truncate(0, s);
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            target_moe_seq_offset.* = 0;
+            return .{ .matched = 0, .full_match = false };
+        }
         var probe: MatchProbe = .{};
         const match = self.findBestRestorableMatch(
             prompt_ids,
@@ -1102,7 +1127,7 @@ pub const HotPrefixCache = struct {
                     resetSsmEntries(ssm_entries);
                     break :disk;
                 };
-                if (self.qsa_history_required and !entriesHaveQsaHistory(ssm_entries)) {
+                if (self.qsa_history_required and !(entriesHaveQsaHistory(ssm_entries) and qsaRestoreSatisfiesForward(ssm_entries, restored))) {
                     log.warn("  [disk-cache] hybrid restore carries no QSA history — falling back to RAM/cold path\n", .{});
                     target_cache.truncate(0, s) catch {};
                     resetSsmEntries(ssm_entries);
@@ -1111,15 +1136,17 @@ pub const HotPrefixCache = struct {
                 // A checkpoint is always ≤ prompt_len−1, so a hybrid restore
                 // never takes the full-match branch (same as the RAM path).
                 target_moe_seq_offset.* = restored;
+                self.last_restored_disk_id = d.entries.items[hm.idx].id;
                 const ms = sw.read() / std.time.ns_per_ms;
                 log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
+                const disk_mtp = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp);
                 return .{
                     .matched = restored,
                     .full_match = false,
                     // The spec sidecar of the entry the TRUNK came from: `dm` ranks by raw
                     // length, `hm` by restorable checkpoint, so they routinely differ.
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
-                    .mtp_base = diskRestoreSpec(d, hm.idx, mtp_target, restored, s, .mtp),
+                    .mtp_base = disk_mtp,
                 };
             }
 
@@ -1146,11 +1173,12 @@ pub const HotPrefixCache = struct {
             target_moe_seq_offset.* = final_len;
             const ms = sw.read() / std.time.ns_per_ms;
             log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
+            const disk_mtp = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp);
             return .{
                 .matched = final_len,
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
-                .mtp_base = diskRestoreSpec(d, dm.idx, mtp_target, final_len, s, .mtp),
+                .mtp_base = disk_mtp,
             };
         }
 
@@ -1189,13 +1217,17 @@ pub const HotPrefixCache = struct {
             });
             return .{ .matched = 0, .full_match = false };
         }
-        // The stamp before the bump: two arms after the restore still end in `matched = 0`.
+        const would_full = m.shared == prompt_ids.len and m.shared > 1;
+        const restore_cap: usize = blk: {
+            if (target_ssm_entries == null or !would_full) break :blk m.shared;
+            const cps = e.ssm_checkpoints orelse break :blk m.shared;
+            const cp = highestCoveringCheckpoint(cps, m.shared) orelse break :blk m.shared;
+            if (cp.pos == m.shared) break :blk m.shared - 1;
+            break :blk m.shared;
+        };
         if (e.ssm_checkpoints) |cps| {
-            if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
-                const src_cp = qsaHistorySource(cps, cp) orelse cp;
-                if (!transformer_mod.checkpointQsaCoversPos(cp, src_cp, cp.pos)) {
-                    return error.QsaHistoryGap;
-                }
+            if (highestCoveringCheckpoint(cps, restore_cap) == null and highestCheckpointAtOrBelow(cps, restore_cap) != null) {
+                return error.QsaHistoryGap;
             }
         }
         const used_before_restore = e.last_used;
@@ -1218,20 +1250,38 @@ pub const HotPrefixCache = struct {
         // the effective matched length to that position. KV is positionally
         // trimmable; SSM is only restorable at the snapshotted positions.
         // The two MUST stay in sync, so we rewind KV further too.
-        var effective_matched: usize = m.shared;
+        var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
+        var effective_matched: usize = restore_cap;
         if (target_ssm_entries) |entries| {
             if (e.ssm_checkpoints) |cps| {
-                if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
+                if (highestCoveringCheckpoint(cps, restore_cap)) |cp| {
                     try restoreSsmCheckpoint(entries, cp);
                     effective_matched = cp.pos;
-                    // QSA indexer history is stored once on the latest snap
-                    // (full length). Intermediate restores slice it to cp.pos.
-                    if (qsaHistorySource(cps, cp)) |src| {
-                        try applyQsaHistoryAt(entries, src, cp.pos, s);
+                    const bank = qsaHistorySource(cps, cp);
+                    if (bank) |src| {
+                        try applyQsaHistoryAt(entries, src, cp.pos, s, false);
                     }
-                    if (self.qsa_history_required and !entriesHaveQsaHistory(entries)) {
-                        // No indexer history after restore: a miss, never
-                        // an entry that fails every turn.
+                    const ring_rows: c_int = blk: {
+                        for (entries) |*ent| {
+                            if (ent.aux_state.ctx == null) continue;
+                            const sh = mlx.getShape(ent.aux_state);
+                            if (sh.len >= 2) break :blk sh[1];
+                        }
+                        break :blk 0;
+                    };
+                    dump.cp = cp.pos;
+                    dump.bank_from = if (bank) |b| b.pos else cp.pos;
+                    dump.source = if (bank == null) "own" else "donor";
+                    dump.entry_idx = m.idx + 1;
+                    dump.entry_count = self.entries.items.len;
+                    log.debug("  [hot-cache] restore pos={d} cp={d} bank_from=cp@{d} ring_rows={d} source={s}\n", .{
+                        effective_matched,
+                        dump.cp,
+                        dump.bank_from,
+                        ring_rows,
+                        dump.source,
+                    });
+                    if (self.qsa_history_required and !(entriesHaveQsaHistory(entries) and qsaRestoreSatisfiesForward(entries, effective_matched))) {
                         resetSsmEntries(entries);
                         effective_matched = 0;
                     }
@@ -1282,25 +1332,28 @@ pub const HotPrefixCache = struct {
         // token id, so the match can never reach into it — discarding it is correct.
         try target_cache.truncate(final_len, s);
 
-        if (full_match and effective_matched > 1) {
-            target_moe_seq_offset.* = effective_matched - 1;
-            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ effective_matched - 1, prompt_ids.len });
-            return .{
-                .matched = effective_matched - 1,
-                .full_match = true,
-                .dflash_base = restoreDflash(e, dflash_target, effective_matched - 1, s),
-                .mtp_base = restoreMtp(e, mtp_target, effective_matched - 1, s),
-            };
+        const full_reuse = full_match and effective_matched > 1;
+        const matched = if (full_reuse) effective_matched - 1 else effective_matched;
+        if (full_reuse) {
+            target_moe_seq_offset.* = matched;
+            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ matched, prompt_ids.len });
+        } else {
+            log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
         }
-
-        log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
         var res: LookupResult = .{
-            .matched = effective_matched,
+            .matched = matched,
             .full_match = full_match,
-            .dflash_base = restoreDflash(e, dflash_target, effective_matched, s),
-            .mtp_base = restoreMtp(e, mtp_target, effective_matched, s),
+            .dflash_base = restoreDflash(e, dflash_target, matched, s),
+            .mtp_base = restoreMtp(e, mtp_target, matched, s),
         };
-        res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
+        if (!full_reuse) {
+            res.checked_out = self.checkoutIfEligible(m.idx, m.shared, prompt_ids.len, slot_id);
+        }
+        dump.pos = res.matched;
+        dump.mtp_base = res.mtp_base;
+        dump.entry_idx = m.idx + 1;
+        dump.entry_count = self.entries.items.len;
+        _ = restore_dump.dumpRestoreIfEnabled(target_cache, target_ssm_entries, s, dump);
         return res;
     }
 
@@ -1419,9 +1472,14 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) !CommitStatus {
-        return self.commitWithMediaState(source_cache, tokens, has_tools, vision_key, 0, null, ssm_cps, dflash, mtp);
+        return self.commitWithMediaState(source_cache, tokens, has_tools, vision_key, 0, null, ssm_cps, dflash, mtp, tokens.len);
     }
 
+    /// `prompt_len` is the committing request's PROMPT length inside `tokens`
+    /// (which may carry the generated tail too): inherited checkpoints are capped
+    /// at it, because a donor's checkpoints past the prompt hold the donor's own
+    /// generation and a greedy continuation can match those tokens verbatim.
+    /// `commitWithState` passes `tokens.len`, right only for a prompt-only array.
     pub fn commitWithMediaState(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
@@ -1433,6 +1491,7 @@ pub const HotPrefixCache = struct {
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
+        prompt_len: usize,
     ) !CommitStatus {
         const quant_config = source_cache.config;
 
@@ -1716,19 +1775,55 @@ pub const HotPrefixCache = struct {
             else
                 self.max_kv_bytes - new_bytes;
             const donor_cps = self.entries.items[donor.idx].ssm_checkpoints.?;
-            const cloned = (cloneCheckpointsUpTo(self.allocator, donor_cps, donor.shared, budget) catch |err| {
+            const prompt_cap = @min(if (prompt_len == 0) eff_tokens.len else prompt_len, eff_tokens.len);
+            const inherit_limit = @min(donor.shared, prompt_cap);
+            const cloned = (cloneCheckpointsUpTo(self.allocator, donor_cps, inherit_limit, budget) catch |err| {
                 log.warn("  [hot-cache] checkpoint inheritance failed: {s}\n", .{@errorName(err)});
                 break :inherit;
             }) orelse break :inherit;
+            var donor_bank: ?*const SSMCheckpoint = null;
+            for (donor_cps) |*cp| {
+                if (checkpointHasQsaPooled(cp)) donor_bank = cp;
+            }
+            if (donor_bank) |src| {
+                if (src.pos > inherit_limit and cloned.len > 0) {
+                    sliceQsaHistoryOntoCheckpoint(&cloned[cloned.len - 1], src, cloned[cloned.len - 1].pos, mlx.gpuStream()) catch |err| {
+                        log.warn("  [hot-cache] inherited QSA bank slice failed: {s}\n", .{@errorName(err)});
+                        for (cloned) |*c| c.deinit(self.allocator);
+                        self.allocator.free(cloned);
+                        break :inherit;
+                    };
+                }
+            }
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                eff_cps = self.mergeCheckpointLists(cloned, own, eff_media_start) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, eff_media_start) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
+                    new_bytes -= new_ssm_bytes;
+                    new_ssm_bytes = 0;
                     break :inherit;
                 };
+                if (merged) |m| {
+                    eff_cps = m;
+                } else {
+                    eff_cps = null;
+                    new_bytes -= new_ssm_bytes;
+                    new_ssm_bytes = 0;
+                    break :inherit;
+                }
             } else {
                 eff_cps = cloned;
+            }
+            if (eff_cps) |cps| {
+                if (self.takeCpsIfQsaBank(cps)) |kept| {
+                    eff_cps = kept;
+                } else {
+                    eff_cps = null;
+                    new_bytes -= new_ssm_bytes;
+                    new_ssm_bytes = 0;
+                    break :inherit;
+                }
             }
             var inherited_bytes: u64 = 0;
             for (eff_cps.?) |*cp| inherited_bytes += ssmCheckpointBytes(cp);
@@ -1736,7 +1831,7 @@ pub const HotPrefixCache = struct {
             new_ssm_bytes = inherited_bytes;
             log.info("  [hot-cache] inherited {d} checkpoints (<= {d} tokens) from a shared prefix\n", .{
                 eff_cps.?.len,
-                donor.shared,
+                inherit_limit,
             });
         }
 
@@ -1838,6 +1933,15 @@ pub const HotPrefixCache = struct {
             }
         }
 
+        if (eff_cps) |cps| {
+            if (self.takeCpsIfQsaBank(cps)) |kept| {
+                eff_cps = kept;
+            } else {
+                new_bytes -= new_ssm_bytes;
+                new_ssm_bytes = 0;
+                eff_cps = null;
+            }
+        }
         self.entries.append(self.allocator, .{
             .tokens = tokens_owned,
             .has_tools = has_tools,
@@ -2240,7 +2344,7 @@ pub const HotPrefixCache = struct {
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
         media_start: ?usize,
-    ) ![]SSMCheckpoint {
+    ) !?[]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
         var j: usize = 0;
@@ -2299,7 +2403,16 @@ pub const HotPrefixCache = struct {
         // The inherited latest and this turn's latest both carry the indexer
         // history: keep one.
         keepOnlyLatestQsaHistory(owned);
-        return owned;
+        return self.takeCpsIfQsaBank(owned);
+    }
+
+    fn takeCpsIfQsaBank(self: *HotPrefixCache, cps: []SSMCheckpoint) ?[]SSMCheckpoint {
+        if (!self.qsa_history_required) return cps;
+        if (checkpointListHasQsaPooled(cps)) return cps;
+        for (cps) |*cp| cp.deinit(self.allocator);
+        self.allocator.free(cps);
+        log.info("  [hot-cache] dropped checkpoints: no QSA indexer bank\n", .{});
+        return null;
     }
 
     /// The resident entry whose checkpoints a commit of `tokens` may inherit:
@@ -2418,11 +2531,12 @@ pub const HotPrefixCache = struct {
                 boundaryCheckpointIndex(cps[0..n], newest.media_start),
             );
             const freed = ssmCheckpointBytes(&cps[drop]);
-            // Defensive: the shared selection never picks the last.
-            if (drop + 1 == n and drop > 0 and checkpointHasQsaPooled(&cps[drop])) {
-                sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch |err| {
-                    log.warn("  [hot-cache] shed dropped the QSA indexer history: {s}\n", .{@errorName(err)});
-                };
+            if (checkpointHasQsaPooled(&cps[drop])) {
+                if (drop > 0) {
+                    sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch |err| {
+                        log.warn("  [hot-cache] shed dropped the QSA indexer history: {s}\n", .{@errorName(err)});
+                    };
+                }
             }
             cps[drop].deinit(self.allocator);
             var k = drop;
@@ -2439,6 +2553,17 @@ pub const HotPrefixCache = struct {
         // slice — `highestCheckpointAtOrBelow` skips empty checkpoints and a
         // re-deinit of a stub is a no-op, so they are inert.
         newest.ssm_checkpoints = self.allocator.realloc(cps, n) catch cps;
+        if (self.takeCpsIfQsaBank(newest.ssm_checkpoints.?)) |kept| {
+            newest.ssm_checkpoints = kept;
+            n = kept.len;
+        } else {
+            const leftover = newest.ssm_bytes;
+            newest.ssm_checkpoints = null;
+            newest.ssm_bytes = 0;
+            newest.kv_bytes -|= leftover;
+            self.current_kv_bytes -|= leftover;
+            n = 0;
+        }
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
@@ -2469,6 +2594,30 @@ pub const HotPrefixCache = struct {
         const before = self.entries.items.len;
         self.evictOneLru(reason, incoming_key);
         return self.entries.items.len != before;
+    }
+
+    pub fn dropLastRestored(self: *HotPrefixCache) bool {
+        var dropped = false;
+        if (self.last_restored_disk_id) |id| {
+            self.last_restored_disk_id = null;
+            if (self.disk) |*d| {
+                if (d.poisonId(id, "QSA history check")) dropped = true;
+            }
+        }
+        const used = self.last_restored_used orelse return dropped;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.last_used != used) continue;
+            self.last_restored_used = null;
+            self.evictAt(i, "QSA history check");
+            return true;
+        }
+        self.last_restored_used = null;
+        return dropped;
+    }
+
+    pub fn dropQsaGapEntry(slot_cache: ?*HotPrefixCache) bool {
+        if (slot_cache) |hc| return hc.dropLastRestored();
+        return false;
     }
 
     fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
@@ -3191,7 +3340,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
     // Cancel shape (the scheduler passes the boundary raw): media declared
     // at 500, entry covers [0, 400) — no media rows inside, so the entry
     // must be text-keyed.
-    const st = try hc.commitWithMediaState(&cache, tokens[0..400], false, 0xABCD, 0, 500, null, null, null);
+    const st = try hc.commitWithMediaState(&cache, tokens[0..400], false, 0xABCD, 0, 500, null, null, null, 400);
     try testing.expect(st == .ok);
     try testing.expectEqual(@as(u64, 0), hc.entries.items[0].vision_key);
     try testing.expect(hc.entries.items[0].media_start == null);
@@ -3210,7 +3359,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
         var c2 = try KVCache.init(testing.allocator, 2);
         defer c2.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreWithMedia(&c2, &moe, null, s, &tokens, false, 0, null, null, null, null);
+        const res = try hc.lookupAndRestoreWithMedia(&c2, &moe, null, s, &tokens, false, 0, null, null, null, null, false);
         try testing.expectEqual(@as(usize, 400), res.matched);
     }
     // A different-image request caps at ITS media boundary (500 > 400 here,
@@ -3219,7 +3368,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
         var c3 = try KVCache.init(testing.allocator, 2);
         defer c3.deinit();
         var moe: usize = 0;
-        const res = try hc.lookupAndRestoreWithMedia(&c3, &moe, null, s, &tokens, false, 0xFFFF, 500, null, null, null);
+        const res = try hc.lookupAndRestoreWithMedia(&c3, &moe, null, s, &tokens, false, 0xFFFF, 500, null, null, null, false);
         try testing.expectEqual(@as(usize, 400), res.matched);
     }
 
@@ -3230,7 +3379,7 @@ test "HotPrefixCache: an entry shorter than its media boundary is pure text" {
     var cache2 = try KVCache.init(testing.allocator, 2);
     defer cache2.deinit();
     try testFillCache(&cache2, s, 2, 600);
-    const st2 = try hc2.commitWithMediaState(&cache2, &tokens, false, 0xABCD, 0, 300, null, null, null);
+    const st2 = try hc2.commitWithMediaState(&cache2, &tokens, false, 0xABCD, 0, 300, null, null, null, tokens.len);
     try testing.expect(st2 == .ok);
     try testing.expectEqual(@as(usize, 256), st2.ok); // 32 KB / 128 B rows
     try testing.expectEqual(@as(u64, 0), hc2.entries.items[0].vision_key);
@@ -3280,7 +3429,7 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, null, null, null);
+        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, null, null, null, false);
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 400), res.matched);
         try testing.expectEqual(@as(usize, 400), cache2.step);
@@ -3571,6 +3720,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         checkpoints,
         null,
         null,
+        cached_tokens.len,
     );
 
     var target_cache = try KVCache.init(testing.allocator, 3);
@@ -3590,6 +3740,7 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
         null,
         null,
         null,
+        false,
     );
 
     try testing.expectEqual(media_start, result.matched);
@@ -3686,7 +3837,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     text_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 4, s);
     text_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 8, s);
     text_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &text_ssm, 10, s);
-    _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, 0, 0, null, text_cps, null, null);
+    _ = try hc.commitWithMediaState(&text_cache, &text_tokens, false, 0, 0, null, text_cps, null, null, text_tokens.len);
 
     // The image turn restores the pre-media text prefix (cross-key, capped
     // at the boundary) and prefills the rest.
@@ -3707,6 +3858,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
         null,
         null,
         null,
+        false,
     );
     try testing.expectEqual(@as(usize, 10), restored.matched);
 
@@ -3719,7 +3871,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
     const image_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     image_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 16, s);
     image_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &image_state, 18, s);
-    _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, image_key, 0, media_start, image_cps, null, null);
+    _ = try hc.commitWithMediaState(&image_cache, &image_tokens, false, image_key, 0, media_start, image_cps, null, null, image_tokens.len);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
 
     // The next text-only turn must still restore the pre-media prefix: the
@@ -3741,6 +3893,7 @@ test "HotPrefixCache: a text turn after image turns restores the pre-media prefi
         null,
         null,
         null,
+        false,
     );
     try testing.expectEqual(@as(usize, 10), result.matched);
     try testing.expectEqual(@as(usize, 10), later_cache.step);
@@ -3769,7 +3922,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c1, s, 3, 16);
     const first = try testing.allocator.alloc(SSMCheckpoint, 3);
     for (first, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 2 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, 0xF00D, 0, media_start, first, null, null);
+    _ = try hc.commitWithMediaState(&c1, tokens[0..16], false, 0xF00D, 0, media_start, first, null, null, 16);
 
     // The next turn extends the same conversation, so the commit replaces the
     // entry and merges: seven checkpoints thinned down to the cap of three.
@@ -3778,7 +3931,7 @@ test "HotPrefixCache: thinning keeps the highest checkpoint below the media boun
     try testFillCache(&c2, s, 3, 24);
     const second = try testing.allocator.alloc(SSMCheckpoint, 4);
     for (second, 0..) |*c, i| c.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &ssm, 12 + i * 2, s);
-    _ = try hc.commitWithMediaState(&c2, &tokens, false, 0xF00D, 0, media_start, second, null, null);
+    _ = try hc.commitWithMediaState(&c2, &tokens, false, 0xF00D, 0, media_start, second, null, null, tokens.len);
 
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     const kept = hc.entries.items[0].ssm_checkpoints.?;
@@ -4656,6 +4809,73 @@ fn pcFreeQsaHybrid(e: *[3]SSMCacheEntry) void {
     }
 }
 
+test "HotPrefixCache: restore dump writes named tensors and is a no-op when unset" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 8);
+    var live = pcBuildQsaHybrid(s, 8, 100.0);
+    defer pcFreeQsaHybrid(&live);
+
+    restore_dump.dump_restore_override = null;
+    try testing.expectEqual(@as(?u64, null), restore_dump.dumpRestoreIfEnabled(&cache, &live, s, .{
+        .kind = "restore",
+        .pos = 8,
+    }));
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const dir = buf[0..root_len];
+    restore_dump.dump_restore_override = dir;
+    defer restore_dump.dump_restore_override = null;
+    const n = restore_dump.dumpRestoreIfEnabled(&cache, &live, s, .{
+        .kind = "restore",
+        .pos = 8,
+        .cp = 8,
+        .bank_from = 8,
+        .source = "own",
+        .entry_idx = 1,
+        .entry_count = 1,
+    }) orelse return error.TestExpectedEqual;
+
+    const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/restore-{d}-pos8.safetensors", .{ dir, n }, 0);
+    defer testing.allocator.free(st_path);
+    const json_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/restore-{d}-pos8.json", .{ dir, n }, 0);
+    defer testing.allocator.free(json_path);
+    {
+        const sf = std.c.fopen(st_path, "r") orelse return error.TestExpectedEqual;
+        _ = std.c.fclose(sf);
+        const jf = std.c.fopen(json_path, "r") orelse return error.TestExpectedEqual;
+        _ = std.c.fclose(jf);
+    }
+    var tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    var mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    try mlx.check(mlx.mlx_load_safetensors(&tmap, &mmap, st_path, s));
+    const names = [_][:0]const u8{
+        "pos",
+        "layers.0.aux_state",
+        "layers.0.qsa_pooled",
+        "layers.0.ple_prev",
+        "layers.0.qsa_rows",
+        "layers.0.qsa_key_rows",
+        "layers.0.ring_start",
+        "layers.1.conv_state",
+        "kv.0.k_tail",
+        "kv.0.v_tail",
+    };
+    for (names) |name| {
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&got, tmap, name));
+        try testing.expect(got.ctx != null);
+    }
+}
+
 test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, never a poisoned entry" {
     // A snap without QSA history (a cancel handoff whose attach failed, an
     // old on-disk entry) used to restore aux-less; the next prefill then died
@@ -4949,7 +5169,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
     const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
     cps[0] = .{ .pos = 4, .layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
     var toks = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, 0, 0, null, cps, null, null));
+    try testing.expectError(error.OutOfMemory, hc.commitWithMediaState(&src, &toks, false, 0, 0, null, cps, null, null, toks.len));
     // No frees here: the cache owns the checkpoints on every outcome.
 }
 
@@ -5046,6 +5266,1300 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     try testing.expectEqual(@as(usize, 16), moe_off);
     // The restored state is the checkpoint A captured at 16 (srcs[1]).
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(target_ssm[0].conv_state, 0, s));
+}
+
+test "HotPrefixCache: inheriting a 1-token-tail commit cannot restore a bank-less leftover" {
+    const s = mlx.gpuStream();
+    var donor_toks: [30]u32 = undefined;
+    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var heir_toks: [19]u32 = undefined;
+    @memcpy(heir_toks[0..17], donor_toks[0..17]);
+    heir_toks[17] = 900;
+    heir_toks[18] = 901;
+
+    var live = pcBuildQsaHybrid(s, 25, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
+    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
+
+    var lookup = heir_toks;
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
+    const pos: c_int = @intCast(r.matched);
+    const ratio: c_int = if (target[0].qsa_ratio > 0) target[0].qsa_ratio else 4;
+    const blocks: c_int = if (target[0].qsa_pooled.ctx != null) mlx.getShape(target[0].qsa_pooled)[1] else 0;
+    const held: c_int = if (target[0].aux_state.ctx != null) mlx.getShape(target[0].aux_state)[1] else 0;
+    const backed = target[0].qsa_hist_rows == pos and blocks * ratio + held >= pos;
+    try testing.expect(r.matched == 0 or backed);
+}
+
+test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_end-1" {
+    const s = mlx.gpuStream();
+    var prefix: [18]u32 = undefined;
+    for (&prefix, 0..) |*t, i| t.* = @intCast(i + 1);
+    const donor_toks = prefix ++ [_]u32{ 90, 91 };
+    const heir_toks = prefix ++ [_]u32{ 200, 201, 202, 203, 204, 205, 206, 207 };
+    var live = pcBuildQsaHybrid(s, 18, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
+    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_live = pcBuildQsaHybrid(s, 21, 100.0);
+    defer pcFreeQsaHybrid(&heir_live);
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 21, s);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
+
+    var lookup = heir_toks ++ [_]u32{ 300, 301 };
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 18), r.matched);
+    try testing.expectEqual(@as(c_int, 18), target[0].qsa_hist_rows);
+    try testing.expect(target[0].qsa_pooled.ctx != null);
+    const ratio: c_int = if (target[0].qsa_ratio > 0) target[0].qsa_ratio else 4;
+    const blocks: c_int = mlx.getShape(target[0].qsa_pooled)[1];
+    const held: c_int = if (target[0].aux_state.ctx != null) mlx.getShape(target[0].aux_state)[1] else 0;
+    try testing.expect(blocks * ratio + held >= 18);
+}
+
+test "HotPrefixCache: a leftover-only checkpoint list is a lookup miss" {
+    const s = mlx.gpuStream();
+    var toks: [19]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 17, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, toks.len);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null) catch |err| blk: {
+        try testing.expectEqual(error.QsaHistoryGap, err);
+        break :blk LookupResult{ .matched = 0, .full_match = false };
+    };
+    try testing.expectEqual(@as(usize, 0), r.matched);
+}
+
+test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored position, all four residues" {
+    const s = mlx.gpuStream();
+    var donor_toks: [30]u32 = undefined;
+    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var heir_toks: [28]u32 = undefined;
+    @memcpy(heir_toks[0..21], donor_toks[0..21]);
+    for (heir_toks[21..], 0..) |*t, i| t.* = @intCast(900 + i);
+
+    var donor_live = pcBuildQsaHybrid(s, 25, 100.0);
+    defer pcFreeQsaHybrid(&donor_live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 8, s);
+    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 16, s);
+    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 25, s);
+    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_live = pcBuildQsaHybrid(s, 21, 200.0);
+    defer pcFreeQsaHybrid(&heir_live);
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 20, s);
+    try transformer_mod.attachQsaHistoryToLatest(heir_own, &heir_live, s);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
+
+    var n: usize = 17;
+    var hits: usize = 0;
+    while (n <= 20) : (n += 1) {
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..n], false, 0, null, null) catch |err| blk: {
+            try testing.expectEqual(error.QsaHistoryGap, err);
+            break :blk LookupResult{ .matched = 0, .full_match = false };
+        };
+        try testing.expect(!r.full_match);
+        if (r.matched > 0) {
+            hits += 1;
+            try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
+            try testing.expectEqual(r.matched, moe_off);
+        }
+    }
+    try testing.expect(hits == 4);
+}
+
+fn pcQsaArangeKeys(s: mlx.mlx_stream, rows: c_int, hd: c_int) !mlx.mlx_array {
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    mlx.check(mlx.mlx_arange(&flat, 0.0, @floatFromInt(rows * hd), 1.0, .float32, s)) catch return error.TestUnexpectedResult;
+    var shaped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(shaped);
+    mlx.check(mlx.mlx_reshape(&shaped, flat, &[_]c_int{ 1, rows, hd }, 3, s)) catch return error.TestUnexpectedResult;
+    var out = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_astype(&out, shaped, .bfloat16, s)) catch return error.TestUnexpectedResult;
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
+fn pcQsaBf16Equal(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
+    try testing.expect(a.ctx != null);
+    try testing.expect(b.ctx != null);
+    _ = mlx.mlx_array_eval(a);
+    _ = mlx.mlx_array_eval(b);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    _ = mlx.mlx_array_eval(eq);
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
+}
+
+fn pcQsaSliceAxis1(s: mlx.mlx_stream, arr: mlx.mlx_array, from: c_int, to: c_int) !mlx.mlx_array {
+    const sh = mlx.getShape(arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, from, 0 }, 3, &[_]c_int{ sh[0], to, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return out;
+}
+
+fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMCacheEntry, pos: c_int) !void {
+    try testing.expectEqual(pos, warm.qsa_hist_rows);
+    try testing.expectEqual(pos, cold.qsa_hist_rows);
+    const ratio = @max(@max(warm.qsa_ratio, cold.qsa_ratio), 1);
+    const need_blocks = @divTrunc(pos, ratio);
+    const leftover_n = @mod(pos, ratio);
+    if (need_blocks > 0) {
+        try testing.expect(warm.qsa_pooled.ctx != null);
+        try testing.expect(cold.qsa_pooled.ctx != null);
+        const w = try pcQsaSliceAxis1(s, warm.qsa_pooled, 0, need_blocks);
+        defer _ = mlx.mlx_array_free(w);
+        const c = try pcQsaSliceAxis1(s, cold.qsa_pooled, 0, need_blocks);
+        defer _ = mlx.mlx_array_free(c);
+        pcQsaBf16Equal(s, w, c) catch {
+            log.warn("qsa pooled mismatch at pos {d} need_blocks {d} warm_blocks {d} cold_blocks {d}\n", .{
+                pos,
+                need_blocks,
+                mlx.getShape(warm.qsa_pooled)[1],
+                mlx.getShape(cold.qsa_pooled)[1],
+            });
+            return error.TestExpectedEqual;
+        };
+    }
+    if (leftover_n > 0) {
+        try testing.expect(warm.aux_state.ctx != null);
+        try testing.expect(cold.aux_state.ctx != null);
+        const wh = mlx.getShape(warm.aux_state)[1];
+        const ch = mlx.getShape(cold.aux_state)[1];
+        try testing.expect(wh >= leftover_n);
+        try testing.expect(ch >= leftover_n);
+        const w = try pcQsaSliceAxis1(s, warm.aux_state, wh - leftover_n, wh);
+        defer _ = mlx.mlx_array_free(w);
+        const c = try pcQsaSliceAxis1(s, cold.aux_state, ch - leftover_n, ch);
+        defer _ = mlx.mlx_array_free(c);
+        pcQsaBf16Equal(s, w, c) catch {
+            log.warn("qsa leftover mismatch at pos {d} leftover {d} warm_aux {d} cold_aux {d}\n", .{ pos, leftover_n, wh, ch });
+            return error.TestExpectedEqual;
+        };
+    }
+}
+
+fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+    const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
+    defer _ = mlx.mlx_array_free(chunk);
+    try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);
+}
+
+fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    var r = lo;
+    while (r <= hi) : (r += 1) {
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        const got = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, toks[0..r], false, 0, null, null) catch |err| {
+            log.warn("qsa value sweep lookup at r={d}: {s}\n", .{ r, @errorName(err) });
+            return err;
+        };
+        try testing.expect(got.matched > 0);
+        const pos: c_int = @intCast(got.matched);
+        var cold = pcEmptySsm();
+        defer pcFreeQsaHybrid(&cold);
+        cold[0].qsa_ratio = 4;
+        try pcQsaFeed(&xfm, &cold[0], keys, pos, s);
+        pcQsaExpectViewEqual(s, &target[0], &cold[0], pos) catch {
+            log.warn("qsa value sweep mismatch r={d} restored={d} full_match={}\n", .{ r, got.matched, got.full_match });
+            return error.TestExpectedEqual;
+        };
+    }
+}
+
+test "HotPrefixCache: restored QSA history values match a cold feed at every position" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const P: usize = 80;
+    const keys = try pcQsaArangeKeys(s, @intCast(P), hd);
+    defer _ = mlx.mlx_array_free(keys);
+    var toks: [P]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+
+    // Plain entry: checkpoints at every r in [P-40, P], bank on latest.
+    {
+        var live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&live);
+        const n_cps: usize = 41;
+        const cps = try testing.allocator.alloc(SSMCheckpoint, n_cps);
+        var i: usize = 0;
+        while (i < n_cps) : (i += 1) {
+            const pos: c_int = @intCast(P - 40 + i);
+            const chunk = try pcQsaSliceAxis1(s, keys, 0, pos);
+            defer _ = mlx.mlx_array_free(chunk);
+            transformer_mod.ssmFreeQsaState(&live[0]);
+            live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
+            try transformer_mod.qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
+            cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, @intCast(pos), s);
+        }
+        try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.qsa_history_required = true;
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, toks.len);
+        _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+        try pcQsaSweep(&hc, &toks, keys, P - 39, P, s);
+    }
+
+    // Inherited entry: donor bank sits above shared; heir is a short-tail commit.
+    {
+        const shared: usize = 48;
+        const donor_len: usize = 64;
+        const donor_keys = try pcQsaArangeKeys(s, @intCast(donor_len), hd);
+        defer _ = mlx.mlx_array_free(donor_keys);
+        var donor_toks: [64]u32 = undefined;
+        for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+        var heir_toks: [56]u32 = undefined;
+        @memcpy(heir_toks[0..shared], donor_toks[0..shared]);
+        for (heir_toks[shared..], 0..) |*t, i| t.* = @intCast(10_000 + i);
+
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        hc.qsa_history_required = true;
+
+        var donor_live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&donor_live);
+        const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 5);
+        for ([_]c_int{ 16, 32, 48, 56, 64 }, 0..) |pos, i| {
+            const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, pos);
+            defer _ = mlx.mlx_array_free(chunk);
+            transformer_mod.ssmFreeQsaState(&donor_live[0]);
+            donor_live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
+            try transformer_mod.qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
+            donor_cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, @intCast(pos), s);
+        }
+        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
+        var donor_cache = try KVCache.init(testing.allocator, 3);
+        defer donor_cache.deinit();
+        try testFillCache(&donor_cache, s, 3, donor_toks.len);
+        _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+        var heir_live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&heir_live);
+        {
+            const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, @intCast(shared));
+            defer _ = mlx.mlx_array_free(chunk);
+            try transformer_mod.qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
+        }
+        const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+        heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, shared, s);
+        var heir_cache = try KVCache.init(testing.allocator, 3);
+        defer heir_cache.deinit();
+        try testFillCache(&heir_cache, s, 3, heir_toks.len);
+        _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
+
+        try pcQsaSweep(&hc, heir_toks[0..shared], donor_keys, 17, shared, s);
+    }
+}
+
+test "HotPrefixCache: shed rescues an interior QSA bank" {
+    const s = mlx.gpuStream();
+    var toks: [30]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 25, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var probe = try KVCache.init(testing.allocator, 3);
+    defer probe.deinit();
+    try testFillCache(&probe, s, 3, toks.len);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    hc.ssm_checkpoint_max = 8;
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    try transformer_mod.sliceQsaHistoryOntoCheckpoint(&cps[1], &cps[2], cps[1].pos, s);
+    for (cps[2].layers) |*l| {
+        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+        l.qsa_pooled = .{ .ctx = null };
+    }
+    _ = try hc.commitWithState(&probe, &toks, false, 0, cps, null, null);
+    const before = hc.current_kv_bytes;
+    const listed = hc.entries.items[0].ssm_checkpoints.?;
+    hc.max_kv_bytes = before - ssmCheckpointBytes(&listed[1]) + 1;
+    hc.shedCheckpointsToFit();
+    try testing.expect(hc.entryCount() == 1);
+    const kept = hc.entries.items[0].ssm_checkpoints.?;
+    try testing.expect(kept.len >= 1);
+    try testing.expect(transformer_mod.checkpointListHasQsaPooled(kept));
+}
+
+test "HotPrefixCache: dropLastRestored removes the restored entry so the next lookup is cold" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const first = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
+    try testing.expect(first.matched > 0);
+    try testing.expect(hc.dropLastRestored());
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    var target2 = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target2);
+    var moe2: usize = 0;
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), second.matched);
+}
+
+test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibling cache" {
+    const s = mlx.gpuStream();
+    const tokens_a = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const tokens_b = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+
+    var last_loaded = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer last_loaded.deinit();
+    last_loaded.qsa_history_required = true;
+    var cache_a = try KVCache.init(testing.allocator, 3);
+    defer cache_a.deinit();
+    try testFillCache(&cache_a, s, 3, tokens_a.len);
+    var live_a = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live_a);
+    const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps_a, &live_a, s);
+    _ = try last_loaded.commitWithState(&cache_a, &tokens_a, false, 0, cps_a, null, null);
+
+    var slot_hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer slot_hc.deinit();
+    slot_hc.qsa_history_required = true;
+    var cache_b = try KVCache.init(testing.allocator, 3);
+    defer cache_b.deinit();
+    try testFillCache(&cache_b, s, 3, tokens_b.len);
+    var live_b = pcBuildQsaHybrid(s, 10, 200.0);
+    defer pcFreeQsaHybrid(&live_b);
+    const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps_b, &live_b, s);
+    _ = try slot_hc.commitWithState(&cache_b, &tokens_b, false, 0, cps_b, null, null);
+
+    var tgt_a = try KVCache.init(testing.allocator, 3);
+    defer tgt_a.deinit();
+    var ssm_a = pcEmptySsm();
+    defer pcFreeQsaHybrid(&ssm_a);
+    var moe_a: usize = 0;
+    const ra = try last_loaded.lookupAndRestore(&tgt_a, &moe_a, &ssm_a, s, &tokens_a, false, 0, null, null);
+    try testing.expect(ra.matched > 0);
+
+    var tgt_b = try KVCache.init(testing.allocator, 3);
+    defer tgt_b.deinit();
+    var ssm_b = pcEmptySsm();
+    defer pcFreeQsaHybrid(&ssm_b);
+    var moe_b: usize = 0;
+    const rb = try slot_hc.lookupAndRestore(&tgt_b, &moe_b, &ssm_b, s, &tokens_b, false, 0, null, null);
+    try testing.expect(rb.matched > 0);
+
+    try testing.expect(HotPrefixCache.dropQsaGapEntry(&slot_hc));
+    try testing.expectEqual(@as(usize, 0), slot_hc.entryCount());
+    try testing.expectEqual(@as(usize, 1), last_loaded.entryCount());
+}
+
+test "HotPrefixCache: inherited checkpoints never exceed the shared prefix" {
+    const s = mlx.gpuStream();
+    var prefix: [18]u32 = undefined;
+    for (&prefix, 0..) |*t, i| t.* = @intCast(i + 1);
+    const donor_toks = prefix ++ [_]u32{ 90, 91 };
+    const prompt_len: usize = 19;
+    const heir_toks = prefix ++ [_]u32{200} ++ [_]u32{ 300, 301, 302, 303, 304, 305, 306, 307 };
+    var live = pcBuildQsaHybrid(s, 18, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
+    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
+
+    var found = false;
+    for (hc.entries.items) |*e| {
+        if (e.tokens.len != heir_toks.len) continue;
+        found = true;
+        const cps = e.ssm_checkpoints orelse continue;
+        for (cps) |*cp| try testing.expect(cp.pos <= prompt_len - 1);
+    }
+    try testing.expect(found);
+}
+
+fn pcArrEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
+    if (a.ctx == null and b.ctx == null) return;
+    try testing.expect(a.ctx != null);
+    try testing.expect(b.ctx != null);
+    _ = mlx.mlx_array_eval(a);
+    _ = mlx.mlx_array_eval(b);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, a, b, false, s));
+    _ = mlx.mlx_array_eval(eq);
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
+}
+
+fn pcSsmDiffField(s: mlx.mlx_stream, a: []const SSMCacheEntry, b: []const SSMCacheEntry) ![]const u8 {
+    if (a.len != b.len) return "layer_count";
+    for (a, b, 0..) |*la, *lb, i| {
+        _ = i;
+        if (la.initialized != lb.initialized) return "initialized";
+        if (la.ple_prev_valid != lb.ple_prev_valid) return "ple_prev_valid";
+        if (!std.mem.eql(u32, &la.ple_prev, &lb.ple_prev)) return "ple_prev";
+        if (la.qsa_ratio != lb.qsa_ratio) return "qsa_ratio";
+        if (la.qsa_hist_rows != lb.qsa_hist_rows) return "qsa_hist_rows";
+        if (la.qsa_key_rows != lb.qsa_key_rows) return "qsa_key_rows";
+        if (la.qsa_pooled_blocks != lb.qsa_pooled_blocks) return "qsa_pooled_blocks";
+        pcArrEqual(s, la.conv_state, lb.conv_state) catch return "conv_state";
+        pcArrEqual(s, la.ssm_state, lb.ssm_state) catch return "ssm_state";
+        pcArrEqual(s, la.qsa_pooled, lb.qsa_pooled) catch return "qsa_pooled";
+        pcArrEqual(s, la.aux_state, lb.aux_state) catch return "aux_state";
+    }
+    return "";
+}
+
+fn pcCaptureFed(
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    xfm: *transformer_mod.Transformer,
+    keys: mlx.mlx_array,
+    pos: c_int,
+    conv_base: f64,
+    ple0: u32,
+) !SSMCheckpoint {
+    var live: [3]SSMCacheEntry = .{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = mlx.mlx_array_new(), .initialized = true, .ple_prev = .{ ple0, 0, 0, 0, 0, 0, 0, 0 }, .ple_prev_valid = true },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer pcFreeQsaHybrid(&live);
+    try pcQsaFeed(xfm, &live[0], keys, pos, s);
+    return transformer_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
+}
+
+test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const P: usize = 20;
+    const hd: c_int = 8;
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    const keys = try pcQsaArangeKeys(s, 40, hd);
+    defer _ = mlx.mlx_array_free(keys);
+    var donor_toks: [40]u32 = undefined;
+    var heir_toks: [40]u32 = undefined;
+    for (0..P) |i| {
+        donor_toks[i] = @intCast(i + 1);
+        heir_toks[i] = @intCast(i + 1);
+    }
+    for (P..40) |i| {
+        donor_toks[i] = @intCast(1000 + i);
+        heir_toks[i] = @intCast(2000 + i);
+    }
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 4);
+    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 8, 100.0, 8);
+    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 16, 160.0, 16);
+    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 30, 300.0, 30);
+    donor_cps[3] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 40, 400.0, 40);
+    {
+        var live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&live);
+        try pcQsaFeed(&xfm, &live[0], keys, 40, s);
+        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    }
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
+
+    var found = false;
+    for (hc.entries.items) |*e| {
+        if (e.tokens.len != heir_toks.len or e.tokens[P] != heir_toks[P]) continue;
+        found = true;
+        const cps = e.ssm_checkpoints orelse return error.TestExpectedEqual;
+        for (cps) |*cp| try testing.expect(cp.pos <= P);
+    }
+    try testing.expect(found);
+
+    var rpos: usize = P - 4;
+    while (rpos <= P) : (rpos += 1) {
+        var target_cache = try KVCache.init(testing.allocator, 3);
+        defer target_cache.deinit();
+        var target = pcEmptySsm();
+        defer pcFreeQsaHybrid(&target);
+        var moe_off: usize = 0;
+        const got = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..rpos], false, 0, null, null);
+        try testing.expect(got.matched > 0);
+        try testing.expect(got.matched <= P);
+        var cold = pcEmptySsm();
+        defer pcFreeQsaHybrid(&cold);
+        cold[0].qsa_ratio = 4;
+        try pcQsaFeed(&xfm, &cold[0], keys, @intCast(got.matched), s);
+        pcQsaExpectViewEqual(s, &target[0], &cold[0], @intCast(got.matched)) catch {
+            log.warn("inherit divergence restore mismatch pos={d} restored={d}\n", .{ rpos, got.matched });
+            return error.TestExpectedEqual;
+        };
+    }
+}
+
+test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const P: usize = 48;
+    const prompt_len: usize = P - 1;
+    const hd: c_int = 8;
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    const keys = try pcQsaArangeKeys(s, 80, hd);
+    defer _ = mlx.mlx_array_free(keys);
+
+    var donor_toks: [64]u32 = undefined;
+    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var heir_toks: [59]u32 = undefined;
+    @memcpy(&heir_toks, donor_toks[0..59]);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 19, 190.0, 19);
+    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(P), 480.0, 48);
+    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 64, 640.0, 64);
+    {
+        var live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&live);
+        try pcQsaFeed(&xfm, &live[0], keys, 64, s);
+        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    }
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    _ = try hc.commitWithMediaState(&heir_cache, &heir_toks, false, 0, 0, null, null, null, null, prompt_len);
+
+    var found = false;
+    for (hc.entries.items) |*e| {
+        if (e.tokens.len != heir_toks.len) continue;
+        found = true;
+        const cps = e.ssm_checkpoints orelse return error.TestExpectedEqual;
+        for (cps) |*cp| try testing.expect(cp.pos <= prompt_len);
+    }
+    try testing.expect(found);
+}
+
+test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at every residue" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const ratio: c_int = 4;
+    const B: usize = 19;
+    const H: usize = 80;
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+    const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
+    defer _ = mlx.mlx_array_free(keys);
+
+    var live: [3]SSMCacheEntry = .{
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+    };
+    defer pcFreeQsaHybrid(&live);
+    try pcQsaFeed(&xfm, &live[0], keys, @intCast(B), s);
+    var cps = [_]SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, B, s),
+        undefined,
+    };
+    transformer_mod.ssmFreeQsaState(&live[0]);
+    live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio };
+    try pcQsaFeed(&xfm, &live[0], keys, @intCast(H), s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, H, s);
+    defer for (&cps) |*c| c.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &live, s);
+    if (live[0].aux_state.ctx != null) {
+        if (cps[1].layers[0].aux_state.ctx != null) _ = mlx.mlx_array_free(cps[1].layers[0].aux_state);
+        cps[1].layers[0].aux_state = try transformer_mod.materializedOwnedCopy(s, live[0].aux_state);
+        _ = mlx.mlx_array_eval(cps[1].layers[0].aux_state);
+    }
+
+    var cold = pcEmptySsm();
+    defer pcFreeQsaHybrid(&cold);
+    cold[0].qsa_ratio = ratio;
+    try pcQsaFeed(&xfm, &cold[0], keys, @intCast(B), s);
+
+    var from_full = pcEmptySsm();
+    defer pcFreeQsaHybrid(&from_full);
+    try transformer_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
+    transformer_mod.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
+        std.debug.print("sliced-apply residue fail K=full field=apply {s}\n", .{@errorName(err)});
+        return err;
+    };
+    pcQsaExpectViewEqual(s, &from_full[0], &cold[0], @intCast(B)) catch {
+        std.debug.print("sliced-apply residue fail K=full field=cold_view hist={d}/{d} blocks={d}\n", .{
+            from_full[0].qsa_hist_rows,
+            from_full[0].qsa_key_rows,
+            from_full[0].qsa_pooled_blocks,
+        });
+        return error.TestExpectedEqual;
+    };
+
+    var K: usize = B + 1;
+    while (K < H) : (K += 1) {
+        var sliced = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
+        defer sliced.deinit(testing.allocator);
+        sliced.pos = K;
+        try transformer_mod.sliceQsaHistoryOntoCheckpoint(&sliced, &cps[1], K, s);
+
+        var from_sliced = pcEmptySsm();
+        defer pcFreeQsaHybrid(&from_sliced);
+        try transformer_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
+        transformer_mod.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
+            std.debug.print("sliced-apply residue fail K={d} field=apply {s}\n", .{ K, @errorName(err) });
+            return err;
+        };
+
+        const field = try pcSsmDiffField(s, &from_full, &from_sliced);
+        if (field.len != 0) {
+            std.debug.print("sliced-apply residue fail K={d} field={s} full_hist={d}/{d} sliced_hist={d}/{d} full_blocks={d} sliced_blocks={d}\n", .{
+                K,
+                field,
+                from_full[0].qsa_hist_rows,
+                from_full[0].qsa_key_rows,
+                from_sliced[0].qsa_hist_rows,
+                from_sliced[0].qsa_key_rows,
+                from_full[0].qsa_pooled_blocks,
+                from_sliced[0].qsa_pooled_blocks,
+            });
+            return error.TestExpectedEqual;
+        }
+        pcQsaExpectViewEqual(s, &from_sliced[0], &cold[0], @intCast(B)) catch {
+            std.debug.print("sliced-apply residue fail K={d} field=cold_view\n", .{K});
+            return error.TestExpectedEqual;
+        };
+    }
+}
+
+test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const hd: c_int = 8;
+    const P: usize = 48;
+    const backoff: usize = 19;
+    const donor_gen: usize = 16;
+    const heir_gen: usize = 12;
+    const a2_extra: usize = 8;
+    var xfm: transformer_mod.Transformer = undefined;
+    xfm.s = s;
+    xfm.allocator = testing.allocator;
+
+    const donor_len = P + donor_gen;
+    const a2_len = donor_len + a2_extra;
+    const heir_len = (P - 1) + heir_gen;
+    const keys = try pcQsaArangeKeys(s, @intCast(a2_len), hd);
+    defer _ = mlx.mlx_array_free(keys);
+
+    var donor_toks: [P + donor_gen]u32 = undefined;
+    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var a2_toks: [P + donor_gen + a2_extra]u32 = undefined;
+    @memcpy(a2_toks[0..donor_toks.len], &donor_toks);
+    for (a2_toks[donor_toks.len..], 0..) |*t, i| t.* = @intCast(50_000 + i);
+    var heir_toks: [(P - 1) + heir_gen]u32 = undefined;
+    @memcpy(heir_toks[0 .. P - 1], donor_toks[0 .. P - 1]);
+    for (heir_toks[P - 1 ..], 0..) |*t, i| t.* = @intCast(90_000 + i);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
+    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(backoff), 190.0, 19);
+    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(P), 480.0, 48);
+    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(donor_len), 640.0, 64);
+    {
+        var live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&live);
+        try pcQsaFeed(&xfm, &live[0], keys, @intCast(donor_len), s);
+        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
+    }
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    var a2_cache = try KVCache.init(testing.allocator, 3);
+    defer a2_cache.deinit();
+    try testFillCache(&a2_cache, s, 3, a2_toks.len);
+    const a2_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+    a2_own[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(a2_len), 720.0, 72);
+    {
+        var live: [3]SSMCacheEntry = .{
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
+        };
+        defer pcFreeQsaHybrid(&live);
+        try pcQsaFeed(&xfm, &live[0], keys, @intCast(a2_len), s);
+        try transformer_mod.attachQsaHistoryToLatest(a2_own, &live, s);
+    }
+    _ = try hc.commitWithState(&a2_cache, &a2_toks, false, 0, a2_own, null, null);
+
+    var donor_restored = pcEmptySsm();
+    defer pcFreeQsaHybrid(&donor_restored);
+    var donor_kv = try KVCache.init(testing.allocator, 3);
+    defer donor_kv.deinit();
+    var donor_moe: usize = 0;
+    const donor_hit = try hc.lookupAndRestore(&donor_kv, &donor_moe, &donor_restored, s, a2_toks[0..P], false, 0, null, null);
+    try testing.expectEqual(backoff, donor_hit.matched);
+
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+    heir_own[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 44, 440.0, 44);
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
+
+    var heir_restored = pcEmptySsm();
+    defer pcFreeQsaHybrid(&heir_restored);
+    var heir_kv = try KVCache.init(testing.allocator, 3);
+    defer heir_kv.deinit();
+    var heir_moe: usize = 0;
+    const heir_hit = try hc.lookupAndRestore(&heir_kv, &heir_moe, &heir_restored, s, &heir_toks, false, 0, null, null);
+    try testing.expectEqual(backoff, heir_hit.matched);
+
+    const field = try pcSsmDiffField(s, &donor_restored, &heir_restored);
+    if (field.len != 0) {
+        log.warn("heir vs donor restore differed in {s} (donor_pos={d} heir_pos={d} heir_hist={d}/{d} donor_hist={d}/{d})\n", .{
+            field,
+            donor_hit.matched,
+            heir_hit.matched,
+            heir_restored[0].qsa_hist_rows,
+            heir_restored[0].qsa_key_rows,
+            donor_restored[0].qsa_hist_rows,
+            donor_restored[0].qsa_key_rows,
+        });
+        return error.TestExpectedEqual;
+    }
+    _ = heir_len;
+}
+
+test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
+    const s = mlx.gpuStream();
+    var toks: [19]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 18, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, toks.len);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, toks.len - 1, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
+    try testing.expectEqual(toks.len - 1, r.matched);
+    try testing.expect(!r.full_match);
+    try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
+}
+
+test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var toks: [10]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var prompt: [12]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 8, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, toks.len);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+
+    var slot = try KVCache.init(testing.allocator, 3);
+    defer slot.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 0xA11CE);
+    try testing.expect(r.matched > 0);
+    try testing.expect(r.checked_out);
+    try testing.expectEqual(@as(?usize, 0xA11CE), hc.entries.items[0].checked_out_by);
+}
+
+test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a lower one" {
+    const s = mlx.gpuStream();
+    var toks: [20]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 16, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, toks.len);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 16), r.matched);
+    try testing.expect(target[0].qsa_pooled.ctx != null);
+}
+
+test "HotPrefixCache: skip set on the cache without a lookup does not poison the next request" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null, null, null, true);
+    try testing.expectEqual(@as(usize, 0), skipped.matched);
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var target2 = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target2);
+    var moe2: usize = 0;
+    const leaked = try hc.lookupAndRestoreWithMedia(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null, null, null, false);
+    try testing.expect(leaked.matched > 0);
+}
+
+test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entry exists" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target);
+    var moe_off: usize = 0;
+    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null, null, null, true);
+    try testing.expectEqual(@as(usize, 0), skipped.matched);
+
+    var target2 = pcEmptySsm();
+    defer pcFreeQsaHybrid(&target2);
+    var moe2: usize = 0;
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
+    try testing.expect(second.matched > 0);
+}
+
+test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildQsaHybrid(s, 10, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+
+    var skipped_cache = try KVCache.init(testing.allocator, 3);
+    defer skipped_cache.deinit();
+    var skipped_ssm = pcEmptySsm();
+    defer pcFreeQsaHybrid(&skipped_ssm);
+    var skip_off: usize = 7;
+    const skipped = try hc.lookupAndRestoreWithMedia(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, 0, null, null, null, null, true);
+
+    var cold = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer cold.deinit();
+    cold.qsa_history_required = true;
+    var cold_cache = try KVCache.init(testing.allocator, 3);
+    defer cold_cache.deinit();
+    var cold_ssm = pcEmptySsm();
+    defer pcFreeQsaHybrid(&cold_ssm);
+    var cold_off: usize = 7;
+    const cold_r = try cold.lookupAndRestore(&cold_cache, &cold_off, &cold_ssm, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(cold_r.matched, skipped.matched);
+    try testing.expectEqual(cold_off, skip_off);
+    try testing.expectEqual(@as(usize, 0), skipped.matched);
+}
+
+test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qsa-poison", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+        var src256 = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src256);
+        var src512 = pcBuildHybrid(s, 300.0, 700.0);
+        defer pcFreeHybrid(&src512);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        _ = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qsa-poison", 0, 128);
+    defer hc2.deinit();
+    try testing.expectEqual(@as(usize, 0), hc2.entryCount());
+    try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+    const disk_id = hc2.disk.?.entries.items[0].id;
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, 0, null, null);
+    try testing.expect(res.matched > 0);
+    try testing.expect(hc2.dropLastRestored());
+    try testing.expect(hc2.disk.?.entryPoisoned(disk_id));
+
+    var cache3 = try KVCache.init(testing.allocator, 3);
+    defer cache3.deinit();
+    var ssm3 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm3);
+    var moe3: usize = 0;
+    const res3 = try hc2.lookupAndRestore(&cache3, &moe3, &ssm3, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), res3.matched);
+}
+
+test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM bytes" {
+    const s = mlx.gpuStream();
+    var donor_toks: [30]u32 = undefined;
+    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var heir_toks: [19]u32 = undefined;
+    @memcpy(heir_toks[0..17], donor_toks[0..17]);
+    heir_toks[17] = 900;
+    heir_toks[18] = 901;
+
+    var live = pcBuildQsaHybrid(s, 17, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var ctrl = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer ctrl.deinit();
+    var ctrl_cache = try KVCache.init(testing.allocator, 3);
+    defer ctrl_cache.deinit();
+    try testFillCache(&ctrl_cache, s, 3, heir_toks.len);
+    _ = try ctrl.commitWithState(&ctrl_cache, &heir_toks, false, 0, null, null, null);
+    const snap_only = ctrl.entries.items[0].kv_bytes;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var donor_cache = try KVCache.init(testing.allocator, 3);
+    defer donor_cache.deinit();
+    try testFillCache(&donor_cache, s, 3, donor_toks.len);
+    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
+    for (donor_cps[0].layers) |*l| {
+        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+        l.qsa_pooled = .{ .ctx = null };
+    }
+    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
+
+    hc.qsa_history_required = true;
+    var heir_live = pcBuildQsaHybrid(s, 19, 100.0);
+    defer pcFreeQsaHybrid(&heir_live);
+    var heir_cache = try KVCache.init(testing.allocator, 3);
+    defer heir_cache.deinit();
+    try testFillCache(&heir_cache, s, 3, heir_toks.len);
+    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
+    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 18, s);
+    for (heir_own[0].layers) |*l| {
+        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+        l.qsa_pooled = .{ .ctx = null };
+    }
+    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
+
+    var found = false;
+    for (hc.entries.items) |*e| {
+        if (e.tokens.len != heir_toks.len) continue;
+        found = true;
+        try testing.expect(e.ssm_checkpoints == null);
+        try testing.expectEqual(@as(u64, 0), e.ssm_bytes);
+        try testing.expectEqual(snap_only, e.kv_bytes);
+    }
+    try testing.expect(found);
+}
+
+test "HotPrefixCache: shedding the oldest QSA bank with no lower destination drops the list" {
+    const s = mlx.gpuStream();
+    var toks: [30]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = pcBuildQsaHybrid(s, 8, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var live2 = pcBuildQsaHybrid(s, 25, 200.0);
+    defer pcFreeQsaHybrid(&live2);
+    var probe = try KVCache.init(testing.allocator, 3);
+    defer probe.deinit();
+    try testFillCache(&probe, s, 3, toks.len);
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    hc.qsa_history_required = true;
+    hc.ssm_checkpoint_max = 8;
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live2, 25, s);
+    try transformer_mod.attachQsaHistoryToLatest(cps[0..1], &live, s);
+    for (cps[1].layers) |*l| {
+        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+        l.qsa_pooled = .{ .ctx = null };
+    }
+    _ = try hc.commitWithState(&probe, &toks, false, 0, cps, null, null);
+    hc.max_kv_bytes = 1;
+    hc.shedCheckpointsToFit();
+    try testing.expect(hc.entryCount() == 1);
+    try testing.expect(hc.entries.items[0].ssm_checkpoints == null);
+}
+
+test "HotPrefixCache: a QSA-required restore without indexer history is a miss even when forward-satisfy is vacuous" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, tokens.len);
+    var live = pcBuildHybrid(s, 123.0, 456.0);
+    defer pcFreeHybrid(&live);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
+    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
+    hc.qsa_history_required = true;
+
+    var target_cache = try KVCache.init(testing.allocator, 3);
+    defer target_cache.deinit();
+    var target = pcEmptySsm();
+    defer pcFreeHybrid(&target);
+    var moe_off: usize = 0;
+    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), r.matched);
 }
 
 test "prefix cache: a hybrid miss with a raw token match names itself" {
@@ -5392,7 +6906,7 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     var ssm = pcEmptySsm();
     defer pcFreeHybrid(&ssm);
     var moe_off: usize = 0;
-    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, null, null, 0xF5);
+    const hit = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, null, null, 0xF5, false);
 
     // The outcome: nothing delivered.
     try t.expectEqual(@as(usize, 0), hit.matched);

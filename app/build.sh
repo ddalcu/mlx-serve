@@ -145,6 +145,10 @@ SWIFT_BUILD_FLAGS=(-c "$SWIFT_CONFIG" ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[
 # lookup before compiling; the script is idempotent and fails loudly.
 swift package resolve
 bash "$PROJECT_ROOT/scripts/patch-swatex-font-lookup.sh" "$SCRIPT_DIR/.build/checkouts/SwaTex"
+# No test step here, and never add one: this script is also the FAST_DEV
+# iteration loop (build, look, adjust — about two seconds when nothing
+# changed), and the Swift suite costs 24s parallel / 55s serial. Run
+# `swift test --parallel` yourself before landing.
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
 SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
@@ -223,9 +227,9 @@ else
     ICONSET="$ICON_DIR/AppIcon.iconset"
     mkdir -p "$ICONSET"
     for size in 16 32 64 128 256 512; do
-        sips -z $size $size "$SCRIPT_DIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+        sips -z $size $size "$SCRIPT_DIR/appicon.png" --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
         double=$((size * 2))
-        sips -z $double $double "$SCRIPT_DIR/appiconb.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+        sips -z $double $double "$SCRIPT_DIR/appicon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
     done
     iconutil -c icns "$ICONSET" -o "$ICON_DIR/AppIcon.icns" 2>/dev/null || echo "  (iconutil skipped, will use default icon)"
 fi
@@ -253,6 +257,20 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
+
+PLUGIN_SRC="$PROJECT_ROOT/lib/opencode2-mlx-serve"
+PLUGIN_DST="$CONTENTS/Resources/opencode2-mlx-serve"
+if [ -d "$PLUGIN_SRC" ]; then
+    mkdir -p "$PLUGIN_DST"
+    for f in LICENSE package.json tui.tsx; do
+        [ -f "$PLUGIN_SRC/$f" ] && cp "$PLUGIN_SRC/$f" "$PLUGIN_DST/"
+    done
+    for f in "$PLUGIN_SRC"/*.ts; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in *.test.ts) continue ;; esac
+        cp "$f" "$PLUGIN_DST/"
+    done
+fi
 
 # SwiftPM does not embed resource bundles when we assemble the .app by hand.
 # SwaTex loads its KaTeX fonts from this bundle at runtime.

@@ -1029,6 +1029,90 @@ value and warns `Ignoring --include since filenames have been explicitly set`
 first pass. Pass filenames POSITIONALLY.
 
 
+## The ANE seam is fp16 end to end, and H3's DiT rendered BLACK (2026-09-10)
+
+Wiring the channel-mode ANE MLP offload into H3's video DiT gave a clean
+1.24x on the denoise step and an all-zero video. The seam MATH was never
+wrong — a per-block parity probe read cos 0.99999 / rms_ratio 1.0000 against
+the plain `mlpForward` at blocks 0-2. The output was NaN from block 36 on.
+
+**Cause**: the compiled ANE program computes in fp16 from input plane to
+output plane, and H3's DiT partials do not fit. Measured at 864x480/22f: the
+fc2 partial peaks at ~1.7M and the intermediate `act = silu(gate)*up` at 52k,
+against an fp16 max of 65504. The plane saturated to INF, the residual stream
+went NaN, and the VAE decoded zeros.
+
+**The fix is a scale, and WHERE it goes is the whole point.** Dividing the
+`up` half of the ANE's weight copy by `ane.OUT_PLANE_SCALE` (256) and
+multiplying the read-back partial by it is EXACT: `up` is linear into the
+product, so `act` and the down-conv output both scale with it, while
+`silu(gate)` is untouched; per-row int8 quantization folds the factor into the
+row scale so the codes are unchanged; and a power of two is exact in fp16.
+Scaling `gate` instead would be wrong (it sits under a nonlinearity), and
+scaling fc2 alone bounds the output but not `act` — that arm was measured and
+still hit INF at block 49.
+
+**Two false starts worth keeping**: scaling fc2 by 16 (output bounded, `act`
+still overflowed); then 64 (same, and the parity probe read 0.92 because it
+was comparing the scaled partial against an unscaled reference — a probe that
+does not follow the fix reports the fix as a regression).
+
+**The class lesson**: the LM prefill seam never hit this because a normed
+decoder hidden is O(1) and its MLP output is O(100). A DiT residual stream is
+not, and neither is any other backend we might point this seam at. The scale
+is now unconditional in both seams. Krea had shipped without it and looked
+correct — it was silently losing precision at the top of the fp16 range: mean
+|diff| vs the GPU arm 5.68/255 -> 2.00 and cos 0.9962 -> 0.9993 once scaled.
+A correct-looking image is not evidence of range headroom.
+
+**Guard**: `ane.OUT_PLANE_SCALE` carries the measured peaks in its doc
+comment; the bar is perceived content plus a finite-output check, never bytes.
+
+## ACE-Step peak-normalizes, so raw RMS cannot measure the ANE arm (2026-09-10)
+
+The first ANE-vs-GPU audio comparison reported a "loudness lift" of +0.7 to
++1.1 dB RMS that changed SIGN across seeds. It was not energy the offload
+added. `generate()` ends with `peakNormalize(samples, -1 dBFS)`: one global
+max sample sets the gain for the whole 180 s track. In the GPU track that
+peak is an isolated spike (the runner-up frame sits at 0.853 of it); the ANE
+arm rounds that one sample differently, the spike shrinks, and the whole
+track is scaled up to put a different sample at -1 dBFS. Raw RMS and crest
+factor then measure the spike, not the audio.
+
+**Valid measures**: a ROBUST energy (per-frame RMS, trimmed of the top
+percentiles — +1.9%/+2.8% at 0.45/0.75 over 3 seeds, consistent in sign) and
+log-STFT cosine (≥ 0.994). Anything normalized by a single sample is out.
+
+**The class**: a metric taken AFTER a global normalization step measures the
+normalizer's anchor, not the signal. Check for one before trusting any
+whole-track scalar on a generated audio arm.
+
+## A GPU tail built after the ANE wait is serial, and a small one is launch latency (2026-09-11)
+
+The media seam moved to one fixed 256-row tile looped over every request (`ane.mediaMlp`), so a new image size, canvas or song length stops compiling and storing another 1.3-4.9 GB program set. Its first version ran the rows past the last full tile through the full GPU MLP AFTER the tile loop and trailed the whole-request tile by 3-4% on ACE-Step and H3.
+
+The tail was not costing its rows. The whole-request tile had the same shape with a sub-32-row tail, and moving that 23-row tail to go out with the GPU complement, before the first ANE wait, took ACE 30 s whole@0.60 diffusion from 1982 to 1836 ms. Three small matmuls are dispatch latency, and built after a blocking wait nothing overlaps them; built before it they land in whatever GPU slack the ANE-critical block leaves.
+
+Fix: `ane.mediaMlp` async-evals every GPU piece (complement and tail) before the loop. A partial last tile rides the ANE zero-padded when `tail > T x (1 - share)` (`ane.mediaTilePlan`), the balance point where padding the ANE costs less than the tail on the GPU. M4 Max, T = 256: ACE 180 s pads (12.4 s vs 13.6 s unpadded), H3's 116 rows stay on the GPU (7.44 s/step vs 7.64 padded), ACE 30 s ties. Against the whole-request tile: Krea -0.6%, ACE 180 s tie, H3 -1..2%/step, ACE 30 s -7% (140 ms of 2 s).
+
+Guard: the `mediaTilePlan` test; live, the `[ane] <what> offload engaged: tiled N x 256 rows (P padded), tail R on GPU` line.
+
+## A parameter that keys a compiled artifact must not be re-derived per request (2026-09-11)
+
+The media share decides which ANE program set a build compiles, and the lineage prune keeps one share per model. It was re-solved at every build from a GPU probe timed at the request's own row count, so the fixed 256-row tile still recompiled: a 50 s song solved 0.50 where a 30 s one had solved 0.60, and H3 builds on every request. A sweep showed the size was not even the main problem: at 256-4096 rows the M4 Max probe reads 11.2-13.5 TFLOPS on all three models, so the raw share sits at 0.47-0.51, and Krea and H3 straddle the 0.475 rounding line (two consecutive H3 probes at 1024 rows: 0.468, 0.477). Any re-solve can land on the other side and cost a full compile plus a prune.
+
+Fix: the probe runs at a fixed `MEDIA_PROBE_ROWS` (4096), and a model reuses the share of its most recently used compiled set (`ane.cachedShare` over `msv_ane_cache_variant`), tagged `calibrated share=X`. An explicit `--ane-split` tags plain `share=X` and is never reused, and a cache hit re-tags the entry with the current lineage, so a set built by an older binary becomes reusable. The same sweep showed last round's ACE "0.60 match" was an outlier probe (7.8 TFLOPS): the solve cannot tell ACE from Krea or H3 on M4 Max.
+
+Guard: the `shareVariant` test; live, `[ane] <what> offload share X (reused from its compiled set)` on every build after the first.
+
+## A calibration timed on the wrong dtype aims low (2026-09-11)
+
+The media share is calibrated on block 0: its ANE program over one 4096-row run, its GPU complement over the same rows, balanced. The first version fed the complement bf16 ones (the weight-scale dtype) and aimed ACE at 0.50 and H3 at 0.40, below the measured bests of 0.60 and 0.45. Sustained ANE runs (clock ramp) and running both sides at once (bandwidth and power contention) each moved the timings by under 3%. A throwaway seam probe found the gap: at 0.50 ACE's real GPU complement took ~18 ms per block against the 12.9 ms calibration predicted, so every block was GPU-bound. ACE's DiT stream is float32 and so is its complement; Krea's is float32 cast to bf16 inside each linear; only H3's is bf16.
+
+Fix: each backend's calibrator names the dtype its MLP sees (`AneCalib.dtype`), and the complement is timed on that. ACE now calibrates at 0.57 (GPU 32.9 vs 25.9 ms). H3's remaining 0.42 vs 0.45 is its bench canvas's 116-row GPU tail, a per-request cost a per-model share cannot carry.
+
+Guard: the `calibratedShare` test; live, `[ane] <what> offload share calibrated X in Ns: …`.
+
 ## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
 
 The third cause above, closed. `vae_diffusion_decoder.safetensors` is four
@@ -1712,3 +1796,28 @@ NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
 reaching the client as `Model load failed: <name>`), `NgramTable.parse`
 checks every header field and proves every region sits inside the mapping,
 and a PLE the layer loop never installed is a load error.
+
+## Spark-X2.5 (`spark2_5`) port (2026-09-09)
+
+XHToken's 1.7B/4B dense models load from the community MLX packs
+(`abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`, mlx-lm layout, same weight names as
+the HF checkpoint) on the standard dense forward. What the arch adds over
+gemma3/muse: exact-erf GELU (`HiddenAct.gelu`, not the tanh approximation the
+compiled GeGLU runs), a fused `q_k_v_proj` row-sliced into q/k/v at load
+(`splitFusedQkvRows`, materialized; dense packs are transposed inside the
+split so the generic transpose pass skips them), an `out_proj` spelling, and
+a PER-HEAD sigmoid output gate (`g_proj` is `[heads, hidden]`, broadcast over
+head_dim in `attnOutGate` — muse's gate is per channel and the same helper
+serves both). Per-type RoPE (sliding: full rotary at 1e4; full: 25% rotary at
+5e6) and the 3:1 sliding(512)/full ladder were already generic
+(`layer_types` + `rope_parameters.{full,sliding}_attention`).
+
+Tokenizer trap: the pre_tokenizer is DeepSeek's (`\p{N}{1,3}` first) but a
+later `Digits(individual_digits)` rule re-splits every group, so the
+checkpoint is per-digit. `digitGroupFromPreTokenizer` used to stop at the
+first `{1,3}` and would have served 3-digit groups. Cross-checked against
+HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
+
+Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
+tool-response turn, 2.8k-token needle past the 512 window) and the HF
+reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).

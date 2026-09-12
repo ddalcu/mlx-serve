@@ -507,18 +507,10 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen => |*c| for (c.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-            },
+            .qwen => |*c| c.appendEvalArrays(vec),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);
-                for (r.t.qwen4_mtp.?.cache.entries) |*entry| {
-                    if (!entry.initialized) continue;
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-                    _ = mlx.mlx_vector_array_append_value(vec, entry.values);
-                }
+                r.t.qwen4_mtp.?.cache.appendEvalArrays(vec);
             },
         }
     }
@@ -1993,6 +1985,9 @@ pub const Generator = struct {
         /// prefill saturates the GPU while both tiles read 0 / "—". The
         /// scheduler resets it to 0 when the prefill ends.
         prefill_progress: ?*std.atomic.Value(u64) = null,
+        /// Total tokens this prefill will forward (post-cache tail, same scale
+        /// as `prefill_progress`), published once; null on the bypass engines.
+        prefill_expected: ?*std.atomic.Value(u64) = null,
 
         /// Called once per completed prefill chunk boundary (chunk state
         /// evaluated, allocator cache cleared), except the final one. The
@@ -2393,6 +2388,7 @@ pub const Generator = struct {
             );
 
             var pos: usize = 0;
+            if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);
             while (pos < loop_end) {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
@@ -10886,6 +10882,9 @@ pub fn computeEmbeddingsBatch(
     }
     var start: usize = 0;
     while (start < seqs.len) {
+        // A decoder-arch embedder (Qwen3-Embedding) forwards through the KV
+        // cache: without a reset, a sub-batch attends to earlier sub-batches' rows.
+        try xfm.resetCache();
         const sub = seqs[start..embedSubBatchEnd(seqs, start, EMBED_MAX_BATCH, EMBED_TOKEN_BUDGET)];
         var pb = try buildPaddedBatch(allocator, sub);
         defer pb.deinit(allocator);

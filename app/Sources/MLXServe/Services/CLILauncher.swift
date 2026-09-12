@@ -19,6 +19,7 @@ final class CLILauncher: ObservableObject {
         .pi,
         .omp,
         .opencode,
+        .opencode2,
         .codex,
         .hermes,
         .aider,
@@ -27,6 +28,12 @@ final class CLILauncher: ObservableObject {
     /// Stable id list — pinned against the MAS instructions panel's tabs
     /// (same CLIs, same order) by `CLISetupInstructionsTests`.
     nonisolated static var candidateIds: [String] { candidates.map(\.id) }
+
+    /// What the "On this Mac" section shows: the detected CLIs plus the plain
+    /// shell, which has nothing to detect.
+    nonisolated static func offered(detected: [LauncherCLI]) -> [LauncherCLI] {
+        detected + [.shell]
+    }
 
     init() {
         Task { await refresh() }
@@ -41,7 +48,7 @@ final class CLILauncher: ObservableObject {
             return
         }
         let found = await Self.detectInstalled()
-        self.available = found
+        self.available = Self.offered(detected: found)
         self.hasScanned = true
     }
 
@@ -156,6 +163,9 @@ struct LauncherCLI: Identifiable, Equatable {
     /// desktop app bundles (codex inside ChatGPT.app/Codex.app). `~` is not
     /// expanded here; entries may start with `$HOME`, expanded at probe time.
     var fallbackPaths: [String] = []
+    /// A row that talks to mlx-serve refuses to start while the server is
+    /// down; the plain shell does not.
+    var requiresServer: Bool = true
     /// Shell body that sets env vars and execs the CLI. Does NOT include the
     /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
     /// it into its inline config; pi/Claude Code ignore it — pi's list is
@@ -375,6 +385,62 @@ extension LauncherCLI {
             """
         }
     )
+
+    static let opencode2 = LauncherCLI(
+        id: "opencode2",
+        displayName: "OpenCode 2",
+        binaryName: "opencode2",
+        iconSystemName: "chevron.left.forwardslash.chevron.right",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, _, _, _ in
+            let pluginDest = NSString(string: "~/.mlx-serve/opencode2/opencode/plugins/mlx-serve").expandingTildeInPath
+            AgentConfigs.copyOpencode2Plugin(to: pluginDest)
+            let cliDir = NSString(string: "~/.mlx-serve/opencode2/opencode").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: cliDir, withIntermediateDirectories: true)
+            let userCli: String
+            if let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"], !xdg.isEmpty {
+                userCli = (xdg as NSString).appendingPathComponent("opencode/cli.json")
+            } else {
+                userCli = NSString(string: "~/.config/opencode/cli.json").expandingTildeInPath
+            }
+            let existing = (try? String(contentsOfFile: userCli, encoding: .utf8)) ?? "{}"
+            let json = AgentConfigs.opencode2CliJSON(existing: existing, baseURL: baseURL)
+            try? json.write(toFile: (cliDir as NSString).appendingPathComponent("cli.json"),
+                            atomically: true, encoding: .utf8)
+        },
+        scriptBody: { baseURL, model, cdLine, budget, entries in
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            return """
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true))'
+            export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+            \(cdLine)
+            if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
+            opencode2 --standalone
+            """
+        }
+    )
+
+    /// A plain login shell in the terminal pane. No config, no server: the
+    /// script only cds and hands the row an INTERACTIVE zsh — without the
+    /// exec the script would end and the row would close on open.
+    static let shell = LauncherCLI(
+        id: "shell",
+        displayName: "Shell",
+        binaryName: "zsh",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: nil,
+        requiresServer: false,
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(cdLine)
+            exec /bin/zsh -i
+            """
+        }
+    )
 }
 
 // MARK: - UI
@@ -405,6 +471,7 @@ struct CLILauncherButton: View {
     let openHostCLI: (LauncherCLI) -> Void
 
     @StateObject private var detector = CLILauncher()
+    @State private var hovering = false
 
     var body: some View {
         Group {
@@ -421,19 +488,20 @@ struct CLILauncherButton: View {
                                          openSandboxAgent: openSandboxAgent,
                                          openHostCLI: openHostCLI)
                 } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "terminal")
-                        Text("Code")
-                    }
-                    .frame(maxWidth: .infinity)
+                    // The tray tile's own face (`TrayTileFace`), so the Code
+                    // menu matches its Chat / Tasks / Quit siblings and the
+                    // Media Generation row above them.
+                    TrayTileFace(icon: "terminal", title: "Code",
+                                 hovering: hovering, isEnabled: isEnabled)
                 }
-                // Standard bordered-button chrome so the menu is visually
-                // identical to its sibling Chat/Tasks buttons — the previous
-                // hand-rolled stroke + material background rendered as an
-                // odd-one-out outlined pill in the tray footer.
+                // `.button` (not `.borderlessButton`, which throws the custom
+                // label away and draws a plain menu title) + a plain button so
+                // the tile face IS the control.
                 .menuStyle(.button)
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
+                .frame(maxWidth: .infinity)
+                .onHover { hovering = $0 }
                 .disabled(!isEnabled)
                 .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }

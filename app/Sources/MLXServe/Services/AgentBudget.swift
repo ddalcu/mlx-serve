@@ -248,8 +248,10 @@ enum AgentConfigs {
     /// custom providers, so the FULL chat-capable list is baked here — its
     /// in-session /models picker shows exactly these entries, each with its
     /// own limits (never the loaded model's budget stamped on everything).
+    /// `pinModel` writes a top-level `"model"` — opencode 2's TUI has no
+    /// `--model` flag, so the config is the only place to select one.
     static func opencodeJSON(baseURL: String, defaultModel: String,
-                             entries: [AgentModelEntry]) -> String {
+                             entries: [AgentModelEntry], pinModel: Bool = false) -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -260,9 +262,10 @@ enum AgentConfigs {
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
                 + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.output) } }"
         }.joined(separator: ",\n        ")
+        let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
         return """
         {
-          "$schema": "https://opencode.ai/config.json",
+          "$schema": "https://opencode.ai/config.json",\(pinned)
           "provider": {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",
@@ -282,6 +285,68 @@ enum AgentConfigs {
     static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
         opencodeJSON(baseURL: baseURL, defaultModel: model,
                      entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+    }
+
+    static func isLoopbackBaseURL(_ url: String) -> Bool {
+        guard let parsed = URL(string: url), let host = parsed.host else { return false }
+        if host == "localhost" || host == "::1" { return true }
+        return host.hasPrefix("127.")
+    }
+
+    static func opencode2CliJSON(existing: String, baseURL: String, apiKey: String? = nil) -> String {
+        let data = Data(existing.utf8)
+        var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        var plugins: [[String: Any]] = []
+        if let raw = obj["plugins"] as? [Any] {
+            plugins = raw.compactMap { $0 as? [String: Any] }
+        }
+        plugins.removeAll { p in
+            let pkg = p["package"] as? String ?? ""
+            return pkg == "./plugins/mlx-serve" || pkg == "mlx-serve" || pkg.hasSuffix("/mlx-serve")
+        }
+        let trimmed = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        var options: [String: Any] = ["metricsUrl": trimmed + "/metrics.json"]
+        let token: String?
+        if let k = apiKey, !k.isEmpty { token = k }
+        else if !isLoopbackBaseURL(baseURL) { token = "mlx-serve" }
+        else { token = nil }
+        if let token { options["metricsToken"] = token }
+        plugins.append(["package": "./plugins/mlx-serve", "options": options])
+        obj["plugins"] = plugins
+        guard let out = try? JSONSerialization.data(withJSONObject: obj),
+              let s = String(data: out, encoding: .utf8) else { return "{}" }
+        return s.replacingOccurrences(of: "\\/", with: "/")
+    }
+
+    static func opencode2PluginSourceDir() -> URL? {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("lib/opencode2-mlx-serve")
+        let candidates = [
+            Bundle.main.resourceURL?.appendingPathComponent("opencode2-mlx-serve"),
+            repo,
+        ]
+        return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func copyOpencode2Plugin(to dest: String) {
+        guard let src = opencode2PluginSourceDir() else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: dest, withIntermediateDirectories: true)
+        guard let names = try? fm.contentsOfDirectory(atPath: src.path) else { return }
+        for name in names {
+            if name.hasSuffix(".test.ts") { continue }
+            let keep = name.hasSuffix(".ts") || name == "tui.tsx" || name == "package.json" || name == "LICENSE"
+            if !keep { continue }
+            let from = (src.path as NSString).appendingPathComponent(name)
+            let to = (dest as NSString).appendingPathComponent(name)
+            try? fm.removeItem(atPath: to)
+            try? fm.copyItem(atPath: from, toPath: to)
+        }
     }
 
     /// oh-my-pi (omp) `models.yml` — written to the dedicated

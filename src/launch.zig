@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const opencode2_plugin = @import("opencode2_plugin");
 
 pub const Budget = struct { context: u64, output: u64 };
 
@@ -43,6 +44,7 @@ pub const AgentKind = enum {
     pi,
     omp,
     opencode,
+    opencode2,
     codex,
     hermes,
     aider,
@@ -51,12 +53,12 @@ pub const AgentKind = enum {
         // The codex rebrand: issue #188 asks for `mlx-serve launch chatgpt`.
         if (std.mem.eql(u8, name, "chatgpt")) return .codex;
         inline for (@typeInfo(AgentKind).@"enum".field_names, 0..) |f, i| {
-            if (std.mem.eql(u8, name, f)) return @enumFromInt(i);
+            if (std.mem.eql(u8, name, f)) return @fromBackingInt(@intCast(i));
         }
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, codex, hermes, aider";
+    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider";
 };
 
 // ── Config builders (pure — unit-tested below) ──────────────────────────
@@ -151,11 +153,15 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
 /// opencode config — carried inline via OPENCODE_CONFIG_CONTENT (merges over
 /// the user's own config, no file writes). Single-quoted in the script, so
 /// the JSON must stay single-quote-free.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry) ![]u8 {
+/// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
+/// `--model` flag, so the config is the only place to select one.
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry, pin_model: ?[]const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
+    if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
     try out.print(allocator,
-        \\{{"$schema": "https://opencode.ai/config.json", "provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
+        \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
     for (entries, 0..) |e, i| {
         try out.print(allocator, "{s}\"{s}\": {{\"name\": \"{s} (mlx-serve)\",{s} \"limit\": {{\"context\": {d}, \"output\": {d}}}}}", .{
@@ -169,6 +175,98 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
     }
     try out.appendSlice(allocator, "}}}}");
     return out.toOwnedSlice(allocator);
+}
+
+pub fn isLoopbackBaseUrl(url: []const u8) bool {
+    var rest = url;
+    if (std.mem.startsWith(u8, rest, "http://")) {
+        rest = rest["http://".len..];
+    } else if (std.mem.startsWith(u8, rest, "https://")) {
+        rest = rest["https://".len..];
+    }
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    if (rest.len >= 2 and rest[0] == '[') {
+        if (std.mem.indexOfScalar(u8, rest, ']')) |end| {
+            return std.mem.eql(u8, rest[1..end], "::1");
+        }
+    }
+    const host = if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| rest[0..colon] else rest;
+    if (std.mem.eql(u8, host, "localhost")) return true;
+    if (std.mem.eql(u8, host, "::1")) return true;
+    return std.mem.startsWith(u8, host, "127.");
+}
+
+/// What to tell the user about the monitor plugin's feed, from the status
+/// `GET /metrics.json` returned. The CLI server defaults to metrics OFF and
+/// answers 503; the plugin then shows `feed --metrics off` with an empty panel.
+pub fn metricsFeedNote(status: u16) ?[]const u8 {
+    return switch (status) {
+        200 => null,
+        503 => "this server was started without --metrics: the OpenCode 2 sidebar panel will read '--metrics off' (the footer turn meter still works). Restart with `mlx-serve serve --metrics` for the full panel.",
+        401, 403 => "GET /metrics.json is refused (api key): the OpenCode 2 sidebar panel will read '401 unauthorized'.",
+        else => "GET /metrics.json did not answer 200: the OpenCode 2 sidebar panel will read 'unreachable'.",
+    };
+}
+
+fn isMlxServePlugin(v: std.json.Value) bool {
+    if (v != .object) return false;
+    const pkg = v.object.get("package") orelse return false;
+    if (pkg != .string) return false;
+    const s = pkg.string;
+    if (std.mem.eql(u8, s, "./plugins/mlx-serve")) return true;
+    if (std.mem.eql(u8, s, "mlx-serve")) return true;
+    return std.mem.endsWith(u8, s, "/mlx-serve");
+}
+
+pub fn mergeOpencode2CliJson(
+    allocator: std.mem.Allocator,
+    existing: []const u8,
+    base_url: []const u8,
+    known_api_key: ?[]const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+    const body = if (trimmed.len == 0) "{}" else existing;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    if (parsed.value != .object) {
+        parsed.deinit();
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    }
+    defer parsed.deinit();
+    const a = parsed.arena.allocator();
+
+    var kept = std.json.Array.init(a);
+    if (parsed.value.object.get("plugins")) |pv| {
+        if (pv == .array) {
+            for (pv.array.items) |item| {
+                if (isMlxServePlugin(item)) continue;
+                try kept.append(item);
+            }
+        }
+    }
+
+    const metrics_url = try std.fmt.allocPrint(a, "{s}/metrics.json", .{std.mem.trimEnd(u8, base_url, "/")});
+    var options: std.json.ObjectMap = .empty;
+    try options.put(a, "metricsUrl", .{ .string = metrics_url });
+    const token: ?[]const u8 = if (known_api_key) |k|
+        (if (k.len > 0) k else null)
+    else if (!isLoopbackBaseUrl(base_url))
+        "mlx-serve"
+    else
+        null;
+    if (token) |tok| {
+        try options.put(a, "metricsToken", .{ .string = tok });
+    }
+
+    var entry: std.json.ObjectMap = .empty;
+    try entry.put(a, "package", .{ .string = "./plugins/mlx-serve" });
+    try entry.put(a, "options", .{ .object = options });
+    try kept.append(.{ .object = entry });
+
+    var obj = parsed.value.object;
+    try obj.put(a, "plugins", .{ .array = kept });
+    parsed.value = .{ .object = obj };
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
 /// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
@@ -322,6 +420,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\opencode --model mlx/{s}
             , .{ opencode_config.?, model });
         },
+        .opencode2 => {
+            try out.print(allocator,
+                \\export OPENCODE_CONFIG_CONTENT='{s}'
+                \\export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+                \\if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
+                \\opencode2 --standalone
+            , .{opencode_config.?});
+        },
         .codex => {
             // PATH first, then the CLI the desktop app bundles (codex's
             // rebranded app installs as ChatGPT.app or Codex.app, bundle id
@@ -390,6 +496,20 @@ fn serverUp(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) bool
 
 /// `open -g -a "MLX Core"` — nonzero exit = the app isn't installed, which is
 /// the detection: no probing of /Applications by hand.
+/// HTTP status of `GET <base_url>/metrics.json`, or null when curl could not
+/// reach the server at all.
+fn metricsStatus(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) ?u16 {
+    const url = std.fmt.allocPrint(allocator, "{s}/metrics.json", .{base_url}) catch return null;
+    defer allocator.free(url);
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "5", url },
+        .stdout_limit = .limited(64),
+    }) catch return null;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    return std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout, " \r\n"), 10) catch null;
+}
+
 fn tryStartApp(allocator: std.mem.Allocator, io: std.Io) bool {
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "open", "-g", "-a", "MLX Core" },
@@ -492,11 +612,32 @@ fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, 
     try dir.writeFile(io, .{ .sub_path = name, .data = content });
 }
 
+fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
+        const dir = std.mem.span(xdg);
+        if (dir.len > 0) return std.fmt.allocPrint(allocator, "{s}/opencode/cli.json", .{dir});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.config/opencode/cli.json", .{homeDir()});
+}
+
 /// Write the agent's config files (the app's prepareConfig twin). opencode
 /// carries its config inline and writes nothing.
 fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, entries: []const Entry) !void {
     switch (kind) {
         .claude, .opencode => {},
+        .opencode2 => {
+            const user_path = try userOpencodeCliPath(allocator);
+            defer allocator.free(user_path);
+            const existing = std.Io.Dir.cwd().readFileAlloc(io, user_path, allocator, .limited(1 << 20)) catch
+                try allocator.dupe(u8, "{}");
+            defer allocator.free(existing);
+            const json = try mergeOpencode2CliJson(allocator, existing, base_url, null);
+            defer allocator.free(json);
+            try writeAgentFile(allocator, io, "opencode2/opencode", "cli.json", json);
+            inline for (opencode2_plugin.files) |f| {
+                try writeAgentFile(allocator, io, "opencode2/opencode/plugins/mlx-serve", f.name, f.bytes);
+            }
+        },
         .pi => {
             const json = try piModelsJson(allocator, base_url, entries);
             defer allocator.free(json);
@@ -675,14 +816,22 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         std.process.exit(1);
     };
 
-    const oc_config: ?[]u8 = if (parsed.kind == .opencode)
-        try opencodeJson(allocator, base_url, models.entries)
+    const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
+        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
 
     const script = try scriptFor(allocator, parsed.kind, base_url, chosen.id, chosen.budget, oc_config, parsed.extras);
     defer allocator.free(script);
+
+    if (parsed.kind == .opencode2) {
+        // The plugin's whole data source is /metrics.json; say so now rather
+        // than leave an empty panel to explain itself.
+        if (metricsStatus(allocator, io, base_url)) |status| {
+            if (metricsFeedNote(status)) |note| log.warn("{s}\n", .{note});
+        }
+    }
 
     if (parsed.print_only) {
         var stdout_buf: [8192]u8 = undefined;
@@ -752,9 +901,11 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = true, .loaded = true },
         .{ .id = "m2", .budget = .{ .context = 8192, .output = 2048 }, .vision = false, .loaded = false },
     };
-    inline for (.{ piModelsJson, opencodeJson }) |builder| {
-        const json = try builder(t.allocator, "http://127.0.0.1:11234", &entries);
-        defer t.allocator.free(json);
+    const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", &entries);
+    defer t.allocator.free(pi_json);
+    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    defer t.allocator.free(oc_json);
+    for ([_][]const u8{ pi_json, oc_json }) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
         defer parsed.deinit();
         // opencode's config rides single-quoted inside the launch script.
@@ -804,6 +955,125 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
     // Never exec an empty resolution — refuse with the install hint.
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "\n\"$CODEX_BIN\"") != null);
+}
+
+test "AgentKind.fromName recognizes opencode2" {
+    try t.expect(AgentKind.fromName("opencode2") != null);
+    try t.expectEqualStrings("opencode2", @tagName(AgentKind.fromName("opencode2").?));
+}
+
+test "opencode2 cli.json merge keeps theme and unrelated plugins, one mlx-serve entry" {
+    const existing =
+        \\{"theme":"nord","keybinds":{"leader":"ctrl+x"},"plugins":[{"package":"other-plugin","options":{"a":1}}]}
+    ;
+    const json = try mergeOpencode2CliJson(t.allocator, existing, "http://127.0.0.1:11234", null);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try t.expectEqualStrings("nord", obj.get("theme").?.string);
+    try t.expectEqualStrings("ctrl+x", obj.get("keybinds").?.object.get("leader").?.string);
+    const plugins = obj.get("plugins").?.array.items;
+    try t.expectEqual(@as(usize, 2), plugins.len);
+    var saw_other = false;
+    var saw_mlx: usize = 0;
+    for (plugins) |p| {
+        const pkg = p.object.get("package").?.string;
+        if (std.mem.eql(u8, pkg, "other-plugin")) {
+            saw_other = true;
+            try t.expectEqual(@as(i64, 1), p.object.get("options").?.object.get("a").?.integer);
+        } else if (std.mem.eql(u8, pkg, "./plugins/mlx-serve")) {
+            saw_mlx += 1;
+            const opts = p.object.get("options").?.object;
+            try t.expectEqualStrings("http://127.0.0.1:11234/metrics.json", opts.get("metricsUrl").?.string);
+            try t.expect(opts.get("metricsToken") == null);
+        }
+    }
+    try t.expect(saw_other);
+    try t.expectEqual(@as(usize, 1), saw_mlx);
+}
+
+test "opencode2 cli.json merge replaces a prior mlx-serve plugin, does not duplicate" {
+    const existing =
+        \\{"plugins":[{"package":"./plugins/mlx-serve","options":{"metricsUrl":"http://old:1/metrics.json","metricsToken":"stale"}},{"package":"keep-me"}]}
+    ;
+    const json = try mergeOpencode2CliJson(t.allocator, existing, "http://127.0.0.1:8097", null);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const plugins = parsed.value.object.get("plugins").?.array.items;
+    try t.expectEqual(@as(usize, 2), plugins.len);
+    var saw_mlx: usize = 0;
+    var saw_keep = false;
+    for (plugins) |p| {
+        const pkg = p.object.get("package").?.string;
+        if (std.mem.eql(u8, pkg, "./plugins/mlx-serve")) {
+            saw_mlx += 1;
+            try t.expectEqualStrings("http://127.0.0.1:8097/metrics.json", p.object.get("options").?.object.get("metricsUrl").?.string);
+        } else if (std.mem.eql(u8, pkg, "keep-me")) {
+            saw_keep = true;
+        }
+    }
+    try t.expectEqual(@as(usize, 1), saw_mlx);
+    try t.expect(saw_keep);
+}
+
+test "opencode2 cli.json merge omits metricsToken on loopback and writes it otherwise" {
+    const loop = try mergeOpencode2CliJson(t.allocator, "{}", "http://127.0.0.1:11234", null);
+    defer t.allocator.free(loop);
+    const loop_p = try std.json.parseFromSlice(std.json.Value, t.allocator, loop, .{});
+    defer loop_p.deinit();
+    const loop_opts = loop_p.value.object.get("plugins").?.array.items[0].object.get("options").?.object;
+    try t.expect(loop_opts.get("metricsToken") == null);
+
+    const remote = try mergeOpencode2CliJson(t.allocator, "{}", "http://10.0.0.2:11234", null);
+    defer t.allocator.free(remote);
+    const remote_p = try std.json.parseFromSlice(std.json.Value, t.allocator, remote, .{});
+    defer remote_p.deinit();
+    const remote_opts = remote_p.value.object.get("plugins").?.array.items[0].object.get("options").?.object;
+    try t.expectEqualStrings("mlx-serve", remote_opts.get("metricsToken").?.string);
+    try t.expectEqualStrings("http://10.0.0.2:11234/metrics.json", remote_opts.get("metricsUrl").?.string);
+
+    const known = try mergeOpencode2CliJson(t.allocator, "{}", "http://127.0.0.1:11234", "secret-key");
+    defer t.allocator.free(known);
+    const known_p = try std.json.parseFromSlice(std.json.Value, t.allocator, known, .{});
+    defer known_p.deinit();
+    const known_opts = known_p.value.object.get("plugins").?.array.items[0].object.get("options").?.object;
+    try t.expectEqualStrings("secret-key", known_opts.get("metricsToken").?.string);
+}
+
+test "opencode2 feed note: 200 is silent, 503 names --metrics, 401 names the key" {
+    try t.expect(metricsFeedNote(200) == null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(503).?, "--metrics") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(503).?, "footer turn meter still works") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(401).?, "401 unauthorized") != null);
+    try t.expect(std.mem.indexOf(u8, metricsFeedNote(500).?, "unreachable") != null);
+}
+
+test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and invokes opencode2" {
+    const cfg = "{\"provider\":{}}";
+    const script = try scriptFor(t.allocator, .opencode2, "http://127.0.0.1:11234", "m1", .{ .context = 4096, .output = 1024 }, cfg, &.{ "resume", "it's" });
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export XDG_CONFIG_HOME=\"$HOME/.mlx-serve/opencode2\"") != null);
+    try t.expect(std.mem.indexOf(u8, script, "export OPENCODE_CONFIG_CONTENT='{\"provider\":{}}'") != null);
+    // v2 has no root --model flag and resolves models in a SHARED background
+    // service that never sees our env: --standalone, model pinned in the config.
+    try t.expect(std.mem.indexOf(u8, script, "opencode2 --standalone") != null);
+    try t.expect(std.mem.indexOf(u8, script, "--model") == null);
+    try t.expect(std.mem.indexOf(u8, script, "npm install -g @opencode/cli") != null);
+    try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
+    try t.expect(std.mem.indexOf(u8, script, "'resume' 'it'\\''s'") != null);
+}
+
+test "opencodeJson pins the default model only when asked" {
+    const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = false }};
+    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null);
+    defer t.allocator.free(plain);
+    try t.expect(std.mem.indexOf(u8, plain, "\"model\"") == null);
+
+    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    defer t.allocator.free(pinned);
+    try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
 }
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {

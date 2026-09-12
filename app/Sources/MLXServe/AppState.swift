@@ -20,6 +20,12 @@ class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
+    /// Chat is answered by Apple's on-device model rather than the server.
+    /// Persisted like `selectedModelPath`; the local pick stays set underneath
+    /// so turning it off lands back on the model that was chosen before.
+    @Published var useAppleModel: Bool = UserDefaults.standard.bool(forKey: "useAppleModel") {
+        didSet { UserDefaults.standard.set(useAppleModel, forKey: "useAppleModel") }
+    }
     @Published var selectedModelPath: String = "" {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
@@ -333,11 +339,16 @@ class AppState: ObservableObject {
     /// the per-surface-copy class the tag semantics were centralised to avoid.
     func applyChatModelPick(_ tag: String) {
         switch ChatModelSelection.action(for: tag) {
+        case .selectApple:
+            server.lanChatModelId = nil
+            useAppleModel = true
         case .selectLan(let id):
+            useAppleModel = false
             selectLanModel(id)
         case .selectLocal(let path):
             // Picking a local model always clears the LAN choice, or the chat
             // keeps being answered by the other Mac.
+            useAppleModel = false
             server.lanChatModelId = nil
             selectedModelPath = path
         }
@@ -361,43 +372,26 @@ class AppState: ObservableObject {
         pendingChatOpenTick += 1
     }
 
-    /// Start a sandbox terminal (pi / hermes, or a plain shell for nil) after
-    /// asking which folder it works in — hot-mounted into the guest, so
-    /// several terminals on different folders coexist. Cancel creates nothing.
+    /// Start a sandbox terminal (pi / hermes, or a plain shell for nil) in the
+    /// default working folder, hot-mounted into the guest. The folder is the
+    /// Settings one — a terminal opens on click, it does not interrogate.
     /// The ONE door for every "… in Sandbox" entry (tray, chip, sidebar).
     func startTerminal(agentId: String?) {
         let agent = SandboxAgentRegistry.all.first { $0.id == agentId }
-        // Every caller is a MENU item (the Sessions +, the tray's Code button,
-        // the empty-state chip). A modal panel run inside the menu's own click
-        // handler races the menu's dismissal and sometimes never shows — so
-        // the picker opens one run-loop turn later, once the menu is gone.
         DispatchQueue.main.async { [self] in
-            guard let workspace = pickTerminalWorkspace(for: agent?.displayName ?? "the shell") else { return }
-            showTerminal(terminals.start(agent: agent, workspace: workspace))
+            showTerminal(terminals.start(agent: agent,
+                                         workspace: ChatSession.defaultWorkingDirectory))
         }
     }
 
-    /// A host CLI (Claude Code, opencode, …) in a terminal row of the chat
-    /// window — the same door shape as the sandbox one; Terminal.app is no
-    /// longer involved.
+    /// A host CLI (Claude Code, opencode, …) or a plain shell in a terminal
+    /// row of the chat window — the same door shape as the sandbox one;
+    /// Terminal.app is no longer involved.
     func startTerminal(hostCLI cli: LauncherCLI) {
         DispatchQueue.main.async { [self] in
-            guard let workspace = pickTerminalWorkspace(for: cli.displayName) else { return }
-            showTerminal(terminals.startHost(cli: cli, workspace: workspace))
+            showTerminal(terminals.startHost(cli: cli,
+                                             workspace: ChatSession.defaultWorkingDirectory))
         }
-    }
-
-    private func pickTerminalWorkspace(for name: String) -> String? {
-        let panel = OpenPanel.make()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = true
-        panel.directoryURL = URL(fileURLWithPath: ChatSession.defaultWorkingDirectory)
-        panel.message = "Choose the folder \(name) works in"
-        panel.prompt = "Open Terminal"
-        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return nil }
-        return url.path
     }
 
     /// Close a terminal row (terminating a live session) and leave its pane.

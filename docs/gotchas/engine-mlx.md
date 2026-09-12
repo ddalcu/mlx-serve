@@ -159,7 +159,7 @@ Two things this refutes, both by measurement, so do not re-derive them:
 - **`dflash.wideVerifyLaneAvailable()` stays NAX-only.** Making it true off-NAX uncaps `resolveBlockSize` to the sidecar's config block (8), which is worse on every rung but predictable. `blockCapForMachine`'s M4 row stays 5.
 - **`round_cost.WidthChooser` stays OPT-IN.** At block 8 it takes predictable to 116.7 tok/s (its best number anywhere) and leaves novel at 27.8; started narrow (block 5, max 7) it gives 94.3 / 33.1 — worse novel than no chooser at all. It can only trial `current +/- 1` against unmeasured cells, so inside one 192-token generation it neither climbs to 7 on echo nor falls to 2 on novel. A chooser that can move more than one width per decision is the prerequisite, not the default flip.
 
-Two methodology notes. The persisted round-cost table is keyed on (chip, model, quant, OS build) and NOT the engine build, so every cell past w4 was still carrying a price from the previous kernel build: clear `~/.mlx-serve/round-cost/` (or `MLX_SERVE_ROUND_COST_PERSIST=0`) on BOTH arms of any width A/B. And the `verifyQmm µbench` evaluated one launch per `mlx_array_eval`, i.e. ~0.14 ms of sync per call — more than the whole `out` projection, so every small shape was a sync measurement and `out` at M=16 read 2.5x its M=12 time. It now batches 12 independent launches per eval like `vw-ubench`, prints TFLOP/s, and sums the shapes over the real layer inventory.
+Two methodology notes. The persisted round-cost table is OPT-IN (`MLX_SERVE_ROUND_COST_PERSIST=1`) and keyed on (chip, model, quant, OS build, engine build), so a previous kernel's cells never share a file: leave persist off (the default) on BOTH arms of any width A/B. And the `verifyQmm µbench` evaluated one launch per `mlx_array_eval`, i.e. ~0.14 ms of sync per call — more than the whole `out` projection, so every small shape was a sync measurement and `out` at M=16 read 2.5x its M=12 time. It now batches 12 independent launches per eval like `vw-ubench`, prints TFLOP/s, and sums the shapes over the real layer inventory.
 
 **The wide verify is NOT at the roofline, but the slack is not where a plan would put it (2026-09-04)** — decomposing the S=16 marginal (89.4 - 33.7 = 55.7 ms) with the batched µbench summed over the pack's inventory (48 GDN `in_proj` 5120x16384 + `out` 6144x5120, 16 attention q/k/v/o, 64 x gate_up 5120x34816 + down 17408x5120, lm_head 5120x248320): whole-forward qmm is 35.5 ms at M=1 (which is the entire serial forward, as a bandwidth-bound decode should be) and 73.8 ms at M=16, so **qmm is 69% of the marginal at 11.1 TFLOP/s** — about 70% of the M4 Max fp32 peak, which is a good but not final number for a dequant+fp32-mma kernel. Both Phase-0 gate conditions (>= 80% of the marginal, >= 12 TFLOP/s) therefore fail, but the ~1.4x of theoretical qmm headroom applies to two thirds of a marginal that only matters at widths the acceptance data says never to run. The remaining 19 ms of non-qmm marginal is NOT the GDN recurrence (its own µbench costs 12.3 ms per model at T=1 and 8.7 at T=16 — the marginal is negative).
 
@@ -4835,3 +4835,108 @@ exclusive and a second user queued; the state is now a per-request
 (two interleave, three go plain). Bars: `tests/test_mtp_batched.sh` (fixed
 depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
 `tests/bench_concurrency_ladder.sh` (the numbers).
+
+## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
+
+`msv_qsa_select` ran one threadgroup per query row: right for a 4096-row prefill chunk, wrong for
+decode, verify and every MTP draft step, where a single threadgroup walked 215k block scores four
+times (three radix digits plus the compaction) at ~20x under the bandwidth floor. Measured with
+the real kernel: 0.73 ms per layer at 860k, 5.8 of the 8.8 ms that separate a long-context tick
+from a short one, and a depth-6 round pays it seven times. Vectorized loads, unrolling and split
+histogram banks inside one threadgroup did nothing (best 0.77 ms): occupancy, not ILP, was the
+bound. Fix: at rows <= 15 and nb >= 24576 each row splits over 16 slices, each slice runs the
+SAME exact radix select (one shared body), and a second dispatch selects over the 16*K
+candidates. Exact because the order is total (ordinal, then lowest original index), so every
+global top-K element sits in its slice's top-K; candidates arrive ascending by original index
+with sentinel slots skipped, which is what resolves a cross-slice tie at the K-th ordinal to the
+lowest index. 0.72 → 0.26 ms per layer at S=1, 0.68 → 0.33 at S=7, ids bit-equal on 1550/1550
+probe cases. The floor is where the live win clears boot-to-boot noise (an A/A boot pair measured
++4% serial / +5% MTP on identical code): +4% MTP net at 40k blocks, +18% serial at 200k; the
+design cannot engage below 16k blocks (2*G*K <= nb at G=16). A second pass measured the
+remaining cost as per-level fixed work, not the walk (each radix level ~10 us regardless of
+element count; the compaction a 32-iteration loop every thread ran): a simd prefix-scan
+compaction and four 8-bit digits at decode widths (shape-gated: 8-bit digits LOSE 3-9% at
+prefill widths) took the split pair 0.120 -> 0.077 ms per layer at S=1 measured as marginal
+in-graph cost, and the floor to 24576. Guards: `qsa select split: ids are identical ...` over random, mostly-zero,
+tied-at-K, NaN/-0.0, bounds<K, ragged nb; the predicate test; the single kernel's exactness test
+pinned to the single arm; the kill-switch seam test.
+
+## The indexer score sheet was four memory-bound ops per row chunk (2026-09-09)
+
+qwen4_exp scored QSA blocks with `astype(q,f32) → mlx_matmul → maximum → sum_axis` over a
+`[4, rows, nb]` f32 sheet re-chunked to a 256 MB budget: at kv 1M, 64 passes of ~3.9 ms per
+4096-token chunk per QSA layer, ~3 s of every prefill chunk, all bandwidth. Two probes settled
+the design: every operand entering the matmul is already bf16-valued (a bf16-in, f32-accumulate
+`matmul2d` computes the same products; only the accumulation order can differ), and MLX's f32
+GEMM runs in tf32 mode on NAX by default with a k-loop of 8 ascending 16-deep steps. A hand
+kernel reproducing that order is bit-identical on 100% of elements at every width, ragged nb,
+and the strided capacity-buffer bank; `mlx_sum_axis` over the 4 heads is sequential ascending
+(brute-forced over every order), so the epilogue sums the same way. `msv_qsa_score` writes the
+f32 sheet straight from bf16 `q_rope` and the bf16 pooled bank (`h4` per-head accumulator at
+rows >= 128, head-interleaved `base` below); the f32 score bank (1,536 B/token, rebuilt on every
+restore) is never built under it, and the sheet budget buys 4x the rows. In situ at 162k the
+score+select chain is 2.0x and the whole prefill -2..5% (the chain is 8% of a chunk there,
+linear in kv); the gather attention (`gatherQsa256`, 66 ms per call, flat in kv) is the larger
+prefill term at every context. Guards: the `qsa score kernel` bit-equality grid (both layouts,
+sliced-Q parent, prefix-view bank), ids through `qsaSelectTopBlocks`, the geometry-fallback and
+bill-follows-predicate tests, `tests/test_qwen4_exp.sh` with the kernel engaged, and the
+`QWEN4_DUMP_QSA_BLOCKS` dump for real-prompt block-id identity.
+
+## The QSA gather attention rides NAX cooperative tensors at prefill (2026-09-09)
+
+`gatherQsa256` (the block-gathered sparse attention of qwen4_exp prefill) was the largest
+flat prefill term at every context: ~65 ms per 4096-row call, ~26% of a chunk, ~3 TFLOP/s
+on a 60 TFLOP/s part. PR #385 (Nikolai V.) ported the split-head-dimension attention of
+MLX's steel NAX kernels to per-query sparse block selection (`msv_qsa_nax_precise`). The
+cooperative input-tensor API needs macOS 26.3 on a G17 GPU, one release past ordinary NAX
+availability, so the gate is its own predicate (`qsaNaxEligible`: G17 + 26.3 + bf16 + hd 256
++ gqa 12 + q_len >= 16) and the kernel is never compiled where it fails. The bf16 MMA rounds
+the softmax weights: the PR split each weight into three bf16 terms; two terms match stock's
+bf16 store to the same max error and beat three on the chained graph (33.5 vs 36.2 ms), one
+term is worse than stock, so two ship. Not bit-identical to the stock gather, so the bar is
+per-element error against float64 of the bf16-rounded inputs, no worse than stock
+(`tests/qsa_nax_precision.py`), and greedy answers are expected to fork on long prompts.
+Measured: gather 2.06x at kv 4k, 1.93x at 65k, 1.64x at 262k (it is not flat in kv: scattered
+K/V reads from a larger buffer); live 162k prefill 1480 -> 1667 tok/s (+12.6%). Default on
+where eligible, `MLX_SERVE_QSA_NAX=0` restores the stock gather. Guards: the `gatherQsa256 NAX`
+tests, the eligibility-predicate test, the precision probe, `tests/test_qsa_nax_prefill.py`.
+
+## A 3-row conv_state view pinned the whole prefill chunk input (2026-09-10, found by Nikolai V., #366)
+
+`conv1dWithCache` stored the GDN conv state as `mlx_slice(conv_input, last kernel-1 rows)`. A slice is a
+view, and the residual's cadence eval materialises `conv_input` (`[B, k-1+T, conv_dim]` bf16) because
+`conv_out` depends on it, so every conv-cached layer kept its whole chunk input alive until that layer's
+next forward: 36 x 4096 x 10240 x 2 B = 3.0 GB on qwen4_exp at width 4096 (7.5 GB on the 27B at 8192).
+The design point that made the first attempt a null: a lazy `materializedOwnedCopy` stored into
+`conv_state` is NOT in the residual's graph, so a plain `mlx_array_eval(h)` leaves it lazy and the copy
+still holds the parent; only the post-chunk eval would evaluate it, which lowers post-chunk bytes and not
+the peak. The copy has to be named in the cadence eval vector inside the layer loop (`evalCadencePoint`),
+which leaves at most `cadence + 1` parents alive. Measured on the production pack: peak -2.5 GB at width
+4096 (the 8192 pin is clamped on qwen4_exp), -2.8 GB at the 128k rung, greedy byte-identical, llmprobe
+4k-128k neutral. The copy is gated on a chunk-wide parent (T >= 32) so composed decode on lfm2/nemotron/KDA
+pays nothing. Guards: the retention tests (active bytes after `mlx_clear_cache`), the on/off identity
+tests through `compact_conv_state_override`, and a cadence test that fails with the cadence sites reverted
+(it pins that every layer's tail is copied and named in an in-loop eval; the peak itself is only measurable
+live, a tiny fixture's peak is dominated by the gated-conv internals). A final partial chunk narrower than
+32 rows keeps the view: its pin is at most `(T + k - 1) x conv_dim x 2` per layer, a few MB. The identity
+tests use `mlx_array_equal`, which cannot see the `-0.0 -> +0.0` flip of the `x + 0` copy idiom; the live
+greedy byte identity is what covers that. The admission bill followed: `prefillStreamBytesPerToken` charged every linear layer's stream
+(737 KB/token here) because that term WAS this pin; it now bills `min(linear_layers, cadence + 1)` layers,
+and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the exact pin bytes. Rule: a
+lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
+still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
+(`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
+
+## A failed dense KV write left freed view handles in the entry (2026-09-10)
+
+`KVCache.updateDense` frees the previous `key_view`/`value_view` first, so the buffer can be
+donated, and assigned the handles fresh only after the grow and the writes. When one of those
+failed (an MLX error, catchable since #353), the entry kept both freed handles and the next
+`resetCache` or `deinit` of that cache freed them again: SIGSEGV in `freeKVEntry`. Seen live when
+Qwen3-Embedding sub-batches shared the cache and a write failed on the batch dimension
+(`broadcast_shapes`). `updateAffine` already reset its handles at the free, and
+`updateTurboQuant` goes through it. Fix: reset the handles at the free; `writeAtOffset` releases
+its result on the error path. A grow that fails after K but before V can leave their capacities
+apart; the error aborts that forward and the next request's reset restores a coherent pair.
+Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
+in-capacity and a growing update.

@@ -31,6 +31,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "bailing",    // inclusionAI Ling 3.0 — repos tag "bailing_moe_v3" and/or "bailing_hybrid"
     "ling",       // …and/or the family name
     "gpt_oss",    // GPT-OSS family tags (e.g. mlx-community/gpt-oss-20b-MXFP4-Q8)
+    "spark",      // XHToken Spark-X2.5 — repos tag "spark2_5" and/or "sparkx2_5"
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -52,6 +53,7 @@ let supportedModelTypes: Set<String> = [
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
+    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so

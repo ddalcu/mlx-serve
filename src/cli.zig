@@ -107,6 +107,8 @@ pub const aliases = [_]Alias{
     .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
     .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
+    .{ .name = "spark", .tag = "4b", .repo = "abenzerps/Spark-X2.5-4B-MLX-4bit", .is_default = true },
+    .{ .name = "spark", .tag = "4b-8bit", .repo = "abenzerps/Spark-X2.5-4B-MLX-8bit" },
 };
 
 pub const Resolved = struct {
