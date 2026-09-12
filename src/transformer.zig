@@ -6279,14 +6279,20 @@ pub fn qsaScoreRowsPerChunk(n_idx: u64, nb: u64, rows: u64, idx_hd: u64) u64 {
 pub fn qsaPrefillTransientBytes(n_idx: u64, fwd: u64, kv: u64, ratio: u64, idx_hd: u64) u64 {
     if (ratio == 0) return 0;
     const nb = kv / ratio;
+    const pair = @import("qsa_pair.zig");
+    // The bill covers an earlier eligible chunk even when the final KV exceeds the cap.
+    const planner = if (pair.enabled() and ratio == 4 and fwd >= 16)
+        pair.plannerBytes(1, @min(fwd, 8192), @min(nb, 512))
+    else
+        0;
     const fused = qsaScoreFusedActiveFor(1, @intCast(n_idx), @intCast(idx_hd));
     const rows = qsaScoreRowsPerChunkFused(n_idx, nb, fwd, fused);
     if (fused) {
         const sheet = rows * nb * 4;
         const select_mult: u64 = if (qsaSelectKernelEnabled()) 1 else 4;
-        return sheet * select_mult + fwd * @min(nb, 512) * 4;
+        return planner + sheet * select_mult + fwd * @min(nb, 512) * 4;
     }
-    return rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
+    return planner + rows * nb * 4 * (n_idx * 2 + 4) + fwd * @min(nb, 512) * 4;
 }
 
 fn fusedSdpa256Impl(
@@ -28532,8 +28538,8 @@ var gdn_prefill_engaged = false;
 fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@as(c_int, 8192), batch)) return false;
     if (gdn_prefill_fused_override) |on| return on;
-    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED") orelse return false;
-    return std.mem.eql(u8, std.mem.span(raw), "1");
+    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
 }
 
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
@@ -42919,38 +42925,45 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const hp = @import("hc_prefill.zig");
     const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    xfm.compileQwen4Hc();
+    defer inline for (.{ xfm.compiled_hc_silu, xfm.compiled_hc_mix, xfm.compiled_hc_inj, xfm.compiled_hc_write }) |slot| {
+        if (slot) |closure| _ = mlx.mlx_closure_free(closure);
+    };
+    try testing.expect(xfm.compiled_hc_write != null and xfm.compiled_hc_mix != null);
     var prng = std.Random.DefaultPrng.init(0x91831);
     const rnd = prng.random();
-    const w = try attn256RandBf16(rnd, &.{ 4, 2560 }, s);
-    defer _ = mlx.mlx_array_free(w);
-    const iw = try attn256RandBf16(rnd, &.{ 10240, 4 }, s);
-    defer _ = mlx.mlx_array_free(iw);
     const eps = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps);
-    const ones = try standinOnes(&.{2560}, s);
-    defer _ = mlx.mlx_array_free(ones);
-    for ([_][2]c_int{ .{ 2, 17 }, .{ 1, 65 }, .{ 1, 513 } }) |shape| {
+    for ([_][4]c_int{ .{ 2, 17, 4, 2560 }, .{ 1, 65, 4, 2560 }, .{ 1, 513, 4, 2560 }, .{ 1, 33, 2, 1536 } }) |shape| {
         const b = shape[0];
         const seq = shape[1];
-        const x = try attn256RandBf16(rnd, &.{ b, seq, 4, 2560 }, s);
+        const hc = shape[2];
+        const hidden = shape[3];
+        const width = hc * hidden;
+        const w = try attn256RandBf16(rnd, &.{ hc, hidden }, s);
+        defer _ = mlx.mlx_array_free(w);
+        const iw = try attn256RandBf16(rnd, &.{ width, hc }, s);
+        defer _ = mlx.mlx_array_free(iw);
+        const ones = try standinOnes(&.{hidden}, s);
+        defer _ = mlx.mlx_array_free(ones);
+        const x = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
         defer _ = mlx.mlx_array_free(x);
-        const wo = try attn256RandBf16(rnd, &.{ b, seq, 1, 2560 }, s);
+        const wo = try attn256RandBf16(rnd, &.{ b, seq, 1, hidden }, s);
         defer _ = mlx.mlx_array_free(wo);
-        const wi = try attn256RandBf16(rnd, &.{ b, seq, 4, 1 }, s);
+        const wi = try attn256RandBf16(rnd, &.{ b, seq, hc, 1 }, s);
         defer _ = mlx.mlx_array_free(wi);
-        var delta = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(delta);
-        try mlx.check(mlx.mlx_multiply(&delta, wo, wi, s));
-        var written = mlx.mlx_array_new();
+        const written = (try Transformer.applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
         defer _ = mlx.mlx_array_free(written);
-        try mlx.check(mlx.mlx_add(&written, x, delta, s));
         for ([_]bool{ false, true }) |pending| {
             const stream = if (pending) written else x;
             const n = (try hp.norm(s, x, w, iw, eps, b, seq, if (pending) .{ .out = wo, .inj = wi } else null)) orelse return error.HcFusedDeclined;
             defer n.deinit();
             var state = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(state);
-            try mlx.check(mlx.mlx_reshape(&state, n.stream, &[_]c_int{ b, seq, 4, 2560 }, 4, s));
+            try mlx.check(mlx.mlx_reshape(&state, n.stream, &[_]c_int{ b, seq, hc, hidden }, 4, s));
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(state, stream, s));
             var rms = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(rms);
@@ -42961,25 +42974,33 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.normalized, normed, s));
             var flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(flat);
-            try mlx.check(mlx.mlx_reshape(&flat, normed, &[_]c_int{ b, seq, 10240 }, 3, s));
+            try mlx.check(mlx.mlx_reshape(&flat, normed, &[_]c_int{ b, seq, width }, 3, s));
             var raw = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(raw);
             try mlx.check(mlx.mlx_matmul(&raw, flat, iw, s));
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.raw_inject, raw, s));
-            var sig = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sig);
-            try mlx.check(mlx.mlx_sigmoid(&sig, x, s));
-            var prod = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(prod);
-            try mlx.check(mlx.mlx_multiply(&prod, sig, normed, s));
-            var expected = mlx.mlx_array_new();
+            const expected = (try Transformer.applyClosure(xfm.compiled_hc_mix, &.{ x, normed })) orelse return error.MissingCompiledHc;
             defer _ = mlx.mlx_array_free(expected);
-            try mlx.check(mlx.mlx_mean_axis(&expected, prod, 2, false, s));
             const mixed = (try hp.mix(s, x, normed, b, seq)) orelse return error.HcFusedDeclined;
             defer _ = mlx.mlx_array_free(mixed);
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(mixed, expected, s));
         }
     }
+}
+
+test "qsa pair: planner allocation is billed and context reaches one million" {
+    const pair = @import("qsa_pair.zig");
+    try testing.expect(pair.supports(1, 8192, 200_000, 4, 512));
+    try testing.expect(pair.supports(2, 8192, pair.MAX_KV, 4, 512));
+    try testing.expect(!pair.supports(1, 8192, pair.MAX_KV + 1, 4, 512));
+    const one = @as(u64, 4096 * 133 * 9 * 4);
+    try testing.expectEqual(one, pair.plannerBytes(1, 8192, 512));
+    try testing.expectEqual(2 * one, pair.plannerBytes(2, 8192, 512));
+    defer pair.enabled_override = null;
+    pair.enabled_override = false;
+    const without = qsaPrefillTransientBytes(4, 8192, 65_536, 4, 128);
+    pair.enabled_override = true;
+    try testing.expectEqual(without + one, qsaPrefillTransientBytes(4, 8192, 65_536, 4, 128));
 }
 
 test "qsa pair: Zig dispatch preserves outputs across batch and sequence shape changes" {
@@ -46037,6 +46058,14 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
     defer gdn_prework_override = null;
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    xfm.compileGdnGate();
+    defer if (xfm.compiled_gdn_gate) |closure| {
+        _ = mlx.mlx_closure_free(closure);
+    };
+    try testing.expect(xfm.compiled_gdn_gate != null);
     var prng = std.Random.DefaultPrng.init(0x6D1);
     const rnd = prng.random();
 
@@ -46176,7 +46205,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, ref_state, s));
 
         // Gate + beta against the graph chain.
-        const g_ref = try gdnGateChain(A_log, a_in, dt_bias, s);
+        const g_ref = try xfm.computeGdnGate(A_log, a_in, dt_bias);
         defer _ = mlx.mlx_array_free(g_ref);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.g, g_ref, s));
         var beta_ref = mlx.mlx_array_new();

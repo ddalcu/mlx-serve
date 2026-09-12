@@ -27,13 +27,13 @@ const int end0=(counts[0]*RATIO+31)/32;
 const int end1=end0+(counts[1]*RATIO+31)/32;
 const int end2=end1+(counts[2]*RATIO+31)/32;
 const int NG=(qL+1)/2;
-device int* pos=tilepos+((long)bb*NG+gi)*NT*32;
+device int* pos=tilepos+((long)bb*NG+gi)*NT*8;
 device int* masks=tilemask+((long)bb*NG+gi)*NT;
 for(int it=lane;it<NT;it+=32)masks[it]=it<end0?1:(it<end1?2:(it<end2?3:0));
-for(int i=lane;i<NT*32;i+=32) {
-  int it=i/32;
+for(int i=lane;i<NT*8;i+=32) {
+  int it=i/8;
   int b=it<end0?0:(it<end1?1:2);
   int start=b==0?0:(b==1?end0:end1);
-  int r=i-start*32;
-  pos[i]=it<end2 && r<counts[b]*RATIO ? bucket[b*CAP+r/RATIO]*RATIO+r%RATIO : -1;
+  int r=i-start*8;
+  pos[i]=it<end2 && r<counts[b] ? bucket[b*CAP+r]*RATIO : -1;
 }

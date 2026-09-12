@@ -4904,3 +4904,9 @@ and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the
 lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
 still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
 (`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
+
+## Prefill fusion parity and QSA planner memory
+
+HC/GDN tests must compare with the closures compiled by the Transformer: MLX compilation can alter rounding, so an eager graph is insufficient. HC retains native inject matmul and compares pending write/mix against the production closures. GDN compares its gate against `computeGdnGate`; these are finite fixture checks, not a proof for every possible activation.
+
+Paired QSA changes reduction order, so it retains an explicit opt-in and a float64 error bar. The planner stores one base position per four-key block and a mask per tile; admission bills both buffers, including an earlier eligible chunk when later context falls back. Supports extends through 1,048,576 KV rows; declines are logged once. The HTTP smoke is launched by `tests/test_qsa_pair_prefill.sh`; its default pack is mixed-4-8bit.

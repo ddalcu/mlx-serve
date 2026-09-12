@@ -14,7 +14,7 @@ const ushort lane=thread_index_in_simdgroup;
 const int tid=thread_index_in_threadgroup;
 const int p=kL-qL+s;
 const int NT=tilepos_shape[1], NG=(qL+G-1)/G;
-const device int* poslist=tilepos+((long)bb*NG+gi)*NT*BK;
+const device int* poslist=tilepos+((long)bb*NG+gi)*NT*(BK/RATIO);
 const device int* masks=tilemask+((long)bb*NG+gi)*NT;
 const device T* Kp=k+bb*k_strides[0]+hk*k_strides[1];
 const device T* Vp=v+bb*v_strides[0]+hk*v_strides[1];
@@ -39,7 +39,8 @@ for(int it=0;it<NT;++it) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for(int i=tid;i<BK*32;i+=NSG*32) {
     int r=i>>5,c=i&31; uint4 value=uint4(0);
-    int pos=poslist[it*BK+r];
+    const int base=poslist[it*(BK/RATIO)+r/RATIO];
+    int pos=base<0 ? -1 : base+r%RATIO;
     if(pos>=0 && pos<kL) {
       value=*((const device uint4*)(Kp+(long)pos*k_strides[2])+c);
     }
@@ -72,7 +73,9 @@ for(int it=0;it<NT;++it) {
     for(short i=0;i<8;++i) {
       S.frag_at(0,ik)[i]+=exchange[(sg^1)*512+lane*16+ik*8+i];
       S.frag_at(0,ik)[i]*=scale;
-      const int pos=poslist[it*BK+ik*16+coord.x+i%4];
+      const int r=ik*16+coord.x+i%4;
+      const int base=poslist[it*(BK/RATIO)+r/RATIO];
+      const int pos=base<0 ? -1 : base+r%RATIO;
       if(!active || pos<0 || pos>p)S.frag_at(0,ik)[i]=-INFINITY;
     }
   }
@@ -87,7 +90,8 @@ for(int it=0;it<NT;++it) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for(int i=tid;i<BK*32;i+=NSG*32) {
     int r=i>>5,c=i&31; uint4 value=uint4(0);
-    int pos=poslist[it*BK+r];
+    const int base=poslist[it*(BK/RATIO)+r/RATIO];
+    int pos=base<0 ? -1 : base+r%RATIO;
     if(pos>=0 && pos<kL) {
       value=*((const device uint4*)(Vp+(long)pos*v_strides[2])+c);
     }

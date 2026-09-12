@@ -4,15 +4,31 @@ const log = @import("log.zig");
 
 var kernels: ?[2]mlx.mlx_fast_metal_kernel = null;
 var announced = false;
+var fallback_announced = false;
+pub var enabled_override: ?bool = null;
+pub const MAX_KV: c_int = 1_048_576;
 
+// Approximate reduction: per-element error vs float64 <= max(1.5 * stock,
+// 2.5e-6) before BF16, <= max(1.5 * stock, 2e-3) after BF16; not byte identity.
 pub fn enabled() bool {
+    if (enabled_override) |value| return value;
     const raw = std.c.getenv("MLX_SERVE_QSA_PAIR") orelse return false;
     return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
 }
 
 pub fn supports(batch: c_int, seq: c_int, kv: c_int, ratio: c_int, kb: c_int) bool {
     return ratio == 4 and kb > 0 and kb <= 512 and seq >= 16 and seq <= 8192 and
-        batch >= 1 and batch <= 2 and kv >= seq and kv <= 131072;
+        batch >= 1 and batch <= 2 and kv >= seq and kv <= MAX_KV;
+}
+
+pub fn tileCount(kb: c_int) c_int {
+    return 2 * @divTrunc((kb + 1) * 4 + 31, 32) + 3;
+}
+
+/// One base position per four-key block, plus one query-membership mask per tile.
+pub fn plannerBytes(batch: u64, seq: u64, kb: u64) u64 {
+    if (batch == 0 or seq == 0 or kb == 0) return 0;
+    return batch * ((seq + 1) / 2) * @as(u64, @intCast(tileCount(@intCast(@min(kb, 512))))) * (8 + 1) * 4;
 }
 
 fn getKernels() ![2]mlx.mlx_fast_metal_kernel {
@@ -43,13 +59,19 @@ pub fn apply(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const bs = mlx.getShape(blocks);
-    if (!supports(qs[0], qs[2], ks[2], ratio, bs[2])) return null;
+    if (!supports(qs[0], qs[2], ks[2], ratio, bs[2])) {
+        if (!fallback_announced) {
+            fallback_announced = true;
+            log.info("[qsa-pair] fallback: unsupported S={d} kv={d} KB={d} B={d} ratio={d} (max_kv={d})\n", .{ qs[2], ks[2], bs[2], qs[0], ratio, MAX_KV });
+        }
+        return null;
+    }
     const ng = @divTrunc(qs[2] + 1, 2);
-    const nt = 2 * @divTrunc((bs[2] + 1) * ratio + 31, 32) + 3;
+    const nt = tileCount(bs[2]);
     const pair = try getKernels();
     const pc = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(pc);
-    const pos_shape = [_]c_int{ qs[0] * ng, nt, 32 };
+    const pos_shape = [_]c_int{ qs[0] * ng, nt, 8 };
     const mask_shape = [_]c_int{ qs[0] * ng, nt };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pc, &pos_shape, 3, .int32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pc, &mask_shape, 2, .int32));
