@@ -4640,15 +4640,10 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 }
 
 /// Service one embedding request on the inference thread. Runs the batched
-/// encoder-only forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`,
-/// resets the global xfm.cache between requests (encoder-only does not
-/// share KV state across embeddings), and wakes the conn thread.
+/// forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`, which resets
+/// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    xfm_ptr.resetCache() catch |err| {
-        finishEmbedRequest(sch, req, @errorName(err));
-        return;
-    };
     const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;

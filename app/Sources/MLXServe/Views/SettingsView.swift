@@ -499,6 +499,15 @@ private struct EngineAwareSections: View {
             }
         }
 
+        // Unconditional: the media offloads apply to generation models, which
+        // are not the text engine the gates above key on.
+        SettingsSection(
+            category: .neuralEngine,
+            subtitle: "Run part of the work on the Apple Neural Engine beside the GPU. Each switch keeps its own copy of part of the model, so it costs extra memory and disk — the estimate is under each switch. A Max or Ultra lands near the low end; smaller GPUs hand the Neural Engine more of the work and land near the high end. Compiled copies are cached on disk, up to 40 GB (less when the disk is nearly full). Opt-in and lossy by design; the server declines by name where the copy does not fit. Server-launch flags — restart to apply."
+        ) {
+            NeuralEngineSectionContent()
+        }
+
         if showLlama {
             SettingsSection(
                 category: .ggufPerformance,
@@ -612,10 +621,13 @@ private struct SettingsRow<Control: View>: View {
     /// every server-launch row by default — that's noisy when nothing has
     /// actually been changed yet.
     var isDirty: Bool = false
+    /// The setting's memory/disk cost; orange and bold while it is switched on.
+    var cost: String? = nil
+    var costActive: Bool = false
     @ViewBuilder var control: Control
 
     var body: some View {
-        SearchableRow(searchText: [title, explainer]) {
+        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 }) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -636,6 +648,13 @@ private struct SettingsRow<Control: View>: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let cost {
+                    Text(cost)
+                        .font(.caption)
+                        .fontWeight(costActive ? .semibold : .regular)
+                        .foregroundStyle(costActive ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -1670,30 +1689,6 @@ private struct PerformanceSectionContent: View {
                 }
             }
         }
-        if let m = meta["anePrefill"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.anePrefill)
-            ) {
-                // The switch works everywhere (the server declines by name
-                // where it can't run), so the per-Mac caution rides beside
-                // it rather than gating it — a hidden or disabled switch on
-                // a Mac that gets RAM tomorrow is the dead-control class.
-                VStack(alignment: .trailing, spacing: 4) {
-                    Toggle("", isOn: opts.anePrefill)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                    if let caution = AnePrefillAdvice.liveCaution {
-                        Text(caution)
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .multilineTextAlignment(.trailing)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-        }
         if let m = meta["decodeAttnQuant"] {
             SettingsRow(
                 title: m.title,
@@ -1791,6 +1786,65 @@ private struct PerformanceSectionContent: View {
 /// stripper that brought a 1813-token Gemma 4 repeat from 240 ms to
 /// 0.002 ms. Reorg-friendly: anything we add later that crosses engines
 /// (e.g. shared HTTP timeout overrides) lands here.
+private struct NeuralEngineSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+
+        if let m = meta["anePrefill"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.anePrefill),
+                cost: m.cost,
+                costActive: appState.serverOptions.anePrefill
+            ) {
+                // The switch works everywhere (the server declines by name
+                // where it can't run), so the per-Mac caution rides beside
+                // it rather than gating it — a hidden or disabled switch on
+                // a Mac that gets RAM tomorrow is the dead-control class.
+                VStack(alignment: .trailing, spacing: 4) {
+                    Toggle("", isOn: opts.anePrefill)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    if let caution = AnePrefillAdvice.liveCaution {
+                        Text(caution)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        if let m = meta["aneImage"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
+                        cost: m.cost, costActive: appState.serverOptions.aneImage) {
+                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch)
+            }
+        }
+        if let m = meta["aneVideo"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneVideo),
+                        cost: m.cost, costActive: appState.serverOptions.aneVideo) {
+                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch)
+            }
+        }
+        if let m = meta["aneAudio"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneAudio),
+                        cost: m.cost, costActive: appState.serverOptions.aneAudio) {
+                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch)
+            }
+        }
+    }
+}
+
 private struct CommonPerformanceSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager

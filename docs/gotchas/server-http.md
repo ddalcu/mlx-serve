@@ -2068,3 +2068,19 @@ sequence with one U+FFFD. Valid input is byte-identical.
 
 Guard: `EVERY JSON string escaper survives bytes that are not valid UTF-8`
 (server.zig), one invariant over all four.
+
+## Qwen3-Embedding sub-batches shared one KV cache (2026-09-10)
+
+A `/v1/embeddings` request splits into sub-batches once rows x longest input passes
+`EMBED_TOKEN_BUDGET` (64 x 512): 64 inputs with one over 512 tokens is enough. BERT and the
+EmbeddingGemma encoder hold no KV state, but Qwen3-Embedding runs the ordinary decoder forward,
+which appends to `xfm.cache`, and the cache was reset once per REQUEST (`runEmbedRequest`), not
+per sub-batch as issue #116 asked. Sub-batch 2 wrote its keys after sub-batch 1's, so its rows
+attended causally to sub-batch 1's rows of the same index at shifted RoPE positions. Where the
+cache write could carry those rows into the new shape (typically a second sub-batch no larger
+than the first) the request answered 200 with wrong vectors; otherwise it failed with
+`broadcast_shapes` and a 500, and the model's next embeddings request crashed in `freeKVEntry`
+(a separate `updateDense` defect). Fix: the reset moved from `runEmbedRequest` into
+`computeEmbeddingsBatch`, before every sub-batch. Guard: `tests/test_embeddings.sh` [4c] (the
+later of two equal sub-batches matches the same inputs sent alone, a second sub-batch with more
+rows answers 200, the server still answers afterwards).

@@ -448,6 +448,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         publishTurnState()
     }
 
+    /// Apple's on-device model answers with no mlx-serve process, so the
+    /// server gate does not apply to it.
+    nonisolated static func canRunTurn(serverRunning: Bool, apple: Bool) -> Bool {
+        apple || serverRunning
+    }
+
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
@@ -457,7 +463,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
         let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || images != nil || videos != nil || audio != nil,
-              server.status == .running else { return }
+              Self.canRunTurn(serverRunning: server.status == .running,
+                              apple: appState.useAppleModel) else { return }
 
         // A new submission to the SAME session supersedes its in-flight turn.
         // Other sessions' turns are untouched — the engine is multi-turn.
@@ -523,7 +530,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
                                        serverRunning: server.status == .running,
                                        busy: composerState(for: sessionId) != .idle,
-                                       engine: server.chatModelInfo?.engine)
+                                       engine: server.chatModelInfo?.engine,
+                                       apple: appState.useAppleModel)
         else { return }
         stop(sessionId: sessionId)
         let token = ledger.begin(session: sessionId)
@@ -634,13 +642,20 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                      messages: [[String: Any]], config: TurnConfig,
                                      token: UUID, continuing: Bool = false) async {
         do {
+            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let stream: AsyncThrowingStream<SSEEvent, Error>
+            if appState.useAppleModel {
+                // Apple's on-device model needs no server and no load.
+                stream = AppleFoundationChat.stream(
+                    messages: messages,
+                    temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature))
+            } else {
             // A media-first server runs headless (no default model) — hot-load
             // the selected chat model once so the request below resolves.
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             // Pin the request to the active model (server-resolved default if
             // nil) so hot-switch can finish in-flight requests on the old model.
-            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
-            let stream = api.streamChat(
+            stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
@@ -651,6 +666,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 modelId: server.chatModelId,
                 continueFinalMessage: continuing
             )
+            }
             var coalescer = StreamCoalescer()
             beginLiveTokenCount(for: sessionId)
             for try await event in stream {
@@ -815,7 +831,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let turnMax = turnMaxTokens(config)
             let contextLength = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             let useServerPreprocess = wantsServerImagePreprocess
             var history = AgentEngine.buildAgentHistory(
@@ -941,12 +958,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let combinedToolsJSON = Self.combinedToolsJSON(
                 tools: config.advertisedTools,
                 mcpToolsJSON: mcpToolsJSON,
-                docsToolJSON: config.documentIndex != nil ? AgentPrompt.searchDocumentsToolJSON : nil
+                // The docs tool normally rides along with an attached folder;
+                // on-device there is no room for a third definition.
+                docsToolJSON: config.documentIndex != nil && !appState.useAppleModel
+                    ? AgentPrompt.searchDocumentsToolJSON : nil
             )
+            let stream: AsyncThrowingStream<SSEEvent, Error>
+            if appState.useAppleModel {
+                // The on-device model's tool calls come back OUT of its
+                // session as `.toolCalls`, so the loop below — approvals,
+                // repetition guard, logging — is the same one every model runs.
+                stream = AppleFoundationChat.stream(
+                    messages: messages, toolsJSON: combinedToolsJSON,
+                    temperature: turnTemperature(config, default: Self.agentLoopTemperature))
+            } else {
             // Headless (media-first) server → ensure the selected chat model
             // is loaded + promoted before the alias-addressed request.
             await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
-            let stream = api.streamChat(
+            stream = api.streamChat(
                 port: server.port,
                 messages: messages,
                 maxTokens: turnMaxTokens(config),
@@ -957,6 +986,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 defaults: config.requestDefaults(from: appState.serverOptions),
                 modelId: server.chatModelId
             )
+            }
 
             // No client-side stream watchdog: long generations (large
             // contexts, big batches, slow sampling on big MoE) can legitimately

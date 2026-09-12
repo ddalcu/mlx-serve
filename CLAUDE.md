@@ -70,7 +70,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --max-mtp-ctx --ane-prefill --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
@@ -85,7 +85,7 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 
 ## Testing — TDD is mandatory
 
-Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test` 6/6 0 fail + `cd app && swift test`/`build` + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
+Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test` 6/6 0 fail + `bash app/test.sh`/`swift build` + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test red→fix→green, red-on-revert. Cross-arch = cover every touched arch. Refactor = characterization test first. UI/build scripts = factor a pure helper and test that.
 
@@ -148,6 +148,14 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.
 - Endpoint/field/backend detail: `docs/reference.md`. Guards: `tests/test_unified_gen.sh` + per-modality scripts; parity via env-gated cos oracles (`tests/dump_*_fixtures.py`).
+- **A denoise step is the ANE case the LM prefill seam never was** (opt-in, LOSSY: `--ane-image` Krea, `--ane-video` H3, `--ane-audio` ACE-Step; ONE value `ane.media_offload` set in `main()`): batch job at the compute roofline; ONE compiled 256-row tile, looped (`ane.mediaMlp`), serves every step AND every request size, so the ANE cache never grows per size. M4 Max: Krea 1.30x, H3 1.22x/step, ACE-Step 1.33x; M4 base ACE-Step 1.58x. Tables: `docs/reference.md`.
+- **The media share is CALIBRATED once per (chip, model), then STICKS** (`ane.planMediaOffload` → `calibrate`): block 0 alone, compiled at the probe's seed, timed on the ANE and GPU over the same 4096 rows, the GPU fed the dtype the MLP really sees (bf16 ones read ACE's f32 GPU 27% fast); later builds reuse the set's `calibrated share=` tag (`ane.cachedShare`; an explicit `--ane-split` never is), since re-solving recompiled + pruned on size and probe jitter.
+- **The ANE compile cache is capped by FREE DISK and pruned per LINEAGE** (`msv_ane_cache_lineage`: same seam+shape, other share → gone on the next cold compile; byte cap = min(40 GB, volume room − 8 GB reserve)): a fixed cap above free space is not a cap, and two small-disk boxes shipped `ready: N/M`. The gate bills the build's f32 transient against a 4 GB swap floor (`mediaGateRefusal`), refusing by NAME.
+- The seam is the channel-mode one (`ane.packUnitPlanes`/`readPlane`/`dequantToHostF32` shared with `transformer.zig`): ANE holds gate/up channels [0..k) + the matching down K-slabs, GPU the complement, partials ADD. H3's fc1 is FUSED, so its complement is TWO row views (`aneBuildRest`).
+- **The ANE graph is fp16 END TO END, so a partial-sum seam must SCALE** (`ane.OUT_PLANE_SCALE` 256, folded into the `up` copy at build time, multiplied back on read — exact: per-row int8 puts it in the row scale, and `up` is linear into `silu(gate)*up`). Unscaled, H3 saturated to INF from block 36 and rendered BLACK; Krea only lost precision (cos vs GPU 0.996 -> 0.9993).
+- **A LoRA-attached block DECLINES** (`aneBlockEligible` in both): the adapter is summed at forward from the FULL activation, half of which never leaves the ANE program. Turbo binds `blocks.N.mlp.fc1/fc2`, so H3's fast path is GPU-only until the LoRA is folded into the int8 snapshot.
+- **GPU work built AFTER a blocking ANE wait is serial, and a small piece of it is LAUNCH LATENCY, not rows** (`ane.mediaMlp`): a 23-row tail after the tile loop cost ACE 30 s 7% of diffusion. Every GPU piece goes out with the complement BEFORE the loop; a partial tile pads onto the ANE only past `tail > T x (1 - share)` (`ane.mediaTilePlan`).
+- **H3 stages the DiT per REQUEST, so the ANE build is paid per request** (cold 32 s, warm 8 s + a 4.9 GB int8 copy): noise against a 275 s/step dense render, dominant on a short one. Caching the engine across requests is owed.
 
 ## HTTP APIs
 
@@ -314,6 +322,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Default bind is 0.0.0.0 and serve mode WARNS** (`server.shouldWarnOpenBind`); flips to 127.0.0.1 in a future release. The app always passes `--host` explicitly.
 - **A reload FREES the CPU state `unloadResident` retains, so the registry mutex alone does not make a read of it safe**: `config`/`chat_config`/`tokenizer`/`token_bytes`/`tokenize_cache` are freed off-mutex while the entry is `.loading` (`releaseRetainedCpuState`, asserted). A reader holding no refcount takes the mutex AND skips them while `.loading` — not `== .ready`, an unloaded entry keeps them by contract.
 - **A status route must never reach `ensureLoaded`**: `GET /props` cold-loaded the model, so a 3s tray poll retook the memory idle eviction had just handed back. Nothing resident → answer from the counters (`handlePropsNoModel`).
+- **An embedding SUB-BATCH is its own forward** (`computeEmbeddingsBatch` resets the cache before every sub-batch, not the request): a decoder-arch embedder (Qwen3-Embedding) forwards through the KV cache, so a later sub-batch attended to the earlier rows and answered wrong vectors. Guard: `tests/test_embeddings.sh` [4c].
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
@@ -423,6 +432,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A kernel's dtype and its threadgroup BLOCK SIZE are ONE decision** (`gdnBlockTFor`; dtypes off the ARRAY; Metal has no implicit float→bfloat).
 - **Every KV buffer is sized from the OPERAND it stores; a scheme with a shape constraint refuses at LOAD**: K/V widths differ on MLA; TurboQuant needs pow2 → `initWithConfigAndHeadDim` checks `kvCacheKeyHeadDim()`.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object on the error path** — build first, then swap (`KVCache.reinit`). Scan-pinned: no `.cache = try` in transformer/scheduler/main.
+- **A handle freed before a fallible op is reset AT the free** (`updateDense` views, as `updateAffine` does): a write that failed after the free left freed views in the entry for the next `resetCache` to free again (SIGSEGV in `freeKVEntry`). Guard: the `KVCache dense update` fault sweep.
 - **An MLA cache is billed per ATTENTION head** (`kvBytesPerToken`): the latent decompresses to all heads; only an asymmetric config tells the spellings apart.
 - **A gate's LOWER BOUND may REPLACE the formula, not clamp it** (KDA: `g = exp(bound·σ(…))`); two arms means the arm is SELECTED (`kdaUsesBoundedGate`): absent bound = softplus arm, never bound 0. Read the reference KERNEL's arms.
 - **Per-head vs per-channel gating is an INDEXING contract**: one recurrence generated for both (`gdnKernelSource(vectorized, capture_seq)`); other-shape kernels DECLINE; test = per-channel gate held UNIFORM must match the scalar kernel EXACTLY.

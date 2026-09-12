@@ -6614,10 +6614,7 @@ const ane_offload = @import("ane.zig");
 /// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
 /// consume this must treat 0 as "unknown", never as "tiny machine").
 fn totalMemBytes() u64 {
-    var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
-    return mem;
+    return ane_offload.totalMemBytes();
 }
 
 const ModelConfig = model_mod.ModelConfig;
@@ -7258,9 +7255,13 @@ pub const KVCache = struct {
     fn updateDense(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         const entry = &self.entries[layer];
 
-        // 1. Free stale views — drops refcount on buffer → enables buffer donation
+        // 1. Free stale views — drops refcount on buffer → enables buffer donation.
+        //    Reset the handles at once: a failing op below must not leave freed
+        //    handles for `freeKVEntry` to free again.
         _ = mlx.mlx_array_free(entry.key_view);
         _ = mlx.mlx_array_free(entry.value_view);
+        entry.key_view = mlx.mlx_array_new();
+        entry.value_view = mlx.mlx_array_new();
 
         // 2. Get shape info from new_k: [B, heads, new_len, head_dim]. The V
         //    head dim is read off new_v, NOT new_k: an MLA arch scores over
@@ -7311,8 +7312,6 @@ pub const KVCache = struct {
         else
             0;
 
-        entry.key_view = mlx.mlx_array_new();
-        entry.value_view = mlx.mlx_array_new();
         // buildSliceView takes the whole-buffer shortcut itself (mlx-lm's
         // optimization: no slice when the view covers the buffer) and reads
         // each buffer's own last dim, so K and V may differ in width.
@@ -7461,6 +7460,7 @@ pub const KVCache = struct {
         const su_stop = [_]c_int{ buf_shape[0], buf_shape[1], off_end, buf_shape[3] };
         const su_strides = [_]c_int{ 1, 1, 1, 1 };
         var updated = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(updated);
         try mlx.check(mlx.mlx_slice_update(&updated, buf.*, new_chunk, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
         _ = mlx.mlx_array_free(buf.*);
         buf.* = updated;
@@ -22742,7 +22742,7 @@ pub const Transformer = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, self.s));
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("prefill");
         return out;
     }
 
@@ -22874,52 +22874,13 @@ pub const Transformer = struct {
     /// flattened 1-D to force a row-major materialization (the raw-read
     /// contiguity rule), then one contiguous memcpy.
     fn anePackPlane(self: *Transformer, x_rows: mlx.mlx_array, plane: [*]f16) !void {
-        const sh = mlx.getShape(x_rows); // [1, R, H]
-        const rows = sh[1];
-        const h_dim = sh[2];
-        var x_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_flat);
-        {
-            var x2d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x2d);
-            const shape2 = [_]c_int{ rows, h_dim };
-            try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, self.s));
-            var xt_view = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(xt_view);
-            const perm = [_]c_int{ 1, 0 };
-            try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, self.s));
-            var xf = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(xf);
-            try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, self.s));
-            const flat_shape = [_]c_int{h_dim * rows};
-            try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, self.s));
-        }
-        try mlx.check(mlx.mlx_array_eval(x_flat));
-        const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
-        const count: usize = @intCast(h_dim * rows);
-        @memcpy(plane[0..count], src[0..count]);
+        return ane_offload.packPlane(self.s, x_rows, plane);
     }
 
     /// Read an ANE output plane ([width][R] fp16 channel-major) back as a
     /// [1, R, width] tensor in `dtype`.
     fn aneReadPlane(self: *Transformer, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
-        const t_shape = [_]c_int{ width, rows };
-        // mlx_array_new_data COPIES at construction, so the plane is free
-        // for the next program the moment this returns.
-        const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
-        defer _ = mlx.mlx_array_free(y_f16);
-        var y_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y_t);
-        const perm = [_]c_int{ 1, 0 };
-        try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, self.s));
-        var y_cast = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(y_cast);
-        try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, self.s));
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        const shape3 = [_]c_int{ 1, rows, width };
-        try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, self.s));
-        return out;
+        return ane_offload.readPlane(self.s, plane, width, rows, dtype);
     }
 
     // ── ANE channel-split (A1, MLX_SERVE_ANE_MODE=channel) ──
@@ -22973,27 +22934,12 @@ pub const Transformer = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_add(&out, acc, y_gpu, self.s));
         _ = mlx.mlx_array_free(acc);
-        eng.logEngagedOnce();
+        eng.logEngagedOnce("prefill");
         return out;
     }
 
-    /// Fill every unit's ANE input plane with the same packed hidden. The
-    /// pack is done ONCE and memcpy'd into the other units (~1.7 ms on the
-    /// 27B against a ~20 ms eval); MLX_SERVE_ANE_DUAL_SHARE_INPUT=1 makes
-    /// the units share one surface and skips the copy. The wait for the
-    /// pack stays BLOCKING and on this thread: oMLX measured that moving it
-    /// to a worker, or launching the ANE from the Metal completion
-    /// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
     fn anePackUnitPlanes(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array) !void {
-        const first = eng.units[0].inputBase() orelse return error.AnePlaneMissing;
-        try self.anePackPlane(x, first);
-        if (eng.units.len == 1) return;
-        const count: usize = @as(usize, eng.hidden) * eng.rows;
-        for (eng.units[1..]) |*u| {
-            const plane = u.inputBase() orelse return error.AnePlaneMissing;
-            if (plane == first) continue; // shared surface
-            @memcpy(plane[0..count], first[0..count]);
-        }
+        return ane_offload.packUnitPlanes(self.s, eng, x);
     }
 
     /// GDN projections through explicit weight arrays (the channel rest
@@ -23308,6 +23254,7 @@ pub const Transformer = struct {
                 });
                 return;
             }
+            ane_offload.setCacheLineage("prefill", cfg.num_hidden_layers, hidden, ffn, share);
             const cold_budget: u64 = @as(u64, cfg.num_hidden_layers) * 3 * hidden * eng_ffn * units;
             if (free_disk > 0 and free_disk < cold_budget) {
                 log.info("[ane] internal free disk {d:.1} GB is under a fully-cold build's ~{d:.1} GB compiler-scratch budget — a cold build will converge across boots (warm cache entries are unaffected)\n", .{
@@ -48833,6 +48780,49 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         }
     }
     try testing.expectEqual(n_ops, fired);
+}
+
+test "KVCache dense update: a faulted op leaves no freed view handle in the entry" {
+    // The bar: after any failing op, `deinit` frees each handle the entry holds exactly once.
+    if (!mlxDeviceUsable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const first = testKV(4, s);
+    defer _ = mlx.mlx_array_free(first);
+
+    // 4 more tokens fit the first update's buffer; 300 more take the grow path.
+    var ops = [_]u64{ 0, 0 };
+    for ([_]usize{ 4, 300 }, &ops) |len, *n_ops| {
+        const kv = testKV(len, s);
+        defer _ = mlx.mlx_array_free(kv);
+        {
+            var cache = try KVCache.init(testing.allocator, 1);
+            defer cache.deinit();
+            var dv = try cache.update(0, first, first, s, 0);
+            dv.deinit();
+            const c0 = mlx.op_count.load(.monotonic);
+            var dv2 = try cache.update(0, kv, kv, s, 0);
+            dv2.deinit();
+            n_ops.* = mlx.op_count.load(.monotonic) - c0;
+        }
+
+        var k: u64 = 1;
+        while (k <= n_ops.*) : (k += 1) {
+            var cache = try KVCache.init(testing.allocator, 1);
+            defer cache.deinit();
+            var dv = try cache.update(0, first, first, s, 0);
+            dv.deinit();
+            mlx.fault.arm(k);
+            const r = cache.update(0, kv, kv, s, 0);
+            const did = mlx.fault.didFire();
+            mlx.fault.disarm();
+            try testing.expectError(error.MlxError, r);
+            try testing.expect(did);
+            // The views are built last, K then V: a fault before a view's own build leaves it empty.
+            if (k + 1 < n_ops.*) try testing.expect(cache.entries[0].key_view.ctx == null);
+            if (k < n_ops.*) try testing.expect(cache.entries[0].value_view.ctx == null);
+        }
+    }
+    try testing.expect(ops[0] >= 4 and ops[1] > ops[0]);
 }
 
 test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
