@@ -320,6 +320,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A llama session trim is FALLIBLE on recurrent/hybrid GGUFs** (#286 + #287; `mlx_llama_session_trim` returns 1 = cleared): `llama_memory_seq_rm` refuses a partial tail past the recurrent snapshot window and mutates NOTHING — a trimmed mirror over an untrimmed KV served the PREVIOUS request's tool calls. Cold-prefill on refusal.
 - **A READY model never advertises LESS capability than its stub** (`readyHasChat` counts embedded engines; app `lanAdvertises` tolerates empty caps).
 - **Default bind is 0.0.0.0 and serve mode WARNS** (`server.shouldWarnOpenBind`); flips to 127.0.0.1 in a future release. The app always passes `--host` explicitly.
+- **An embedding SUB-BATCH is its own forward** (`computeEmbeddingsBatch` resets the cache before every sub-batch, not the request): a decoder-arch embedder (Qwen3-Embedding) forwards through the KV cache, so a later sub-batch attended to the earlier rows and answered wrong vectors. Guard: `tests/test_embeddings.sh` [4c].
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 
@@ -429,6 +430,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **A kernel's dtype and its threadgroup BLOCK SIZE are ONE decision** (`gdnBlockTFor`; dtypes off the ARRAY; Metal has no implicit float→bfloat).
 - **Every KV buffer is sized from the OPERAND it stores; a scheme with a shape constraint refuses at LOAD**: K/V widths differ on MLA; TurboQuant needs pow2 → `initWithConfigAndHeadDim` checks `kvCacheKeyHeadDim()`.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object on the error path** — build first, then swap (`KVCache.reinit`). Scan-pinned: no `.cache = try` in transformer/scheduler/main.
+- **A handle freed before a fallible op is reset AT the free** (`updateDense` views, as `updateAffine` does): a write that failed after the free left freed views in the entry for the next `resetCache` to free again (SIGSEGV in `freeKVEntry`). Guard: the `KVCache dense update` fault sweep.
 - **An MLA cache is billed per ATTENTION head** (`kvBytesPerToken`): the latent decompresses to all heads; only an asymmetric config tells the spellings apart.
 - **A gate's LOWER BOUND may REPLACE the formula, not clamp it** (KDA: `g = exp(bound·σ(…))`); two arms means the arm is SELECTED (`kdaUsesBoundedGate`): absent bound = softplus arm, never bound 0. Read the reference KERNEL's arms.
 - **Per-head vs per-channel gating is an INDEXING contract**: one recurrence generated for both (`gdnKernelSource(vectorized, capture_seq)`); other-shape kernels DECLINE; test = per-channel gate held UNIFORM must match the scalar kernel EXACTLY.

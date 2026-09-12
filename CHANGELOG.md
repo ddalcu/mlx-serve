@@ -22,6 +22,7 @@
 ## Fixes
 
 - OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
+- An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
 
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 

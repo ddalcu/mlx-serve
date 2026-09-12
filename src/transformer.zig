@@ -7255,9 +7255,13 @@ pub const KVCache = struct {
     fn updateDense(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         const entry = &self.entries[layer];
 
-        // 1. Free stale views — drops refcount on buffer → enables buffer donation
+        // 1. Free stale views — drops refcount on buffer → enables buffer donation.
+        //    Reset the handles at once: a failing op below must not leave freed
+        //    handles for `freeKVEntry` to free again.
         _ = mlx.mlx_array_free(entry.key_view);
         _ = mlx.mlx_array_free(entry.value_view);
+        entry.key_view = mlx.mlx_array_new();
+        entry.value_view = mlx.mlx_array_new();
 
         // 2. Get shape info from new_k: [B, heads, new_len, head_dim]. The V
         //    head dim is read off new_v, NOT new_k: an MLA arch scores over
@@ -7308,8 +7312,6 @@ pub const KVCache = struct {
         else
             0;
 
-        entry.key_view = mlx.mlx_array_new();
-        entry.value_view = mlx.mlx_array_new();
         // buildSliceView takes the whole-buffer shortcut itself (mlx-lm's
         // optimization: no slice when the view covers the buffer) and reads
         // each buffer's own last dim, so K and V may differ in width.
@@ -7458,6 +7460,7 @@ pub const KVCache = struct {
         const su_stop = [_]c_int{ buf_shape[0], buf_shape[1], off_end, buf_shape[3] };
         const su_strides = [_]c_int{ 1, 1, 1, 1 };
         var updated = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(updated);
         try mlx.check(mlx.mlx_slice_update(&updated, buf.*, new_chunk, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
         _ = mlx.mlx_array_free(buf.*);
         buf.* = updated;
@@ -48777,6 +48780,49 @@ test "growQuantBuf else-arm: a faulted zeros leaves the old buffer owned (no dou
         }
     }
     try testing.expectEqual(n_ops, fired);
+}
+
+test "KVCache dense update: a faulted op leaves no freed view handle in the entry" {
+    // The bar: after any failing op, `deinit` frees each handle the entry holds exactly once.
+    if (!mlxDeviceUsable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const first = testKV(4, s);
+    defer _ = mlx.mlx_array_free(first);
+
+    // 4 more tokens fit the first update's buffer; 300 more take the grow path.
+    var ops = [_]u64{ 0, 0 };
+    for ([_]usize{ 4, 300 }, &ops) |len, *n_ops| {
+        const kv = testKV(len, s);
+        defer _ = mlx.mlx_array_free(kv);
+        {
+            var cache = try KVCache.init(testing.allocator, 1);
+            defer cache.deinit();
+            var dv = try cache.update(0, first, first, s, 0);
+            dv.deinit();
+            const c0 = mlx.op_count.load(.monotonic);
+            var dv2 = try cache.update(0, kv, kv, s, 0);
+            dv2.deinit();
+            n_ops.* = mlx.op_count.load(.monotonic) - c0;
+        }
+
+        var k: u64 = 1;
+        while (k <= n_ops.*) : (k += 1) {
+            var cache = try KVCache.init(testing.allocator, 1);
+            defer cache.deinit();
+            var dv = try cache.update(0, first, first, s, 0);
+            dv.deinit();
+            mlx.fault.arm(k);
+            const r = cache.update(0, kv, kv, s, 0);
+            const did = mlx.fault.didFire();
+            mlx.fault.disarm();
+            try testing.expectError(error.MlxError, r);
+            try testing.expect(did);
+            // The views are built last, K then V: a fault before a view's own build leaves it empty.
+            if (k + 1 < n_ops.*) try testing.expect(cache.entries[0].key_view.ctx == null);
+            if (k < n_ops.*) try testing.expect(cache.entries[0].value_view.ctx == null);
+        }
+    }
+    try testing.expect(ops[0] >= 4 and ops[1] > ops[0]);
 }
 
 test "mlx check fault injection: the ownership shape releases its array on every faulted op" {
