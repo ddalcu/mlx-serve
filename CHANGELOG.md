@@ -28,6 +28,10 @@
 - OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
 - An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
 
+### Fixes
+
+- "Auto-start on launch" loaded a model at login. The checkbox passed `--model`, which the server treats as an eager, blocking load, so a setting that promised a running server read the whole selected checkpoint — tens of gigabytes — off disk before anything was asked of it (#214, thanks @Fe2-O3). Auto-start now brings the server up with no model resident and the first message loads one on demand. Loading at start is its own setting in Settings > Server, off by default including for upgrading users, with a choice between the last model used (resolved at start, so it keeps up as you switch) and one you pin. A pinned model that has since been uninstalled starts headless rather than substituting one you did not choose, sharing your models over the LAN no longer forces the load either, and the tray's Start button follows the same setting — so a server you start by hand — from the tray or from the chat window — can sit with nothing resident. Turning the setting back on restores a model loading with the server, at login and from the tray; either way it now loads on demand rather than as the server's launch model, so ejecting it sticks instead of reloading on the next request.
+
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
 ### Highlights
