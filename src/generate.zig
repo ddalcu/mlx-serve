@@ -5770,7 +5770,6 @@ pub const Generator = struct {
         return try mtpSerialOneToken(allocator, token);
     }
 
-
     /// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
     /// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
     /// three verify outputs, `mtpRoundFinish` consumes them.
@@ -6616,7 +6615,6 @@ pub const Generator = struct {
             .accepted_tokens = accepted,
         };
     }
-
 
     // ── MTP adaptive depth ──
     // Unlike the drafter's binary gate, the MTP head has a useful fallback

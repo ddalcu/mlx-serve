@@ -625,13 +625,6 @@ enum ServerEngine: String, CaseIterable {
     }
 }
 
-/// What the server's measured spec-decode cost model resolved for this load
-/// (`/props` `"spec_cost"`, absent when `MLX_SERVE_SPEC_COST_PROBE=0` or the
-/// probe declined — then the per-silicon tables applied instead).
-///
-/// The Settings picker shows this beside "Automatic" rather than offering a
-/// second "Probe" entry: a user cannot choose between "Automatic" and "Probe"
-/// without benchmarking, but they can read what Automatic landed on.
 /// The `/props` "batching" object: does the loaded model share one decode
 /// forward across concurrent requests, and why not when it does not.
 struct BatchingInfo: Equatable {
@@ -660,6 +653,13 @@ struct BatchingInfo: Equatable {
     }
 }
 
+/// What the server's measured spec-decode cost model resolved for this load
+/// (`/props` `"spec_cost"`, absent when `MLX_SERVE_SPEC_COST_PROBE=0` or the
+/// probe declined — then the per-silicon tables applied instead).
+///
+/// The Settings picker shows this beside "Automatic" rather than offering a
+/// second "Probe" entry: a user cannot choose between "Automatic" and "Probe"
+/// without benchmarking, but they can read what Automatic landed on.
 struct SpecCostInfo: Equatable {
     var mtpDepthCap: Int
     var widths: [Int]

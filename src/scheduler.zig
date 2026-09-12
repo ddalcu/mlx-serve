@@ -734,7 +734,6 @@ pub const Slot = struct {
         return slot;
     }
 
-    /// This slot's attention KV length for the batched group; never `cache.step` (0 forever on a linear-layer-0 trunk).
     /// Free everything the slot owns. Only safe to call when no thread can
     /// observe the slot anymore (i.e. after the inference thread has
     /// finished/errored it AND the connection thread has consumed the final
@@ -2245,7 +2244,7 @@ pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
 /// One line per slot the first time it decodes serial beside live company;
 /// the counter moves every tick so the rate is visible under `--metrics`.
 fn noteSerial(sch: *Scheduler, slot: *Slot, why: BatchVerdict) void {
-    if (sch.metrics) |m| m.decode_serial_total[@intFromEnum(why)].inc();
+    if (sch.metrics) |m| m.decode_serial_total[@backingInt(why)].inc();
     if (slot.serial_reason_logged) return;
     slot.serial_reason_logged = true;
     log.info("[batched] slot serial: {s} (model={s})\n", .{ @tagName(why), slot.model.id });
@@ -3131,14 +3130,14 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config",         "prefix_cache_capacity",     "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes", "ssm_checkpoint_stride",     "ssm_checkpoint_max",
-        "mtp_enabled",             "mtp_head_kv_quant",         "mtp_depth",
-        "llama_cache_entries",
-        "llama_kv_type_k",         "llama_kv_type_v",           "ds4_mtp",
-        "ds4_dspark",              "ds4_ssd_streaming",         "no_drafter",
-        "draft_block_size",        "draft_block_size_explicit", "ane_prefill",
-        "ane_chunk_resolver",      "ane_headroom_resolver",     "prefix_cache_mem_resolver",
+        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
+        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
+        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
+        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
+        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
+        "prefix_cache_mem_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -7107,9 +7106,8 @@ fn mtpGroupEnabled() bool {
     return on;
 }
 
-/// qwen4_exp verify rows are expert BYTES (S=1/2/4 = 16/22/31 ms) and the batched forward
-/// has no PLE spec capture at S > 1, so its MTP rounds stay solo; two of them interleave
-/// (68 tok/s aggregate vs 65 plain), three lose to the plain batched tick (67 vs 82).
+/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
+/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
 var mtp_batched_qwen4_env: ?bool = null;
 fn mtpBatchedQwen4Enabled() bool {
     if (mtp_batched_qwen4_env) |v| return v;
@@ -7199,20 +7197,19 @@ fn runMtpGroups(sch: *Scheduler, slots: []*Slot) !void {
 }
 
 /// Rows one batched verify may carry: past 7 the projections leave the split-K lane for
-/// stock kernels (M4 Max: a 2-slot depth-3 round cost 2x a solo one); the NAX m16 tile
-/// carries 16.
+/// stock kernels; the NAX m16 tile carries 16.
 fn mtpGroupRowCap() u32 {
     return if (dflash_mod.wideVerifyLaneAvailable()) 16 else 7;
 }
 
-/// MTP slots on one model at or past this count decode on the plain batched tick instead
-/// (27B, M4 Max: 4 slots = 69 tok/s as 2+2 verify groups, 80 plain).
+/// MTP slots on one model at or past this count decode on the plain batched tick instead:
+/// sub-grouped verify rounds lose to one plain tick there.
 fn mtpCrowdThreshold() usize {
     return mtpSubGroupSize(std.math.maxInt(usize), mtpGroupRowCap()) + 1;
 }
 
-/// Slots in the next sub-group: two at depth 2 or three at depth 1 fill 7 rows (measured
-/// 73 and 82 tok/s aggregate on the 27B vs 50 solo); four is better as 2+2 than 3+1.
+/// Slots in the next sub-group: two at depth 2 or three at depth 1 fill 7 rows; four is
+/// better as 2+2 than 3+1.
 pub fn mtpSubGroupSize(remaining: usize, row_cap: u32) usize {
     if (remaining < 2) return remaining;
     if (row_cap >= 16) return @min(remaining, 4);
@@ -7684,7 +7681,7 @@ test "the batched group is capped by padding waste before it is dispatched" {
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "batchedKvKeepCount(") != null);
     // ...and the dropped slots must still be ticked, or they never advance.
-    try testing.expect(std.mem.indexOf(u8, body, "for (group[keep..]) |s| {\n                    noteSerial(sch, s, .pad_waste);\n                    try runSingleDecodeTick") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {

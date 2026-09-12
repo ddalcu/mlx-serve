@@ -4831,8 +4831,9 @@ group thins. Flash Next's head kept per-request state on the module
 (`Qwen4Mtp.cache/entry/seq_offset/...`), which is why its MTP slot was
 exclusive and a second user queued; the state is now a per-request
 `Qwen4MtpState` swapped onto the module before every head touch
-(`qwen4MtpActivate`). Its verify rows are expert bytes, so its rounds stay solo
-(two interleave, three go plain). Bars: `tests/test_mtp_batched.sh` (fixed
+(`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
+better than solo rounds, so it stays opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
+solo, two interleave, three go plain. Bars: `tests/test_mtp_batched.sh` (fixed
 depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
 `tests/bench_concurrency_ladder.sh` (the numbers).
 
