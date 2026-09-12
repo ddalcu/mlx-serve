@@ -192,6 +192,8 @@ class ServerManager: ObservableObject {
         status = .starting
         lastError = ""
         chatDefaultEnsured = false
+        crashCount = 0
+        lastCrashDate = nil
         clearServerLog()
 
         // Reap orphaned mlx-serve processes still bound to our port (e.g. left
@@ -373,9 +375,13 @@ class ServerManager: ObservableObject {
     /// memory branches of `summarizeCrash`; drives the "here's what's using
     /// memory" advice in the crash alert. Pure + testable.
     nonisolated static func isMemoryFailure(_ log: String) -> Bool {
-        if log.contains("Insufficient memory to load model") { return true }
-        return log.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
-            || (log.contains("[METAL]") && log.localizedCaseInsensitiveContains("Insufficient Memory"))
+        let lines = log.split(whereSeparator: \.isNewline).map(String.init)
+            .filter { !isRequestPreviewLine($0) }
+        return lines.contains { $0.contains("Insufficient memory to load model") }
+            || lines.contains {
+                $0.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+                    || ($0.contains("[METAL]") && $0.localizedCaseInsensitiveContains("Insufficient Memory"))
+            }
     }
 
     private func handleTermination(exitCode: Int32) {
@@ -628,7 +634,7 @@ class ServerManager: ObservableObject {
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       json["status"] as? String == "ok" else { return }
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
+                    guard let self, self.process != nil else { return }
                     if self.status != .running {
                         self.transitionToRunning()
                     }

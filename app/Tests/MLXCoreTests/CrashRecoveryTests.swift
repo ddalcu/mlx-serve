@@ -39,12 +39,20 @@ final class CrashRecoveryTests: XCTestCase {
         XCTAssertFalse(decision, "OOM will recur immediately — don't retry")
     }
 
-    func testNoAutoRestartAfterMaxRetries() {
+    func testAutoRestartAtExactMaxRetries() {
         let decision = CrashRecovery.shouldAutoRestart(
             mode: .autoRestart, wasRunning: true, exitCode: 9,
             isMemoryFailure: false, crashCount: 3, maxRetries: 3
         )
-        XCTAssertFalse(decision, "exhausted retries → fall back to modal")
+        XCTAssertTrue(decision, "crashCount == maxRetries → still restarts (3rd attempt)")
+    }
+
+    func testNoAutoRestartPastMaxRetries() {
+        let decision = CrashRecovery.shouldAutoRestart(
+            mode: .autoRestart, wasRunning: true, exitCode: 9,
+            isMemoryFailure: false, crashCount: 4, maxRetries: 3
+        )
+        XCTAssertFalse(decision, "crashCount > maxRetries → fall back to modal")
     }
 
     func testNoAutoRestartWhenServerWasNotRunning() {
@@ -97,5 +105,21 @@ final class CrashRecoveryTests: XCTestCase {
 
     func testNilLastCrashTreatedAsExpired() {
         XCTAssertTrue(CrashRecovery.crashWindowExpired(lastCrash: nil, window: 300))
+    }
+
+    // MARK: - isMemoryFailure (preview-line filtering)
+
+    func testMemoryFailureIgnoresRequestPreviewLines() {
+        let log = """
+        > "Insufficient memory to load model in the prompt"
+        some normal log line
+        """
+        XCTAssertFalse(ServerManager.isMemoryFailure(log),
+                       "A preview line matching OOM needles must not suppress auto-restart")
+    }
+
+    func testMemoryFailureDetectsRealOOM() {
+        let log = "Insufficient memory to load model"
+        XCTAssertTrue(ServerManager.isMemoryFailure(log))
     }
 }

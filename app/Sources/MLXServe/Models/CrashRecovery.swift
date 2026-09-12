@@ -21,6 +21,16 @@ enum CrashRecoveryMode: String, Codable, CaseIterable, Identifiable {
 
     static let defaultMode: CrashRecoveryMode = .ask
     static let defaultsKey = "crashRecoveryMode"
+
+    /// Clear the persisted mode when a server or all-settings reset applies.
+    static func resetIfApplicable(_ selection: SettingsSelection) {
+        switch selection {
+        case .all, .category(.server):
+            UserDefaults.standard.removeObject(forKey: defaultsKey)
+        default:
+            break
+        }
+    }
 }
 
 /// Pure decision logic for crash recovery — no side effects, fully testable.
@@ -42,7 +52,7 @@ enum CrashRecovery {
         guard wasRunning else { return false }
         guard exitCode != 0 else { return false }
         guard !isMemoryFailure else { return false }
-        guard crashCount < maxRetries else { return false }
+        guard crashCount <= maxRetries else { return false }
         return true
     }
 

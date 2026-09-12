@@ -375,6 +375,7 @@ private struct ResetDefaultsFooter: View {
                 ) {
                     Button("Reset", role: .destructive) {
                         appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                        CrashRecoveryMode.resetIfApplicable(selection)
                     }
                     .keyboardShortcut(.defaultAction)
                     Button("Cancel", role: .cancel) { }
