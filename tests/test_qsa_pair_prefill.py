@@ -12,6 +12,7 @@ p.add_argument('--model', default='ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit')
 p.add_argument('--log', type=Path, required=True)
 p.add_argument('--pair', choices=('on', 'off'), required=True)
 p.add_argument('--hc', choices=('on', 'off'))
+p.add_argument('--gdn', choices=('on', 'off'))
 p.add_argument('--first-chunk', action='store_true')
 args = p.parse_args()
 log_offset = args.log.stat().st_size if args.log.exists() else 0
@@ -48,4 +49,8 @@ if args.hc == 'on':
     assert '[hc-prefill] engaged:' in log, 'Missing HC prefill engagement'
 if args.hc == 'off':
     assert '[hc-prefill] engaged:' not in log
+if args.gdn == 'on':
+    assert re.search(r'\[gdn-prefill\] engaged: S=8192 B=1 cold=true', log), 'Missing cold GDN prefill engagement'
+if args.gdn == 'off':
+    assert '[gdn-prefill] engaged:' not in log
 print('PASS: long prefill answers and expected QSA arm')

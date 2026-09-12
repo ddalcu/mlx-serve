@@ -22267,12 +22267,22 @@ pub const Transformer = struct {
         var g_fused: ?mlx.mlx_array = null;
         var beta_fused: ?mlx.mlx_array = null;
 
-        // Packed prework mixer at decode + verify widths (S 1..9): one launch
-        // for conv + SiLU + split + Q/K norm-and-scale + next conv state +
-        // gate + beta. The per-channel (KDA) gate never lands here — its
-        // q/k/v layout is the same but the composed path is what its parity
-        // tests pin; the bounded-sigmoid gate arm is composed too.
-        if (!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and batch * seq_len <= GDN_FUSED_MAX_ROWS and kernel == 4 and ssm.initialized) blk: {
+        // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
+        const prefill_fused = cfg.longCtxGated() and is_prefill and gdnPrefillFusedFor(seq_len, batch);
+        if (!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and
+            (batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
+            kernel == 4 and (ssm.initialized or prefill_fused))
+        blk: {
+            var zero_conv = mlx.mlx_array{ .ctx = null };
+            defer if (zero_conv.ctx != null) {
+                _ = mlx.mlx_array_free(zero_conv);
+            };
+            const cold = !ssm.initialized;
+            if (cold) {
+                zero_conv = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_zeros(&zero_conv, &[_]c_int{ batch, 3, conv_dim }, 3, .bfloat16, self.s));
+            }
+            const incoming_conv = if (cold) zero_conv else ssm.conv_state;
             const pre = (gdnPreworkFused(self.s, .{
                 .qkv = qkv,
                 .qkv_off = 0,
@@ -22285,7 +22295,7 @@ pub const Transformer = struct {
                 .a_stride = num_v_heads,
                 .A_log = la.A_log,
                 .dt_bias = la.dt_bias,
-                .conv_state = ssm.conv_state,
+                .conv_state = incoming_conv,
                 .conv_w = la.conv1d_w,
                 .q_scale = inv_scale_sq,
                 .k_scale = inv_sqrt_sc,
@@ -22299,7 +22309,7 @@ pub const Transformer = struct {
             // Spec-capture rollback slices the conv INPUT; build the concat
             // the composed path would have stashed (lazy, one launch).
             if (self.spec_capture_ssm) {
-                const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
+                const arr = [_]mlx.mlx_array{ incoming_conv, qkv };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 defer _ = mlx.mlx_vector_array_free(vec);
                 if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
@@ -22316,9 +22326,14 @@ pub const Transformer = struct {
                     break :blk;
                 };
             }
-            if (diagEnvOn("QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, ssm.conv_state, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
+            if (diagEnvOn("QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = pre.conv_state;
+            ssm.initialized = true;
+            if (prefill_fused and seq_len >= 512 and !gdn_prefill_engaged) {
+                gdn_prefill_engaged = true;
+                log.info("[gdn-prefill] engaged: S={d} B={d} cold={}\n", .{ seq_len, batch, cold });
+            }
             _ = mlx.mlx_array_free(q_scaled);
             _ = mlx.mlx_array_free(k_scaled);
             _ = mlx.mlx_array_free(v_heads);
@@ -28382,8 +28397,10 @@ const GDN_PREWORK_SOURCE =
     \\    }
     \\    const T conv = T(acc);
     \\    // MLX's unary Sigmoid formula (unary_ops.h), verbatim, in the tensor dtype.
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-    \\    const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+    \\    T sig;
+    \\    if constexpr (S >= 17) sig = sigtab[as_type<ushort>(conv)];
+    \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); sig = conv < T(0) ? sy : T(1) - sy; }
+    \\    const T act = conv * sig;
     \\    activated[i] = act;
     \\    float value = float(act);
     \\    sumsq += value * value;
@@ -28414,8 +28431,10 @@ const GDN_PREWORK_SOURCE =
     \\        // softplus(a + dt_bias)) with the compiled chain's own casts:
     \\        // bf16 add, f32 precise exp / log1p / exp, bf16 store.
     \\        const T bv = b_in[row * uint(BSTRIDE) + uint(BOFF) + head];
-    \\        T by = T(1) / (T(1) + metal::exp(metal::abs(bv)));
-    \\        beta_out[row * uint(HV) + head] = (bv < T(0)) ? by : T(1) - by;
+    \\        T bsig;
+    \\        if constexpr (S >= 17) bsig = sigtab[as_type<ushort>(bv)];
+    \\        else { T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); bsig = bv < T(0) ? by : T(1) - by; }
+    \\        beta_out[row * uint(HV) + head] = bsig;
     \\        const T apd = T(float(a_in[row * uint(ASTRIDE) + uint(AOFF) + head]) + float(dt_bias[head]));
     \\        float sp = msv_log1p(metal::precise::exp(float(apd)));
     \\        float ea = metal::precise::exp(float(A_log[head]));
@@ -28472,7 +28491,7 @@ pub fn gdnDecodeFusedEnabled() bool {
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_prework_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias" };
+    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab" };
     const output_names = [_][*:0]const u8{ "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -28507,6 +28526,16 @@ pub const GdnPrework = struct {
 /// Rows (batch*seq) the decode-width GDN fusions serve.
 pub const GDN_FUSED_MAX_ROWS: c_int = 16;
 
+var gdn_prefill_fused_override: ?bool = null;
+var gdn_prefill_engaged = false;
+
+fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
+    if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@as(c_int, 8192), batch)) return false;
+    if (gdn_prefill_fused_override) |on| return on;
+    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED") orelse return false;
+    return std.mem.eql(u8, std.mem.span(raw), "1");
+}
+
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
 /// per row, so they may all alias one folded in_proj output.
 pub const GdnPreworkArgs = struct {
@@ -28539,7 +28568,7 @@ pub const GdnPreworkArgs = struct {
 /// installs `conv_state` into the SSM cache entry).
 pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     if (!gdnPreworkEnabled()) return null;
-    if (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS) return null;
+    if (!gdnPrefillFusedFor(in.seq, in.batch) and (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS)) return null;
     if (in.seq < 3 and !gdnDecodeFusedEnabled()) return null;
     if (in.dk != 128 or in.dv != 128) return null;
     inline for (.{ in.qkv, in.b, in.a, in.conv_state, in.conv_w, in.dt_bias }) |arr| {
@@ -28582,7 +28611,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     }
 
     const kernel = try getGdnPreworkKernel();
-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias };
+    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try @import("hc_prefill.zig").sigmoidTable(s) else in.qkv };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -28638,8 +28667,9 @@ const GDN_NORMGATE_SOURCE =
     \\for (uint i = 0; i < 4; ++i) {
     \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
     \\    const T zv = z[zbase + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv)));
-    \\    const T sig = (zv < T(0)) ? sy : T(1) - sy;
+    \\    T sig;
+    \\    if constexpr (S >= 17) sig = sigtab[as_type<ushort>(zv)];
+    \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); sig = zv < T(0) ? sy : T(1) - sy; }
     \\    // swish gate: silu(z) * normed (qwen3.5); sigmoid gate: normed * sigmoid(z) (qwen4_exp, KDA)
     \\    out[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
     \\}
@@ -28654,7 +28684,7 @@ var gdn_normgate_cfg_key: GdnNormGateCfgKey = std.mem.zeroes(GdnNormGateCfgKey);
 
 fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_normgate_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "y", "z", "norm_w", "eps" };
+    const input_names = [_][*:0]const u8{ "y", "z", "norm_w", "eps", "sigtab" };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -28682,7 +28712,8 @@ pub fn gdnNormGateFused(
     seq: c_int,
 ) !?mlx.mlx_array {
     if (!gdnDecodeFusedEnabled()) return null;
-    if (dv != 128 or seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS) return null;
+    if (dv != 128) return null;
+    if (!gdnPrefillFusedFor(seq, batch) and (seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if (mlx.mlx_array_dtype(arr) != .bfloat16) {
             if (!gdn_normgate_declined) {
@@ -28710,14 +28741,14 @@ pub fn gdnNormGateFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off } };
+        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "S", seq } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
         gdn_normgate_cfg = config;
         gdn_normgate_cfg_key = key;
     }
     const kernel = try getGdnNormGateKernel();
-    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps };
+    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (seq >= 17) try @import("hc_prefill.zig").sigmoidTable(s) else y };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -46006,8 +46037,10 @@ test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided pos
     }
 }
 
-test "gdn packed prework: bit-identical to the composed chain at S 1..9 incl. gate/beta + folded layout (+ decline gates)" {
+test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
     const s = mlx.gpuStream();
+    gdn_prefill_fused_override = true;
+    defer gdn_prefill_fused_override = null;
     gdn_prework_override = true;
     defer gdn_prework_override = null;
     gdn_decode_fused_override = true;
@@ -46037,12 +46070,16 @@ test "gdn packed prework: bit-identical to the composed chain at S 1..9 incl. ga
     const dt_bias = try attn256RandBf16(rnd, &hv_shape, s);
     defer _ = mlx.mlx_array_free(dt_bias);
 
-    for ([_]c_int{ 1, 2, 3, 5, 9 }) |seq| {
+    for ([_]c_int{ 1, 2, 3, 5, 9, 17, 65, 513 }) |seq| {
         const qkv_shape = [_]c_int{ 1, seq, c_dim };
         const qkv = try attn256RandBf16(rnd, &qkv_shape, s);
         defer _ = mlx.mlx_array_free(qkv);
         const st_shape = [_]c_int{ 1, 3, c_dim };
-        const conv_state = try attn256RandBf16(rnd, &st_shape, s);
+        const conv_state = if (seq == 17) blk: {
+            var zero = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&zero, &st_shape, 3, .bfloat16, s));
+            break :blk zero;
+        } else try attn256RandBf16(rnd, &st_shape, s);
         defer _ = mlx.mlx_array_free(conv_state);
         const w_shape = [_]c_int{ c_dim, 4, 1 };
         const conv_w = try attn256RandBf16(rnd, &w_shape, s);
@@ -46204,7 +46241,7 @@ test "gdn packed prework: bit-identical to the composed chain at S 1..9 incl. ga
         // Batched arm (B=2 merged slots): row 0 of the batched outputs is
         // bit-identical to the single-batch outputs above; row 1 to a
         // second slot's own single-batch run.
-        if (seq <= 8) {
+        if (seq <= 8 or seq == 65) {
             const qkv_b = try attn256RandBf16(rnd, &qkv_shape, s);
             defer _ = mlx.mlx_array_free(qkv_b);
             const st_b = try attn256RandBf16(rnd, &st_shape, s);
@@ -46318,8 +46355,10 @@ test "gdn packed prework: bit-identical to the composed chain at S 1..9 incl. ga
     }
 }
 
-test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at S 1..9, z at a folded offset" {
+test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and prefill widths, z at a folded offset" {
     const s = mlx.gpuStream();
+    gdn_prefill_fused_override = true;
+    defer gdn_prefill_fused_override = null;
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x9A7E);
@@ -46334,7 +46373,7 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at S 1..9, z 
     const eps_arr = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    for ([_]c_int{ 1, 4, 9 }) |seq| {
+    for ([_]c_int{ 1, 4, 9, 17, 65, 513 }) |seq| {
         const y_shape = [_]c_int{ 1, seq, hv, dv };
         const y = try attn256RandBf16Scaled(rnd, &y_shape, 8.0, s);
         defer _ = mlx.mlx_array_free(y);

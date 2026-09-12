@@ -96,7 +96,7 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, iw: mlx.mlx_a
     return .{ .normalized = normalized, .raw_inject = raw, .stream = stream };
 }
 
-fn getSigmoid(s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
     if (sigmoid_table) |table| return table;
     var bits: [65536]u16 = undefined;
     for (&bits, 0..) |*v, i| v.* = @intCast(i);
@@ -122,7 +122,7 @@ pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batc
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", batch * seq));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", 2560));
-    const ins = mlx.mlx_vector_array_new_data(&.{ up, normalized, try getSigmoid(s) }, 3);
+    const ins = mlx.mlx_vector_array_new_data(&.{ up, normalized, try sigmoidTable(s) }, 3);
     defer _ = mlx.mlx_vector_array_free(ins);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
