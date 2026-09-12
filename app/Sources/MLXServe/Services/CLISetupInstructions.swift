@@ -86,21 +86,32 @@ enum CLISetupInstructions {
                 if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
                 opencode2 --model mlx/\(servedModelId)
                 """),
-            // codex honors CODEX_HOME for its whole config tree; the dir must
-            // exist before codex runs. Responses wire API — our /v1/responses.
-            // The resolver line also finds the CLI the ChatGPT/Codex desktop
-            // app bundles, for installs with no codex on PATH.
+            // codex settings ride the generated `--profile mlx-serve` layer
+            // inside the user's own Codex home (the dir is created if
+            // missing); the user's config.toml is never written. Responses
+            // wire API — our /v1/responses. The resolver line also finds the
+            // CLI the ChatGPT/Codex desktop app bundles, for installs with no
+            // codex on PATH.
             Tab(id: "codex",
                 title: "Codex",
                 installHint: "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it",
                 command: """
-                mkdir -p ~/.mlx-serve/codex
-                cat > ~/.mlx-serve/codex/config.toml <<'EOF'
-                \(AgentConfigs.codexConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget))
+                CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+                mkdir -p "$CODEX_HOME"
+                MLX_TRUSTS=$(grep -A1 '^\\[projects\\.' "$CODEX_HOME/mlx-serve.config.toml" 2>/dev/null)
+                cat > "$CODEX_HOME/mlx-serve.config.toml" <<EOF
+                model = "\(servedModelId)"
+                model_provider = "mlx"
+                model_context_window = \(budget.context)
+
+                [model_providers.mlx]
+                name = "MLX Serve (local)"
+                base_url = "\(baseURL)/v1"
+                wire_api = "responses"
+                $MLX_TRUSTS
                 EOF
-                export CODEX_HOME="$HOME/.mlx-serve/codex"
                 \(AgentConfigs.codexBinResolver)
-                "$CODEX_BIN"
+                "$CODEX_BIN" --profile mlx-serve
                 """),
             // hermes reads its whole tree from HERMES_HOME; the .env is the
             // first-run wizard kill switch (OPENAI_BASE_URL set = configured).

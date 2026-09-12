@@ -32,7 +32,7 @@ mlx-serve launch codex -- resume     # everything after -- goes to the agent
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours). Codex is the exception: it launches against your real Codex home so MCP servers, plugins, and auth work — see [Codex](#codex).
 
 ## Coding agents (manual setup)
 
@@ -147,15 +147,16 @@ opencode2 --model mlx/MODEL_ID
 
 ### Codex
 
-Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. `CODEX_HOME` relocates its whole config tree (the folder must exist before codex runs). No key setup: with no `env_key` configured, codex skips the login screen.
+Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve does NOT relocate your config: your real Codex home (`${CODEX_HOME:-$HOME/.codex}`) is used as-is, so your MCP servers, plugins, auth, and project trusts all work. mlx-serve writes only a generated `mlx-serve.config.toml` there (its managed keys are rewritten on every launch, but the `[projects.*]` trust entries codex persists into that file survive — put other personal settings in `config.toml`) and launches codex with `--profile mlx-serve`, the file that `--profile NAME` layers over your `config.toml`. No key setup: with no `env_key` configured, codex skips the login screen.
 
 No `codex` on PATH but you have the ChatGPT desktop app? It bundles the CLI at `/Applications/ChatGPT.app/Contents/Resources/codex` (the launchers find it there automatically; `mlx-serve launch chatgpt` works too).
 
-Codex will print `Model metadata for <id> not found. Defaulting to fallback metadata` on every turn. That's its internal catalog of OpenAI model ids and it fires for any custom provider's model; it's cosmetic. The part that matters, the context window, comes from `model_context_window` in the config above, which overrides the fallback.
+Codex will print `Model metadata for <id> not found. Defaulting to fallback metadata` on every turn. That's its internal catalog of OpenAI model ids and it fires for any custom provider's model; it's cosmetic. The part that matters, the context window, comes from `model_context_window` in the profile below, which overrides the fallback.
 
 ```bash
-mkdir -p ~/.mlx-serve/codex
-cat > ~/.mlx-serve/codex/config.toml <<'EOF'
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$CODEX_HOME"
+cat > "$CODEX_HOME/mlx-serve.config.toml" <<'EOF'
 model = "MODEL_ID"
 model_provider = "mlx"
 model_context_window = CTX
@@ -165,8 +166,7 @@ name = "MLX Serve (local)"
 base_url = "http://127.0.0.1:11234/v1"
 wire_api = "responses"
 EOF
-export CODEX_HOME="$HOME/.mlx-serve/codex"
-codex
+codex --profile mlx-serve
 ```
 
 ### Hermes
