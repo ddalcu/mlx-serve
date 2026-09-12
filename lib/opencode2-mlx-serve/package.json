@@ -1,0 +1,32 @@
+{
+  "name": "opencode2-mlx-serve",
+  "version": "0.2.0",
+  "description": "OpenCode 2 CLI plugin: live mlx-serve stats in the session sidebar and a turn speed meter in the prompt footer",
+  "license": "MIT",
+  "author": "Theinruj Toranavikrai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/beamivalice/opencode2-mlx-serve.git"
+  },
+  "homepage": "https://github.com/beamivalice/opencode2-mlx-serve#readme",
+  "bugs": "https://github.com/beamivalice/opencode2-mlx-serve/issues",
+  "keywords": ["opencode", "opencode2", "mlx-serve", "mlx", "plugin", "tui", "metrics"],
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
+  },
+  "scripts": {
+    "test": "node --test",
+    "probe": "node probe-live.ts"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.8",
+    "@opentui/solid": ">=0.5.8",
+    "solid-js": ">=1.9.0"
+  }
+}

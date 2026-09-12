@@ -321,6 +321,18 @@ head requantization uses our existing per-weight quantization path, and the
 crossrow kernel is emitted by comptime codegen with our own host dispatch
 (paired input groups instead of their idle-odd-threadgroup reuse).
 
+--------------------------------------------------------------------------------
+opencode2-mlx-serve
+https://github.com/beamivalice/opencode2-mlx-serve
+Copyright (c) 2026 Theinruj Toranavikrai
+Licensed under the MIT License.
+
+Vendored in full at `lib/opencode2-mlx-serve`: the OpenCode 2 monitor plugin
+that `mlx-serve launch opencode2` installs (session sidebar stats and the
+prompt-footer turn meter). Its sources are embedded into the mlx-serve binary
+by `lib/opencode2_plugin.zig` and copied into the app bundle by
+`app/build.sh`.
+
 
 ================================================================================
 Other licenses

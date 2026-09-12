@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. The opencode2 monitor plugin is VENDORED first-party at `lib/opencode2-mlx-serve` (plain tracked files, not a submodule; embedded by `lib/opencode2_plugin.zig`). Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -22,7 +22,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 |---|---|
 | `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
 | `cli.zig` | Ollama-grade CLI: alias → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
-| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider): reads `/v1/models` (models + ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, starts the app if the server is down. Swift `CLILauncher`+`AgentConfigs` is the twin (omp `PI_CODING_AGENT_DIR`, codex Responses-only `CODEX_HOME`, hermes `HERMES_HOME`; opencode2 `XDG_CONFIG_HOME` + monitor plugin) |
+| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider): reads `/v1/models` (models + ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, starts the app if the server is down. Swift `CLILauncher`+`AgentConfigs` is the twin (omp `PI_CODING_AGENT_DIR`, codex Responses-only `CODEX_HOME`, hermes `HERMES_HOME`; opencode2 `XDG_CONFIG_HOME` + the monitor plugin vendored at `lib/opencode2-mlx-serve`) |
 | `mlx.zig` | mlx-c FFI |
 | `model.zig` | Config parse + safetensors loading |
 | `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |
