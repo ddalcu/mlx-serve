@@ -444,7 +444,55 @@ pub const NgramTable = struct {
             }
             if (start >= row_ids.len) return;
         };
+        const nthr = parThreads();
+        if (nthr > 1 and row_ids.len >= 1024) {
+            var pctx: ParCtx = .{ .table = self, .rows = row_ids, .out = out, .next = std.atomic.Value(usize).init(0) };
+            var th: [64]std.Thread = undefined;
+            const want = @min(nthr, 64);
+            var started: usize = 0;
+            while (started < want) : (started += 1) {
+                th[started] = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, parWorker, .{&pctx}) catch break;
+            }
+            if (started > 0) {
+                parWorker(&pctx);
+                for (th[0..started]) |t| t.join();
+                return;
+            }
+        }
         for (row_ids, 0..) |r, i| self.row(@intCast(r), out[i * self.dim ..][0..self.dim]);
+    }
+
+    /// EXPERIMENT (QWEN4_PLE_PAR, default 1 = today's serial path). A prefill
+    /// chunk gathers 65k rows x 3 sites; the serial loop takes every fault by
+    /// itself. Spreading the same faults over threads overlaps them.
+    fn parThreads() u32 {
+        if (ple_par_override) |v| return v;
+        const S = struct {
+            var v: ?u32 = null;
+        };
+        if (S.v) |v| return v;
+        var v: u32 = 1;
+        if (std.c.getenv("QWEN4_PLE_PAR")) |raw| v = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch 1;
+        S.v = v;
+        return v;
+    }
+
+    const ParCtx = struct {
+        table: *const NgramTable,
+        rows: []const i64,
+        out: []f32,
+        next: std.atomic.Value(usize),
+    };
+
+    fn parWorker(ctx: *ParCtx) void {
+        const dim = ctx.table.dim;
+        const BLK: usize = 256;
+        while (true) {
+            const start = ctx.next.fetchAdd(BLK, .acq_rel);
+            if (start >= ctx.rows.len) return;
+            const end = @min(start + BLK, ctx.rows.len);
+            for (start..end) |i| ctx.table.row(@intCast(ctx.rows[i]), ctx.out[i * dim ..][0..dim]);
+        }
     }
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
@@ -586,6 +634,10 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
 }
 
 /// Test seams for the prefill gate below (both envs are read once per process).
+/// Test seam for `parThreads` — mirrors `ple_prefill_prefetch_override` so the
+/// threaded gather arm is reachable from `zig build test` without the env var.
+pub var ple_par_override: ?u32 = null;
+
 pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
@@ -899,6 +951,73 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     t.gather(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
+}
+
+test "ngram prefill gather: the threaded walk is byte-identical to the serial one" {
+    // The threaded arm only engages past 1024 rows, so 4096 exercises the
+    // work-stealing loop over several 256-row blocks per worker. A wrong `end`
+    // bound or a `dim` mix-up in parWorker corrupts rows here; the serial walk
+    // is the reference.
+    const ROWS: usize = 4096;
+    const HDR: usize = 512;
+    const W: usize = ROWS * 16;
+    const SB: usize = ROWS * 2;
+    const buf = try testing.allocator.alloc(u8, 8 + HDR + W + 2 * SB);
+    defer testing.allocator.free(buf);
+    const header = "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[4096,4],\"data_offsets\":[0,65536]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[65536,73728]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4096,1],\"data_offsets\":[73728,81920]}}";
+    std.mem.writeInt(u64, buf[0..8], HDR, .little);
+    @memset(buf[8 .. 8 + HDR], ' ');
+    @memcpy(buf[8..][0..header.len], header);
+    for (buf[8 + HDR ..], 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = buf });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/ngram_table.bin", .{pbuf[0..root_len]});
+
+    warm_override = false;
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    try testing.expectEqual(@as(u32, 32), t.dim);
+
+    // Keep the pool out of it: this test is about the threaded mmap walk only.
+    ple_prefill_prefetch_override = false;
+    defer ple_prefill_prefetch_override = null;
+
+    const ids = try testing.allocator.alloc(i64, ROWS);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ROWS);
+
+    const ref = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(ref);
+    const got = try testing.allocator.alloc(f32, ROWS * t.dim);
+    defer testing.allocator.free(got);
+    @memset(got, std.math.nan(f32));
+
+    ple_par_override = 1;
+    t.gather(ids, ref, 0);
+    ple_par_override = 16;
+    t.gather(ids, got, 0);
+    ple_par_override = null;
+
+    try testing.expectEqualSlices(f32, ref, got);
+
+    // A row count under the 1024 floor must stay on the serial path and still
+    // agree — the gate itself is part of the contract.
+    const SHORT: usize = 512;
+    @memset(got[0 .. SHORT * t.dim], std.math.nan(f32));
+    ple_par_override = 16;
+    t.gather(ids[0..SHORT], got[0 .. SHORT * t.dim], 0);
+    ple_par_override = null;
+    try testing.expectEqualSlices(f32, ref[0 .. SHORT * t.dim], got[0 .. SHORT * t.dim]);
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {
