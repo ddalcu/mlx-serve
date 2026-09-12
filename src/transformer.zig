@@ -42915,7 +42915,7 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
     }
 }
 
-test "hc prefill: pending write, normalized streams, inject mapping and BF16 mix across shapes" {
+test "hc prefill: pending write, normalized streams, native inject reduction and BF16 mix across shapes" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const hp = @import("hc_prefill.zig");
     const s = mlx.gpuStream();
@@ -42923,21 +42923,13 @@ test "hc prefill: pending write, normalized streams, inject mapping and BF16 mix
     const rnd = prng.random();
     const w = try attn256RandBf16(rnd, &.{ 4, 2560 }, s);
     defer _ = mlx.mlx_array_free(w);
-    var inject: [40960]f32 = @splat(0);
-    const cols = [_]u32{ 123, 2683, 5243, 7803 };
-    for (cols, 0..) |col, c| inject[col * 4 + c] = 1;
-    const iw32 = mlx.mlx_array_new_data(&inject, &[_]c_int{ 10240, 4 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(iw32);
-    var iw = mlx.mlx_array_new();
+    const iw = try attn256RandBf16(rnd, &.{ 10240, 4 }, s);
     defer _ = mlx.mlx_array_free(iw);
-    try mlx.check(mlx.mlx_astype(&iw, iw32, .bfloat16, s));
-    const ids = mlx.mlx_array_new_data(&cols, &[_]c_int{4}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(ids);
     const eps = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps);
     const ones = try standinOnes(&.{2560}, s);
     defer _ = mlx.mlx_array_free(ones);
-    for ([_][2]c_int{ .{ 2, 17 }, .{ 1, 65 } }) |shape| {
+    for ([_][2]c_int{ .{ 2, 17 }, .{ 1, 65 }, .{ 1, 513 } }) |shape| {
         const b = shape[0];
         const seq = shape[1];
         const x = try attn256RandBf16(rnd, &.{ b, seq, 4, 2560 }, s);
@@ -42972,7 +42964,7 @@ test "hc prefill: pending write, normalized streams, inject mapping and BF16 mix
             try mlx.check(mlx.mlx_reshape(&flat, normed, &[_]c_int{ b, seq, 10240 }, 3, s));
             var raw = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(raw);
-            try mlx.check(mlx.mlx_take_axis(&raw, flat, ids, 2, s));
+            try mlx.check(mlx.mlx_matmul(&raw, flat, iw, s));
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.raw_inject, raw, s));
             var sig = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sig);
