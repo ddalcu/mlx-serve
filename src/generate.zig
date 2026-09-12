@@ -3175,7 +3175,7 @@ pub const Generator = struct {
                     constraint.pstate.pending_len = @intCast(planned_len);
                     @memcpy(constraint.pstate.pending[0..planned_len], planned[0..planned_len]);
                 }
-                return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint, proto) };
+                return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint) };
             },
             .reasoning, .header => {
                 if (self.has_pending_logits) {
@@ -3191,7 +3191,7 @@ pub const Generator = struct {
                     constraint.pstate.pending_len = @intCast(planned_len);
                     @memcpy(constraint.pstate.pending[0..planned_len], planned[0..planned_len]);
                 }
-                return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint, proto) };
+                return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint) };
             },
         }
     }
@@ -3199,8 +3199,7 @@ pub const Generator = struct {
     /// Commit ONE canonical transition token through the live model state,
     /// then leave its logits pending for the next sample. Called once per
     /// scheduler tick while `pstate.recovering` drains.
-    fn commitForcedConstraintToken(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !u32 {
-        _ = proto;
+    fn commitForcedConstraintToken(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint) !u32 {
         if (self.has_pending_logits) {
             _ = mlx.mlx_array_free(self.pending_logits);
             self.has_pending_logits = false;
@@ -3243,10 +3242,6 @@ pub const Generator = struct {
         return @min(self.loop_guard_start, self.generated_ids.items.len);
     }
 
-    /// Commit the configured reasoning close token through the live model
-    /// state, then leave its logits pending for the first constrained sample.
-    /// This is used only for model-driven terminal paths; cancellation, stop
-    /// sequences, inference errors, and stalled forwards never call it.
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -9045,7 +9040,7 @@ pub const Generator = struct {
         // Recovery drain: at most one canonical transition token per tick,
         // through the same forward/accounting path as a sampled token.
         if (constraint.pstate.recovering) {
-            return try self.commitForcedConstraintToken(allocator, constraint, proto);
+            return try self.commitForcedConstraintToken(allocator, constraint);
         }
         switch (constraint.pstate.phase) {
             .choice, .header => return self.nextChoiceStep(allocator, constraint, proto),
@@ -9313,7 +9308,6 @@ pub const Generator = struct {
             }
         }
         if (allowed == 0) {
-            if (constraint.proto != null) return error.NoValidProtocolToken;
             log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
             constraint.grammar.dead = true;
             @memset(constraint.mask_buf, true);
@@ -9382,7 +9376,6 @@ pub const Generator = struct {
                 for (bytes) |b| {
                     const ok = try constraint.grammar.acceptByte(b);
                     if (!ok) {
-                        if (constraint.proto != null) return error.InvalidProtocolPayload;
                         log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
                         constraint.grammar.dead = true;
                         break;

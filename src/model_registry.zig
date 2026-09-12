@@ -328,6 +328,10 @@ pub const LoadedModel = struct {
     ) !*const token_mask_mod.TokenBytes {
         self.token_bytes_mutex.lockUncancelable(io);
         defer self.token_bytes_mutex.unlock(io);
+        return self.tokenBytesLocked(gpa);
+    }
+
+    fn tokenBytesLocked(self: *LoadedModel, gpa: std.mem.Allocator) !*const token_mask_mod.TokenBytes {
         if (self.token_bytes) |*tb| return tb;
         const tok = self.tokenizer orelse return error.NoTokenizer;
         log.info("[grammar] building token-byte table for {s} (one-time, ~50ms)\n", .{self.id});
@@ -345,10 +349,10 @@ pub const LoadedModel = struct {
             if (std.mem.eql(u8, marker.text, text)) return marker;
         }
         const tok = self.tokenizer orelse return error.NoTokenizer;
-        if (self.token_bytes == null) self.token_bytes = try token_mask_mod.build(gpa, tok);
+        const tb = try self.tokenBytesLocked(gpa);
         const marker = try self.allocator.create(ReasoningMarker);
         errdefer self.allocator.destroy(marker);
-        marker.* = try ReasoningMarker.init(self.allocator, tok, &self.token_bytes.?, text);
+        marker.* = try ReasoningMarker.init(self.allocator, tok, tb, text);
         errdefer marker.arena.deinit();
         try self.reasoning_markers.append(self.allocator, marker);
         return marker;

@@ -84,8 +84,6 @@ Sampling defaults for omitted fields: body > launch flags > model `generation_co
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 
-- Constrained JSON payload offsets are authoritative: do not run markup cleanup on that content. Response routing/normalization buffers must outlive response serialization (including Anthropic's inner thinking block). See `docs/gotchas/server-http.md`.
-
 ## Testing — TDD is mandatory
 
 Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test` 6/6 0 fail + `bash app/test.sh`/`swift build` + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
@@ -226,6 +224,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 ### Server, HTTP, lifecycle (→ docs/gotchas/server-http.md)
 
+- **A constrained JSON payload offset is AUTHORITATIVE** (`reasoning_protocol.Delivery`, all three surfaces, stream + non-stream): the generator publishes where the schema payload begins and nothing after it is re-parsed, so a marker string inside JSON data stays data; markup cleanup never runs on it, and the routing buffers outlive serialization (Anthropic's thinking block). Guard: `tests/test_json_schema_protocol_routing.py`.
 - **`messages.deinit(allocator)` frees the Message array and NOTHING it points at**: request media is owned by ONE `server.RequestMedia` beside the `messages` list; `Message` BORROWS the slice; a media list is only obtainable from `openImages`/`openVideos`/`openAudio`; slots are INDICES. Guards: source scan + a `std.testing.allocator` test on `RequestMedia`.
 - **Select active-turn media from WIRE METADATA before decoding it**: a stateless client resends every historical data URL every turn, only the active media message is encoded. `activeWireMediaIndex` mirrors the parsed-message assistant/tool boundary on both chat surfaces. Guard: `tests/test_vision_prefix_cache.sh`.
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`; `Generator.sampleLazy` is the one lazy sampler): the lazy path used MLX's global RNG (seed worked only with `logprobs`, replaying ONE key every step).

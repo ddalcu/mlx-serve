@@ -15651,12 +15651,6 @@ fn handleAnthropicStreaming(
             break :blk with_carry;
         };
 
-        // Constrained routing: consult the generator's payload boundary once
-        // the token carrying it arrives. A DIRECT answer (payload at
-        // generated token 0) leaves the think arm before it can buffer
-        // anything; a later boundary is confirmed after the close scan has
-        // already routed the transition.
-
         if (gated_stream or stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
         }
@@ -17129,8 +17123,6 @@ fn handleResponsesInner(
                 break :blk with_carry;
             };
             defer allocator.free(token_text);
-
-            // Constrained routing — see the chat streaming arm.
 
             try raw_buf.appendSlice(allocator, token_text);
 

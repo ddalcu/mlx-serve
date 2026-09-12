@@ -6713,8 +6713,14 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     var inner_err: ?anyerror = null;
-    runSingleDecodeTickInner(sch, slot) catch |e| {
-        inner_err = e;
+    runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
+        // A reasoning-protocol dead end is this request's failure; the tick
+        // error path would fail every active slot.
+        error.NoValidProtocolToken, error.InvalidProtocolTransition, error.InvalidProtocolPayload => {
+            log.err("[grammar] reasoning protocol failed ({s}); failing this request only\n", .{@errorName(e)});
+            slot.markError(@errorName(e));
+        },
+        else => inner_err = e,
     };
     mlx.checkErrorDecode() catch |mlx_err| {
         log.err("[scheduler] decode aborted: MLX failure mid-generation ({s}) — failing this request, the server keeps serving\n", .{@errorName(mlx_err)});
