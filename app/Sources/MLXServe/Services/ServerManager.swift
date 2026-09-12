@@ -379,7 +379,6 @@ class ServerManager: ObservableObject {
     }
 
     private func handleTermination(exitCode: Int32) {
-        NSLog("[crash-recovery] handleTermination called, exitCode=\(exitCode), status=\(status.label)")
         pollSource?.cancel()
         pollSource = nil
         healthTask?.cancel()
@@ -423,8 +422,6 @@ class ServerManager: ObservableObject {
             isMemoryFailure: memFail,
             crashCount: crashCount, maxRetries: CrashRecovery.maxRetries
         )
-
-        NSLog("[crash-recovery] mode=\(mode.rawValue) exitCode=\(exitCode) memFail=\(memFail) crashCount=\(crashCount) shouldRestart=\(shouldRestart)")
 
         guard shouldRestart else {
             status = .error("Exited unexpectedly")
