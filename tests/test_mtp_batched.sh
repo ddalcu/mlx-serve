@@ -21,17 +21,19 @@ req() { python3 -c "import json,sys; print(json.dumps({'model':'mlx-serve','mess
     curl -s -m 900 -X POST -H 'Content-Type: application/json' -d @- "$BASE/v1/chat/completions" |
     python3 -c "import sys,json; j=json.load(sys.stdin); print(j['choices'][0]['message']['content'])"; }
 
+# qwen4 rounds stay solo and two of them interleave; three go plain (a B=3 tick).
+N=$([ "$IS_QWEN4" = 1 ] && echo 2 || echo 3); LAST=$((N-1))
 req "${P[0]}" > /dev/null
-for i in 0 1 2; do req "${P[$i]}" > "$OUT/solo$i"; done
-pids=(); for i in 0 1 2; do req "${P[$i]}" > "$OUT/conc$i" & pids+=($!); done; wait "${pids[@]}"
+for i in $(seq 0 $LAST); do req "${P[$i]}" > "$OUT/solo$i"; done
+pids=(); for i in $(seq 0 $LAST); do req "${P[$i]}" > "$OUT/conc$i" & pids+=($!); done; wait "${pids[@]}"
 # A batched verify is a B>1 forward: like the plain batched tick it is not bit-identical
 # to serial, so a divergence is acquitted at a serial top-2 gap <= 0.15 nats (the MTP
 # equivalence bar). qwen4 rounds are solo forwards and must match byte for byte.
 fail=0
-for i in 0 1 2; do
+for i in $(seq 0 $LAST); do
     if cmp -s "$OUT/solo$i" "$OUT/conc$i"; then continue; fi
     if [ "$IS_QWEN4" = 1 ]; then
-        echo -e "${RED}FAIL${NC} stream $i at N=3 differs from its solo run"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1; continue
+        echo -e "${RED}FAIL${NC} stream $i at N=$N differs from its solo run"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1; continue
     fi
     gap=$(python3 - "$BASE" "${P[$i]}" "$OUT/solo$i" "$OUT/conc$i" <<'PYEOF'
 import sys, json, urllib.request
@@ -52,10 +54,10 @@ PYEOF
     if python3 -c "import sys; sys.exit(0 if float('$g') <= 0.15 else 1)"; then
         echo -e "  ${YELLOW}near-tie${NC} stream $i diverged at token $idx, serial top-2 gap $g nats: acquitted"
     else
-        echo -e "${RED}FAIL${NC} stream $i at N=3 diverged at token $idx with a serial top-2 gap of $g nats"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1
+        echo -e "${RED}FAIL${NC} stream $i at N=$N diverged at token $idx with a serial top-2 gap of $g nats"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1
     fi
 done
-[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} three concurrent MTP streams match solo (fixed depth 2; near-ties acquitted on the batched verify)"
+[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} $N concurrent MTP streams match solo (fixed depth 2; near-ties acquitted on the batched verify)"
 if [ "$IS_QWEN4" = 1 ]; then
     grep -q "gdn batched verify engaged" "$LOG" && { echo -e "${RED}FAIL${NC} qwen4 rounds must stay solo (no batched verify yet)"; fail=1; }
     [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} qwen4 MTP users interleave on their own head state"
