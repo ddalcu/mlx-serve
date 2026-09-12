@@ -932,6 +932,10 @@ pub fn aneBlockEligible(rows: u32, quantized: bool, lora_count: u8) bool {
     return true;
 }
 
+fn mlpLoraCount(m: *const SwiGLU) u8 {
+    return @max(@max(m.gate.lora_count, m.up.lora_count), m.down.lora_count);
+}
+
 /// What `ane.planMediaOffload` calibrates on: block 0 built alone.
 const AneCalib = struct {
     d: *Dit,
@@ -1317,18 +1321,22 @@ pub const Dit = struct {
     /// DiT runs GPU-only.
     fn aneEnsure(self: *Dit, seq: u32, s: S) void {
         if (self.ane_tried) return;
-        self.ane_tried = true;
         if (!ane.media_offload.image) return;
         if (!ane.available()) {
+            self.ane_tried = true;
             log.warn("[ane] image offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
         }
         const rows = ane.mediaTileRows(seq);
         const b0 = &self.blocks[0].mlp;
-        if (!aneBlockEligible(rows, b0.gate.quantized, b0.gate.lora_count)) {
-            log.warn("[ane] image offload declined: {d} rows, quantized={}, loras={d} — GPU only\n", .{ rows, b0.gate.quantized, b0.gate.lora_count });
+        const loras = mlpLoraCount(b0);
+        if (!aneBlockEligible(rows, b0.gate.quantized, loras)) {
+            // A LoRA or a short request declines this request only; a bf16 pack never qualifies.
+            self.ane_tried = !b0.gate.quantized;
+            log.warn("[ane] image offload declined: {d} rows, quantized={}, loras={d} — GPU only\n", .{ rows, b0.gate.quantized, loras });
             return;
         }
+        self.ane_tried = true;
         const feat = self.cfg.features;
         const mlpdim = swigluDim(feat, self.cfg.multiplier);
         const probe: ane.QuantWeight = .{ .w = b0.gate.w, .scales = b0.gate.scales, .biases = b0.gate.biases, .bits = b0.gate.bits, .group_size = b0.gate.group_size, .in_dim = feat, .out_dim = mlpdim };
@@ -1389,7 +1397,7 @@ pub const Dit = struct {
     fn mlpMaybeAne(self: *Dit, x: mlx.mlx_array, b: *const Block, idx: usize, s: S) !mlx.mlx_array {
         const eng = self.ane_eng orelse return b.mlp.forward(x, s);
         if (!eng.mlpReady(idx) or idx >= self.ane_rest.len) return b.mlp.forward(x, s);
-        if (b.mlp.gate.lora_count > 0 or b.mlp.down.lora_count > 0) return b.mlp.forward(x, s);
+        if (mlpLoraCount(&b.mlp) > 0) return b.mlp.forward(x, s);
         const sh = mlx.getShape(x);
         if (sh.len != 3 or sh[0] != 1 or sh[2] != @as(c_int, @intCast(eng.hidden))) return b.mlp.forward(x, s);
         return ane.mediaMlp(s, eng, idx, "image", x, AneSeam{ .mlp = &b.mlp, .rest = &self.ane_rest[idx], .s = s }) catch |err| {
