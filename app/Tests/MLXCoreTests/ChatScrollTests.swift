@@ -13,26 +13,29 @@ final class ChatScrollTests: XCTestCase {
 
     // MARK: - Opening a conversation
 
-    func testATranscriptOpensOnTheNewestMessage() {
-        // Restoring a saved chat used to land at the OLDEST message: the scroll
-        // view had no bottom anchor and nothing scrolled it, because the only
-        // triggers were message-count and last-content changes that never fire
-        // on a conversation that isn't moving.
+    func testATranscriptOpensOnTheNewestMessageWithoutBeingScrolledThere() {
+        // Restoring a saved chat used to land at the OLDEST message, and was
+        // fixed by scrolling to the end on appear. That jump is itself the
+        // blank-transcript bug (C16): a lazy stack that has measured almost
+        // none of its rows puts "the end" a few hundred points down, and the
+        // jump lands the visible rectangle outside the rows that exist. The
+        // view is laid out bottom-anchored instead, so opening at the newest
+        // line costs no scroll at all.
         var s = ChatScrollState()
-        XCTAssertEqual(s.handle(.transcriptShown), .toBottom(animated: false))
+        XCTAssertEqual(s.handle(.transcriptShown), .none)
         XCTAssertTrue(s.isPinnedToBottom)
     }
 
-    func testSwitchingSessionsReturnsToTheBottomAndRe_engages() {
+    func testSwitchingSessionsRe_engagesFollowing() {
         // ChatDetailView is REUSED across tabs, so scroll state is per-view and
         // leaked between conversations: leaving tab A scrolled up made tab B
-        // open unpinned at an arbitrary offset.
+        // open unpinned.
         var s = ChatScrollState()
         _ = s.handle(.driverChanged(.user))
         _ = s.handle(.geometryChanged(distanceFromBottom: 800))
         XCTAssertFalse(s.isPinnedToBottom)
 
-        XCTAssertEqual(s.handle(.transcriptShown), .toBottom(animated: false))
+        _ = s.handle(.transcriptShown)
         XCTAssertTrue(s.isPinnedToBottom)
     }
 
@@ -163,6 +166,101 @@ final class ChatScrollTests: XCTestCase {
 
         XCTAssertEqual(s.handle(.jumpTapped), .toBottom(animated: true))
         XCTAssertTrue(s.isPinnedToBottom)
+    }
+
+    // MARK: - A row gets shorter
+
+    /// The offset is a distance from the top of the transcript, not a hold on a
+    /// piece of content: a row that shrinks above the reader slides everything
+    /// they can see up by what it lost. The control they clicked sits at the
+    /// BOTTOM of that row, so it — and everything below it — stays put exactly
+    /// when the offset drops by what the row has lost.
+    func testAShrinkingRowKeepsTheControlWhereItWas() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 7000)),
+                       .toOffset(3000))
+    }
+
+    /// An animated fold loses its height over several frames; every one is
+    /// measured against where the fold STARTED, never against the last frame.
+    func testAnAnimatedShrinkTracksFrameByFrame() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 8500)), .toOffset(4500))
+        // The correction landed; the offset now reads 4500. No new height, no action.
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 4500, contentHeight: 8500)), .none)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 4500, contentHeight: 7000)), .toOffset(3000))
+    }
+
+    /// A row taller than everything above it: the view stops at the top.
+    func testTheCorrectedOffsetNeverGoesAboveTheTop() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 800, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 800, contentHeight: 2000)), .toOffset(0))
+    }
+
+    /// Once the fold is over, height changes are content again (a reply
+    /// streaming in) and must not be corrected against a stale snapshot.
+    func testAFinishedShrinkStopsCorrecting() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowDidShrink)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9400)), .none)
+    }
+
+    func testAReaderWhoScrollsMidShrinkWins() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.driverChanged(.user))
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 4200, contentHeight: 7000)), .none)
+    }
+
+    /// While following the end, the bottom anchor already has it.
+    func testAShrinkingRowWhileFollowingTheEndIsLeftToTheAnchor() {
+        var s = ChatScrollState()
+        _ = s.handle(.transcriptShown)
+        _ = s.handle(.contentGeometry(offsetY: 8000, contentHeight: 9000))
+        _ = s.handle(.rowWillShrink)
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 8000, contentHeight: 7000)), .none)
+        XCTAssertTrue(s.isPinnedToBottom)
+    }
+
+    /// The frame after a fold: content shorter than the stale offset, distance
+    /// deeply negative — the rubber-band shape, without anyone having gone
+    /// anywhere. Reading it as arrival re-engaged following, and the bottom
+    /// anchor plus the correction rule then dragged the reader to the end,
+    /// overriding every fold correction that was ever issued.
+    func testAFoldOvershootIsNotArrivalAtTheBottom() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 30000, contentHeight: 31000))
+        _ = s.handle(.rowWillShrink)
+        XCTAssertEqual(s.handle(.geometryChanged(distanceFromBottom: -21000)), .none)
+        XCTAssertFalse(s.isPinnedToBottom)
+        // Once the fold is over, the rule is the rule again.
+        _ = s.handle(.rowDidShrink)
+        _ = s.handle(.geometryChanged(distanceFromBottom: -46))
+        XCTAssertTrue(s.isPinnedToBottom)
+    }
+
+    func testAHeightChangeOutsideAShrinkIsNotCorrected() {
+        var s = unpinned()
+        _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
+        XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9400)), .none)
+    }
+
+    /// Reading history with following switched off.
+    private func unpinned() -> ChatScrollState {
+        var s = ChatScrollState()
+        _ = s.handle(.driverChanged(.user))
+        _ = s.handle(.geometryChanged(distanceFromBottom: 900))
+        _ = s.handle(.driverChanged(.idle))
+        return s
     }
 
     // MARK: - Driver classification
