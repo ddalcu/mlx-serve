@@ -30,8 +30,7 @@ final class ServerControlButtonPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.tint, .accent)
     }
 
-    /// A headless start is up in a second and puts nothing resident, so the
-    /// button must not describe work that is not happening.
+    /// A headless start must not claim to be loading a model.
     func testAHeadlessStartDoesNotClaimToBeLoadingAModel() {
         let starting = ServerControlButtonPresentation(status: .starting, loadsModel: false)
         XCTAssertEqual(starting.title, "Starting Server...")
@@ -40,9 +39,7 @@ final class ServerControlButtonPresentationTests: XCTestCase {
         XCTAssertTrue(ServerControlButtonPresentation(status: .stopped).help.contains("load the selected model"))
     }
 
-    /// A hot-load leaves the server RUNNING while the checkpoint reads. The
-    /// tray has no per-model spinner, so without this the button would flip to
-    /// "Stop Server" and say nothing for the minute that follows.
+    /// A hot-load in flight reads as loading even though the server is running.
     func testALoadingModelOutranksRunning() {
         let loading = ServerControlButtonPresentation(status: .running, isLoadingModel: true)
         XCTAssertEqual(loading.title, "Loading Model...")

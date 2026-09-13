@@ -1993,12 +1993,8 @@ struct ChatDetailView: View {
         )
         if control != .hidden {
             Button {
-                // Headless, then hot-load the selection (`startServerForChat`):
-                // the same resident model as `--model` would give, but as an
-                // ordinary registry entry rather than the launch default — one
-                // the user can eject and have stay ejected. The pill spins
-                // meanwhile. A second `server.start` call site here is how the
-                // start paths would drift.
+                // The one button-start path; a second `server.start` call site
+                // here is how the start paths would drift.
                 appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
