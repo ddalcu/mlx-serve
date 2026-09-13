@@ -304,6 +304,15 @@ final class ProcessRegistry: ObservableObject {
         processes.first { $0.handle == handle }?.status.isAlive ?? false
     }
 
+    /// Alive AND started by this chat: the counter is app-wide and restarts at
+    /// `bg1` every launch, so a handle is only an identity within one chat.
+    /// A nil `sessionId` (a task run's transcript) keeps the global answer.
+    func isAlive(handle: String, sessionId: UUID?) -> Bool {
+        guard let sessionId else { return isAlive(handle: handle) }
+        return processes.first { $0.handle == handle && $0.sessionId == sessionId }?
+            .status.isAlive ?? false
+    }
+
     /// Incremental output since the last read, or nil for an unknown handle.
     func readOutput(handle: String) -> String? {
         processes.first { $0.handle == handle }?.output.readNew()
@@ -419,5 +428,28 @@ final class ProcessRegistry: ObservableObject {
 enum ProcessCardControls {
     static func killable(handles: [String]?, isAlive: (String) -> Bool) -> [String] {
         (handles ?? []).filter(isAlive)
+    }
+
+    /// Claimed handles show beside their call inside the panel, unclaimed ones
+    /// in the header.
+    static func split(live: [String],
+                      claimedBy callHandles: [String?]) -> (claimed: [String], unclaimed: [String]) {
+        let claims = Set(callHandles.compactMap { $0 })
+        return (live.filter { claims.contains($0) }, live.filter { !claims.contains($0) })
+    }
+
+    /// Handle names are reused across launches: the last announcement of a
+    /// handle owns it, earlier cards drop it.
+    static func handleOwnership<ID: Hashable>(_ announcements: [(ID, [String])]) -> [ID: [String]] {
+        var owner: [String: ID] = [:]
+        for (id, handles) in announcements {
+            for handle in handles { owner[handle] = id }
+        }
+        var owned: [ID: [String]] = [:]
+        for (id, handles) in announcements {
+            var seen = Set<String>()
+            owned[id] = handles.filter { owner[$0] == id && seen.insert($0).inserted }
+        }
+        return owned
     }
 }

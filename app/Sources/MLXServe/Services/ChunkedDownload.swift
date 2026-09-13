@@ -155,6 +155,15 @@ struct ChunkedResumeState: Codable, Equatable {
         guard let data = FileManager.default.contents(atPath: sidecarPath(forPartial: partialPath)),
               let state = try? JSONDecoder().decode(ChunkedResumeState.self, from: data),
               state.isValid(forSize: expectedSize) else { return nil }
+        // The sidecar describes bytes in a `.partial`. If that file is gone or
+        // shorter than what it banks, the bookkeeping outlived the data: a
+        // "finished" plan with no file made `run()` return success and the
+        // caller's rename throw NSFileNoSuchFileError, so the download could
+        // never complete until the sidecar was deleted by hand. Chunks are
+        // written positionally, so the file is always at least as long as the
+        // total it banks.
+        let onDisk = (try? FileManager.default.attributesOfItem(atPath: partialPath))?[.size] as? Int64
+        guard let onDisk, onDisk >= state.completedBytes else { return nil }
         return state
     }
 

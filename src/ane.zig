@@ -28,6 +28,8 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const mlx = @import("mlx.zig");
+const status = @import("status.zig");
 
 // ── C ABI (lib/ane/ane_mlp.h) ──
 
@@ -36,6 +38,8 @@ pub const MsvAneBank = opaque {};
 pub const MsvAnePlane = opaque {};
 extern fn msv_ane_available() c_int;
 extern fn msv_ane_internal_free_disk() u64;
+extern fn msv_ane_cache_lineage(group: [*:0]const u8, variant: [*:0]const u8) void;
+extern fn msv_ane_cache_variant(group: [*:0]const u8, out: [*]u8, out_len: c_int) void;
 extern fn msv_ane_plane_create(bytes: usize) ?*MsvAnePlane;
 extern fn msv_ane_plane_free(p: ?*MsvAnePlane) void;
 extern fn msv_ane_plane_base(p: ?*MsvAnePlane) ?[*]f16;
@@ -117,6 +121,15 @@ pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
     return rows;
 }
 
+/// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
+/// consume this must treat 0 as "unknown", never as "tiny machine").
+pub fn totalMemBytes() u64 {
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    return mem;
+}
+
 /// Chip name via sysctl ("Apple M3 Ultra"); empty on failure — callers fall
 /// to their default row. Canonical copy (dflash.zig delegates here); the GPU
 /// arch string cannot tell Ultra from Max, hence the CPU brand.
@@ -191,11 +204,330 @@ pub fn dualDefault(chip: []const u8) bool {
 /// chunk token rows). MLX_SERVE_ANE_SPLIT overrides; the default is per
 /// (mode, silicon) — see `defaultShare`.
 pub fn splitShare() f32 {
-    const def = defaultShare(splitMode(), chipBrand());
-    const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return def;
-    const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return def;
-    if (!(v > 0) or v > 1) return def;
+    return explicitShareEnv() orelse defaultShare(splitMode(), chipBrand());
+}
+
+// ── Media offload (image / video / audio DiTs) ──
+
+/// The three media seams' switches and the explicit share, set ONCE in
+/// `main()` from `--ane-image/--ane-video/--ane-audio` + `--ane-split` (or
+/// MLX_SERVE_ANE_SPLIT). The seams sit under gen.zig with no server config
+/// in reach, so this is process-global like `applyMlxCacheLimit`.
+pub const MediaOffload = struct {
+    image: bool = false,
+    video: bool = false,
+    audio: bool = false,
+    share: ?f32 = null,
+};
+pub var media_offload: MediaOffload = .{};
+
+/// MLX_SERVE_ANE_SPLIT parsed; null when unset or outside (0, 1].
+pub fn explicitShareEnv() ?f32 {
+    const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return null;
+    const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return null;
+    if (!(v > 0) or v > 1) return null;
     return v;
+}
+
+/// The share a media seam falls back to when nothing can be solved.
+pub const DEFAULT_MEDIA_SHARE: f32 = 0.45;
+
+/// Every media request loops ONE compiled tile of this many rows, so every
+/// request size shares one program set: disk stays fixed per model and share,
+/// and a new size never cold-compiles.
+pub const MEDIA_TILE_ROWS: u32 = 256;
+
+/// The compiled tile for a `seq`-row request; 0 = shorter than one tile.
+pub fn mediaTileRows(seq: u32) u32 {
+    return if (seq < MEDIA_TILE_ROWS) 0 else MEDIA_TILE_ROWS;
+}
+
+/// One 16-core ANE's measured rate on our int8/fp16 MLP program (the
+/// Stage-A harness in the file header). M1 through M4 all ship that engine.
+pub const ANE_TFLOPS_M1_M4: f64 = 11.8;
+
+/// Total ANE rate for `units` engines, or null on silicon nobody measured
+/// (M5+ NAX-class GPUs, an unreadable brand): the caller keeps the default
+/// rather than guessing. Token-exact family match, never a substring.
+pub fn aneTflopsFor(chip: []const u8, units: u32) ?f64 {
+    var it = std.mem.splitScalar(u8, chip, ' ');
+    while (it.next()) |tok| {
+        for ([_][]const u8{ "M1", "M2", "M3", "M4" }) |fam| {
+            if (std.mem.eql(u8, tok, fam)) return ANE_TFLOPS_M1_M4 * @as(f64, @floatFromInt(units));
+        }
+    }
+    return null;
+}
+
+/// Balance point of a split where both units work the same rows:
+/// s* = A / (A + G), A the ANE's rate, G the GPU's EFFECTIVE rate at this
+/// model's MLP shape. Clamped to the measured sweep range and rounded to its
+/// 0.05 grid: the plateau near the peak is ~6% wide, and a finer answer lets
+/// probe jitter pick a new slice width (a cold compile) on every boot. A
+/// degenerate probe answers the default.
+pub fn solveShare(a_tflops: f64, g_tflops: f64) f32 {
+    if (!(a_tflops > 0) or !(g_tflops > 0)) return DEFAULT_MEDIA_SHARE;
+    const s = std.math.clamp(a_tflops / (a_tflops + g_tflops), 0.25, 0.85);
+    return @floatCast(@round(s * 20) / 20);
+}
+
+/// One affine-quantized weight [out_dim, in_dim] the GPU probe times.
+pub const QuantWeight = struct {
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+};
+
+/// The GPU's effective rate at this model's MLP shape: the best of three
+/// timed quantized matmuls `[rows, in] x [in, out]^T` on the real block-0
+/// weight after one warm-up. No ANE compile is involved, so the solve
+/// happens before the programs are built.
+pub fn probeGpuTflops(io: std.Io, s: mlx.mlx_stream, rows: u32, qw: QuantWeight) !f64 {
+    const shape = [_]c_int{ @intCast(rows), @intCast(qw.in_dim) };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &shape, 2, mlx.mlx_array_dtype(qw.scales), s));
+    try mlx.check(mlx.mlx_array_eval(x));
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (0..4) |i| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        var o = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_quantized_matmul(&o, x, qw.w, qw.scales, qw.biases, true, mlx.mlx_optional_int.some(@intCast(qw.group_size)), mlx.mlx_optional_int.some(@intCast(qw.bits)), "affine", s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        const ns: u64 = @intCast(t0.untilNow(io, .awake).nanoseconds);
+        if (i > 0) best_ns = @min(best_ns, ns);
+    }
+    if (best_ns == 0) return error.AneProbeClock;
+    const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(qw.in_dim)) * @as(f64, @floatFromInt(qw.out_dim));
+    return flops / @as(f64, @floatFromInt(best_ns)) * 1e-3;
+}
+
+/// Rows the media share probe times: enough that the GPU matmul runs at its
+/// steady rate, so the solve depends on the Mac and the model, never on the
+/// request size.
+pub const MEDIA_PROBE_ROWS: u32 = 4096;
+
+/// The seed share calibration starts from: the silicon's ANE row against one
+/// timed GPU matmul at the model's shape; unknown silicon or a failed probe
+/// keeps the default.
+fn probeShare(io: std.Io, s: mlx.mlx_stream, what: []const u8, qw: QuantWeight, units: u32) f32 {
+    const a = aneTflopsFor(chipBrand(), units) orelse {
+        log.info("[ane] {s} offload share seed {d:.2} (default: no ANE rate row for '{s}')\n", .{ what, DEFAULT_MEDIA_SHARE, chipBrand() });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const g = probeGpuTflops(io, s, MEDIA_PROBE_ROWS, qw) catch |err| {
+        log.warn("[ane] {s} offload share seed {d:.2} (default: GPU probe failed {s})\n", .{ what, DEFAULT_MEDIA_SHARE, @errorName(err) });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const share = solveShare(a, g);
+    log.info("[ane] {s} offload share seed {d:.2}: gpu {d:.1} TFLOPS at [{d} x {d}] x [{d} x {d}], ane {d:.1} TFLOPS ({d} unit(s))\n", .{ what, share, g, MEDIA_PROBE_ROWS, qw.in_dim, qw.in_dim, qw.out_dim, a, units });
+    return share;
+}
+
+/// The share that balances ANE and GPU, from one block timed at `s0`: `ane_s`
+/// for its ANE tiles and `gpu_s` for its GPU complement over the same rows.
+/// A 0.01 grid: it is solved once, so no probe jitter to absorb, and its
+/// two-decimal cache tag reads back as the same share.
+pub fn calibratedShare(s0: f32, ane_s: f64, gpu_s: f64) f32 {
+    const a = @as(f64, s0) / ane_s;
+    const g = (1 - @as(f64, s0)) / gpu_s;
+    if (!(a > 0) or !(g > 0)) return s0;
+    const x = std.math.clamp(a / (a + g), 0.25, 0.85);
+    return @floatCast(@round(x * 100) / 100);
+}
+
+/// Block 0 measured both ways at the seed share: its compiled ANE program over
+/// one tile and its GPU complement over MEDIA_PROBE_ROWS rows of the dtype the
+/// MLP really sees. `calib` builds block 0 alone (`buildBlock0(k, units,
+/// share)`), runs its complement (`complement(x)`), names that input dtype
+/// (`dtype`) and drops both (`teardown()`). Null = keep the seed.
+fn calibrate(io: std.Io, s: mlx.mlx_stream, what: []const u8, group: [:0]const u8, s0: f32, k0: u32, units: u32, calib: anytype) ?f32 {
+    // Its own lineage group, so the one-block program never prunes the model's sets.
+    var cb: [104]u8 = undefined;
+    tagCacheLineage(std.fmt.bufPrintSentinel(&cb, "{s}-cal", .{group}, 0) catch return null, s0, false);
+    const start = std.Io.Timestamp.now(io, .awake);
+    const eng = calib.buildBlock0(k0, units, s0) catch |err| {
+        log.warn("[ane] {s} offload calibration build failed ({s}) — keeping share {d:.2}\n", .{ what, @errorName(err), s0 });
+        return null;
+    };
+    defer calib.teardown();
+    const t = timeOverlapped(io, s, eng, calib.dtype, calib) catch |err| {
+        log.warn("[ane] {s} offload calibration: timing failed ({s}) — keeping share {d:.2}\n", .{ what, @errorName(err), s0 });
+        return null;
+    };
+    const ane_s = t.ane;
+    const gpu_s = t.gpu;
+    const share = calibratedShare(s0, ane_s, gpu_s);
+    const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)))) / 1e9;
+    log.info("[ane] {s} offload share calibrated {d:.2} in {d:.1}s: at {d:.2} one block takes {d:.1} ms on the ANE, {d:.1} ms on the GPU for {d} rows\n", .{ what, share, secs, s0, ane_s * 1e3, gpu_s * 1e3, MEDIA_PROBE_ROWS });
+    return share;
+}
+
+/// Block 0 run the way the seam runs it: MEDIA_PROBE_ROWS worth of ANE tiles
+/// on a helper thread while this thread evaluates the GPU complement over the
+/// same rows, so each side is timed under the other's load (they share memory
+/// bandwidth and the power budget). Best of three after a warm-up round.
+fn timeOverlapped(io: std.Io, s: mlx.mlx_stream, eng: *AnePrefill, dt: mlx.mlx_dtype, calib: anytype) !struct { ane: f64, gpu: f64 } {
+    if (!eng.mlpReady(0)) return error.AneNoProgram;
+    for (eng.units) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        @memset(plane[0 .. @as(usize, eng.hidden) * eng.rows], 0);
+    }
+    const shape = [_]c_int{ @intCast(MEDIA_PROBE_ROWS), @intCast(eng.hidden) };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &shape, 2, dt, s));
+    try mlx.check(mlx.mlx_array_eval(x));
+    const AneLoop = struct {
+        eng: *AnePrefill,
+        io: std.Io,
+        ns: u64 = 0,
+        ok: bool = true,
+        fn run(self: *@This()) void {
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            for (0..MEDIA_PROBE_ROWS / self.eng.rows) |_| {
+                self.eng.kickMlp(0);
+                if (!self.eng.waitAll()) self.ok = false;
+            }
+            self.ns = @intCast(t0.untilNow(self.io, .awake).nanoseconds);
+        }
+    };
+    var ane_ns: u64 = std.math.maxInt(u64);
+    var gpu_ns: u64 = std.math.maxInt(u64);
+    for (0..4) |i| {
+        var loop: AneLoop = .{ .eng = eng, .io = io };
+        const th = try std.Thread.spawn(.{}, AneLoop.run, .{&loop});
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        const y = calib.complement(x) catch |err| {
+            th.join();
+            return err;
+        };
+        defer _ = mlx.mlx_array_free(y);
+        const rc = mlx.mlx_array_eval(y);
+        const g: u64 = @intCast(t0.untilNow(io, .awake).nanoseconds);
+        th.join();
+        try mlx.check(rc);
+        if (!loop.ok) return error.AneEvalFailed;
+        if (i > 0) {
+            ane_ns = @min(ane_ns, loop.ns);
+            gpu_ns = @min(gpu_ns, g);
+        }
+    }
+    return .{ .ane = @as(f64, @floatFromInt(ane_ns)) / 1e9, .gpu = @as(f64, @floatFromInt(gpu_ns)) / 1e9 };
+}
+
+/// The host-side peak of one layer's build: gate/up/down (or fused fc1 +
+/// fc2) dequantized to f32 and alive together, plus the MLX-side f32
+/// dequant transient of the weight in flight.
+pub fn buildPeakBytes(hidden: u64, ffn: u64) u64 {
+    return 4 * hidden * ffn * 4;
+}
+
+pub const MediaPlan = struct { share: f32, units: u32, k: u32 };
+
+/// Everything a media seam decides before its build: units, share (explicit,
+/// reused from the model's compiled set, or calibrated on block 0 through
+/// `calib`), the per-unit slice, the memory gate and the disk floor. Every
+/// decline is one named `[ane] <what> offload …` line; null = GPU only.
+pub fn planMediaOffload(io: std.Io, s: mlx.mlx_stream, what: []const u8, layers: usize, hidden: u32, ffn: u32, rows: u32, probe: QuantWeight, calib: anytype) ?MediaPlan {
+    var gb: [96]u8 = undefined;
+    const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return null;
+    const units = unitCount(.channel, chipBrand(), dualEnabled());
+    const fixed: ?f32 = if (media_offload.share) |v| blk: {
+        log.info("[ane] {s} offload share {d:.2} (explicit)\n", .{ what, v });
+        break :blk v;
+    } else if (cachedShare(group)) |v| blk: {
+        log.info("[ane] {s} offload share {d:.2} (reused from its compiled set)\n", .{ what, v });
+        break :blk v;
+    } else null;
+    var share = fixed orelse probeShare(io, s, what, probe, units);
+    var k = channelSliceWidthUnits(ffn, share, units);
+    if (k == 0) {
+        log.warn("[ane] {s} offload: share {d:.2} of ffn {d} over {d} unit(s) leaves no usable slice — GPU only\n", .{ what, share, ffn, units });
+        return null;
+    }
+    if (!mediaFits(what, layers, hidden, ffn, k, rows, units, "GPU only")) return null;
+    var calibrated = false;
+    if (fixed == null) {
+        if (calibrate(io, s, what, group, share, k, units, calib)) |c| {
+            const kc = channelSliceWidthUnits(ffn, c, units);
+            if (kc > 0 and (kc <= k or mediaFits(what, layers, hidden, ffn, kc, rows, units, "keeping the seed share"))) {
+                share = c;
+                k = kc;
+                calibrated = true;
+            }
+        }
+    }
+    tagCacheLineage(group, share, calibrated);
+    return .{ .share = share, .units = units, .k = k };
+}
+
+/// Whether a `k`-wide build fits memory and the disk floor; a refusal is one
+/// named line ending in `fallback`.
+fn mediaFits(what: []const u8, layers: usize, hidden: u32, ffn: u32, k: u32, rows: u32, units: u32, fallback: []const u8) bool {
+    const gib = 1024 * 1024 * 1024;
+    const bill = engineBillBytes(layers, 0, hidden, k, 0, 0, rows, units);
+    const peak = buildPeakBytes(hidden, ffn);
+    var resident: usize = 0;
+    _ = mlx.mlx_get_active_memory(&resident);
+    const avail_mem = status.getAvailableMemBytes();
+    if (mediaGateRefusal(totalMemBytes(), avail_mem, resident, bill, peak)) |why| {
+        switch (why) {
+            .total_ram => log.warn("[ane] {s} offload bills ~{d:.1} GB on top of {d:.1} GB resident, over {d} GB total RAM — {s}\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(resident)) / gib, totalMemBytes() / gib, fallback }),
+            .swap_floor => log.warn("[ane] {s} offload: ~{d:.1} GB int8 + ~{d:.1} GB build transient would leave {d:.1} GB available under the {d} GB swap floor — {s}\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(peak)) / gib, @as(f64, @floatFromInt(avail_mem)) / gib, SWAP_FLOOR_BYTES / gib, fallback }),
+        }
+        return false;
+    }
+    const free_disk = internalFreeDiskBytes();
+    if (free_disk > 0 and free_disk < BUILD_DISK_FLOOR_BYTES) {
+        log.warn("[ane] {s} offload: under the {d} GB internal-disk build floor, where compiles fail bare — {s}\n", .{ what, BUILD_DISK_FLOOR_BYTES / gib, fallback });
+        return false;
+    }
+    return true;
+}
+
+/// Tag the entries the coming build will store so a share sweep prunes its
+/// predecessors instead of stacking one program set per value.
+pub fn setCacheLineage(what: []const u8, layers: usize, hidden: u32, ffn: u32, share: f32) void {
+    var gb: [96]u8 = undefined;
+    const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return;
+    tagCacheLineage(group, share, false);
+}
+
+fn lineageGroup(buf: []u8, what: []const u8, layers: usize, hidden: u32, ffn: u32) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}:{d}x{d}x{d}", .{ what, layers, hidden, ffn }, 0);
+}
+
+fn tagCacheLineage(group: [:0]const u8, share: f32, reusable: bool) void {
+    var vb: [32]u8 = undefined;
+    const variant = shareVariant(&vb, share, reusable) catch return;
+    msv_ane_cache_lineage(group.ptr, variant.ptr);
+}
+
+/// A set's lineage variant. Only a calibrated media share is tagged reusable,
+/// so a bench's `--ane-split`, an uncalibrated seed or the LM seam's fixed
+/// share is never reused as one.
+fn shareVariant(buf: []u8, share: f32, reusable: bool) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}share={d:.2}", .{ if (reusable) "calibrated " else "", share }, 0);
+}
+
+fn parseShareVariant(v: []const u8) ?f32 {
+    const prefix = "calibrated share=";
+    if (!std.mem.startsWith(u8, v, prefix)) return null;
+    const x = std.fmt.parseFloat(f32, v[prefix.len..]) catch return null;
+    return if (x > 0 and x <= 1) x else null;
+}
+
+/// The calibrated share of the most recently used set compiled for `group`.
+fn cachedShare(group: [:0]const u8) ?f32 {
+    var buf: [32]u8 = @splat(0);
+    msv_ane_cache_variant(group.ptr, &buf, buf.len);
+    return parseShareVariant(std.mem.sliceTo(&buf, 0));
 }
 
 /// ANE prefill is for M4-and-below: on NAX-class GPUs (M5+) the GPU prefill
@@ -358,6 +690,24 @@ pub const MIN_CONTEXT_TOKENS: u32 = 32768;
 pub fn gateAllows(total_mem: u64, resident: u64, bill: u64, headroom: u64) bool {
     if (total_mem == 0) return true;
     return resident +| bill +| headroom <= total_mem;
+}
+
+pub const GateRefusal = enum { total_ram, swap_floor };
+
+/// What the offload must leave the SYSTEM after its build: under this macOS
+/// is already compressing and the next allocation swaps. The total-RAM gate
+/// alone admitted a 6.8 GB copy on a 32 GB M1 Pro beside a 14.7 GB pack and
+/// the ranked request churned ~380 MB of swap with nothing logged.
+pub const SWAP_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The media seams' gate: the total-RAM bill first, then the resident copy
+/// plus the build's f32 transient against what is available now. An unknown
+/// `avail_mem` (probe failure) is no information.
+pub fn mediaGateRefusal(total_mem: u64, avail_mem: u64, resident: u64, bill: u64, build_peak: u64) ?GateRefusal {
+    if (!gateAllows(total_mem, resident, bill, GATE_BASELINE_BYTES)) return .total_ram;
+    if (avail_mem == 0) return null;
+    if (avail_mem < bill +| build_peak +| SWAP_FLOOR_BYTES) return .swap_floor;
+    return null;
 }
 
 /// The hard floor for starting an ANE build at all: below this much free
@@ -986,10 +1336,14 @@ pub const AnePrefill = struct {
     /// One-shot engagement lines, one PER SEAM — a built-but-never-
     /// dispatched program is exactly the dispatch-hole class, so each seam
     /// proves its own dispatch in the log (the expectNoSpec rule).
-    pub fn logEngagedOnce(self: *AnePrefill) void {
+    /// `what` names the CALLER's surface ("prefill", "image", "video",
+    /// "audio"): one engine serves all of them, and a media seam logging
+    /// "prefill offload engaged (--ane-prefill)" reads as a flag nobody
+    /// passed.
+    pub fn logEngagedOnce(self: *AnePrefill, what: []const u8) void {
         if (self.engaged_logged) return;
         self.engaged_logged = true;
-        log.info("[ane] prefill offload engaged: mode={s} units={d} mlp={d} rows={d}/{d} (--ane-prefill; MLX_SERVE_ANE_SPLIT sets the share)\n", .{ @tagName(self.mode), self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
+        log.info("[ane] {s} offload engaged: mode={s} units={d} mlp={d} rows={d}/{d} (MLX_SERVE_ANE_SPLIT sets the share)\n", .{ what, @tagName(self.mode), self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
     }
 
     pub fn logGdnEngagedOnce(self: *AnePrefill) void {
@@ -1015,6 +1369,373 @@ pub const AnePrefill = struct {
         });
     }
 };
+
+// ── Seam plane I/O ──
+//
+// Shared by every offload seam (LM prefill in transformer.zig, media DiT
+// blocks in the backends): the planes are fp16 CHANNEL-major, so a [1,R,W]
+// activation transposes to [W][R] going in and back on the way out.
+
+/// Pack a [1, R, W] activation into an ANE input plane. bf16→fp16 is exact in
+/// fp16's normal range and the graph computes fp16 anyway. Blocks on the eval:
+/// the caller is the sole MLX caller and the plane must be filled before kick.
+pub fn packPlane(s: mlx.mlx_stream, x_rows: mlx.mlx_array, plane: [*]f16) !void {
+    const sh = mlx.getShape(x_rows); // [1, R, W]
+    const rows = sh[1];
+    const width = sh[2];
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    {
+        var x2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2d);
+        const shape2 = [_]c_int{ rows, width };
+        try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, s));
+        var xt_view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xt_view);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, s));
+        var xf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xf);
+        try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, s));
+        const flat_shape = [_]c_int{width * rows};
+        try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, s));
+    }
+    try mlx.check(mlx.mlx_array_eval(x_flat));
+    const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
+    const count: usize = @intCast(width * rows);
+    @memcpy(plane[0..count], src[0..count]);
+}
+
+/// Read an ANE output plane ([width][R] fp16 channel-major) back as a
+/// [1, R, width] tensor in `dtype`.
+pub fn readPlane(s: mlx.mlx_stream, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const t_shape = [_]c_int{ width, rows };
+    // mlx_array_new_data COPIES at construction, so the plane is free for the
+    // next program the moment this returns.
+    const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(y_f16);
+    var y_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_t);
+    const perm = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, s));
+    var y_cast = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_cast);
+    try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape3 = [_]c_int{ 1, rows, width };
+    try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, s));
+    return out;
+}
+
+/// The ANE program computes in fp16 throughout, so both its INTERNAL
+/// activation (`silu(gate) * up`) and its output plane must stay under 65504.
+/// The `up` half of the ANE's weight copy is divided by this at build time and
+/// the read-back partial multiplied back: `up` is linear into the product, so
+/// `act` and the down-conv output both scale by it exactly, while `silu(gate)`
+/// is untouched. EXACT — per-row int8 quantization folds the factor into the
+/// row scale, and a power of two is exact in fp16.
+///
+/// Measured on H3's DiT (864x480, 21f): the fc2 partial peaks at ~1.7M and
+/// `act` at 52k, so an unscaled seam saturates to INF from block 36 on and the
+/// video renders BLACK. 256 leaves ~10x headroom over that peak; entries it
+/// pushes subnormal sit 7+ orders below the max and are already fp16 noise.
+pub const OUT_PLANE_SCALE: f32 = 256.0;
+
+/// Dequantize an affine-packed weight to host f32 [out_dim, in_dim] row-major
+/// — the layout `quantizeRowsInt8` expects. THE dequant for every seam.
+pub fn dequantToHostF32(
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+) ![]f32 {
+    if (scales.ctx == null) return error.AneDenseBf16Unsupported;
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(
+        &deq,
+        w,
+        scales,
+        biases,
+        mlx.mlx_optional_int.some(@intCast(group_size)),
+        mlx.mlx_optional_int.some(@intCast(bits)),
+        "affine",
+        .{}, // global_scale
+        .{ .value = .float32, .has_value = true },
+        s,
+    ));
+    const sh = mlx.getShape(deq);
+    if (sh.len != 2 or sh[0] != @as(c_int, @intCast(out_dim)) or sh[1] != @as(c_int, @intCast(in_dim))) return error.AneWeightShape;
+    const n: c_int = @intCast(out_dim * in_dim);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const fs = [_]c_int{n};
+    try mlx.check(mlx.mlx_reshape(&flat, deq, &fs, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const ptr = mlx.mlx_array_data_float32(flat) orelse return error.AneDequantRead;
+    const out = try allocator.alloc(f32, @intCast(n));
+    @memcpy(out, ptr[0..@intCast(n)]);
+    return out;
+}
+
+/// Fill every unit's input plane with the same packed activation. The pack is
+/// done ONCE and memcpy'd into the other units (~1.7 ms on the 27B against a
+/// ~20 ms eval); MLX_SERVE_ANE_DUAL_SHARE_INPUT=1 shares one surface and skips
+/// the copy. The wait stays BLOCKING and on this thread: oMLX measured that
+/// moving it to a worker, or launching the ANE from the Metal completion
+/// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
+pub fn packUnitPlanes(s: mlx.mlx_stream, eng: *AnePrefill, x: mlx.mlx_array) !void {
+    const first = eng.units[0].inputBase() orelse return error.AnePlaneMissing;
+    try packPlane(s, x, first);
+    if (eng.units.len == 1) return;
+    const count: usize = @as(usize, eng.hidden) * eng.rows;
+    for (eng.units[1..]) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        if (plane == first) continue; // shared surface
+        @memcpy(plane[0..count], first[0..count]);
+    }
+}
+
+// ── Media seam (image / video / audio DiT blocks) ──
+
+pub const TilePlan = struct { tiles: u32, cover: u32 };
+
+/// How `seq` rows map onto T-row tiles: `tiles` ANE evals covering rows
+/// [0, cover), the rest on the full GPU MLP. A partial last tile rides the ANE
+/// zero-padded only when its rows cost the GPU more alone than a whole tile
+/// costs the ANE at a balanced share: tail > T x (1 - share).
+pub fn mediaTilePlan(seq: u32, t: u32, share: f32) TilePlan {
+    const full = seq / t;
+    const tail = seq - full * t;
+    if (tail > 0 and @as(f32, @floatFromInt(tail)) > @as(f32, @floatFromInt(t)) * (1 - share))
+        return .{ .tiles = full + 1, .cover = seq };
+    return .{ .tiles = full, .cover = full * t };
+}
+
+/// One DiT block's SwiGLU with the channel split, `x` [..., W]. Rows
+/// [0, cover) ride the compiled T-row tile (T = eng.rows) one tile at a time
+/// while the GPU complement `ctx.complement(head)` computes over all of them;
+/// the rest run the full GPU MLP `ctx.full`. A failed eval recomputes the
+/// block on the GPU: a subset of the partials is not an answer.
+pub fn mediaMlp(s: mlx.mlx_stream, eng: *AnePrefill, layer: usize, what: []const u8, x: mlx.mlx_array, ctx: anytype) !mlx.mlx_array {
+    const shape = mlx.getShape(x);
+    const w: c_int = @intCast(eng.hidden);
+    var numel: c_int = 1;
+    for (shape) |d| numel *= d;
+    const seq: u32 = @intCast(@divExact(numel, w));
+    const t = eng.rows;
+    const plan = mediaTilePlan(seq, t, eng.share);
+    const n = plan.tiles;
+    if (n == 0) return ctx.full(x);
+    const tc: c_int = @intCast(t);
+    const nc: c_int = @intCast(n);
+    const cover: c_int = @intCast(plan.cover);
+
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    const s2 = [_]c_int{ @intCast(seq), w };
+    try mlx.check(mlx.mlx_reshape(&x2, x, &s2, 2, s));
+    const head = try rowsView(x2, 0, cover, s);
+    defer _ = mlx.mlx_array_free(head);
+    const packed_tiles = try packTiles(s, head, nc, tc, w);
+    defer _ = mlx.mlx_array_free(packed_tiles);
+    const src = mlx.mlx_array_data_float16(packed_tiles) orelse return error.AnePackReadFailed;
+    const tile_len: usize = @as(usize, eng.hidden) * t;
+
+    try fillInputs(eng, src[0..tile_len]);
+    eng.kickMlp(layer);
+    var in_flight = true;
+    defer if (in_flight) {
+        _ = eng.waitAll();
+    };
+    // Every GPU piece goes out before the tile loop so it overlaps all of it.
+    const y_gpu = try ctx.complement(head);
+    defer _ = mlx.mlx_array_free(y_gpu);
+    var tail_out: ?mlx.mlx_array = null;
+    defer if (tail_out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    if (plan.cover < seq) {
+        const tail_in = try rowsView(x2, cover, @intCast(seq), s);
+        defer _ = mlx.mlx_array_free(tail_in);
+        tail_out = try ctx.full(tail_in);
+    }
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
+        if (tail_out) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
+        _ = mlx.mlx_async_eval(ev);
+    }
+
+    const units = eng.units.len;
+    var outs: [MAX_UNITS]mlx.mlx_vector_array = undefined;
+    for (outs[0..units]) |*v| v.* = mlx.mlx_vector_array_new();
+    defer for (outs[0..units]) |v| {
+        _ = mlx.mlx_vector_array_free(v);
+    };
+    const plane_shape = [_]c_int{ w, tc };
+    for (0..n) |i| {
+        const ok = eng.waitAll();
+        in_flight = false;
+        if (!ok) return ctx.full(x);
+        for (eng.units, outs[0..units]) |*u, v| {
+            const plane = u.mlpOutputBase() orelse return error.AnePlaneMissing;
+            // COPIES, so the plane is free for the next tile on return.
+            const y = mlx.mlx_array_new_data(plane, &plane_shape, 2, .float16);
+            defer _ = mlx.mlx_array_free(y);
+            _ = mlx.mlx_vector_array_append_value(v, y);
+        }
+        if (i + 1 < n) {
+            try fillInputs(eng, src[(i + 1) * tile_len ..][0..tile_len]);
+            eng.kickMlp(layer);
+            in_flight = true;
+        }
+    }
+
+    const dt = mlx.mlx_array_dtype(y_gpu);
+    var ane_part = try sumUnitTiles(s, outs[0..units], nc, tc, w, dt);
+    defer _ = mlx.mlx_array_free(ane_part);
+    if (cover < nc * tc) {
+        const cut = try rowsView(ane_part, 0, cover, s);
+        _ = mlx.mlx_array_free(ane_part);
+        ane_part = cut;
+    }
+    // Undo the build-time `up` scale that keeps the fp16 graph in range.
+    const sc_f32 = mlx.mlx_array_new_float(OUT_PLANE_SCALE);
+    defer _ = mlx.mlx_array_free(sc_f32);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, sc_f32, dt, s));
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, ane_part, sc, s));
+    var head_out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head_out);
+    try mlx.check(mlx.mlx_add(&head_out, scaled, y_gpu, s));
+
+    if (!eng.engaged_logged) {
+        eng.engaged_logged = true;
+        log.info("[ane] {s} offload engaged: tiled {d} x {d} rows ({d} padded), tail {d} on GPU, units={d} mlp={d}\n", .{ what, n, t, n * t - plan.cover, seq - plan.cover, units, eng.coveredLayers() });
+    }
+
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    if (tail_out) |tail| {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, head_out);
+        _ = mlx.mlx_vector_array_append_value(vec, tail);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&joined, head_out));
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, joined, shape.ptr, shape.len, s));
+    return out;
+}
+
+fn rowsView(x: mlx.mlx_array, lo: c_int, hi: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const start = [_]c_int{ lo, 0 };
+    const stop = [_]c_int{ hi, mlx.getShape(x)[1] };
+    const step = [_]c_int{ 1, 1 };
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 2, &stop, 2, &step, 2, s));
+    return o;
+}
+
+/// [rows, W] -> n contiguous [W][T] fp16 plane images in ONE eval, zero rows
+/// padding the last tile (each ANE row is independent, so they only cost time).
+fn packTiles(s: mlx.mlx_stream, head: mlx.mlx_array, n: c_int, t: c_int, w: c_int) !mlx.mlx_array {
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    const rows = mlx.getShape(head)[0];
+    if (rows < n * t) {
+        const zero_f32 = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero_f32);
+        var zero = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zero);
+        try mlx.check(mlx.mlx_astype(&zero, zero_f32, mlx.mlx_array_dtype(head), s));
+        const axes = [_]c_int{0};
+        const lo = [_]c_int{0};
+        const hi = [_]c_int{n * t - rows};
+        try mlx.check(mlx.mlx_pad(&full, head, &axes, 1, &lo, 1, &hi, 1, zero, "constant", s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&full, head));
+    }
+    var r3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r3);
+    const s3 = [_]c_int{ n, t, w };
+    try mlx.check(mlx.mlx_reshape(&r3, full, &s3, 3, s));
+    var tr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tr);
+    const perm = [_]c_int{ 0, 2, 1 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &perm, 3, s));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, tr, .float16, s));
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    const fs = [_]c_int{n * w * t};
+    try mlx.check(mlx.mlx_reshape(&flat, f, &fs, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    return flat;
+}
+
+fn fillInputs(eng: *AnePrefill, tile: []const f16) !void {
+    var last: ?[*]f16 = null;
+    for (eng.units) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        if (plane == last) continue; // shared input surface
+        @memcpy(plane[0..tile.len], tile);
+        last = plane;
+    }
+}
+
+/// Each unit's n [W, T] fp16 output tiles back to [n*T, W] rows in `dt`,
+/// summed across units.
+fn sumUnitTiles(s: mlx.mlx_stream, outs: []const mlx.mlx_vector_array, n: c_int, t: c_int, w: c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
+    var acc = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(acc);
+    for (outs, 0..) |tiles, u| {
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, tiles, 0, s));
+        var r3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r3);
+        const s3 = [_]c_int{ n, w, t };
+        try mlx.check(mlx.mlx_reshape(&r3, cat, &s3, 3, s));
+        var tr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tr);
+        const perm = [_]c_int{ 0, 2, 1 };
+        try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &perm, 3, s));
+        var cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, tr, dt, s));
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        const s2 = [_]c_int{ n * t, w };
+        try mlx.check(mlx.mlx_reshape(&part, cast, &s2, 2, s));
+        if (u == 0) {
+            try mlx.check(mlx.mlx_array_set(&acc, part));
+        } else {
+            var sum = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_add(&sum, acc, part, s));
+            _ = mlx.mlx_array_free(acc);
+            acc = sum;
+        }
+    }
+    return acc;
+}
 
 // ── Tests ──
 
@@ -1139,6 +1860,26 @@ test "aneShareRows: 32-row floor, GPU remainder, engagement minimum" {
     try testing.expect(clamped <= 8192 - 16 and clamped % 32 == 0 and clamped > 0);
 }
 
+test "calibratedShare: balanced timings keep the seed, a slower GPU hands the ANE more" {
+    // ANE tiles and GPU complement took the same time at 0.45: already balanced.
+    try testing.expectEqual(@as(f32, 0.45), calibratedShare(0.45, 1.0, 1.0));
+    // The complement took twice as long: 0.45 / (0.45 + 0.275) = 0.62.
+    try testing.expectEqual(@as(f32, 0.62), calibratedShare(0.45, 1.0, 2.0));
+}
+
+test "shareVariant: a calibrated set's tag reads back as its share, any other never does" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqual(@as(?f32, 0.6), parseShareVariant(try shareVariant(&buf, 0.6, true)));
+    try testing.expectEqual(@as(?f32, null), parseShareVariant(try shareVariant(&buf, 0.4, false)));
+}
+
+test "mediaTilePlan: a partial last tile pads onto the ANE only when that beats the GPU tail" {
+    // ACE 30 s at 0.60: the 119-row tail outweighs 256 x 0.40 rows of ANE work.
+    try testing.expectEqual(TilePlan{ .tiles = 2, .cover = 375 }, mediaTilePlan(375, 256, 0.60));
+    // H3 at 0.45: 116 < 256 x 0.55, so the tail stays on the GPU.
+    try testing.expectEqual(TilePlan{ .tiles = 11, .cover = 2816 }, mediaTilePlan(2932, 256, 0.45));
+}
+
 test "channelSliceWidth: 128-aligned slice, GPU remainder, degenerate shares" {
     // The 27B geometries at the default share (the spike's probed widths).
     try testing.expectEqual(@as(u32, 6912), channelSliceWidth(17408, 0.40));
@@ -1244,4 +1985,51 @@ test "quantizeRowsInt8: round-trip, per-row scales, zero row" {
             try testing.expect(@abs(deq - w[i * 4 + j]) <= rq.s[i] * 0.5 + 1e-9);
         }
     }
+}
+
+test "solveShare: lands on the four measured optima, clamps, degenerate probe = default" {
+    const a = ANE_TFLOPS_M1_M4;
+    // (implied GPU rate, measured optimum) from the 2026-09-10 sweeps.
+    const rows = [_]struct { g: f64, want: f32 }{
+        .{ .g = 0.18 * a, .want = 0.85 }, // M4 base / ACE-Step
+        .{ .g = 0.33 * a, .want = 0.75 }, // M1 Pro / ACE-Step
+        .{ .g = 0.67 * a, .want = 0.60 }, // M4 Max / ACE-Step
+        .{ .g = 1.22 * a, .want = 0.45 }, // M4 Max / H3
+    };
+    for (rows) |r| {
+        try testing.expectEqual(r.want, solveShare(a, r.g));
+        // A few % of probe jitter must not move it: a new share is a cold compile.
+        try testing.expectEqual(r.want, solveShare(a, r.g * 0.97));
+        try testing.expectEqual(r.want, solveShare(a, r.g * 1.03));
+    }
+    try testing.expectEqual(@as(f32, 0.85), solveShare(a, 0.01 * a));
+    try testing.expectEqual(@as(f32, 0.25), solveShare(a, 10 * a));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(a, 0));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(0, a));
+}
+
+test "aneTflopsFor: one row for M1-M4 per unit, unknown silicon is no row" {
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M1 Pro", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M4", 1));
+    try testing.expectEqual(@as(?f64, 2 * ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M3 Ultra", 2));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M5 Max", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M45", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("", 1));
+}
+
+test "mediaGateRefusal: total-RAM bill, then the build peak against a swap floor" {
+    const gib = 1024 * 1024 * 1024;
+    // Fits total RAM and leaves the floor: admitted.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(128 * gib, 60 * gib, 40 * gib, 4 * gib, 2 * gib));
+    // The old gate: resident + bill + baseline over total.
+    try testing.expectEqual(@as(?GateRefusal, .total_ram), mediaGateRefusal(32 * gib, 20 * gib, 26 * gib, 5 * gib, 1 * gib));
+    // The M1 Pro case: passes total RAM, but the int8 copy + the build's f32
+    // transient would leave the system under the swap floor.
+    try testing.expectEqual(@as(?GateRefusal, .swap_floor), mediaGateRefusal(32 * gib, 10 * gib, 15 * gib, 7 * gib, 2 * gib));
+    // Unknown available (probe failed) is no information.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(32 * gib, 0, 15 * gib, 7 * gib, 2 * gib));
+}
+
+test "buildPeakBytes: three host f32 copies plus the MLX dequant transient" {
+    try testing.expectEqual(@as(u64, 4 * 4 * 8 * 4), buildPeakBytes(4, 8));
 }

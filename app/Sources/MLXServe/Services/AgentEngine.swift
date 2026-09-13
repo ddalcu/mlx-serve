@@ -42,9 +42,16 @@ enum AgentEngine {
     // MARK: - Context Helpers
 
     /// Determine effective context length from user config or model metadata.
-    static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?) -> Int {
-        if appContextSize > 0 { return appContextSize }
+    /// The server's advertised context wins: it already reflects `--ctx-size`
+    /// and the model's own `model-settings.json` override. The slider answers
+    /// only before a server has reported one.
+    /// - Parameter apple: chat is answered by the on-device model, whose
+    ///   window is fixed and much smaller than anything served here.
+    static func effectiveContextLength(appContextSize: Int, modelContextLength: Int?,
+                                       apple: Bool = false) -> Int {
+        if apple { return AppleFoundationChat.contextTokens }
         if let modelCtx = modelContextLength, modelCtx > 0 { return modelCtx }
+        if appContextSize > 0 { return appContextSize }
         return 32768  // safe default
     }
 

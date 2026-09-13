@@ -97,7 +97,8 @@ final class ModelRowActionsTests: XCTestCase {
             .appendingPathComponent("Sources/MLXServe/Views/ModelBrowserView.swift")
         let text = try String(contentsOf: src, encoding: .utf8)
         for needle in ["activateFileViewerSelecting", ".contextMenu", "ModelRowActions.showsLock",
-                       "ModelRowActions.showsTrash", "systemName: \"folder\"", "systemName: \"lock\""] {
+                       "ModelRowActions.showsTrash", "systemName: \"folder\"", "systemName: \"lock\"",
+                       "Model Settings\\u{2026}", "ModelSettingsSheet("] {
             XCTAssertTrue(text.contains(needle), "the row never wires \(needle)")
         }
         XCTAssertFalse(text.contains("externaldrive.badge.icloud"),

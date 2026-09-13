@@ -10,6 +10,7 @@ struct ImageGenView: View {
     /// The enlarge side. Two services, one pane — see `ImagePanePreview`.
     @EnvironmentObject var restore: RestoreService
     @EnvironmentObject var server: ServerManager
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
     /// For "Send to Chat" — the hand-off opens a new conversation and switches
     /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
@@ -54,6 +55,12 @@ struct ImageGenView: View {
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
+    /// how strongly to follow the prompt over the unconditional pathway.
+    @State private var guidanceScale: Double = 1.0
+    /// What to steer away from (Advanced, CFG only). Transient like the main
+    /// prompt — not persisted.
+    @State private var negativePrompt: String = ""
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
     @State private var loras: [LoraAdapter] = []
@@ -641,11 +648,8 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            // No CFG field and no negative prompt: NO image backend reads either
-            // one (`handleImage` parses neither, and the app never sent
-            // guidance), so both were pure decoration on every model, not just
-            // the distilled ones. Steps stay overridable even where the schedule
-            // is fixed — it's the Advanced panel, and the hint says the cost.
+            // Steps stay overridable even where the schedule is fixed — it's
+            // the Advanced panel, and the hint says the cost.
             HStack {
                 // Steps belong to the image schedule; an enlarge is one step
                 // by construction, so the field would be a lie there.
@@ -661,6 +665,28 @@ struct ImageGenView: View {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+
+            // Real CFG — the undistilled base checkpoint only. Every other
+            // preset has guidance baked into its weights, so the field would
+            // be pure decoration there and stays hidden. SeedVR2 reads neither
+            // field, so an enlarge hides them too.
+            if effectiveVerb != .enlarge, model.supportsGuidance {
+                Divider()
+                Text("Classifier-free guidance").font(.caption.weight(.semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Guidance scale").font(.caption)
+                    Stepper(value: $guidanceScale, in: 1...20, step: 0.5) {
+                        Text(String(format: "%.1f", guidanceScale))
+                    }
+                    .onChange(of: guidanceScale) { _, _ in guard !hydrating else { return }; persist() }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Negative prompt").font(.caption)
+                    TextField("", text: $negativePrompt, prompt: Text("what to steer away from (optional)"))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
             }
             Toggle("Keep model loaded afterwards", isOn: $keepResident)
                 .font(.caption)
@@ -807,7 +833,7 @@ struct ImageGenView: View {
     /// preview's "Enlarge a photo…" is a verb and a file panel in one gesture,
     /// not "attach something and then go find the mode".
     private func chooseSourceImage(verb: ImageSourceVerb? = nil) {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -823,7 +849,7 @@ struct ImageGenView: View {
     }
 
     private func chooseRefImage() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -851,7 +877,7 @@ struct ImageGenView: View {
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
@@ -1234,6 +1260,7 @@ struct ImageGenView: View {
         sourceVerb = s.sourceVerb
         condGain = s.condGain
         condWeightsText = s.condWeightsText
+        guidanceScale = s.guidanceScale
         loras = s.loras
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
@@ -1265,6 +1292,7 @@ struct ImageGenView: View {
         s.sourceVerb = sourceVerb
         s.condGain = condGain
         s.condWeightsText = condWeightsText
+        s.guidanceScale = guidanceScale
         s.loras = loras
         s.save()
         RestoreGenSettings(modelId: LanPick.persisted(lanModel: restoreLanModel, presetId: restoreModel.id),
@@ -1306,7 +1334,9 @@ struct ImageGenView: View {
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loras: loras
+            loras: loras,
+            guidanceScale: model.supportsGuidance ? guidanceScale : 1.0,
+            negativePrompt: model.supportsGuidance ? negativePrompt : ""
         )
         persist()  // final capture — the agent's generate_image reuses these
 
@@ -1377,10 +1407,6 @@ struct ImageGenView: View {
     }
 
     private func showLogWindow() {
-        let text = server.combinedGenLog(own: service.log)
-        let alert = NSAlert()
-        alert.messageText = "Image generation log"
-        alert.informativeText = text.isEmpty ? "(no output)" : text
-        alert.runModal()
+        AppActivation.openWindow(id: "serverLog", using: openWindow)
     }
 }

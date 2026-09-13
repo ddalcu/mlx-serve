@@ -18,9 +18,11 @@ char* jinja_render_chat(
     const char* messages_json,
     const char* tools_json,
     const char* extra_json,
-    int add_generation_prompt
+    int add_generation_prompt,
+    size_t* out_len
 ) {
     g_last_error.clear();
+    if (out_len) *out_len = 0;
     try {
         // Parse the template: lexer → parser → AST
         jinja::lexer lex;
@@ -56,7 +58,9 @@ char* jinja_render_chat(
 
         char* out = (char*)std::malloc(result.size() + 1);
         if (!out) return nullptr;
-        std::memcpy(out, result.c_str(), result.size() + 1);
+        std::memcpy(out, result.data(), result.size());
+        out[result.size()] = '\0';
+        if (out_len) *out_len = result.size();
         return out;
     } catch (const std::exception& e) {
         g_last_error = e.what();

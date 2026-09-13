@@ -75,17 +75,24 @@ final class VoiceOrbInlineTests: XCTestCase {
                       "the composer toggle must carry its session too")
     }
 
-    func testThinkingHeaderTogglesTheAccordion() throws {
+    /// The whole header toggles, and the chevron sits at the column's trailing
+    /// edge. Both are why the accordion is hand-built: `DisclosureGroup` pins
+    /// its chevron to the LEADING edge with no way to move it, and hit-tests
+    /// only that chevron — which left the "Thinking" text a dead click target
+    /// (same fix as the Agents editor's Advanced row).
+    func testTheWholeThinkingHeaderToggles() throws {
         let chat = try viewSource("ChatView.swift")
         let block = try declaration("thinkingBlock", in: chat)
-        XCTAssertTrue(block.contains("DisclosureGroup(isExpanded:"),
-                      "the thinking accordion needs an explicit binding so the header can drive it")
-        XCTAssertTrue(block.contains(".contentShape(Rectangle())")
-                      && block.contains(".onTapGesture"), """
-            the WHOLE header must toggle the accordion — macOS only hit-tests \
-            the chevron on a DisclosureGroup label, so without a tap gesture \
-            the "Thinking" text is dead (same fix as the Agents editor's \
-            Advanced row).
+        XCTAssertFalse(block.contains("DisclosureGroup"),
+                       "a DisclosureGroup cannot put its chevron on the trailing edge")
+        XCTAssertTrue(block.contains("Button"),
+                      "the header must be one button spanning the strip")
+        XCTAssertTrue(block.contains(".contentShape(Rectangle())"), """
+            a stack's empty space hit-tests against nothing, so without a \
+            content shape only the glyphs and the words are clickable and the \
+            gap between them is dead.
             """)
+        XCTAssertTrue(block.contains("Spacer("),
+                      "the chevron is pushed to the trailing edge, not laid beside the label")
     }
 }

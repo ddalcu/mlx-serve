@@ -136,6 +136,21 @@ assert_gt "system prompt produces response" "${#CONTENT}" 0
 echo "  content: '${CONTENT:0:100}'"
 echo ""
 
+# ── Test 2b: system role inside messages (#365) ──
+echo "--- Test 2b: system role inside messages ---"
+sys_tokens() {
+  curl -sf "$BASE/v1/messages" -H "Content-Type: application/json" -d "$1" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['input_tokens'])" 2>/dev/null
+}
+SYS_TEXT="You are a pirate. Every response must include the word arrr."
+BASE_TOKENS=$(sys_tokens '{"model":"mlx-serve","max_tokens":1,"messages":[{"role":"user","content":"Greet me."}]}')
+TOP_TOKENS=$(sys_tokens "{\"model\":\"mlx-serve\",\"max_tokens\":1,\"system\":\"$SYS_TEXT\",\"messages\":[{\"role\":\"user\",\"content\":\"Greet me.\"}]}")
+IN_TOKENS=$(sys_tokens "{\"model\":\"mlx-serve\",\"max_tokens\":1,\"messages\":[{\"role\":\"system\",\"content\":\"$SYS_TEXT\"},{\"role\":\"user\",\"content\":\"Greet me.\"}]}")
+echo "  input_tokens: none=$BASE_TOKENS top-level=$TOP_TOKENS in-messages=$IN_TOKENS"
+assert_gt "system in messages is rendered, not dropped" "$IN_TOKENS" "$BASE_TOKENS"
+assert_eq "system in messages costs the same as top-level" "$TOP_TOKENS" "$IN_TOKENS"
+echo ""
+
 # ── Test 3: Streaming ──
 echo "--- Test 3: Streaming /v1/messages ---"
 SSE=$(curl -sf "$BASE/v1/messages" \

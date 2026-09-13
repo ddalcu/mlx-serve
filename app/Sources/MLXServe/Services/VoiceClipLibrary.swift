@@ -94,7 +94,7 @@ enum VoiceClipLibrary {
     /// Pick an audio file and add it to the library. nil when the user cancels.
     @MainActor
     static func pickAndInstall() throws -> Clip? {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

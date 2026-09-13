@@ -10,7 +10,18 @@ const chat_mod = @import("chat.zig");
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
 
+/// Escape into a JSON string literal. Every string here is built from model
+/// bytes, and a token is a BPE fragment — see the same chokepoint in server.zig.
 pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) {
+        const clean = try chat_mod.utf8Sanitize(allocator, input);
+        defer allocator.free(clean);
+        return jsonEscapeValid(allocator, clean);
+    }
+    return jsonEscapeValid(allocator, input);
+}
+
+fn jsonEscapeValid(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '"');
@@ -103,13 +114,16 @@ pub const ReasoningConfig = struct {
 };
 
 /// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
-/// `null` / unknown → thinking disabled, budget unchanged.
+/// "none" is an explicit off, matching the chat and Anthropic surfaces;
+/// `null` / non-object → thinking disabled, budget unchanged.
 pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) ReasoningConfig {
     const v = reasoning_val orelse return .{ .enable = false, .budget = default_budget };
     if (v != .object) return .{ .enable = false, .budget = default_budget };
     const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
-    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget), .effort = effort_val.string };
+    const word = effort_val.string;
+    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
+    return .{ .enable = true, .budget = effortBudget(word, default_budget), .effort = word };
 }
 
 /// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
@@ -417,7 +431,7 @@ fn appendMessageItem(
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
-    const role = role_val.string;
+    const role = chat_mod.canonicalRole(role_val.string);
 
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
@@ -750,6 +764,16 @@ test "parseReasoning maps effort levels" {
     try testing.expectEqual(@as(i32, -1), parseReasoning(null, -1).budget);
 }
 
+// `none` is the OpenAI/gpt-5.1 spelling of an explicit thinking-off on the chat
+// and Anthropic surfaces; Responses must agree, not treat a present effort as on.
+test "parseReasoning: effort none is an explicit thinking-off" {
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"none\"}", .{});
+    defer v.deinit();
+    const cfg = parseReasoning(v.value, -1);
+    try testing.expectEqual(false, cfg.enable);
+    try testing.expectEqualStrings("none", cfg.effort.?);
+}
+
 test "parseTextFormat extracts schema from flat shape" {
     const json =
         \\{"format":{"type":"json_schema","name":"x","schema":{"type":"object"}}}
@@ -853,6 +877,18 @@ test "parseInput string becomes single user message" {
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
     try testing.expectEqualStrings("hello", pi.messages.items[0].content);
+}
+
+test "parseInput reads a developer item as the system turn" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("You are S.", pi.messages.items[0].content);
 }
 
 test "parseInput with instructions prepends system" {

@@ -7,3 +7,6 @@
 [submodule "lib/mlxc-src"]
 	path = lib/mlxc-src
 	url = https://github.com/ml-explore/mlx-c
+[submodule "lib/opencode2-mlx-serve"]
+	path = lib/opencode2-mlx-serve
+	url = https://github.com/beamivalice/opencode2-mlx-serve

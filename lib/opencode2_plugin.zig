@@ -1,0 +1,15 @@
+pub const files = [_]struct { name: []const u8, bytes: []const u8 }{
+    .{ .name = "LICENSE", .bytes = @embedFile("opencode2-mlx-serve/LICENSE") },
+    .{ .name = "package.json", .bytes = @embedFile("opencode2-mlx-serve/package.json") },
+    .{ .name = "index.ts", .bytes = @embedFile("opencode2-mlx-serve/index.ts") },
+    .{ .name = "discover.ts", .bytes = @embedFile("opencode2-mlx-serve/discover.ts") },
+    .{ .name = "fixtures.ts", .bytes = @embedFile("opencode2-mlx-serve/fixtures.ts") },
+    .{ .name = "logtail.ts", .bytes = @embedFile("opencode2-mlx-serve/logtail.ts") },
+    .{ .name = "options.ts", .bytes = @embedFile("opencode2-mlx-serve/options.ts") },
+    .{ .name = "probe-live.ts", .bytes = @embedFile("opencode2-mlx-serve/probe-live.ts") },
+    .{ .name = "rows.ts", .bytes = @embedFile("opencode2-mlx-serve/rows.ts") },
+    .{ .name = "schedule.ts", .bytes = @embedFile("opencode2-mlx-serve/schedule.ts") },
+    .{ .name = "stats.ts", .bytes = @embedFile("opencode2-mlx-serve/stats.ts") },
+    .{ .name = "tracker.ts", .bytes = @embedFile("opencode2-mlx-serve/tracker.ts") },
+    .{ .name = "tui.tsx", .bytes = @embedFile("opencode2-mlx-serve/tui.tsx") },
+};

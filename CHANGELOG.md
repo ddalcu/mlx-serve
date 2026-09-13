@@ -1,17 +1,110 @@
 # Changelog
 
-## v26.9.1 (unreleased)
+## v26.9.3 — dev unreleased
 
 ### Highlights
-
+- **Long prompts need 2.5 GB less memory on Flash Next and the other conv-cached models.** Each linear-attention layer kept a 3-row view of its whole prefill chunk input alive until its next forward, so a 4096-token chunk pinned about 3 GB on Qwen3.8 Flash Next (by the same arithmetic, 7.5 GB on the 27B at chunk 8192). The tail is now an owned copy evaluated with the layer loop's cadence; output is byte-identical and prefill speed is unchanged. Found by Nikolai V. (#366). The prefill admission bill follows the fix, so a long prompt that used to be refused or narrowed at the memory ceiling now gets its full chunk width.
+- **Flash Next admission stops charging for a buffer that no longer grows.** The sparse-attention indexer's raw keys have been a fixed 32-row ring since #381, but they were still billed as 3 KB per token of context; at 512k tokens that was 1.6 GB of phantom that shrank the advertised context and refused prompts that fit. The ring is billed once per session now.
+- **`--mtp-head-kv-quant` lets Flash Next's speculative head keep its KV at the model's `--kv-quant` precision** (about 1 KB per token of context with MTP on, 1 GB at 1M). Off by default: the head stays dense bf16 as before. Acceptance measured within noise of dense from 4k to 128k with the flag on; the head's KV is now counted in admission either way, and a cached conversation whose speculative snapshot was saved at the other precision is re-saved on its next turn.
+- **`--wired-margin-gib <n>`** sets how far under a raised `iogpu.wired_limit_mb` the planner may reach (default 8, the previous fixed value). A 96 GB Mac running the limit at 90 or 96 GB can take 6 and gain 2 GB of admissible context.
+- **`--ssm-checkpoint-max` now defaults to 16** (was 32): it halves the checkpoint bytes a cached session holds (about 57 MB each on Flash Next), and at 256k tokens still leaves a checkpoint every 16k tokens for a diverging turn to resume from.
+- **A model can hand its memory back when nobody is using it.** `--idle-evict-secs N` unloads a model that has served nothing for N seconds, and the next request reloads it; in the app it is Settings ▸ Server ▸ "Unload idle models", off by default. The flag previously had no effect, and a status poll to `/props` no longer cold-loads a model just to answer it.
+- **Reloading a model no longer leaks the tokenizer, config and chat template it replaces.** A server that loaded and unloaded the same model repeatedly grew by the size of its CPU-side state on every cycle.
+- **Spark-X2.5 (XHToken, 1.7B and 4B) is served natively.** `mlx-serve pull spark` fetches the 4B MLX pack; thinking, tool calls and 1M-token context all ride the model's own template.
+- **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
+- **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
+- **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
+- **Image, video and music generation can borrow the Neural Engine.** Turn on `--ane-image`, `--ane-video` or `--ane-audio` (Settings ▸ Neural Engine) and Krea, MiniMax-H3 or ACE-Step split each denoise step between the GPU and the Neural Engine; the split is solved per Mac and model at the first request. Off by default, and the server declines by name when the Mac cannot hold it.
+- The Neural Engine compile cache is capped by the free space on the internal disk, so a full disk no longer ships a silently half-built offload.
+- **Chat with Apple's built-in on-device model.** Pick Apple Intelligence in the model picker and the conversation is answered by macOS itself: nothing to download and no server running. Tools work, but the model's window is a fixed 4k that macOS does not let anyone raise, so keep the tool list short. No thinking mode: the framework does not have one. The row appears only when Apple Intelligence is turned on in System Settings.
 - **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window.
-- **Watch a video take shape while it renders.** Video Generation has a "Show live preview while generating" toggle: with it on, each denoise step sends back a small still (or a filmstrip of several frames) so you can tell early whether a 6-minute render is going where you wanted. It reads the latent directly — no second decode — using the published colour projection for each model's latent space, so the picture actually resembles the finished clip on both LTX and MiniMax H3. Off by default, and off costs nothing.
+
+### Changes
+
+- The launcher offers a plain Shell beside the coding agents, on this Mac and in the sandbox.
+- Terminals open on click. The sandbox and host terminals no longer ask which folder to work in first; they use the working folder from Settings.
 
 ### Fixes
 
-- Long cached Pi/agent conversations are no longer refused by a phantom second KV-cache copy. RAM prefix restores share MLX buffers, and the cache memory limit now remains a hard cap even when one entry alone is oversized.
-- Qwen 3.8 Flash Next community/custom packs converted with `--ngram-bits 3/5/6` served a noise n-gram table (#305, thanks @Sinojen). The reader now follows `mx.quantize`'s dense packing; 2/4/8-bit packs are unchanged.
-- JSON-schema output with thinking enabled returned the JSON as `reasoning_content` with empty `content` on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now forces thinking off on every surface, matching `/v1/messages`.
+- Tool arguments whose array or object items repeat a key with the same value are coerced to the declared type again instead of reaching the client as a string (#402).
+- Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
+- OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
+- An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
+
+## v26.9.2 — Per-model settings, chat providers, faster Flash Next
+
+### Highlights
+
+- **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
+- **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
+- **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
+- **Every model can have its own settings.** Right-click a model in My Models > Model Settings to give it its own context size, KV cache precision and speculative-decoding default. They apply every time that model loads, and a model that is already running picks them up on the spot. Headless: `~/.mlx-serve/model-settings.json`.
+- **Chat with other servers from the same picker.** Settings > Providers takes any OpenAI-compatible chat server (a cloud API, another Mac, a local runtime) with its key, and its models appear in the model picker as `<model>@<name>`. Chat only for now; provider models are never shared over the LAN. Headless: `~/.mlx-serve/providers.json`.
+- **Qwen 3.8 Flash Next is faster across the board.** Speculative decoding costs less per step, reaches full speed on the first request instead of the fifteenth, and picks its draft from a small shortlist instead of reading the whole vocabulary. Long prompts process faster too. On an M4 Max the headline goes 83 to 93 tokens per second, with +50% at short prompts and +30% at 64k and 128k. Generated text is unchanged.
+- **Long Flash Next conversations can live on SSD.** With `--prefix-cache-disk`, memory holds the model and the conversation you are in; every other conversation is written to disk in the background and comes back in seconds instead of minutes when you return to it.
+- **Speculative decoding knows when to stop helping.** Past some conversation length a speculative step costs more than it saves; Flash Next now measures both and switches speculation off there and back on when it pays again. `--max-mtp-ctx <n>` sets a hard cutoff if you want one.
+- **Structured (JSON schema) output at full speed.** Constrained decoding used to crawl at about one token per second on Flash Next; it now runs at the model's normal speed. (#380)
+- **The chat reads the way you want.** Pick Narrow, Medium or Wide from Settings or F1 to F3. Your own messages get the same hover actions as replies, photos lay out in a grid, the reasoning block collapses out of the way and shows how long the model thought, tables no longer squeeze their headers, and numbered lists, quotes and inline code render properly. (#339, thanks @lojza3d)
+- **My Models shows how much disk space is left.** (#328, thanks @justinluque)
+- **Several people can use speculative decoding at once.** On dense Qwen 3.5/3.8 models, concurrent users' draft checks now run in one pass (two users: 64 tok/s combined instead of 48; three: 73), and with four or more the server switches them to plain batching, which is faster there. On Flash Next a second MTP user no longer waits for the first to finish. Concurrent output is unchanged: at a fixed draft depth it is byte-identical on Flash Next and within kernel rounding on the batched path.
+- **Concurrent users on Qwen 3.5 and 3.8 MoE models share one decode pass** instead of taking turns, the same batching dense models and Flash Next already had. You can now see whether your model batches: Settings > Concurrent requests says so, `/props` carries a `batching` object, `/v1/models` rows carry `batched_decode`, and the log names the reason whenever a request has to decode on its own (speculative decoding, JSON schema, logprobs). Running two servers on one Mac for two users was never needed; the log line at boot now says so at every `--max-concurrent` value.
+
+### Fixes
+
+- Claude Code no longer loses its SessionStart hook output, `CLAUDE.md` or any other context a client puts in a `system` message inside `messages` on `/v1/messages`. It was discarded without a warning, so the reply looked plausible on a third less prompt. (#365, thanks @nikolai-vysotskyi)
+- A `developer` message is read as the system turn instead of being dropped for an unknown role.
+- Mage-Flow Edit loads again. It had been refused for a missing vision tower, which the loader was dropping before the backend saw it.
+- Gemma 4, LFM2.5-8B-A1B and Muse-Glimmer no longer show their thinking as the answer when streaming. When the model opened its own thought rather than the prompt template, the streamed reply carried the whole chain of thought as text while the same request unstreamed split it correctly.
+- A reply cut off in the middle of a character (an emoji, an accented letter) no longer makes the whole response unreadable to the client.
+- Pasting binary data into a chat (for example `grep -a` output) no longer silently cuts the conversation short at that point, and no longer knocks the prompt back to a generic format. The model used to answer with nothing and the agent's turn ended empty.
+- Tool calls survive tricky arguments: a value that happens to contain the tool format's own closing tags, a call cut off mid-way, or a number-like value such as `0755` is now passed through as written instead of being emptied, dropped, renamed or turned into a number.
+- Streaming and non-streaming replies agree in more places: a spent reasoning budget no longer leaks the rest of the thinking into the answer, a tool-calling reply keeps the sentence the model said before the call, `stop` sequences cut at the exact match, a client that hangs up is reported as a disconnect instead of a token limit, and `seed: -1` means unseeded instead of crashing the server.
+- A long hybrid-model conversation no longer suddenly re-reads its whole history from scratch (nine minutes at 390k tokens). Two causes: a cached turn did not inherit the restore points of the entry it grew from, and a text turn after a run of image turns could not find any of them. Both fixed, and a miss with a matching prompt is now logged.
+- Running out of GPU memory during a very long prompt no longer kills the server: that request gets an error and the next one is served. Requests are also admitted more accurately, so a long prompt that fits is no longer refused for memory it would never use, and the cache is evicted to make room instead of the request being turned away. (#353)
+- Raising `iogpu.wired_limit_mb` is honoured: a 448k-token Flash Next conversation used to be refused because the guard looked at RAM other apps left free rather than the limit you set.
+- The prefix cache budget follows what is actually loaded. It used to be fixed at startup against every model on the machine, so a model loaded next to a large one could keep a near-zero cache for the whole session. (#364)
+- A batch of unrelated requests no longer evicts your live conversation from the cache; each workload evicts its own entries first. (#378)
+- Speculative decoding on Flash Next no longer pays for a full draft round when the model's very first token ends the reply, and that prompt still lands in the cache for the next turn.
+- Very long prompts no longer process at the narrowest width on a 1M-context server; the width is chosen per request.
+- Long Flash Next sessions no longer end in "Failed to create Metal shared event": a small buffer per generated token was never released.
+- Models with padding rows past the end of their vocabulary (Flash Next has 243) can no longer pick one; a reply used to lose a step when that happened.
+- A model shipping both a drafter and an MTP head now uses the drafter, as intended; `--no-drafter` hands the round back to MTP. The drafter also samples 8 rounds before giving up on a request instead of 3.
+- A stale speculative-decoding cost table from an older build is cleaned up at load instead of steering the planner away from the fastest width. (#382)
+- A malformed Flash Next checkpoint is refused at load instead of served.
+- `--max-tokens N` in serve mode sets the reply budget for clients that do not send one, and `mlx-serve launch claude` passes the server's real context size instead of assuming 200k.
+- The server log says `auto` instead of a billion tokens when a client omits `max_tokens`.
+- Show log in the image, video, audio and 3D panes opens the Server Log window, and a recommended model that ships a draft head is rated at the speed it actually runs.
+
+## v26.9.1 — Terminals in the sidebar, 1M context, faster Flash Next
+
+### Highlights
+
+- **Your coding agents moved in with your chats.** The separate Sandbox window is gone. Claude Code, pi, opencode, codex and the rest now sit in the Sessions list beside your conversations. Drag to reorder, jump anywhere with Cmd+1..9, rename, pick a theme per terminal, or pop one out into its own window. Close a window and the session keeps running. Each terminal asks for a folder and mounts it at `/projects/<name>`, so you can work several projects at once. Themes live in Settings > Interface.
+- **Qwen 3.8 Flash Next reads a million tokens.** YaRN rope scaling to 1,048,576 tokens, compatible with HF and vLLM and checked against the reference past the trained window (#323, thanks @beamivalice). `--config-overrides` turns it on without touching the model folder.
+- **And it got quicker doing it.** Decode is up 10% on an M4 Max (63 -> 69 tok/s short, 55 -> 61 at 8.5k). Long prompts prefill a lot faster: 32k 589 -> 699, 128k 395 -> 654, 256k 267 -> 551 tok/s. Long-context decode holds up too, a 128k prompt now decodes at 47 tok/s instead of 40, and the gap grows with context (thanks @beamivalice). The first long prompt after a restart no longer takes three times longer (38k: 174 s -> 55 s). Direct-index idea from Jonathan Spangler's oMLX (jundot/omlx #3244).
+- **Long agent sessions stop starting over.** Hybrid models (Qwen 3.5, 3.8, Flash Next) used to cold-prefill a 200k prompt every turn once a session got big. Four cache fixes put an end to that: checkpoints stay spread across the prompt (#307, #310, thanks @kartalbas), entries rank by what can actually be restored (#312, thanks @IridiumMaster), an entry that outgrows the budget keeps the part that fits instead of being thrown away (#330, thanks @d-b), and a restore is no longer counted twice (#326, thanks @ViRb3).
+- **Image chats stay snappy.** Only the current turn's picture is decoded; earlier ones ride the cache, and swapping a picture keeps everything before it (#318, #320, #314, thanks @IridiumMaster).
+- **Watch your video take shape.** Video Generation gained a live preview toggle: every denoise step sends back a small still or filmstrip for LTX and MiniMax H3. Off by default, and free when off (#208, thanks @Rhystic1).
+- **Your Mac stays awake while it works** (#251, thanks @JustasMonkev). `--no-prevent-sleep` if you'd rather it didn't.
+- **Make it yours.** Settings > Interface: light, dark or system, accent colour, chat text size, compact mode, and your own global shortcut for the quick launcher (#143, thanks @deanputney).
+- **Lighter chat history.** Images are stored as files instead of base64 in the history, so a typical history shrinks from 1.5 MB to 80 KB. HEIC, TIFF and raw photos are converted so the model actually sees them (#313, thanks @lojza3d).
+- **MiniCPM5 V3 tool calls** are understood natively, even when cut off mid-call (#315, thanks @uncle9x9).
+
+### Fixes
+
+- Chat templates using `|min` or `|max` on an array silently fell back to the wrong prompt format, so the model lost its stop token. Every MiniCPM5 multi-turn tool conversation hit this (#335, thanks @uncle9x9).
+- JSON-schema output with thinking on returned the JSON as reasoning with empty content on `/v1/chat/completions` and `/v1/responses` (#331, thanks @perretv). A schema request now turns thinking off everywhere, like `/v1/messages` already did.
+- Flash Next packs converted with `--ngram-bits 3/5/6` served noise from the n-gram table (#305, thanks @Sinojen). 2/4/8-bit packs were fine.
+- A big `--prefix-cache-mem` next to a big pack could pass the load and then die on a long prompt. The cache budget is now capped by what the weights leave free.
+- Flash Next prefills no longer die around 400k tokens: cache snapshots were cloning the growing sparse-attention history at every stride, tens of GB of it. It is stored once per cached prompt now (thanks @beamivalice).
+- LTX video crashed the server at "Decoding video" on 26.8.11 (#321, thanks @hermitdave, @jedisct1). MLX 0.32.2 changed how 3D convolutions run and the decoder's working set ballooned; peak memory is back from 67 GB to 36 GB at 97 frames 1024x576, same speed.
+- Image turns after a tool response landed at the wrong spot in the prompt on ChatML models.
+- Sparse-attention RoPE was missing the YaRN scale; the SSD cache fingerprint now includes `--config-overrides`.
+- An LTX download whose `.partial` file vanished could never finish.
+- Prose that merely mentions `<function name="...">` is no longer turned into a tool call.
+- Failed terminal rows offer Start Server / Retry instead of an alert; file pickers show hidden files.
+- Attachments the server cannot decode (HEIC, TIFF, camera raw) no longer drop out of the prompt silently.
+- Model Browser sizes and RAM fit for quantized repos were 4x too high after Hugging Face changed how it counts packed weights. They match the real download again.
 
 ## v26.8.11 — Qwen 3.8 Flash Next, MLX 0.32.2
 
@@ -71,7 +164,7 @@
 Same models, same Macs, 26.8.9 vs 26.8.10:
 
 | Mac | Model | 26.8.9 | 26.8.10 | |
-| --- | --- | --- | --- | --- |
+|---|---|---|---|---|
 | M1 Pro 32 GB | Qwen3.8 27B | 9.3 tok/s | 11.5 tok/s | **+24%** |
 | M1 Pro 32 GB | Qwen3.5 9B, 8k chat | 26.3 tok/s | 30.8 tok/s | **+17%** |
 | M4 Max | Qwen3.8 27B | 66 tok/s | 73 tok/s | **+10%** |
@@ -80,7 +173,7 @@ Same models, same Macs, 26.8.9 vs 26.8.10:
 Neural Engine prefill, 16k-token prompt (new, off by default):
 
 | Mac | Model | GPU only | + Neural Engine | |
-| --- | --- | --- | --- | --- |
+|---|---|---|---|---|
 | M1 Pro 32 GB | Qwen3.8 27B | 41 tok/s | 56 tok/s | **+35%** |
 | M4 16 GB | Qwen3.5 4B | 368 tok/s | 487 tok/s | **+32%** |
 | M4 Max | Qwen3.8 27B | 247 tok/s | 293 tok/s | **+19%** |
@@ -142,6 +235,7 @@ Neural Engine prefill, 16k-token prompt (new, off by default):
 - **Media checkpoints in My Models stopped reading as "Unsupported"** and gained a Use button. MiniMax Music 3, MageFlow and Kokoro were missing from the app's copy of the architecture list, so a model the app itself offers to download came back with a red badge. Thanks @Fe2-O3 (#229).
 - **The tray shows live prefill and decode tokens/s** Metrics are on by default now so those rows always have something to read — the cost is a few counters per request, never per token.
 - **The memory meter is one bar** — model, everything else in use, free — instead of two bars measured against the same total, which invited reading them as if they added up.
+
 
 ## v26.8.9 — Launch your coding agent, richer chat, faster decode
 
@@ -295,7 +389,7 @@ A sliding-window model looks back over a fixed window, not the whole conversatio
 Measured against v26.8.5 on an M4 Max, median of three runs per point, same models and settings on both:
 
 | Model | | 16k context | 64k context |
-| --- | --- | --- | --- |
+|---|---|---|---|
 | Muse-Glimmer 30B 4-bit | decode | 24.7 -> **40.2 tok/s** | 8.6 -> **21.0 tok/s** |
 | Laguna XS 2.1 NVFP4 | prompt | 609 -> **774 tok/s** | 236 -> **540 tok/s** |
 | Laguna XS 2.1 NVFP4 | decode | 62.7 -> **77.7 tok/s** | 34.9 -> **46.8 tok/s** |
@@ -313,7 +407,7 @@ The gain grows with the conversation, so short prompts are unchanged and below r
 - Turning thinking on for a model that has no thinking mode put the whole reply inside the Thinking box and left the answer blank. Only streaming replies were affected.
 - A tool call could be named after the wrong tool when one of its arguments contained something that looked like a tool call, such as a package.json being written to a file. Qwen 3.5 and 3.6 allow two ways of writing a call and the server read the wrong one first, so a file's contents could decide which tool ran.
 
-## v26.8.5 — Muse-Glimmer
+## v26.8.5 — Muse-Glimmer 
 
 ### Highlights
 
@@ -331,8 +425,8 @@ The gain grows with the conversation, so short prompts are unchanged and below r
 
 - A model folder can include a `drafter/` companion; the server loads it with the model, and switching models keeps the speedup. `--no-drafter` turns it off.
 - The draft size adapts to your Mac, and reused conversations keep their speedup instead of restarting it cold.
-- <https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit>
-- <https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit>
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit
+- https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit
 
 ### Thinking
 
@@ -423,7 +517,7 @@ The gain grows with the conversation, so short prompts are unchanged and below r
 - **Settings ▸ Model Folders ▸ Default folder** chooses where new downloads land. Everything already downloaded keeps working, because the old folder stays in the scan list.
 - Custom folders are actually served now. `--model-dir` is repeatable, so every folder you list shows up in `/v1/models` instead of only in the app's own picker. If the same model sits in two folders the download folder wins, and a folder that is not reachable is skipped with a warning instead of stopping the server.
 
-### Logprobs. Fixed
+### Logprobs. Fixed.
 
 - Three things were wrong at once, on every model: the numbers moved when you changed the temperature instead of being the model's own, ties handed back an arbitrary token, and the whole list was off by one so each token came back with the *next* token's alternatives.
 - None of this changed the text any model produced. It matters if you score outputs, route on confidence, or build evals.
@@ -455,7 +549,7 @@ The gain grows with the conversation, so short prompts are unchanged and below r
 - Streaming a long thinking block no longer costs CPU that grows with the length of the thought.
 - `/detokenize` returned bodies that no JSON parser would accept if any token contained a control byte.
 
-Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://github.com/funk80rus) and [@AideYu](https://github.com/AideYu) for testing and finding a bunch of problems! It really helps !
+Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://github.com/funk80rus) and [@AideYu](https://github.com/AideYu) for testing and finding a bunch of problems! It really helps ! 
 
 ---
 
@@ -506,6 +600,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
   - The chat window's minimum width is a bit wider.
   - Fix Prefill Guard. Adjusted OutOfMemory detector to be more accurate, and allow more of a ceiling.
 
+
 ## v26.7.12 — Deepseek V4 0731 + DSpark, Inkling Small support, Laguna 5x faster, Agents, media generation in chat
 
 - **The big speed release.** poolside Laguna XS generates almost 5x faster than the last release, from 25 to 121 tokens per second on an M4 Max. Qwen3.6 35B jumps 20%, from 129 to 155 tokens per second, and reaches 237 with its speed helper on. Most other models pick up a little too. One piece of this trades a tiny amount of wording variation for speed on certain models; it is on by default and can be switched off in Settings ("Fast decode for bf16-attention models"). The full version-by-version history lives in benchmarks.md.
@@ -522,10 +617,9 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **A nicer chat window.** Code blocks get colors, line numbers and a copy button. There is a model picker in the toolbar, web sources on answers, failed turns show as a tidy card instead of raw errors, and tools and MCP servers flip on and off with one click.
 - **Speed helpers set themselves up.** Download a dense Gemma 4 model and its speed-up companion model now comes along and just works, 27 to 40% faster on code and agent tasks. Nothing to pair up by hand.
 - **Faster model downloads.** Up to 16 connections per file, and model search stops getting rate limited when you have a Hugging Face token set.
-- **KV cache quantization is now fast.** With `--kv-quant 4` or `8`, decode now reads the compressed cache in place instead of unpacking it every token: 10% faster at 10K context and 56% faster at 42K on Laguna XS, 26% faster on Qwen3.6 27B at 37K.
+- **KV cache quantization is now fast.** With `--kv-quant 4` or `8`, decode now reads the compressed cache in place instead of unpacking it every token: 10% faster at 10K context and 56% faster at 42K on Laguna XS, 26% faster on Qwen3.6 27B at 37K. 
 - **Fixed runaway memory on long chats.** A long session could quietly grow the server to tens of GB until you quit it (#110). Fixed, and the memory panel now shows exactly where the memory goes.
 - **Fixed thinking for some models.** Laguna needed a bit special handling for thinking tags, and potentially other models based on their chat template.
-
 ---
 
 ## v26.7.11 — Mage-Flow image editing, a built-in console, faster MoE decode
@@ -533,7 +627,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Mage-Flow runs natively.** Microsoft's Mage-Flow Turbo generates images in 4 steps, and Mage-Flow Edit Turbo edits them from reference images: no masks, no fine-tuning, just the picture and what you want changed. Point it at several references and it composes them ("put the object from image 2 into image 1"). Full native port like everything else here, no Python. 8-bit conversions are on Hugging Face at 8.5 GB for generation and 9.1 GB for editing, against 16 GB for the originals.
 - **Image editing in the app.** The Image tab takes a source image now, tells you the edit comes back at your picture's own size, and hides the knobs a distilled model ignores (Mage-Flow is fixed at 4 steps, so raising it only costs you time).
 - **Edit images with the OpenAI SDK.** `client.images.edit(image=..., prompt=...)` now works against mlx-serve, including repeated `image[]` for multi-reference edits. It reaches the same engine as everything else, so it works on any edit-capable model you have loaded (FLUX.2 or Mage-Flow Edit). Anything OpenAI accepts that we can't honor gets a named 400 rather than being quietly ignored: masks, `n` > 1, URL response format, non-PNG output, streaming.
-- **The server has a real console now.** Open its address in a browser (<http://localhost:11234> by default) and you get a working chat against any model on the box, with history in the sidebar, a Monitor page showing what's loaded and the live metrics, and the full API reference. You can also just ask for things: "generate an image of a fox", attach a photo and say "make it winter", "write me a lo-fi track". It picks the right model for the job and shows the result inline, and it can answer questions about the server's own API.
+- **The server has a real console now.** Open its address in a browser (http://localhost:11234 by default) and you get a working chat against any model on the box, with history in the sidebar, a Monitor page showing what's loaded and the live metrics, and the full API reference. You can also just ask for things: "generate an image of a fox", attach a photo and say "make it winter", "write me a lo-fi track". It picks the right model for the job and shows the result inline, and it can answer questions about the server's own API.
 - **MoE coding models decode a lot faster.** A new in-place gather kernel for MoE decode reads the expert bank where it sits instead of paying for its size on every token. Laguna at 4-bit went from 37.0 to 55.5 tok/s on an M4 Max, and 2-bit is up 24%, both against the previous release.
 - **Bug fixes.**
   - Image edits keep the source photo's shape instead of squashing it.
@@ -604,7 +698,6 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Fix server crash** If you sent some un-expected payloads on some endpoints it would crash the server.
 - **Support for multiple different GGUF quant** Fixes issue #76, once you downloaded a GGUF quant you were stuck with that, now you can download & select others also.
 - **Swift window focus issue** Sometimes the windows would not properly focus on click, and put them in a weird state, now fixed.
-
 ---
 
 ## v26.7.6 — Long contexts that actually fit, and fly
@@ -682,7 +775,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 
 - **Agent Sandbox, built on Apple's own virtualization** The isolated Linux VM that runs the agent's shell commands is now powered directly by Apple's Virtualization framework: it boots in under a second, and the same design is Mac App Store-compatible. The agent is also told which environment it's in — Linux sandbox or your Mac — so it stops reaching for `brew` inside the VM (and vice versa), a green shield in the chat toolbar shows when commands run isolated, and the `/workspace` mount follows your working-folder switch automatically. The working-folder chip now shows just the folder's name (full path in the tooltip).
 - **Quick Launcher: ⌃Space, ask, done.** A new Spotlight-style prompt panel summons over any app — hit ⌃Space, type a question, and the answer streams in right there from your local model, no window shuffling. Follow-ups keep their context, ⌘↩ hands the conversation off to the full chat window, and Esc dismisses while the answer keeps generating into your chat sidebar. Opt in with the new toggle under Voice in the menu-bar tray; no permissions prompt, works from any Space or full-screen app.
-- **Two-stage video quality is back, native and actually looks good now.** The Quality and Super-Quality video presets now run the full reference two-stage pipeline on the native engine: a guided half-resolution pass on the dev model (CFG + modality guidance, with the second-order res_2s sampler for Super-Quality), a learned 2× latent upscale, then a distilled refine at full resolution.
+- **Two-stage video quality is back, native and actually looks good now.** The Quality and Super-Quality video presets now run the full reference two-stage pipeline on the native engine: a guided half-resolution pass on the dev model (CFG + modality guidance, with the second-order res_2s sampler for Super-Quality), a learned 2× latent upscale, then a distilled refine at full resolution. 
 - **Make your characters speak.** Put the spoken words in quotes in your video prompt — short phrases with acting directions between them — and LTX generates the voice, timed to the picture. A new "Talking character" example in the Video pane shows the format, and audio guidance on the Quality presets now steers harder toward clean speech: clearer voices, less stray background noise. Attach a real speech or music clip in the Video pane's new Speech & sound section — or type a line and have the local Qwen3-TTS voice speak it — and the video is generated *against* that soundtrack: voices, lip sync, and performance follow the clip, and the original audio (not a lossy re-synthesis) lands in the mp4. Any WAV/MP3/M4A works, the frame count auto-fits the clip length, and everything runs on-device through the same one-click LTX download (`audio` field on `/v1/video/generations` for API users).
 - **Image-to-video: animate your own photo.** Drop a picture into the Video pane's First frame slot and the clip begins from it — the image is VAE-encoded and locked as the clean opening frame on your Mac, and the model animates forward from there. It works on the standard one-stage pipeline at any resolution, and if you don't attach an image (or haven't downloaded the encoder) it simply generates from the prompt as before.
 - **Edit your own photos with instructions.** Attach a picture in the Image pane, type what should change — "make the hair blue", "remove the monitor in the background" — and FLUX.2-klein edits the image while keeping the subject, pose, and scene intact: the source rides through the model as a clean in-context reference (the mechanism klein was trained on), not a noisy remix. Your photo keeps its proportions too — the reference is passed to the model at its own aspect ratio, so a portrait or landscape source is recomposed into the output size instead of being squished. Verified live: a "make the fox blue" edit kept 97% structural correlation with the original photo. Runs fully on-device (`mode:"edit"` + `image` on `/v1/images/generations`).
@@ -692,6 +785,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Video generation is about 2× faster.** The one-stage LTX path now runs without classifier-free guidance by default — the setting it's actually designed for — which halves the work per step (one model pass instead of two) and tends to give a more natural, less over-saturated look. Want the punchier, higher-contrast style? Pass a guidance scale per request to turn it back on.
 - **Drop-in Ollama replacement.** mlx-serve now speaks the Ollama wire protocol (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/show`, `/api/ps`, `/api/pull`) alongside its OpenAI and Anthropic APIs — point Raycast, Obsidian, Enchanted, Open WebUI, ollama-python/js, or anything else that expects Ollama at your mlx-serve port and it just works: streaming, tool calling, thinking, images, JSON-schema formats, and tagged model names like `qwen3.6:latest` all translate natively. Same GGUF or MLX weights, the faster engine underneath.
 - **Improve command line: `mlx-serve run gemma4`.** One command downloads the model (resumable, straight from Hugging Face), starts the server, and drops you into a streaming chat REPL with live tok/s. `mlx-serve pull` and `mlx-serve list` round it out — short names like `qwen3.6:27b`, `gemma4:12b`, or any Hugging Face `org/repo` work everywhere, and `mlx-serve serve` exposes everything you've pulled for on-demand loading by name (models stored in `org/repo` folders are now discovered too, listed under that full name).
+
 
 ---
 
@@ -776,7 +870,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 
 ## v26.6.7 — Agent-grade speed and rock-solid concurrent streaming
 
-- **MacOS 26 Is now required** (issue #21),
+- **MacOS 26 Is now required** (issue #21), 
 - **Network GUI Settings** Expose port & bind ip (issue #22)
 - **Support qwen3_moe architecture** (Qwen3-30B-A3B / Coder) (issue #20)
 - **Big prompts tokenize faster.** A rewrite of the BPE tokenizer's merge loop takes a Claude Code-sized system prompt (~30 KB) from 3.9 seconds to 8 milliseconds — every request used to pay that cost, even on a full KV-cache hit. Warm agent turns now round-trip in ~0.1s end to end.
@@ -833,10 +927,10 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 
 - **Video generation & setup fix.** A breaking rename in the upstream `ltx-2-mlx` pipelines — plus a newly mandatory frame-rate setting — had been leaving on-device video generation broken even after a clean install. MLX Core now drives the current pipeline API across all three quality tiers (one-stage, two-stage, two-stage HQ), and the fast one-stage path picked up first-frame image-to-video support along the way.
 
+
 ---
 
 ## v26.6.1 — Gemma 4 12b Support
-
 - **Gemma 4 12B.** Run `gemma-4-12b-it-4bit` — the dense 12B slots between E4B and the 26B-A4B MoE for a quality-vs-speed middle ground.
 - **Agent mode that actually codes.** The built-in agent now completes real multi-step coding tasks instead of stalling. Tool calls whose name carries a stray trailing colon (some Gemma 4 builds emit `shell:`) resolve correctly instead of dead-looping on "unknown tool"; the shell tool closes stdin so interactive scaffolders like `npm create svelte` / `npx sv create` fail fast instead of freezing the agent, backed by a timeout that can't hang on a runaway command; and the agent is steered toward non-interactive setup (`npm install` + writing files directly) over interactive wizards. A local model can now `npm install`, initialize Prisma, and create a SQLite database end-to-end.
 - **Reliable Gemma 4 tool calls with nested arguments.** Tool calls whose arguments contain nested objects or arrays — a metadata object, a list of recipients — now come back as valid JSON instead of malformed output that broke the call.
@@ -858,6 +952,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Engine-aware Settings.** The Settings window now shows the right knobs for the model you've loaded: MLX targets see the MLX KV-quant + speculative-decode controls; GGUF targets see llama.cpp's own quant and session-cache controls instead of MLX toggles that silently no-op. New rows for `--llama-kv-quant`, `--llama-cache-entries`, and `--tokenize-cache-entries`; restart banner fires when launch flags change.
 
 - **Smarter Model Browser for GGUF.** GGUF repos now show a "X–Y GB" RAM-estimate range covering the smallest and largest quants in the repo, the previous "Unsupported architecture" false-flag on LM Studio's community GGUF repacks (`lmstudio-community/gemma-4-E4B-it-GGUF` and friends) is fixed, mmproj sidecars are auto-skipped when picking a `.gguf` from a folder, and the MLX-only drafter pairing chip no longer appears on rows where it can't apply. Downloads + Download action columns widened so headers and the GGUF "Download ▾" menu render on one line.
+
 
 ---
 
@@ -899,7 +994,7 @@ Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://
 - **Adaptive prompt-time gate**: per-request 3-gram repetition score on the prompt disables PLD/drafter on novel content (`spec_gate_threshold = 0.01`). Validated 9/9 on a tuning corpus. Bypass with explicit `enable_pld:true` / `enable_drafter:true` in the request body.
 - **Runtime acceptance gate**: mid-decode fallback when actual draft acceptance is below break-even — < 0.30 after 5 attempts for PLD/drafter, < 0.70 after 8 attempts for MTP (binary outcome → separate threshold). Sticky per-request; protects against workloads the prompt-time gate misjudged.
 - **Settings window** (MLX Core, Cmd+,): single source-of-truth for server-launch flags (port, ctx-size, log-level, vision, MTP/PLD/drafter, draft lengths) and per-request defaults (max-tokens, temperature, top-p/top-k, repeat/presence penalty, reasoning budget, thinking, per-request spec-decode overrides). Restart banner appears when launch flags change; per-request fields apply on the next chat.
-- **Tokenizer correctness fix**: GPT-2 pre-tokenizer rewritten as a priority-ordered state machine matching the reference regex. Four classes of splits now correct — leading-space + letters as one pre-token (`total`), leading-space + punct (`+=`), multi-space runs preceding identifiers (`total`), and digits as single codepoints (`100` → 1, 0, 0). Old impl perturbed BPE merges on every subsequent word.
+- **Tokenizer correctness fix**: GPT-2 pre-tokenizer rewritten as a priority-ordered state machine matching the reference regex. Four classes of splits now correct — leading-space + letters as one pre-token (` total`), leading-space + punct (` +=`), multi-space runs preceding identifiers (`    total`), and digits as single codepoints (`100` → 1, 0, 0). Old impl perturbed BPE merges on every subsequent word.
 - **Markdown rendering**: assistant messages render in a single NSTextView so drag-select spans paragraphs / lists / code blocks / tables. Adds GFM table parsing with column alignment; small in-prompt nudge steers smaller models toward GFM table syntax for plain-chat tabular output.
 - **`/v1/models` meta additions**: `model_max_tokens` (architectural cap, independent of `--ctx-size`) and `supports_mtp` (config declares MTP layers).
 - **Build**: Swift 5 language mode globally (`-Xswiftc -swift-version -Xswiftc 5`) — required under Swift 6.3 / Xcode 26+ because the pinned `swift-sdk` 0.10.x trips new `SendingRisksDataRace` diagnostics. No-op on the Swift 6.1 CI runner.

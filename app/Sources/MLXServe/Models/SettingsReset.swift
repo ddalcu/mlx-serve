@@ -37,7 +37,8 @@ enum SettingsReset {
         // `@AppStorage`-backed display prefs, not a `ServerOptions` field —
         // each of its rows (appearance/accent/text size/compact/shortcut)
         // carries its own control default or Reset (the shortcut row's).
-        case .modelFolders, .updates, .about, .interface:
+        // Providers live in providers.json, edited row by row in their own pane.
+        case .modelFolders, .updates, .about, .interface, .providers:
             return []
 
         case .server:
@@ -57,6 +58,7 @@ enum SettingsReset {
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
                 f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
                 f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
+                f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
             ]
 
         case .lanSharing:
@@ -78,7 +80,7 @@ enum SettingsReset {
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
+                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 
@@ -87,13 +89,20 @@ enum SettingsReset {
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
-                f("anePrefill") { $0.anePrefill = $1.anePrefill },
                 f("decodeAttnQuantChoice") { $0.decodeAttnQuantChoice = $1.decodeAttnQuantChoice },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("enablePrefixCacheDisk") { $0.enablePrefixCacheDisk = $1.enablePrefixCacheDisk },
                 f("prefixCacheDisk") { $0.prefixCacheDisk = $1.prefixCacheDisk },
+            ]
+
+        case .neuralEngine:
+            return [
+                f("anePrefill") { $0.anePrefill = $1.anePrefill },
+                f("aneImage") { $0.aneImage = $1.aneImage },
+                f("aneVideo") { $0.aneVideo = $1.aneVideo },
+                f("aneAudio") { $0.aneAudio = $1.aneAudio },
             ]
 
         case .ggufPerformance:

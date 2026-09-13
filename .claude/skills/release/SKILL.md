@@ -16,7 +16,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 | 5 | API conformance | `npx llmprobe@latest http://127.0.0.1:<port>/v1 --quick` → expect **100%** engine conformance | ~10 s/model |
 | 6 | Regression scripts | `integration_test.sh`, `test_anthropic_api.sh`, `test_ollama_api.sh`, `test_stream_keepalive.sh`, `test_disconnect_cancel.sh`, `test_pld_equivalence.sh`, `test_mtp_equivalence.sh` | ~15 min |
 | 7 | Soak (bigger releases) | `SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh` — RSS drift < 10% | 1 h |
-| 8 | **Cross-engine table** (only when an ENGINE version changed, or before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` per engine → rewrite the `vs other engines` table in `benchmarks.md` | ~90 min |
+| 8 | **Cross-engine check** (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` per engine; record in `~/claude-tmp/bench-<tag>/`, name the engine in every win — `benchmarks.md` carries mlx-serve only | ~90 min |
 | 9 | Bundle | `SKIP_NOTARIZE=1 bash app/build.sh` (both binaries move together) | ~2 min |
 
 **Rules:**
@@ -38,7 +38,7 @@ The record is `benchmarks.md` plus the saved llmprobe reports under `~/claude-tm
 Rules:
 - **Paste the printed rows into the `Decode tok/s by release` table**, one new column, mode suffix included. A cell that lost its mode suffix is the signal that speculation stopped engaging — chase it before shipping.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k. For a regression CLAIM on a spec cell, sample across runs and boot orders regardless of depth.
-- **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in the README caption. There is no longer a script that regenerates it; refresh the `vs other engines` table instead.
+- **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in the README caption. There is no longer a script that regenerates it, and `benchmarks.md` no longer carries a cross-engine table (dropped 26.9.2).
 
 ## Versioning & Releases
 

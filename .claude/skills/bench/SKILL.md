@@ -9,7 +9,7 @@ description: mlx-serve benchmarking methodology — bench.sh/llmprobe usage, com
 
 ```
 ./tests/bench.sh                                # every model (~did we regress)
-./tests/bench.sh --only qwen36-27b              # one row
+./tests/bench.sh --only qwen38-27b              # one row
 ./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
 ./tests/bench.sh --full                         # median of 3 per rung, to 64k
 ```

@@ -10,23 +10,21 @@ final class WelcomeModelPicksTests: XCTestCase {
         SystemMemoryInfo(totalBytes: total * gib, usableBytes: usable * gib)
     }
 
-    func testTwentyFourGBMacGetsGemma12BAndQwen9BAndDropsLaguna() {
+    func testTwentyFourGBMacGetsGemma12BAndQwen9B() {
         let picks = WelcomeModelPicks.forMemory(mac(total: 24, usable: 16))
         // General → Gemma 4 12B (26B-A4B needs ~17 GB, exceeds 16 usable).
         XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-12b")
         // Coding & agents → Qwen 9B (27B needs ~18 GB, exceeds).
         XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen35-9b")
-        // Coding specialist → Laguna XS needs ~24 GB, exceeds 16 → category dropped.
-        XCTAssertNil(picks.first { $0.category == "Coding specialist" })
         XCTAssertEqual(picks.count, 2)
     }
 
     func testLargeMacGetsTheBiggestOfEachType() {
         let picks = WelcomeModelPicks.forMemory(mac(total: 256, usable: 200))
-        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-31b-8bit")
+        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-26b-a4b-8bit")
         XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen36-35b-a3b")
-        XCTAssertEqual(picks.first { $0.category == "Coding specialist" }?.pick.id, "laguna-s-2.1-nvfp4")
-        XCTAssertEqual(picks.count, 3)
+        XCTAssertNil(picks.first { $0.pick.id == "qwen38-flash-next" }, "Largest is a browser-only tier, not a welcome category")
+        XCTAssertEqual(picks.count, 2)
     }
 
     func testEveryPickHasAOneLineStrength() {
@@ -39,6 +37,6 @@ final class WelcomeModelPicksTests: XCTestCase {
     func testTinyMacStillGetsAtLeastAGeneralModel() {
         // 8 GB: usable ~6. Only the smallest Gemma fits; coding families drop.
         let picks = WelcomeModelPicks.forMemory(mac(total: 8, usable: 6))
-        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-e2b")
+        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-e4b")
     }
 }

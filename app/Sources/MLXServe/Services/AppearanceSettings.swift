@@ -13,6 +13,59 @@ enum InterfacePrefKey {
     static let accentColor = "accentColorName"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
+    static let chatColumn = "chatColumnWidth"
+    /// Default `TerminalTheme` id for new sandbox terminals; a session can
+    /// override it from its row's context menu.
+    static let terminalTheme = "terminalTheme"
+    /// "#RRGGBB" ground painted under the default terminal theme; "" = the
+    /// theme's own.
+    static let terminalBackground = "terminalBackground"
+}
+
+/// How wide a conversation reads: fixed points, so resizing the window spends
+/// the margins rather than reflowing the text; a window narrower than the
+/// setting wraps to the window.
+enum ChatColumnWidth: String, CaseIterable, Identifiable {
+    case narrow, medium, wide
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .narrow: return "Narrow"
+        case .medium: return "Medium"
+        case .wide: return "Wide"
+        }
+    }
+    /// nil = the window decides (`ChatMetrics.contentWidthFraction` of it).
+    var proseWidth: CGFloat? {
+        switch self {
+        case .narrow: return 840
+        case .medium: return 1260
+        case .wide: return nil
+        }
+    }
+
+    /// Narrower than the column: a user bubble reaching the reply's left edge
+    /// stops reading as the other side of the conversation.
+    var userBubbleWidth: CGFloat {
+        switch self {
+        case .narrow: return 700
+        case .medium, .wide: return 900
+        }
+    }
+
+    /// ⌘⌥1 / ⌘⌥2 / ⌘⌥3, narrowest first, in View ▸ Interface. ⌘ combos never
+    /// reach an embedded terminal, unlike bare function or Control keys.
+    var menuShortcut: KeyEquivalent {
+        switch self {
+        case .narrow: return "1"
+        case .medium: return "2"
+        case .wide: return "3"
+        }
+    }
+
+    static var current: ChatColumnWidth {
+        ChatColumnWidth(rawValue: UserDefaults.standard.string(forKey: InterfacePrefKey.chatColumn) ?? "") ?? .wide
+    }
 }
 
 enum AppAppearanceMode: String, CaseIterable, Identifiable {

@@ -3101,11 +3101,17 @@ pub const VisionTower = struct {
 
     /// Mage-Flow's layout: the tower lives in the `text_encoder/` component dir.
     pub fn load(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, dtype: mlx.mlx_dtype) !VisionTower {
-        const dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
-        defer allocator.free(dir);
-        var w = try model_mod.loadWeights(io, allocator, dir);
+        var w = try openWeights(io, allocator, model_dir);
         defer w.deinit();
         return loadFrom(allocator, s, &w, MAGEFLOW_VIT, dtype);
+    }
+
+    /// The tower's own keys are `model.visual.*`, which the text loader drops
+    /// as a `--no-vision` tower.
+    pub fn openWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !model_mod.Weights {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
+        defer allocator.free(dir);
+        return model_mod.loadWeightsWithVision(io, allocator, dir);
     }
 
     /// Load from an ALREADY-OPEN weight map. H3 keeps its tower in the same
@@ -4591,6 +4597,36 @@ test "Engine.load errors cleanly on a config-only checkpoint (no weights)" {
         eng.deinit();
         try testing.expect(false); // should not have loaded
     } else |_| {}
+}
+
+test "VisionTower.openWeights keeps the model.visual tower keys" {
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.createDirPath(io, "text_encoder");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(a, "{s}/text_encoder/model.safetensors", .{root}, 0);
+    defer a.free(st_path);
+    {
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const shape = [_]c_int{ 2, 2 };
+        const arr = mlx.mlx_array_new_data(&[_]f32{ 1, 2, 3, 4 }, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(arr);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.visual.patch_embed.proj.weight", arr);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.language_model.norm.weight", arr);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+    var w = try VisionTower.openWeights(io, a, root);
+    defer w.deinit();
+    try testing.expect(w.get("model.visual.patch_embed.proj.weight") != null);
 }
 
 test "computeSigmas: static-shift FlowMatchEuler schedule" {

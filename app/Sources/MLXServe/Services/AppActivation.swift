@@ -50,9 +50,6 @@ enum AppActivation {
         switch id {
         case "chat":         return "MLX Core"
         case "serverLog":    return "Server Log"
-        // Base title only — a live session retitles to "pi — MLX Sandbox";
-        // the identifier fallback in windowMatches covers that state.
-        case "sandboxTerminal": return "MLX Sandbox"
         default:             return "Browser"
         }
     }
@@ -83,6 +80,14 @@ enum AppActivation {
         }
     }
 
+    /// Same, for a `WindowGroup(for:)` scene keyed by a value — one window per
+    /// value, raised again on a repeat call.
+    static func openWindow<V: Codable & Hashable>(id: String, value: V, using open: OpenWindowAction) {
+        focus()
+        open(id: id, value: value)
+        DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
+    }
+
     // MARK: - Panels
 
     /// Run a file picker modally, focused. The ONLY way the app runs a panel
@@ -91,6 +96,10 @@ enum AppActivation {
     static func runModal(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
         focus()
         panel.level = .modalPanel
+        // A modal panel opened while another app is frontmost can come up
+        // behind it (macOS ≥14 may ignore the ignoringOtherApps hint). Order
+        // it front ourselves before the modal loop takes over.
+        panel.makeKeyAndOrderFront(nil)
         let response = panel.runModal()
         // The picker may have been the only thing keeping us .regular.
         ActivationPolicyManager.shared.reapply()

@@ -94,8 +94,10 @@ TARGETS=(
   "gemma4-e4b-4bit|$SSD/mlx-community/gemma-4-e4b-it-4bit|--drafter '$SSD/mlx-community/gemma-4-E4B-it-assistant-bf16'|dense, 35/42 sliding @ sw 512; sidecar drafter"
   "laguna-xs-nvfp4|$SSD/poolside/Laguna-XS-2.1-NVFP4-mlx||serial coder, 30/40 sliding @ sw 512; prefill-chunk win"
   "inkling-small-2bit|$SSD/mlx-community/Inkling-Small-mlx-2bit||serial MoE, 35/42 sliding @ sw 512; RelativeLogits bias"
+  # ── qwen4_exp: hyper-connections + n-gram PLE + QSA; MTP is opt-in on MoE, forced like bench.sh ──
+  "qwen38-flash-next-4bit|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit|--mtp|125B-A6B, no sliding; in-checkpoint MTP head (opt-in), QSA past 2048"
   # ── controls: no sliding layers, so these must come out FLAT ──
-  "qwen38-27b-4bit|$SSD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit||CONTROL: no sliding; in-checkpoint MTP head; the round-cost table's home cell"
+  "qwen38-27b-4bit|$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit||CONTROL: no sliding; in-checkpoint MTP head; the round-cost table's home cell"
   "lfm2-2.6b-nvfp4|$SSD/mlx-community/LFM2.5-2.6B-nvfp4||CONTROL: hybrid conv+full attn, no sliding; cheap smoke"
 )
 

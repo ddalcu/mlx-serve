@@ -20,6 +20,12 @@ class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
+    /// Chat is answered by Apple's on-device model rather than the server.
+    /// Persisted like `selectedModelPath`; the local pick stays set underneath
+    /// so turning it off lands back on the model that was chosen before.
+    @Published var useAppleModel: Bool = UserDefaults.standard.bool(forKey: "useAppleModel") {
+        didSet { UserDefaults.standard.set(useAppleModel, forKey: "useAppleModel") }
+    }
     @Published var selectedModelPath: String = "" {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
@@ -145,14 +151,49 @@ class AppState: ObservableObject {
     /// Set by the menu bar's Voice action; the chat detail view consumes it to
     /// auto-start Voice mode (whether the window was already open or just opened).
     @Published var pendingVoiceLaunch = false
-    /// Set by the tray's "pi/hermes in Sandbox" shortcut; the Sandbox window
-    /// consumes it (focus a running session of that agent, else start one)
-    /// and clears it. Fresh `id` per click so repeat clicks re-fire onChange.
-    struct SandboxAgentLaunch: Equatable {
-        let id = UUID()
-        let agentId: String
+    /// Sandbox terminals (pi / hermes / shell in the guest): rows of the
+    /// Chats section, owned here so closing the chat window ends nothing.
+    lazy var terminals = TerminalSessionStore(server: server,
+                                              options: { [unowned self] in self.serverOptions })
+    /// The sidebar's dragged order over conversations and terminals (ids in
+    /// visual order). Empty = newest first. Persisted; terminals' ids drop out
+    /// at quit like the terminals do.
+    @Published var sidebarOrder: [UUID] = (UserDefaults.standard.stringArray(forKey: "sidebarRowOrder") ?? [])
+        .compactMap(UUID.init) {
+        didSet {
+            UserDefaults.standard.set(sidebarOrder.map(\.uuidString), forKey: "sidebarRowOrder")
+        }
     }
-    @Published var pendingSandboxAgentLaunch: SandboxAgentLaunch?
+
+    /// Drag-to-reorder: `visible` is the whole panel in its current visual
+    /// order, so the result is a complete order and stale ids self-prune.
+    func moveSidebarRow(_ id: UUID, onto target: UUID, visible: [UUID]) {
+        let next = SidebarChatRows.moved(id, onto: target, in: visible)
+        if next != visible { sidebarOrder = next }
+    }
+
+    /// "Rename…" on a sidebar row (a chat or a terminal): the sidebar's one
+    /// rename dialog edits this id. nil = none open.
+    @Published var pendingRename: UUID?
+
+    /// Rename a session row. A chat keeps the name (the auto-titler only
+    /// renames placeholders, so a user's title sticks); blank puts a chat back
+    /// to the placeholder and a terminal back to its numbered auto name.
+    func renameSession(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let idx = chatSessions.firstIndex(where: { $0.id == id }) {
+            chatSessions[idx].title = trimmed.isEmpty
+                ? ChatSessionTitle.placeholder(hasAgent: chatSessions[idx].agentId != nil)
+                : trimmed
+            saveChatHistory()
+        } else {
+            terminals.rename(id, to: trimmed)
+        }
+    }
+
+    /// A terminal row's ✕ on a live/preparing session — the sidebar's dialog
+    /// asks first. nil = no confirm pending.
+    @Published var pendingTerminalClose: UUID?
     @Published var agentMemory = AgentMemory()
     /// Saved personas (`~/.mlx-serve/agents/index.json`) plus the read-only
     /// starters. Views observe it directly (`.environmentObject(appState.agents)`),
@@ -299,11 +340,16 @@ class AppState: ObservableObject {
     /// the per-surface-copy class the tag semantics were centralised to avoid.
     func applyChatModelPick(_ tag: String) {
         switch ChatModelSelection.action(for: tag) {
+        case .selectApple:
+            server.lanChatModelId = nil
+            useAppleModel = true
         case .selectLan(let id):
+            useAppleModel = false
             selectLanModel(id)
         case .selectLocal(let path):
             // Picking a local model always clears the LAN choice, or the chat
             // keeps being answered by the other Mac.
+            useAppleModel = false
             server.lanChatModelId = nil
             selectedModelPath = path
         }
@@ -319,6 +365,41 @@ class AppState: ObservableObject {
     func showTasks() {
         chatWorkspace = .tasks
         pendingChatOpenTick += 1
+    }
+
+    /// Show a sandbox terminal — the one way in, same shape as `showTasks()`.
+    func showTerminal(_ id: UUID) {
+        chatWorkspace = .terminal(id)
+        pendingChatOpenTick += 1
+    }
+
+    /// Start a sandbox terminal (pi / hermes, or a plain shell for nil) in the
+    /// default working folder, hot-mounted into the guest. The folder is the
+    /// Settings one — a terminal opens on click, it does not interrogate.
+    /// The ONE door for every "… in Sandbox" entry (tray, chip, sidebar).
+    func startTerminal(agentId: String?) {
+        let agent = SandboxAgentRegistry.all.first { $0.id == agentId }
+        DispatchQueue.main.async { [self] in
+            showTerminal(terminals.start(agent: agent,
+                                         workspace: ChatSession.defaultWorkingDirectory))
+        }
+    }
+
+    /// A host CLI (Claude Code, opencode, …) or a plain shell in a terminal
+    /// row of the chat window — the same door shape as the sandbox one;
+    /// Terminal.app is no longer involved.
+    func startTerminal(hostCLI cli: LauncherCLI) {
+        DispatchQueue.main.async { [self] in
+            showTerminal(terminals.startHost(cli: cli,
+                                             workspace: ChatSession.defaultWorkingDirectory))
+        }
+    }
+
+    /// Close a terminal row (terminating a live session) and leave its pane.
+    func closeTerminal(_ id: UUID) {
+        terminals.close(id)
+        pendingTerminalClose = nil
+        if chatWorkspace == .terminal(id) { showConversation() }
     }
 
     /// Show the Agents pane. The standalone Agents window still exists for the
@@ -1087,6 +1168,16 @@ class AppState: ObservableObject {
         }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }
         if let streaming { chatSessions[sIdx].messages[mIdx].isStreaming = streaming }
+
+        // Thinking ends at the first content delta, or at stream end for a
+        // reasoning-only reply. Measured from the message's timestamp, so it
+        // includes the prefill (time the user waited on the pulsing brain).
+        let msg = chatSessions[sIdx].messages[mIdx]
+        let answerStarted = (content?.isEmpty == false) || streaming == false
+        if msg.thinkingSeconds == nil, answerStarted, msg.reasoningContent?.isEmpty == false {
+            chatSessions[sIdx].messages[mIdx].thinkingSeconds =
+                Date().timeIntervalSince(msg.timestamp)
+        }
     }
 
     // MARK: - Agent Helpers

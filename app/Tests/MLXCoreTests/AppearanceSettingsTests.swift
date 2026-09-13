@@ -20,7 +20,7 @@ final class AppearanceSettingsTests: XCTestCase {
     func testEveryWindowSceneAppliesTheAppAppearance() throws {
         let text = try source("Sources/MLXServe/MLXServeApp.swift")
         let scenes = text.components(separatedBy: "Window(\"").dropFirst()
-        XCTAssertGreaterThanOrEqual(scenes.count, 5, "expected the app's window scenes to be found")
+        XCTAssertGreaterThanOrEqual(scenes.count, 4, "expected the app's window scenes to be found")
         for scene in scenes {
             let name = scene.prefix(while: { $0 != "\"" })
             XCTAssertTrue(scene.contains(".appAppearance()"),

@@ -10,9 +10,13 @@
 #       carries the server's ADVERTISED context (never a hardcoded one)
 #   [4] launch codex --print: config.toml targets our /v1/responses
 #       (wire_api = "responses") with the advertised context
-#   [5] launch claude --print: env-only script, no config file, output budget
-#       derived from the advertised context
+#   [5] launch claude --print: env-only script, no config file, ADVERTISED
+#       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
+#       Claude Code assumes 200k and auto-compacts there) + the derived output
+#       budget
 #   [6] extra args after -- ride the agent invocation line
+#   [7] launch opencode2 --print: XDG_CONFIG_HOME under the dedicated dir,
+#       cli.json carries metricsUrl = base + /metrics.json, plugin has tui.tsx
 #
 # The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
@@ -111,11 +115,14 @@ EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 4)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
 echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$EXPECT_OUT" || OK=0
+# Without this, Claude Code assumes 200k for an off-catalog model and
+# auto-compacts there — a 786k server driven as a 200k one.
+echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$ADV_CTX" || OK=0
 echo "$OUT" | grep -q "claude --model $MODEL_ID" || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "claude script is env-only with the derived output budget" PASS
+    run_test "claude script is env-only with the advertised context + derived output budget" PASS
 else
-    run_test "claude script is env-only with the derived output budget" FAIL "$OUT"
+    run_test "claude script is env-only with the advertised context + derived output budget" FAIL "$OUT"
 fi
 
 # ── [6] passthrough args ──
@@ -124,6 +131,37 @@ if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"
+fi
+
+# ── [7] opencode2 --print ──
+OUT=$("$BIN" launch opencode2 --print --url "$BASE" 2>&1)
+OK=1
+echo "$OUT" | grep -q 'export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"' || OK=0
+echo "$OUT" | grep -q 'export OPENCODE_CONFIG_CONTENT=' || OK=0
+echo "$OUT" | grep -q '^opencode2 --standalone$' || OK=0
+echo "$OUT" | grep -q "\"model\": \"mlx/$MODEL_ID\"" || OK=0
+CLI_JSON="$HOME/.mlx-serve/opencode2/opencode/cli.json"
+if [ ! -f "$CLI_JSON" ]; then
+    OK=0
+else
+    python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+want = sys.argv[2] + '/metrics.json'
+plugins = d.get('plugins') or []
+# a user's own plugins ride through the merge as plain strings
+mlx = [p for p in plugins if isinstance(p, dict) and (p.get('package') or '').endswith('mlx-serve')]
+assert len(mlx) == 1, mlx
+assert mlx[0].get('options', {}).get('metricsUrl') == want, mlx[0]
+assert 'metricsToken' not in (mlx[0].get('options') or {})
+" "$CLI_JSON" "$BASE" || OK=0
+fi
+[ -f "$HOME/.mlx-serve/opencode2/opencode/plugins/mlx-serve/tui.tsx" ] || OK=0
+if [ "$OK" = 1 ]; then
+    run_test "opencode2 script + cli.json + plugin tui.tsx" PASS
+else
+    run_test "opencode2 script + cli.json + plugin tui.tsx" FAIL "$OUT"
 fi
 
 echo ""

@@ -32,10 +32,19 @@ enum ModelPalette {
 
     /// Heading for models shared by other Macs, spelled as the pill spells it.
     static let networkSection = "On Your Network"
+    /// Heading for configured upstream providers (Settings ▸ Providers).
+    static let providersSection = "Providers"
+    /// Heading for Apple's on-device model — neither local checkpoint nor peer.
+    static let onDeviceSection = "On-Device"
+
+    static func remoteSection(for m: ModelInfo) -> String {
+        m.provider == nil ? networkSection : providersSection
+    }
 
     // MARK: - Rows
 
-    static func rows(local: [LocalModel], lan: [ModelInfo]) -> [ModelPaletteRow] {
+    static func rows(appleAvailable: Bool = false,
+                     local: [LocalModel], lan: [ModelInfo]) -> [ModelPaletteRow] {
         let pickable = local.filter(\.isChatPickable)
         // The pill's own duplicate rule: two rows reading identically make the
         // list a coin flip, so a shared label earns its engine in the detail.
@@ -51,6 +60,7 @@ enum ModelPalette {
         for peer in lan where peer.lanAdvertises("chat") {
             out.append(row(forLan: peer))
         }
+        if appleAvailable { out.append(appleRow) }
         return out
     }
 
@@ -83,15 +93,23 @@ enum ModelPalette {
                 .joined(separator: " ").lowercased())
     }
 
+    private static var appleRow: ModelPaletteRow {
+        ModelPaletteRow(tag: ChatModelSelection.appleTag,
+                        title: AppleFoundationChat.displayName,
+                        detail: "On this Mac, no server",
+                        section: onDeviceSection,
+                        searchText: "apple intelligence on-device foundation models")
+    }
+
     private static func row(forLan peer: ModelInfo) -> ModelPaletteRow {
         let title = ModelDisplayName.pretty(peer.name)
         let host = peer.lanPeer ?? ""
-        let detail = host.isEmpty ? "On your network" : "On \(host)"
+        let detail = peer.provider != nil ? "Via \(host)" : host.isEmpty ? "On your network" : "On \(host)"
         return ModelPaletteRow(
             tag: ChatModelSelection.tag(localPath: "", lanChatModelId: peer.name),
             title: title,
             detail: detail,
-            section: networkSection,
+            section: remoteSection(for: peer),
             searchText: [title, peer.name, host]
                 .joined(separator: " ").lowercased())
     }

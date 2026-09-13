@@ -102,6 +102,12 @@ struct SettingsView: View {
                     ) {
                         LanSharingSectionContent()
                     }
+                    SettingsSection(
+                        category: .providers,
+                        subtitle: "Add OpenAI-compatible chat endpoints — a cloud API, another machine, a local runtime. Their models join the picker as <model>@<name> while the provider answers. Applies on save — no restart needed."
+                    ) {
+                        ProvidersSectionContent()
+                    }
                     // Engine-aware sections. Each panel is hidden when its
                     // controls don't apply to the active engine — flipping
                     // `--kv-quant` on a GGUF model silently no-ops, so we'd
@@ -493,6 +499,15 @@ private struct EngineAwareSections: View {
             }
         }
 
+        // Unconditional: the media offloads apply to generation models, which
+        // are not the text engine the gates above key on.
+        SettingsSection(
+            category: .neuralEngine,
+            subtitle: "Run part of the work on the Apple Neural Engine beside the GPU. Each switch keeps its own copy of part of the model, so it costs extra memory and disk — the estimate is under each switch. A Max or Ultra lands near the low end; smaller GPUs hand the Neural Engine more of the work and land near the high end. Compiled copies are cached on disk, up to 40 GB (less when the disk is nearly full). Opt-in and lossy by design; the server declines by name where the copy does not fit. Server-launch flags — restart to apply."
+        ) {
+            NeuralEngineSectionContent()
+        }
+
         if showLlama {
             SettingsSection(
                 category: .ggufPerformance,
@@ -606,10 +621,13 @@ private struct SettingsRow<Control: View>: View {
     /// every server-launch row by default — that's noisy when nothing has
     /// actually been changed yet.
     var isDirty: Bool = false
+    /// The setting's memory/disk cost; orange and bold while it is switched on.
+    var cost: String? = nil
+    var costActive: Bool = false
     @ViewBuilder var control: Control
 
     var body: some View {
-        SearchableRow(searchText: [title, explainer]) {
+        SearchableRow(searchText: [title, explainer] + [cost].compactMap { $0 }) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
@@ -630,6 +648,13 @@ private struct SettingsRow<Control: View>: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let cost {
+                    Text(cost)
+                        .font(.caption)
+                        .fontWeight(costActive ? .semibold : .regular)
+                        .foregroundStyle(costActive ? Color.orange : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -718,7 +743,7 @@ private struct ModelFoldersSectionContent: View {
     }
 
     private func chooseDownloadFolder() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -786,7 +811,7 @@ private struct ModelFoldersSectionContent: View {
     }
 
     private func choose() {
-        let panel = NSOpenPanel()
+        let panel = OpenPanel.make()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
@@ -890,6 +915,237 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+// MARK: - Providers section
+
+/// Rows of `~/.mlx-serve/providers.json`. Every edit saves the file and asks
+/// the running server to reload; the health dot is the server's own probe
+/// (`GET /v1/providers`), never a guess made here.
+private struct ProvidersSectionContent: View {
+    @EnvironmentObject var server: ServerManager
+    @State private var entries: [ProviderEntry] = ProvidersFile.load()
+    @State private var status: [ProviderStatus] = []
+    @State private var saveError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if entries.isEmpty {
+                Text("No providers yet.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach($entries) { $entry in
+                ProviderRow(entry: $entry,
+                            serverPort: server.port,
+                            status: status.first { $0.name == entry.name },
+                            duplicate: ProvidersFile.duplicateNames(entries).contains(entry.name),
+                            onDelete: { entries.removeAll { $0.id == entry.id }; save() },
+                            onCommit: save)
+            }
+            HStack {
+                Button { entries.append(ProviderEntry()) } label: { Label("Add Provider", systemImage: "plus") }
+                Spacer()
+                // Fields also save on Enter, but an edit followed by a click
+                // elsewhere never submits — this is the button that always writes.
+                Button("Save") { save() }
+                .keyboardShortcut("s", modifiers: .command)
+                .help("Write providers.json and ask the server to re-probe now")
+            }
+            if let saveError {
+                Text(saveError).font(.caption).foregroundStyle(.red)
+            }
+            Text("Keys are stored in plain text in ~/.mlx-serve/providers.json. Prefer an environment variable name for a shared machine. Provider models are never shared over the LAN.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .task { await refreshStatus() }
+        .onChange(of: server.status) { _, s in
+            if s == .running { Task { await refreshStatus() } }
+        }
+    }
+
+    private func save() {
+        do {
+            try ProvidersFile.save(entries)
+            saveError = nil
+        } catch {
+            saveError = "Could not save providers.json: \(error.localizedDescription)"
+            return
+        }
+        Task {
+            await server.reloadProviders()
+            // The probe runs on the server's own thread right after reload.
+            try? await Task.sleep(for: .seconds(2))
+            await refreshStatus()
+        }
+    }
+
+    private func refreshStatus() async {
+        guard server.status == .running else { return }
+        status = await server.providerStatus()
+    }
+}
+
+private struct ProviderRow: View {
+    @Binding var entry: ProviderEntry
+    let serverPort: UInt16
+    let status: ProviderStatus?
+    let duplicate: Bool
+    let onDelete: () -> Void
+    let onCommit: () -> Void
+    @State private var modelsText: String = ""
+    @State private var picking = false
+
+    private var problem: String? {
+        if duplicate { return "Another provider already uses this name" }
+        return entry.problem(serverPort: serverPort)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                healthDot
+                TextField("name", text: $entry.name, prompt: Text("name"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                    .onSubmit(onCommit)
+                TextField("url", text: $entry.url, prompt: Text("https://api.openai.com/v1"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+                Toggle("", isOn: $entry.enabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .onChange(of: entry.enabled) { _, _ in onCommit() }
+                Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
+                    .buttonStyle(.borderless)
+                    .help("Remove this provider")
+            }
+            HStack(spacing: 8) {
+                SecureField("api key", text: $entry.apiKey, prompt: Text("API key"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+                TextField("env", text: $entry.apiKeyEnv, prompt: Text("or env var, e.g. OPENAI_API_KEY"))
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(onCommit)
+            }
+            HStack(spacing: 8) {
+                TextField("models", text: $modelsText, prompt: Text("Models, comma-separated — only these are exposed; empty = all the provider lists"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .onAppear { modelsText = entry.models.joined(separator: ", ") }
+                    .onChange(of: modelsText) { _, t in entry.models = ProviderEntry.parseModelList(t) }
+                    .onSubmit(onCommit)
+                Button("Pick…") { picking = true }
+                    .disabled(entry.problem() != nil)
+                    .help("Fetch the provider's model list and tick the ones to expose")
+            }
+            .sheet(isPresented: $picking) {
+                ProviderModelPickerSheet(entry: entry) { chosen in
+                    modelsText = chosen.joined(separator: ", ")
+                    entry.models = chosen
+                    onCommit()
+                }
+            }
+            if let problem {
+                Text(problem).font(.caption2).foregroundStyle(.orange)
+            } else if let status {
+                Text(statusLine(status)).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private var healthDot: some View {
+        Circle()
+            .fill(status.map { $0.up ? Color.green : ($0.probed ? Color.red : Color.gray) } ?? Color.gray)
+            .frame(width: 8, height: 8)
+            .help(status.map(statusLine) ?? "Not reported by the server yet")
+    }
+
+    private func statusLine(_ s: ProviderStatus) -> String {
+        if !s.probed { return "Checking…" }
+        return s.up ? "Up — \(s.models) model\(s.models == 1 ? "" : "s")" : "Unreachable"
+    }
+}
+
+/// Fetches `<url>/models` with the row's key and lets the user tick the ids
+/// to expose. Done writes the list back as the comma-separated field.
+private struct ProviderModelPickerSheet: View {
+    let entry: ProviderEntry
+    let onDone: ([String]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var ids: [String] = []
+    @State private var chosen: Set<String> = []
+    @State private var filter = ""
+    @State private var error: String?
+    @State private var loading = true
+
+    private var shown: [String] {
+        filter.isEmpty ? ids : ids.filter { $0.localizedCaseInsensitiveContains(filter) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Models at \(entry.name)").font(.headline)
+            TextField("Filter", text: $filter).textFieldStyle(.roundedBorder)
+            if loading {
+                ProgressView().frame(maxWidth: .infinity)
+            } else if let error {
+                Text(error).foregroundStyle(.red).font(.caption)
+            } else {
+                List(shown, id: \.self) { id in
+                    Toggle(id, isOn: Binding(
+                        get: { chosen.contains(id) },
+                        set: { on in if on { chosen.insert(id) } else { chosen.remove(id) } }
+                    ))
+                }
+                .listStyle(.plain)
+            }
+            HStack {
+                Text("\(chosen.count) of \(ids.count) selected").font(.caption).foregroundStyle(.secondary)
+                Button("Clear") { chosen = [] }.disabled(chosen.isEmpty)
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Done") {
+                    onDone(ids.filter { chosen.contains($0) })
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(loading)
+            }
+        }
+        .padding()
+        .frame(width: 460, height: 520)
+        .task { await load() }
+    }
+
+    private func load() async {
+        chosen = Set(entry.models)
+        var key = entry.apiKey
+        if !entry.apiKeyEnv.isEmpty, let v = LoginShellEnv.values(of: [entry.apiKeyEnv])[entry.apiKeyEnv], !v.isEmpty { key = v }
+        var lastError = "No model list at \(entry.url)"
+        for url in ProviderEntry.modelsURLs(for: entry.url) {
+            var req = URLRequest(url: url, timeoutInterval: 15)
+            if !key.isEmpty { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200, let list = ProviderEntry.modelIds(fromModelsBody: data) {
+                    ids = list.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+                    loading = false
+                    return
+                }
+                lastError = "HTTP \(code) from \(url.absoluteString)"
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        self.error = lastError
+        loading = false
     }
 }
 
@@ -1031,6 +1287,21 @@ private struct ServerSectionContent: View {
                 }
             }
         }
+        if let m = meta["idleEvictSecs"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.idleEvictSecs)
+            ) {
+                let secs = appState.serverOptions.idleEvictSecs
+                snappingSlider(
+                    presets: ServerOptions.idleEvictPresets,
+                    current: secs,
+                    set: { appState.serverOptions.idleEvictSecs = $0 },
+                    label: ServerOptions.idleEvictLabel(secs)
+                )
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,
@@ -1100,11 +1371,7 @@ private struct ContextSizeRow: View {
     // Powers of two plus 1.5× midpoints (issue #188: 32K→64K→128K jumps are
     // too coarse on a memory-limited Mac). Every value is a multiple of 1024
     // so formatTokens renders it exactly.
-    private static let allPresets: [Int] = [
-        0, 4_096, 6_144, 8_192, 12_288, 16_384, 24_576, 32_768,
-        49_152, 65_536, 98_304, 131_072, 196_608, 262_144,
-        393_216, 524_288, 786_432, 1_048_576,
-    ]
+    private static let allPresets = ContextSizeDisplay.presets
 
     /// Drop any preset larger than the model's `max_position_embeddings` so
     /// the slider can't pick a value the model would refuse. Auto (0) always
@@ -1346,13 +1613,13 @@ private struct SpecDecodeSectionContent: View {
                 .disabled(!appState.serverOptions.enableMTP)
             }
         }
-        if let m = meta["forceMTPOnMoE"] {
+        if let m = meta["mtpOnMoE"] {
             SettingsRow(
                 title: m.title,
                 explainer: m.explainer,
-                isDirty: dirty.dirty(\.forceMTPOnMoE)
+                isDirty: dirty.dirty(\.mtpOnMoE)
             ) {
-                Toggle("", isOn: opts.forceMTPOnMoE)
+                Toggle("", isOn: opts.mtpOnMoE)
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .disabled(!appState.serverOptions.enableMTP)
@@ -1416,32 +1683,15 @@ private struct PerformanceSectionContent: View {
                 explainer: m.explainer,
                 isDirty: dirty.dirty(\.maxConcurrent)
             ) {
-                Stepper(value: opts.maxConcurrent, in: 1...8) {
-                    Text("\(appState.serverOptions.maxConcurrent)")
-                        .font(.body.monospacedDigit())
-                }
-            }
-        }
-        if let m = meta["anePrefill"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.anePrefill)
-            ) {
-                // The switch works everywhere (the server declines by name
-                // where it can't run), so the per-Mac caution rides beside
-                // it rather than gating it — a hidden or disabled switch on
-                // a Mac that gets RAM tomorrow is the dead-control class.
                 VStack(alignment: .trailing, spacing: 4) {
-                    Toggle("", isOn: opts.anePrefill)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                    if let caution = AnePrefillAdvice.liveCaution {
-                        Text(caution)
-                            .font(.caption2)
-                            .foregroundStyle(.orange)
-                            .multilineTextAlignment(.trailing)
-                            .fixedSize(horizontal: false, vertical: true)
+                    Stepper(value: opts.maxConcurrent, in: 1...8) {
+                        Text("\(appState.serverOptions.maxConcurrent)")
+                            .font(.body.monospacedDigit())
+                    }
+                    if let b = server.batching {
+                        Text(b.label)
+                            .font(.caption)
+                            .foregroundStyle(b.supported ? .secondary : Color.orange)
                     }
                 }
             }
@@ -1543,6 +1793,65 @@ private struct PerformanceSectionContent: View {
 /// stripper that brought a 1813-token Gemma 4 repeat from 240 ms to
 /// 0.002 ms. Reorg-friendly: anything we add later that crosses engines
 /// (e.g. shared HTTP timeout overrides) lands here.
+private struct NeuralEngineSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+
+        if let m = meta["anePrefill"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.anePrefill),
+                cost: m.cost,
+                costActive: appState.serverOptions.anePrefill
+            ) {
+                // The switch works everywhere (the server declines by name
+                // where it can't run), so the per-Mac caution rides beside
+                // it rather than gating it — a hidden or disabled switch on
+                // a Mac that gets RAM tomorrow is the dead-control class.
+                VStack(alignment: .trailing, spacing: 4) {
+                    Toggle("", isOn: opts.anePrefill)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    if let caution = AnePrefillAdvice.liveCaution {
+                        Text(caution)
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        if let m = meta["aneImage"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
+                        cost: m.cost, costActive: appState.serverOptions.aneImage) {
+                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch)
+            }
+        }
+        if let m = meta["aneVideo"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneVideo),
+                        cost: m.cost, costActive: appState.serverOptions.aneVideo) {
+                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch)
+            }
+        }
+        if let m = meta["aneAudio"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneAudio),
+                        cost: m.cost, costActive: appState.serverOptions.aneAudio) {
+                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch)
+            }
+        }
+    }
+}
+
 private struct CommonPerformanceSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -1824,7 +2133,10 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.appearanceMode) private var appearanceModeRaw = AppAppearanceMode.system.rawValue
     @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
+    @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+    @AppStorage(InterfacePrefKey.terminalTheme) private var terminalThemeId = TerminalTheme.defaultId
+    @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
 
     var body: some View {
         SettingsRow(title: "Appearance", explainer: "Follow the system setting, or force light/dark for this app only.") {
@@ -1855,15 +2167,65 @@ private struct InterfaceSectionContent: View {
             .labelsHidden()
             .frame(width: 140)
         }
-        SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen.") {
+        SettingsRow(title: "Chat Column",
+                    explainer: "How wide a conversation reads. Narrow and Medium are fixed widths, so resizing the window moves the margins rather than the text; Wide follows the window. Also on ⌘⌥1-3, under View ▸ Interface.") {
+            Picker("", selection: $chatColumnRaw) {
+                ForEach(ChatColumnWidth.allCases) { width in
+                    Text(width.label).tag(width.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 220)
+        }
+        SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen. Also on ⌘⌥C, under View ▸ Interface.") {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
                 .toggleStyle(.switch)
+        }
+        SettingsRow(title: "Terminal Theme",
+                    explainer: "Colors for new sandbox terminals. Right-click a terminal in the sidebar to give one session a different theme.") {
+            Picker("", selection: $terminalThemeId) {
+                ForEach(TerminalTheme.all) { theme in
+                    Text(theme.name).tag(theme.id)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 160)
+        }
+        SettingsRow(title: "Terminal Background",
+                    explainer: "Ground under the default theme. Reset to use the theme's own.") {
+            HStack(spacing: 8) {
+                ColorPicker("", selection: terminalBackground, supportsOpacity: false)
+                    .labelsHidden()
+                if !terminalBackgroundHex.isEmpty {
+                    Button("Reset") { terminalBackgroundHex = "" }
+                        .controlSize(.small)
+                }
+            }
         }
         SettingsRow(title: "Quick Launcher Shortcut",
                     explainer: "The global combo that summons the Quick Launcher (⌃Space by default) from any app. Must include at least one modifier key.") {
             HotKeyRecorderControl(onChange: { appState.quickLauncher.updateHotKey() })
         }
+    }
+}
+
+extension InterfaceSectionContent {
+    /// The color well ↔ the stored "#RRGGBB" (empty = the theme's ground).
+    fileprivate var terminalBackground: Binding<Color> {
+        Binding(
+            get: {
+                let rgb = TerminalTheme.RGB(hex: terminalBackgroundHex)
+                    ?? (TerminalTheme.theme(terminalThemeId) ?? TerminalTheme.theme(TerminalTheme.defaultId)!).background
+                return Color(.sRGB, red: Double(rgb.r) / 255, green: Double(rgb.g) / 255, blue: Double(rgb.b) / 255)
+            },
+            set: { color in
+                guard let c = NSColor(color).usingColorSpace(.sRGB) else { return }
+                terminalBackgroundHex = TerminalTheme.RGB(UInt8((c.redComponent * 255).rounded()),
+                                                          UInt8((c.greenComponent * 255).rounded()),
+                                                          UInt8((c.blueComponent * 255).rounded())).hex
+            })
     }
 }
 

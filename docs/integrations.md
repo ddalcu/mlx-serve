@@ -25,7 +25,7 @@ Two ways to skip everything below:
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
-mlx-serve launch claude              # any of: claude, pi, omp, opencode, codex, hermes, aider
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
@@ -120,6 +120,29 @@ No file needed. `OPENCODE_CONFIG_CONTENT` merges over your own config, so plugin
 ```bash
 export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
 opencode --model mlx/MODEL_ID
+```
+
+### OpenCode 2
+
+`opencode2` (npm `@opencode/cli`) reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON. The launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`).
+
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. `mlx-serve launch opencode2` probes the endpoint and prints a warning when it is off.
+
+```bash
+export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+```
+
+`$XDG_CONFIG_HOME/opencode/cli.json` (plugin `package` is relative to that config dir):
+
+```json
+{ "plugins": [ { "package": "./plugins/mlx-serve", "options": { "metricsUrl": "http://127.0.0.1:11234/metrics.json" } } ] }
+```
+
+Loopback omits `metricsToken`; a non-loopback URL adds `"metricsToken": "mlx-serve"` (`Authorization: Bearer`). `mlx-serve launch opencode2` copies the plugin into `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/` and never writes `~/.config/opencode/`.
+
+```bash
+opencode2 --model mlx/MODEL_ID
 ```
 
 ### Codex

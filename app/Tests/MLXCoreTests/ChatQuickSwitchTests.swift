@@ -364,7 +364,7 @@ final class ChatQuickSwitchTests: XCTestCase {
         XCTAssertTrue(source.contains("keyboardShortcut(key, modifiers: [.command, .control])"),
                       "each slot needs its ⌃⌘-digit key equivalent — same digit, ranging instead of jumping")
 
-        XCTAssertTrue(source.contains("ChatQuickSwitch.outcome("),
+        XCTAssertTrue(source.contains("ChatQuickSwitch.target("),
                       "both shortcut families must go through the one decision, which resolves the "
                       + "digit against the same numbering the badge was drawn from")
 
@@ -395,5 +395,38 @@ final class ChatQuickSwitchTests: XCTestCase {
         let source = SourceScan.source("Views/ChatView.swift", from: #filePath)
         XCTAssertTrue(source.contains("commandHeld"),
                       "badges appear only while ⌘ is down — otherwise they are permanent chrome")
+    }
+}
+
+/// Terminals are rows of the same panel, so they wear numbers too and ⌘-digit
+/// reaches them — the numbering is the PANEL's visual order (drag order
+/// included), never a chats-only list that would put 3 on a different row than
+/// the one showing 3.
+final class ChatQuickSwitchTerminalTests: XCTestCase {
+
+    func testTheDigitsFollowThePanelsVisibleOrderAcrossChatsAndTerminals() {
+        let chat1 = UUID(), term = UUID(), chat2 = UUID()
+        let visible = [chat1, term, chat2]
+        XCTAssertEqual(ChatQuickSwitch.slot(for: term, visible: visible, numbering: nil), 2)
+        XCTAssertEqual(ChatQuickSwitch.id(forSlot: 3, visible: visible, numbering: nil), chat2)
+        XCTAssertEqual(ChatQuickSwitch.numbered(visible: visible, numbering: [term, chat2]), [term, chat2])
+    }
+
+    func testADigitOnATerminalShowsItAndOnAChatSelectsIt() {
+        let chat1 = UUID(), term = UUID(), chat2 = UUID()
+        let visible = [chat1, term, chat2]
+        switch ChatQuickSwitch.target(slot: 2, visible: visible, chats: [chat1, chat2], numbering: nil,
+                                      selection: [chat1], anchor: nil, active: chat1, extend: true) {
+        case .terminal(let id): XCTAssertEqual(id, term, "a terminal is shown even on ⌃⌘: there is nothing to range")
+        default: XCTFail("expected the terminal")
+        }
+        switch ChatQuickSwitch.target(slot: 3, visible: visible, chats: [chat1, chat2], numbering: nil,
+                                      selection: [chat1], anchor: nil, active: chat1, extend: true) {
+        case .chat(let o):
+            XCTAssertEqual(o.selection, [chat1, chat2], "ranging runs over the CHATS, skipping the terminal between")
+        default: XCTFail("expected a chat outcome")
+        }
+        XCTAssertNil(ChatQuickSwitch.target(slot: 4, visible: visible, chats: [chat1, chat2], numbering: nil,
+                                            selection: [], anchor: nil, active: nil, extend: false))
     }
 }

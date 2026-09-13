@@ -2,14 +2,6 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Shared geometry for the tray footer's Chat / Tasks / Code buttons —
-/// they live in three files (StatusMenuView, CLILauncher,
-/// CLISetupInstructions), and with inlined values the icon-to-text gap
-/// drifted (Chat/Tasks at the 8pt HStack default, Code at an explicit 6).
-enum TrayFooterMetrics {
-    static let iconSpacing: CGFloat = 6
-}
-
 /// Claude logo icon from the official Claude AI symbol SVG.
 struct ClaudeIcon: View {
     var size: CGFloat = 14
@@ -170,14 +162,6 @@ struct StatusMenuView: View {
     let openServerLog: () -> Void
     let openTasks: () -> Void
     var openAgents: () -> Void = {}
-    var openSandboxTerminal: () -> Void = {}
-
-    /// Observes the shared sandbox so the tray badge appears/updates live when
-    /// the Agent Sandbox is turned on and when its guest boots. Safe to observe
-    /// from the tray: the per-command transcript lives in the separate
-    /// `AgentSandbox.transcriptStore` (observed only by the Sandbox Terminal),
-    /// so command churn never re-renders this menu.
-    @ObservedObject private var sandbox = AgentSandbox.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -354,11 +338,25 @@ struct StatusMenuView: View {
             // LAN discovery on). Tags are "lan:"-prefixed so they can't collide
             // with paths.
             let lanChat = server.lanModels(capability: "chat")
-            if !lanChat.isEmpty {
-                Section("On Your Network") {
-                    ForEach(lanChat, id: \.name) { m in
+            let network = lanChat.filter { $0.provider == nil }
+            let providers = lanChat.filter { $0.provider != nil }
+            if !network.isEmpty {
+                Section(ModelPalette.networkSection) {
+                    ForEach(network, id: \.name) { m in
                         Text(m.lanDisplayName).tag("lan:" + m.name)
                     }
+                }
+            }
+            if !providers.isEmpty {
+                Section(ModelPalette.providersSection) {
+                    ForEach(providers, id: \.name) { m in
+                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                    }
+                }
+            }
+            if case .available = AppleFoundationChat.availability {
+                Section(ModelPalette.onDeviceSection) {
+                    Text(AppleFoundationChat.displayName).tag(ChatModelSelection.appleTag)
                 }
             }
         }
@@ -439,7 +437,7 @@ struct StatusMenuView: View {
         // Model slots — one row per RESIDENT registry entry (chat,
         // image/video/audio gen, embeddings), each with an eject button that
         // frees its memory. Unloaded stubs are hidden.
-        let loadedModels = server.allModels.filter(\.loaded)
+        let loadedModels = server.residentModels
         return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             TraySectionHeader(title: "In Memory",
                               detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)
@@ -563,68 +561,23 @@ struct StatusMenuView: View {
             // Spotlight-style ⌃Space prompt panel, summonable from any app
             // while MLX Core runs in the tray.
             QuickLauncherTrayRow()
-
-            // Agent-sandbox badge — visible only while the sandbox is enabled.
-            // Green box = a guest is live; click to open the Sandbox Terminal
-            // and run commands / watch the agent in the isolated Linux VM.
-            if sandbox.isEnabled {
-                TrayRowSeparator()
-                Button {
-                    openSandboxTerminal()
-                } label: {
-                    TrayFeatureRow(
-                        icon: "shippingbox.fill",
-                        title: "Agent Sandbox",
-                        // guestMemoryText is quantized + published only on
-                        // change, so this row doesn't re-render per second.
-                        subtitle: sandbox.guestRunning
-                            ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
-                            : "Idle — boots on the first command",
-                        isOn: true,
-                        tint: sandbox.guestRunning ? .green : .orange
-                    ) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Open the Sandbox Terminal")
-            }
         }
     }
 
     // MARK: - Footer
 
     /// Chat, Tasks, Claude Code & Quit — the panel's exits, on their own bar so
-    /// they read as chrome rather than as one more section.
+    /// they read as chrome rather than as one more section. Same tiles as the
+    /// Media Generation row: one shape for everything you can open from here.
     private var footer: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 8) {
-                Button {
-                    openChat()
-                } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                        Text("Chat")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+            HStack(spacing: 6) {
+                TrayTile(icon: "bubble.left.and.bubble.right", title: "Chat",
+                         help: "Open the chat window") { openChat() }
 
-                Button {
-                    openTasks()
-                } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "clock.badge.checkmark")
-                        Text("Tasks")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help("Scheduled Tasks")
+                TrayTile(icon: "clock.badge.checkmark", title: "Tasks",
+                         help: "Scheduled Tasks") { openTasks() }
 
                 // The App Store build can't detect or launch other apps'
                 // CLIs, so its Code button shows copy-paste terminal
@@ -638,13 +591,8 @@ struct StatusMenuView: View {
                         serverContextLength: server.chatModelInfo?.contextLength,
                         models: server.allModels,
                         isEnabled: server.status == .running,
-                        openSandboxAgent: { agentId in
-                            // Post the request FIRST — the Sandbox window
-                            // reads it in .onAppear when this click is what
-                            // opens the window.
-                            appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
-                            openSandboxTerminal()
-                        }
+                        openSandboxAgent: { appState.startTerminal(agentId: $0) },
+                        openHostCLI: { appState.startTerminal(hostCLI: $0) }
                     )
                 } else {
                     CLISetupInstructionsButton(
@@ -655,14 +603,14 @@ struct StatusMenuView: View {
                     )
                 }
 
-                Button {
+                // Named and red: the bare power glyph read as "stop the
+                // server", which is the control directly above it.
+                TrayTile(icon: "power", title: "Quit",
+                         help: "Quit MLX Core — stops the server and closes the app",
+                         tint: .red) {
                     server.stop()
                     NSApplication.shared.terminate(nil)
-                } label: {
-                    Image(systemName: "power")
                 }
-                .buttonStyle(.bordered)
-                .help("Quit MLX Core")
             }
             .padding(.horizontal, TrayMetrics.gutter)
             .padding(.vertical, 10)
@@ -691,7 +639,8 @@ struct StatusMenuView: View {
     private var trayModelSelection: Binding<String> {
         Binding(
             get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
-                                          lanChatModelId: server.lanChatModelId) },
+                                          lanChatModelId: server.lanChatModelId,
+                                          apple: appState.useAppleModel) },
             // Applying a pick is `AppState.applyChatModelPick` — one method,
             // shared with the chat window's pill and the ⌘L palette.
             set: { picked in appState.applyChatModelPick(picked) }
@@ -1092,7 +1041,7 @@ struct EndpointsSection: View {
 /// (which touches `NSApp`) just makes the requirement explicit.
 @MainActor
 func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
-    let panel = NSOpenPanel()
+    let panel = OpenPanel.make()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
     panel.allowsMultipleSelection = false
