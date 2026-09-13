@@ -1875,9 +1875,10 @@ struct ChatDetailView: View {
     @State private var foldStore = FoldStore()
     /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
     @State private var firstVisibleRow = 0
-    /// Which conversation the cut belongs to. The messages observer fires
-    /// before the session one on a switch, so it decides for itself whether it
-    /// is looking at a new chat (cut afresh) or a changed one (keep the cut).
+    /// Which conversation the cut belongs to. The messages observer is the one
+    /// that fires on first appearance, so it cuts when it sees a new chat; the
+    /// session observer cuts on every switch, including one whose messages
+    /// compare equal (a fork keeps its source's ids) and never reach the first.
     @State private var windowSession: UUID?
     @State private var isRevealingEarlier = false
 
@@ -2898,8 +2899,7 @@ struct ChatDetailView: View {
         .onChange(of: session?.messages, initial: true) { _, msgs in
             rows = ChatRowBuilder.rows(from: msgs ?? [])
             if windowSession != sessionId {
-                windowSession = sessionId
-                firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
+                cutTranscriptWindow()
             } else {
                 firstVisibleRow = TranscriptWindow.clamp(first: firstVisibleRow, total: rows.count)
             }
@@ -2920,6 +2920,10 @@ struct ChatDetailView: View {
             // the old conversation would be what the new one attaches to,
             // instead of its initial anchor.
             scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
+            // `rows` is already this conversation's: the messages observer runs
+            // first when the messages differ, and when they do not (a fork),
+            // the rows are the same rows.
+            cutTranscriptWindow()
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
             // but the first ↑ in the newly-visible tab has to mean "the last
@@ -3447,6 +3451,11 @@ struct ChatDetailView: View {
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity)
         .padding(.bottom, 4)
+    }
+
+    private func cutTranscriptWindow() {
+        windowSession = sessionId
+        firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
     }
 
     /// The rows appear ABOVE what the reader is looking at, so the transcript
