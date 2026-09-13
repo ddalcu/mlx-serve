@@ -1158,7 +1158,95 @@ private struct ServerSectionContent: View {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
+    /// Chat models only — the `isChatPickable` filter every other model picker uses.
+    private var pickable: [LocalModel] {
+        appState.localModels.filter(\.isChatPickable)
+    }
+
+    /// The tray picker's labels: a `.menu` Picker keys its checkmark by title, so
+    /// duplicate labels get an engine suffix.
+    private func startupModelLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
+        let label = model.displayLabel
+        guard dupNames.contains(label) else { return label }
+        return "\(label) · \(model.engine.shortLabel)"
+    }
+
+    /// Under "Last model used" the dropdown shows the rule's answer, read from the
+    /// same `StartupModelChoice.resolved` as the launch gate. The setter only runs
+    /// in `.pinned` mode; the control is disabled otherwise.
+    private var startupModelDisplay: Binding<String> {
+        Binding(
+            get: {
+                guard appState.startupModelMode == .lastUsed else {
+                    return appState.startupModelPinnedPath
+                }
+                return StartupModelChoice.resolved(mode: .lastUsed,
+                                                   pinnedPath: nil,
+                                                   lastUsed: StartupModelChoice.lastUsed(),
+                                                   installedPaths: pickable.map(\.path)) ?? ""
+            },
+            set: { appState.startupModelPinnedPath = $0 }
+        )
+    }
+
     var body: some View {
+        // Whether and which model loads at start; auto-start itself is the tray's toggle.
+        SettingsRow(
+            title: "Load a model at start",
+            explainer: "Off by default. Auto-start brings the server up with no model resident; it loads one on demand at your first message, so login stays fast. Turn this on to pay for the load up front instead — a large checkpoint can take a while and holds the memory from the moment you log in."
+        ) {
+            Toggle("", isOn: $appState.loadModelAtStart)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        SettingsRow(
+            title: "Which model",
+            explainer: "\"Last model used\" follows whatever you were last chatting with, decided when the app starts rather than when you set this — so it keeps up as you switch models. \"Always this model\" pins one regardless."
+        ) {
+            Picker("", selection: $appState.startupModelMode) {
+                ForEach(StartupModelChoice.Mode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .disabled(!appState.loadModelAtStart)
+        }
+        SettingsRow(
+            title: "Model",
+            explainer: "If the pinned model is removed later — or nothing has been loaded yet — the server simply starts with nothing resident, rather than substituting a model you did not choose."
+        ) {
+            VStack(alignment: .trailing, spacing: 4) {
+                Picker("", selection: startupModelDisplay) {
+                    let dupNames = LocalModel.duplicateNames(in: pickable)
+                    ForEach(pickable) { model in
+                        Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
+                    }
+                    // A selection that matches no row renders blank, so empty and
+                    // uninstalled selections each get a row of their own.
+                    if startupModelDisplay.wrappedValue.isEmpty {
+                        Text("None — starts with no model").tag("")
+                    }
+                    if !appState.startupModelPinnedPath.isEmpty,
+                       !pickable.contains(where: { $0.path == appState.startupModelPinnedPath }) {
+                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed")
+                            .tag(appState.startupModelPinnedPath)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 180)
+                .disabled(!appState.loadModelAtStart || appState.startupModelMode == .lastUsed)
+
+                if appState.startupModelMode == .lastUsed {
+                    Text("Resolved each time the app starts, so it keeps up as you switch models.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
         if let m = meta["host"] {
             SettingsRow(
                 title: m.title,

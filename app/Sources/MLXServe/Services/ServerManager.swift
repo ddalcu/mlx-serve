@@ -160,6 +160,8 @@ class ServerManager: ObservableObject {
                                            selectedModelPath: selectedModelPath) else { return }
         if (try? await loadModel(id: selectedModelPath)) != nil {
             chatDefaultEnsured = true
+            // Recorded here, not in `loadModel`: this hot-load passes no `setDefault`.
+            StartupModelChoice.recordLoaded(path: selectedModelPath)
         }
     }
 
@@ -309,14 +311,6 @@ class ServerManager: ObservableObject {
         throughput = nil
         decodeTPSNow = nil
         prefillTPSNow = nil
-    }
-
-    func toggle(modelPath: String, options: ServerOptions) {
-        if status == .running || status == .starting {
-            stop()
-        } else {
-            start(modelPath: modelPath, options: options)
-        }
     }
 
     /// Distill a crashed server's stderr tail into one human-meaningful line for
@@ -577,6 +571,8 @@ class ServerManager: ObservableObject {
     private func transitionToRunning() {
         guard status != .running else { return }
         status = .running
+        // A `--model` launch gets here only once loaded; headless leaves the path empty.
+        StartupModelChoice.recordLoaded(path: currentModelPath)
         Task { await self.refreshModels() }
         // If the user has the menu open at the exact moment the server comes
         // up, start the live /props ticker now so the GPU-memory bar fills in
@@ -679,7 +675,11 @@ class ServerManager: ObservableObject {
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).
-        if setDefault, id.hasPrefix("/") { currentModelPath = id }
+        if setDefault, id.hasPrefix("/") {
+            currentModelPath = id
+            // Only a chat switch records: media models hot-load through here too.
+            StartupModelChoice.recordLoaded(path: id)
+        }
         await refreshModels()
         return info
     }
@@ -741,16 +741,17 @@ class ServerManager: ObservableObject {
         return port
     }
 
-    /// Poll `status` until the health loop flips it to `.running` (or `.error`).
-    /// Internal (not `private`) — `AppState.useModelAndAwaitReady` awaits this
-    /// too, for the Model Browser's "Use" button.
+    /// Poll `status` until the health loop flips it to `.running`. `.error` and
+    /// `.stopped` end the wait: every caller starts the server first, so a stop
+    /// seen here ended the launch being waited on.
     func waitUntilRunning(timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             switch status {
             case .running: return
             case .error(let m): throw GenServerError.startFailed(m)
-            default: break
+            case .stopped: throw GenServerError.startFailed("server was stopped")
+            case .starting: break
             }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }

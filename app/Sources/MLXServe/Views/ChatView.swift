@@ -1993,11 +1993,9 @@ struct ChatDetailView: View {
         )
         if control != .hidden {
             Button {
-                // ONE start path, shared with the LAN toggle: it loads the
-                // selected checkpoint, or boots headless when the model
-                // answering is on another Mac. A second `server.start` call
-                // site here is how the two would drift.
-                appState.ensureServerForLan()
+                // The one button-start path; a second `server.start` call site
+                // here is how the start paths would drift.
+                appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
                     if control == .starting {

@@ -29,6 +29,8 @@
 - Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
 - OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
 - An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
+- "Auto-start on launch" no longer loads a model at login: the server starts empty and loads your model at the first message, and Settings ▸ Server ▸ "Load a model at start" (off by default) loads the last model used, or one you pin, at launch instead (#214, thanks @Fe2-O3).
+- A model you eject from a server started with the tray's or the chat window's Start button stays unloaded instead of coming back on the next request.
 
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
