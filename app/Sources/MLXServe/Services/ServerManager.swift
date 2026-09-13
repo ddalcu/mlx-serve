@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import UserNotifications
 
 @MainActor
 class ServerManager: ObservableObject {
@@ -66,6 +67,9 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
+    private var restartTask: Task<Void, Never>?
+    private var crashCount = 0
+    private var lastCrashDate: Date?
     let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
@@ -189,6 +193,8 @@ class ServerManager: ObservableObject {
         status = .starting
         lastError = ""
         chatDefaultEnsured = false
+        crashCount = 0
+        lastCrashDate = nil
         clearServerLog()
 
         // Reap orphaned mlx-serve processes still bound to our port (e.g. left
@@ -272,6 +278,8 @@ class ServerManager: ObservableObject {
     private var quitObserver: NSObjectProtocol?
 
     func stop() {
+        restartTask?.cancel()
+        restartTask = nil
         pollSource?.cancel()
         pollSource = nil
         healthTask?.cancel()
@@ -369,9 +377,13 @@ class ServerManager: ObservableObject {
     /// memory branches of `summarizeCrash`; drives the "here's what's using
     /// memory" advice in the crash alert. Pure + testable.
     nonisolated static func isMemoryFailure(_ log: String) -> Bool {
-        if log.contains("Insufficient memory to load model") { return true }
-        return log.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
-            || (log.contains("[METAL]") && log.localizedCaseInsensitiveContains("Insufficient Memory"))
+        let lines = log.split(whereSeparator: \.isNewline).map(String.init)
+            .filter { !isRequestPreviewLine($0) }
+        return lines.contains { $0.contains("Insufficient memory to load model") }
+            || lines.contains {
+                $0.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+                    || ($0.contains("[METAL]") && $0.localizedCaseInsensitiveContains("Insufficient Memory"))
+            }
     }
 
     private func handleTermination(exitCode: Int32) {
@@ -383,26 +395,106 @@ class ServerManager: ObservableObject {
         healthTimer = nil
         process = nil
 
-        // Read straight from the locked buffer — the throttled `serverLog`
-        // can be up to one flush-interval (~100 ms) behind, which on a fast
-        // crash means we'd present the alert before the fatal stderr line
-        // made it to @Published.
         let errSnippet = currentServerLogSnapshot()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shortErr = Self.summarizeCrash(errSnippet, exitCode: exitCode)
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
-        if case .running = status {
+        let wasRunning: Bool
+        if case .running = status { wasRunning = true }
+        else { wasRunning = false }
+
+        // Startup failures always show the modal — the config is likely wrong.
+        guard wasRunning else {
+            if case .starting = status {
+                status = .error("Failed to start")
+                lastError = shortErr
+                presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
+            } else {
+                status = .stopped
+            }
+            return
+        }
+
+        // Manage the crash counter with a sliding window.
+        if CrashRecovery.crashWindowExpired(lastCrash: lastCrashDate, window: CrashRecovery.crashWindow) {
+            crashCount = 0
+        }
+        crashCount += 1
+        lastCrashDate = Date()
+
+        let mode = Self.loadCrashRecoveryMode()
+        let memFail = Self.isMemoryFailure(fullLog)
+        let shouldRestart = CrashRecovery.shouldAutoRestart(
+            mode: mode, wasRunning: true, exitCode: exitCode,
+            isMemoryFailure: memFail,
+            crashCount: crashCount, maxRetries: CrashRecovery.maxRetries
+        )
+
+        guard shouldRestart else {
             status = .error("Exited unexpectedly")
             lastError = shortErr
             presentCrashAlert(title: "mlx-serve exited unexpectedly", log: fullLog, exitCode: exitCode)
-        } else if case .starting = status {
-            status = .error("Failed to start")
-            lastError = shortErr
-            presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
-        } else {
-            status = .stopped
+            return
         }
+
+        // Auto-restart path.
+        let delay = CrashRecovery.backoffDelay(attempt: crashCount)
+        let attempt = crashCount
+        status = .error("Restarting in \(Int(delay))s (\(attempt)/\(CrashRecovery.maxRetries))")
+        lastError = shortErr
+
+        if mode == .autoRestart {
+            sendCrashNotification(attempt: attempt, delay: delay)
+        }
+
+        restartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            guard let opts = self.lastLaunchedOptions else {
+                self.status = .error("Cannot restart — no saved launch options")
+                return
+            }
+            if self.currentModelPath.isEmpty {
+                // Was a headless launch — restart headless.
+                let dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+                self.startHeadless(modelsDir: dirs.first ?? "", options: opts)
+            } else {
+                self.start(modelPath: self.currentModelPath, options: opts)
+            }
+            self.scheduleStabilityReset()
+        }
+    }
+
+    /// After stable uptime, reset the crash counter so a one-off crash
+    /// hours later gets its full retry budget.
+    private func scheduleStabilityReset() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(CrashRecovery.stableThreshold))
+            guard let self else { return }
+            if case .running = self.status {
+                self.crashCount = 0
+                self.lastCrashDate = nil
+            }
+        }
+    }
+
+    private func sendCrashNotification(attempt: Int, delay: TimeInterval) {
+        let content = UNMutableNotificationContent()
+        content.title = "mlx-serve crashed"
+        content.body = "Restarting automatically (\(attempt)/\(CrashRecovery.maxRetries)) in \(Int(delay))s…"
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: "crash-restart-\(attempt)",
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+
+    nonisolated static func loadCrashRecoveryMode() -> CrashRecoveryMode {
+        guard let raw = UserDefaults.standard.string(forKey: CrashRecoveryMode.defaultsKey),
+              let mode = CrashRecoveryMode(rawValue: raw) else {
+            return .defaultMode
+        }
+        return mode
     }
 
     // MARK: - Server log (throttled)
@@ -544,7 +636,7 @@ class ServerManager: ObservableObject {
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       json["status"] as? String == "ok" else { return }
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
+                    guard let self, self.process != nil else { return }
                     if self.status != .running {
                         self.transitionToRunning()
                     }
