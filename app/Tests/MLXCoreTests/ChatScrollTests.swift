@@ -180,7 +180,7 @@ final class ChatScrollTests: XCTestCase {
     func testAShrinkingRowKeepsTheControlWhereItWas() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 7000)),
                        .toOffset(3000))
     }
@@ -190,7 +190,7 @@ final class ChatScrollTests: XCTestCase {
     func testAnAnimatedShrinkTracksFrameByFrame() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 8500)), .toOffset(4500))
         // The correction landed; the offset now reads 4500. No new height, no action.
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 4500, contentHeight: 8500)), .none)
@@ -201,7 +201,7 @@ final class ChatScrollTests: XCTestCase {
     func testTheCorrectedOffsetNeverGoesAboveTheTop() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 800, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 800, contentHeight: 2000)), .toOffset(0))
     }
 
@@ -210,15 +210,15 @@ final class ChatScrollTests: XCTestCase {
     func testAFinishedShrinkStopsCorrecting() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
-        _ = s.handle(.rowDidShrink)
+        _ = s.handle(.rowWillResize)
+        _ = s.handle(.rowDidResize)
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9400)), .none)
     }
 
     func testAReaderWhoScrollsMidShrinkWins() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 5000, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         _ = s.handle(.driverChanged(.user))
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 4200, contentHeight: 7000)), .none)
     }
@@ -228,7 +228,7 @@ final class ChatScrollTests: XCTestCase {
         var s = ChatScrollState()
         _ = s.handle(.transcriptShown)
         _ = s.handle(.contentGeometry(offsetY: 8000, contentHeight: 9000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         XCTAssertEqual(s.handle(.contentGeometry(offsetY: 8000, contentHeight: 7000)), .none)
         XCTAssertTrue(s.isPinnedToBottom)
     }
@@ -241,11 +241,11 @@ final class ChatScrollTests: XCTestCase {
     func testAFoldOvershootIsNotArrivalAtTheBottom() {
         var s = unpinned()
         _ = s.handle(.contentGeometry(offsetY: 30000, contentHeight: 31000))
-        _ = s.handle(.rowWillShrink)
+        _ = s.handle(.rowWillResize)
         XCTAssertEqual(s.handle(.geometryChanged(distanceFromBottom: -21000)), .none)
         XCTAssertFalse(s.isPinnedToBottom)
         // Once the fold is over, the rule is the rule again.
-        _ = s.handle(.rowDidShrink)
+        _ = s.handle(.rowDidResize)
         _ = s.handle(.geometryChanged(distanceFromBottom: -46))
         XCTAssertTrue(s.isPinnedToBottom)
     }

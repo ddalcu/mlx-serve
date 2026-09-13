@@ -36,13 +36,14 @@ enum ChatScrollEvent: Equatable {
     /// Negative when the scroll view is rubber-banding past the end.
     case geometryChanged(distanceFromBottom: CGFloat)
     /// Where the transcript sits and how tall it is. Every frame, beside
-    /// `geometryChanged`; only a shrink in progress reads it.
+    /// `geometryChanged`; only a resize in progress reads it.
     case contentGeometry(offsetY: CGFloat, contentHeight: CGFloat)
-    /// A row is about to get shorter — a long turn folding, a thinking block
-    /// closing, an edit field replacing the bubble.
-    case rowWillShrink
+    /// Content the reader is looking at the BOTTOM edge of is about to change
+    /// height: a long turn folding, a thinking block closing, an edit field
+    /// replacing the bubble, earlier rows appearing above the first one.
+    case rowWillResize
     /// …and has finished changing.
-    case rowDidShrink
+    case rowDidResize
 }
 
 enum ChatScrollAction: Equatable {
@@ -77,31 +78,31 @@ struct ChatScrollState: Equatable {
     private(set) var driver: ChatScrollDriver = .idle
     private var offsetY: CGFloat = 0
     private var contentHeight: CGFloat = 0
-    /// The transcript as it was when a row started shrinking.
-    private struct Shrink: Equatable {
+    /// The transcript as it was when the change began.
+    private struct Resize: Equatable {
         let offsetY: CGFloat
         let contentHeight: CGFloat
     }
-    private var shrink: Shrink?
+    private var resize: Resize?
 
     mutating func handle(_ event: ChatScrollEvent) -> ChatScrollAction {
         switch event {
         case .transcriptShown:
             isPinnedToBottom = true
-            shrink = nil
+            resize = nil
             // No jump: a conversation is a new scroll view laid out from its
             // bottom anchor (`.initialOffset`), so it opens at the end already.
             return .none
 
         case .userSentMessage, .jumpTapped:
             isPinnedToBottom = true
-            shrink = nil
+            resize = nil
             return .toBottom(animated: true)
 
         case .driverChanged(let driver):
             self.driver = driver
-            // The reader took over mid-fold; their scroll wins.
-            if driver == .user { shrink = nil }
+            // The reader took over mid-change; their scroll wins.
+            if driver == .user { resize = nil }
             return .none
 
         case .geometryChanged(let distance):
@@ -110,9 +111,9 @@ struct ChatScrollState: Equatable {
             // a taller message, a card appearing, a window resize — is content
             // moving under a reader who has not asked for anything.
             //
-            // Except mid-shrink: content shorter than a stale offset reads as
+            // Except mid-change: content shorter than a stale offset reads as
             // a deep overscroll for one frame, and nobody has gone anywhere.
-            if distance <= Self.bottomTolerance, shrink == nil {
+            if distance <= Self.bottomTolerance, resize == nil {
                 isPinnedToBottom = true
             } else if driver == .user {
                 isPinnedToBottom = false
@@ -127,21 +128,21 @@ struct ChatScrollState: Equatable {
             let heightChanged = h != contentHeight
             offsetY = y
             contentHeight = h
-            // The control the reader clicked sits at the BOTTOM of the row
-            // that is shrinking, so it stays put exactly when the offset drops
-            // by what the row has lost so far. Per frame, so an animation tracks.
-            guard let s = shrink, heightChanged else { return .none }
+            // What the reader is looking at sits BELOW the change, so it stays
+            // put exactly when the offset moves by what the content above it has
+            // gained or lost so far. Per frame, so an animation tracks.
+            guard let s = resize, heightChanged else { return .none }
             return .toOffset(max(0, s.offsetY - (s.contentHeight - h)))
 
-        case .rowWillShrink:
-            // Growing needs no help (the top stays put and the rest extends
-            // below), and while following the end the bottom anchor has it.
+        case .rowWillResize:
+            // A change BELOW the reader needs no help (its top stays put), and
+            // while following the end the bottom anchor has it.
             guard !isPinnedToBottom else { return .none }
-            shrink = Shrink(offsetY: offsetY, contentHeight: contentHeight)
+            resize = Resize(offsetY: offsetY, contentHeight: contentHeight)
             return .none
 
-        case .rowDidShrink:
-            shrink = nil
+        case .rowDidResize:
+            resize = nil
             return .none
         }
     }

@@ -1873,6 +1873,13 @@ struct ChatDetailView: View {
     // the LazyVStack could spin forever.
     @State private var rows: [ChatRow] = []
     @State private var foldStore = FoldStore()
+    /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
+    @State private var firstVisibleRow = 0
+    /// Which conversation the cut belongs to. The messages observer fires
+    /// before the session one on a switch, so it decides for itself whether it
+    /// is looking at a new chat (cut afresh) or a changed one (keep the cut).
+    @State private var windowSession: UUID?
+    @State private var isRevealingEarlier = false
 
 
     private var session: ChatSession? {
@@ -2408,7 +2415,10 @@ struct ChatDetailView: View {
                     // it has built, and every scroll decision below aims at
                     // that number (story: docs/gotchas/app.md).
                     VStack(spacing: ChatMetrics.transcriptSpacing) {
-                        ForEach(rows) { row in
+                        if firstVisibleRow > 0 {
+                            showEarlierButton
+                        }
+                        ForEach(rows[firstVisibleRow...]) { row in
                             switch row {
                             case .message(let m):
                                 MessageBubble(
@@ -2472,8 +2482,8 @@ struct ChatDetailView: View {
                                     onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
                                         ? { appState.forkSession(sessionId, from: m.id) }
                                         : nil,
-                                    onWillShrink: { applyScroll(.rowWillShrink) },
-                                    onDidShrink: { applyScroll(.rowDidShrink) },
+                                    onWillResize: { applyScroll(.rowWillResize) },
+                                    onDidResize: { applyScroll(.rowDidResize) },
                                     foldStore: foldStore)
                                 .id(m.id)
                             case .toolCall(let call, let results, let calls, let owned):
@@ -2887,6 +2897,12 @@ struct ChatDetailView: View {
         }
         .onChange(of: session?.messages, initial: true) { _, msgs in
             rows = ChatRowBuilder.rows(from: msgs ?? [])
+            if windowSession != sessionId {
+                windowSession = sessionId
+                firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
+            } else {
+                firstVisibleRow = TranscriptWindow.clamp(first: firstVisibleRow, total: rows.count)
+            }
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -3405,6 +3421,47 @@ struct ChatDetailView: View {
             instant.disablesAnimations = true
             withTransaction(instant) {
                 scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+    }
+
+    /// Above the first laid-out row of a long conversation.
+    private var showEarlierButton: some View {
+        Button {
+            revealEarlierRows()
+        } label: {
+            Group {
+                if isRevealingEarlier {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Show earlier messages")
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(height: 22)
+            .padding(.horizontal, 12)
+            .background(Color.secondary.opacity(0.15), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 4)
+    }
+
+    /// The rows appear ABOVE what the reader is looking at, so the transcript
+    /// holds their place through it (the same bracket a fold uses), and the
+    /// button answers the click before the layout that makes it slow starts.
+    private func revealEarlierRows() {
+        isRevealingEarlier = true
+        applyScroll(.rowWillResize)
+        DispatchQueue.main.async {
+            firstVisibleRow = 0
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    applyScroll(.rowDidResize)
+                    isRevealingEarlier = false
+                }
             }
         }
     }
@@ -3964,8 +4021,8 @@ struct MessageBubble: View {
     /// Bracket a change that makes this row shorter (a fold, a thinking block
     /// closing, an edit field replacing the bubble), so the transcript can
     /// hold the reader's place through it. nil where there is no scroll view.
-    var onWillShrink: (() -> Void)?
-    var onDidShrink: (() -> Void)?
+    var onWillResize: (() -> Void)?
+    var onDidResize: (() -> Void)?
     /// Survives a transcript rebuild; see `FoldStore`.
     var foldStore: FoldStore?
     /// Hover over the whole row reveals the user turn's action row; the
@@ -4012,7 +4069,7 @@ struct MessageBubble: View {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
                     if thinkingExpanded {
-                        shrink { thinkingExpanded = false }
+                        resize { thinkingExpanded = false }
                     } else {
                         withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded = true }
                     }
@@ -4319,7 +4376,7 @@ struct MessageBubble: View {
         editDraft = message.content
         // The field is capped in height where the bubble was not, so on a long
         // turn it would otherwise open above the top of the window.
-        shrink(animated: false) {
+        resize(animated: false) {
             isEditing = true
             // Put the caret in the field the edit just opened — otherwise
             // Return is typed at whatever still holds focus (the composer
@@ -4397,7 +4454,7 @@ struct MessageBubble: View {
                     isFolding = false
                 }
             } else {
-                shrink({ longTurnExpanded = false }, done: { isFolding = false })
+                resize({ longTurnExpanded = false }, done: { isFolding = false })
             }
         }
     }
@@ -4405,10 +4462,10 @@ struct MessageBubble: View {
     /// Brackets a change that makes this row shorter. The end is reported one
     /// turn after the change has landed, so the geometry of its last frame is
     /// seen inside the bracket.
-    private func shrink(animated: Bool = true, _ change: @escaping () -> Void,
+    private func resize(animated: Bool = true, _ change: @escaping () -> Void,
                         done: (() -> Void)? = nil) {
-        onWillShrink?()
-        let finish = { onDidShrink?(); done?() }
+        onWillResize?()
+        let finish = { onDidResize?(); done?() }
         if animated {
             withAnimation(.easeInOut(duration: 0.15)) { change() } completion: {
                 DispatchQueue.main.async(execute: finish)
