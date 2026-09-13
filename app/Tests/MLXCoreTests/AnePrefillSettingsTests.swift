@@ -35,11 +35,31 @@ final class AnePrefillSettingsTests: XCTestCase {
         // it: the extra memory copy, that the fit is checked per model at
         // load (not a flat RAM floor — the server's gate bills the actual
         // config), and where the win applies.
-        let text = ServerOptions.serverFlagFields["anePrefill"]?.explainer ?? ""
+        let field = ServerOptions.serverFlagFields["anePrefill"]
+        let text = (field?.explainer ?? "") + " " + (field?.cost ?? "")
         XCTAssertTrue(text.lowercased().contains("declin"))
         XCTAssertTrue(text.contains("27B"))
         XCTAssertFalse(text.contains("96 GB"), "the flat 96 GB gate is retired — the copy must not resurrect it")
         XCTAssertTrue(text.lowercased().contains("prefill") || text.lowercased().contains("prompt"))
+    }
+
+    // ── The three media offloads: same shape (server default OFF, ON emits) ──
+
+    func testMediaOffloadsDefaultOffAndEmitOnlyWhenOn() throws {
+        for flag in ["--ane-image", "--ane-video", "--ane-audio"] {
+            XCTAssertFalse(args().contains(flag), flag)
+        }
+        XCTAssertTrue(args { $0.aneImage = true }.contains("--ane-image"))
+        XCTAssertTrue(args { $0.aneVideo = true }.contains("--ane-video"))
+        XCTAssertTrue(args { $0.aneAudio = true }.contains("--ane-audio"))
+        let legacy = #"{"host":"0.0.0.0","port":11234,"anePrefill":true}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
+        XCTAssertFalse(decoded.aneImage || decoded.aneVideo || decoded.aneAudio)
+        for key in ["aneImage", "aneVideo", "aneAudio"] {
+            let text = ServerOptions.serverFlagFields[key]?.explainer ?? ""
+            XCTAssertTrue(text.lowercased().contains("declin"), key)
+            XCTAssertTrue(text.lowercased().contains("off by default"), key)
+        }
     }
 
     // ── Per-Mac advice (pure: chip brand string + RAM in) ──

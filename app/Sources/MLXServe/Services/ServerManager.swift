@@ -51,6 +51,7 @@ class ServerManager: ObservableObject {
     /// What the server's measured spec-decode cost model resolved for the
     /// resident model. nil = the per-silicon tables applied.
     @Published var specCost: SpecCostInfo?
+    @Published var batching: BatchingInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -304,6 +305,7 @@ class ServerManager: ObservableObject {
         allModels = []
         memoryInfo = nil
         specCost = nil
+        batching = nil
         throughput = nil
         decodeTPSNow = nil
         prefillTPSNow = nil
@@ -615,6 +617,7 @@ class ServerManager: ObservableObject {
         if let props = try? await api.fetchProps(port: port) {
             memoryInfo = props.memory
             specCost = props.specCost
+            batching = props.batching
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {

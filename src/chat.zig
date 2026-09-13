@@ -1641,7 +1641,7 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
 /// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
 /// call, so any residual `<tool_call|>` reaching here is orphan by construction.
 /// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
-fn trimTrailingThinkClosers(content: []const u8) []const u8 {
+pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
     var s = content;
     while (true) {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");
@@ -1760,6 +1760,9 @@ const MUSE_START_TAG = "<|start|>";
 const MUSE_MSG_TAG = "<|message|>";
 const MUSE_EOM_TAG = "<|eom|>";
 const MUSE_EOT_TAG = "<|eot|>";
+
+pub const BARE_THINK_OPENER = "<think>";
+pub const BARE_THINK_CLOSER = "</think>";
 
 // ── gpt_oss / harmony channels ──
 //
@@ -2242,6 +2245,28 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 pub fn promptTailOpensBareThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
     return std.mem.endsWith(u8, trimmed, "<think>");
+}
+
+/// Which reasoning opener a rendered generation prompt ENDS with (trailing
+/// whitespace ignored): a bare `<think>`, a complete suffixed `<think:S>`, or
+/// nothing. Generation-side protocol resolution consumes this — the suffix is
+/// carried into the close delimiter (`</think:S>`) so a close with a different
+/// suffix is never treated as the boundary. The returned suffix borrows the
+/// caller's buffer.
+pub const ThinkTailClass = union(enum) {
+    bare,
+    suffixed: []const u8,
+    none,
+};
+
+pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
+    const trimmed_tail = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    if (endsWithThinkOpenTag(trimmed_tail)) |l| {
+        const tag = trimmed_tail[trimmed_tail.len - l ..];
+        if (std.mem.eql(u8, tag, BARE_THINK_OPENER)) return .bare;
+        return .{ .suffixed = tag["<think:".len .. tag.len - 1] };
+    }
+    return .none;
 }
 
 /// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
@@ -3635,6 +3660,34 @@ fn looseBoolSpelling(raw: []const u8) ?bool {
     return null;
 }
 
+/// Strict parse of a container string that admits a key repeated with the SAME
+/// value (issue #402: a model spelling `header` twice per item) and refuses a
+/// key repeated with different values: the two are told apart by parsing
+/// first-wins and last-wins and comparing the documents.
+fn parseContainerAllowingRepeats(allocator: std.mem.Allocator, text: []const u8) ?std.json.Parsed(std.json.Value) {
+    var first = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_first }) catch return null;
+    var last = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_last }) catch {
+        first.deinit();
+        return null;
+    };
+    defer last.deinit();
+    const a = std.json.Stringify.valueAlloc(allocator, first.value, .{}) catch {
+        first.deinit();
+        return null;
+    };
+    defer allocator.free(a);
+    const b = std.json.Stringify.valueAlloc(allocator, last.value, .{}) catch {
+        first.deinit();
+        return null;
+    };
+    defer allocator.free(b);
+    if (!std.mem.eql(u8, a, b)) {
+        first.deinit();
+        return null;
+    }
+    return first;
+}
+
 /// Coerce ONE value to the declared type. Returns null when the value already
 /// matches or the spelling is undecidable. Allocated replacements are appended
 /// to `owned`; parsed sub-documents to `docs` — both are freed by the caller
@@ -3658,7 +3711,7 @@ fn coerceValueToType(
         if (t.len == 0 or t[0] != (if (want_array) @as(u8, '[') else @as(u8, '{'))) return null;
 
         // Strict first; a well-formed container is the common case.
-        if (std.json.parseFromSlice(std.json.Value, allocator, t, .{})) |doc| {
+        if (parseContainerAllowingRepeats(allocator, t)) |doc| {
             const kind_ok = if (want_array) doc.value == .array else doc.value == .object;
             if (kind_ok) {
                 try docs.append(allocator, doc);
@@ -3667,7 +3720,7 @@ fn coerceValueToType(
             var d = doc;
             d.deinit();
             return null;
-        } else |_| {}
+        }
 
         // The container string is itself MANGLED (live: pi's `edits` array with a
         // missing comma between two object values). Same big-file escaping class
@@ -3675,7 +3728,10 @@ fn coerceValueToType(
         // the result so a mis-repair that yields invalid JSON is discarded.
         const repaired = looseRepairContainer(allocator, t) orelse return null;
         defer allocator.free(repaired);
-        var rdoc = std.json.parseFromSlice(std.json.Value, allocator, repaired, .{}) catch return null;
+        var rdoc = parseContainerAllowingRepeats(allocator, repaired) orelse {
+            log.debug("[tool-autocorrect] {s} param left as a string: not well-formed JSON of that kind\n", .{want});
+            return null;
+        };
         const rkind_ok = if (want_array) rdoc.value == .array else rdoc.value == .object;
         if (!rkind_ok) {
             rdoc.deinit();
@@ -6950,6 +7006,17 @@ test "promptTailOpensThink detects template-injected opener" {
     // Gemma 4 prompt tail (no injected opener)
     try testing.expect(!promptTailOpensThink("<|turn>model\n"));
     try testing.expect(!promptTailOpensThink(""));
+}
+
+test "promptThinkTailClass resolves bare, suffixed, and plain tails" {
+    try testing.expectEqual(ThinkTailClass.bare, promptThinkTailClass("<|im_start|>assistant\n<think>\n"));
+    const s = promptThinkTailClass("<think:opensource>");
+    try testing.expectEqualStrings("opensource", s.suffixed);
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|im_start|>assistant\n"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|start|>assistant"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass(""));
+    // A PARTIAL opener is not an opener.
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think:open"));
 }
 
 test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
@@ -11309,6 +11376,42 @@ test "coerceToolArgsToSchema: an ARRAY param passed through Hermes XML is not le
     try testing.expectEqualStrings("const a = 2;", edits.array.items[0].object.get("newText").?.string);
     // sibling scalars still coerce/pass through
     try testing.expectEqualStrings("/tmp/a.js", parsed.value.object.get("path").?.string);
+}
+
+test "coerceToolArgsToSchema: identical duplicate keys inside a container param still coerce; conflicting ones do not" {
+    // Issue #402: Qwen Code's ask_user_question array arrived as a string whose
+    // items repeated `header` with the same value; strict parse rejects the
+    // duplicate, the tolerant re-emit keeps it, and the string reached the
+    // client unchanged. Identical duplicates carry no ambiguity; conflicting
+    // ones do, and guessing a value is worse than leaving the string alone.
+    const allocator = testing.allocator;
+    const cases = [_]struct { inner: []const u8, want_array: bool }{
+        .{ .inner = "[{\"header\":\"Scope\",\"question\":\"Which scope?\",\"header\":\"Scope\",\"options\":[{\"label\":\"Small\"}]}]", .want_array = true },
+        .{ .inner = "[{\"header\":\"Scope\",\"header\":\"Size\"}]", .want_array = false },
+    };
+    for (cases) |c| {
+        const raw = try std.fmt.allocPrint(allocator, "<tool_call>\n<function=edit>\n<parameter=edits>\n{s}\n</parameter>\n</function>\n</tool_call>", .{c.inner});
+        defer allocator.free(raw);
+        const calls = (try parseToolCalls(allocator, raw)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try coerceToolArgsToSchema(allocator, calls, edit_array_tools_json_test);
+        const parsed = try parseArgsObj(allocator, calls[0].arguments);
+        defer parsed.deinit();
+        const edits = parsed.value.object.get("edits").?;
+        if (c.want_array) {
+            try testing.expect(edits == .array);
+            try testing.expectEqualStrings("Scope", edits.array.items[0].object.get("header").?.string);
+            try testing.expectEqual(@as(usize, 3), edits.array.items[0].object.count());
+        } else {
+            try testing.expect(edits == .string);
+        }
+    }
 }
 
 test "coerceToolArgsToSchema: a STRING param whose content is JSON stays a string" {

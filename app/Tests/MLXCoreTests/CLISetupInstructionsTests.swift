@@ -26,6 +26,30 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(tabs.map(\.id), CLILauncher.candidateIds)
     }
 
+    func testPlainShellLauncherNeedsNoServerAndKeepsTheShellAlive() {
+        let shell = LauncherCLI.shell
+        XCTAssertFalse(shell.requiresServer)
+        let script = shell.scriptBody("http://localhost:11234", "m1", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains("cd '/tmp'"), script)
+        // Without an exec the script would run to the end and the row would
+        // close the moment it opened.
+        XCTAssertTrue(script.contains("exec"), script)
+    }
+
+    /// The plain shell rides beside the detected CLIs but is not a candidate:
+    /// there is no binary to probe and no instructions tab for it.
+    func testShellIsOfferedButNotDetected() {
+        XCTAssertFalse(CLILauncher.candidateIds.contains("shell"))
+        XCTAssertEqual(CLILauncher.offered(detected: [.claudeCode]).map(\.id),
+                       ["claude", "shell"])
+    }
+
+    func testEveryOtherLauncherStillRequiresTheServer() {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider] {
+            XCTAssertTrue(cli.requiresServer, cli.id)
+        }
+    }
+
     func testClaudeTabExportsTheEnvAndLaunches() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "claude" })
         // Verbatim reuse of the launcher's env block — the drift guard.

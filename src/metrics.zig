@@ -120,6 +120,10 @@ pub const Metrics = struct {
     ane_layers: Gauge,
     // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so far; zero when nothing is warming.
     ngram_warm_bytes: Gauge,
+    // Slots in the last batched decode group (0 = the last tick batched nothing).
+    batched_group_size: Gauge,
+    // Slot-ticks that decoded serial beside live company, per `BatchVerdict` reason.
+    decode_serial_total: [SERIAL_REASONS.len]Counter,
 
     pub fn init() Metrics {
         return .{
@@ -150,6 +154,8 @@ pub const Metrics = struct {
             .ane_int8_bytes = Gauge.init(),
             .ane_layers = Gauge.init(),
             .ngram_warm_bytes = Gauge.init(),
+            .batched_group_size = Gauge.init(),
+            .decode_serial_total = @splat(Counter.init()),
         };
     }
 
@@ -264,6 +270,12 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
     try writeGauge(w, "mlx_serve:ane_layers", "Layers covered by compiled ANE prefill programs, mlp + gdn (0 when off)", m.ane_layers.load());
     try writeGauge(w, "mlx_serve:ngram_warm_bytes", "Bytes of the qwen4 n-gram table read so far by the background page-cache warm (0 when off or done with no table resident)", m.ngram_warm_bytes.load());
+    try writeGauge(w, "mlx_serve:batched_group_size", "Slots in the last batched decode group (0 when the last tick batched nothing)", m.batched_group_size.load());
+    try w.print("# HELP mlx_serve:decode_serial_total Slot-ticks that decoded serial beside other live slots, by reason\n# TYPE mlx_serve:decode_serial_total counter\n", .{});
+    for (SERIAL_REASONS, 0..) |name, i| {
+        if (name.len == 0) continue;
+        try w.print("mlx_serve:decode_serial_total{{reason=\"{s}\"}} {d}\n", .{ name, m.decode_serial_total[i].load() });
+    }
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -308,8 +320,9 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"mlx_cache_bytes\":{d}," ++
             "\"ane_int8_bytes\":{d}," ++
             "\"ane_layers\":{d}," ++
-            "\"ngram_warm_bytes\":{d}" ++
-            "}},\"histograms\":{{",
+            "\"ngram_warm_bytes\":{d}," ++
+            "\"batched_group_size\":{d}" ++
+            "}},\"decode_serial\":{{",
         .{
             m.prompt_tokens_total.load(),
             m.prefill_tokens_total.load(),
@@ -332,8 +345,16 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.ane_int8_bytes.load(),
             m.ane_layers.load(),
             m.ngram_warm_bytes.load(),
+            m.batched_group_size.load(),
         },
     );
+    var first = true;
+    for (SERIAL_REASONS, 0..) |name, i| {
+        if (name.len == 0) continue;
+        try w.print("{s}\"{s}\":{d}", .{ if (first) "" else ",", name, m.decode_serial_total[i].load() });
+        first = false;
+    }
+    try w.print("}},\"histograms\":{{", .{});
 
     try writeHistogramJson(w, "time_to_first_token_seconds", &m.ttft_ns, ns_to_s);
     try w.print(",", .{});
@@ -416,6 +437,15 @@ fn writeHistogramJson(w: *std.Io.Writer, name: []const u8, hist: anytype, scale:
 
 /// Monotonically increasing lock-free counter.
 /// Safe to add from any thread; use load() to snapshot.
+/// Label per `scheduler.BatchVerdict` tag; `.ok` is not a serial reason and renders nothing.
+pub const SERIAL_REASONS = blk: {
+    const V = @import("scheduler.zig").BatchVerdict;
+    const fields = @typeInfo(V).@"enum".field_names;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |f, i| names[i] = if (std.mem.eql(u8, f, "ok")) "" else f;
+    break :blk names;
+};
+
 pub const Counter = struct {
     value: std.atomic.Value(u64),
 
@@ -565,7 +595,7 @@ test "prefill throughput must exclude cache-restored tokens" {
         m.prefill_tokens_total.load() + m.prefix_cache_tokens_total.load(),
     );
 
-    var buf: [8192]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try renderPrometheus(&m, &w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "mlx_serve:prefill_tokens_total 500") != null);
@@ -591,7 +621,7 @@ test "prefill progress is exposed live, not only at request completion" {
     m.prefill_tokens_live.set(16384);
     m.prefill_tokens_expected.set(48000);
 
-    var buf: [8192]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try renderPrometheus(&m, &w);
     const out = w.buffered();
@@ -616,7 +646,7 @@ test "prefill progress is exposed live, not only at request completion" {
     // first 8192-token chunk (and it also covers ds4/llama, whose prefill never
     // reaches the MLX chunk loop and so never moves the token gauge).
     m.requests_prefilling.set(1);
-    var b2: [8192]u8 = undefined;
+    var b2: [16384]u8 = undefined;
     var w2 = std.Io.Writer.fixed(&b2);
     try renderPrometheus(&m, &w2);
     try testing.expect(std.mem.indexOf(u8, w2.buffered(), "mlx_serve:requests_prefilling 1") != null);
@@ -822,4 +852,28 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
     var pw: std.Io.Writer = .fixed(&pbuf);
     try renderPrometheus(&m, &pw);
     try testing.expect(std.mem.indexOf(u8, pbuf[0..pw.end], "mlx_serve:ngram_warm_bytes 17179869184") != null);
+}
+
+test "decode_serial_total carries one labelled series per serial reason, never ok" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.decode_serial_total[@intFromEnum(@import("scheduler.zig").BatchVerdict.spec_active)].add(3);
+    m.batched_group_size.set(2);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = buf[0..w.end];
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:decode_serial_total{reason=\"spec_active\"} 3\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "reason=\"ok\"") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:batched_group_size 2\n") != null);
+
+    var jbuf: [64 * 1024]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try renderJson(&m, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jbuf[0..jw.end], .{});
+    defer parsed.deinit();
+    const serial = parsed.value.object.get("decode_serial").?.object;
+    try testing.expectEqual(@as(i64, 3), serial.get("spec_active").?.integer);
+    try testing.expect(serial.get("ok") == null);
 }

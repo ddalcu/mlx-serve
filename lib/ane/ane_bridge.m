@@ -136,10 +136,38 @@ static bool bridge_cache_restore(NSString *identifier, NSString *directory) {
  * (weights x shape) combination adds a ~250 MB entry FOREVER — a share sweep
  * grew the cache to 49 GB and ran the disk to 100%, after which ANECCompile
  * fails bare mid-build and the offload silently ships partial layer coverage
- * (measured 2026-08-18). Oldest-first prune past the byte cap, run on the
- * cold-compile path only; restores touch the entry mtime so the policy is
- * LRU, not insertion order. MLX_SERVE_ANE_CACHE_CAP_GB overrides (default
- * 40 — two full 27B program sets). */
+ * (measured 2026-08-18). Two prunes run on the cold-compile path:
+ *  1. LINEAGE: the caller names the group (seam + shape) and variant (share)
+ *     the coming build belongs to; entries of the same group at another
+ *     variant go first — a share sweep replaces its predecessors rather than
+ *     stacking one program set per value (7.9 GB for five shares observed).
+ *  2. BYTES: oldest-first past the cap. The cap is the LESSER of the
+ *     configured ceiling (MLX_SERVE_ANE_CACHE_CAP_GB, default 40) and what
+ *     the volume can hold while keeping CACHE_DISK_RESERVE free for the
+ *     build's own staging burst — a cap above free space is not a cap, and
+ *     that is how two small-disk boxes shipped `ready: N/M` on 2026-09-10.
+ * Restores touch the entry mtime so the byte policy is LRU, not insertion
+ * order. */
+#define CACHE_DISK_RESERVE (8ull << 30)
+
+static char lineage_group[128];
+static char lineage_variant[32];
+
+void msv_ane_cache_lineage(const char *group, const char *variant) {
+    snprintf(lineage_group, sizeof lineage_group, "%s", group ? group : "");
+    snprintf(lineage_variant, sizeof lineage_variant, "%s", variant ? variant : "");
+}
+
+/* Tag an entry with the current lineage (no-op when untagged). A build that
+ * restores a set built under another tag re-tags it, so the tag always names
+ * the build that last used it. */
+static void bridge_cache_tag(NSString *entry) {
+    if (!lineage_group[0]) return;
+    [[NSString stringWithFormat:@"%s\n%s\n", lineage_group, lineage_variant]
+        writeToFile:[entry stringByAppendingPathComponent:@"lineage"]
+         atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 static unsigned long long bridge_cache_cap_bytes(void) {
     const char *env = getenv("MLX_SERVE_ANE_CACHE_CAP_GB");
     long gb = env ? atol(env) : 40;
@@ -147,8 +175,43 @@ static unsigned long long bridge_cache_cap_bytes(void) {
     return (unsigned long long)gb << 30;
 }
 
+static unsigned long long bridge_dir_bytes(NSFileManager *files, NSString *path) {
+    unsigned long long bytes = 0;
+    for (NSString *sub in [files enumeratorAtPath:path])
+        bytes += [[files attributesOfItemAtPath:
+            [path stringByAppendingPathComponent:sub] error:nil] fileSize];
+    return bytes;
+}
+
+/* "group\nvariant\n" as stored beside the entry; nil when untagged. */
+static NSArray<NSString *> *bridge_entry_lineage(NSString *path) {
+    NSString *text = [NSString stringWithContentsOfFile:
+        [path stringByAppendingPathComponent:@"lineage"]
+        encoding:NSUTF8StringEncoding error:nil];
+    NSArray<NSString *> *parts = [text componentsSeparatedByString:@"\n"];
+    return parts.count >= 2 ? parts : nil;
+}
+
+void msv_ane_cache_variant(const char *group, char *out, int out_len) {
+    @autoreleasepool {
+        out[0] = 0;
+        NSString *root = [bridge_cache_root() stringByAppendingPathComponent:@"entries"];
+        NSFileManager *files = [NSFileManager defaultManager];
+        NSDate *newest = nil;
+        for (NSString *name in [files contentsOfDirectoryAtPath:root error:nil]) {
+            NSString *path = [root stringByAppendingPathComponent:name];
+            NSArray<NSString *> *lineage = bridge_entry_lineage(path);
+            if (!lineage || ![lineage[0] isEqualToString:@(group)]) continue;
+            NSDate *date = [[files attributesOfItemAtPath:path error:nil]
+                fileModificationDate] ?: [NSDate distantPast];
+            if (newest && [date compare:newest] != NSOrderedDescending) continue;
+            newest = date;
+            snprintf(out, out_len, "%s", lineage[1].UTF8String);
+        }
+    }
+}
+
 static void bridge_cache_prune(void) {
-    unsigned long long cap = bridge_cache_cap_bytes();
     NSString *root = [bridge_cache_root() stringByAppendingPathComponent:@"entries"];
     NSFileManager *files = [NSFileManager defaultManager];
     NSArray<NSString *> *names = [files contentsOfDirectoryAtPath:root error:nil];
@@ -157,14 +220,26 @@ static void bridge_cache_prune(void) {
     unsigned long long total = 0;
     for (NSString *name in names) {
         NSString *path = [root stringByAppendingPathComponent:name];
-        unsigned long long bytes = 0;
-        for (NSString *sub in [files enumeratorAtPath:path])
-            bytes += [[files attributesOfItemAtPath:
-                [path stringByAppendingPathComponent:sub] error:nil] fileSize];
+        unsigned long long bytes = bridge_dir_bytes(files, path);
+        NSArray<NSString *> *lineage = bridge_entry_lineage(path);
+        if (lineage && lineage_group[0] &&
+            [lineage[0] isEqualToString:@(lineage_group)] &&
+            ![lineage[1] isEqualToString:@(lineage_variant)]) {
+            [files removeItemAtPath:path error:nil];
+            continue;
+        }
         NSDate *date = [[files attributesOfItemAtPath:path error:nil]
             fileModificationDate] ?: [NSDate distantPast];
         total += bytes;
         [entries addObject:@[ date, name, @(bytes) ]];
+    }
+    unsigned long long cap = bridge_cache_cap_bytes();
+    NSNumber *free = [[files attributesOfFileSystemForPath:root error:nil]
+        objectForKey:NSFileSystemFreeSize];
+    if (free) {
+        unsigned long long room = free.unsignedLongLongValue + total;
+        room = room > CACHE_DISK_RESERVE ? room - CACHE_DISK_RESERVE : 0;
+        if (room < cap) cap = room;
     }
     if (total <= cap) return;
     [entries sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
@@ -198,6 +273,7 @@ static void bridge_cache_store(NSString *identifier, NSString *directory) {
             if (![files copyItemAtPath:from toPath:to error:nil]) return;
         }
     }
+    bridge_cache_tag(entry);
     [[NSData data] writeToFile:
         [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
 }
@@ -348,6 +424,7 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
         NSFileManager *files = [NSFileManager defaultManager];
         bool cache = msv_ane_cache_enabled();
         bool cached = cache && bridge_cache_restore(identifier, directory);
+        if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
         if (!cached) bridge_write_sources(directory, program, weights);
         [[NSString stringWithFormat:@"%d", getpid()]
             writeToFile:[directory stringByAppendingPathComponent:@"msv-ane.pid"]
