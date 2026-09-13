@@ -122,4 +122,94 @@ final class CrashRecoveryTests: XCTestCase {
         let log = "Insufficient memory to load model"
         XCTAssertTrue(ServerManager.isMemoryFailure(log))
     }
+
+    // MARK: - CounterState (pure, drives the retry budget)
+
+    /// Consecutive crashes within the window accumulate and eventually
+    /// exhaust the retry budget.
+    func testCounterAccumulatesAcrossRecordCrashCalls() {
+        var counter = CrashRecovery.CounterState()
+        let now = Date()
+        let maxRetries = CrashRecovery.maxRetries
+
+        for i in 1...maxRetries {
+            counter.recordCrash(now: now)
+            XCTAssertEqual(counter.count, i)
+            XCTAssertTrue(CrashRecovery.shouldAutoRestart(
+                mode: .autoRestart, wasRunning: true, exitCode: 9,
+                isMemoryFailure: false, crashCount: counter.count, maxRetries: maxRetries
+            ), "attempt \(i)/\(maxRetries) should restart")
+        }
+        // One more crash exceeds the budget.
+        counter.recordCrash(now: now)
+        XCTAssertEqual(counter.count, maxRetries + 1)
+        XCTAssertFalse(CrashRecovery.shouldAutoRestart(
+            mode: .autoRestart, wasRunning: true, exitCode: 9,
+            isMemoryFailure: false, crashCount: counter.count, maxRetries: maxRetries
+        ), "budget exhausted → modal")
+    }
+
+    /// Resetting the counter mid-sequence restores the full retry budget.
+    /// This is the behaviour of a manual start; an auto-restart must NOT
+    /// call reset(), or the budget never exhausts.
+    func testResetRestoresFullRetryBudget() {
+        var counter = CrashRecovery.CounterState()
+        let now = Date()
+
+        // Two crashes.
+        counter.recordCrash(now: now)
+        counter.recordCrash(now: now)
+        XCTAssertEqual(counter.count, 2)
+
+        // Manual start resets.
+        counter.reset()
+        XCTAssertEqual(counter.count, 0)
+        XCTAssertNil(counter.lastCrashDate)
+
+        // Next crash is attempt 1 again — budget restored.
+        counter.recordCrash(now: now)
+        XCTAssertEqual(counter.count, 1,
+            "after reset the counter starts from 1, not 3")
+    }
+
+    /// The sliding window auto-resets the counter when enough time has
+    /// passed since the last crash.
+    func testWindowExpiryResetsCounter() {
+        var counter = CrashRecovery.CounterState()
+        let t0 = Date()
+        // Two rapid crashes (within the window).
+        counter.recordCrash(now: t0)
+        counter.recordCrash(now: t0.addingTimeInterval(1))
+        XCTAssertEqual(counter.count, 2)
+
+        // Third crash 400s later — well past the 300s window.
+        counter.recordCrash(now: t0.addingTimeInterval(400))
+        XCTAssertEqual(counter.count, 1,
+            "window expired → counter restarted from 0 before incrementing")
+    }
+
+    // MARK: - Settings reset notification
+
+    func testResetPostsNotification() {
+        let key = CrashRecoveryMode.defaultsKey
+        UserDefaults.standard.set(CrashRecoveryMode.autoRestart.rawValue, forKey: key)
+
+        let expectation = expectation(forNotification: CrashRecoveryMode.didResetNotification, object: nil)
+        CrashRecoveryMode.resetIfApplicable(.all)
+        wait(for: [expectation], timeout: 1.0)
+
+        XCTAssertNil(UserDefaults.standard.string(forKey: key),
+                     "reset should remove the persisted key")
+    }
+
+    func testResetDoesNotFireForUnrelatedCategory() {
+        let key = CrashRecoveryMode.defaultsKey
+        UserDefaults.standard.set(CrashRecoveryMode.autoRestart.rawValue, forKey: key)
+
+        CrashRecoveryMode.resetIfApplicable(.category(.providers))
+
+        XCTAssertEqual(UserDefaults.standard.string(forKey: key),
+                       CrashRecoveryMode.autoRestart.rawValue,
+                       "non-server reset must leave the key intact")
+    }
 }

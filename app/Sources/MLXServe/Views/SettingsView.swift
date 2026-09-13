@@ -1302,8 +1302,17 @@ private struct CrashRecoveryRow: View {
             .labelsHidden()
             .frame(width: 200)
             .onChange(of: mode) { _, newValue in
-                UserDefaults.standard.set(newValue.rawValue, forKey: CrashRecoveryMode.defaultsKey)
+                // Only persist when the effective value actually changed.
+                // This prevents the programmatic reset (onReceive below)
+                // from writing the default back after resetIfApplicable
+                // removed the key.
+                if ServerManager.loadCrashRecoveryMode() != newValue {
+                    UserDefaults.standard.set(newValue.rawValue, forKey: CrashRecoveryMode.defaultsKey)
+                }
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: CrashRecoveryMode.didResetNotification)) { _ in
+            mode = .defaultMode
         }
     }
 }
