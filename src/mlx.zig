@@ -79,6 +79,8 @@ pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
 
 // Stream
 pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
+pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
 pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;

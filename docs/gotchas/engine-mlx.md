@@ -4928,6 +4928,36 @@ lazily copied side-channel state is not in the residual's graph; the cadence eva
 still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
 (`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
 
+
+### Grouped MTP keeps request state private and prices complete rounds
+
+Qwen4 groups lose throughput when long-context noise makes useful verify rounds
+look unprofitable, or ordinary decoding leaves their cost evidence stale.
+The group planner shares runtime shape prices while each request owns
+acceptance, head history, and recurrent state. Mean-cost confidence controls
+throughput; raw round variance and observed gaps still constrain latency.
+Bounded recovery refreshes evidence after 48 ordinary tokens, with at most eight
+narrow rounds per request and at least 96 tokens remaining.
+Entry consumes pending drafts without creating successors; a surviving row skips
+the multi-row padding guard. Draft steps visit only active rows. An active head leaves the shared module before
+its request state is accessed, and an empty head resolves its origin to position 1.
+The verifier joins eligible projections and expert work while preserving each
+request's reduction lanes. Unsupported shapes use the existing solo adapter.
+Rollback retains KV offsets and SSM state, never references to backing KV buffers;
+full acceptance preserves GDN's dedicated final state instead of its unwritten tail.
+Model gates compare drafts, logits, committed state, resumed rounds and failure
+cleanup; the live gate checks EOS and cancellation against legacy MTP.
+Group planning defaults on; `MLX_SERVE_MTP_GROUP_PLANNER=0` disables it. `enable_batch_mtp:false`
+keeps a request on legacy MTP. Existing v3 round-cost files remain unchanged.
+
+### A generic compiler architecture must not enable NAX
+
+The fallback Metal target `air64_v27` describes a compiler version, not GPU
+hardware. Parsing its digits as a GPU generation enabled M5-only kernels on M4.
+`naxArchGeneration` accepts only `applegpu_g<digits>[suffix]` or `g<digits>[suffix]`.
+Hardware-specific tests use the same eligibility guard as their kernels;
+parser and forced-fallback regressions cover the unsupported-device path.
+
 ## A failed dense KV write left freed view handles in the entry (2026-09-10)
 
 `KVCache.updateDense` frees the previous `key_view`/`value_view` first, so the buffer can be

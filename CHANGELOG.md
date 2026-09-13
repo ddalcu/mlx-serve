@@ -20,6 +20,8 @@
 
 ### Changes
 
+- Flash Next shares MTP drafting and verification across requests by default (`MLX_SERVE_MTP_GROUP_PLANNER=0` disables it), using adaptive group widths and bounded recovery at long context.
+
 - The launcher offers a plain Shell beside the coding agents, on this Mac and in the sandbox.
 - Terminals open on click. The sandbox and host terminals no longer ask which folder to work in first; they use the working folder from Settings.
 

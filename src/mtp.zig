@@ -1025,6 +1025,148 @@ pub fn rerankSelect(
     return out;
 }
 
+fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse) !mlx.mlx_array {
+    const shape = mlx.getShape(x);
+    if (shape.len < 2 or shape.len > 3 or shape[0] < 1 or shape[0] > 32) return error.MtpRerankBatchTooWide;
+    if (shape.len == 3 and shape[1] != 1) return error.MtpRerankInputShape;
+    if (transformer_mod.mtpCoarsePairsEnabled() and transformer_mod.batchedMtpHeadEnabled()) {
+        if (try transformer_mod.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    }
+    if (try @import("transformer.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    const n: usize = @intCast(shape[0]);
+    var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (parts[0..n]) |p| {
+        if (p.ctx != null) _ = mlx.mlx_array_free(p);
+    };
+    for (0..n) |i| {
+        var start: [3]c_int = @splat(0);
+        var stop: [3]c_int = @splat(0);
+        const strides: [3]c_int = @splat(1);
+        @memcpy(stop[0..shape.len], shape);
+        start[0] = @intCast(i);
+        stop[0] = @intCast(i + 1);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, x, &start, @intCast(shape.len), &stop, @intCast(shape.len), &strides, @intCast(shape.len), s));
+        parts[i] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(&parts[i], row, rc.q.w, rc.q.s, rc.q.b, true, mlx.mlx_optional_int.some(@intCast(rc.group_size)), mlx.mlx_optional_int.some(@intCast(rc.bits)), "affine", s));
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts[0..n].ptr, n);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
+}
+/// Batched greedy draft ids from mixer rows `x` `[N,1,H]`. Same scheme as
+/// `rerankSelect` per row; one coarse readout over N.
+pub fn rerankSelectBatched(
+    s: mlx.mlx_stream,
+    target: *Transformer,
+    coarse: *?RerankCoarse,
+    logged: *bool,
+    x: mlx.mlx_array,
+    suppress_mask: ?mlx.mlx_array,
+) !?mlx.mlx_array {
+    const rc = if (coarse.*) |*p| p else return null;
+    const xsh = mlx.getShape(x);
+    const N: c_int = xsh[0];
+    if (N <= 1) return rerankSelect(s, target, coarse, logged, x, suppress_mask);
+
+    var coarse_logits = try rerankCoarseRows(s, x, rc);
+    defer _ = mlx.mlx_array_free(coarse_logits);
+    if (suppress_mask) |mask| {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_where(&masked, mask, neg_inf, coarse_logits, s));
+        _ = mlx.mlx_array_free(coarse_logits);
+        coarse_logits = masked;
+    }
+    if (!logged.*) {
+        log.info("[mtp] draft rerank engaged ({d}-bit coarse -> top-32 -> trunk re-score)\n", .{rc.bits});
+        logged.* = true;
+    }
+
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    const rows = rc.rows;
+    var id_parts: [32]mlx.mlx_array = undefined;
+    const n_usize: usize = @intCast(N);
+    if (n_usize > id_parts.len) return error.MtpRerankBatchTooWide;
+    for (id_parts[0..n_usize]) |*p| p.* = .{ .ctx = null };
+    defer for (id_parts[0..n_usize]) |p| {
+        if (p.ctx != null) _ = mlx.mlx_array_free(p);
+    };
+    const csh = mlx.getShape(coarse_logits);
+    const last = csh[csh.len - 1];
+    for (0..n_usize) |i| {
+        const i_c: c_int = @intCast(i);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        if (csh.len == 3) {
+            try mlx.check(mlx.mlx_slice(&row, coarse_logits, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, last }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        } else {
+            try mlx.check(mlx.mlx_slice(&row, coarse_logits, &[_]c_int{ i_c, 0 }, 2, &[_]c_int{ i_c + 1, last }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        }
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, row, &[_]c_int{rows}, 1, s));
+        const cands = draftTop32(s, flat, rows) catch |err| {
+            log.warn("[mtp] draft rerank shortlist failed ({s}) - dropping to the full readout\n", .{@errorName(err)});
+            var dead = coarse.*.?;
+            dead.deinit();
+            coarse.* = null;
+            return null;
+        };
+        defer _ = mlx.mlx_array_free(cands);
+        var w32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w32);
+        var s32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(s32);
+        var b32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b32);
+        try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
+        if (target.lm_head_b.ctx != null)
+            try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
+        var xi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xi);
+        try mlx.check(mlx.mlx_slice(&xi, x, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        var exact = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(exact);
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &exact,
+            xi,
+            w32,
+            s32,
+            b32,
+            true,
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
+            qp.mode.cstr(),
+            s,
+        ));
+        var amax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(amax);
+        try mlx.check(mlx.mlx_argmax_axis(&amax, exact, -1, false, s));
+        var picked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(picked);
+        try mlx.check(mlx.mlx_take_axis(&picked, cands, amax, 0, s));
+        var id = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&id, picked, .int32, s));
+        var id2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&id2, id, &[_]c_int{ 1, 1 }, 2, s));
+        _ = mlx.mlx_array_free(id);
+        id_parts[i] = id2;
+    }
+    const vec = mlx.mlx_vector_array_new_data(id_parts[0..n_usize].ptr, n_usize);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var stacked = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
+    for (id_parts[0..n_usize]) |*p| p.* = .{ .ctx = null };
+    return stacked;
+}
+
 /// Sidecar file layouts we accept, in priority order. The native layout wins
 /// so a repo shipping several keeps loading exactly what it loaded before.
 /// Root-level names are what others publish (mutual compat: their
@@ -4928,6 +5070,42 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
     try testing.expect(kept * 2 >= draws);
 }
 
+test "mtp: batched rerank ids equal N solo rerankSelect" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBA7C);
+    defer fx.deinit();
+    const coarse = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    var slot: ?RerankCoarse = coarse;
+    defer if (slot) |*q| q.deinit();
+    var logged = false;
+    const xa = try fx.randomX(s, 11);
+    defer _ = mlx.mlx_array_free(xa);
+    const xb = try fx.randomX(s, 23);
+    defer _ = mlx.mlx_array_free(xb);
+    const sa = (try rerankSelect(s, &fx.xfm, &slot, &logged, xa, null)) orelse return error.SoloRerankDeclined;
+    defer _ = mlx.mlx_array_free(sa);
+    const sb = (try rerankSelect(s, &fx.xfm, &slot, &logged, xb, null)) orelse return error.SoloRerankDeclined;
+    defer _ = mlx.mlx_array_free(sb);
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, xa);
+    _ = mlx.mlx_vector_array_append_value(vec, xb);
+    var stacked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stacked);
+    try mlx.check(mlx.mlx_concatenate_axis(&stacked, vec, 0, s));
+    const bat = (try rerankSelectBatched(s, &fx.xfm, &slot, &logged, stacked, null)) orelse return error.BatchedRerankDeclined;
+    defer _ = mlx.mlx_array_free(bat);
+    var a0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a0);
+    var a1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a1);
+    try mlx.check(mlx.mlx_slice(&a0, bat, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try mlx.check(mlx.mlx_slice(&a1, bat, &[_]c_int{ 1, 0 }, 2, &[_]c_int{ 2, 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try testing.expectEqual(try readIdScalar(sa), try readIdScalar(a0));
+    try testing.expectEqual(try readIdScalar(sb), try readIdScalar(a1));
+}
+
 test "mtp: rerankSelect declines without a coarse head, and the full readout is the exact argmax" {
     // The fallback is not decoration: `canRerankDrafts` false, a build refusal
     // and a mid-chain shortlist failure all land here, and the answer must
@@ -5127,4 +5305,51 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 
     try testing.expect(mtpCtxWithinLimit(1, 1));
     try testing.expect(!mtpCtxWithinLimit(1, 2));
+}
+
+test "mtp: row-axis coarse logits equal each solo readout" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
+    defer fx.deinit();
+    var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
+    defer rc.deinit();
+    const tx = @import("transformer.zig");
+    const saved = tx.batched_mtp_head_override;
+    defer tx.batched_mtp_head_override = saved;
+    for ([_]bool{ true, false }) |enabled| {
+        tx.batched_mtp_head_override = enabled;
+        for ([_]usize{ 2, 4, 8, 17 }) |n| {
+            var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
+            defer for (parts[0..n]) |x| {
+                if (x.ctx != null) _ = mlx.mlx_array_free(x);
+            };
+            for (0..n) |i| parts[i] = try fx.randomX(s, 17 + i);
+            const vec = mlx.mlx_vector_array_new_data(parts[0..n].ptr, n);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 0, s));
+            const before = tx.mtp_head_row_dispatches;
+            const got = try rerankCoarseRows(s, x, &rc);
+            defer _ = mlx.mlx_array_free(got);
+            try testing.expectEqual(@as(usize, if (enabled and n <= 16) 1 else 0), tx.mtp_head_row_dispatches - before);
+            for (parts[0..n], 0..) |input, i| {
+                var want = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(want);
+                try mlx.check(mlx.mlx_quantized_matmul(&want, input, rc.q.w, rc.q.s, rc.q.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(3), "affine", s));
+                var row = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(row);
+                try mlx.check(mlx.mlx_slice(&row, got, &[_]c_int{ @intCast(i), 0, 0 }, 3, &[_]c_int{ @intCast(i + 1), 1, rc.rows }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                var same = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(same);
+                try mlx.check(mlx.mlx_array_equal(&same, row, want, false, s));
+                try mlx.check(mlx.mlx_array_eval(same));
+                var equal: bool = false;
+                try mlx.check(mlx.mlx_array_item_bool(&equal, same));
+                if (!equal) std.debug.print("coarse logits differ: N={d} row={d}\n", .{ n, i });
+                try testing.expect(equal);
+            }
+        }
+    }
 }

@@ -1676,3 +1676,7 @@ test "round_cost: persist write is a no-op when a diagnostic that adds barriers 
     try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
     try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
 }
+
+test "group pricing keeps the existing long-context store version" {
+    try testing.expectEqual(@as(u32, 3), storeVersion(.long));
+}

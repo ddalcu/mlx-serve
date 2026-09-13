@@ -260,6 +260,9 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
 
+    const test_build = b.step("test-build", "Compile unit tests without running them");
+    test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+
     const run_unit_tests = b.addRunArtifact(unit_tests);
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);

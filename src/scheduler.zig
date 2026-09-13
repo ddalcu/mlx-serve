@@ -72,6 +72,7 @@ const SamplingParams = generate_mod.SamplingParams;
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const round_cost_mod = @import("round_cost.zig");
+const group_cost_mod = @import("mtp_group_cost.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -264,6 +265,7 @@ pub const SubmitParams = struct {
     dflash: ?*DflashModel = null,
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
+    allow_batch_mtp: bool = true,
     mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
@@ -485,6 +487,7 @@ pub const Slot = struct {
     dflash: ?*DflashModel,
     drafter_block_size: u32,
     enable_mtp: bool,
+    allow_batch_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
     pld_draft_len: u32,
@@ -497,6 +500,12 @@ pub const Slot = struct {
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
     /// batched forward captures its hidden so the next solo tick can resume speculating.
     mtp_plain_tick: bool = false,
+    planner_plain_transition: bool = false,
+    planner_price_transition: bool = false,
+    planner_last_width: u8 = 255,
+    planner_force_plain: bool = false,
+    mtp_publish_ns: u64 = 0,
+    mtp_publish_gap_ms: f32 = 0,
 
     // ── State + output channel. ──
     state: SlotState,
@@ -689,6 +698,7 @@ pub const Slot = struct {
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
+            .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
@@ -2188,6 +2198,7 @@ pub const Scheduler = struct {
     /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
     /// INIT options does not bind DISPATCH".
     fn slotTicksRegular(slot: *const Slot) bool {
+        if (Planner.enabled() and slot.planner_force_plain) return true;
         const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
@@ -6343,6 +6354,24 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         if (s.legacy_gen) |*g| g.spec_cost_solo = active.len == 1;
     }
 
+    if (Planner.enabled()) {
+        for (active) |slot| if (slot.legacy_gen) |*gen| {
+            gen.mtp_planner_width = null;
+            gen.mtp_planner_probe = false;
+            gen.mtp_planner_recovering = false;
+            slot.planner_plain_transition = false;
+            slot.planner_force_plain = false;
+        };
+        if (try tryPlannerTick(sch, active)) return;
+        for (active) |slot| if (slot.legacy_gen) |*gen| {
+            if (gen.mtp_planner_owned) slot.planner_force_plain = true;
+        };
+    }
+    defer if (Planner.enabled()) for (active) |slot| {
+        slot.planner_force_plain = false;
+        if (slot.legacy_gen) |*gen| gen.mtp_planner_pending = false;
+    };
+
     // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
     // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
     // Phase A7 test hook: `MLX_SERVE_FORCE_BATCHED=1` bypasses the gate so the
@@ -6643,13 +6672,26 @@ pub fn specTickMode(
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
+fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
+    const now = gen.timer.read();
+    slot.mtp_publish_gap_ms = if (slot.mtp_publish_ns > 0 and now >= slot.mtp_publish_ns) @as(f32, @floatFromInt(now - slot.mtp_publish_ns)) / std.time.ns_per_ms else 0;
+    slot.mtp_publish_ns = now;
+    if (Planner.enabled() and gen.mtp_planner_owned) gen.mtp_planner_max_gap_ms = @max(gen.mtp_planner_max_gap_ms, slot.mtp_publish_gap_ms);
+}
+
 fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {
+    if (gen.mtp != null and tokens.len > 0) {
+        plannerOutputClock(slot, gen);
+    }
     // The Generator has already committed the whole block internally. Publish
     // it incrementally so streaming, cancellation, EOS and usage all observe
     // the same per-token boundary. The generator-side cap guarantees max_tokens
     // cannot land before the returned block ends.
-    for (tokens) |t| {
-        if (slot.cancelled.load(.acquire)) return;
+    for (tokens, 0..) |t, i| {
+        if (slot.cancelled.load(.acquire)) {
+            if (gen.mtp != null) log.debug("[mtp-publish] cancelled after round: discarded={d}\n", .{tokens.len - i});
+            return;
+        }
         if (generate_mod.isEosId(t, slot.eos_token_ids)) {
             finishSlot(sch, slot, "stop");
             return;
@@ -6749,6 +6791,9 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     };
 
     if (try loopGuardTick(sch, slot, gen)) return;
+    if (Planner.enabled() and slot.planner_force_plain) {
+        gen.mtp_hidden_stale = true;
+    }
     if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
@@ -6756,7 +6801,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode = specTickMode(
+    const tick_mode: SpecTickMode = if (Planner.enabled() and slot.planner_force_plain) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
@@ -6829,6 +6874,10 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
     gen.observeSerialTick();
+    if (Planner.enabled()) {
+        if (slot.planner_force_plain) gen.mtp_planner_plain_ticks += 1;
+        plannerOutputClock(slot, gen);
+    }
     const t = tok_opt.?;
     // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
     // transfers into slot.logprobs_buf (gen sets the field, we null it here).
@@ -7172,6 +7221,397 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.drafter != null, gen.dflash != null, slot.enable_pld, gen.pld_enabled, gen.dspark_enabled) == .mtp;
 }
 
+const Planner = @import("mtp_group_planner.zig");
+
+fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
+    const xfm = slots[0].model.transformer.?;
+    var shape = group_cost_mod.GroupShape{ .n = @intCast(slots.len), .kv_format = cacheCostFormat(slots[0].cache.config) };
+    for (slots, widths, 0..) |slot, width, i| {
+        const gen = &slot.legacy_gen.?;
+        const kv: u8 = @intCast(xfm.round_cost.bucketOf(@intCast(slot.moe_seq_offset)));
+        if (width == 0) {
+            shape.rows[i] = group_cost_mod.GroupShape.row(0, 0, 0, kv, 0, 0, group_cost_mod.GroupShape.samplingMode(false, false, false, gen.sampling.temperature > 0.01));
+        } else {
+            const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
+            const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
+            shape.head_format = cacheCostFormat(xfm.qwen4_mtp.?.cache.config);
+            shape.rows[i] = group_cost_mod.GroupShape.row(width, width, width, kv, @intCast(xfm.round_cost.bucketOf(@intCast(off))), @intCast(@min(history, round_cost_mod.MAX_WIDTH + 2)), gen.mtpPlannerMode());
+        }
+    }
+    return shape;
+}
+
+fn plannerInputSame(a: group_cost_mod.GroupShape, b: group_cost_mod.GroupShape) bool {
+    var aa = a;
+    var bb = b;
+    aa.attention = 0;
+    aa.moe = 0;
+    aa.head_calls = 0;
+    bb.attention = 0;
+    bb.moe = 0;
+    bb.head_calls = 0;
+    return std.meta.eql(aa, bb);
+}
+
+fn plannerPriceTransition(previous: u8, width: u8, pending: bool) bool {
+    return width > 0 and (pending or previous != width);
+}
+
+fn plannerRecurringInputSame(a: group_cost_mod.GroupShape, b: group_cost_mod.GroupShape) bool {
+    if (a.n != b.n or a.width() == 0 or b.width() == 0) return false;
+    inline for (.{ @as(u6, 24), @as(u6, 32) }) |shift| {
+        var a_max: u8 = 0;
+        var b_max: u8 = 0;
+        for (a.rows[0..a.n], b.rows[0..b.n]) |arow, brow| {
+            a_max = @max(a_max, group_cost_mod.GroupShape.part(arow, shift));
+            b_max = @max(b_max, group_cost_mod.GroupShape.part(brow, shift));
+        }
+        if (a_max != b_max) return false;
+    }
+    var aa = a;
+    var bb = b;
+    const recurring_mask = ~((@as(u64, 0xff) << 24) | (@as(u64, 0xff) << 32) | (@as(u64, 0xff) << 40));
+    for (aa.rows[0..aa.n], bb.rows[0..bb.n]) |*arow, *brow| {
+        if (group_cost_mod.GroupShape.part(arow.*, 40) < 2 or group_cost_mod.GroupShape.part(brow.*, 40) < 2) return false;
+        arow.* &= recurring_mask;
+        brow.* &= recurring_mask;
+    }
+    return plannerInputSame(aa.canonical(), bb.canonical());
+}
+
+const PlannerPrices = struct {
+    slots: []const *Slot,
+    geometry: group_cost_mod.GroupShape,
+
+    fn init(slots: []const *Slot) PlannerPrices {
+        var widths: [Planner.MAX_ROWS]u8 = @splat(0);
+        for (slots, 0..) |slot, i| widths[i] = @intFromBool(slot.legacy_gen.?.mtp != null and slot.legacy_gen.?.mtp_cache != null);
+        return .{ .slots = slots, .geometry = plannerShape(slots, widths[0..slots.len]) };
+    }
+
+    fn keyFor(self: *const PlannerPrices, slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
+        var key = self.geometry;
+        key.n = @intCast(slots.len);
+        key.rows = @splat(0);
+        key.head_format = 0;
+        for (slots, widths, 0..) |slot, width, i| {
+            for (self.slots, 0..) |original, j| {
+                if (original != slot) continue;
+                const code = self.geometry.rows[j];
+                key.rows[i] = if (width == 0) group_cost_mod.GroupShape.row(0, 0, 0, group_cost_mod.GroupShape.part(code, 24), 0, 0, group_cost_mod.GroupShape.part(code, 48) & 8) else (code & ~@as(u64, 0xffffff)) | @as(u64, width) * 0x10101;
+                if (width > 0) key.head_format = self.geometry.head_format;
+                break;
+            }
+        }
+        return key.canonical();
+    }
+
+    fn sample(self: *const PlannerPrices, slots: []const *Slot, widths: []const u8, trusted: bool) ?Planner.Price {
+        if (slots.len == 0) return .{ .ms = 0, .samples = std.math.maxInt(u32) };
+        const key = self.keyFor(slots, widths);
+        const table = &slots[0].model.transformer.?.mtp_group_cost;
+        var selected: ?Planner.Price = null;
+        var score: f32 = 0;
+        var max_gap: f32 = 0;
+        var mean_upper: f32 = 0;
+        var mean_lower: f32 = std.math.inf(f32);
+        const plain = key.width() == 0;
+        for (table.shapes) |entry| {
+            if (entry.cell.n == 0 or !plannerInputSame(key, entry.shape)) continue;
+            if (trusted and entry.cell.n < Planner.MIN_SAMPLES) continue;
+            const deviation = 2 * @sqrt(entry.variance);
+            const mean_deviation = 2 * @sqrt(entry.variance * entry.mean_weight_sq);
+            mean_upper = @max(mean_upper, entry.cell.ms + mean_deviation);
+            mean_lower = @min(mean_lower, entry.cell.ms - mean_deviation);
+            const value = if (plain) entry.cell.ms - deviation else entry.cell.ms + deviation;
+            for (entry.gap_ms[0..key.n]) |gap| max_gap = @max(max_gap, gap);
+            if (selected == null or (if (plain) value < score else value > score)) {
+                score = value;
+                selected = .{ .ms = entry.cell.ms, .variance = entry.variance, .samples = entry.cell.n };
+            }
+        }
+        if (selected) |*value| {
+            value.max_gap_ms = max_gap;
+            if (!plain and Planner.meanCostEnabled()) value.mean_upper_ms = mean_upper;
+            if (plain and Planner.meanCostEnabled()) value.mean_lower_ms = mean_lower;
+            return selected;
+        }
+        if (plain) return null;
+
+        var pooled_n: u32 = 0;
+        var sum: f64 = 0;
+        var sum_sq: f64 = 0;
+        var mean_sum_sq: f64 = 0;
+        max_gap = 0;
+        for (table.shapes) |entry| {
+            if (entry.cell.n == 0 or !plannerRecurringInputSame(key, entry.shape)) continue;
+            const n: f64 = @floatFromInt(entry.cell.n);
+            const mean: f64 = entry.cell.ms;
+            pooled_n +|= entry.cell.n;
+            sum += n * mean;
+            sum_sq += n * (@as(f64, entry.variance) + mean * mean);
+            // History-to-history differences remain uncertainty in a pooled prediction.
+            mean_sum_sq += n * (@as(f64, entry.variance) * entry.mean_weight_sq + mean * mean);
+            for (entry.gap_ms[0..key.n]) |gap| max_gap = @max(max_gap, gap);
+        }
+        const required: u32 = if (trusted) Planner.MIN_SAMPLES else 1;
+        if (pooled_n < required) return null;
+        const n: f64 = @floatFromInt(pooled_n);
+        const mean = sum / n;
+        const variance = @max(0, sum_sq / n - mean * mean);
+        const mean_variance = @max(0, mean_sum_sq / n - mean * mean);
+        return .{ .ms = @floatCast(mean), .variance = @floatCast(variance), .samples = pooled_n, .max_gap_ms = max_gap, .mean_upper_ms = if (Planner.meanCostEnabled()) @floatCast(mean + 2 * @sqrt(mean_variance)) else null };
+    }
+
+    pub fn price(self: *PlannerPrices, widths: []const u8) ?Planner.Price {
+        var positive: [Planner.MAX_ROWS]*Slot = undefined;
+        var drafts: [Planner.MAX_ROWS]u8 = undefined;
+        var zeros: [Planner.MAX_ROWS]*Slot = undefined;
+        const zero_widths: [Planner.MAX_ROWS]u8 = @splat(0);
+        var pn: usize = 0;
+        var zn: usize = 0;
+        for (self.slots, widths) |slot, width| {
+            if (width == 0) {
+                zeros[zn] = slot;
+                zn += 1;
+            } else {
+                positive[pn] = slot;
+                drafts[pn] = width;
+                pn += 1;
+            }
+        }
+        const plain = self.sample(zeros[0..zn], zero_widths[0..zn], true) orelse return null;
+        const spec = self.sample(positive[0..pn], drafts[0..pn], true) orelse return null;
+        const deviation = @sqrt(plain.variance) + @sqrt(spec.variance);
+        return .{ .ms = plain.ms + spec.ms, .variance = deviation * deviation, .samples = @min(plain.samples, spec.samples), .max_gap_ms = @max(plain.max_gap_ms, spec.max_gap_ms), .mean_upper_ms = if (spec.mean_upper_ms) |bound| plain.ms + 2 * @sqrt(plain.variance) + bound else null, .mean_lower_ms = if (pn == 0) plain.mean_lower_ms else null };
+    }
+
+    fn probeEstimate(self: *PlannerPrices, widths: []const u8, plain: Planner.Price) f32 {
+        if (self.sample(self.slots, widths, false)) |value| return value.ms + 2 * @sqrt(value.variance);
+        var widest: u8 = 0;
+        for (widths) |width| widest = @max(widest, width);
+        var lower: [Planner.MAX_ROWS]u8 = undefined;
+        for ([_]u8{ 2, 1 }) |cap| {
+            if (cap >= widest) continue;
+            for (widths, 0..) |width, i| lower[i] = @min(width, cap);
+            if (self.sample(self.slots, lower[0..widths.len], false)) |value| return scaledProbeEstimate(value, widest, cap);
+        }
+        if (self.slots.len >= 4 and self.slots.len % 2 == 0) {
+            const half = self.slots.len / 2;
+            if (self.sample(self.slots[0..half], widths[0..half], false)) |a| {
+                if (self.sample(self.slots[half..], widths[half..], false)) |b| return a.ms + b.ms + 2 * (@sqrt(a.variance) + @sqrt(b.variance));
+            }
+        }
+        return self.probeFallbackEstimate(widths, plain);
+    }
+
+    fn probeFallbackEstimate(_: *PlannerPrices, widths: []const u8, plain: Planner.Price) f32 {
+        var widest: u8 = 0;
+        for (widths) |width| widest = @max(widest, width);
+        const upper = plain.ms + 2 * @sqrt(plain.variance);
+        if (widest <= 2) return 2 * upper;
+        return 1.5 * upper * @as(f32, @floatFromInt(widest + 1));
+    }
+
+    fn scaledProbeEstimate(value: Planner.Price, widest: u8, measured: u8) f32 {
+        const ratio = @as(f32, @floatFromInt(widest + 1)) / @as(f32, @floatFromInt(measured + 1));
+        return value.ms * ratio;
+    }
+};
+
+var planner_engaged_logged = false;
+var planner_calibration_block_logged = false;
+var planner_depth_two_reject_logged = false;
+
+fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
+    if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
+    const xfm = active[0].model.transformer orelse return false;
+    if (xfm.qwen4 == null or xfm.qwen4_mtp == null) return false;
+    if (active.len == 1) {
+        const gen = if (active[0].legacy_gen) |*g| g else return false;
+        if (!gen.mtp_planner_owned) return false;
+    }
+    var rows: [Planner.MAX_ROWS]Planner.Row = undefined;
+    var lenses: [Planner.MAX_ROWS]u32 = undefined;
+    var has_mtp = false;
+    var pending_pipeline = false;
+    var pending_draft = false;
+    for (active, 0..) |slot, i| {
+        if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
+        const gen = if (slot.legacy_gen) |*g| g else return false;
+        if (gen.ctx.mrope_pos != null) return false;
+        pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
+        pending_draft = pending_draft or gen.mtp_pre_draft != null;
+        const why = sch.batchVerdict(slot);
+        const mtp_row = why == .spec_active and slotMtpGroupable(slot);
+        if (why != .ok and !mtp_row) return false;
+        has_mtp = has_mtp or mtp_row;
+        const cap = if (mtp_row) @min(@min(if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current), Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1) else 0;
+        rows[i] = .{ .history = &gen.mtp_planner_history, .cap = @intCast(cap), .latency_ms = Planner.latencyMs() };
+        lenses[i] = @intCast(slot.moe_seq_offset);
+    }
+    if (!has_mtp) return false;
+    std.sort.insertion(u32, lenses[0..active.len], {}, std.sort.asc(u32));
+    if (active.len > 1 and batchedKvKeepCount(lenses[0..active.len]) != active.len) return false;
+    const entry = Planner.entry(pending_pipeline, pending_draft);
+    if (entry == .wait_predraft) {
+        // Consume the pending rounds without perpetually replacing their successors.
+        for (active) |slot| slot.legacy_gen.?.mtp_planner_pending = true;
+        return false;
+    }
+    if (entry == .drain) {
+        for (active, rows[0..active.len]) |slot, row| {
+            const gen = &slot.legacy_gen.?;
+            if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
+            if (row.cap > 0) gen.mtp_planner_owned = true;
+            slot.planner_plain_transition = true;
+            slot.mtp_plain_tick = row.cap > 0;
+        }
+        log.info("[mtp-planner] rows={d} action=drain\n", .{active.len});
+        try runBatchedDecodeTick(sch, active);
+        return true;
+    }
+
+    var live: [Planner.MAX_ROWS]*Slot = undefined;
+    var count: usize = 0;
+    for (active) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        if (try gen.checkStop()) {
+            finishSlot(sch, slot, gen.finish_reason);
+            continue;
+        }
+        live[count] = slot;
+        count += 1;
+    }
+    if (count != active.len) {
+        if (count > 0) try runDecodeTick(sch, live[0..count]);
+        return true;
+    }
+    for (active, rows[0..active.len]) |slot, row| if (row.cap > 0) {
+        slot.legacy_gen.?.mtp_planner_owned = true;
+    };
+    var prices = PlannerPrices.init(active);
+    var decision = Planner.choose(rows[0..active.len], &prices);
+    var probe = false;
+    var recovering = false;
+    const zero_widths: [Planner.MAX_ROWS]u8 = @splat(0);
+    var probe_rounds: u8 = std.math.maxInt(u8);
+    for (active, rows[0..active.len]) |slot, row| if (row.cap > 0) {
+        probe_rounds = @min(probe_rounds, slot.legacy_gen.?.mtp_planner_probes);
+    };
+    if (!planner_depth_two_reject_logged and probe_rounds >= 12 and Planner.shouldProbe(decision, probe_rounds)) {
+        var depth_two: [Planner.MAX_ROWS]u8 = @splat(0);
+        var expected: f32 = 0;
+        for (rows[0..active.len], 0..) |row, i| {
+            depth_two[i] = @min(2, row.cap);
+            expected += row.history.expected(depth_two[i]);
+        }
+        planner_depth_two_reject_logged = true;
+        log.info("[mtp-planner] depth-two rejected price={any} expected_tokens={d:.2} plain_rate={d:.1}\n", .{ prices.price(depth_two[0..active.len]), expected, decision.plain_rate });
+    }
+    if (Planner.shouldProbe(decision, probe_rounds)) {
+        if (prices.price(zero_widths[0..active.len])) |plain| {
+            var candidate: [Planner.MAX_ROWS]u8 = @splat(0);
+            var available = true;
+            for (active, rows[0..active.len], 0..) |slot, row, i| {
+                const gen = &slot.legacy_gen.?;
+                candidate[i] = Planner.probeWidth(gen.mtp_planner_probes, gen.max_tokens -| gen.completion_tokens, row.cap) orelse {
+                    available = false;
+                    break;
+                };
+            }
+            if (available) {
+                const estimate = prices.probeEstimate(candidate[0..active.len], plain);
+                var latency_limit: f32 = std.math.floatMax(f32);
+                for (rows[0..active.len]) |row| {
+                    latency_limit = @min(latency_limit, row.latency_ms);
+                    if (estimate > row.latency_ms) available = false;
+                }
+                if (available) {
+                    decision.widths = candidate;
+                    decision.upper_ms = estimate;
+                    probe = true;
+                } else {
+                    if (!planner_calibration_block_logged) {
+                        planner_calibration_block_logged = true;
+                        log.info("[mtp-planner] calibration blocked widths={any} predicted_ms={d:.2} latency_ms={d:.2}\n", .{ candidate[0..active.len], estimate, latency_limit });
+                    }
+                }
+            }
+        }
+    }
+    if (!probe and Planner.shouldProbe(decision, probe_rounds)) {
+        var candidate: [Planner.MAX_ROWS]u8 = @splat(0);
+        var available = true;
+        for (active, rows[0..active.len], 0..) |slot, row, i| {
+            const gen = &slot.legacy_gen.?;
+            candidate[i] = gen.mtp_planner_recovery.width(gen.completion_tokens, gen.max_tokens -| gen.completion_tokens, row.cap, gen.mtp_planner_probes) orelse {
+                available = false;
+                break;
+            };
+        }
+        if (available) if (prices.price(zero_widths[0..active.len])) |plain| {
+            const estimate = prices.probeEstimate(candidate[0..active.len], plain);
+            for (rows[0..active.len]) |row| if (estimate > row.latency_ms) {
+                available = false;
+            };
+            if (available) {
+                decision.widths = candidate;
+                decision.upper_ms = estimate;
+                probe = true;
+                recovering = true;
+            }
+        };
+    }
+    if (Generator.mtpForcedDepth()) |depth| {
+        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
+        probe = false;
+        recovering = false;
+    }
+    var stale: [Planner.MAX_ROWS]bool = undefined;
+    for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
+    const execution = Planner.execution(decision.widths[0..active.len], stale[0..active.len]);
+    const prime = execution.prime;
+    var positives: [Planner.MAX_ROWS]*Slot = undefined;
+    var plains: [Planner.MAX_ROWS]*Slot = undefined;
+    const pn = execution.speculative_n;
+    const zn = execution.plain_n;
+    var changed = false;
+    for (active, decision.widths[0..active.len]) |slot, width| {
+        const row_changed = slot.planner_last_width != width;
+        changed = changed or row_changed;
+        slot.planner_price_transition = plannerPriceTransition(slot.planner_last_width, width, slot.planner_price_transition);
+        slot.planner_last_width = width;
+    }
+    for (execution.plain[0..zn], 0..) |row, i| {
+        const slot = active[row];
+        const gen = &slot.legacy_gen.?;
+        slot.planner_plain_transition = gen.mtp_hist_stash != null or gen.mtp_pre_draft != null or prime;
+        if (gen.mtp != null) try gen.mtpDetachHead(slot.allocator, true);
+        slot.mtp_plain_tick = execution.capture[row];
+        plains[i] = slot;
+    }
+    for (execution.speculative[0..pn], 0..) |row, i| {
+        const slot = active[row];
+        const gen = &slot.legacy_gen.?;
+        gen.mtp_planner_width = decision.widths[row];
+        gen.mtp_planner_probe = probe;
+        gen.mtp_planner_recovering = recovering;
+        positives[i] = slot;
+    }
+    if (!planner_engaged_logged) {
+        planner_engaged_logged = true;
+        log.info("[mtp-planner] engaged: margin=5% noise=2sigma latency_ms={d:.1} max_rows=8\n", .{Planner.latencyMs()});
+    }
+    if (changed or prime or probe) log.info("[mtp-planner] rows={d} widths={any} action={s} predicted_ms={d:.2} rate={d:.1} plain={d:.1}\n", .{ active.len, decision.widths[0..active.len], if (prime) "prime" else if (recovering) "recover" else if (probe) "calibrate" else "choose", decision.upper_ms, decision.rate, decision.plain_rate });
+    if (pn > 0) {
+        try runBatchedMtpHeadTick(sch, positives[0..pn]);
+    }
+    if (zn > 0) try runBatchedDecodeTick(sch, plains[0..zn]);
+    return true;
+}
+
 var mtp_group_env: ?bool = null;
 fn mtpGroupEnabled() bool {
     if (mtp_group_env) |v| return v;
@@ -7194,6 +7634,24 @@ fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
     return has_qwen4 and !env_on;
 }
 
+/// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape
+/// that may. A qwen4 trunk's batched sub-paths are decode-shaped: the merged forward
+/// misses per-row byte equality at width 2 and dies with SIGSEGV at width 5.
+pub fn mergedVerifyDeclineReason(has_qwen4: bool, width: u32) ?[]const u8 {
+    if (has_qwen4 and width > 1) return "qwen4 trunk past verify width 1";
+    return null;
+}
+
+pub const VerifyShape = enum { solo, row_axis, merged };
+
+pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
+    if (rows <= 1) return .solo;
+    if (mergedVerifyDeclineReason(has_qwen4, width) != null) return .row_axis;
+    return .merged;
+}
+
+var merged_verify_decline_logged: bool = false;
+
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
@@ -7201,6 +7659,133 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
     return if (mtpRoundsStaySolo(slot)) 3 else mtpCrowdThreshold();
+}
+
+fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
+    const cost_xfm = group[0].model.transformer.?;
+    cost_xfm.cost_trace_active = cost_xfm.qwen4 != null;
+    cost_xfm.cost_attention = 0;
+    cost_xfm.cost_moe = 0;
+    const head_calls_before = transformer_mod.mtp_head_row_dispatches;
+    defer cost_xfm.cost_trace_active = false;
+    defer for (group) |slot| {
+        if (slot.legacy_gen) |*gen| gen.mtp_batch_head = false;
+    };
+    var tick_sw = io_util.Stopwatch.init(group[0].io);
+    var gens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
+    var chains: [MAX_BATCH_GROUP]generate_mod.Generator.MtpPreDraft = undefined;
+    var opens: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundOpen = undefined;
+    var live: [MAX_BATCH_GROUP]*Slot = undefined;
+    var n: usize = 0;
+    var n_chain: usize = 0;
+    defer for (opens[0..n]) |*o| {
+        if (o.chain.drafts.len != 0) o.chain.deinit(live[0].allocator);
+    };
+    defer for (chains[0..n_chain]) |*c| c.deinit(live[0].allocator);
+
+    for (group) |slot| {
+        const gen = &slot.legacy_gen.?;
+        if (try loopGuardTick(sch, slot, gen)) continue;
+        gen.mtp_batch_head = true;
+        const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
+            gen.mtp_batch_head = false;
+            slot.markError(@errorName(e));
+            continue;
+        };
+        switch (begun) {
+            .done => |r| publishMtpResult(sch, slot, gen, r),
+            .verify => |st_in| {
+                var state = st_in;
+                defer state.deinit(slot.allocator);
+                gen.mtpRoundVerify(&state) catch |e| {
+                    slot.markError(@errorName(e));
+                    continue;
+                };
+                const r = gen.mtpRoundFinish(slot.allocator, &state) catch |e| {
+                    slot.markError(@errorName(e));
+                    continue;
+                };
+                publishMtpResult(sch, slot, gen, r);
+            },
+            .open => |o| {
+                opens[n] = o;
+                gens[n] = gen;
+                live[n] = slot;
+                n += 1;
+            },
+        }
+    }
+    if (n == 0) return;
+
+    var depth: u32 = 1;
+    for (opens[0..n], 0..) |*o, i| {
+        depth = @max(depth, o.chain.m);
+        chains[i] = o.chain;
+        o.chain = .{
+            .plan = chains[i].plan,
+            .off0 = 0,
+            .t1 = 0,
+            .t1_arr = .{ .ctx = null },
+            .drafts = &.{},
+            .draft_arrs = &.{},
+            .n_drafted = 0,
+            .conf_arrs = null,
+            .n_conf = 0,
+            .q_probs = null,
+            .n_qp = 0,
+            .h_chain = null,
+            .m = 0,
+        };
+        n_chain = i + 1;
+    }
+
+    generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
+        for (live[0..n]) |slot| slot.markError(@errorName(e));
+        return;
+    };
+
+    const taken = n;
+    n = 0;
+    n_chain = 0;
+    var states: [MAX_BATCH_GROUP]generate_mod.Generator.MtpRoundState = undefined;
+    var vgens: [MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
+    var vlive: [MAX_BATCH_GROUP]*Slot = undefined;
+    var vn: usize = 0;
+    defer for (states[0..vn], vlive[0..vn]) |*st, slot| {
+        st.deinit(slot.allocator);
+    };
+    for (0..taken) |i| {
+        opens[i].chain = chains[i];
+        states[vn] = gens[i].mtpRoundContinue(live[i].allocator, opens[i]) catch |e| {
+            live[i].markError(@errorName(e));
+            continue;
+        };
+        vgens[vn] = gens[i];
+        vlive[vn] = live[i];
+        vn += 1;
+    }
+    if (vn == 0) return;
+
+    var sts: [MAX_BATCH_GROUP]*generate_mod.Generator.MtpRoundState = undefined;
+    for (states[0..vn], 0..) |*st, i| sts[i] = st;
+    if (generate_mod.Generator.mtpGroupVerify(vgens[0..vn], sts[0..vn])) |_| {
+        generate_mod.Generator.mtpGroupAccept(vgens[0..vn], sts[0..vn]) catch |e| {
+            for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
+            return;
+        };
+    } else |e| {
+        for (vlive[0..vn]) |slot| slot.markError(@errorName(e));
+        return;
+    }
+    for (states[0..vn], vgens[0..vn], vlive[0..vn]) |*st, gen, slot| {
+        if (slot.state == .errored) continue;
+        const r = gen.mtpRoundFinish(slot.allocator, st) catch |e| {
+            slot.markError(@errorName(e));
+            continue;
+        };
+        publishMtpResult(sch, slot, gen, r);
+    }
+    observeGroupRound(vlive[0..vn], states[0..vn], group.len, &tick_sw, head_calls_before);
 }
 
 /// Group MTP slots by model (pad-waste capped like the plain group) and run one
@@ -7324,6 +7909,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
             continue;
         };
         switch (begun) {
+            .open => unreachable,
             .done => |r| publishMtpResult(sch, slot, gen, r),
             .verify => |st| {
                 states[n] = st;
@@ -7426,6 +8012,57 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     }
 }
 
+/// One wall for the group grid: from the tick's first round-begin to its last publish.
+/// Both group sites hand their tick stopwatch here rather than starting one of their own.
+fn groupCostSampleComplete(expected: usize, retained: []const u32, published: []const bool) bool {
+    if (expected < 1 or expected > group_cost_mod.MAX_GROUP_ROWS or retained.len != expected or published.len != expected) return false;
+    for (retained, published) |count, complete| if (count == 0 or !complete) return false;
+    return true;
+}
+
+fn cacheCostFormat(config: transformer_mod.KVQuantConfig) u64 {
+    return (@as(u64, config.group_size) << 16) | (@as(u64, config.bits) << 8) | @backingInt(config.scheme);
+}
+
+fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, expected: usize, tick_sw: *io_util.Stopwatch, head_calls_before: u64) void {
+    const xfm = live[0].model.transformer orelse return;
+    if (live.len > group_cost_mod.MAX_GROUP_ROWS) return;
+    var price_transition = false;
+    for (live) |slot| price_transition = price_transition or slot.planner_price_transition;
+    defer {
+        for (live) |slot| slot.planner_price_transition = false;
+    }
+    var emitted: [group_cost_mod.MAX_GROUP_ROWS]u32 = undefined;
+    var published: [group_cost_mod.MAX_GROUP_ROWS]bool = undefined;
+    var gaps: [group_cost_mod.MAX_GROUP_ROWS]f32 = undefined;
+    for (live, states, 0..) |slot, st, i| {
+        emitted[i] = st.retained;
+        published[i] = slot.state == .decoding and !slot.cancelled.load(.acquire);
+        gaps[i] = slot.mtp_publish_gap_ms;
+    }
+    if (!groupCostSampleComplete(expected, emitted[0..live.len], published[0..live.len])) return;
+    if (price_transition) return;
+    var key = group_cost_mod.GroupShape{
+        .n = @intCast(live.len),
+        .kv_format = cacheCostFormat(live[0].cache.config),
+        .head_format = if (xfm.qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
+        .attention = xfm.cost_attention,
+        .moe = xfm.cost_moe,
+        .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),
+    };
+    for (live, states, 0..) |slot, st, i| {
+        const chain = st.chain;
+        if (chain.m > round_cost_mod.MAX_WIDTH or chain.n_drafted > round_cost_mod.MAX_WIDTH or chain.head_input_rows > round_cost_mod.MAX_WIDTH + 2) return;
+        const mode = group_cost_mod.GroupShape.samplingMode(slot.legacy_gen.?.mtp.?.canRerankDrafts(), chain.conf_arrs != null, chain.q_probs != null, slot.legacy_gen.?.sampling.temperature > 0.01);
+        key.rows[i] = group_cost_mod.GroupShape.row(@intCast(chain.m), @intCast(chain.n_drafted), @intCast(@min(chain.plan.m_lo, chain.n_drafted)), @intCast(xfm.round_cost.bucketOf(@intCast(st.moe_seq_offset_snap))), @intCast(xfm.round_cost.bucketOf(@intCast(chain.off0))), @intCast(chain.head_input_rows), mode);
+        key.padding += @intCast(st.verify_len - (1 + chain.m));
+    }
+    const ms = @as(f32, @floatFromInt(tick_sw.read())) / @as(f32, std.time.ns_per_ms);
+    _ = xfm.mtp_group_cost.observeShape(key, ms, emitted[0..live.len], gaps[0..live.len], .round);
+}
+
+/// One verify forward for a whole group: ragged rows ride the row-axis form, equal-lane
+/// trunks the merged padded forward, one row a solo round.
 fn publishMtpResult(sch: *Scheduler, slot: *Slot, gen: *Generator, result: ?Generator.DrafterStepResult) void {
     const r = result orelse {
         finishSlot(sch, slot, gen.finish_reason);
@@ -7462,6 +8099,25 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
 
+    const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
+    var price_watch = io_util.Stopwatch.init(active[0].io);
+    var price_key: group_cost_mod.GroupShape = .{};
+    var price_clean = observe_plain;
+    if (observe_plain) {
+        const zeros: [Planner.MAX_ROWS]u8 = @splat(0);
+        price_key = plannerShape(active, zeros[0..N]);
+        xfm_ptr.cost_trace_active = true;
+        xfm_ptr.cost_attention = 0;
+        xfm_ptr.cost_moe = 0;
+        for (active) |slot| {
+            const gen = &slot.legacy_gen.?;
+            if (gen.has_pending_logits or gen.has_pending_token or slot.planner_plain_transition or slot.mtp_plain_tick) price_clean = false;
+        }
+    }
+    defer if (observe_plain) {
+        xfm_ptr.cost_trace_active = false;
+    };
+
     // Legacy→batched transition: a slot arriving from a legacy single-slot
     // tick (or fresh from prefill) carries lazy pipeline state — a lookahead
     // token ALREADY FORWARDED into its KV cache plus `pending_logits` for
@@ -7487,6 +8143,10 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             };
             if (emitted) |tok| {
                 slot.pushToken(tok);
+                if (Planner.enabled() and gen.mtp_planner_owned) {
+                    gen.mtp_planner_plain_ticks += 1;
+                    plannerOutputClock(slot, gen);
+                }
                 if (tok != 0) slot.was_pad_only = false;
                 slot.completion_tokens = gen.completion_tokens;
                 if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
@@ -7543,7 +8203,16 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         return;
     }
     var want_hidden = false;
-    for (batch) |slot| want_hidden = want_hidden or slot.mtp_plain_tick;
+    for (batch) |slot| {
+        want_hidden = want_hidden or slot.mtp_plain_tick;
+        if (Planner.enabled() and slot.legacy_gen.?.mtp_planner_owned) {
+            const gen = &slot.legacy_gen.?;
+            if (slot.mtp_plain_tick) gen.mtp_planner_prime_ticks += 1 else {
+                gen.mtp_hidden_stale = true;
+                gen.mtp_planner_plain_ticks += 1;
+            }
+        }
+    }
     var hidden_rows: ?[]mlx.mlx_array = null;
     defer if (hidden_rows) |rows| {
         for (rows) |a| _ = mlx.mlx_array_free(a);
@@ -7566,6 +8235,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             gen.last_hidden = rows[i];
             rows[i] = mlx.mlx_array_new();
             gen.has_last_hidden = true;
+            if (Planner.enabled()) gen.mtp_hidden_stale = false;
         }
     }
     for (batch) |slot| slot.mtp_plain_tick = false;
@@ -7607,6 +8277,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         if (emit != 0) slot.was_pad_only = false;
         const val = sampled orelse continue;
         gen.next_token_id = @intCast(val);
+        if (Planner.enabled()) plannerOutputClock(slot, gen);
 
         // Stop checks (mirrors Generator.checkStop).
         if (generate_mod.isEosId(emit, slot.eos_token_ids)) {
@@ -7641,6 +8312,18 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             finishSlot(sch, slot, "length");
             continue;
         }
+    }
+    if (price_clean and live_n == N) {
+        var gaps: [Planner.MAX_ROWS]f32 = undefined;
+        for (batch, 0..) |slot, i| {
+            if (slot.state != .decoding or slot.cancelled.load(.acquire)) return;
+            gaps[i] = slot.mtp_publish_gap_ms;
+        }
+        price_key.attention = xfm_ptr.cost_attention;
+        price_key.moe = xfm_ptr.cost_moe;
+        const emitted: [Planner.MAX_ROWS]u32 = @splat(1);
+        const ms = @as(f32, @floatFromInt(price_watch.read())) / std.time.ns_per_ms;
+        _ = xfm_ptr.mtp_group_cost.observeShape(price_key, ms, emitted[0..N], gaps[0..N], .round);
     }
 }
 
@@ -8802,4 +9485,255 @@ test "mtpSubGroupSize fills the verify lane's row budget" {
     // The depth each sub-group gets: floor(rows / size) - 1.
     try testing.expectEqual(@as(u32, 2), 7 / @as(u32, 2) - 1);
     try testing.expectEqual(@as(u32, 1), 7 / @as(u32, 3) - 1);
+}
+
+test "L10 retained position: a padded row can never take the full-accept arm" {
+    // Unpadded full accept commits 1+m and keeps the trunk state the forward left.
+    try testing.expect(generate_mod.Generator.mtpFullAccept(2, 2, 3));
+    try testing.expectEqual(@as(u32, 3), generate_mod.Generator.mtpRetained(2));
+    // Same accept count, row padded to a neighbour's width: rollback arm.
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(2, 2, 5));
+    try testing.expectEqual(@as(u32, 3), generate_mod.Generator.mtpRetained(2));
+    // Partial and zero accepts are rollback at any width.
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(1, 2, 3));
+    try testing.expect(!generate_mod.Generator.mtpFullAccept(0, 2, 3));
+    try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
+}
+
+test "single MTP slot reaches the round entry through runDecodeTick" {
+    var xfm: Transformer = undefined;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.transformer = null;
+    var gen: Generator = undefined;
+    gen.mtp_planner_owned = false;
+    gen.generated_ids = .empty;
+    gen.loop_guard_start = 0;
+    gen.mtp = .{ .qwen4 = &xfm };
+    gen.mtp_cache = .{ .qwen = undefined };
+    gen.has_last_hidden = true;
+    gen.drafter = null;
+    gen.dflash = null;
+    gen.pld_enabled = false;
+    gen.dspark_enabled = false;
+    gen.done = false;
+    gen.sampling = .{};
+    gen.logprobs_n = 1;
+    var slot: Slot = undefined;
+    slot.allocator = testing.allocator;
+    slot.model = &model;
+    slot.ds4_session = null;
+    slot.llama_session = null;
+    slot.diffusion = null;
+    slot.legacy_gen = gen;
+    slot.enable_mtp = true;
+    slot.enable_drafter = false;
+    slot.enable_pld = false;
+    slot.finished = false;
+    slot.error_code = null;
+    slot.cancelled = std.atomic.Value(bool).init(false);
+    slot.completion_tokens = 0;
+    var sch: Scheduler = undefined;
+    sch.force_batched = false;
+    sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+    var active = [_]*Slot{&slot};
+    try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
+    try testing.expect(slot.legacy_gen.?.spec_cost_solo);
+    try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
+    try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
+}
+
+test "L10 merged verify: an uncertified [N,S] shape is declined by name, never dispatched" {
+    // Measured on Qwen3.8-Flash-Next: the merged forward misses per-row byte equality
+    // at width 2 (~98% of logits elements) and dies with SIGSEGV at width 5.
+    try testing.expect(mergedVerifyDeclineReason(true, 5) != null);
+    try testing.expect(mergedVerifyDeclineReason(true, 2) != null);
+    // Width 1 is a plain batched decode row, not a verify.
+    try testing.expect(mergedVerifyDeclineReason(true, 1) == null);
+    // Other GDN trunks keep the padded merged forward they had.
+    try testing.expect(mergedVerifyDeclineReason(false, 5) == null);
+}
+
+test "L10 group verify: ragged widths keep ONE forward, never a solo cohort per width" {
+    // Cohorts of one take the solo arm, which releases and re-merges the persistent GDN
+    // group every tick; the merged forward pads as it did before L10 and the row-axis
+    // form runs each row at its own width, so a mixed group is never split.
+    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(4, true, 9));
+    try testing.expectEqual(VerifyShape.row_axis, verifyShapeFor(2, true, 2));
+    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(4, false, 9));
+    try testing.expectEqual(VerifyShape.merged, verifyShapeFor(2, false, 3));
+    // One row is a solo round on every trunk.
+    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, true, 5));
+    try testing.expectEqual(VerifyShape.solo, verifyShapeFor(1, false, 5));
+}
+
+test "group cost geometry rejects partial rounds and keeps complete cache formats" {
+    try testing.expect(groupCostSampleComplete(2, &.{ 1, 3 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(3, &.{ 1, 3 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(2, &.{ 1, 0 }, &.{ true, true }));
+    try testing.expect(!groupCostSampleComplete(2, &.{ 1, 3 }, &.{ true, false }));
+    const a = transformer_mod.KVQuantConfig.affine(8);
+    var b = a;
+    b.group_size = 128;
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
+    b = a;
+    b.scheme = .turboquant_4;
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
+}
+
+test "L11 scheduler prices each shared execution once and preserves row sampling geometry" {
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var a: Slot = undefined;
+    var b: Slot = undefined;
+    a.model = &model;
+    b.model = &model;
+    const slots = [_]*Slot{ &a, &b };
+    var geometry = group_cost_mod.GroupShape{ .n = 2, .kv_format = 8, .head_format = 8 };
+    geometry.rows[0] = group_cost_mod.GroupShape.row(1, 1, 1, 2, 1, 3, 1);
+    geometry.rows[1] = group_cost_mod.GroupShape.row(1, 1, 1, 5, 2, 2, 9);
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+    const speculative = prices.keyFor(&slots, &.{ 2, 4 });
+    const swapped = prices.keyFor(&.{ &b, &a }, &.{ 4, 2 });
+    try testing.expectEqual(speculative, swapped);
+    for (0..3) |_| _ = xfm.mtp_group_cost.observeShape(speculative, 30, &.{ 2, 4 }, &.{ 30, 30 }, .round);
+    try testing.expectEqual(@as(f32, 30), prices.price(&.{ 2, 4 }).?.ms);
+    const plain_a = prices.keyFor(&.{&a}, &.{0});
+    const spec_b = prices.keyFor(&.{&b}, &.{4});
+    for (0..3) |_| {
+        _ = xfm.mtp_group_cost.observeShape(plain_a, 10, &.{1}, &.{10}, .round);
+        _ = xfm.mtp_group_cost.observeShape(spec_b, 25, &.{4}, &.{25}, .round);
+    }
+    try testing.expectEqual(@as(f32, 35), prices.price(&.{ 0, 4 }).?.ms);
+    try testing.expect(prices.price(&.{ 4, 0 }) == null);
+    const plain_b = prices.keyFor(&.{&b}, &.{0});
+    try testing.expectEqual(@as(u8, 8), group_cost_mod.GroupShape.part(plain_b.rows[0], 48));
+    try testing.expectEqual(@as(u8, 5), group_cost_mod.GroupShape.part(plain_b.rows[0], 24));
+    try testing.expectEqual(@as(u8, 0), group_cost_mod.GroupShape.part(plain_b.rows[0], 40));
+    try testing.expectEqual(@as(u64, 0), plain_b.head_format);
+}
+
+test "L11 planner pools recurring head histories without mixing the cold first history" {
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var slots_storage: [4]Slot = undefined;
+    var slots: [4]*Slot = undefined;
+    for (&slots_storage, 0..) |*slot, i| {
+        slot.model = &model;
+        slots[i] = slot;
+    }
+    var geometry = group_cost_mod.GroupShape{ .n = 4, .kv_format = 8, .head_format = 8 };
+    @memset(geometry.rows[0..4], group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 4, 1));
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+
+    var cold = geometry;
+    cold.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 1, 1);
+    _ = xfm.mtp_group_cost.observeShape(cold, 180, &.{ 2, 2, 2, 2 }, &.{ 180, 180, 180, 180 }, .round);
+    var h2 = geometry;
+    h2.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 2, 1);
+    _ = xfm.mtp_group_cost.observeShape(h2, 74, &.{ 2, 3, 3, 2 }, &.{ 74, 74, 74, 74 }, .round);
+    const probe_seed = prices.sample(&slots, &.{ 2, 2, 2, 2 }, false).?;
+    try testing.expectEqual(@as(u32, 1), probe_seed.samples);
+    try testing.expectEqual(@as(f32, 74), probe_seed.ms);
+    var h3 = geometry;
+    h3.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 1, 1, 3, 1);
+    _ = xfm.mtp_group_cost.observeShape(h3, 76, &.{ 3, 2, 3, 2 }, &.{ 76, 76, 76, 76 }, .round);
+    var other_head_kv = geometry;
+    other_head_kv.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 2, 3, 1);
+    _ = xfm.mtp_group_cost.observeShape(other_head_kv, 20, &.{ 3, 3, 3, 3 }, &.{ 20, 20, 20, 20 }, .round);
+    var other_mode = geometry;
+    other_mode.rows[1] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 1, 3, 9);
+    _ = xfm.mtp_group_cost.observeShape(other_mode, 20, &.{ 3, 3, 3, 3 }, &.{ 20, 20, 20, 20 }, .round);
+    try testing.expect(prices.price(&.{ 2, 2, 2, 2 }) == null);
+
+    var h4 = geometry;
+    h4.rows[2] = group_cost_mod.GroupShape.row(2, 2, 2, 2, 0, 2, 1);
+    _ = xfm.mtp_group_cost.observeShape(h4, 78, &.{ 3, 3, 2, 2 }, &.{ 78, 78, 78, 78 }, .round);
+    const pooled = prices.price(&.{ 2, 2, 2, 2 }).?;
+    try testing.expectEqual(@as(u32, 3), pooled.samples);
+    try testing.expect(pooled.ms >= 74 and pooled.ms <= 78);
+    try testing.expect(pooled.variance > 0);
+    try testing.expect(pooled.max_gap_ms >= 78);
+
+    const plain = prices.keyFor(&slots, &.{ 0, 0, 0, 0 });
+    for (0..3) |_| _ = xfm.mtp_group_cost.observeShape(plain, 37, &.{ 1, 1, 1, 1 }, &.{ 37, 37, 37, 37 }, .round);
+    var histories: [4]Planner.History = @splat(.{});
+    var rows: [4]Planner.Row = undefined;
+    for (&histories, 0..) |*history, i| {
+        for (0..3) |_| history.observe(2, 2);
+        rows[i] = .{ .history = history };
+    }
+    const decision = Planner.choose(&rows, &prices);
+    try testing.expectEqualSlices(u8, &.{ 2, 2, 2, 2 }, decision.widths[0..4]);
+}
+
+test "mean cost pooling retains differences between histories and both worst-case bounds" {
+    const previous = Planner.mean_cost_override;
+    Planner.mean_cost_override = true;
+    defer Planner.mean_cost_override = previous;
+    var xfm: Transformer = undefined;
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    var model: LoadedModel = undefined;
+    model.transformer = &xfm;
+    var storage: [2]Slot = undefined;
+    var slots: [2]*Slot = undefined;
+    for (&storage, 0..) |*slot, i| {
+        slot.model = &model;
+        slots[i] = slot;
+    }
+    var geometry = group_cost_mod.GroupShape{ .n = 2 };
+    @memset(geometry.rows[0..2], group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 4, 1));
+    var prices = PlannerPrices{ .slots = &slots, .geometry = geometry };
+    var a = geometry;
+    var b = geometry;
+    a.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 2, 1);
+    b.rows[0] = group_cost_mod.GroupShape.row(2, 2, 2, 4, 4, 3, 1);
+    for (0..20) |_| {
+        _ = xfm.mtp_group_cost.observeShape(a, 64, &.{ 3, 3 }, &.{ 64, 64 }, .round);
+        _ = xfm.mtp_group_cost.observeShape(b, 80, &.{ 3, 3 }, &.{ 80, 80 }, .round);
+    }
+    const pooled = prices.price(&.{ 2, 2 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 88), pooled.mean_upper_ms.?, 0.001);
+    xfm.round_cost = .{ .layout = .long };
+    xfm.mtp_group_cost = .{};
+    a = geometry;
+    b = geometry;
+    b.head_calls = 2;
+    xfm.mtp_group_cost.shapes[0] = .{ .shape = a, .cell = .{ .ms = 60, .n = 100 }, .variance = 225, .mean_weight_sq = 1.0 / 19.0 };
+    xfm.mtp_group_cost.shapes[1] = .{ .shape = b, .cell = .{ .ms = 75, .n = 3 }, .variance = 9, .mean_weight_sq = 1.0 / 3.0 };
+    const exact = prices.price(&.{ 2, 2 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 90), exact.ms + 2 * @sqrt(exact.variance), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 75) + 2 * @sqrt(@as(f32, 3)), exact.mean_upper_ms.?, 0.001);
+    a = prices.keyFor(&slots, &.{ 0, 0 });
+    b = a;
+    b.head_calls = 2;
+    xfm.mtp_group_cost.shapes[0] = .{ .shape = a, .cell = .{ .ms = 40, .n = 100 }, .variance = 25, .mean_weight_sq = 1.0 / 19.0 };
+    xfm.mtp_group_cost.shapes[1] = .{ .shape = b, .cell = .{ .ms = 35, .n = 3 }, .variance = 1, .mean_weight_sq = 1.0 / 3.0 };
+    const plain = prices.price(&.{ 0, 0 }).?;
+    try testing.expectApproxEqAbs(@as(f32, 35) - 2 * @sqrt(@as(f32, 1.0 / 3.0)), plain.mean_lower_ms.?, 0.001);
+}
+
+test "L11 cold grouped depths one and two use a bounded two-tick bootstrap" {
+    var prices: PlannerPrices = undefined;
+    prices.slots = &.{};
+    const plain = Planner.Price{ .ms = 40, .variance = 4, .samples = 10 };
+    try testing.expectEqual(@as(f32, 88), prices.probeFallbackEstimate(&.{ 1, 1, 1, 1 }, plain));
+    try testing.expectEqual(@as(f32, 88), prices.probeFallbackEstimate(&.{ 2, 2, 2, 2 }, plain));
+    try testing.expectEqual(@as(f32, 330), prices.probeFallbackEstimate(&.{ 4, 4, 4, 4 }, plain));
+    const lower = Planner.Price{ .ms = 60, .variance = 100, .samples = 2, .max_gap_ms = 170 };
+    try testing.expectEqual(@as(f32, 90), PlannerPrices.scaledProbeEstimate(lower, 2, 1));
+}
+
+test "L11 transition pricing skips the first realized round after prime or width change" {
+    try testing.expect(plannerPriceTransition(255, 1, false));
+    try testing.expect(plannerPriceTransition(1, 1, true));
+    try testing.expect(!plannerPriceTransition(1, 1, false));
+    try testing.expect(plannerPriceTransition(1, 2, false));
+    try testing.expect(!plannerPriceTransition(2, 0, true));
 }

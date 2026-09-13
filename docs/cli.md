@@ -60,7 +60,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
-| `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off) |
+| `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off); qwen4 group planning defaults on (`MLX_SERVE_MTP_GROUP_PLANNER=0` disables it) |
 | `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
@@ -90,3 +90,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |
+
+The qwen4 group planner requires native MTP and defaults on. With it enabled,
+`enable_batch_mtp:false` on a request retains legacy MTP. Group cost estimates live
+in memory; existing v3 round-cost files are unchanged.
