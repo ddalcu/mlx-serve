@@ -1875,10 +1875,10 @@ struct ChatDetailView: View {
     @State private var foldStore = FoldStore()
     /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
     @State private var firstVisibleRow = 0
-    /// Which conversation the cut belongs to. The messages observer is the one
-    /// that fires on first appearance, so it cuts when it sees a new chat; the
-    /// session observer cuts on every switch, including one whose messages
-    /// compare equal (a fork keeps its source's ids) and never reach the first.
+    /// Which conversation the cut belongs to. The messages observer cuts on
+    /// first appearance (it is the one with `initial: true`); the session
+    /// observer cuts on every switch, with its own copy of the rows, so
+    /// neither depends on the other having run.
     @State private var windowSession: UUID?
     @State private var isRevealingEarlier = false
 
@@ -2920,9 +2920,10 @@ struct ChatDetailView: View {
             // the old conversation would be what the new one attaches to,
             // instead of its initial anchor.
             scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
-            // `rows` is already this conversation's: the messages observer runs
-            // first when the messages differ, and when they do not (a fork),
-            // the rows are the same rows.
+            // Rebuilt here as well so the cut does not depend on whether the
+            // messages observer ran first (it runs only when the messages
+            // differ, which a fork's do not).
+            rows = ChatRowBuilder.rows(from: session?.messages ?? [])
             cutTranscriptWindow()
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
