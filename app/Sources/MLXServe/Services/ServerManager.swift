@@ -763,16 +763,17 @@ class ServerManager: ObservableObject {
         return port
     }
 
-    /// Poll `status` until the health loop flips it to `.running` (or `.error`).
-    /// Internal (not `private`) — `AppState.useModelAndAwaitReady` awaits this
-    /// too, for the Model Browser's "Use" button.
+    /// Poll `status` until the health loop flips it to `.running`. `.error` and
+    /// `.stopped` end the wait: every caller starts the server first, so a stop
+    /// seen here ended the launch being waited on.
     func waitUntilRunning(timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             switch status {
             case .running: return
             case .error(let m): throw GenServerError.startFailed(m)
-            default: break
+            case .stopped: throw GenServerError.startFailed("server was stopped")
+            case .starting: break
             }
             try? await Task.sleep(nanoseconds: 300_000_000)
         }
