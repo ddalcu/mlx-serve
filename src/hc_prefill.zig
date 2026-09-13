@@ -5,6 +5,78 @@ const log = @import("log.zig");
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var sigmoid_table: ?mlx.mlx_array = null;
 var announced = false;
+var upmix_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var upmix_announced = false;
+var upmix_verified: u32 = 0;
+
+pub fn upmixEnabled() bool {
+    if (@import("prefill_experiment.zig").hcUpmix()) |on| return on;
+    const raw = std.c.getenv("MLX_SERVE_HC_UPMIX") orelse return false;
+    return raw[0] == '1';
+}
+
+pub fn verifyUpmix() bool {
+    const raw = std.c.getenv("QWEN4_HC_UPMIX_VERIFY") orelse return false;
+    if (raw[0] != '1' or upmix_verified >= 2) return false;
+    upmix_verified += 1;
+    return true;
+}
+
+pub fn upMix(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, normalized: mlx.mlx_array) !?mlx.mlx_array {
+    const ns = mlx.getShape(normalized);
+    if (ns.len != 4 or ns[2] != 4 or ns[3] != 2560 or !geometry(ns[0], ns[1])) return null;
+    const rows = ns[0] * ns[1];
+    if (rows < 2048 or @mod(rows, 64) != 0 or mlx.mlx_array_size(x) != @as(usize, @intCast(rows * 320))) return null;
+    if (!std.mem.eql(c_int, mlx.getShape(w), &.{ 10240, 80 }) or !std.mem.eql(c_int, mlx.getShape(sc), &.{ 10240, 5 }) or !std.mem.eql(c_int, mlx.getShape(bi), &.{ 10240, 5 })) return null;
+    if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(normalized) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var shaped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(shaped);
+    try mlx.check(mlx.mlx_reshape(&shaped, dq, &.{ 4, 2560, 320 }, 3, s));
+    var transposed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(transposed);
+    try mlx.check(mlx.mlx_transpose_axes(&transposed, shaped, &.{ 1, 0, 2 }, 3, s));
+    var flat_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat_w);
+    try mlx.check(mlx.mlx_reshape(&flat_w, transposed, &.{ 10240, 320 }, 2, s));
+    var flat_x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat_x);
+    try mlx.check(mlx.mlx_reshape(&flat_x, x, &.{ rows, 320 }, 2, s));
+    var flat_n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat_n);
+    try mlx.check(mlx.mlx_reshape(&flat_n, normalized, &.{ rows, 4, 2560 }, 3, s));
+    if (upmix_kernel == null) {
+        const names = [_][*:0]const u8{ "x", "w", "normed", "sigtab" };
+        const ins = mlx.mlx_vector_string_new_data(&names, names.len);
+        defer _ = mlx.mlx_vector_string_free(ins);
+        const outs = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(outs);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_hc_upmix", ins, outs, @embedFile("kernels/hc_prefill_upmix.metal"), @embedFile("kernels/qsa_nax_header.metal"), true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        upmix_kernel = k;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ ns[0], ns[1], 2560 }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 160 * 32, @divTrunc(rows, 64) * 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
+    const inputs = mlx.mlx_vector_array_new_data(&.{ flat_x, flat_w, flat_n, try sigmoidTable(s) }, 4);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, upmix_kernel.?, inputs, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs, 0));
+    if (!upmix_announced) {
+        upmix_announced = true;
+        log.info("[hc-upmix] engaged: rows={d} HC=4 H=2560 K=320 bits=8 transient_up_eliminated=true weight_cache=false\n", .{rows});
+    }
+    return out;
+}
 
 pub fn enabled() bool {
     const raw = std.c.getenv("MLX_SERVE_HC_PREFILL") orelse return true;

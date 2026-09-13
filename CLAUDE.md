@@ -112,6 +112,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour, and pass against their own needles. Test the behaviour or state the rule in a comment. A test comment is one line saying what the bar is.
 - **One story per gotcha, one line per rule.** A gotcha entry is the defect, the cause, the fix and the guard in under 20 lines, written once after the work lands. No round-by-round logs, no ledgers, no "what the reviewer said". CHANGELOG: one user-facing sentence per change, no provisional numbers.
 
+- **Qwen4 experimental PLE/group/upmix/MPP prefill paths remain opt-in until architecture, quality and pressure acceptance**: preserve request-owned bounded PLE data and the inference-thread-only MLX contract; diagnostics are not serving benchmarks. See `docs/qwen4-prefill-final.md`.
+
 ## Supported architectures
 
 Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash → ds4, else llama.cpp).

@@ -4914,3 +4914,9 @@ Paired QSA changes reduction order, so it retains an explicit opt-in and a float
 
 - **An 8192-token chunk can execute S8703 after tail coalescing.** HC/GDN/QSA prefill specializations use `qwen4_prefill_limits.max_seq`, and QSA admission reserves the largest eligible coalesced planner. Checking only S<=8192 quietly disabled every fusion around an 8K prompt; the fallback log exposed it. `generate.nextChunkEnd` tests tie the specialization limit to the real merge rule.
 - **HC mean uses a BF16 reciprocal.** Dividing the BF16 sum by an FP32 HC count matches HC4 but fails HC3. Materialize `T(1.f/HC)` before multiply and compare with the production compiled HC closure. Keep HC3 among the geometry fixtures when changing this kernel.
+
+## Bounded PLE and experimental MPP prefill
+
+Registering the entire mmapped n-gram table with Metal can worsen full-model residency despite a fast isolated gather. PLE ahead stages only selected packed rows in request-owned snapshots, checks row identity, and joins its worker on cancellation; all MLX calls remain on the inference thread.
+
+The HC-upmix and MoE MPP epilogues preserve tested BF16 rounding but depend on cooperative tile layout. NAX availability is only a capability guard, not an architecture parity proof. Keep these opt-ins off without the stated validation; layout startup fallback and pressure/admission review remain required. Guards: PLE ownership/cancellation, grouping/tile coverage and compiled HC-upmix parity tests.

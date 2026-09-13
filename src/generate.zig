@@ -2344,6 +2344,28 @@ pub const Generator = struct {
                 @intCast(reserved_tokens),
             );
 
+            // Fixed-boundary text prefill only. The worker receives cloned
+            // row metadata and a read-only table, never request cache state.
+            // Defer joins on success, cancellation and every error path.
+            if (xfm.config.isQwen4()) @import("prefill_experiment.zig").begin(prompt_ids.len);
+            ctx.ple_ahead = ahead: {
+                if (!@import("ple_packed.zig").Ahead.enabled() or width_is_adaptive or has_vision or mtp_active or dflash_active or xfm.compiled_forward != null) break :ahead null;
+                var ends: std.ArrayList(usize) = .empty;
+                defer ends.deinit(allocator);
+                var boundary: usize = 0;
+                while (boundary < loop_end) {
+                    boundary = nextChunkEnd(boundary, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, false);
+                    try ends.append(allocator, boundary);
+                }
+                break :ahead xfm.preparePleAhead(&ctx, prompt_ids[0..loop_end], ends.items) catch |err| {
+                    log.info("[ple-ahead] preparation declined: {s}\n", .{@errorName(err)});
+                    break :ahead null;
+                };
+            };
+            defer {
+                if (ctx.ple_ahead) |ahead| ahead.destroy();
+                ctx.ple_ahead = null;
+            }
             var pos: usize = 0;
             if (options.prefill_expected) |e| e.store(@intCast(loop_end), .monotonic);
             while (pos < loop_end) {
