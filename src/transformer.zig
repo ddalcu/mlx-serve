@@ -1517,27 +1517,21 @@ fn runVerifyQmmMsg(
 // ── NAX m16 verify tile (M5-class matrix units; see the section comment
 // above for provenance, gating, and the never-build-off-probe rule) ──
 
-/// Case-insensitive prefix match on the M5-class GPU family identifier.
-/// Prefix (not equality) is MTPLX's shipping behavior — device variants
-/// report suffixed forms ("applegpu_g17s", "applegpu_g17d").
+/// Parse Apple GPU families, not compiler targets whose suffix is a version.
 pub fn naxArchGeneration(arch: []const u8) struct { gen: u32, phone: bool } {
-    if (arch.len < 3) return .{ .gen = 0, .phone = false };
     var buf: [128]u8 = undefined;
-    const n = @min(arch.len, buf.len);
-    for (arch[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
-    const a = buf[0..n];
-    const last = a[a.len - 1];
-    if (last >= '0' and last <= '9') {
-        var i: usize = a.len;
-        while (i > 0 and a[i - 1] >= '0' and a[i - 1] <= '9') i -= 1;
-        const gen = std.fmt.parseInt(u32, a[i..], 10) catch 0;
-        return .{ .gen = gen, .phone = false };
-    }
-    const tens_c = a[a.len - 3];
-    const ones_c = a[a.len - 2];
-    const tens: u32 = if (tens_c >= '0' and tens_c <= '9') tens_c - '0' else 0;
-    const ones: u32 = if (ones_c >= '0' and ones_c <= '9') ones_c - '0' else 0;
-    return .{ .gen = tens * 10 + ones, .phone = last == 'p' };
+    if (arch.len < 3 or arch.len > buf.len) return .{ .gen = 0, .phone = false };
+    for (arch, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const a = buf[0..arch.len];
+    const prefix = "applegpu_g";
+    const family = if (std.mem.startsWith(u8, a, prefix)) a[prefix.len..] else if (a[0] == 'g') a[1..] else return .{ .gen = 0, .phone = false };
+    if (family.len != 2 and family.len != 3) return .{ .gen = 0, .phone = false };
+    if (!std.ascii.isDigit(family[0]) or !std.ascii.isDigit(family[1])) return .{ .gen = 0, .phone = false };
+    if (family.len == 3) switch (family[2]) {
+        'g', 's', 'd', 'p' => {},
+        else => return .{ .gen = 0, .phone = false },
+    };
+    return .{ .gen = @as(u32, family[0] - '0') * 10 + family[1] - '0', .phone = family.len == 3 and family[2] == 'p' };
 }
 
 pub fn naxArchSupportedFrom(arch: []const u8) bool {
@@ -44071,9 +44065,7 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
     try testing.expect(mtpNaxProfileEnabledFrom(bad));
 }
 
-test "NAX availability probe: G17 prefix + macOS 26.2 floor + fallback rehearsal (pure parts)" {
-    // Mirrors MTPLX's shipping nax_available() gate exactly (nax_verify.py).
-    // Arch: case-insensitive prefix match on "applegpu_g17".
+test "NAX availability probe: GPU family + macOS 26.2 floor + fallback rehearsal (pure parts)" {
     try testing.expect(naxArchIsG17("applegpu_g17s"));
     try testing.expect(naxArchIsG17("AppleGPU_G17"));
     try testing.expect(naxArchIsG17("applegpu_g17"));
@@ -46625,7 +46617,7 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
     try qsaNaxAssertNoWorseThanStock(s, q, k, v, scale, fx.blocks, 4, 4.9e-4);
 }
 
-test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the stock arm" {
+test "gatherQsa256 NAX: unsupported hardware and probe failure preserve stock outputs" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -46633,8 +46625,10 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
     defer qsa_gather_override = null;
     const saved_nax = qsa_nax_override;
     const saved_fail = qsa_nax_probe_fail_override;
+    const saved_available = vqmm_nax_probe_override;
     defer {
         qsa_nax_override = saved_nax;
+        vqmm_nax_probe_override = saved_available;
         qsa_nax_probe_fail_override = saved_fail;
         qsaNaxProbeReset();
     }
@@ -46664,6 +46658,20 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
     defer _ = mlx.mlx_array_free(fallback);
     try std.testing.expect(!qsa_gather_used_nax);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(stock, fallback, s));
+
+    for ([_][]const u8{ "air64_v27", "applegpu_g16s", "g17p" }) |arch| {
+        const available = naxAvailableFrom(false, arch, "26.6.2");
+        try testing.expect(!available);
+        vqmm_nax_probe_override = available;
+        qsa_nax_probe_fail_override = false;
+        qsaNaxProbeReset();
+        const builds = qsa_nax_kernel_builds;
+        const got = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expect(!qsa_gather_used_nax);
+        try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(stock, got, s));
+        try std.testing.expectEqual(builds, qsa_nax_kernel_builds);
+    }
 }
 
 test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
@@ -46832,7 +46840,7 @@ test "gatherQsa256: stock then NAX each fire one engaged line" {
     try std.testing.expectEqual(@as(u32, 1), qsa_gather_engaged_nax);
 }
 
-test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
+test "naxArchSupportedFrom: GPU families only, desktop gen>=17 and phone gen>=18" {
     try std.testing.expect(naxArchSupportedFrom("applegpu_g17s"));
     try std.testing.expect(naxArchSupportedFrom("applegpu_g17"));
     try std.testing.expect(naxArchSupportedFrom("g17"));
@@ -46846,6 +46854,26 @@ test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
     try std.testing.expect(naxArchSupportedFrom("g18p"));
     try std.testing.expect(!naxArchSupportedFrom("garbage"));
     try std.testing.expect(!naxArchSupportedFrom(""));
+
+    for ([_][]const u8{ "AppleGPU_G17G", "applegpu_g17d", "G18P" }) |arch| {
+        const available = naxAvailableFrom(false, arch, "26.6.2");
+        try testing.expect(available);
+        try testing.expect(verifyQmmNaxEnabledForMFrom(8, 5120, 5120, true, true, available, 8));
+        try testing.expect(qsaNaxEligibleFrom(available, "26.6.2", .bfloat16, .bfloat16, .bfloat16, 256, 12, 16));
+    }
+    for ([_][]const u8{
+        "air64_v27",                            "AIR64_V99",   "vendor_g17s",    "gpu17",         "17",
+        "applegpu_g",                           "applegpu_g1", "applegpu_g177s", "applegpu_g17x", "applegpu_g17s-extra",
+        "g17junk",                              "g17s27",      "g17 ",           " g17",          "g+17",
+        "g99999999999999999999999999999999999", "g17\x00",
+    }) |arch| {
+        try testing.expectEqual(@as(u32, 0), naxArchGeneration(arch).gen);
+        const available = naxAvailableFrom(false, arch, "26.6.2");
+        try testing.expect(!available);
+        try testing.expect(!verifyQmmNaxEnabledForMFrom(8, 5120, 5120, true, true, available, 8));
+        try testing.expect(!qsaNaxEligibleFrom(available, "26.6.2", .bfloat16, .bfloat16, .bfloat16, 256, 12, 16));
+        try testing.expectEqualStrings("off (requires M5-class GPU)", naxStatusFrom(arch, "26.6.2"));
+    }
 }
 
 test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows, 16/32 key tiles)" {

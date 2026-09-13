@@ -4957,3 +4957,9 @@ its result on the error path. A grow that fails after K but before V can leave t
 apart; the error aborts that forward and the next request's reset restores a coherent pair.
 Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
 in-capacity and a growing update.
+
+## Compiler-target versions are not NAX GPU generations
+
+Reading trailing digits from an architecture string classified `air64_v27` as generation27 and enabled NAX kernels on a device that could not construct them. The failures also left a pending MLX error that affected later tests. Parse the entire Apple GPU family identifier, preserving desktop17+/phone18+ floors and rejecting unknown prefixes, variants and suffixes.
+
+Guards: positive/negative architecture and dispatch cases, plus real stock-gather output equality with unchanged NAX-kernel build count when hardware support is absent. The M5 positive kernel/parity tests remain enabled; CI does not bypass the checks.

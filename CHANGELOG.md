@@ -4,6 +4,8 @@
 
 ### Highlights
 
+- Unknown GPU architecture names now keep the stock compute path instead of treating compiler-target version numbers as NAX hardware support.
+
 - Consolidate experimental Qwen4 bounded PLE staging, MoE grouping and HC/MPP prefill epilogues with the existing prefill fusions; retain opt-in rollout pending cross-device validation.
 
 - Flash Next prefill fuses HC/GDN work with stock-path kill switches and adds optional paired sparse attention with bounded, billed planner memory. These paths also handle the small tail absorbed by an 8192-token chunk.
