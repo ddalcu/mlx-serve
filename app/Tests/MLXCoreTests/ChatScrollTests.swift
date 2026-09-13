@@ -35,7 +35,9 @@ final class ChatScrollTests: XCTestCase {
         _ = s.handle(.geometryChanged(distanceFromBottom: 800))
         XCTAssertFalse(s.isPinnedToBottom)
 
-        _ = s.handle(.transcriptShown)
+        // No jump here either: the switch hands the view a fresh scroll view
+        // AND a fresh position binding, so the layout anchor is what places it.
+        XCTAssertEqual(s.handle(.transcriptShown), .none)
         XCTAssertTrue(s.isPinnedToBottom)
     }
 

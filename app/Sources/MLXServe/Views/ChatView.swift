@@ -2900,6 +2900,10 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // The binding outlives the scroll view too: a point a fold set in
+            // the old conversation would be what the new one attaches to,
+            // instead of its initial anchor.
+            scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
             // but the first ↑ in the newly-visible tab has to mean "the last
