@@ -99,6 +99,9 @@ struct ImageGenView: View {
     /// what used to blank a perfectly good picture the moment the controls
     /// changed.
     @State private var selectedPath: String? = nil
+    /// An enlarged result opens as a before/after comparison; the preview's
+    /// split button turns the divider off to look at the result alone.
+    @State private var compareEnlarged: Bool = true
     /// Set when a delete can't go through, so a failed Move to Trash says so
     /// instead of looking like a dead menu item.
     @State private var deleteError: String? = nil
@@ -1062,11 +1065,19 @@ struct ImageGenView: View {
     /// pane used to offer Reveal alone, so the same picture got different
     /// options depending on how it was made.
     private func completedPreview(path: String, origin: ImagePanePreview.Origin) -> some View {
-        VStack(spacing: 8) {
+        // Only an enlarge has a "before", and only one made since inputs were
+        // kept — older results in the folder show the plain picture.
+        let comparisonInput = origin == .enlarged ? RestoreComparison.existingInput(forResult: path) : nil
+        return VStack(spacing: 8) {
             if let img = NSImage(contentsOfFile: path) {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFit()
+                if compareEnlarged, let input = comparisonInput,
+                   let before = NSImage(contentsOfFile: input) {
+                    BeforeAfterSlider(before: before, after: img)
+                } else {
+                    Image(nsImage: img)
+                        .resizable()
+                        .scaledToFit()
+                }
             }
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
@@ -1075,6 +1086,15 @@ struct ImageGenView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
+                if comparisonInput != nil {
+                    Button { compareEnlarged.toggle() } label: {
+                        Image(systemName: compareEnlarged ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(compareEnlarged
+                          ? "Hide the before/after divider"
+                          : "Compare with the picture SeedVR2 started from")
+                }
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
@@ -1214,7 +1234,11 @@ struct ImageGenView: View {
         // row from memory and the preview keeps pointing at a trashed file.
         switch item.origin {
         case .generated: service.forget(path: item.path)
-        case .enlarged: restore.forget(path: item.path)
+        case .enlarged:
+            restore.forget(path: item.path)
+            // Its before/after input goes too: once the result is gone nothing
+            // can show that copy, and it is as big as the result.
+            RestoreComparison.removeInput(forResult: item.path)
         }
         MediaThumbnails.forget(path: item.path)
         selectedPath = next

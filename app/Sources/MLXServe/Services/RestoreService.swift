@@ -84,6 +84,71 @@ enum RestoreGeometry {
     }
 }
 
+/// The "before" half of the enlarge preview's before/after slider.
+///
+/// An upscale records nothing about where it came from, and the source photo
+/// can move, be deleted, or be an earlier result the user has since trashed —
+/// so the comparison keeps its OWN copy: the exact bytes SeedVR2 was handed.
+/// That picture is already the restore's canvas (cropped onto the /16 grid, or
+/// bicubic-resized for a scale above 1x), so it lines up with the result pixel
+/// for pixel and the slider never stretches one side to meet the other. It is
+/// kept exactly as sent, lossless: SeedVR2 removes compression artefacts, and a
+/// JPEG "before" would credit it with repairing damage the comparison did.
+enum RestoreComparison {
+
+    /// A dot-folder inside the result's own day folder: Finder hides it, and
+    /// the `recent` scan reads only the day folder's files, so a stored input
+    /// is never listed as a result of its own (`RestoreService.recentPaths`).
+    static let folderName = ".before"
+
+    /// Keyed by the result's filename, so a result always finds its input
+    /// and two results can never share one.
+    static func inputPath(forResult resultPath: String) -> String {
+        let dir = (resultPath as NSString).deletingLastPathComponent
+        let name = (resultPath as NSString).lastPathComponent
+        return ((dir as NSString).appendingPathComponent(folderName) as NSString)
+            .appendingPathComponent(name)
+    }
+
+    /// Best-effort: a comparison is a nicety, and failing to store one must
+    /// never fail the restore that already worked.
+    @discardableResult
+    static func saveInput(_ data: Data, forResult resultPath: String) -> Bool {
+        let path = inputPath(forResult: resultPath)
+        do {
+            try FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: path))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// nil for a result made before comparisons existed; the preview then
+    /// shows the plain picture, as it always did.
+    static func existingInput(forResult resultPath: String) -> String? {
+        let path = inputPath(forResult: resultPath)
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    /// Deleted outright rather than trashed: it is a copy the app derived, not
+    /// the user's picture, and a second file of the same name in the Trash
+    /// reads as a duplicate of the one they just threw away.
+    static func removeInput(forResult resultPath: String) {
+        try? FileManager.default.removeItem(atPath: inputPath(forResult: resultPath))
+    }
+
+    /// The divider's position, as a fraction of the picture's width, for a
+    /// pointer at `x`. Clamped, so a drag past either edge parks the divider on
+    /// that edge instead of losing it; a frame not laid out yet sits centred.
+    static func fraction(x: CGFloat, width: CGFloat) -> CGFloat {
+        guard width > 0 else { return 0.5 }
+        return min(1, max(0, x / width))
+    }
+}
+
 /// Drives image restoration/upscaling (SeedVR2) on the native mlx-serve
 /// server via `POST /v1/images/upscales`.
 ///
@@ -169,6 +234,9 @@ final class RestoreService: ObservableObject {
                                                     path: "/v1/images/upscales", json: body)
                 await releaseIfNeeded()
                 try png.write(to: URL(fileURLWithPath: outputPath))
+                // After the result, never before: a write that throws above
+                // must not leave a "before" with nothing to compare it to.
+                RestoreComparison.saveInput(prepared.data, forResult: outputPath)
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
@@ -287,9 +355,16 @@ final class RestoreService: ObservableObject {
     }
 
     private func loadRecent() {
-        let root = MediaStorage.upscalesRoot
+        recent = Self.recentPaths(root: MediaStorage.upscalesRoot)
+    }
+
+    /// Every result under `root`, newest first. Reads each day folder's own
+    /// files and never descends further — which is what keeps the stored
+    /// comparison inputs in `.before/`, filenames identical to their results,
+    /// out of the strip (`RestoreComparison`).
+    nonisolated static func recentPaths(root: String, limit: Int = 60) -> [String] {
         let fm = FileManager.default
-        guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
+        guard let days = try? fm.contentsOfDirectory(atPath: root) else { return [] }
         var paths: [(String, Date)] = []
         for day in days.sorted(by: >) {
             let dayDir = (root as NSString).appendingPathComponent(day)
@@ -300,7 +375,7 @@ final class RestoreService: ObservableObject {
                 paths.append((full, date))
             }
         }
-        recent = paths.sorted { $0.1 > $1.1 }.prefix(60).map(\.0)
+        return paths.sorted { $0.1 > $1.1 }.prefix(limit).map(\.0)
     }
 
     private static func makeOutputPath(sourcePath: String) -> String {
