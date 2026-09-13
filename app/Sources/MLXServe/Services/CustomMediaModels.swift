@@ -74,6 +74,10 @@ enum CustomMediaModels {
         arch.hasPrefix("hunyuan3d") ? .hunyuan3d21_8bit : nil
     }
 
+    private static func restoreFamily(arch: String) -> RestoreModelPreset? {
+        arch.hasPrefix("seedvr2") ? .seedvr2_3b : nil
+    }
+
     /// The family download bundle for a declared media arch — the exact
     /// allowlists + ready markers the catalog packs use, with the repo
     /// swapped in. This is what the Model Browser downloads a community pack
@@ -85,6 +89,7 @@ enum CustomMediaModels {
         if let p = audioFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = musicFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = meshFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
+        if let p = restoreFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         return nil
     }
 
@@ -108,6 +113,10 @@ enum CustomMediaModels {
 
     static func meshPreset(for id: String, from models: [ModelInfo]) -> Model3DModelPreset? {
         entry(for: id, in: models).flatMap { meshFamily(arch: $0.architecture) }?.asCustom(id: id)
+    }
+
+    static func restorePreset(for id: String, from models: [ModelInfo]) -> RestoreModelPreset? {
+        entry(for: id, in: models).flatMap { restoreFamily(arch: $0.architecture) }?.asCustom(id: id)
     }
 
     // MARK: - "On This Mac" rows (local, non-catalog, sorted)
@@ -141,6 +150,11 @@ enum CustomMediaModels {
         let known = Set(Model3DModelPreset.all.map(\.repo))
         return localIds(in: models, excluding: known).compactMap { meshPreset(for: $0, from: models) }
     }
+
+    static func restorePresets(from models: [ModelInfo]) -> [RestoreModelPreset] {
+        let known = Set(RestoreModelPreset.all.map(\.repo))
+        return localIds(in: models, excluding: known).compactMap { restorePreset(for: $0, from: models) }
+    }
 }
 
 /// A preset that can stand in for a user-added checkpoint of its family:
@@ -168,6 +182,7 @@ extension VideoModelPreset: CustomizableMediaPreset {}
 extension AudioModelPreset: CustomizableMediaPreset {}
 extension MusicModelPreset: CustomizableMediaPreset {}
 extension Model3DModelPreset: CustomizableMediaPreset {}
+extension RestoreModelPreset: CustomizableMediaPreset {}
 
 // The old pickers' "On This Mac" Section (`CustomModelPickerRows`) retired
 // with them — `MediaModelChooser` draws that section itself from the

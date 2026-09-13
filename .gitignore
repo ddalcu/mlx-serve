@@ -70,6 +70,7 @@ tests/fixtures/acestep/
 tests/fixtures/hy3d/
 tests/fixtures/krea/
 tests/fixtures/ltx/
+tests/fixtures/seedvr2/
 /lib/guest/
 
 # XcodeGen output — regenerate with `cd app && xcodegen generate` (spec: app/project.yml)

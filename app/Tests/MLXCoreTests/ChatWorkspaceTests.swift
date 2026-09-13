@@ -139,6 +139,9 @@ final class ChatWorkspaceTests: XCTestCase {
             "AudioGenService": ".environmentObject(appState.audioGen)",
             "MusicGenService": ".environmentObject(appState.musicGen)",
             "Model3DGenService": ".environmentObject(appState.model3dGen)",
+            // The Image pane drives two services now: enlarging is a verb on a
+            // source image, not a separate pane with its own environment.
+            "RestoreService": ".environmentObject(appState.restoreGen)",
             "TaskScheduler": ".environmentObject(appState.taskScheduler)",
             "AgentStore": ".environmentObject(appState.agents)",
             "TerminalSessionStore": ".environmentObject(appState.terminals)",

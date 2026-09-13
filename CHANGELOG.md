@@ -17,6 +17,7 @@
 - **Image, video and music generation can borrow the Neural Engine.** Turn on `--ane-image`, `--ane-video` or `--ane-audio` (Settings ▸ Neural Engine) and Krea, MiniMax-H3 or ACE-Step split each denoise step between the GPU and the Neural Engine; the split is solved per Mac and model at the first request. Off by default, and the server declines by name when the Mac cannot hold it.
 - The Neural Engine compile cache is capped by the free space on the internal disk, so a full disk no longer ships a silently half-built offload.
 - **Chat with Apple's built-in on-device model.** Pick Apple Intelligence in the model picker and the conversation is answered by macOS itself: nothing to download and no server running. Tools work, but the model's window is a fixed 4k that macOS does not let anyone raise, so keep the tool list short. No thinking mode: the framework does not have one. The row appears only when Apple Intelligence is turned on in System Settings.
+- **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window, then drag the divider across the result to compare it with the picture you started from.
 
 ### Changes
 
