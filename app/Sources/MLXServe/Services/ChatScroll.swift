@@ -35,11 +35,21 @@ enum ChatScrollEvent: Equatable {
     case driverChanged(ChatScrollDriver)
     /// Negative when the scroll view is rubber-banding past the end.
     case geometryChanged(distanceFromBottom: CGFloat)
+    /// Where the transcript sits and how tall it is. Every frame, beside
+    /// `geometryChanged`; only a shrink in progress reads it.
+    case contentGeometry(offsetY: CGFloat, contentHeight: CGFloat)
+    /// A row is about to get shorter — a long turn folding, a thinking block
+    /// closing, an edit field replacing the bubble.
+    case rowWillShrink
+    /// …and has finished changing.
+    case rowDidShrink
 }
 
 enum ChatScrollAction: Equatable {
     case none
     case toBottom(animated: Bool)
+    /// Put the transcript at this offset, unanimated.
+    case toOffset(CGFloat)
 }
 
 /// Decides whether the transcript follows the newest line, and when to scroll.
@@ -65,19 +75,33 @@ struct ChatScrollState: Equatable {
 
     private(set) var isPinnedToBottom = true
     private(set) var driver: ChatScrollDriver = .idle
+    private var offsetY: CGFloat = 0
+    private var contentHeight: CGFloat = 0
+    /// The transcript as it was when a row started shrinking.
+    private struct Shrink: Equatable {
+        let offsetY: CGFloat
+        let contentHeight: CGFloat
+    }
+    private var shrink: Shrink?
 
     mutating func handle(_ event: ChatScrollEvent) -> ChatScrollAction {
         switch event {
         case .transcriptShown:
             isPinnedToBottom = true
-            return .toBottom(animated: false)
+            shrink = nil
+            // No jump: a conversation is a new scroll view laid out from its
+            // bottom anchor (`.initialOffset`), so it opens at the end already.
+            return .none
 
         case .userSentMessage, .jumpTapped:
             isPinnedToBottom = true
+            shrink = nil
             return .toBottom(animated: true)
 
         case .driverChanged(let driver):
             self.driver = driver
+            // The reader took over mid-fold; their scroll wins.
+            if driver == .user { shrink = nil }
             return .none
 
         case .geometryChanged(let distance):
@@ -85,7 +109,10 @@ struct ChatScrollState: Equatable {
             // only disengages when the user did the leaving. Everything else —
             // a taller message, a card appearing, a window resize — is content
             // moving under a reader who has not asked for anything.
-            if distance <= Self.bottomTolerance {
+            //
+            // Except mid-shrink: content shorter than a stale offset reads as
+            // a deep overscroll for one frame, and nobody has gone anywhere.
+            if distance <= Self.bottomTolerance, shrink == nil {
                 isPinnedToBottom = true
             } else if driver == .user {
                 isPinnedToBottom = false
@@ -95,6 +122,27 @@ struct ChatScrollState: Equatable {
             guard isPinnedToBottom, driver == .idle,
                   distance > Self.correctionSlack else { return .none }
             return .toBottom(animated: false)
+
+        case .contentGeometry(let y, let h):
+            let heightChanged = h != contentHeight
+            offsetY = y
+            contentHeight = h
+            // The control the reader clicked sits at the BOTTOM of the row
+            // that is shrinking, so it stays put exactly when the offset drops
+            // by what the row has lost so far. Per frame, so an animation tracks.
+            guard let s = shrink, heightChanged else { return .none }
+            return .toOffset(max(0, s.offsetY - (s.contentHeight - h)))
+
+        case .rowWillShrink:
+            // Growing needs no help (the top stays put and the rest extends
+            // below), and while following the end the bottom anchor has it.
+            guard !isPinnedToBottom else { return .none }
+            shrink = Shrink(offsetY: offsetY, contentHeight: contentHeight)
+            return .none
+
+        case .rowDidShrink:
+            shrink = nil
+            return .none
         }
     }
 
