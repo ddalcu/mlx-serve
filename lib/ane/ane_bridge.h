@@ -63,4 +63,12 @@ bool msv_ane_model_cache_hit(const msv_ane_model *model);
  * while disabled also evicts its entry. */
 bool msv_ane_cache_enabled(void);
 
+/* Names the (seam + shape, share) the next compiles belong to: entries of
+ * the same group at a different variant are pruned on the cold-compile
+ * path, so a share sweep replaces its predecessors. Empty group = untagged. */
+void msv_ane_cache_lineage(const char *group, const char *variant);
+/* The variant of the most recently used entry tagged with `group` (empty
+ * when none), so a later build can reuse the share that set was built at. */
+void msv_ane_cache_variant(const char *group, char *out, int out_len);
+
 #endif

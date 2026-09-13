@@ -2504,3 +2504,25 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
         try testing.expectEqualStrings(d.value, rt_val.string);
     }
 }
+
+test "format corpus: constrained JSON marker strings are data on every protocol" {
+    const rp = @import("reasoning_protocol.zig");
+    const json = "{\"note\":\"<think>kept</think> <|channel>thought <|content_thinking|> <tool_call>literal</tool_call>\"}";
+    inline for (std.meta.tags(rp.Kind)) |kind| {
+        var proto = rp.Protocol{ .kind = kind, .initial_phase = .json_body };
+        _ = proto.setCloser(rp.BARE_THINK_CLOSER);
+        var delivery = rp.Delivery.init(&proto);
+        defer delivery.deinit(testing.allocator);
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(testing.allocator);
+        // Exercise every byte as its own transport chunk after the authoritative
+        // JSON boundary, including all fragments of marker-looking strings.
+        for (json) |byte| {
+            delivery.noteToken(1, .{ .token_index = 0, .byte_offset = 0 });
+            try delivery.feed(testing.allocator, &.{byte});
+            try testing.expectEqual(@as(usize, 0), delivery.reasoning.items.len);
+            try output.appendSlice(testing.allocator, delivery.content.items);
+        }
+        try testing.expectEqualStrings(json, output.items);
+    }
+}

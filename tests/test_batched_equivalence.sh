@@ -373,6 +373,29 @@ t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 
     fi
     echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
 fi
+
+# Observability: the verdict a user reads without the log. /props and
+# /v1/models both say the loaded model batches, and a slot that cannot
+# (logprobs) names its reason once beside live company.
+if ! curl -s "$BASE/props" | grep -q '"batching":{"supported":true'; then
+    echo -e "${RED}FAIL${NC} /props does not report batching.supported=true"
+    curl -s "$BASE/props" | head -c 600; echo; kill $CONC_PID 2>/dev/null || true; exit 1
+fi
+if ! curl -s "$BASE/v1/models" | grep -q '"batched_decode":true'; then
+    echo -e "${RED}FAIL${NC} /v1/models row lacks batched_decode:true"
+    kill $CONC_PID 2>/dev/null || true; exit 1
+fi
+LP_PAYLOAD=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=1; print(json.dumps(d))" "$LONG_JSON_PAYLOAD")
+echo "$LP_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > /dev/null &
+LA=$!
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > /dev/null &
+LB=$!
+wait $LA; wait $LB
+if grep -q "\[batched\] slot serial: logprobs" "$CONC_LOG"; then
+    echo -e "${GREEN}PASS${NC} a logprobs slot beside a batched one names its serial reason"
+else
+    echo -e "  ${YELLOW}NOT RUN${NC} the logprobs request never overlapped a live slot (no serial-reason line)"
+fi
 kill $CONC_PID 2>/dev/null || true
 wait $CONC_PID 2>/dev/null || true
 rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"

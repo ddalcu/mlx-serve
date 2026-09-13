@@ -114,13 +114,16 @@ pub const ReasoningConfig = struct {
 };
 
 /// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
-/// `null` / unknown → thinking disabled, budget unchanged.
+/// "none" is an explicit off, matching the chat and Anthropic surfaces;
+/// `null` / non-object → thinking disabled, budget unchanged.
 pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) ReasoningConfig {
     const v = reasoning_val orelse return .{ .enable = false, .budget = default_budget };
     if (v != .object) return .{ .enable = false, .budget = default_budget };
     const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
-    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget), .effort = effort_val.string };
+    const word = effort_val.string;
+    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
+    return .{ .enable = true, .budget = effortBudget(word, default_budget), .effort = word };
 }
 
 /// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
@@ -759,6 +762,16 @@ test "parseReasoning maps effort levels" {
 
     try testing.expectEqual(false, parseReasoning(null, -1).enable);
     try testing.expectEqual(@as(i32, -1), parseReasoning(null, -1).budget);
+}
+
+// `none` is the OpenAI/gpt-5.1 spelling of an explicit thinking-off on the chat
+// and Anthropic surfaces; Responses must agree, not treat a present effort as on.
+test "parseReasoning: effort none is an explicit thinking-off" {
+    const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"none\"}", .{});
+    defer v.deinit();
+    const cfg = parseReasoning(v.value, -1);
+    try testing.expectEqual(false, cfg.enable);
+    try testing.expectEqualStrings("none", cfg.effort.?);
 }
 
 test "parseTextFormat extracts schema from flat shape" {

@@ -96,4 +96,21 @@ final class ChatModeTogglesTests: XCTestCase {
                                       toolsLockedBy: "Chef").isLocked)
         XCTAssertFalse(ChatModeToggles(thinking: false, agent: true, mcp: false).isLocked)
     }
+
+    /// Apple's on-device model has no thinking mode and no room for MCP's tool
+    /// definitions, so both discs read locked with it named as the owner —
+    /// the same shape an agent's lock takes.
+    func testAppleIntelligenceLocksThinkingAndMCP() {
+        let t = ChatModeToggles.resolve(isExternalBridge: false,
+                                        telegramThinking: false, telegramAgent: false, telegramMCP: false,
+                                        inAppThinking: true, inAppAgent: true, inAppMCP: true,
+                                        apple: true)
+        XCTAssertFalse(t.thinking)
+        XCTAssertFalse(t.mcp)
+        XCTAssertEqual(t.thinkingLockedBy, AppleFoundationChat.displayName)
+        XCTAssertEqual(t.mcpLockedBy, AppleFoundationChat.displayName)
+        // The tool LOOP still switches; only the tool SET is clamped.
+        XCTAssertTrue(t.agent)
+        XCTAssertNil(t.toolsLockedBy)
+    }
 }

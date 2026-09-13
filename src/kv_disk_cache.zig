@@ -786,7 +786,7 @@ pub const DiskTier = struct {
             }
         }
         if (qsa_overlay) |*qsa_cp| {
-            try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s);
+            try transformer_mod.applyQsaHistoryAt(ssm_entries, qsa_cp, cp_pos, s, true);
         }
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
@@ -1559,7 +1559,10 @@ pub const DiskTier = struct {
             (mtp != null and e.spec_mtp == null) or
             // v5 upgrade: an entry persisted with a KV-only MTP snap gains the head's QSA half.
             (mtp != null and mtp.?.head_aux != null and
-                (e.spec_mtp == null or e.spec_mtp.?.head == null));
+                (e.spec_mtp == null or e.spec_mtp.?.head == null)) or
+            // A sidecar written under another KV scheme is declined at restore, so it
+            // must be rewritten or the entry would draft blind forever.
+            (mtp != null and e.spec_mtp != null and !std.meta.eql(e.spec_mtp.?.quant, mtp.?.config));
     }
 
     /// Write (or delete) the entry's ONE spec sidecar from this commit's
@@ -1691,7 +1694,10 @@ pub const DiskTier = struct {
             .mtp => e.spec_mtp,
         }) orelse return null;
         if (meta.layers != expected_layers) return null;
-        if (!std.meta.eql(meta.quant, target_config)) return null;
+        if (!std.meta.eql(meta.quant, target_config)) {
+            log.info("  [disk-cache] spec sidecar declined (quant mismatch)\n", .{});
+            return null;
+        }
 
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
@@ -5068,6 +5074,7 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     // equal layer counts — the check must fire before it).
     try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 3, kv_quant.KVQuantConfig.dense) == null);
     try testing.expect(tier2.loadSpecSnap(m.idx, .dflash, 2, kv_quant.KVQuantConfig.affine(8)) == null);
+    try testing.expect(tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.affine(8)) == null);
 
     // A commit WITHOUT spec payloads carries none (and, per the supersede
     // rule, would delete a stale sidecar on its own entry).
@@ -5111,6 +5118,116 @@ test "DiskTier: v4 spec snapshots round-trip; geometry mismatches decline; v3 re
     defer cache3.deinit();
     const restored = try tier3.restoreInto(&cache3, m3.idx, s);
     try testing.expectEqual(@as(u32, 600), restored);
+}
+
+test "DiskTier: a dense MTP sidecar is rewritten at affine-8 on the next commit" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-mtp-rewrite", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp_dense = try KVCache.init(testing.allocator, 1);
+    defer mtp_dense.deinit();
+    try fillCache(&mtp_dense, s, 1, 590, 8, 9.5, .float32);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
+        s,
+    );
+    try testing.expectEqual(kv_quant.KVQuantConfig.dense, tier.entries.items[0].spec_mtp.?.quant);
+    try testing.expect(tier.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.affine(8)) == null);
+
+    const q8 = kv_quant.KVQuantConfig.affine(8);
+    var mtp_q = try KVCache.initWithConfig(testing.allocator, 1, q8);
+    defer mtp_q.deinit();
+    try fillCache(&mtp_q, s, 1, 590, 64, 9.5, .bfloat16);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
+        s,
+    );
+    try testing.expectEqual(q8, tier.entries.items[0].spec_mtp.?.quant);
+    var loaded = tier.loadSpecSnap(0, .mtp, 1, q8) orelse return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 590), loaded.snap.step);
+}
+
+test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-mtp-rewrite-dense", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    const q8 = kv_quant.KVQuantConfig.affine(8);
+    var mtp_q = try KVCache.initWithConfig(testing.allocator, 1, q8);
+    defer mtp_q.deinit();
+    try fillCache(&mtp_q, s, 1, 590, 64, 9.5, .bfloat16);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp_q.entries, .step = mtp_q.step, .config = mtp_q.config, .base_pos = 0 },
+        s,
+    );
+    try testing.expectEqual(q8, tier.entries.items[0].spec_mtp.?.quant);
+    try testing.expect(tier.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.dense) == null);
+
+    var mtp_dense = try KVCache.init(testing.allocator, 1);
+    defer mtp_dense.deinit();
+    try fillCache(&mtp_dense, s, 1, 590, 8, 9.5, .float32);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{ .entries = mtp_dense.entries, .step = mtp_dense.step, .config = mtp_dense.config, .base_pos = 0 },
+        s,
+    );
+    try testing.expectEqual(kv_quant.KVQuantConfig.dense, tier.entries.items[0].spec_mtp.?.quant);
+    var loaded = tier.loadSpecSnap(0, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 590), loaded.snap.step);
 }
 
 test "modelFingerprint: stable per path, rolls with config.json changes" {

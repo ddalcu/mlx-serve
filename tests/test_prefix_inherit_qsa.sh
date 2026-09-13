@@ -11,6 +11,10 @@
 # the 1-token tail / full-reuse shape actually occurs; the script fails if it
 # never did.
 #
+# Warm and cold run sequentially on ONE port: warm phase, capture greedy
+# texts, stop, wait for the port and for free+inactive+speculative pages,
+# then boot `--prefix-cache-entries 0` and replay. Never two servers at once.
+#
 # Usage: ./tests/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp] [port]
 #
 # Coordinator runs this. Do not start a model server from the agent.
@@ -24,6 +28,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
+MEM_RECOVER_GAP_MB=10240
+MEM_RECOVER_TIMEOUT_S=90
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_prefix_inherit_qsa: $MODEL not found."
@@ -35,30 +41,93 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
+SERVER_PID=""
+LOGFILE=""
+COLD_LOG=""
+
+free_mb() {
+  vm_stat | awk '
+    /page size of/         { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) ps = $i }
+    /^Pages free:/         { gsub(/\./, "", $3); free = $3 }
+    /^Pages inactive:/     { gsub(/\./, "", $3); inact = $3 }
+    /^Pages speculative:/  { gsub(/\./, "", $3); spec = $3 }
+    END { if (ps == "") ps = 16384; printf "%d", (free + inact + spec) * ps / 1048576 }'
+}
+
+wait_port_closed() {
+    local i
+    for i in $(seq 1 60); do
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    return 1
+}
+
+stop_server() {
+    [ -n "${SERVER_PID:-}" ] || return 0
+    local was="$SERVER_PID"
+    kill "$was" 2>/dev/null || true
+    for _ in $(seq 1 30); do kill -0 "$was" 2>/dev/null || break; sleep 1; done
+    kill -9 "$was" 2>/dev/null || true
+    wait "$was" 2>/dev/null || true
+    SERVER_PID=""
+    wait_port_closed || true
+}
+
+wait_for_release() {
+    local pid="$1"
+    local baseline="$2"
+    local floor=$((baseline - MEM_RECOVER_GAP_MB))
+    local waited=0
+    local now
+    while [ "$waited" -lt "$MEM_RECOVER_TIMEOUT_S" ]; do
+        now=$(free_mb)
+        if ! kill -0 "$pid" 2>/dev/null && [ "$now" -ge "$floor" ]; then
+            lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || {
+                echo "  pack released after ${waited}s (free+inactive+speculative ${now} MB >= floor ${floor} MB)"
+                return 0
+            }
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo "  WARN: memory did not recover within ${MEM_RECOVER_TIMEOUT_S}s (free+inactive+speculative $(free_mb) MB, floor ${floor} MB) - proceeding"
+    wait_port_closed || echo "  WARN: port $PORT still listening"
+    return 0
+}
+
+cleanup() {
+    stop_server
+    rm -f "$LOGFILE" "$COLD_LOG"
+}
+trap cleanup EXIT INT TERM
+
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
-sleep 1
+wait_port_closed || true
+
+BASELINE_FREE_MB=$(free_mb)
+echo "  baseline free+inactive+speculative before any boot: ${BASELINE_FREE_MB} MB"
+
+start_server() {
+    local log="$1"
+    shift
+    echo "  starting server $*..."
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 \
+        "$@" --log-level info ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$log" 2>&1 &
+    SERVER_PID=$!
+    local up=0
+    local i
+    for i in $(seq 1 180); do
+        curl -s -f "$BASE/health" > /dev/null 2>&1 && { up=1; break; }
+        sleep 1
+    done
+    if [ "$up" != "1" ]; then
+        echo -e "${RED}FAIL${NC} server did not become healthy"; tail -40 "$log"; exit 1
+    fi
+}
 
 LOGFILE=$(mktemp)
-echo "  starting server (--prefix-cache-mem 2048MB)..."
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 \
-    --prefix-cache-entries 8 --prefix-cache-mem 2048MB --prefix-cache-disk off \
-    --log-level info ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
-SERVER_PID=$!
-cleanup() {
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    rm -f "$LOGFILE"
-}
-trap cleanup EXIT
-
-up=0
-for i in $(seq 1 180); do
-    curl -s -f "$BASE/health" > /dev/null 2>&1 && { up=1; break; }
-    sleep 1
-done
-if [ "$up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} server did not become healthy"; tail -40 "$LOGFILE"; exit 1
-fi
+start_server "$LOGFILE" --prefix-cache-entries 8 --prefix-cache-mem 2048MB --prefix-cache-disk off
 
 SYSTEM=$(python3 -c "print('You are a careful assistant for the Orion project. Rule %d: answer briefly. ' * 900 % tuple(range(900)))")
 
@@ -155,31 +224,20 @@ else
     echo "  self-heal events: 0"
 fi
 
-COLD_PORT=$((PORT + 1))
-COLD_BASE="http://127.0.0.1:$COLD_PORT"
+WARM_PID="$SERVER_PID"
+stop_server
+wait_for_release "$WARM_PID" "$BASELINE_FREE_MB"
+
 COLD_LOG=$(mktemp)
-pkill -f "mlx-serve.*--port $COLD_PORT" 2>/dev/null || true
-sleep 1
-echo "  starting cold-control server (--prefix-cache-entries 0)..."
-"$BINARY" --model "$MODEL" --serve --port "$COLD_PORT" --host 127.0.0.1 \
-    --prefix-cache-entries 0 --prefix-cache-disk off \
-    --log-level info ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$COLD_LOG" 2>&1 &
-COLD_PID=$!
-cold_up=0
-for i in $(seq 1 180); do
-    curl -s -f "$COLD_BASE/health" > /dev/null 2>&1 && { cold_up=1; break; }
-    sleep 1
-done
-if [ "$cold_up" != "1" ]; then
-    echo -e "${RED}FAIL${NC} cold-control server did not become healthy"; tail -40 "$COLD_LOG"; fail=1
-else
-    COLD1=$(post_body "$BODY" "$COLD_BASE") || { echo -e "${RED}FAIL${NC} cold request 1 failed"; fail=1; COLD1='{"code":0,"text":""}'; }
-    python3 -c "
+start_server "$COLD_LOG" --prefix-cache-entries 0 --prefix-cache-disk off
+
+COLD1=$(post_body "$BODY" "$BASE") || { echo -e "${RED}FAIL${NC} cold request 1 failed"; fail=1; COLD1='{"code":0,"text":""}'; }
+python3 -c "
 import json,sys,urllib.request
 warm=json.loads(sys.argv[1])['text']
 cold=json.loads(sys.argv[2])['text']
 base=sys.argv[3]
-if cold and not warm:
+if not warm:
     print('empty warm vs non-empty cold')
     raise SystemExit(1)
 def toks(text):
@@ -194,14 +252,10 @@ if wt != ct:
     print(' warm', wt[:8], 'len', len(toks(warm)))
     print(' cold', ct[:8], 'len', len(toks(cold)))
     raise SystemExit(1)
-" "$WARM2" "$COLD1" "$COLD_BASE" || { echo -e "${RED}FAIL${NC} warm greedy text != cold"; fail=1; }
-    if [ "$fail" -eq 0 ]; then
-        echo -e "${GREEN}PASS${NC} warm greedy text matches cold (first 32 tokens)"
-    fi
+" "$WARM2" "$COLD1" "$BASE" || { echo -e "${RED}FAIL${NC} warm greedy text != cold"; fail=1; }
+if [ "$fail" -eq 0 ]; then
+    echo -e "${GREEN}PASS${NC} warm greedy text matches cold (first 32 tokens)"
 fi
-kill $COLD_PID 2>/dev/null || true
-wait $COLD_PID 2>/dev/null || true
-rm -f "$COLD_LOG"
 
 if [ "$fail" -eq 0 ]; then
     echo -e "${GREEN}PASS${NC} test_prefix_inherit_qsa"

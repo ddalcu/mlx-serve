@@ -787,3 +787,19 @@ stream start and `museHeaderOpensReasoning` routes a `self` header to reasoning
 Guard: `tests/test_thinking_tools.sh` Test 6b and the per-arch
 `tests/test_smoke_matrix.sh` thinking check: the same temp-0 request streamed
 and not must agree on the split. A tag grep cannot see this class.
+
+
+## A duplicated key defeated container coercion (#402, 2026-09-12)
+
+Qwen Code's `ask_user_question` declares `questions` as an array; Flash Next
+shipped it through the Hermes XML dialect as a string whose items repeated
+`header` with the same value. `coerceValueToType` strict-parses such a string
+(std.json rejects duplicate keys), then re-emits it tolerantly and strict-parses
+again, and the tolerant emitter keeps the repeat, so both parses failed and the
+string reached the client unchanged: `Parameter "questions" must be an array`.
+
+Fix: `parseContainerAllowingRepeats` parses first-wins and last-wins and accepts
+the document only when both agree. An identical repeat carries no ambiguity; a
+conflicting one stays a string rather than picking a value. A failed container
+coercion now logs at debug. Guard: the identical-vs-conflicting duplicate test
+beside `coerceToolArgsToSchema`.

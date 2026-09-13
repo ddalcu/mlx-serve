@@ -813,16 +813,27 @@ pub const ModelConfig = struct {
         return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
-    /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
-    /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
-    /// layer. Not kv-quantized. Zero on archs without an indexer. ONE copy; the billed
-    /// width (copies + score bank) is `server.statePerTokenBilled`.
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
+    /// blocks `[kv/ratio, idx_hd]` per full-attn layer. The raw keys are a fixed
+    /// ring (`qsaRingBytes`, billed once per slot), not per token. Not
+    /// kv-quantized. Zero on archs without an indexer. ONE copy; the billed width
+    /// (copies + score bank) is `server.statePerTokenBilled`.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
-        return n * hd * 2 + n * hd * 2 / ratio;
+        return n * hd * 2 / ratio;
+    }
+
+    /// The raw indexer keys every live slot holds: `QSA_RING_ROWS` rows per
+    /// full-attn layer, context-independent, billed once per slot.
+    pub fn qsaRingBytes(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        return n * rows * hd * 2;
     }
 
     /// f32 bytes per token of the QSA block-score operand a live slot holds
@@ -927,6 +938,14 @@ pub const ModelConfig = struct {
         return self.isQwen4();
     }
 
+    pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
+        if (!self.isQwen4() or !gather_on) return kv;
+        if (kv <= gather_min_kv) return kv;
+        const cap = self.indexer_budget + self.indexer_compress_ratio;
+        if (cap == 0) return kv;
+        return @min(kv, cap);
+    }
+
     /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
         return self.longCtxGated();
@@ -966,7 +985,9 @@ pub const ModelConfig = struct {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
-        if (self.isMoe() and !self.isQwen4()) return false; // routed experts: only qwen4_exp's per-slot state is modelled
+        // Routed experts are row-generic; a MoE trunk batches when its per-slot
+        // state is what the path merges (GDN pair, qwen4's PLE window + QSA keys).
+        if (self.isMoe() and !self.isQwen4() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
@@ -1245,6 +1266,15 @@ pub const ModelConfig = struct {
         log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
         });
+    }
+
+    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
+    pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
+        if (self.ngram_table_path) |p| allocator.free(p);
+        self.ngram_table_path = null;
     }
 };
 
@@ -6030,6 +6060,27 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
 }
 
+test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
+    // Bar: routed experts are row-generic (the sorted gather path takes B*S rows),
+    // so a qwen3_5 MoE batches like the dense trunk; MoE trunks with other
+    // per-slot state (hy3, laguna, lfm2_moe, bailing) stay refused.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {"hidden_size": 2048, "num_experts": 256, "full_attention_interval": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.isMoe());
+    try testing.expect(config.supportsBatchedGdnDecode());
+
+    var laguna = std.mem.zeroes(ModelConfig);
+    laguna.model_type = "laguna";
+    laguna.num_experts = 64;
+    laguna.full_attention_interval = 4;
+    try testing.expect(!laguna.supportsBatchedGdnDecode());
+}
+
 test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
     // A checkpoint declaring an affine bit-width outside MLX's kernel set
     // ({2,3,4,5,6,8}) must fail at PARSE, not at warmup: mlx only validates
@@ -6665,7 +6716,8 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
-    try testing.expectEqual(@as(u64, 12 * 128 * 2 + 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
