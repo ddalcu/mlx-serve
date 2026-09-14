@@ -4709,6 +4709,21 @@ or neither. Then the persisted head shipped its history with a step of 0:
 `num_hidden_layers`, so `qwen4MtpAdvance` sets it and the commit refuses a
 snapshot whose step disagrees.
 
+## QSA trim budgets must include the transferred pooled bank (2026-09-14)
+
+A 496,263-token commit selected a 491,520-token prefix using a 56 MB checkpoint bill.
+That checkpoint did not yet carry the pooled QSA indexer bank: trimming moved the bank
+from the newest checkpoint onto it. Even after shedding all other checkpoints, the
+entry cost 11,936 MB against an 11,735 MB cap, so replacement evicted the only entry.
+
+`trimmedCheckpointBytes` prices the bank's sliced shape at each candidate position,
+replacing any bank already billed there. Only the final retained checkpoint gets
+that bill; lower checkpoints keep their own costs in the shedding simulation.
+Both the shedding and all-lower trim policies use it. The trim log reports bytes
+before shedding rather than asserting an unchecked `<=` relationship. Regression
+tests compare the estimate with materialized history across pooling boundaries and
+check that an oversized commit retains a budget-compliant, reusable prefix.
+
 ## QSA at long context: split-K, an exact select, one history copy (PR #363, qwen4_exp)
 
 - **Verify widths** (2 <= S < 16) spent ~50 dependent ops per layer and

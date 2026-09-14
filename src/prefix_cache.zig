@@ -779,7 +779,7 @@ pub const HotPrefixCache = struct {
         if (cps) |list| {
             while (k < list.len and k < SHED_SIM_MAX) : (k += 1) {
                 pos_buf[k] = list[k].pos;
-                byte_buf[k] = ssmCheckpointBytes(&list[k]);
+                byte_buf[k] = trimmedCheckpointBytes(list, k);
             }
         }
         const total = if (cps) |list| list.len else 0;
@@ -789,6 +789,30 @@ pub const HotPrefixCache = struct {
 
     /// Stack bound for the shed simulation; a longer list falls back to billing every lower checkpoint.
     const SHED_SIM_MAX: usize = 128;
+
+    /// The last retained checkpoint inherits the latest checkpoint's pooled bank.
+    /// Price its sliced shape before allocating/copying any multi-GB KV prefix.
+    /// Captured aux state already contains the destination's pos % ratio leftover.
+    fn trimmedCheckpointBytes(list: []const SSMCheckpoint, index: usize) u64 {
+        const dst = &list[index];
+        const src = &list[list.len - 1];
+        var bytes = ssmCheckpointBytes(dst);
+        if (index == list.len - 1 or !checkpointHasQsaPooled(src)) return bytes;
+        if (dst.layers.len != src.layers.len) return bytes;
+        for (dst.layers, src.layers) |d, from| {
+            if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
+            if (from.qsa_pooled.ctx == null) continue;
+            if (d.qsa_pooled.ctx != null)
+                bytes -= @as(u64, mlx.mlx_array_size(d.qsa_pooled)) * @as(u64, mlx.mlx_array_itemsize(d.qsa_pooled));
+            const shape = mlx.getShape(from.qsa_pooled);
+            const blocks: u64 = @intCast(shape[1]);
+            if (blocks == 0) continue;
+            const retained = @min(blocks, dst.pos / @as(usize, @intCast(@max(from.qsa_ratio, 1))));
+            bytes += (@as(u64, mlx.mlx_array_size(from.qsa_pooled)) / blocks) *
+                @as(u64, mlx.mlx_array_itemsize(from.qsa_pooled)) * retained;
+        }
+        return bytes;
+    }
 
     /// Bytes the checkpoints at or below a candidate trim point cost after the commit path's
     /// span-preserving shed to `allowance`; null when even the last survivor is over.
@@ -853,6 +877,7 @@ pub const HotPrefixCache = struct {
             if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
             var cps_cost: u64 = 0;
             for (list[0 .. k + 1]) |*cp| cps_cost += ssmCheckpointBytes(cp);
+            cps_cost = cps_cost - ssmCheckpointBytes(&list[k]) + trimmedCheckpointBytes(list, k);
             if (@as(u64, p) * row_bytes + cps_cost <= budget) return p;
         }
         return null;
@@ -881,7 +906,23 @@ pub const HotPrefixCache = struct {
                     pos_buf[i] = cp.pos;
                     byte_buf[i] = ssmCheckpointBytes(cp);
                 }
-                return trimLenForBudgetPure(budget, limit, row_bytes, pos_buf[0..list.len], byte_buf[0..list.len], self.cp_thin);
+                var k = list.len;
+                while (k > 0) {
+                    k -= 1;
+                    const p = pos_buf[k];
+                    if (p > limit) continue;
+                    if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
+                    const rows = @as(u64, p) * row_bytes;
+                    if (rows > budget) continue;
+                    // Only the final survivor carries the bank; lower checkpoints
+                    // retain their original bills during the shed simulation.
+                    const original = byte_buf[k];
+                    byte_buf[k] = trimmedCheckpointBytes(list, k);
+                    const fits = shedSurvivorBytes(pos_buf[0 .. k + 1], byte_buf[0 .. k + 1], budget - rows, self.cp_thin) != null;
+                    byte_buf[k] = original;
+                    if (fits) return p;
+                }
+                return null;
             }
         }
         if (row_bytes == 0) return null;
@@ -1698,7 +1739,7 @@ pub const HotPrefixCache = struct {
                     for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
                 }
                 new_bytes = new_kv_bytes + new_ssm_bytes;
-                log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} <= {d:.2} MB budget)\n", .{
+                log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} MB before checkpoint shedding; {d:.2} MB budget)\n", .{
                     tl,
                     tokens.len,
                     @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
@@ -5654,6 +5695,73 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
 
         try pcQsaSweep(&hc, heir_toks[0..shared], donor_keys, 17, shared, s);
+    }
+}
+
+test "HotPrefixCache: QSA trim checkpoint bill matches materialized history" {
+    const s = mlx.gpuStream();
+    var live = pcBuildQsaHybrid(s, 1027, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var cps: [2]SSMCheckpoint = undefined;
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 1027, s);
+    defer cps[1].deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(cps[1..], &live, s);
+    for ([_]usize{ 256, 257, 258, 259, 512, 1024, 1027 }) |pos| {
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, pos, s);
+        defer cps[0].deinit(testing.allocator);
+        const predicted = HotPrefixCache.trimmedCheckpointBytes(&cps, 0);
+        try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], pos, s);
+        try testing.expectEqual(predicted, ssmCheckpointBytes(&cps[0]));
+        // Pricing a checkpoint that already carries its bank must not double-bill it.
+        try testing.expectEqual(predicted, HotPrefixCache.trimmedCheckpointBytes(&cps, 0));
+    }
+}
+
+test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays reusable" {
+    const s = mlx.gpuStream();
+    for ([_]transformer_mod.ThinPolicy{ .min_span_recency, .min_span }) |policy| {
+        for ([_]bool{ false, true }) |replace| {
+            var toks: [1024]u32 = undefined;
+            for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+            var live = pcBuildQsaHybrid(s, 1024, 100.0);
+            defer pcFreeQsaHybrid(&live);
+            var cache = try KVCache.init(testing.allocator, 3);
+            defer cache.deinit();
+            try testFillCache(&cache, s, 3, toks.len);
+            var snap = try cache.snapshot();
+            defer snap.deinit();
+            const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
+            for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+            // 768 KV rows and all small checkpoints fit, but the 768-row bank does not.
+            const budget = HotPrefixCache.snapshotRowBytes(&snap) * 768 + ssmCheckpointBytes(&cps[0]) * 4 + 1024;
+            var hc = HotPrefixCache.initWithMem(testing.allocator, 1, budget);
+            defer hc.deinit();
+            hc.cp_thin = policy;
+            hc.qsa_history_required = true;
+            if (replace) {
+                var seed = try KVCache.init(testing.allocator, 3);
+                defer seed.deinit();
+                try testFillCache(&seed, s, 3, 256);
+                const seed_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+                seed_cps[0] = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
+                try sliceQsaHistoryOntoCheckpoint(&seed_cps[0], &cps[3], 256, s);
+                _ = try hc.commitWithState(&seed, toks[0..256], false, 0, seed_cps, null, null);
+            }
+            const chosen = hc.trimLenForBudget(budget, toks.len, HotPrefixCache.snapshotRowBytes(&snap), cps);
+            _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+            try testing.expectEqual(@as(?usize, 512), chosen);
+            try testing.expectEqual(@as(usize, 1), hc.entryCount());
+            try testing.expect(hc.current_kv_bytes <= budget);
+            try testing.expectEqual(@as(usize, 512), hc.entries.items[0].tokens.len);
+            var restored = pcEmptySsm();
+            defer pcFreeQsaHybrid(&restored);
+            var target = try KVCache.init(testing.allocator, 3);
+            defer target.deinit();
+            var moe_off: usize = 0;
+            const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &toks, false, 0, null, null);
+            try testing.expectEqual(@as(usize, 512), hit.matched);
+        }
     }
 }
 
