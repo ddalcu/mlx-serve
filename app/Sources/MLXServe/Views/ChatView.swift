@@ -4373,8 +4373,10 @@ struct MessageBubble: View {
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .contextMenu {
-            Button("Copy Message") { copyMessage() }
-            if onEdit != nil {
+            if !message.content.isEmpty {
+                Button("Copy Message") { copyMessage() }
+            }
+            if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
                 // question, editing the model's rewrites what it said.
                 Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
@@ -4589,12 +4591,15 @@ struct MessageBubble: View {
             }
 
             HStack(spacing: 2) {
-                footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                // A generated picture has a footer and no text to copy or edit.
+                if !message.content.isEmpty {
+                    footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
                 // to open on a paragraph.
-                if onEdit != nil, message.role == .assistant {
+                if onEdit != nil, message.role == .assistant, !message.content.isEmpty {
                     footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
                         startEditing()
                     }

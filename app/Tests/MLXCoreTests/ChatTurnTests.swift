@@ -35,6 +35,13 @@ final class ChatTurnTests: XCTestCase {
         return m
     }
 
+    /// The agent loop's generated-image row: empty content, `media` set.
+    private func picture() -> ChatMessage {
+        var m = ChatMessage(role: .assistant, content: "")
+        m.media = [ChatMediaRef(kind: .image, path: "/tmp/a.png", prompt: "a cat")]
+        return m
+    }
+
     private func failed() -> ChatMessage {
         var m = ChatMessage(role: .assistant, content: "")
         m.failedRetry = true
@@ -76,9 +83,7 @@ final class ChatTurnTests: XCTestCase {
     /// A generated picture is the model's answer for that round, delivered by
     /// a file: an empty `content` that still ends something.
     func testARowCarryingMediaIsABoundary() {
-        var m = ChatMessage(role: .assistant, content: "")
-        m.media = [ChatMediaRef(kind: .image, path: "/tmp/a.png", prompt: "a cat")]
-        XCTAssertTrue(ChatTurn.isBoundary(m))
+        XCTAssertTrue(ChatTurn.isBoundary(picture()))
     }
 
     // MARK: - What the trash under a footer removes
@@ -138,6 +143,12 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertTrue(ChatTurn.needsEndFooter([user("q"), failed()], turnInFlight: false))
     }
 
+    /// A picture at the end carries its own footer, like prose does.
+    func testAPictureAtTheEndIsItsOwnEnd() {
+        XCTAssertFalse(ChatTurn.needsEndFooter([user("draw"), caller(), toolResult("ok"), picture()],
+                                               turnInFlight: false))
+    }
+
     func testTheReadersMessageNeedsNone() {
         XCTAssertFalse(ChatTurn.needsEndFooter([user("q"), reply("a"), user("more")], turnInFlight: false))
     }
@@ -172,6 +183,7 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertTrue(ChatTurn.hasOwnFooter(caller("prose too")))
         XCTAssertFalse(ChatTurn.hasOwnFooter(thinking("…")))
         XCTAssertFalse(ChatTurn.hasOwnFooter(summary("**shell**(cmd)")))
+        XCTAssertTrue(ChatTurn.hasOwnFooter(picture()))
         XCTAssertFalse(ChatTurn.hasOwnFooter(user("q")))
         var streaming = reply("half")
         streaming.isStreaming = true

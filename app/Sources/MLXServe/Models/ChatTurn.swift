@@ -22,10 +22,8 @@ enum ChatTurn {
             return false
         case .assistant:
             if let calls = message.toolCalls, !calls.isEmpty { return false }
-            // A round that only thought is part of a turn, not the end of one;
-            // a generated picture is that round's answer, delivered by a file.
-            let saidSomething = !message.content.isEmpty || !(message.media ?? []).isEmpty
-            return saidSomething && !message.isAgentSummary
+            // A round that only thought is part of a turn, not the end of one.
+            return saidSomething(message) && !message.isAgentSummary
                 && !message.failedRetry && message.errorNotice == nil
         }
     }
@@ -33,7 +31,12 @@ enum ChatTurn {
     /// Whether a reply row draws a footer of its own.
     static func hasOwnFooter(_ message: ChatMessage) -> Bool {
         message.role == .assistant && !message.isStreaming
-            && !message.isAgentSummary && !message.content.isEmpty
+            && !message.isAgentSummary && saidSomething(message)
+    }
+
+    /// Prose, or a generated picture: that round's answer, delivered by a file.
+    private static func saidSomething(_ message: ChatMessage) -> Bool {
+        !message.content.isEmpty || !(message.media ?? []).isEmpty
     }
 
     /// Whether a reply's footer carries the trash. Only where the transcript can
