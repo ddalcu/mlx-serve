@@ -453,6 +453,9 @@ final class ServerOptionsTests: XCTestCase {
         b = ServerOptions()
         b.tokenizeCacheEntries = 0
         XCTAssertFalse(a.serverLaunchEquals(b))
+        b = ServerOptions()
+        b.idleEvictSecs = 900
+        XCTAssertFalse(a.serverLaunchEquals(b))
         // Sanity: untouched defaults are equal.
         a = ServerOptions(); b = ServerOptions()
         XCTAssertTrue(a.serverLaunchEquals(b))
@@ -616,6 +619,7 @@ extension ServerOptionsTests {
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
         o.tokenizeCacheEntries = 16
+        o.idleEvictSecs = 1800
         o.defaultMaxTokens = 8192
         o.defaultTemperature = 0.42
         o.defaultTopP = 0.5
@@ -1120,5 +1124,34 @@ extension ServerOptionsTests {
         }
         // Unknown RAM must still produce a usable ladder, not just [Auto].
         XCTAssertGreaterThan(ServerOptions.residentMemPresets(physicalMemoryBytes: 0).count, 1)
+    }
+
+    /// Bar: the flag reaches the server when set, and 0 emits nothing (0 is
+    /// the server's own default).
+    func testIdleEvictSecsIsEmittedWhenSetAndOmittedOtherwise() {
+        var opts = ServerOptions()
+        XCTAssertEqual(opts.idleEvictSecs, 0)
+        XCTAssertFalse(opts.toCLIArgs().contains("--idle-evict-secs"))
+
+        opts.idleEvictSecs = 900
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--idle-evict-secs", value: "900"))
+    }
+
+    /// Bar: Off is reachable, the ladder ascends, and the readout is time.
+    func testIdleEvictLadderOffersOffAndReadsAsTime() {
+        let presets = ServerOptions.idleEvictPresets
+        XCTAssertEqual(presets.first, 0, "Off must be reachable")
+        XCTAssertEqual(presets, presets.sorted(), "snap points must ascend")
+        XCTAssertEqual(Set(presets).count, presets.count, "duplicate snap points")
+        XCTAssertGreaterThan(presets.count, 1, "Off is the only choice")
+        for secs in presets.dropFirst() {
+            XCTAssertEqual(secs % 60, 0, "\(secs)s is not a whole number of minutes")
+            if secs >= 3600 { XCTAssertEqual(secs % 3600, 0, "\(secs)s is not a whole number of hours") }
+        }
+        XCTAssertEqual(ServerOptions.idleEvictLabel(0), "Off")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(300), "5 min")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(1800), "30 min")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(3600), "1 hr")
+        XCTAssertEqual(ServerOptions.idleEvictLabel(7200), "2 hr")
     }
 }

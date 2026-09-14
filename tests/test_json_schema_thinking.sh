@@ -149,5 +149,11 @@ grep -Eq '\[grammar\] reasoning boundary (reached|forced)' "$LOG" \
     || run_test "deferred grammar activates at a boundary" FAIL "missing activation log"
 
 echo
+if python3 tests/test_json_schema_protocol_routing.py "$BASE"; then
+    run_test "marker data survives all HTTP surfaces with thinking on and off" PASS ""
+else
+    run_test "marker data survives all HTTP surfaces with thinking on and off" FAIL "routing regression"
+fi
+
 echo "=== $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ] || exit 1

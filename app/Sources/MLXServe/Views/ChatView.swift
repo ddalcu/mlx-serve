@@ -1872,6 +1872,15 @@ struct ChatDetailView: View {
     // inside the ForEach handed SwiftUI a fresh array on every layout pass and
     // the LazyVStack could spin forever.
     @State private var rows: [ChatRow] = []
+    @State private var foldStore = FoldStore()
+    /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
+    @State private var firstVisibleRow = 0
+    /// Which conversation the cut belongs to. The messages observer cuts on
+    /// first appearance (it is the one with `initial: true`); the session
+    /// observer cuts on every switch, with its own copy of the rows, so
+    /// neither depends on the other having run.
+    @State private var windowSession: UUID?
+    @State private var isRevealingEarlier = false
 
 
     private var session: ChatSession? {
@@ -1952,7 +1961,8 @@ struct ChatDetailView: View {
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
             inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
-            agentLock: agentModeLock)
+            agentLock: agentModeLock,
+            apple: appState.useAppleModel)
     }
 
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
@@ -1977,7 +1987,9 @@ struct ChatDetailView: View {
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
             status: server.status,
-            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+            // Nothing to start for the on-device model — it needs no server.
+            hasStartableModel: !appState.useAppleModel
+                && (!appState.selectedModelPath.isEmpty || server.lanChatModelId != nil)
         )
         if control != .hidden {
             Button {
@@ -2090,13 +2102,19 @@ struct ChatDetailView: View {
     /// as the tool menu's "not in <agent>'s capabilities" rows.
     @ViewBuilder
     private func lockedModeMenu(_ agentName: String) -> some View {
-        Text("Set by \(agentName)")
-        Button("Edit Agent…") {
-            // ON that agent — the window otherwise opens on whoever sorts
-            // first, which is the wrong one every time you got here from a card
-            // that just named a different name.
-            guard let id = activeAgent?.id else { return }
-            appState.openAgentSettings(id, using: openWindow)
+        if agentName == AppleFoundationChat.displayName {
+            // Not an agent, and nothing to edit: the on-device model simply
+            // does not have these.
+            Text("Not available on \(AppleFoundationChat.displayName)")
+        } else {
+            Text("Set by \(agentName)")
+            Button("Edit Agent…") {
+                // ON that agent — the window otherwise opens on whoever sorts
+                // first, which is the wrong one every time you got here from a
+                // card that just named a different name.
+                guard let id = activeAgent?.id else { return }
+                appState.openAgentSettings(id, using: openWindow)
+            }
         }
     }
 
@@ -2207,7 +2225,13 @@ struct ChatDetailView: View {
 
     /// What the tab's agent permits at all; everything when there's no agent.
     private var agentAllowedTools: Set<AgentToolKind> {
-        activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        let fromAgent = activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        // The on-device model's 4k window cannot hold the rest of the tool
+        // definitions; `AgentResolution` clamps the turn, this keeps the menu
+        // from offering what the clamp would drop.
+        return appState.useAppleModel
+            ? fromAgent.intersection(AppleFoundationChat.allowedTools)
+            : fromAgent
     }
 
     private var disabledToolSet: Set<AgentToolKind> {
@@ -2233,9 +2257,14 @@ struct ChatDetailView: View {
     /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
+        if appState.useAppleModel {
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+        }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
+            let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
+            if !tools.isEmpty {
             Section(group.title) {
-                ForEach(group.tools, id: \.self) { tool in
+                ForEach(tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
                     Button {
                         setTool(tool, enabled: !isToolEnabled(tool))
@@ -2252,6 +2281,7 @@ struct ChatDetailView: View {
                     }
                     .disabled(!allowed || isExternalBridgeSession)
                 }
+            }
             }
         }
 
@@ -2364,7 +2394,7 @@ struct ChatDetailView: View {
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
-                                                    serverRunning: server.status == .running) {
+                                                    serverRunning: canAnswer) {
                 Text(subtitle)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -2403,8 +2433,14 @@ struct ChatDetailView: View {
             } else {
             // Messages
                 ScrollView {
-                    LazyVStack(spacing: ChatMetrics.transcriptSpacing) {
-                        ForEach(rows) { row in
+                    // Not lazy: a lazy stack ESTIMATES its height from the rows
+                    // it has built, and every scroll decision below aims at
+                    // that number (story: docs/gotchas/app.md).
+                    VStack(spacing: ChatMetrics.transcriptSpacing) {
+                        if firstVisibleRow > 0 {
+                            showEarlierButton
+                        }
+                        ForEach(rows[firstVisibleRow...]) { row in
                             switch row {
                             case .message(let m):
                                 MessageBubble(
@@ -2467,7 +2503,10 @@ struct ChatDetailView: View {
                                     // the source is changed.
                                     onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
                                         ? { appState.forkSession(sessionId, from: m.id) }
-                                        : nil)
+                                        : nil,
+                                    onWillResize: { applyScroll(.rowWillResize) },
+                                    onDidResize: { applyScroll(.rowDidResize) },
+                                    foldStore: foldStore)
                                 .id(m.id)
                             case .toolCall(let call, let results, let calls, let owned):
                                 ToolCallRow(call: call, results: results, calls: calls,
@@ -2488,12 +2527,6 @@ struct ChatDetailView: View {
                                 .id("mediaProgress")
                         }
                     }
-                    // New identity when the text size or density changes, so
-                    // every row rebuilds with the new metrics at once (see the
-                    // @AppStorage pair above). Only fires on a Settings edit —
-                    // the transcript isn't even visible then (Settings is a
-                    // mode of this window), so the scroll reset is unseen.
-                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -2510,6 +2543,9 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                // A chat opens at its newest line by LAYOUT, with the real
+                // heights in hand, not by a jump aimed at an estimate of them.
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
                 // The transcript is moved from exactly one place — `applyScroll`
                 // — and only ever by a decision `ChatScrollState` made.
                 .scrollPosition($scrollPosition)
@@ -2525,6 +2561,12 @@ struct ChatDetailView: View {
                     ChatScrollState.distanceFromBottom($0)
                 } action: { _, distance in
                     applyScroll(.geometryChanged(distanceFromBottom: distance))
+                }
+                // The two numbers a fold's correction is made of.
+                .onScrollGeometryChange(for: CGPoint.self) {
+                    CGPoint(x: $0.contentOffset.y, y: $0.contentSize.height)
+                } action: { _, g in
+                    applyScroll(.contentGeometry(offsetY: g.x, contentHeight: g.y))
                 }
                 // Who is moving it. The predecessor was an app-global NSEvent
                 // scroll-wheel monitor: it fired for every other window in the
@@ -2546,6 +2588,11 @@ struct ChatDetailView: View {
                     }
                     .animation(.easeInOut(duration: 0.18), value: scrollModel.isPinnedToBottom)
                 }
+                // A new conversation is a new scroll view, laid out from its
+                // initial anchor instead of inheriting an offset measured in
+                // the transcript it replaces. A metrics change rebuilds every
+                // row anyway (they read `ChatMetrics` at build time).
+                .id("transcript-\(sessionId)-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
             // The divider belongs to the transcript — against the empty
             // state's greeting it would draw a line across mid-window.
             Divider()
@@ -2872,6 +2919,11 @@ struct ChatDetailView: View {
         }
         .onChange(of: session?.messages, initial: true) { _, msgs in
             rows = ChatRowBuilder.rows(from: msgs ?? [])
+            if windowSession != sessionId {
+                cutTranscriptWindow()
+            } else {
+                firstVisibleRow = TranscriptWindow.clamp(first: firstVisibleRow, total: rows.count)
+            }
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -2885,11 +2937,25 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // The binding outlives the scroll view too: a point a fold set in
+            // the old conversation would be what the new one attaches to,
+            // instead of its initial anchor.
+            scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
+            // Rebuilt here as well so the cut does not depend on whether the
+            // messages observer ran first (it runs only when the messages
+            // differ, which a fork's do not).
+            rows = ChatRowBuilder.rows(from: session?.messages ?? [])
+            cutTranscriptWindow()
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
             // but the first ↑ in the newly-visible tab has to mean "the last
             // thing I said HERE".
             composerWalk = .idle
+            // Unfolding a long turn belongs to the visit, not to the message:
+            // nothing about it is written to disk, so carrying it across
+            // conversations would remember it until the next launch and no
+            // further, which the reader can rely on in neither direction.
+            foldStore.clear()
         }
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.width
@@ -2923,7 +2989,7 @@ struct ChatDetailView: View {
                           onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
-            .disabled(server.status != .running)
+            .disabled(!canAnswer)
             // The placeholder stands in for the first character you type, so it
             // has to sit exactly where that character lands — which is three
             // insets in, not one (`ComposerTextMetrics`). It was a literal 9
@@ -3015,7 +3081,7 @@ struct ChatDetailView: View {
         // Stop is always tappable for the owning chat. Otherwise: Send,
         // disabled when the server is down or when this chat has nothing to
         // send. Another chat's turn blocks nothing — the engine is multi-turn.
-        .disabled(server.status != .running
+        .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
@@ -3354,6 +3420,13 @@ struct ChatDetailView: View {
                 // they stay synchronous so the jump lands with the click.
                 performScroll(animated: animated)
             }
+        case .toOffset(let y):
+            // From a geometry callback, so out of the layout flush (#136).
+            DispatchQueue.main.async {
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) { scrollPosition.scrollTo(y: y) }
+            }
         }
     }
 
@@ -3374,6 +3447,52 @@ struct ChatDetailView: View {
             instant.disablesAnimations = true
             withTransaction(instant) {
                 scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+    }
+
+    /// Above the first laid-out row of a long conversation.
+    private var showEarlierButton: some View {
+        Button {
+            revealEarlierRows()
+        } label: {
+            Group {
+                if isRevealingEarlier {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Show earlier messages")
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(height: 22)
+            .padding(.horizontal, 12)
+            .background(Color.secondary.opacity(0.15), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 4)
+    }
+
+    private func cutTranscriptWindow() {
+        windowSession = sessionId
+        firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
+    }
+
+    /// The rows appear ABOVE what the reader is looking at, so the transcript
+    /// holds their place through it (the same bracket a fold uses), and the
+    /// button answers the click before the layout that makes it slow starts.
+    private func revealEarlierRows() {
+        isRevealingEarlier = true
+        applyScroll(.rowWillResize)
+        DispatchQueue.main.async {
+            firstVisibleRow = 0
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    applyScroll(.rowDidResize)
+                    isRevealingEarlier = false
+                }
             }
         }
     }
@@ -3402,7 +3521,8 @@ struct ChatDetailView: View {
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }
@@ -3438,7 +3558,8 @@ struct ChatDetailView: View {
             liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
             contextLength: usage?.contextLength
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                      modelContextLength: server.chatModelInfo?.contextLength),
+                                                      modelContextLength: server.chatModelInfo?.contextLength,
+                                                      apple: appState.useAppleModel),
             overflow: lastOverflowNotice)
     }
 
@@ -3531,7 +3652,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -3584,7 +3705,7 @@ struct ChatDetailView: View {
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+              composerState != .generatingHere, canAnswer else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
@@ -3619,11 +3740,20 @@ struct ChatDetailView: View {
             resolved, documentIndex: appState.documentIndexes[sessionId])
     }
 
+    /// Whether this chat can answer at all. Apple's on-device model needs no
+    /// server, so "the server is down" is not the same question as "nothing
+    /// can answer" — every composer gate asks THIS, or the composer locks on a
+    /// model that was ready to reply.
+    private var canAnswer: Bool {
+        ChatTurnEngine.canRunTurn(serverRunning: server.status == .running,
+                                  apple: appState.useAppleModel)
+    }
+
     /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
     /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
     /// the last user turn and resubmits it fresh.
     private var canRegenerate: Bool {
-        server.status == .running && composerState != .generatingHere
+        canAnswer && composerState != .generatingHere
             && session?.isExternalBridge != true
             && (session?.messages.contains { $0.role == .user } ?? false)
     }
@@ -3930,11 +4060,27 @@ struct MessageBubble: View {
     /// new chat and this one is left alone. nil when there would be nothing to
     /// fork (`ChatFork.isForkable`) or on a read-only surface.
     var onFork: (() -> Void)?
+    /// Bracket a change that makes this row shorter (a fold, a thinking block
+    /// closing, an edit field replacing the bubble), so the transcript can
+    /// hold the reader's place through it. nil where there is no scroll view.
+    var onWillResize: (() -> Void)?
+    var onDidResize: (() -> Void)?
+    /// Survives a transcript rebuild; see `FoldStore`.
+    var foldStore: FoldStore?
     /// Hover over the whole row reveals the user turn's action row; the
     /// buttons themselves start invisible.
     @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    /// Unfolding a long turn is an act of reading, and it belongs to the row
+    /// for the same reason the accordion above does: writing it into the
+    /// transcript's own state re-evaluates every row in the conversation, and
+    /// a fold has to feel like a click, not like a page load.
+    @State private var longTurnExpanded = false
+    /// Between the click and the layout it asks for. Laying out a long `Text`
+    /// takes this thread for up to hundreds of milliseconds, so the control
+    /// answers the click before that starts.
+    @State private var isFolding = false
     @State private var isEditing = false
     @State private var editDraft = ""
     /// The edit field is the composer's field (`GrowingTextEditor`), so it
@@ -3964,7 +4110,11 @@ struct MessageBubble: View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                    if thinkingExpanded {
+                        resize { thinkingExpanded = false }
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded = true }
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "brain")
@@ -4097,6 +4247,31 @@ struct MessageBubble: View {
                                 // two roles read at two densities.
                                 .lineSpacing(ChatMetrics.userLineSpacing)
                                 .textSelection(.enabled)
+                                .lineLimit(isFolded ? LongUserTurn.collapsedLineLimit : nil)
+                                // A folded `Text` reports the width of the
+                                // lines it shows, so a bubble that hugged it
+                                // would change width on unfold and re-lay the
+                                // whole turn out at the new one. A turn this
+                                // long is a full-width block either way.
+                                .frame(maxWidth: foldsLongTurn ? .infinity : nil, alignment: .leading)
+                                .overlay(alignment: .bottom) { foldFade }
+                            if foldsLongTurn {
+                                Group {
+                                    if isFolding {
+                                        // The spinner ignores `tint`; it draws
+                                        // white in the dark scheme.
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                            .colorScheme(.dark)
+                                    } else {
+                                        Button(isFolded ? "Show more" : "Show less") { toggleLongTurn() }
+                                            .buttonStyle(.plain)
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(.white.opacity(0.8))
+                                    }
+                                }
+                                .padding(.top, ChatMetrics.foldToggleTopPadding)
+                            }
                         }
                         if message.isStreaming {
                             GeneratingIndicator()
@@ -4165,6 +4340,7 @@ struct MessageBubble: View {
             .frame(maxWidth: .infinity,
                    alignment: message.role == .user ? .trailing : .leading)
         }
+        .onAppear { longTurnExpanded = foldStore?.isExpanded(message.id) ?? false }
         // Hover must cover the transparent action row too, or it vanishes as
         // the pointer approaches it.
         .contentShape(Rectangle())
@@ -4240,11 +4416,15 @@ struct MessageBubble: View {
 
     private func startEditing() {
         editDraft = message.content
-        isEditing = true
-        // Put the caret in the field the edit just opened — otherwise Return
-        // is typed at whatever still holds focus (the composer below), which
-        // sends a NEW message instead of the edit.
-        editFocused = true
+        // The field is capped in height where the bubble was not, so on a long
+        // turn it would otherwise open above the top of the window.
+        resize(animated: false) {
+            isEditing = true
+            // Put the caret in the field the edit just opened — otherwise
+            // Return is typed at whatever still holds focus (the composer
+            // below), which sends a NEW message instead of the edit.
+            editFocused = true
+        }
     }
 
     private func cancelEdit() {
@@ -4266,6 +4446,77 @@ struct MessageBubble: View {
     /// Assistant prose renders bare; user turns and tool-call summaries keep a
     /// bubble.
     private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
+
+    // MARK: - Folding a long user turn
+
+    private var userTurnCharsPerLine: Int {
+        LongUserTurn.charsPerLine(
+            textWidth: ChatMetrics.userBubbleMaxWidth - 2 * ChatMetrics.bubblePaddingH,
+            fontSize: ChatMetrics.transcriptFontSize)
+    }
+
+    private var foldsLongTurn: Bool {
+        guard message.role == .user, !message.isStreaming else { return false }
+        return LongUserTurn.isCollapsible(message.content, charsPerLine: userTurnCharsPerLine)
+    }
+
+    private var isFolded: Bool { foldsLongTurn && !longTurnExpanded }
+
+    /// Fades the last two kept lines into the bubble instead of ending them on
+    /// an ellipsis, so a folded turn reads as continuing rather than as a
+    /// sentence that stops.
+    ///
+    /// An overlay in the bubble's own colour, not a `mask`: a mask renders what
+    /// it covers into an offscreen layer, and an unfolded turn is a layer
+    /// thousands of points tall — which is hundreds of milliseconds per fold.
+    @ViewBuilder
+    private var foldFade: some View {
+        if isFolded {
+            // Stops short of covering the last line: a line faded to nothing
+            // reads as the end of the message, one still faintly there reads as
+            // more of it below.
+            LinearGradient(colors: [bubbleBackground.opacity(0), bubbleBackground.opacity(0.85)],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: (ChatMetrics.transcriptFontSize + ChatMetrics.userLineSpacing) * 2)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func toggleLongTurn() {
+        let expanding = !longTurnExpanded
+        foldStore?.set(message.id, expanded: expanding)
+        isFolding = true
+        // One turn later, so the indicator is drawn before the layout that
+        // makes this click slow takes the thread.
+        DispatchQueue.main.async {
+            if expanding {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    longTurnExpanded = true
+                } completion: {
+                    isFolding = false
+                }
+            } else {
+                resize({ longTurnExpanded = false }, done: { isFolding = false })
+            }
+        }
+    }
+
+    /// Brackets a change that makes this row shorter. The end is reported one
+    /// turn after the change has landed, so the geometry of its last frame is
+    /// seen inside the bracket.
+    private func resize(animated: Bool = true, _ change: @escaping () -> Void,
+                        done: (() -> Void)? = nil) {
+        onWillResize?()
+        let finish = { onDidResize?(); done?() }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.15)) { change() } completion: {
+                DispatchQueue.main.async(execute: finish)
+            }
+        } else {
+            change()
+            DispatchQueue.main.async { DispatchQueue.main.async(execute: finish) }
+        }
+    }
 
     private var bubbleBackground: Color {
         if isBare { return .clear }
@@ -4491,12 +4742,14 @@ struct ChatModeToggles: Equatable {
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
                         inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
-                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+                        agentLock: AgentModeLock? = nil,
+                        /// Chat is answered by Apple's on-device model.
+                        apple: Bool = false) -> ChatModeToggles {
         let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
-        guard let lock = agentLock else { return base }
-        return ChatModeToggles(
+        guard let lock = agentLock else { return applyingApple(base, apple: apple) }
+        return applyingApple(ChatModeToggles(
             // Thinking is the one an agent may leave unset, and `AgentResolution`
             // falls back to the surface's own value there — so locking it anyway
             // would take away a control nobody is deciding for you.
@@ -4505,7 +4758,21 @@ struct ChatModeToggles: Equatable {
             mcp: lock.mcp,
             thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
             toolsLockedBy: lock.name,
-            mcpLockedBy: lock.name)
+            mcpLockedBy: lock.name), apple: apple)
+    }
+
+    /// The on-device model has no thinking mode at all, and its 4k window has
+    /// no room for MCP's tool definitions — so both read locked, with it named
+    /// as the owner. The tool LOOP still switches; the tool SET is clamped in
+    /// `AgentResolution`, which is where capabilities are decided.
+    private static func applyingApple(_ t: ChatModeToggles, apple: Bool) -> ChatModeToggles {
+        guard apple else { return t }
+        var out = t
+        out.thinking = false
+        out.thinkingLockedBy = AppleFoundationChat.displayName
+        out.mcp = false
+        out.mcpLockedBy = AppleFoundationChat.displayName
+        return out
     }
 }
 

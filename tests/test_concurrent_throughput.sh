@@ -54,39 +54,8 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-# Skip MoE / hybrid / encoder-only models — those clamp max_concurrent to 1
-# at server start because the batched kernel doesn't model their state. The
-# test wouldn't be measuring continuous batching on them.
-#
-# EXCEPT a dense GatedDeltaNet trunk (qwen3_5 family): it has its own batched
-# kernel (`Transformer.forwardMoeBatchedDecode`) and is explicitly NOT clamped
-# any more. Skipping it here would hide regressions in the one arch the GDN
-# batching was built for — mirrors `ModelConfig.supportsBatchedGdnDecode`.
-ARCH=$(python3 -c "
-import json, sys
-with open('$MODEL/config.json') as f:
-    c = json.load(f)
-tc = c.get('text_config') or c
-mt = c.get('model_type', '')
-# A config may carry the key with a null value (dense sibling of a MoE family).
-moe_layers = (tc.get('num_local_experts') or 0) > 0 or (tc.get('num_experts') or 0) > 0
-gdn_dense = tc.get('full_attention_interval', 0) > 0 and not moe_layers
-hybrid = mt in ('qwen3_5', 'qwen3_5_moe', 'qwen3_5_moe_text', 'qwen3_next', 'nemotron_h', 'lfm2', 'lfm2_vl')
-encoder = tc.get('is_encoder_only', False) or 'bert' in mt.lower()
-if gdn_dense and not encoder:
-    print(f'OK {mt}')
-elif moe_layers or hybrid or encoder:
-    print(f'SKIP_INCOMPATIBLE {mt}')
-else:
-    print(f'OK {mt}')
-")
-if [[ "$ARCH" == SKIP_INCOMPATIBLE* ]]; then
-    arch_name="${ARCH#SKIP_INCOMPATIBLE }"
-    echo -e "${YELLOW}SKIP${NC} test_concurrent_throughput: model arch '$arch_name' clamps max_concurrent to 1."
-    echo "  Continuous batching only applies to pure-attention models. Use a"
-    echo "  Gemma-4 / Llama / Mistral / Qwen3 dense checkpoint to exercise it."
-    exit 0
-fi
+# Whether the model batches is the SERVER's answer: the boot line says
+# "batched decode on|off" and the script keys on that after startup.
 
 # Decode-bound prompt — short input, long output. We want the timing to be
 # dominated by per-token decode work so the batching benefit is visible.
@@ -131,10 +100,9 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-# Confirm the server actually accepted the concurrent setting (didn't clamp
-# to 1 because of an unexpected arch detection).
-if grep -q "Concurrency: requested .* falling back to 1" "$LOGFILE"; then
-    echo -e "${YELLOW}SKIP${NC} server clamped max_concurrent to 1:"
+# Confirm the model batches (a serial-interleave arch has no throughput to measure).
+if grep -q "Concurrency: .* batched decode off" "$LOGFILE"; then
+    echo -e "${YELLOW}SKIP${NC} model does not batch decode:"
     grep "Concurrency:" "$LOGFILE" | sed 's/^/    /'
     exit 0
 fi

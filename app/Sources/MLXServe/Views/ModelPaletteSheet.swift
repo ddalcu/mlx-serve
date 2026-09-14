@@ -17,7 +17,8 @@ struct ModelPaletteSheet: View {
     @FocusState private var searchFocused: Bool
 
     private var rows: [ModelPaletteRow] {
-        ModelPalette.rows(local: appState.localModels,
+        ModelPalette.rows(appleAvailable: AppleFoundationChat.availability.isAvailable,
+                          local: appState.localModels,
                           lan: server.lanModels(capability: "chat"))
     }
 
@@ -27,7 +28,8 @@ struct ModelPaletteSheet: View {
     /// answering and ⌘L + Return is a no-op.
     private var currentTag: String {
         ChatModelSelection.tag(localPath: appState.selectedModelPath,
-                               lanChatModelId: server.lanChatModelId)
+                               lanChatModelId: server.lanChatModelId,
+                               apple: appState.useAppleModel)
     }
 
     var body: some View {

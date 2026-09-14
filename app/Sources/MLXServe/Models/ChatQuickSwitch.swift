@@ -188,8 +188,11 @@ enum ContinueReply {
     static func isEligible(_ messages: [ChatMessage],
                            serverRunning: Bool,
                            busy: Bool,
-                           engine: ServerEngine? = nil) -> Bool {
-        guard engine != .dsv4 else { return false }
+                           engine: ServerEngine? = nil,
+                           /// Apple's on-device model answers a prompt and
+                           /// cannot extend a reply already written.
+                           apple: Bool = false) -> Bool {
+        guard !apple, engine != .dsv4 else { return false }
         guard serverRunning, !busy, let last = messages.last else { return false }
         guard last.role == .assistant else { return false }
         // Already being written.

@@ -4814,6 +4814,29 @@ see every narrower sample refused against a stale wider cell. Uniform
 contamination across a bucket is invisible to any ratio; that table wants
 deleting. Guard: the #382 parse test in `round_cost.zig`.
 
+### Batched MTP verify: 8 rows fall off the split-K lane; a crowd beats sub-groups
+
+Two MTP users on the dense 27B decoded slower together than one alone: every
+spec slot left the batched group and took turns (53 tok/s aggregate for two,
+45 plain). The round was split into begin / verify / finish (`MtpRoundState`)
+so a group verifies in ONE `[N, S]` trunk forward (rows padded to the widest
+draft, per-row SSM capture split back to each slot, KV + SSM clamped to
+`1 + m` on every padded row). The first cut was 2x SLOWER at depth 3: N*S = 8
+rows leave the split-K verify-qmm lane (M 2..7) for stock kernels, so the group
+is capped at 7 rows off-NAX (`mtpGroupRowCap`: pairs at depth 2, triples at
+depth 1) and the cap clamps each slot's plan (`mtp_group_cap`). Past three
+slots the sub-grouped rounds lose to one plain batched tick, so a crowd decodes
+plain with hidden capture (`mtp_plain_tick`) and resumes speculating when the
+group thins. Flash Next's head kept per-request state on the module
+(`Qwen4Mtp.cache/entry/seq_offset/...`), which is why its MTP slot was
+exclusive and a second user queued; the state is now a per-request
+`Qwen4MtpState` swapped onto the module before every head touch
+(`qwen4MtpActivate`). Its verify rows are expert bytes and a batched verify measured no
+better than solo rounds, so it stays opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`): rounds stay
+solo, two interleave, three go plain. Bars: `tests/test_mtp_batched.sh` (fixed
+depth: byte-identical on qwen4, near-tie acquitted on the batched verify),
+`tests/bench_concurrency_ladder.sh` (the numbers).
+
 ## The exact block select was one threadgroup per row, and decode has one row (2026-09-09)
 
 `msv_qsa_select` ran one threadgroup per query row: right for a 4096-row prefill chunk, wrong for
@@ -4904,3 +4927,52 @@ and the measured-peak rows for qwen3.5 27B/4B were re-derived by subtracting the
 lazily copied side-channel state is not in the residual's graph; the cadence eval must name it, or the copy
 still pins its parent. Same PR: the QSA raw-key ring (32 rows since #381) was still billed per token
 (`qsaHistoryBytesPerToken` 3 KB/token, 1.6 GB of phantom at 512k); it is billed once per slot now.
+
+## A failed dense KV write left freed view handles in the entry (2026-09-10)
+
+`KVCache.updateDense` frees the previous `key_view`/`value_view` first, so the buffer can be
+donated, and assigned the handles fresh only after the grow and the writes. When one of those
+failed (an MLX error, catchable since #353), the entry kept both freed handles and the next
+`resetCache` or `deinit` of that cache freed them again: SIGSEGV in `freeKVEntry`. Seen live when
+Qwen3-Embedding sub-batches shared the cache and a write failed on the batch dimension
+(`broadcast_shapes`). `updateAffine` already reset its handles at the free, and
+`updateTurboQuant` goes through it. Fix: reset the handles at the free; `writeAtOffset` releases
+its result on the error path. A grow that fails after K but before V can leave their capacities
+apart; the error aborts that forward and the next request's reset restores a coherent pair.
+Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
+in-capacity and a growing update.
+
+## 3-bit experts fell off the fused MoE decode kernels; the fix is the pack unit (2026-09-13)
+
+The iQ-MLX 3.3 bpw Flash Next pack quantizes 67 of its expert layers at 3-bit gs128, and every
+fused MoE decode kernel (`gatherQmv`, gate+up, down+reduce, both rows variants) declined 3-bit,
+so those layers ran stock `gather_qmm`: 52.6 tok/s vs 55.5 on the 4-8 pack while reading 30%
+fewer expert bytes. First arm: a 32-value unit of three words per lane, one quant group per unit.
+Correct, but K=2560 is 80 units over 32 lanes, so half the lanes sat idle for a third of the loop,
+and the microbench read 83 us per gate+up+down pair against 73 us for 4-bit. Second arm: the pack
+unit is the byte triple mx.quantize really writes (8 values, value i at bit 3i), read through one
+`mlxserve_qpack<BITS>` loader so the body's `>> (i * BITS)` walk is unchanged; 74.8 us, on par
+with 4-bit. The header is shared with the nvfp4 variants (same source) or their kernels fail to
+compile at runtime. Live: 52.1 -> 54.7 tok/s single stream, +4% at two streams. The lesson the
+microbench taught: at <= 4 bits these kernels are ALU-bound (2/3/4-bit all ~72 us, 8-bit at
+bandwidth), so a narrower pack buys nothing unless the lanes stay balanced; the byte floor for
+3-bit is ~46 us and the gap is a per-value ALU count (shift, mask, convert, two FMAs), the same
+gap the 4-8 pack has. Guards: the 3-bit arms of the gatherQmv fp32-truth test, the gate+up and
+down+reduce bit-identity tests, and the rows-vs-solo test.
+
+## The MoE down+reduce kernel was reduction-bound, not byte-bound (2026-09-13)
+
+Splitting the gate+up and down+reduce timings showed the down kernel reading half the bytes of
+gate+up in the same wall time (4-bit: 8 MB in 33 us vs 16 MB in 41 us). Its layout gave every
+output row a whole simdgroup: K is the MoE intermediate (640 on Flash Next), so each lane held two
+or three packs and then paid a 32-lane `simd_sum`, four rows in series per simdgroup, with K/8 = 80
+packs over 32 lanes leaving 16 lanes idle for a third of the loop. Two experiments, both measured
+INTERLEAVED against the old kernel in one process (separate `zig build test` runs drifted 15%
+between identical kernels, enough to fake either verdict): hoisting the four rows' packs in the old
+layout LOST (34.6 vs 32.9 us); eight lanes per row with the packs hoisted per lane and a three-step
+`simd_shuffle_xor` reduce for all four rows at once took 34 -> 24 us at 2/3/4-bit and 43 -> 37 at
+8-bit. Four lanes per row spills the hoisted array (49 us); sixteen equals eight. The rows twin
+carries the same layout so batched decode stays bit-identical to solo. The reduction tree differs
+from the composed chain, so the parity test moved from bit identity to RMS error against the f32
+truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
+balance; hoist per lane, and A/B kernels only interleaved.

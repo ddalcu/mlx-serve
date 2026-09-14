@@ -186,6 +186,16 @@ v2 tiling (BQ=64, BK=32, 8 simdgroups, register-resident Q, uint4 staging) was
 picked by our own microbenchmark sweep, and a sliding-window band arm and
 key-axis chunked dispatch were added.
 
+The verifier expert-pair kernel (`VERIFY_EXPERT_REUSE_SOURCE`) adapts the
+4-bit affine `qmv_impl`, `load_vector` and `qdot` arithmetic from MLX's
+`backend/metal/kernels/quantized.h`. Modifications: sorted expert-run pairing,
+shared packed-weight reads for two inputs, and verification-only shape guards.
+The fused expert reduction preserves the bf16 partial-sum order of MLX
+`reduction/reduce_col.h:col_reduce_small` while gathering, weighting and
+reducing in one dispatch. The batched coarse-head pair kernel
+(`MTP_COARSE_PAIRS_SOURCE`) adapts the 3-bit affine qmv-fast reduction from
+quantized.h, sharing each packed read across two input rows.
+
 Several other kernels of ours deliberately reproduce the exact arithmetic of
 MLX ops (reduction order, accumulator dtype, `fast::exp`, the `precise::rsqrt`
 variant) so a fused kernel stays bit-identical to the op chain it replaces.
