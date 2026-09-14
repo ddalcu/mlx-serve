@@ -11997,6 +11997,15 @@ pub fn degenerateTailWithExactReps(tokens: []const u32, exact_reps: usize) ?Dege
         degenerate_loop_long_max_period,
         degenerate_loop_long_reps,
     )) |p| {
+        // A short cycle is also periodic at multiples of its true period.
+        // Leave those tails to the configurable short tier, including when
+        // its threshold exceeds the fuzzy window. Falling through would let
+        // the near-repeat tier impose another hidden cap on that threshold.
+        const cycle = tokens[tokens.len - p ..];
+        for (1..degenerate_loop_max_period + 1) |short_p| {
+            if (p % short_p == 0 and
+                std.mem.eql(u32, cycle[short_p..], cycle[0 .. p - short_p])) return null;
+        }
         return .{ .tier = .long_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (tokens.len < near_repeat_window) return null;
@@ -13926,21 +13935,59 @@ test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
     try testing.expectEqualSlices(u32, &[_]u32{ 7, 8, 9, 10, 101, 102, 103 }, ids.items[0..d.start]);
 }
 
-test "degenerateTail: a higher exact threshold permits a finite repeated pattern" {
+test "degenerateTail: every short period honors every repeat-loop preset" {
     const al = testing.allocator;
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(al);
-    try ids.appendSlice(al, &[_]u32{ 7, 8, 9 });
+    // Nonzero Settings presets, plus the smallest CLI threshold.
+    for ([_]usize{ 2, 16, 24, 32, 48, 64 }) |reps| {
+        for (1..9) |p| {
+            ids.clearRetainingCapacity();
+            try ids.appendSlice(al, &.{ 7, 8, 9 });
+            // Check every token so partial cycles cannot hide an early cut.
+            for (0..p * reps) |i| {
+                try testing.expect(degenerateTailWithExactReps(ids.items, reps) == null);
+                try ids.append(al, @intCast(400 + i % p));
+            }
+            const d = degenerateTailWithExactReps(ids.items, reps) orelse return error.TestExpectedLoop;
+            try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+            try testing.expectEqual(3 + p, d.start);
+        }
+    }
+}
 
-    // A finite repeated pattern can cross the default threshold without being
-    // an unbounded generation loop.
-    for (0..20) |_| try ids.append(al, 404);
-    try testing.expect(degenerateTail(ids.items) != null);
-    try testing.expect(degenerateTailWithExactReps(ids.items, 32) == null);
+test "degenerateTail: large CLI thresholds are not capped by the fuzzy tier" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    const reps = 2048;
+    for (1..9) |p| {
+        ids.clearRetainingCapacity();
+        try ids.appendSlice(al, &.{ 7, 8, 9 });
+        for (0..p * reps) |i| try ids.append(al, @intCast(400 + i % p));
+        // These tails qualify as near repeats, but remain short exact cycles.
+        try testing.expect(isNearRepeatTailLoop(ids.items));
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. 3 + near_repeat_window], reps) == null);
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. ids.items.len - 1], reps) == null);
+        const d = degenerateTailWithExactReps(ids.items, reps) orelse return error.TestExpectedLoop;
+        try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+        try testing.expectEqual(3 + p, d.start);
+    }
+}
 
-    for (20..32) |_| try ids.append(al, 404);
-    const d = degenerateTailWithExactReps(ids.items, 32) orelse return error.TestExpectedLoop;
-    try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+test "degenerateTail: genuine long periods retain their ten-repeat threshold" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    for (9..65) |p| {
+        ids.clearRetainingCapacity();
+        try ids.appendSlice(al, &.{ 7, 8, 9 });
+        for (0..p * 10) |i| try ids.append(al, @intCast(400 + i % p));
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. ids.items.len - 1], 2048) == null);
+        const d = degenerateTailWithExactReps(ids.items, 2048) orelse return error.TestExpectedLoop;
+        try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
+        try testing.expectEqual(3 + p, d.start);
+    }
 }
 
 test "degenerateTail: the trim start walks back PAST the near-repeat window" {
