@@ -47,6 +47,28 @@ measured these decode rates (short median / approximately 16K median, tokens/s):
 
 The comparison uses the same probe prompts and timed request fields, but
 different packs, KV formats, sampler filter orders, and unpaired random
-streams. The lossy modes need a separate sampled quality eval before
-production promotion. llmprobe's standard conformance/capability/fidelity
-scores are largely outside its creative-sampling benchmark path.
+streams. In one seeded, 100-question llmprobe creative-thinking-off JavaScript
+code eval on the same mlx-serve binary, exact passed 76, Typical passed 78, and
+TokenV3 passed 77. These are sanity results, with 5–7 token-cap stops per arm;
+the 164-task Python HumanEval quality gate remains open. llmprobe's standard
+conformance/capability/fidelity scores are largely outside its creative-sampling
+benchmark path.
+
+## Paired routed gate/up kernel
+
+`MLX_SERVE_MOE_VERIFY_PAIRED_GU=1` installs an opt-in physical-S=4 routed
+gate/up kernel at model load. It is limited to the Qwen3.8 Flash-Next pack with
+48 MoE layers, hidden width 2560, expert width 640, 512 experts, top-10 routing,
+and separate contiguous affine q4/group-64 gate and up banks. Installation
+checks that contract and bit-compares each layer against the stock sorted gather
+plus fused SwiGLU path before generation. Other shapes continue on the stock
+route; a failed installation stops model loading.
+
+The kernel adapts MTPLX's paired routed producer to this checkpoint's split
+banks and group size. In a two-order, six-pair 16K serving A/B on the same
+binary, with exact MTP acceptance, sampled depth-3 drafts, KV8, creative
+sampling, thinking xhigh, and identical request seeds, mean decode speed rose
+from 70.377 to 70.914 tok/s (+0.76%). Total wall time fell from 109.077 to
+108.675 seconds (0.37% shorter). All paired completion lengths, answer
+digests, and reasoning digests matched. This is a measured 16K-cell result;
+long-context and full state/cache parity remain separate gates.
