@@ -52,6 +52,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
 | `--embedding-max-length N` | auto | Per-input token ceiling for `/v1/embeddings` (auto = the model's declared window; over-limit inputs get a 400, never silent truncation) |
 | `--timeout N` | `300` | Stall timeout — seconds *without a new token* (a request that keeps producing never times out) |
+| `--loop-repetitions N` | `16` | Stop short exact token cycles after N repetitions; N must be at least 2. `0` disables all repetition-loop detection. |
 | `--reasoning-budget N` | `-1` | Thinking token budget (`-1` = unlimited, `0` = no thinking) |
 | `--no-vision` | off | Disable vision encoder even if model supports it |
 | `--pld` / `--no-pld` | on | Prompt Lookup Decoding (model-agnostic spec-decode) |
