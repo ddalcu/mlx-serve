@@ -104,7 +104,9 @@ else
     echo -e "${RED}FAIL${NC} a status poll reloaded the model — eviction cannot win against it"; FAIL=1
 fi
 
-# A status poll must not be USE, either. /props shares handleConnection's
+# A status poll must not be USE, either. /props is the only status route that
+# reaches it: the Ollama endpoints answer in handleOllamaEarly, above
+# ensureLoaded. /props shares handleConnection's
 # ensureLoaded/release pair with the generation routes, so a release that
 # restamps the idle clock lets a 1s watcher (or the app's 3s tray) hold every
 # model resident forever while the sweep sits armed and never fires.
@@ -114,7 +116,6 @@ echo "  polling /props on a RESIDENT model must not pin it"
 POLLED_OUT=1
 for _ in $(seq 1 40); do          # 20s of polling against a 2s window
     curl -fs "$BASE/props" >/dev/null 2>&1
-    curl -fs -X POST "$BASE/api/show" -H 'Content-Type: application/json' -d "{\"model\":\"$M\"}" >/dev/null 2>&1
     sleep 0.5
     if [ "$(resident_count)" = "0" ]; then POLLED_OUT=0; break; fi
 done
