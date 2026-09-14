@@ -424,21 +424,19 @@ class APIClient {
         let rawArguments: String
     }
 
-    /// Read a cut's CAUSE out of one streamed choice. `finish_reason: "length"`
-    /// is the only OpenAI value for both a max_tokens cap and the server's
-    /// degenerate-tail loop cut, so the cause comes from the sibling
-    /// `finish_details` object the server emits beside it. An older server (or
-    /// any other OpenAI-compatible backend) sends no such field and reads as
-    /// `.maxTokens`, which is exactly the behaviour this replaced.
+    /// Read a cut's cause out of one streamed choice. Explicit repetition-loop
+    /// details take precedence over finish_reason: current servers use "stop"
+    /// for loop cuts, while older servers used "length". Without a recognized
+    /// loop cause, only "length" indicates a max_tokens cut.
     ///
     /// Static and dictionary-shaped so it is testable without a live stream.
     static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
-        guard let choice, let fr = choice["finish_reason"] as? String, fr == "length" else { return nil }
+        guard let choice else { return nil }
         if let details = choice["finish_details"] as? [String: Any],
            let type = details["type"] as? String, type == "repetition_loop" {
             return .repetitionLoop
         }
-        return .maxTokens
+        return choice["finish_reason"] as? String == "length" ? .maxTokens : nil
     }
 
     /// Per-request overrides that come from the user's saved ServerOptions.
@@ -774,8 +772,8 @@ class APIClient {
                 }
             }
 
-            // Check finish_reason. "length" is both the max_tokens cap and the
-            // server's own loop cut; `finish_details` is what tells them apart.
+            // Explicit loop details identify an intentional cut even with
+            // finish_reason "stop"; bare "length" identifies a max_tokens cap.
             if let cause = Self.truncationCause(fromChoice: choices.first) {
                 continuation.yield(.truncated(cause))
             }

@@ -65,17 +65,8 @@ final class TruncationNoticeTests: XCTestCase {
     }
 
     func testCauseComesFromTheServersSiblingFieldAndDegradesToMaxTokens() {
-        // "length" is the only OpenAI value for both cuts, so `finish_details`
-        // is the discriminator. Absent (older server, another backend) must
-        // read as .maxTokens — exactly the behaviour this replaced.
+        // Preserve max_tokens handling for backends without loop details.
         XCTAssertEqual(APIClient.truncationCause(fromChoice: ["finish_reason": "length"]), .maxTokens)
-        XCTAssertEqual(
-            APIClient.truncationCause(fromChoice: [
-                "finish_reason": "length",
-                "finish_details": ["type": "repetition_loop"],
-            ]),
-            .repetitionLoop
-        )
         // An unknown cause is still a truncation, not a loop.
         XCTAssertEqual(
             APIClient.truncationCause(fromChoice: [
@@ -84,15 +75,26 @@ final class TruncationNoticeTests: XCTestCase {
             ]),
             .maxTokens
         )
-        // Any other finish_reason is not a cut at all — including one carrying a
-        // stale details object, which the server gates but a proxy might not.
+        // An ordinary stop, including one with unknown details, needs no notice.
         XCTAssertNil(APIClient.truncationCause(fromChoice: ["finish_reason": "stop"]))
         XCTAssertNil(APIClient.truncationCause(fromChoice: [
             "finish_reason": "stop",
-            "finish_details": ["type": "repetition_loop"],
+            "finish_details": ["type": "something_new"],
         ]))
         XCTAssertNil(APIClient.truncationCause(fromChoice: nil))
         XCTAssertNil(APIClient.truncationCause(fromChoice: [:]))
+    }
+
+    func testExplicitLoopDetailsShowTheNoticeAndEndTheTurnRegardlessOfFinishReason() {
+        // Current and legacy server contracts, plus an omitted finish reason:
+        // the explicit cause is sufficient to identify a repetition-loop cut.
+        for reason: String? in ["stop", "length", "tool_calls", nil] {
+            var choice: [String: Any] = ["finish_details": ["type": "repetition_loop"]]
+            if let reason { choice["finish_reason"] = reason }
+            let cause = APIClient.truncationCause(fromChoice: choice)
+            XCTAssertEqual(cause, .repetitionLoop)
+            XCTAssertTrue(TruncationNotice.endsTurn(cause: cause))
+        }
     }
 
     // MARK: - The notice is DATA, never content (2026-08-11)
