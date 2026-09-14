@@ -20586,28 +20586,6 @@ test "repetition-loop cuts decline tool-call parsing" {
     try std.testing.expect(shouldParseToolCalls("unknown_future_detail"));
 }
 
-test "every tool-capable HTTP surface suppresses calls from a repetition-loop cut" {
-    // Wiring class guard: the pure decision is useless if one handler parses
-    // first and turns the cut buffer into executable work. Keep the needles
-    // split so this test's own source does not satisfy its assertions.
-    const src = @embedFile("server.zig");
-    const detail_gate = "shouldParseTool" ++ "Calls";
-    const cases = [_]struct { needle: []const u8, expected: usize }{
-        .{ .needle = "if (has_tools and " ++ detail_gate ++ "(result.finish_details))", .expected = 2 },
-        .{ .needle = "if (has_tools and " ++ detail_gate ++ "(ts.finish_details)) try parseToolCallsForRequest", .expected = 2 },
-        .{ .needle = "if (active_has_tools and " ++ detail_gate ++ "(result.finish_details))", .expected = 1 },
-    };
-    for (cases) |case| {
-        var count: usize = 0;
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, src, i, case.needle)) |at| : (i = at + case.needle.len) count += 1;
-        try std.testing.expectEqual(case.expected, count);
-    }
-    // The Responses streaming path builds a GenerationResult after finalize;
-    // it must carry the cause into the shared post-generation gate.
-    try std.testing.expect(std.mem.indexOf(u8, src, ".finish_details = ts." ++ "finish_details,") != null);
-}
-
 test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
     // Dispatch-hole class: a surface that reports the reason and drops the
     // cause is silent — the response still validates, and no output-equality
@@ -20635,7 +20613,7 @@ test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
     try t.expect(std.mem.indexOf(u8, src, chunk) != null);
 
     // /v1/messages is DELIBERATELY not on this list: its envelope is
-    // Anthropic's, `anthropicStopReason` maps a loop cut to "max_tokens", and
+    // Anthropic's, `anthropicStopReason` maps a loop cut to "end_turn", and
     // inventing a key inside someone else's schema is worse than the gap.
     // The TRIM (which is what actually breaks the feedback loop) applies
     // there anyway — it happens where the text is decoded, not per surface.

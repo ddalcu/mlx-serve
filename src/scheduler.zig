@@ -9071,12 +9071,12 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     try testing.expect(loopStopDecision(ids.items[answer_start..]) == null);
 
     // A new loop wholly inside the constrained answer retains the existing
-    // length/repetition result, with an absolute trim point for response code.
+    // stop/repetition result, with an absolute trim point for response code.
     for (0..generate_mod.degenerate_loop_reps + 4) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
     }
     const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", answer_loop.finish_reason);
+    try testing.expectEqualStrings("stop", answer_loop.finish_reason);
     try testing.expect(answer_loop.trim_start + answer_start >= answer_start);
 
     // Healthy output decides nothing at all — no reason, and nothing to trim.
