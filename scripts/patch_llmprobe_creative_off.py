@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Make llmprobe 0.6.7 timed/eval chat requests explicitly thinking-off.
+"""Make llmprobe 0.6.7 timed/eval chat requests thinking-off and paired.
 
 The published `--reasoning off` omits `reasoning_effort` on eval requests but
 does not send `enable_thinking=false`. Timed requests also bypass MTPLX's
 prefix cache; mlx-serve ignores that header and disables its cache at launch.
 Patch a disposable bundle, not npm's installation. Conformance probes retain
 their original request bodies.
+Timed requests derive the same seed from their prompt and output length on
+both engines, independent of the order of earlier conformance probes.
 """
 
 import hashlib
@@ -24,10 +26,19 @@ def patch_bundle(source: str) -> str:
     timed = timed.replace(
         old_timed,
         '    stream: true,\n'
+        '    seed: stableTimedSeed(text, maxTokens),\n'
         '    ...(surface === "chat" ? { enable_thinking: false } : {})\n'
         '  };',
     )
-    source = source[:timed_start] + timed + source[timed_end:]
+    seed_helper = '''function stableTimedSeed(text, maxTokens) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  }
+  return Math.imul(hash ^ maxTokens, 16777619) >>> 0;
+}
+'''
+    source = source[:timed_start] + seed_helper + timed + source[timed_end:]
 
     timed_start = source.index("async function timedRun(ctx, surface, text, maxTokens, extra, system) {")
     timed_end = source.index("\n}", timed_start)

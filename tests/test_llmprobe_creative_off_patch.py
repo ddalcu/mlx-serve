@@ -31,6 +31,8 @@ async function runReasoning(ctx, opts) {
         self.assertIn('...(surface === "chat" ? { enable_thinking: false } : {})', patched)
         self.assertIn('...(surface === "chat" ? { extra: { enable_thinking: false } } : {})', patched)
         self.assertIn('"X-MTPLX-Cache-Mode": "bypass"', patched)
+        self.assertIn('seed: stableTimedSeed(text, maxTokens),', patched)
+        self.assertIn('function stableTimedSeed(text, maxTokens)', patched)
         self.assertEqual(source.count("enable_thinking"), 0)
         self.assertEqual(patched.count("enable_thinking"), 2)
 
