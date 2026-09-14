@@ -4963,3 +4963,38 @@ in-capacity and a growing update.
 Reading trailing digits from an architecture string classified `air64_v27` as generation27 and enabled NAX kernels on a device that could not construct them. The failures also left a pending MLX error that affected later tests. Parse the entire Apple GPU family identifier, preserving desktop17+/phone18+ floors and rejecting unknown prefixes, variants and suffixes.
 
 Guards: positive/negative architecture and dispatch cases, plus real stock-gather output equality with unchanged NAX-kernel build count when hardware support is absent. The M5 positive kernel/parity tests remain enabled; CI does not bypass the checks.
+
+## 3-bit experts fell off the fused MoE decode kernels; the fix is the pack unit (2026-09-13)
+
+The iQ-MLX 3.3 bpw Flash Next pack quantizes 67 of its expert layers at 3-bit gs128, and every
+fused MoE decode kernel (`gatherQmv`, gate+up, down+reduce, both rows variants) declined 3-bit,
+so those layers ran stock `gather_qmm`: 52.6 tok/s vs 55.5 on the 4-8 pack while reading 30%
+fewer expert bytes. First arm: a 32-value unit of three words per lane, one quant group per unit.
+Correct, but K=2560 is 80 units over 32 lanes, so half the lanes sat idle for a third of the loop,
+and the microbench read 83 us per gate+up+down pair against 73 us for 4-bit. Second arm: the pack
+unit is the byte triple mx.quantize really writes (8 values, value i at bit 3i), read through one
+`mlxserve_qpack<BITS>` loader so the body's `>> (i * BITS)` walk is unchanged; 74.8 us, on par
+with 4-bit. The header is shared with the nvfp4 variants (same source) or their kernels fail to
+compile at runtime. Live: 52.1 -> 54.7 tok/s single stream, +4% at two streams. The lesson the
+microbench taught: at <= 4 bits these kernels are ALU-bound (2/3/4-bit all ~72 us, 8-bit at
+bandwidth), so a narrower pack buys nothing unless the lanes stay balanced; the byte floor for
+3-bit is ~46 us and the gap is a per-value ALU count (shift, mask, convert, two FMAs), the same
+gap the 4-8 pack has. Guards: the 3-bit arms of the gatherQmv fp32-truth test, the gate+up and
+down+reduce bit-identity tests, and the rows-vs-solo test.
+
+## The MoE down+reduce kernel was reduction-bound, not byte-bound (2026-09-13)
+
+Splitting the gate+up and down+reduce timings showed the down kernel reading half the bytes of
+gate+up in the same wall time (4-bit: 8 MB in 33 us vs 16 MB in 41 us). Its layout gave every
+output row a whole simdgroup: K is the MoE intermediate (640 on Flash Next), so each lane held two
+or three packs and then paid a 32-lane `simd_sum`, four rows in series per simdgroup, with K/8 = 80
+packs over 32 lanes leaving 16 lanes idle for a third of the loop. Two experiments, both measured
+INTERLEAVED against the old kernel in one process (separate `zig build test` runs drifted 15%
+between identical kernels, enough to fake either verdict): hoisting the four rows' packs in the old
+layout LOST (34.6 vs 32.9 us); eight lanes per row with the packs hoisted per lane and a three-step
+`simd_shuffle_xor` reduce for all four rows at once took 34 -> 24 us at 2/3/4-bit and 43 -> 37 at
+8-bit. Four lanes per row spills the hoisted array (49 us); sixteen equals eight. The rows twin
+carries the same layout so batched decode stays bit-identical to solo. The reduction tree differs
+from the composed chain, so the parity test moved from bit identity to RMS error against the f32
+truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
+balance; hoist per lane, and A/B kernels only interleaved.

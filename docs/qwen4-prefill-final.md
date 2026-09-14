@@ -48,3 +48,7 @@ Related threads: #366 research ledger and #368 PLE follow-up are consolidated he
 ## Final upstream integration
 
 The final PR integrates upstream0814cf3ce2 after the measured snapshot. Conflict resolution preserves upstream per-slot PLE speculative capture, batched deferred gather and its pending-state error check. The experimental packed path declines batched slots. Both upstream batched GDN tests and the prefill-width test are retained. This adaptation has separate build/test status in the final PR comment; no new model throughput is claimed for the integrated head.
+
+## September14 upstream refresh
+
+The PR now incorporates upstream1075630. Native/grouped deferred PLE retains its single grouped ID synchronization; packed PLE shares the evaluated-ID history transition. Wide prefill grouping stays outside the joined-verifier path, whose route packing, indexed input, paired down projection and fused reduction are retained. ReleaseFast7/7 and2512 Zig tests passed/169 skipped onM5. No full-model speed measurement was performed for this integration. Native-MTP PLE-ahead remains a separately documented, unintegrated proposal.
