@@ -13,6 +13,7 @@ The older full llmprobe ladder on core head d23d9df measured1517→1761 at65.8K 
 Build ReleaseFast with the pinned Zig setup and an isolated cache. The measured local MLX was0.32.3 source1f8e74e3f12f31365464a6867c6579f0e9b29d85; inspect the installed library instead of trusting the stale0.32.2 startup label. Use the mixed pack, not the withdrawn pure4-bit checkpoint. Do not mix this branch with a newer main binary and reuse its measurements.
 
 ```sh
+MLX_SERVE_PREFILL_CHUNK=8192 \
 MLX_SERVE_QSA_PAIR=1 \
 MLX_SERVE_HC_PREFILL=1 \
 MLX_SERVE_GDN_PREFILL_FUSED=1 \
@@ -25,6 +26,10 @@ zig-out/bin/mlx-serve serve \
   --prefill-chunk 8192 --ctx-size 131072 --prefix-cache-entries 0 \
   --kv-quant off --no-mtp --no-pld --no-drafter
 ```
+
+The environment pin above is part of the measured configuration. In this revision, `--prefill-chunk 8192` still passes through `boundedPrefillChunk`, which caps non-sliding hd256 MoE at4096 under the default fused-causal mode. `MLX_SERVE_PREFILL_CHUNK=8192` takes precedence before that cap. Both published benchmark drivers already set it; the earlier manual example omitted it. Check `[prefill-trace] chunk_size` and `chunk_widths`, not just the CLI argument.
+
+MTP changes this comparison too: `mtp_active` currently declines PLE-ahead, even with its flag enabled, and committed-history capture/head forwards run during prefill. The2347 HTTP screen explicitly disabled MTP. An MTP-on result requires its own engagement/trace metadata and cannot be called the identical feature combination.
 
 The new paths have narrow geometry guards and may fall back. Confirm `[qsa-pair]`, `[hc-prefill]`, `[gdn-prefill]`, `[ple-packed]`, `[ple-ahead]`, `[moe-prefill-group]` and `[hc-upmix]` engagement in the relevant request. MPP is an additional experiment, enabled separately by `MLX_SERVE_MOE_PREFILL_MPP=1`; it is not needed for the2347 cell and its incremental whole-model gain remains weak.
 
