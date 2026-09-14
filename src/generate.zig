@@ -1119,7 +1119,7 @@ test "every speculative decoder caps accepted drafts before commit" {
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
-    const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, mlx.mlx_stream) anyerror!MtpBatchedGraph;
+    const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
     xfm: *Transformer,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
     /// pointer, ssm_entries slice, vision_embeddings handle, and capture_hidden
@@ -3634,7 +3634,7 @@ pub const Generator = struct {
                 draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
                 n_arrs += 1;
             }
-            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, s);
+            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, .{}, s);
             defer bg.deinit();
 
             // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -5281,6 +5281,16 @@ pub const Generator = struct {
         };
     }
 
+    /// Allocate one request-local categorical draw index while the lazy MTP
+    /// graph is built. The same counter covers draft and correction samples,
+    /// including cross-round pre-drafts, so no two keyed draws reuse a key.
+    fn mtpSamplingDraw(self: *Generator, params: SamplingParams) SamplingParams {
+        var draw = params;
+        draw.draw = self.sampling.draw;
+        self.sampling.draw +%= 1;
+        return draw;
+    }
+
     /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
     /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
     /// round's tail. Owns every handle it holds; `deinit` frees whatever was
@@ -5445,7 +5455,7 @@ pub const Generator = struct {
                 // in the accept ratio is the true proposal density.
                 slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
                 chain.n_qp = i + 1;
-                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], s);
+                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], self.mtpSamplingDraw(draft_sampling), s);
             } else {
                 chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
             }
@@ -5677,7 +5687,7 @@ pub const Generator = struct {
                     if (c.q_probs) |slots| {
                         slots[i] = try probsAtLastPos(outs[k].logits, draft_sampling, xfm.s);
                         c.n_qp = i + 1;
-                        c.draft_arrs[i] = try sampleFromProbsLazy(slots[i], xfm.s);
+                        c.draft_arrs[i] = try sampleFromProbsLazy(slots[i], g.mtpSamplingDraw(draft_sampling), xfm.s);
                     } else {
                         c.draft_arrs[i] = sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
                     }
@@ -5731,9 +5741,10 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         _: f32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
-        return mtpBatchedAcceptGraph(probs_all, draft_arrs, q_probs, m, s);
+        return mtpBatchedAcceptGraph(probs_all, draft_arrs, q_probs, m, sampling, s);
     }
 
     pub fn mtpBatchedAcceptGraph(
@@ -5741,6 +5752,7 @@ pub const Generator = struct {
         draft_arrs: []const mlx.mlx_array,
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         const shape = mlx.getShape(probs_all); // [1, 1+m, V]
@@ -5825,11 +5837,11 @@ pub const Generator = struct {
             var log_stack = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_stack);
             try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
+            const key = seedKey(sampling);
+            defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, null_key, s));
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
             try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
         }
 
@@ -5871,9 +5883,10 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         delta: f32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
-        return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, s);
+        return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, sampling, s);
     }
 
     pub fn mtpBatchedTokenV3Graph(
@@ -5882,9 +5895,10 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         alpha: f32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
-        return mtpBatchedLossyGraph(.tokenv3, probs_all, draft_arrs, q_probs, m, alpha, s);
+        return mtpBatchedLossyGraph(.tokenv3, probs_all, draft_arrs, q_probs, m, alpha, sampling, s);
     }
 
     /// Specialized at compile time; the installed route adds no mode switch
@@ -5896,6 +5910,7 @@ pub const Generator = struct {
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
         param: f32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         const shape = mlx.getShape(probs_all); // [1, 1+m, V]
@@ -6027,11 +6042,11 @@ pub const Generator = struct {
             var log_stack = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_stack);
             try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
+            const key = seedKey(sampling);
+            defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, null_key, s));
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
             try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
         }
 
@@ -6968,6 +6983,7 @@ pub const Generator = struct {
                 if (q_probs) |qs| qs[0..m] else null,
                 m,
                 self.mtp_accept_param,
+                self.mtpSamplingDraw(self.sampling),
                 s,
             );
             corr_batch = bg.corr_samples;
@@ -7078,16 +7094,16 @@ pub const Generator = struct {
                     var log_res = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(log_res);
                     try mlx.check(mlx.mlx_log(&log_res, residual, s));
-                    const null_key = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(null_key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, null_key, s));
+                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
+                    defer _ = mlx.mlx_array_free(key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, key, s));
                 } else {
                     var log_p = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(log_p);
                     try mlx.check(mlx.mlx_log(&log_p, per_pos_probs.?[m], s));
-                    const null_key = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(null_key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, null_key, s));
+                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
+                    defer _ = mlx.mlx_array_free(key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, key, s));
                 }
             }
         }
@@ -10633,15 +10649,15 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
 /// ([1, vocab]): log(probs) puts masked tokens at -inf, categorical draws
 /// within the kept set — the same distribution as sampling the filtered
 /// logits directly, but the caller keeps `probs` as the proposal density q.
-fn sampleFromProbsLazy(probs: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var logp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logp);
     try mlx.check(mlx.mlx_log(&logp, probs, s));
     var sampled = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(sampled);
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, null_key, s));
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, key, s));
     return sampled;
 }
 
@@ -15152,7 +15168,7 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const drafts = [_]mlx.mlx_array{ d0, d1 };
 
     // Greedy proposals (q == null): one-hot residuals.
-    var g = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, null, 2, s);
+    var g = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, null, 2, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.corr_samples));
     const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
@@ -15175,7 +15191,7 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const q1 = mlx.mlx_array_new_data(&q_data1, &q_shape, 2, .float32);
     defer _ = mlx.mlx_array_free(q1);
     const qs = [_]mlx.mlx_array{ q0, q1 };
-    var gs = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, &qs, 2, s);
+    var gs = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, &qs, 2, .{}, s);
     defer gs.deinit();
     try mlx.check(mlx.mlx_array_eval(gs.corr_samples));
     const corr2 = mlx.mlx_array_data_int32(gs.corr_samples) orelse return error.InvalidDtype;
@@ -15186,6 +15202,52 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const aq = mlx.mlx_array_data_float32(gs.accept_q) orelse return error.InvalidDtype;
     try testing.expectApproxEqAbs(@as(f32, 1.0), aq[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), aq[1], 1e-6);
+}
+
+test "seeded MTP draft and correction draws replay despite unrelated MLX random draws" {
+    const s = mlx.gpuStream();
+    const q_data = [_]f32{ 0.5, 0.5, 0.0, 0.0 };
+    const q_shape = [_]c_int{ 1, 4 };
+    const q = mlx.mlx_array_new_data(&q_data, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q);
+    const p_data = [_]f32{ 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const p = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(p);
+    const d_data: i32 = 3;
+    const d_shape = [_]c_int{1};
+    const d = mlx.mlx_array_new_data(&d_data, &d_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(d);
+    const drafts = [_]mlx.mlx_array{d};
+
+    var runs: [2][16][3]i32 = undefined;
+    for (&runs) |*run| {
+        for (run, 0..) |*out, index| {
+            const draft_params = SamplingParams{ .seed = 0xC0FFEE, .draw = @as(u64, @intCast(index)) * 2 };
+            const lazy_draft = try sampleFromProbsLazy(q, draft_params, s);
+            defer _ = mlx.mlx_array_free(lazy_draft);
+            try mlx.check(mlx.mlx_array_eval(lazy_draft));
+            try mlx.check(mlx.mlx_array_item_int32(&out[0], lazy_draft));
+
+            const correction_params = SamplingParams{ .seed = 0xC0FFEE, .draw = draft_params.draw + 1 };
+            var graph = try Generator.mtpBatchedAcceptGraph(p, &drafts, null, 1, correction_params, s);
+            defer graph.deinit();
+            try mlx.check(mlx.mlx_array_eval(graph.corr_samples));
+            const corrected = mlx.mlx_array_data_int32(graph.corr_samples) orelse return error.MlxArrayDataNull;
+            out[1] = corrected[0];
+            out[2] = corrected[1];
+        }
+
+        // A seeded replay must not depend on unrelated requests consuming the
+        // process-global MLX RNG between runs.
+        const unrelated = try sampleFromProbsLazy(q, SamplingParams{}, s);
+        defer _ = mlx.mlx_array_free(unrelated);
+        try mlx.check(mlx.mlx_array_eval(unrelated));
+    }
+    try testing.expectEqualSlices([3]i32, &runs[0], &runs[1]);
+    var all_same = true;
+    for (runs[0][1..]) |draw| all_same = all_same and std.mem.eql(i32, &draw, &runs[0][0]);
+    try testing.expect(!all_same);
 }
 
 test "MTP typical batched graph uses entropy floor and target-row correction" {
@@ -15199,7 +15261,7 @@ test "MTP typical batched graph uses entropy floor and target-row correction" {
     const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(draft);
     const drafts = [_]mlx.mlx_array{draft};
-    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, s);
+    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.accept_p));
     try mlx.check(mlx.mlx_array_eval(g.accept_q));
@@ -15231,7 +15293,7 @@ test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
     defer _ = mlx.mlx_array_free(q);
     const qs = [_]mlx.mlx_array{q};
 
-    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, 0.95, s);
+    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, 0.95, .{}, s);
     defer sampled.deinit();
     try mlx.check(mlx.mlx_array_eval(sampled.accept_p));
     try mlx.check(mlx.mlx_array_eval(sampled.accept_q));
@@ -15247,7 +15309,7 @@ test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
     try testing.expect(corr[0] == 0 or corr[0] == 1);
     try testing.expectEqual(@as(i32, 3), corr[1]);
 
-    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, s);
+    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, .{}, s);
     defer onehot.deinit();
     try mlx.check(mlx.mlx_array_eval(onehot.accept_p));
     const onehot_pi = mlx.mlx_array_data_float32(onehot.accept_p) orelse return error.InvalidDtype;
@@ -15285,7 +15347,7 @@ test "MTP TokenV3 full Qwen3.8 vocabulary graph stays finite at depth three" {
     defer _ = mlx.mlx_array_free(draft);
     const drafts = [_]mlx.mlx_array{ draft, draft, draft };
     const qs = [_]mlx.mlx_array{ q, q, q };
-    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, 0.95, s);
+    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, 0.95, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.accept_p));
     try mlx.check(mlx.mlx_array_eval(g.accept_defer));
