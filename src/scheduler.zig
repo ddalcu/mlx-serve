@@ -2048,6 +2048,12 @@ pub const Scheduler = struct {
         self.registry.release(lm);
     }
 
+    /// `release` for a status read — same refcount protocol, no recency
+    /// stamp. See `ModelRegistry.releaseStatus`.
+    pub fn releaseStatus(self: *Scheduler, lm: *LoadedModel) void {
+        self.registry.releaseStatus(lm);
+    }
+
     /// Duped stored failure name for the id `ensureLoaded` just refused with
     /// `error.LoadFailed` — feeds the "Model load failed: <name>" HTTP
     /// message (#144). Caller frees.

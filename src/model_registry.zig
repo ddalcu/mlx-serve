@@ -1097,6 +1097,22 @@ pub const ModelRegistry = struct {
         self.lru_clock += 1;
         lm.last_used_ns = self.lru_clock;
         lm.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
+        self.releaseRefLocked(lm);
+    }
+
+    /// Release a borrow taken for a STATUS read, leaving both recency stamps
+    /// alone. A poll is not use: the app's tray polls `/props` every 3s, so
+    /// stamping here pins every resident model against `--idle-evict-secs`
+    /// forever and the sweep never fires. The refcount protocol is unchanged,
+    /// so the pointer is still protected for as long as the caller holds it.
+    pub fn releaseStatus(self: *ModelRegistry, lm: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.releaseRefLocked(lm);
+    }
+
+    /// Shared tail of `release` and `releaseStatus`. Caller holds `mutex`.
+    fn releaseRefLocked(self: *ModelRegistry, lm: *LoadedModel) void {
         const prev = lm.refcount.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         // Broadcast so an evictor waiting for refcount == 0 wakes.
@@ -1593,6 +1609,41 @@ test "ModelRegistry: pickIdleEvictable never picks an entry with a live request"
         try testing.expect(after > stale);
         try testing.expect(reg.pickIdleEvictable(stale + 900_000, 900_000) == null);
         try testing.expect(reg.pickIdleEvictable(after + 900_000, 900_000).? == a);
+    }
+}
+
+test "ModelRegistry: releaseStatus leaves the idle clock alone" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, 900);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 1024);
+
+    // Backdate past the window so the entry is due, then borrow it the way a
+    // status poll does. Absolute, not read off the stamp under test: a
+    // baseline taken from `last_used_ms` makes every assertion below vacuous.
+    const stale: i64 = 1_000;
+    const now: i64 = stale + 1_000_000;
+    a.last_used_ms.store(stale, .release);
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+
+    reg.releaseStatus(a);
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        // The refcount still came back, so the entry is releasable...
+        try testing.expectEqual(@as(u32, 0), a.refcount.load(.acquire));
+        // ...and the poll did not count as use, so it is still due.
+        try testing.expectEqual(stale, a.last_used_ms.load(.acquire));
+        try testing.expect(reg.pickIdleEvictable(now, 900_000).? == a);
+    }
+
+    // The contrast that makes the above mean something: a real release DOES
+    // restamp, and that is what pins the entry.
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    reg.release(a);
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        try testing.expect(a.last_used_ms.load(.acquire) > stale);
     }
 }
 

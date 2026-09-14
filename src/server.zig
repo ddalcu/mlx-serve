@@ -2351,7 +2351,9 @@ fn handleConnection(
             return;
         },
     };
-    defer scheduler.release(lm);
+    // A status read must not look like use — see `isStatusRoute`.
+    const status_read = isStatusRoute(method, path);
+    defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
 
     // A model loaded on demand freezes its own auto-context here, for the same
     // reason the `--model` primary does at startup: the number we advertise is
@@ -6044,6 +6046,17 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_text_lm = lm.state != .ready or lm.transformer != null or
             lm.ds4_engine != null or lm.llama_engine != null,
     };
+}
+
+/// True for the read-only routes that report on a model without using it.
+/// They share `handleConnection`'s `ensureLoaded`/release pair with the
+/// generation routes, so without this they stamp `last_used_ms` and a polling
+/// client holds every model resident against `--idle-evict-secs`.
+fn isStatusRoute(method: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, method, "GET")) {
+        return std.mem.eql(u8, path, "/props") or std.mem.eql(u8, path, "/api/tags");
+    }
+    return std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/show");
 }
 
 /// True for the routes textGenRejectReason protects — used for the
@@ -20976,6 +20989,22 @@ test "isTextGenRoute covers exactly the guarded surfaces" {
     try std.testing.expect(!isTextGenRoute("POST", "/v1/embeddings"));
     try std.testing.expect(!isTextGenRoute("POST", "/api/embed"));
     try std.testing.expect(!isTextGenRoute("GET", "/v1/models"));
+}
+
+test "isStatusRoute: reporting routes are not use" {
+    // These three share handleConnection's ensureLoaded/release pair with the
+    // generation routes; a poll on any of them must not restamp the idle clock.
+    try std.testing.expect(isStatusRoute("GET", "/props"));
+    try std.testing.expect(isStatusRoute("GET", "/api/tags"));
+    try std.testing.expect(isStatusRoute("POST", "/api/show"));
+    // Generation is use.
+    try std.testing.expect(!isStatusRoute("POST", "/v1/chat/completions"));
+    try std.testing.expect(!isStatusRoute("POST", "/v1/completions"));
+    // An explicit load is use — it is the whole point of the request.
+    try std.testing.expect(!isStatusRoute("POST", "/v1/load-model"));
+    // Method matters: the paths alone are not the predicate.
+    try std.testing.expect(!isStatusRoute("POST", "/props"));
+    try std.testing.expect(!isStatusRoute("GET", "/api/show"));
 }
 
 test "embedEffectiveLimit: tighter of flag and model window; zeros mean unbounded" {

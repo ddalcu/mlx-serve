@@ -34,6 +34,7 @@
 - An MLX error while writing the KV cache now fails only that request instead of crashing the server later. (#405, thanks @josk0)
 - The app can reach a server bound to a specific LAN address; it always talked to 127.0.0.1. (#389, thanks @t2tx)
 - Reloading a model no longer leaks the tokenizer, config and chat template it replaces, and a `/props` status poll no longer loads a model just to answer.
+- A status poll no longer holds a model resident. `/props`, `/api/tags` and `/api/show` release through the same path as a chat request, so every poll reset the `--idle-evict-secs` clock and a client polling faster than the window (the app's tray polls every 3s) kept the sweep from ever firing.
 - Tool arguments whose array or object items repeat a key with the same value are coerced to the declared type again instead of reaching the client as a string. (#402)
 - Schema-constrained answers can no longer stall on whitespace and end as an empty `length` reply; the JSON grammar caps free whitespace.
 - OpenCode 2 launches again: it was started with a `--model` flag its CLI does not have, and its background model service never saw our config.
