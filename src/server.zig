@@ -17532,7 +17532,7 @@ fn handleResponsesInner(
     // ── store response ──
     if (should_store) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
+        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -18535,8 +18535,8 @@ fn emitResponsesMessageEvents(
 }
 
 /// Persist a finished response to the in-memory store. The stored history is
-/// the input messages plus the assistant turn, deep-copied into the entry's
-/// arena so it stays valid across the request that produced it.
+/// the input messages plus a non-loop-cut assistant turn, deep-copied into
+/// the entry's arena so it stays valid across requests.
 fn storeResponse(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -18548,6 +18548,7 @@ fn storeResponse(
     visible_text: []const u8,
     reasoning_text: ?[]const u8,
     tool_calls: ?[]const chat_mod.ToolCall,
+    finish_details: ?[]const u8,
 ) !void {
     const sr = try gpa.create(responses_mod.StoredResponse);
     errdefer gpa.destroy(sr);
@@ -18555,32 +18556,11 @@ fn storeResponse(
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // Build the assistant message that produced this response.
-    var assistant_text_parts = std.ArrayList(u8).empty;
-    defer assistant_text_parts.deinit(a);
-    if (reasoning_text) |rt| {
-        try assistant_text_parts.appendSlice(a, "<think>");
-        try assistant_text_parts.appendSlice(a, rt);
-        try assistant_text_parts.appendSlice(a, "</think>");
-    }
-    try assistant_text_parts.appendSlice(a, visible_text);
-    const assistant_content = try a.dupe(u8, assistant_text_parts.items);
-
-    var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
-    if (tool_calls) |tcs| if (tcs.len > 0) {
-        const arr = try a.alloc(chat_mod.ToolCall, tcs.len);
-        for (tcs, 0..) |tc, i| {
-            arr[i] = .{
-                .id = try a.dupe(u8, tc.id),
-                .name = try a.dupe(u8, tc.name),
-                .arguments = try a.dupe(u8, tc.arguments),
-            };
-        }
-        assistant_tool_calls = arr;
-    };
+    // Keep the response retrievable, but never replay a loop-cut assistant turn.
+    const keep_assistant = shouldParseToolCalls(finish_details);
 
     // Deep-copy input messages.
-    const total_msgs = input_messages.len + 1; // +1 for assistant turn
+    const total_msgs = input_messages.len + @intFromBool(keep_assistant);
     const history = try a.alloc(chat_mod.Message, total_msgs);
     for (input_messages, 0..) |m, i| {
         history[i] = .{
@@ -18600,11 +18580,37 @@ fn storeResponse(
             .images = null,
         };
     }
-    history[total_msgs - 1] = .{
-        .role = try a.dupe(u8, "assistant"),
-        .content = assistant_content,
-        .tool_calls = assistant_tool_calls,
-    };
+    if (keep_assistant) {
+        // Build the assistant message that produced this response.
+        var assistant_text_parts = std.ArrayList(u8).empty;
+        defer assistant_text_parts.deinit(a);
+        if (reasoning_text) |rt| {
+            try assistant_text_parts.appendSlice(a, "<think>");
+            try assistant_text_parts.appendSlice(a, rt);
+            try assistant_text_parts.appendSlice(a, "</think>");
+        }
+        try assistant_text_parts.appendSlice(a, visible_text);
+        const assistant_content = try a.dupe(u8, assistant_text_parts.items);
+
+        var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
+        if (tool_calls) |tcs| if (tcs.len > 0) {
+            const arr = try a.alloc(chat_mod.ToolCall, tcs.len);
+            for (tcs, 0..) |tc, i| {
+                arr[i] = .{
+                    .id = try a.dupe(u8, tc.id),
+                    .name = try a.dupe(u8, tc.name),
+                    .arguments = try a.dupe(u8, tc.arguments),
+                };
+            }
+            assistant_tool_calls = arr;
+        };
+
+        history[total_msgs - 1] = .{
+            .role = try a.dupe(u8, "assistant"),
+            .content = assistant_content,
+            .tool_calls = assistant_tool_calls,
+        };
+    }
 
     sr.* = .{
         .id = try a.dupe(u8, resp_id),
@@ -19552,12 +19558,33 @@ test "shouldInjectResponsesJsonInstruction skips required tool turns" {
     try testing.expect(!shouldInjectResponsesJsonInstruction(true, true, "required"));
 }
 
+test "Responses history omits loop cuts while retaining the response and input" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call_1", .name = "writeFile", .arguments = "{}" }};
+    try storeResponse(testing.io, testing.allocator, "loop", "model", "completed", "{\"status\":\"completed\"}", &messages, "loop fragment", "repeated thought", &calls, "repetition_loop");
+    const stored = global_response_store.?.map.get("loop").?;
+    try testing.expectEqualStrings("completed", stored.status);
+    try testing.expectEqualStrings("{\"status\":\"completed\"}", stored.body_json);
+    try testing.expectEqual(@as(usize, 1), stored.history.len);
+    try testing.expectEqualStrings("user", stored.history[0].role);
+    try testing.expectEqualStrings("hi", stored.history[0].content);
+
+    // A continuation keeps earlier input and its healthy assistant output.
+    try storeResponse(testing.io, testing.allocator, "next", "model", "completed", "{}", stored.history, "answer", null, null, null);
+    const next = global_response_store.?.map.get("next").?;
+    try testing.expectEqual(@as(usize, 2), next.history.len);
+    try testing.expectEqualStrings("hi", next.history[0].content);
+    try testing.expectEqualStrings("answer", next.history[1].content);
+}
+
 test "deinitGlobalResponseStore frees stored responses" {
     deinitGlobalResponseStore();
     defer deinitGlobalResponseStore();
 
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
+    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null, null);
 
     if (global_response_store) |*store| {
         try testing.expectEqual(@as(usize, 1), store.map.count());

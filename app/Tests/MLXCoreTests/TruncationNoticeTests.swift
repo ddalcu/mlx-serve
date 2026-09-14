@@ -97,6 +97,48 @@ final class TruncationNoticeTests: XCTestCase {
         }
     }
 
+    func testLoopCutsSuppressAllStreamToolRecoveryPaths() async throws {
+        for reason in ["stop", "length", "tool_calls"] {
+            for structured in [false, true] {
+                let delta: [String: Any] = structured
+                    ? ["tool_calls": [["index": 0, "id": "call_1", "function": ["name": "writeFile", "arguments": "{\"path\":\"unsafe\"}"]]]]
+                    : ["content": "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"unsafe\"}}</tool_call>"]
+                let events = try await streamEvents(delta: delta, reason: reason, loopCut: true)
+                XCTAssertTrue(events.contains { if case .truncated(.repetitionLoop) = $0 { return true }; return false })
+                XCTAssertFalse(events.contains { if case .toolCalls = $0 { return true }; return false })
+            }
+        }
+    }
+
+    func testOrdinaryStreamToolRecoveryStillWorks() async throws {
+        let structured: [String: Any] = ["tool_calls": [["index": 0, "id": "call_1", "function": ["name": "writeFile", "arguments": "{\"path\":\"safe\"}"]]]]
+        let content: [String: Any] = ["content": "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"safe\"}}</tool_call>"]
+        for (delta, reason) in [(structured, "tool_calls"), (structured, "length"), (structured, "stop"), (content, "stop")] {
+            let events = try await streamEvents(delta: delta, reason: reason, loopCut: false)
+            XCTAssertTrue(events.contains { if case .toolCalls = $0 { return true }; return false })
+        }
+    }
+
+    private func streamEvents(delta: [String: Any], reason: String, loopCut: Bool) async throws -> [SSEEvent] {
+        var finish: [String: Any] = ["finish_reason": reason]
+        if loopCut { finish["finish_details"] = ["type": "repetition_loop"] }
+        let chunks: [[String: Any]] = [
+            ["choices": [["delta": delta]]],
+            ["choices": [finish]],
+        ]
+        let lines = try chunks.map { "data: " + String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+        let input = AsyncStream<String> { continuation in
+            for line in lines { continuation.yield(line) }
+            continuation.yield("data: [DONE]")
+            continuation.finish()
+        }
+        let output = AsyncThrowingStream<SSEEvent, Error>.makeStream()
+        try await APIClient.consumeChatLines(input, continuation: output.continuation)
+        var events: [SSEEvent] = []
+        for try await event in output.stream { events.append(event) }
+        return events
+    }
+
     // MARK: - The notice is DATA, never content (2026-08-11)
 
     // Regression context: the banner was appended INTO `message.content`

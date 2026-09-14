@@ -800,7 +800,7 @@ pub const GenerationResult = struct {
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
-    /// ("length", which never moves — see `scheduler.loopStopReason`).
+    /// ("stop" for loop cuts — see `scheduler.loopStopReason`).
     /// Static string; nothing to free.
     finish_details: ?[]const u8 = null,
     /// Absolute byte offset into `text` where the constrained JSON payload

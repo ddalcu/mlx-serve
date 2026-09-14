@@ -667,17 +667,26 @@ class APIClient {
             return
         }
 
+        try await Self.consumeChatLines(bytes.lines, streamStart: streamStart, continuation: continuation)
+    }
+
+    static func consumeChatLines<Lines: AsyncSequence>(
+        _ lines: Lines,
+        streamStart: Date = Date(),
+        continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
+    ) async throws where Lines.Element == String {
         var firstTokenTime: Date?
         // Accumulate tool call deltas across chunks, keyed by index
         var pendingToolCalls: [String: (id: String, name: String, args: String)] = [:]
         var hasToolCalls = false
         var emittedToolCalls = false
+        var loopCut = false
         // Accumulated assistant content — used as last-resort source for tool-call
         // recovery when the server streams <tool_call> blocks as plain content
         // (e.g. some Qwen MoE outputs an older binary failed to parse).
         var contentAccumulator = ""
 
-        for try await line in bytes.lines {
+        for try await line in lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
             if payload == "[DONE]" {
@@ -725,10 +734,14 @@ class APIClient {
                 )))
             }
 
-            guard let choices = chunk["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any] else {
-                continue
+            guard let choices = chunk["choices"] as? [[String: Any]] else { continue }
+            // Explicit loop details identify an intentional cut even with
+            // finish_reason "stop"; bare "length" identifies a max_tokens cap.
+            if let cause = Self.truncationCause(fromChoice: choices.first) {
+                loopCut = loopCut || TruncationNotice.endsTurn(cause: cause)
+                continuation.yield(.truncated(cause))
             }
+            let delta = choices.first?["delta"] as? [String: Any] ?? [:]
             if firstTokenTime == nil {
                 firstTokenTime = Date()
             }
@@ -772,18 +785,13 @@ class APIClient {
                 }
             }
 
-            // Explicit loop details identify an intentional cut even with
-            // finish_reason "stop"; bare "length" identifies a max_tokens cap.
-            if let cause = Self.truncationCause(fromChoice: choices.first) {
-                continuation.yield(.truncated(cause))
-            }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
             // server stall-timeout cut it mid-args). Deliver the salvaged calls so
             // the agent loop's truncation branch (maxTokensHit && !calls.isEmpty)
             // fires the chunk-and-retry nudge — before this, the server hid the
             // cut behind finish_reason "tool_calls" and the model got blamed for
             // "omitting" content it actually generated.
-            if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
+            if !loopCut, let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     Self.appendToolLog("EMIT: name=\(tc.name) rawArgs=\(tc.args.prefix(500))")
@@ -799,7 +807,7 @@ class APIClient {
         }
 
         // Fallback: emit tool calls if stream ended without finish_reason
-        if hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
+        if !loopCut && hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
             Self.appendToolLog("FALLBACK_EMIT: no finish_reason, pending=\(pendingToolCalls.count)")
             var calls: [ToolCall] = []
             for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
@@ -817,7 +825,7 @@ class APIClient {
         // Last-resort: server emitted no tool_calls deltas at all but the
         // assistant content contains <tool_call>...</tool_call> blocks (older
         // server binary / unrecognized format). Recover them from content.
-        if !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
+        if !loopCut && !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
             let recovered = Self.extractToolCallsFromContent(contentAccumulator)
             if !recovered.isEmpty {
                 Self.appendToolLog("CONTENT_SCAN_RECOVER: count=\(recovered.count)")

@@ -874,8 +874,8 @@ const corpus = [_]Expect{
     // The salvage must recover the tool NAME and DROP the fragment value — the
     // Hermes-truncation rule ("a half-written file is worse than a re-issued
     // write") now applied to the Gemma arm too. The cut itself reports
-    // finish_reason "length" (server truncation; scheduler.loopStopReason), so
-    // client truncation recovery fires instead of validating a fragment.
+    // finish_reason "stop" with repetition_loop details; HTTP handlers suppress
+    // tool parsing for that cause instead of exposing the salvaged fragment.
     .{
         // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html):
         // the model looped "server-side scripting language, " (a ~6-token

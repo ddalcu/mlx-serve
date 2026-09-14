@@ -520,6 +520,12 @@ Two fixes, and the split between them is forced by the transport:
   keeps convicting — a restatement loop that ran 3000 tokens is degenerate for
   all 3000, and trimming only the window hands the rest back.
 
+For Responses, the returned envelope and response ID remain retrievable, but
+`previous_response_id` history excludes the loop-cut assistant turn, including
+its reasoning and tool calls. Streaming and non-streaming share this storage
+policy; completion status stays unchanged. Guard: `Responses history omits loop
+cuts while retaining the response and input` in server.zig.
+
 Why streaming keeps the tail: a delta cannot be retracted. It is worth being
 precise about why the tokens are already gone, because "with tools present the
 server buffers" is true only of tool MARKUP — `streamShouldBufferForTools`
