@@ -73,6 +73,14 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertFalse(ChatTurn.isBoundary(thinking("hm")))
     }
 
+    /// A generated picture is the model's answer for that round, delivered by
+    /// a file: an empty `content` that still ends something.
+    func testARowCarryingMediaIsABoundary() {
+        var m = ChatMessage(role: .assistant, content: "")
+        m.media = [ChatMediaRef(kind: .image, path: "/tmp/a.png", prompt: "a cat")]
+        XCTAssertTrue(ChatTurn.isBoundary(m))
+    }
+
     // MARK: - What the trash under a footer removes
 
     /// The reply's footer deletes the model's whole turn: the thinking, the

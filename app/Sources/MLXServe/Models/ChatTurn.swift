@@ -22,9 +22,10 @@ enum ChatTurn {
             return false
         case .assistant:
             if let calls = message.toolCalls, !calls.isEmpty { return false }
-            // A round that only thought, or only carried media, is part of a
-            // turn, not the end of one.
-            return !message.content.isEmpty && !message.isAgentSummary
+            // A round that only thought is part of a turn, not the end of one;
+            // a generated picture is that round's answer, delivered by a file.
+            let saidSomething = !message.content.isEmpty || !(message.media ?? []).isEmpty
+            return saidSomething && !message.isAgentSummary
                 && !message.failedRetry && message.errorNotice == nil
         }
     }
