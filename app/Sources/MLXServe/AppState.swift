@@ -1132,6 +1132,22 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
+    /// Drop the model's turn that ends at `messageId`: that message and
+    /// everything above it back to the nearest boundary (`ChatTurn`), so a
+    /// tool call never outlives its results and the reader's question stays.
+    func deleteTurn(in sessionId: UUID, endingAt messageId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let range = ChatTurn.deletionRange(endingAt: messageId, in: chatSessions[sIdx].messages)
+        else { return }
+        let dropped = Array(chatSessions[sIdx].messages[range])
+        chatSessions[sIdx].messages.removeSubrange(range)
+        for path in AttachmentStore.removablePaths(orphanedBy: dropped, in: chatSessions) {
+            AttachmentStore.remove(path)
+        }
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
     /// Drops every message from `count` onward, keeping only the first `count`.
     /// Used by regenerate (drop the old user turn + reply so `runTurn` can
     /// re-append a fresh copy) and by edit-and-resend (drop everything from

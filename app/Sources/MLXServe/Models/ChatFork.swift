@@ -15,7 +15,7 @@ enum ChatFork {
     static func prefix(_ messages: [ChatMessage], through messageId: UUID) -> [ChatMessage] {
         guard let cut = messages.firstIndex(where: { $0.id == messageId }) else { return [] }
         var out = Array(messages[...cut])
-        while let last = out.last, !isBoundary(last) { out.removeLast() }
+        while let last = out.last, !ChatTurn.isBoundary(last) { out.removeLast() }
         return out
     }
 
@@ -60,26 +60,5 @@ enum ChatFork {
         fork.agentId = source.agentId
         fork.disabledTools = source.disabledTools
         return fork
-    }
-
-    /// Whether the transcript can end here.
-    ///
-    /// A tool call's results arrive AFTER it, so cutting on the caller — or on
-    /// one of the results, with more still to come — hands the model a call
-    /// with no answer, which is the shape it apologises for or re-issues. Our
-    /// own error cards and tool-call summaries are machinery rather than
-    /// something the model said, so they are no better a place to resume from.
-    private static func isBoundary(_ message: ChatMessage) -> Bool {
-        switch message.role {
-        case .user:
-            return true
-        case .system:
-            // Hidden tool results are `.system` carrying a `toolCallId`; a
-            // system message is not a turn to resume after either way.
-            return false
-        case .assistant:
-            if let calls = message.toolCalls, !calls.isEmpty { return false }
-            return !message.isAgentSummary && !message.failedRetry && message.errorNotice == nil
-        }
     }
 }
