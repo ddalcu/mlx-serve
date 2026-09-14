@@ -3,6 +3,7 @@ import os,json,time,subprocess,hashlib,urllib.request,re,socket,argparse,datetim
 from pathlib import Path
 parser=argparse.ArgumentParser()
 parser.add_argument('--binary',type=Path,default=Path('zig-out/bin/mlx-serve'))
+parser.add_argument('--corpus-file',type=Path,help='frozen UTF-8 source corpus; otherwise use the current transformer source slice')
 parser.add_argument('--trace',action='store_true',help='diagnostic Metal System Trace; rates then include tracing overhead')
 parser.add_argument('--sequence',help='hexadecimal masks: 1=group, 2=PLE ahead, 4=HC upmix, 8=MoE MPP; 0=current, 7=previous combination, f=all')
 parser.add_argument('--monitor',type=Path,help='optional local macmon executable; read-only 1-second telemetry')
@@ -25,11 +26,20 @@ def listening():
   sock.settimeout(.2)
   return sock.connect_ex(('127.0.0.1',PORT))==0
 TAG=os.environ.get('PLE_BENCH_TAG','combined-cadence')
-corpus='\n'.join((P/'src/transformer.zig').read_text().splitlines()[100:900])
+corpus=args.corpus_file.read_text() if args.corpus_file else '\n'.join((P/'src/transformer.zig').read_text().splitlines()[100:900])
 records=[]
 diagnostic=args.trace or os.environ.get('PREFILL_CAPTURE_ROUTES')=='1' or os.environ.get('PREFILL_MOE_LIVE_AB')=='1' or os.environ.get('PREFILL_HC_UPMIX_VERIFY')=='1'
 if args.sequence and diagnostic:parser.error('sequence must not add route capture or layer replay synchronization')
 meta={'kind':('diagnostic; synchronization/trace overhead included' if diagnostic else 'HTTP matched screening; not llmprobe'),'binary_sha256':hashlib.sha256(BIN.read_bytes()).hexdigest(),'power':subprocess.check_output(['pmset','-g','batt'],text=True),'corpus_sha256':hashlib.sha256(corpus.encode()).hexdigest(),'records':records}
+meta['library_sha256']={name:hashlib.sha256(path.read_bytes()).hexdigest() for name in ('libmlx.dylib','libmlxc.dylib','mlx.metallib') if (path:=P/'lib/mlx/lib'/name).is_file()}
+model_root=Path.home()/'.mlx-serve/models'/MODEL
+meta['model_metadata_sha256']={name:hashlib.sha256(path.read_bytes()).hexdigest() for name in ('config.json','tokenizer.json','tokenizer_config.json','model.safetensors.index.json') if (path:=model_root/name).is_file()}
+power_modes={};power_section=None
+for line in subprocess.check_output(['pmset','-g','custom'],text=True).splitlines():
+ if line.strip().endswith('Power:'):power_section=line.strip().rstrip(':')
+ parts=line.split()
+ if power_section and len(parts)==2 and parts[0] in ('powermode','lowpowermode','highpowermode'):power_modes.setdefault(power_section,{})[parts[0]]=parts[1]
+meta['power_modes_raw']=power_modes
 meta['sequence']=args.sequence
 meta['cooldown']={'gpu_c':args.cooldown_c,'fan_max_rpm':args.cooldown_fan_max,'timeout_s':args.cooldown_timeout}
 if args.monitor:meta['monitor_sha256']=hashlib.sha256(args.monitor.resolve().read_bytes()).hexdigest()

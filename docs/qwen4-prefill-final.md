@@ -10,7 +10,7 @@ The older full llmprobe ladder on core head d23d9df measured1517→1761 at65.8K 
 
 ## Run the candidate
 
-Build ReleaseFast with the pinned Zig setup and an isolated cache. The measured local MLX was0.32.3 source1f8e74e3f12f31365464a6867c6579f0e9b29d85; inspect the installed library instead of trusting the stale0.32.2 startup label. Use the mixed pack, not the withdrawn pure4-bit checkpoint. Do not mix this branch with a newer main binary and reuse its measurements.
+Build ReleaseFast with the pinned Zig setup and an isolated cache. Correction (September14): the measured library is MLX0.32.2, source1f8e74e3f12f31365464a6867c6579f0e9b29d85. The earlier0.32.3 label was incorrect. Its exported `mlx::core::version()` returns0.32.2 and its SHA256 matches the archived library: `c63811e0fe9afb5463f60137b6db913da0de73634cc736c8e06771a62b1db477`. Use the mixed pack, not the withdrawn pure4-bit checkpoint. Do not mix this branch with a newer main binary and reuse its measurements.
 
 ```sh
 MLX_SERVE_PREFILL_CHUNK=8192 \
