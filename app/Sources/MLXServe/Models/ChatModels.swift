@@ -250,15 +250,34 @@ struct ChatMediaRef: Codable, Equatable, Identifiable {
 /// An audio clip attached to a message. `pcm` holds raw little-endian float32
 /// mono samples at 16 kHz — the format the Gemma 4 12B unified audio embedder
 /// frames into 640-sample tokens. Decoded client-side by `AudioPreprocessor`.
+///
+/// The samples are NOT persisted: like `ChatImage`, the history carries `id`,
+/// `name` and `path`, and a decode reads the clip back from its WAV file
+/// (`AudioClipFile`). A history from before, or a file since gone, decodes
+/// with empty `pcm` rather than throwing, for the same reason as the image.
 struct ChatAudio: Identifiable, Codable, Equatable {
     let id: UUID
     let name: String   // original filename, for the attachment chip
-    let pcm: Data       // float32-LE 16 kHz mono samples
+    /// The WAV under `~/.mlx-serve/attachments/`, when there is one.
+    var path: String?
+    var pcm: Data       // float32-LE 16 kHz mono samples; empty when the file is gone
 
-    init(name: String, pcm: Data) {
+    enum CodingKeys: String, CodingKey { case id, name, path }
+
+    init(name: String, pcm: Data, path: String? = nil) {
         self.id = UUID()
         self.name = name
         self.pcm = pcm
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        pcm = path.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { AudioClipFile.decode(wav: $0) } ?? Data()
     }
 
     /// Number of decoded samples (4 bytes each) and the clip's duration.

@@ -3289,9 +3289,10 @@ struct ChatDetailView: View {
     }
 
     /// Convert pending audio clips to a ChatAudio array, clearing the list.
+    /// Written on SEND like the pictures (`AudioClipFile.stored`).
     private func consumePendingAudio() -> [ChatAudio]? {
         guard !pendingAudio.isEmpty else { return nil }
-        let clips = pendingAudio
+        let clips = pendingAudio.map { AudioClipFile.stored($0) }
         pendingAudio = []
         return clips
     }
@@ -3319,8 +3320,9 @@ struct ChatDetailView: View {
     private func toggleRecording() {
         if recorder.isRecording {
             if let pcm = recorder.stop(), pcm.count >= 4 {
-                let secs = Double(pcm.count / 4) / AudioRecorder.targetSampleRate
-                pendingAudio.append(ChatAudio(name: String(format: "Recording · %.0fs", secs.rounded()), pcm: pcm))
+                // The chips print the duration themselves; a name carrying it too read
+                // "Recording · 4s · 3.8s" and would land in the filename.
+                pendingAudio.append(ChatAudio(name: "Recording", pcm: pcm))
             }
             return
         }
@@ -4205,15 +4207,27 @@ struct MessageBubble: View {
                     }
                 }
 
-                // Attached audio clips
+                // Attached audio clips. A clip whose file is gone says so, the
+                // way a picture does: it was not sent, and a silent chip would
+                // claim otherwise.
                 if let clips = message.audio, !clips.isEmpty {
                     ForEach(clips) { clip in
-                        Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.purple.opacity(0.18))
-                            .clipShape(Capsule())
+                        if clip.pcm.isEmpty {
+                            Label("\(clip.name) · file no longer on disk", systemImage: "questionmark.folder")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(.quaternary.opacity(0.4))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else {
+                            Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.purple.opacity(0.18))
+                                .clipShape(Capsule())
+                        }
                     }
                 }
 
