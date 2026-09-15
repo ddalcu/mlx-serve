@@ -23,6 +23,25 @@ pub fn parse(typical_raw: ?[]const u8, tokenv3_raw: ?[]const u8) !Mode {
     return .exact;
 }
 
+pub const DEFAULT_TYPICAL_DELTA: f32 = 0.2;
+pub const DEFAULT_TOKENV3_ALPHA: f32 = 0.95;
+
+/// The per-model settings vocabulary: a mode by name at its default threshold.
+pub fn fromName(s: []const u8) ?Mode {
+    if (std.mem.eql(u8, s, "exact")) return .exact;
+    if (std.mem.eql(u8, s, "typical")) return .{ .typical = .{ .delta = DEFAULT_TYPICAL_DELTA } };
+    if (std.mem.eql(u8, s, "tokenv3")) return .{ .tokenv3 = DEFAULT_TOKENV3_ALPHA };
+    return null;
+}
+
+pub fn name(mode: Mode) []const u8 {
+    return switch (mode) {
+        .exact => "exact",
+        .typical => "typical",
+        .tokenv3 => "tokenv3",
+    };
+}
+
 /// CPU oracle for the batched GPU entropy graph. `p` is sampler-filtered and
 /// normalized; zero-mass entries make no contribution to Shannon entropy.
 pub fn typicalThreshold(p: []const f64, delta: f64, eps: f64) f64 {

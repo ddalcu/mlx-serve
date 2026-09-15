@@ -5,6 +5,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
+const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -439,6 +440,8 @@ pub const ModelConfig = struct {
     ctx_override: u32 = 0,
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
     mtp_override: ?bool = null,
+    /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
+    mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the

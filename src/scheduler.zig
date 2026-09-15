@@ -2518,6 +2518,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
+    config.mtp_acceptance_override = o.mtp_acceptance;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -6269,7 +6270,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
-            .mtp_acceptance = generate_mod.mtp_acceptance_default,
+            .mtp_acceptance = slot.model.config.?.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,

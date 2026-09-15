@@ -34,7 +34,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
 | `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (`src/html/` as `{s}` args, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
-| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `ctx_size`, `kv_quant`, `mtp`; read at every load construction site, stamped on `ModelConfig.{ctx,kv_quant,mtp}_override` |
+| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `ctx_size`, `kv_quant`, `mtp`, `mtp_acceptance` (`exact|typical|tokenv3` at the default thresholds); read at every load construction site, stamped on `ModelConfig.{ctx,kv_quant,mtp,mtp_acceptance}_override` |
 | `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
 | `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
