@@ -133,6 +133,17 @@ final class MarkdownListTests: XCTestCase {
         XCTAssertGreaterThan(headIndent("three", in: source), headIndent("two", in: source))
     }
 
+    /// A directory tree written as a list is deeper than the column is wide:
+    /// unbounded, twelve levels is 198pt of indent before the text starts, and
+    /// the items end up in a sliver at the right edge.
+    func testAnOutlineDeeperThanTheColumnStopsIndenting() {
+        let source = (0..<9).map { String(repeating: " ", count: $0 * 2) + "- item\($0)" }
+            .joined(separator: "\n")
+        let capped = headIndent("item5", in: source)
+        XCTAssertEqual(headIndent("item8", in: source), capped, "past the cap the indent holds")
+        XCTAssertGreaterThan(capped, headIndent("item4", in: source), "levels below it still step")
+    }
+
     /// A line under an item, indented to its text, is part of that item: it
     /// used to end the list and start a paragraph back at the margin.
     func testAnIndentedLineContinuesTheItemAboveIt() {

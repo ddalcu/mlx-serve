@@ -5427,6 +5427,12 @@ struct MarkdownText: View {
     /// spaces: models write two or four for the same one level, and a list
     /// that starts indented is still at its own top.
     fileprivate struct ListDepth {
+        /// Past this an outline is deeper than the column can show, so further
+        /// levels share an indent rather than walking off the right edge. The
+        /// stack still tracks the real structure, so coming back out lands
+        /// where it should.
+        static let maxLevel = 5
+
         private var stops: [Int] = []
 
         mutating func level(forIndent indent: Int) -> Int {
@@ -5436,7 +5442,7 @@ struct MarkdownText: View {
             } else {
                 stops.append(indent)
             }
-            return stops.count - 1
+            return min(stops.count - 1, Self.maxLevel)
         }
 
         mutating func reset() { stops.removeAll() }
