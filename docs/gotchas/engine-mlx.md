@@ -5009,3 +5009,14 @@ carries the same layout so batched decode stays bit-identical to solo. The reduc
 from the composed chain, so the parity test moved from bit identity to RMS error against the f32
 truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
 balance; hoist per lane, and A/B kernels only interleaved.
+
+## Prefill fusion must preserve the compiled BF16 chain
+
+An eager reference can hide rounding changes introduced by MLX compilation.
+HC prefill keeps the native inject matmul, rounds the mean reciprocal to BF16
+before multiplying (including HC=3/5/6/7), and derives HC/hidden dimensions from
+the config and weights. HC and GDN share an MLX-generated BF16 sigmoid table.
+The width bound includes the chunker's coalesced tail. Unsupported shapes use
+the composed path; `MLX_SERVE_HC_PREFILL=0` and `MLX_SERVE_GDN_PREFILL_FUSED=0`
+restore it. Guards compare HC against compiled write/mix and GDN against
+`computeGdnGate`, covering cold history, batch 2, tail widths and decline gates.
