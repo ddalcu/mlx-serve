@@ -5363,22 +5363,83 @@ struct MarkdownText: View {
         case paragraph(String)
         case heading(Int, String)              // level, text
         case code(String, String)              // language, content
-        case listItem(String, String)          // marker (`•`, `1.`, `2)`), text
+        case listItem(String, String, Int)     // marker (`•`, `1.`, `☐`), text, depth
+        case thematicBreak                     // `---` between sections
         case quote(String)                     // `>` lines, already merged
         case xmlBlock(String)                  // raw XML/tag content
         case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
     }
 
     /// Anchored: at most nine digits (CommonMark) then `.` or `)` and a space.
-    fileprivate static func listItem(in line: String) -> (marker: String, text: String)? {
-        if line.hasPrefix("- ") || line.hasPrefix("* ") {
-            return ("•", String(line.dropFirst(2)))
+    fileprivate static func listItem(in line: String) -> (marker: String, text: String, indent: Int)? {
+        let indent = leadingIndent(of: line)
+        let body = line.drop { $0 == " " || $0 == "\t" }
+        if body.hasPrefix("- ") || body.hasPrefix("* ") {
+            let text = String(body.dropFirst(2))
+            if let box = taskBox(in: text) { return (box.marker, box.text, indent) }
+            return ("•", text, indent)
         }
-        guard let match = line.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
+        guard let match = body.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
             return nil
         }
-        return (String(line[match]).trimmingCharacters(in: .whitespaces),
-                String(line[match.upperBound...]))
+        return (String(body[match]).trimmingCharacters(in: .whitespaces),
+                String(body[match.upperBound...]), indent)
+    }
+
+    /// Spaces before the first mark on the line; a tab counts as four.
+    fileprivate static func leadingIndent(of line: String) -> Int {
+        var n = 0
+        for c in line {
+            if c == " " { n += 1 } else if c == "\t" { n += 4 } else { break }
+        }
+        return n
+    }
+
+    /// A break INSIDE a paragraph. TextKit starts a new paragraph at every
+    /// `\n`, and a new paragraph takes the first-line indent (the margin) and a
+    /// paragraph's worth of air — so an item's own second line would leave the
+    /// list it belongs to.
+    fileprivate static let softBreak = "\u{2028}"
+
+    /// A checklist's boxes, which read at the weight of the text rather than a
+    /// bullet's: they are the item's state, not its punctuation.
+    fileprivate static let taskBoxes: Set<String> = ["\u{25A1}", "\u{2611}"]
+
+    /// `[ ]` or `[x]` right after the marker is a checkbox, not text.
+    private static func taskBox(in text: String) -> (marker: String, text: String)? {
+        guard text.count >= 4, text.hasPrefix("["), text.dropFirst(2).hasPrefix("] ") else { return nil }
+        switch text[text.index(text.startIndex, offsetBy: 1)] {
+        case " ": return ("\u{25A1}", String(text.dropFirst(4)))
+        case "x", "X": return ("\u{2611}", String(text.dropFirst(4)))
+        default: return nil
+        }
+    }
+
+    /// Three or more of one mark, alone on the line.
+    fileprivate static func isThematicBreak(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let mark = trimmed.first, mark == "-" || mark == "*" || mark == "_" else { return false }
+        guard trimmed.allSatisfy({ $0 == mark || $0 == " " }) else { return false }
+        return trimmed.filter { $0 == mark }.count >= 3
+    }
+
+    /// A list's depth comes from the STEPS it takes, not from a count of
+    /// spaces: models write two or four for the same one level, and a list
+    /// that starts indented is still at its own top.
+    fileprivate struct ListDepth {
+        private var stops: [Int] = []
+
+        mutating func level(forIndent indent: Int) -> Int {
+            while let last = stops.last, indent < last { stops.removeLast() }
+            if let last = stops.last {
+                if indent > last { stops.append(indent) }
+            } else {
+                stops.append(indent)
+            }
+            return stops.count - 1
+        }
+
+        mutating func reset() { stops.removeAll() }
     }
 
     /// `>` alone is a blank line inside a quote and keeps the block open.
@@ -5392,6 +5453,7 @@ struct MarkdownText: View {
         var blocks: [Block] = []
         let lines = source.components(separatedBy: "\n")
         var i = 0
+        var depth = ListDepth()
 
         while i < lines.count {
             let line = lines[i]
@@ -5496,10 +5558,40 @@ struct MarkdownText: View {
                 continue
             }
 
-            // List item
-            if let item = listItem(in: line) {
-                blocks.append(.listItem(item.marker, item.text))
+            // A rule, before the list check: `- - -` is a break, not an item.
+            if isThematicBreak(line) {
+                blocks.append(.thematicBreak)
                 i += 1
+                continue
+            }
+
+            // List item, with the lines indented under it: a second line, or a
+            // second paragraph, belongs to the item rather than to the margin.
+            if let item = listItem(in: line) {
+                // Any other block ended the list, so its depth starts again.
+                if case .some(.listItem) = blocks.last {} else { depth.reset() }
+                var text = item.text
+                i += 1
+                while i < lines.count {
+                    // One blank line may sit inside an item, before its second
+                    // paragraph; two end it.
+                    let blank = lines[i].trimmingCharacters(in: .whitespaces).isEmpty
+                    let at = blank ? i + 1 : i
+                    guard at < lines.count else { break }
+                    let next = lines[at]
+                    let trimmed = next.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty,
+                          leadingIndent(of: next) > item.indent,
+                          listItem(in: next) == nil,
+                          !isThematicBreak(next),
+                          quoteBody(in: trimmed) == nil,
+                          !trimmed.hasPrefix("```"), !trimmed.hasPrefix("#"),
+                          !trimmed.hasPrefix("|"), !trimmed.hasPrefix("<")
+                    else { break }
+                    text += (blank ? softBreak + softBreak : softBreak) + trimmed
+                    i = at + 1
+                }
+                blocks.append(.listItem(item.marker, text, depth.level(forIndent: item.indent)))
                 continue
             }
 
@@ -5629,14 +5721,19 @@ struct MarkdownText: View {
                 linkifyBareUrls(code)
                 result.append(code)
 
-            case .listItem(let marker, let text):
+            case .listItem(let marker, let text, let level):
                 let bullet = NSAttributedString(string: marker + " ", attributes: [
                     .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
-                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .foregroundColor: taskBoxes.contains(marker)
+                        ? NSColor.labelColor : NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                // Hanging indent off the marker's own width.
-                p.headIndent = bullet.size().width.rounded(.up)
+                // One step per level; the hanging indent hangs off the marker's
+                // own width, so wrapped lines and the item's own second line
+                // line up under its text.
+                let step = CGFloat(level) * ChatMetrics.listIndentStep
+                p.firstLineHeadIndent = step
+                p.headIndent = step + bullet.size().width.rounded(.up)
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 // Tight between items, a paragraph's worth after the last.
                 p.paragraphSpacing = isItem(idx + 1) ? 4 : 8
@@ -5648,6 +5745,27 @@ struct MarkdownText: View {
                 if isItem(idx + 1) { combined.append(NSAttributedString(string: "\n")) }
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
+
+            case .thematicBreak:
+                // A rule is a bordered block for the same reason the quote bar
+                // is one: an attributed string has no "line across here".
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(1, type: .absoluteValueType, for: .border, edge: .minY)
+                cell.setBorderColor(NSColor.separatorColor, for: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .maxY)
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                // The cell needs something to hold; at 1pt the rule is the
+                // only thing with height.
+                result.append(NSAttributedString(string: "\u{00A0}", attributes: [
+                    .font: NSFont.systemFont(ofSize: 1),
+                    .paragraphStyle: p,
+                ]))
 
             case .table(let headers, let rows, let alignments):
                 result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
@@ -5955,7 +6073,21 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
+        // `~~struck~~` arrives as an intent, like bold and inline code do.
+        result.enumerateAttribute(.inlinePresentationIntent, in: full, options: []) { value, range, _ in
+            guard isStruckThrough(value) else { return }
+            result.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+        }
         tintInlineCode(result, bodyFont: bodyFont)
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber`.
+    private static func isStruckThrough(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.strikethrough) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.strikethrough)
+        }
+        return false
     }
 
     /// Inline code is found by `inlinePresentationIntent`, never by the font:
@@ -6109,6 +6241,38 @@ fileprivate struct SelectableMarkdownNSText: NSViewRepresentable {
     }
 }
 
+/// Where an inline-code span's ground is drawn: one rect per line the span
+/// occupies, each ending at that line's last visible glyph.
+///
+/// Not `enumerateEnclosingRects`, which is SELECTION geometry: a span that
+/// continues on the next line takes its first fragment all the way to the
+/// container's trailing edge, and the tint ran to the right margin.
+enum InlineCodeGround {
+    static func rects(forGlyphRange glyphs: NSRange,
+                      layoutManager: NSLayoutManager,
+                      in container: NSTextContainer) -> [NSRect] {
+        guard glyphs.length > 0, let text = layoutManager.textStorage?.string as NSString? else { return [] }
+        var rects: [NSRect] = []
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, lineGlyphs, _ in
+            let onThisLine = NSIntersectionRange(lineGlyphs, glyphs)
+            guard onThisLine.length > 0 else { return }
+            // The space a line breaks at belongs to the line, and tinting
+            // it is what reaches the margin.
+            var chars = layoutManager.characterRange(forGlyphRange: onThisLine, actualGlyphRange: nil)
+            while chars.length > 0,
+                  let last = text.substring(with: NSRange(location: chars.upperBound - 1, length: 1)).unicodeScalars.first,
+                  CharacterSet.whitespacesAndNewlines.contains(last) {
+                chars.length -= 1
+            }
+            guard chars.length > 0 else { return }
+            let visible = layoutManager.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+            guard visible.length > 0 else { return }
+            rects.append(layoutManager.boundingRect(forGlyphRange: visible, in: container))
+        }
+        return rects
+    }
+}
+
 /// NSTextView that reports its laid-out height as its intrinsic content size,
 /// so embedding it in SwiftUI's layout system "just works" — no manual height
 /// binding required.
@@ -6158,11 +6322,9 @@ fileprivate final class IntrinsicTextView: NSTextView {
             let band = ((font?.ascender ?? 10) - (font?.descender ?? -3)) + 2
             let glyphs = layoutManager.glyphRange(forCharacterRange: range,
                                                   actualCharacterRange: nil)
-            layoutManager.enumerateEnclosingRects(
-                forGlyphRange: glyphs,
-                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
-                in: textContainer
-            ) { rect, _ in
+            for rect in InlineCodeGround.rects(forGlyphRange: glyphs,
+                                               layoutManager: layoutManager,
+                                               in: textContainer) {
                 var box = rect.offsetBy(dx: origin.x, dy: origin.y)
                 if box.height > band {
                     box = box.insetBy(dx: 0, dy: (box.height - band) / 2)
