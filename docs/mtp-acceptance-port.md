@@ -72,3 +72,9 @@ from 70.377 to 70.914 tok/s (+0.76%). Total wall time fell from 109.077 to
 108.675 seconds (0.37% shorter). All paired completion lengths, answer
 digests, and reasoning digests matched. This is a measured 16K-cell result;
 long-context and full state/cache parity remain separate gates.
+
+The complete unchanged-control comparison, quality sanity screen, and 1K-1M
+timing and memory charts are in the
+[benchmark record](benchmarks/qwen38-mtp-port/README.md). The high-context cells are
+explicitly statistics-only and should not be read as long-context quality or
+recurrent-state parity evidence.
