@@ -76,7 +76,7 @@ boot() {
 
 echo "Headless spec-decode flag plumbing (port $PORT)"
 
-echo "[1/5] --pld with non-default draft/key lengths"
+echo "[1/6] --pld with non-default draft/key lengths"
 if boot --pld --pld-draft-len 8 --pld-key-len 4; then
     grep -q "PLD speculative decoding: ENABLED" "$LOG"
     check "--pld enables PLD in headless mode" "$([ $? -eq 0 ] && echo 1 || echo 0)"
@@ -88,7 +88,7 @@ else
     check "boot with --pld" 0
 fi
 
-echo "[2/5] --no-pld still disables"
+echo "[2/6] --no-pld still disables"
 if boot --no-pld --pld-draft-len 8 --pld-key-len 4; then
     grep -q "PLD speculative decoding: ENABLED" "$LOG"
     check "--no-pld keeps PLD off even with lengths passed" "$([ $? -ne 0 ] && echo 1 || echo 0)"
@@ -96,17 +96,19 @@ else
     check "boot with --no-pld" 0
 fi
 
-echo "[3/5] bare default matches the documented 5/3"
+echo "[3/6] bare default matches the documented 5/3"
 if boot; then
     grep -q "draft_len=5, key_len=3" "$LOG"
     check "default headless boot is PLD on at 5/3" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+    grep -q "Repetition loop guard: short-cycle cutoff=16 repeats" "$LOG"
+    check "default loop cutoff remains 16" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 else
     check "bare default boot" 0
 fi
 
 # `--max-tokens` used to feed only the offline `--prompt` mode; headless hand-rolls its own
 # ServerConfig literal, which is how the --pld* trio was eaten.
-echo "[4/5] --max-tokens reaches the serve-mode omitted-field default"
+echo "[4/6] --max-tokens reaches the serve-mode omitted-field default"
 if boot --max-tokens 4096; then
     grep -q "default max_tokens for omitted requests: 4096" "$LOG"
     check "--max-tokens 4096 reaches the headless request defaults" "$([ $? -eq 0 ] && echo 1 || echo 0)"
@@ -127,7 +129,7 @@ fi
 # to anything that maps endpoints by probing them — llmprobe scored every
 # surface absent against a headless boot for exactly this reason (2026-07-25).
 # Headless with an EMPTY model dir is the only place this is observable.
-echo "[5/5] endpoint existence does not depend on a model being loaded"
+echo "[5/6] endpoint existence does not depend on a model being loaded"
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 0.5
 : > "$LOG"
@@ -153,6 +155,20 @@ check "a served endpoint still reports 503 no-model (got $known_code)" \
     "$([ "$known_code" = "503" ] && echo 1 || echo 0)"
 check "a served media endpoint is not mistaken for absent (got $edits_code)" \
     "$([ "$edits_code" = "503" ] && echo 1 || echo 0)"
+
+echo "[6/6] repeat-loop CLI values reach the scheduler"
+if boot --loop-repetitions 64; then
+    grep -q "Repetition loop guard: short-cycle cutoff=64 repeats" "$LOG"
+    check "--loop-repetitions 64 reaches the scheduler" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+else
+    check "boot with --loop-repetitions 64" 0
+fi
+if boot --loop-repetitions 0; then
+    grep -q "Repetition loop guard: disabled (all tiers)" "$LOG"
+    check "--loop-repetitions 0 disables the scheduler guard" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+else
+    check "boot with --loop-repetitions 0" 0
+fi
 
 echo
 echo "  passed: $PASS   failed: $FAIL"

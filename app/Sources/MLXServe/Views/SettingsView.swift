@@ -1677,6 +1677,23 @@ private struct PerformanceSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
 
+        if let m = meta["loopRepetitions"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.loopRepetitions)
+            ) {
+                Picker("", selection: opts.loopRepetitions) {
+                    ForEach(ServerOptions.loopRepetitionPresets, id: \.self) { repetitions in
+                        Text(repetitions == 0 ? "Off" : "\(repetitions) repeats")
+                            .tag(repetitions)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 150)
+            }
+        }
         if let m = meta["maxConcurrent"] {
             SettingsRow(
                 title: m.title,

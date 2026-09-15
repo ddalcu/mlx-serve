@@ -11778,10 +11778,10 @@ pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pa
 
 /// Max cycle length (in tokens) scanned by `isDegenerateTailLoop`, and how many
 /// identical repetitions of that cycle count as "stuck". A real answer — prose,
-/// code, a markdown table — essentially never repeats an identical ≤8-token
-/// cycle 16 times in a row, so these won't fire on legitimate output, while a
-/// model that has collapsed into spamming one short phrase is caught within a
-/// few dozen tokens instead of running all the way to `max_tokens`.
+/// code, a markdown table — usually does not repeat an identical ≤8-token
+/// cycle 16 times in a row, so this catches a collapsed model within a few
+/// dozen tokens instead of running all the way to `max_tokens`. The exact
+/// threshold is configurable for legitimate repetitive output.
 pub const degenerate_loop_max_period: usize = 8;
 pub const degenerate_loop_reps: usize = 16;
 // Tier 2 (2026-08-02 shooter wrap-up class): a two-sentence cycle of ~58
@@ -11987,8 +11987,8 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 /// Convict a degenerate tail and say where it starts. Tier order matches
 /// `scheduler.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
-pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
-    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps)) |p| {
+pub fn degenerateTailWithExactReps(tokens: []const u32, exact_reps: usize) ?DegenerateTail {
+    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, exact_reps)) |p| {
         return .{ .tier = .exact_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (exactCyclePeriod(
@@ -11997,6 +11997,15 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         degenerate_loop_long_max_period,
         degenerate_loop_long_reps,
     )) |p| {
+        // A short cycle is also periodic at multiples of its true period.
+        // Leave those tails to the configurable short tier, including when
+        // its threshold exceeds the fuzzy window. Falling through would let
+        // the near-repeat tier impose another hidden cap on that threshold.
+        const cycle = tokens[tokens.len - p ..];
+        for (1..degenerate_loop_max_period + 1) |short_p| {
+            if (p % short_p == 0 and
+                std.mem.eql(u32, cycle[short_p..], cycle[0 .. p - short_p])) return null;
+        }
         return .{ .tier = .long_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (tokens.len < near_repeat_window) return null;
@@ -12016,6 +12025,12 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         start = cand;
     }
     return .{ .tier = .near_repeat, .start = start };
+}
+
+/// Default detector used by direct callers and tests. The scheduler calls the
+/// configurable form so `--loop-repetitions` can raise the short-cycle bar.
+pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
+    return degenerateTailWithExactReps(tokens, degenerate_loop_reps);
 }
 
 /// Stall clock for the request timeout: the deadline measures time since the
@@ -13918,6 +13933,61 @@ test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
     try testing.expectEqual(@as(usize, 7), d.start);
     // What survives is the honest prefix plus exactly one cycle.
     try testing.expectEqualSlices(u32, &[_]u32{ 7, 8, 9, 10, 101, 102, 103 }, ids.items[0..d.start]);
+}
+
+test "degenerateTail: every short period honors every repeat-loop preset" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    // Nonzero Settings presets, plus the smallest CLI threshold.
+    for ([_]usize{ 2, 16, 24, 32, 48, 64 }) |reps| {
+        for (1..9) |p| {
+            ids.clearRetainingCapacity();
+            try ids.appendSlice(al, &.{ 7, 8, 9 });
+            // Check every token so partial cycles cannot hide an early cut.
+            for (0..p * reps) |i| {
+                try testing.expect(degenerateTailWithExactReps(ids.items, reps) == null);
+                try ids.append(al, @intCast(400 + i % p));
+            }
+            const d = degenerateTailWithExactReps(ids.items, reps) orelse return error.TestExpectedLoop;
+            try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+            try testing.expectEqual(3 + p, d.start);
+        }
+    }
+}
+
+test "degenerateTail: large CLI thresholds are not capped by the fuzzy tier" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    const reps = 2048;
+    for (1..9) |p| {
+        ids.clearRetainingCapacity();
+        try ids.appendSlice(al, &.{ 7, 8, 9 });
+        for (0..p * reps) |i| try ids.append(al, @intCast(400 + i % p));
+        // These tails qualify as near repeats, but remain short exact cycles.
+        try testing.expect(isNearRepeatTailLoop(ids.items));
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. 3 + near_repeat_window], reps) == null);
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. ids.items.len - 1], reps) == null);
+        const d = degenerateTailWithExactReps(ids.items, reps) orelse return error.TestExpectedLoop;
+        try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+        try testing.expectEqual(3 + p, d.start);
+    }
+}
+
+test "degenerateTail: genuine long periods retain their ten-repeat threshold" {
+    const al = testing.allocator;
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    for (9..65) |p| {
+        ids.clearRetainingCapacity();
+        try ids.appendSlice(al, &.{ 7, 8, 9 });
+        for (0..p * 10) |i| try ids.append(al, @intCast(400 + i % p));
+        try testing.expect(degenerateTailWithExactReps(ids.items[0 .. ids.items.len - 1], 2048) == null);
+        const d = degenerateTailWithExactReps(ids.items, 2048) orelse return error.TestExpectedLoop;
+        try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
+        try testing.expectEqual(3 + p, d.start);
+    }
 }
 
 test "degenerateTail: the trim start walks back PAST the near-repeat window" {

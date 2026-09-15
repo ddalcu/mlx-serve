@@ -1684,6 +1684,11 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
+    if (scheduler_mod.loop_repetitions == 0) {
+        log.info("Repetition loop guard: disabled (all tiers)\n", .{});
+    } else {
+        log.info("Repetition loop guard: short-cycle cutoff={d} repeats\n", .{scheduler_mod.loop_repetitions});
+    }
     global_port = port;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
