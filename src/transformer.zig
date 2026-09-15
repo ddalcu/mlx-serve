@@ -20053,7 +20053,7 @@ pub const Transformer = struct {
         const hc: c_int = @intCast(self.config.hc_count);
         const hidden: c_int = @intCast(self.config.hidden_size);
         const hp = @import("hc_prefill.zig");
-        if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size)) {
+        if (hp.eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(stream))) {
             if (try hp.norm(self.s, stream, w.norm_w, w.inject_flat, self.rms_eps_arr, batch, seq_len, if (pend) |p| .{ .out = p.out, .inj = p.inj } else null)) |n| {
                 defer n.deinit();
                 var read = try self.hcReadNormed(n.normalized, w, batch, seq_len, n.raw_inject);
@@ -20137,9 +20137,9 @@ pub const Transformer = struct {
 
     /// Defer `stream += out * inj` to the next read when the fused read will
     /// take it (decode/verify/batched widths); otherwise write now.
-    fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
+    fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
         std.debug.assert(pending.* == null);
-        const prefill = @import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size);
+        const prefill = @import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, inject_flat, mlx.mlx_array_dtype(h.*)) and mlx.mlx_array_dtype(inj) == .bfloat16;
         if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled())) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
             var pd: HcPending = undefined;
             pd.out = mlx.mlx_array_new();
@@ -20212,7 +20212,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(up4);
         try mlx.check(mlx.mlx_reshape(&up4, up, &shape4, 4, self.s));
         var mixed: mlx.mlx_array = undefined;
-        const prefill_mix = if (@import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size)) try @import("hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len) else null;
+        const prefill_mix = if (@import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, w.inject_flat, mlx.mlx_array_dtype(n4))) try @import("hc_prefill.zig").mix(self.s, up4, n4, batch, seq_len) else null;
         if (prefill_mix) |m| {
             mixed = m;
         } else if (try applyClosure(self.compiled_hc_mix, &.{ up4, n4 })) |m| {
@@ -22612,7 +22612,7 @@ pub const Transformer = struct {
                         .full => |fa| try self.qwen4AttnWith(row.ctx, read.mixed, &fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                     };
                     defer _ = mlx.mlx_array_free(attn);
-                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, &row.pending);
+                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
                 }
             }
             if (group_projection) {
@@ -22631,7 +22631,7 @@ pub const Transformer = struct {
                         .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                     };
                     defer _ = mlx.mlx_array_free(attn);
-                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, &row.pending);
+                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
                 }
             }
 
@@ -22665,7 +22665,7 @@ pub const Transformer = struct {
             }
             for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
                 self.fwd_gen = row.generation;
-                try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, &row.pending);
+                try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
             }
         }
 
@@ -22843,7 +22843,7 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_attn, pre.inj);
                 Qwen4Trace.set(&tr.attn_out, attn_out);
             };
-            if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, &pending);
+            if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
 
@@ -22861,7 +22861,7 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
                 Qwen4Trace.set(&tr.mlp_out, mlp_out);
             };
-            if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, &pending);
+            if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
@@ -61299,12 +61299,12 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         xfm.config.hidden_size = @intCast(shape[3]);
         const hc: c_int = @intCast(xfm.config.hc_count);
         const hidden: c_int = @intCast(xfm.config.hidden_size);
-        try testing.expectEqual(hp.enabled(), hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size));
         const width = hc * hidden;
         const w = try attn256RandBf16(rnd, &.{ hc, hidden }, s);
         defer _ = mlx.mlx_array_free(w);
         const iw = try attn256RandBf16(rnd, &.{ width, hc }, s);
         defer _ = mlx.mlx_array_free(iw);
+        try testing.expectEqual(hp.enabled(), hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
         const ones = try standinOnes(&.{hidden}, s);
         defer _ = mlx.mlx_array_free(ones);
         const x = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
@@ -61355,8 +61355,55 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
 
 test "hc prefill: unsupported configuration and coalesced chunk bounds decline" {
     const hp = @import("hc_prefill.zig");
+    const inject = mlx.mlx_array_new_data(&[_]u16{0}, &.{1}, 1, .bfloat16);
+    defer _ = mlx.mlx_array_free(inject);
+    try testing.expectEqual(hp.enabled(), hp.eligible(2, 4351, 4, 128, inject, .bfloat16));
+    try testing.expect(!hp.eligible(2, 4352, 4, 128, inject, .bfloat16));
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
-        try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3]));
+        try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
     }
     try testing.expectEqual(@as(usize, @intCast(hp.max_seq)), @import("generate.zig").nextChunkEnd(0, 8703, 8192, false, 0, 0, true));
+}
+
+test "hc prefill: incompatible read writes immediately" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const hp = @import("hc_prefill.zig");
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    xfm.config.hc_count = 4;
+    xfm.config.hidden_size = 128;
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {
+        var h0 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h0);
+        try mlx.check(mlx.mlx_ones(&h0, &.{ 1, 17, 512 }, 3, dtype, s));
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_ones(&out, &.{ 1, 17, 128 }, 3, dtype, s));
+        var inj = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inj);
+        try mlx.check(mlx.mlx_ones(&inj, &.{ 1, 17, 4, 1 }, 4, dtype, s));
+        for ([_]?mlx.mlx_dtype{ null, .uint32, .float32, .bfloat16 }) |inject_dtype| {
+            var iw = mlx.mlx_array{ .ctx = null };
+            defer if (iw.ctx != null) {
+                _ = mlx.mlx_array_free(iw);
+            };
+            if (inject_dtype) |dt| {
+                iw = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_ones(&iw, &.{ 512, 4 }, 2, dt, s));
+            }
+            var h = try standinRef(h0);
+            defer _ = mlx.mlx_array_free(h);
+            var pending: ?HcPending = null;
+            defer if (pending) |*p| p.deinit();
+            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
+            const can_defer = hp.enabled() and dtype == .bfloat16 and inject_dtype == .bfloat16;
+            try testing.expectEqual(can_defer, pending != null);
+            try xfm.hcFlush(&h, 1, 17, &pending);
+            const expected = try xfm.hcWrite(try standinRef(h0), out, inj, 1, 17);
+            defer _ = mlx.mlx_array_free(expected);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(h, expected, s));
+        }
+    }
 }

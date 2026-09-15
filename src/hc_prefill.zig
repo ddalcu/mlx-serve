@@ -14,12 +14,12 @@ pub fn enabled() bool {
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 
-pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32) bool {
-    return enabled() and geometry(batch, seq) and hc >= 1 and hc <= 8 and hidden >= 128 and hidden <= 4096 and hidden % 128 == 0;
+pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32, inject: mlx.mlx_array, dtype: mlx.mlx_dtype) bool {
+    return inject.ctx != null and dtype == .bfloat16 and mlx.mlx_array_dtype(inject) == .bfloat16 and enabled() and geometry(batch, seq) and hc >= 1 and hc <= 8 and hidden >= 128 and hidden <= 4096 and hidden % 128 == 0;
 }
 
 fn geometry(batch: c_int, seq: c_int) bool {
-    return batch >= 1 and batch <= 2 and seq > 16 and seq <= max_seq;
+    return batch >= 1 and batch <= 2 and seq > 16 and seq <= @divTrunc(max_seq, batch);
 }
 
 pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };
