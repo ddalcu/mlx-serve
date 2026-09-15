@@ -2,6 +2,17 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Every sampled token ranked the whole vocabulary; a shortlist is exact only if it ranks the way the row does
+`applyTopP` argsorted 248,320 logits per sampled token and `applyTopK` paid a second pass through `mlx_argpartition`. On Metal `Partition::eval_gpu` and `ArgPartition::eval_gpu` "direct partition to sort for now", so `mlx_topk` and `mlx_argpartition` ARE the multi-block merge sort and buy nothing. Qwen3.8-Flash-Next on M4 Max, MTP off: 65.0 tok/s greedy vs 60.5 at temperature 1 / top_p 0.95 / top_k 20.
+
+Fix: `topRanksDescending` takes the exact top `m` values AND column ids without ranking the row. Every element of a chunk is at most that chunk's max, so a chunk whose max is not among the `m` largest chunk maxima holds no top-`m` element; rank `V / chunk` maxima, gather the `m` winning chunks, rank their `m * chunk` candidates (balanced at `chunk = sqrt(V / m)`). `applyTopK` scatters the ids; with top_k set `applyTopP` reads the nucleus off the k-shortlist, since nothing below the row's top k can be in it.
+
+Under the rank contract (bdcf5a1: ties cut by rank, never value) the shortlist must break ties exactly as the whole row does, and three things carry that: `ranksDescending` is a stable ascending argsort of the NEGATED row (value desc, ties by lowest column id; mlx's merge sort is stable, an undocumented property a test pins directly); the chunk pick takes the LOWEST chunk ids among equal maxima (a tie group's contributing chunks are a prefix of its ascending-id list; taking the last `m` of an ascending argsort kept the wrong columns on an all-equal row); the winning chunks are sorted by id before the gather so candidates lie in ascending column order.
+
+The nucleus is the mass STRICTLY above each rank (exclusive scan, rank 0 sees zero so the argmax is always kept) over an f32 softmax of the ranked values (the row's finite entries, so the row's normalizer), and the scan runs in f32: mlx instantiates cumsum at the INPUT dtype and logits off a quantized `lm_head` are bf16, which dropped 148 of 3720 nucleus columns on one of six probe rows and made the sum depend on how many entries the scan walked.
+
+Guard: the shortlist route and the full-row route produce byte-identical filtered logits and draw the same token under the same key over `[m, V]` and `[B, L, V]` blocks at V 8192 and 248,320, six `(top_p, top_k)` settings, a 0.25-quantized row and an all-equal row; `applyTopK` keeps exactly k; the f64 nucleus reference may differ by one boundary column (its probability ~1e-5 against ~1e-7 of f32 scan error).
+
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 

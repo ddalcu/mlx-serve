@@ -56,6 +56,12 @@ struct ModelSettingsSheet: View {
                     Text("On").tag(1)
                     Text("Off").tag(0)
                 }
+                Picker("MTP acceptance", selection: Binding(
+                    get: { override.mtpAcceptance?.rawValue ?? "" },
+                    set: { override.mtpAcceptance = MtpAcceptanceChoice(rawValue: $0) })) {
+                    Text("Default").tag("")
+                    ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                }
                 if let live, live.loaded {
                     LabeledContent("Live") {
                         Text("\(ContextSizeDisplay.formatTokens(live.contextLength)) context, KV \(live.kvQuant.isEmpty ? "default" : live.kvQuant)")

@@ -96,6 +96,53 @@ echo "----"
 printf '%s\n' "$CONTENT"
 echo "----"
 
+# The engine keeps ONE persistent session per model, so a repeated prompt is
+# served from its live KV: the second identical request must report a cached
+# prefix (a per-request session always reported 0).
+echo "[ok] POST /v1/chat/completions (repeat, expects cached prefix)"
+RESP2=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Write a haiku about Apple Silicon GPUs."}],"max_tokens":32,"temperature":0.0}')
+CACHED=$(printf '%s' "$RESP2" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["usage"]["prompt_tokens_details"]["cached_tokens"])' 2>/dev/null || echo 0)
+if (( CACHED < 1 )); then
+    echo "[fail] repeated prompt reported cached_tokens=$CACHED (persistent session not reused)"
+    exit 1
+fi
+echo "[ok] repeated prompt reused $CACHED cached tokens"
+
+# An engine-backed model has no MLX transformer: embeddings are refused by
+# NAME, never handed to the scheduler (that path dereferenced the null
+# transformer and took the whole server down mid-run).
+echo "[ok] POST /v1/embeddings (expects a named 400)"
+EMB_CODE=$(curl -s -o /tmp/ds4_emb_body.$$ -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/embeddings" \
+    -H 'Content-Type: application/json' -d '{"model":"mlx-serve","input":"hello"}')
+if [[ "$EMB_CODE" != "400" ]] || ! grep -q "embedded engine" /tmp/ds4_emb_body.$$; then
+    echo "[fail] embeddings on a ds4 model returned HTTP $EMB_CODE: $(head -c 200 /tmp/ds4_emb_body.$$)"
+    rm -f /tmp/ds4_emb_body.$$; exit 1
+fi
+rm -f /tmp/ds4_emb_body.$$
+if ! curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "[fail] server died after the embeddings request"; exit 1
+fi
+echo "[ok] embeddings refused with a named 400, server alive"
+
+# Engagement: when the GGUF carries its own MTP head the engine must report
+# a ready draft (draft_tokens=2 on qwen4/GLM) and a sampled request must still
+# answer (the in-checkpoint head has a sampled speculative arm).
+if grep -q "embedded MTP head armed" /tmp/test_ds4_serve.log; then
+    if ! grep -q "draft_tokens=2" /tmp/test_ds4_serve.log; then
+        echo "[fail] embedded MTP armed but the engine reports no ready draft"; exit 1
+    fi
+    SAMPLED=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Count from one to ten in words."}],"max_tokens":40,"temperature":0.7}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["usage"]["completion_tokens"])' 2>/dev/null || echo 0)
+    if (( SAMPLED < 5 )); then
+        echo "[fail] sampled request under embedded MTP produced $SAMPLED tokens"; exit 1
+    fi
+    echo "[ok] embedded MTP armed: draft ready, sampled request produced $SAMPLED tokens"
+fi
+
 # Streaming chat completion.
 echo "[ok] POST /v1/chat/completions (streaming)"
 STREAM_OUT=$(curl -sf -N -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \

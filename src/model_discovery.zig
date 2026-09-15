@@ -53,6 +53,7 @@ const supported_model_types = [_][]const u8{
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -269,8 +270,18 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
             continue;
         };
     }
-    if (set.count() == 0) {
-        set.deinit(a);
+    // An index none of whose shards exist is stale (the repo was re-sharded
+    // after this index was written); the directory is then the set.
+    var any_present = false;
+    var keys = set.keyIterator();
+    while (keys.next()) |k| {
+        _ = dir.statFile(io, k.*, .{}) catch continue;
+        any_present = true;
+        break;
+    }
+    if (!any_present) {
+        log.warn("model.safetensors.index.json names no shard in this directory; loading every *.safetensors instead\n", .{});
+        freeShardSet(&set);
         return null;
     }
     return set;

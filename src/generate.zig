@@ -13,6 +13,7 @@ const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
+const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
@@ -45,6 +46,10 @@ pub var prefill_chunk_override: usize = 8192;
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
 pub var prefill_trace_force: bool = false;
+
+/// Set once by the serve CLI before request construction. Direct callers may
+/// override it through InitOptions; exact remains the library default.
+pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
 
 /// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
 pub fn envPrefillChunk() usize {
@@ -151,7 +156,7 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// on 256 exactly: both were measured on hd-256 checkpoints and neither
 /// generalizes (the fused kernel is hd-256-only; the 2048 composed cap was
 /// tuned against a 27B's own prefill ladder).
-pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
+pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool) usize {
     const head_dim = score_head_dim;
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
     // Non-sliding hd-256 archs under FUSED causal (the default since the
@@ -166,7 +171,9 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // the 8K rung on Qwen3.6-27B dense (M4 Max, 2026-07-30), flat at 32K.
     // Never raises a caller-lowered base.
     if (head_dim == 256 and !sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
-        return @min(base_chunk, if (is_moe) @as(usize, 4096) else @as(usize, 8192));
+        // A long-context-gated MoE prices the 8192 rung per request in `chooseRequestPrefillChunk`
+        // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
+        return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
     // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
@@ -193,7 +200,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, pinned_chunk: usize) usize {
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
     const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
     if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
@@ -205,7 +212,7 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
         prefill_chunk_override
     else
         @min(prefill_chunk_override, pinned_chunk);
-    return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe);
+    return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -1114,6 +1121,7 @@ test "every speculative decoder caps accepted drafts before commit" {
 /// built as a single lazy computation graph, async_eval'd together. The GPU
 /// never idles between token generation steps.
 pub const Generator = struct {
+    const MtpGraphFn = *const fn (mlx.mlx_array, []const mlx.mlx_array, ?[]const mlx.mlx_array, u32, f32, SamplingParams, mlx.mlx_stream) anyerror!MtpBatchedGraph;
     xfm: *Transformer,
     /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
     /// pointer, ssm_entries slice, vision_embeddings handle, and capture_hidden
@@ -1274,6 +1282,10 @@ pub const Generator = struct {
     // KV cache — OWNED by the Generator (built during prefill, freed in
     // `deinit`).
     mtp: ?MtpHeadRef = null,
+    /// Installed verifier route; selected once at init, not checked per token.
+    mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
+    mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
+    mtp_accept_param: f32 = 0,
     /// Does the model have a usable MTP head? `--no-mtp` clears it; a per-request `enable_mtp:false` does not.
     model_has_mtp: bool = false,
     mtp_cache: ?MtpCacheRef = null,
@@ -1882,6 +1894,8 @@ pub const Generator = struct {
         /// final-token forward captures `last_hidden`, exactly like the
         /// drafter path. Same lazy-pre-forward skip semantics as PLD/drafter.
         mtp_enabled: bool = false,
+        /// Explicit verifier selected by the caller at construction.
+        mtp_acceptance: mtp_acceptance.Mode = .exact,
         /// Non-owning pointer to the loaded MTP head.
         mtp: ?MtpHeadRef = null,
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
@@ -2203,6 +2217,7 @@ pub const Generator = struct {
             total_ctx_for_chunk,
             xfm.config.has_sliding_window,
             xfm.config.isMoe(),
+            xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
         );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
@@ -2266,6 +2281,24 @@ pub const Generator = struct {
         // forwarded tail — RoPE offsets are cache-relative, so a late-starting
         // history is self-consistent (sliding-window history semantics).
         const mtp_active = options.mtp_enabled and options.mtp != null;
+        const AcceptRoute = struct {
+            graph: MtpGraphFn,
+            prefix: mtp_acceptance.PrefixFn,
+            param: f32,
+        };
+        const accept_route: AcceptRoute = switch (options.mtp_acceptance) {
+            .exact => .{ .graph = mtpBatchedExactGraph, .prefix = mtp_acceptance.exactPrefix, .param = 0 },
+            .typical => |cfg| .{ .graph = mtpBatchedTypicalGraph, .prefix = mtp_acceptance.typicalPrefix, .param = cfg.delta },
+            .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
+        };
+        if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
+            if (!mtpBatchCorrEnabled()) return error.MtpLossyRequiresBatchedCorrections;
+            switch (options.mtp_acceptance) {
+                .typical => |cfg| log.info("  [mtp-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact\n", .{ cfg.delta, cfg.eps }),
+                .tokenv3 => |alpha| log.info("  [mtp-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),
+                .exact => unreachable,
+            }
+        }
         var mtp_cache: ?MtpCacheRef = null;
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
@@ -2347,6 +2380,7 @@ pub const Generator = struct {
                 total_ctx_for_chunk,
                 xfm.config.has_sliding_window,
                 xfm.config.isMoe(),
+                xfm.config.longCtxGated(),
                 0,
             ));
             adapt_state.width_min = @intCast(default_chunk);
@@ -2968,6 +3002,9 @@ pub const Generator = struct {
                     null,
                 .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
+                .mtp_accept_graph = accept_route.graph,
+                .mtp_accept_prefix = accept_route.prefix,
+                .mtp_accept_param = accept_route.param,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
                 .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
@@ -3601,7 +3638,7 @@ pub const Generator = struct {
                 draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
                 n_arrs += 1;
             }
-            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, s);
+            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, .{}, s);
             defer bg.deinit();
 
             // ONE bounded sync: the accept vector + pre-sampled corrections
@@ -5248,6 +5285,16 @@ pub const Generator = struct {
         };
     }
 
+    /// Allocate one request-local categorical draw index while the lazy MTP
+    /// graph is built. The same counter covers draft and correction samples,
+    /// including cross-round pre-drafts, so no two keyed draws reuse a key.
+    fn mtpSamplingDraw(self: *Generator, params: SamplingParams) SamplingParams {
+        var draw = params;
+        draw.draw = self.sampling.draw;
+        self.sampling.draw +%= 1;
+        return draw;
+    }
+
     /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
     /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
     /// round's tail. Owns every handle it holds; `deinit` frees whatever was
@@ -5412,7 +5459,7 @@ pub const Generator = struct {
                 // in the accept ratio is the true proposal density.
                 slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
                 chain.n_qp = i + 1;
-                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], s);
+                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], self.mtpSamplingDraw(draft_sampling), s);
             } else {
                 chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
             }
@@ -5644,7 +5691,7 @@ pub const Generator = struct {
                     if (c.q_probs) |slots| {
                         slots[i] = try probsAtLastPos(outs[k].logits, draft_sampling, xfm.s);
                         c.n_qp = i + 1;
-                        c.draft_arrs[i] = try sampleFromProbsLazy(slots[i], xfm.s);
+                        c.draft_arrs[i] = try sampleFromProbsLazy(slots[i], g.mtpSamplingDraw(draft_sampling), xfm.s);
                     } else {
                         c.draft_arrs[i] = sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
                     }
@@ -5678,21 +5725,38 @@ pub const Generator = struct {
         /// [m] f32 filtered target probability of each draft.
         accept_p: mlx.mlx_array,
         /// [m] f32 proposal density at each draft (sharp drafts only;
-        /// null-ctx under greedy proposals).
+        /// null-ctx under greedy proposals). Typical mode stores its entropy
+        /// floor here instead.
         accept_q: mlx.mlx_array,
+        /// [m] bool TokenV3 deferral decisions; null for other modes.
+        accept_defer: mlx.mlx_array = .{ .ctx = null },
 
         pub fn deinit(self: *MtpBatchedGraph) void {
             _ = mlx.mlx_array_free(self.corr_samples);
             _ = mlx.mlx_array_free(self.accept_p);
             if (self.accept_q.ctx != null) _ = mlx.mlx_array_free(self.accept_q);
+            if (self.accept_defer.ctx != null) _ = mlx.mlx_array_free(self.accept_defer);
         }
     };
+
+    fn mtpBatchedExactGraph(
+        probs_all: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        _: f32,
+        sampling: SamplingParams,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        return mtpBatchedAcceptGraph(probs_all, draft_arrs, q_probs, m, sampling, s);
+    }
 
     pub fn mtpBatchedAcceptGraph(
         probs_all: mlx.mlx_array,
         draft_arrs: []const mlx.mlx_array,
         q_probs: ?[]const mlx.mlx_array,
         m: u32,
+        sampling: SamplingParams,
         s: mlx.mlx_stream,
     ) !MtpBatchedGraph {
         const shape = mlx.getShape(probs_all); // [1, 1+m, V]
@@ -5777,11 +5841,11 @@ pub const Generator = struct {
             var log_stack = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(log_stack);
             try mlx.check(mlx.mlx_log(&log_stack, stack, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
+            const key = seedKey(sampling);
+            defer _ = mlx.mlx_array_free(key);
             var sampled = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, null_key, s));
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
             try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
         }
 
@@ -5815,6 +5879,252 @@ pub const Generator = struct {
         }
 
         return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
+    }
+
+    pub fn mtpBatchedTypicalGraph(
+        probs_all: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        delta: f32,
+        sampling: SamplingParams,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        return mtpBatchedLossyGraph(.typical, probs_all, draft_arrs, q_probs, m, delta, sampling, s);
+    }
+
+    pub fn mtpBatchedTokenV3Graph(
+        probs_all: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        alpha: f32,
+        sampling: SamplingParams,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        return mtpBatchedLossyGraph(.tokenv3, probs_all, draft_arrs, q_probs, m, alpha, sampling, s);
+    }
+
+    /// Specialized at compile time; the installed route adds no mode switch
+    /// to a measured MTP round. Both lanes keep corrections in one lazy graph.
+    fn mtpBatchedLossyGraph(
+        comptime mode: enum { typical, tokenv3 },
+        probs_all: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        param: f32,
+        sampling: SamplingParams,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        const shape = mlx.getShape(probs_all); // [1, 1+m, V]
+        const vocab = shape[2];
+        const mi: c_int = @intCast(m);
+        const strides2 = [_]c_int{ 1, 1 };
+
+        var p2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p2d);
+        const p2_shape = [_]c_int{ mi + 1, vocab };
+        try mlx.check(mlx.mlx_reshape(&p2d, probs_all, &p2_shape, 2, s));
+
+        var ids_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_2d);
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+            const id2_shape = [_]c_int{ mi, 1 };
+            try mlx.check(mlx.mlx_reshape(&ids_2d, flat, &id2_shape, 2, s));
+        }
+
+        var p_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p_rows);
+        var bonus = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bonus);
+        {
+            const r_start = [_]c_int{ 0, 0 };
+            const r_stop = [_]c_int{ mi, vocab };
+            try mlx.check(mlx.mlx_slice(&p_rows, p2d, &r_start, 2, &r_stop, 2, &strides2, 2, s));
+            const b_start = [_]c_int{ mi, 0 };
+            const b_stop = [_]c_int{ mi + 1, vocab };
+            try mlx.check(mlx.mlx_slice(&bonus, p2d, &b_start, 2, &b_stop, 2, &strides2, 2, s));
+        }
+
+        // TokenV3 needs the FULL q row. Typical acceptance uses only p and
+        // does not add a proposal concat or one-hot operation to the graph.
+        var proposal: mlx.mlx_array = .{ .ctx = null };
+        defer if (proposal.ctx != null) {
+            _ = mlx.mlx_array_free(proposal);
+        };
+        if (comptime mode == .tokenv3) {
+            proposal = mlx.mlx_array_new();
+            if (q_probs) |qs| {
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (qs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                try mlx.check(mlx.mlx_concatenate_axis(&proposal, vec, 0, s));
+            } else {
+                var indices = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(indices);
+                try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vocab)), 1, .int32, s));
+                var onehot_b = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(onehot_b);
+                try mlx.check(mlx.mlx_equal(&onehot_b, indices, ids_2d, s));
+                try mlx.check(mlx.mlx_astype(&proposal, onehot_b, mlx.mlx_array_dtype(p2d), s));
+            }
+        }
+
+        // TokenV3 Eq. 11: pi = q*1[Top] + p*sum(q outside Top).
+        // The p*eta term applies to EVERY token, including those inside Top.
+        var pi: mlx.mlx_array = .{ .ctx = null };
+        defer if (pi.ctx != null) {
+            _ = mlx.mlx_array_free(pi);
+        };
+        var defer_mask: mlx.mlx_array = .{ .ctx = null };
+        defer if (defer_mask.ctx != null) {
+            _ = mlx.mlx_array_free(defer_mask);
+        };
+        if (comptime mode == .tokenv3) {
+            var peak = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(peak);
+            try mlx.check(mlx.mlx_max_axis(&peak, p_rows, 1, true, s));
+            const complement = mlx.mlx_array_new_float(1.0 - param);
+            defer _ = mlx.mlx_array_free(complement);
+            var cutoff = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cutoff);
+            try mlx.check(mlx.mlx_multiply(&cutoff, peak, complement, s));
+            defer_mask = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_less(&defer_mask, p_rows, cutoff, s));
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var deferred_q = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deferred_q);
+            try mlx.check(mlx.mlx_where(&deferred_q, defer_mask, proposal, zero, s));
+            var eta = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eta);
+            try mlx.check(mlx.mlx_sum_axis(&eta, deferred_q, 1, true, s));
+            var kept_q = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(kept_q);
+            try mlx.check(mlx.mlx_where(&kept_q, defer_mask, zero, proposal, s));
+            var recycled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(recycled);
+            try mlx.check(mlx.mlx_multiply(&recycled, p_rows, eta, s));
+            pi = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&pi, kept_q, recycled, s));
+        }
+        const decision_rows = if (comptime mode == .tokenv3) pi else p_rows;
+
+        var corr_samples = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(corr_samples);
+        {
+            var corr_rows: mlx.mlx_array = .{ .ctx = null };
+            defer if (corr_rows.ctx != null) {
+                _ = mlx.mlx_array_free(corr_rows);
+            };
+            if (comptime mode == .typical) {
+                corr_rows = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&corr_rows, p_rows));
+            } else {
+                var diff = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(diff);
+                try mlx.check(mlx.mlx_subtract(&diff, pi, proposal, s));
+                const zero = mlx.mlx_array_new_float(0.0);
+                defer _ = mlx.mlx_array_free(zero);
+                corr_rows = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_maximum(&corr_rows, diff, zero, s));
+            }
+            var stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stack);
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, corr_rows);
+            _ = mlx.mlx_vector_array_append_value(vec, bonus);
+            try mlx.check(mlx.mlx_concatenate_axis(&stack, vec, 0, s));
+            var log_stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_stack);
+            try mlx.check(mlx.mlx_log(&log_stack, stack, s));
+            const key = seedKey(sampling);
+            defer _ = mlx.mlx_array_free(key);
+            var sampled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sampled);
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, key, s));
+            try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
+        }
+
+        var accept_p = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(accept_p);
+        {
+            var taken = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken);
+            try mlx.check(mlx.mlx_take_along_axis(&taken, decision_rows, ids_2d, -1, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const m_shape = [_]c_int{mi};
+            try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
+            try mlx.check(mlx.mlx_astype(&accept_p, flat, .float32, s));
+        }
+
+        var accept_q: mlx.mlx_array = .{ .ctx = null };
+        errdefer if (accept_q.ctx != null) {
+            _ = mlx.mlx_array_free(accept_q);
+        };
+        if (comptime mode == .typical) {
+            // H(p) = -sum p*log(p), with log(0) safely masked by clamping
+            // only the log operand. The p factor remains exactly zero.
+            const tiny = mlx.mlx_array_new_float(1e-30);
+            defer _ = mlx.mlx_array_free(tiny);
+            var safe_p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(safe_p);
+            try mlx.check(mlx.mlx_maximum(&safe_p, p_rows, tiny, s));
+            var log_p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_p);
+            try mlx.check(mlx.mlx_log(&log_p, safe_p, s));
+            var p_log_p = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(p_log_p);
+            try mlx.check(mlx.mlx_multiply(&p_log_p, p_rows, log_p, s));
+            var sum = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_sum_axis(&sum, p_log_p, 1, false, s));
+            var scaled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(scaled);
+            try mlx.check(mlx.mlx_exp(&scaled, sum, s)); // exp(-H)
+            const delta = mlx.mlx_array_new_float(param);
+            defer _ = mlx.mlx_array_free(delta);
+            var raw_floor = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw_floor);
+            try mlx.check(mlx.mlx_multiply(&raw_floor, scaled, delta, s));
+            const eps = mlx.mlx_array_new_float(1.0);
+            defer _ = mlx.mlx_array_free(eps);
+            accept_q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_minimum(&accept_q, raw_floor, eps, s));
+        } else if (q_probs != null) {
+            var taken = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken);
+            try mlx.check(mlx.mlx_take_along_axis(&taken, proposal, ids_2d, -1, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const m_shape = [_]c_int{mi};
+            try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
+            accept_q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&accept_q, flat, .float32, s));
+        }
+
+        var accept_defer: mlx.mlx_array = .{ .ctx = null };
+        errdefer if (accept_defer.ctx != null) {
+            _ = mlx.mlx_array_free(accept_defer);
+        };
+        if (comptime mode == .tokenv3) {
+            var taken = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken);
+            try mlx.check(mlx.mlx_take_along_axis(&taken, defer_mask, ids_2d, -1, s));
+            const m_shape = [_]c_int{mi};
+            accept_defer = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&accept_defer, taken, &m_shape, 1, s));
+        }
+        return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q, .accept_defer = accept_defer };
     }
 
     /// Batched-corrections kill switch — MLX_SERVE_MTP_BATCH_CORR=0
@@ -6647,8 +6957,14 @@ pub const Generator = struct {
         };
         var accept_p_vec = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(accept_p_vec);
-        var accept_q_vec = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(accept_q_vec);
+        var accept_q_vec: mlx.mlx_array = .{ .ctx = null };
+        defer if (accept_q_vec.ctx != null) {
+            _ = mlx.mlx_array_free(accept_q_vec);
+        };
+        var accept_defer_vec: mlx.mlx_array = .{ .ctx = null };
+        defer if (accept_defer_vec.ctx != null) {
+            _ = mlx.mlx_array_free(accept_defer_vec);
+        };
         var corr_samples: ?[]mlx.mlx_array = null;
         var corr_samples_n: usize = 0;
         defer if (corr_samples) |slots| {
@@ -6665,20 +6981,20 @@ pub const Generator = struct {
         if (stochastic and mtpBatchCorrEnabled()) {
             const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
-            const bg = try mtpBatchedAcceptGraph(
+            const bg = try self.mtp_accept_graph(
                 probs_all,
                 draft_arrs[0..m],
                 if (q_probs) |qs| qs[0..m] else null,
                 m,
+                self.mtp_accept_param,
+                self.mtpSamplingDraw(self.sampling),
                 s,
             );
             corr_batch = bg.corr_samples;
             _ = mlx.mlx_array_free(accept_p_vec);
             accept_p_vec = bg.accept_p;
-            if (bg.accept_q.ctx != null) {
-                _ = mlx.mlx_array_free(accept_q_vec);
-                accept_q_vec = bg.accept_q;
-            }
+            accept_q_vec = bg.accept_q;
+            accept_defer_vec = bg.accept_defer;
         } else if (stochastic) {
             const slice_strides = [_]c_int{ 1, 1, 1 };
             // Filtered + softmaxed target probs for ALL 1+m positions in one
@@ -6738,6 +7054,7 @@ pub const Generator = struct {
                 var cat = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(cat);
                 try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+                accept_q_vec = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_astype(&accept_q_vec, cat, .float32, s));
             }
 
@@ -6781,16 +7098,16 @@ pub const Generator = struct {
                     var log_res = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(log_res);
                     try mlx.check(mlx.mlx_log(&log_res, residual, s));
-                    const null_key = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(null_key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, null_key, s));
+                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
+                    defer _ = mlx.mlx_array_free(key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, key, s));
                 } else {
                     var log_p = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(log_p);
                     try mlx.check(mlx.mlx_log(&log_p, per_pos_probs.?[m], s));
-                    const null_key = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(null_key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, null_key, s));
+                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
+                    defer _ = mlx.mlx_array_free(key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, key, s));
                 }
             }
         }
@@ -6817,7 +7134,8 @@ pub const Generator = struct {
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             if (stochastic) {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
-                if (q_probs != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
+                if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
+                if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
                 if (corr_batch.ctx != null) {
                     _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
                 } else {
@@ -6855,20 +7173,21 @@ pub const Generator = struct {
             const p_data = mlx.mlx_array_data_float32(accept_p_vec) orelse {
                 return error.MlxArrayDataNull;
             };
-            var q_data: ?[*]const f32 = null;
-            if (q_probs != null) {
+            var q_data: ?[]const f32 = null;
+            if (accept_q_vec.ctx != null) {
                 try mlx.check(mlx.mlx_array_eval(accept_q_vec));
-                q_data = mlx.mlx_array_data_float32(accept_q_vec) orelse {
+                const q_ptr = mlx.mlx_array_data_float32(accept_q_vec) orelse {
                     return error.MlxArrayDataNull;
                 };
+                q_data = q_ptr[0..m];
             }
-            var k: u32 = 0;
-            while (k < m) : (k += 1) {
-                const accept_prob: f32 = if (q_data) |qd| specAcceptProb(p_data[k], qd[k]) else @min(1.0, p_data[k]);
-                const u: f32 = self.prng.random().float(f32);
-                if (u >= accept_prob) break;
-                accepted += 1;
+            var defer_data: ?[]const bool = null;
+            if (accept_defer_vec.ctx != null) {
+                try mlx.check(mlx.mlx_array_eval(accept_defer_vec));
+                const defer_ptr = mlx.mlx_array_data_bool(accept_defer_vec) orelse return error.MlxArrayDataNull;
+                defer_data = defer_ptr[0..m];
             }
+            accepted = self.mtp_accept_prefix(p_data[0..m], q_data, defer_data, &self.prng);
             accepted = capAcceptedForTokenBudget(
                 accepted,
                 self.completion_tokens,
@@ -10046,7 +10365,7 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     }
     if (sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10173,7 +10492,7 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
     }
     if (sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10334,15 +10653,15 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
 /// ([1, vocab]): log(probs) puts masked tokens at -inf, categorical draws
 /// within the kept set — the same distribution as sampling the filtered
 /// logits directly, but the caller keeps `probs` as the proposal density q.
-fn sampleFromProbsLazy(probs: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+fn sampleFromProbsLazy(probs: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     var logp = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logp);
     try mlx.check(mlx.mlx_log(&logp, probs, s));
     var sampled = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(sampled);
-    const null_key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(null_key);
-    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, null_key, s));
+    const key = seedKey(sampling);
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, key, s));
     return sampled;
 }
 
@@ -10425,7 +10744,7 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
     // Apply top-p filtering (lazy)
     if (sampling.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopP(&next, current, sampling.top_p, s) catch {};
+        applyTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -10616,7 +10935,7 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
     }
     if (p0.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopP(&next, current, p0.top_p, s) catch {
+        applyTopP(&next, current, p0.top_p, p0.top_k, s) catch {
             _ = mlx.mlx_array_free(next);
             next = current;
             current = mlx.mlx_array_new();
@@ -10945,6 +11264,7 @@ pub fn generateMtp(
     var timer = io_util.Stopwatch.init(io);
     var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
         .mtp_enabled = true,
+        .mtp_acceptance = mtp_acceptance_default,
         .mtp = MtpHeadRef{ .qwen = head },
         .mtp_depth = depth,
         .lookup_prompt = lookup_prompt,
@@ -11784,7 +12104,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     };
 
     if (sampling.top_p < 1.0) {
-        try applyTopP(&after_topp, current, sampling.top_p, s);
+        try applyTopP(&after_topp, current, sampling.top_p, sampling.top_k, s);
         current = after_topp;
         topp_owned = true;
     }
@@ -11990,103 +12310,271 @@ fn maskForLogitVocab(allocator: std.mem.Allocator, mask: []const bool, vocab_siz
     return .{ .slice = adjusted, .owned = adjusted };
 }
 
+/// Rank cap for the filter helpers. The widest shape a caller passes is
+/// `[B, S, V]`; anything past this is a named error, never a wrong axis.
+const SAMPLER_MAX_NDIM = 4;
+
+/// `a[..., start..stop]`, every leading axis passed through whole.
+fn sliceLastAxis(res: *mlx.mlx_array, a: mlx.mlx_array, start: usize, stop: usize, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(a);
+    if (shape.len > SAMPLER_MAX_NDIM) return error.UnsupportedSamplerRank;
+    var lo: [SAMPLER_MAX_NDIM]c_int = undefined;
+    var hi: [SAMPLER_MAX_NDIM]c_int = undefined;
+    var st: [SAMPLER_MAX_NDIM]c_int = undefined;
+    for (shape, 0..) |dim, i| {
+        const last = i == shape.len - 1;
+        lo[i] = if (last) @intCast(start) else 0;
+        hi[i] = if (last) @intCast(stop) else dim;
+        st[i] = 1;
+    }
+    const n = shape.len;
+    try mlx.check(mlx.mlx_slice(res, a, &lo, n, &hi, n, &st, n, s));
+}
+
+/// Column ids of `a` ranked by value DESCENDING, ties by LOWEST ORIGINAL INDEX.
+///
+/// mlx's merge sort is stable — `ThreadSort` swaps only on a strict less-than and
+/// the merge takes from B only when `b < a` — so an ascending argsort of the
+/// negated row is exactly that order, and it is the `msv_qsa_select` tie rule.
+/// Both filters and both of their routes rank through here, which is what makes a
+/// shortlist cutoff agree with the whole row's on a tie-heavy row. Pinned by
+/// `sampler ranks break ties by the lowest original index`.
+fn ranksDescending(res: *mlx.mlx_array, a: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, a, s));
+    try mlx.check(mlx.mlx_argsort_axis(res, neg, -1, s));
+}
+
+/// Candidate-chunk width for `topRanksDescending`: cost is one sort of
+/// `V / chunk` chunk maxima plus one of `m * chunk` candidates, balanced at
+/// sqrt(V / m).
+fn shortlistChunkWidth(v: usize, m: usize) usize {
+    const bal = @sqrt(@as(f64, @floatFromInt(v)) / @as(f64, @floatFromInt(@max(m, 1))));
+    const c: usize = @intFromFloat(@max(16.0, @min(2048.0, bal)));
+    return @min(c, v);
+}
+
+/// The top `m` of every row — values and their column ids, both in
+/// `ranksDescending` order — without ranking the whole row.
+///
+/// Every element of a chunk is at most that chunk's max, so a chunk whose max is
+/// not among the `m` largest chunk maxima holds no top-`m` element: at most `m`
+/// chunks can, and ranking their `m * chunk` candidates is exact. On Metal a
+/// full-row `mlx_argsort_axis` is a multi-block merge sort over the whole
+/// vocabulary — and so are `mlx_topk` and `mlx_argpartition`, which mlx routes to
+/// that same sort, so neither of those buys a shortlist.
+fn topRanksDescending(
+    vals: *mlx.mlx_array,
+    ids: *mlx.mlx_array,
+    logits: mlx.mlx_array,
+    m: u32,
+    s: mlx.mlx_stream,
+) !void {
+    const shape = mlx.getShape(logits);
+    if (shape.len == 0 or shape.len > SAMPLER_MAX_NDIM) return error.UnsupportedSamplerRank;
+    const v: usize = @intCast(shape[shape.len - 1]);
+    const want: usize = @min(@as(usize, m), v);
+    if (want == 0) return error.EmptyShortlist;
+    const chunk = shortlistChunkWidth(v, want);
+    const groups = (v + chunk - 1) / chunk;
+
+    // Nothing left to win once the candidate set is the row itself.
+    if (want >= v or want * chunk >= v) {
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        try ranksDescending(&order, logits, s);
+        try sliceLastAxis(ids, order, 0, want, s);
+        return mlx.check(mlx.mlx_take_along_axis(vals, logits, ids.*, -1, s));
+    }
+
+    // Pad the last chunk with -inf so the reshape is exact.
+    var padded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(padded);
+    if (groups * chunk != v) {
+        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var pad_val = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pad_val);
+        try mlx.check(mlx.mlx_astype(&pad_val, neg_inf, mlx.mlx_array_dtype(logits), s));
+        const axes = [_]c_int{@intCast(shape.len - 1)};
+        const low = [_]c_int{0};
+        const high = [_]c_int{@intCast(groups * chunk - v)};
+        try mlx.check(mlx.mlx_pad(&padded, logits, &axes, 1, &low, 1, &high, 1, pad_val, "constant", s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&padded, logits));
+    }
+
+    var dims: [SAMPLER_MAX_NDIM + 1]c_int = undefined;
+    @memcpy(dims[0 .. shape.len - 1], shape[0 .. shape.len - 1]);
+    const lead = shape.len - 1;
+    dims[lead] = @intCast(groups);
+    dims[lead + 1] = @intCast(chunk);
+    var blk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(blk);
+    try mlx.check(mlx.mlx_reshape(&blk, padded, &dims, lead + 2, s));
+
+    var chunk_max = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chunk_max);
+    try mlx.check(mlx.mlx_max_axis(&chunk_max, blk, -1, false, s));
+
+    // Chunks ranked by max, ties by lowest chunk id. A tie group's contributing
+    // chunks are a PREFIX of its ascending-id list — a lower id holds a lower
+    // column id, which outranks — so taking the lowest ids is what keeps the
+    // shortlist equal to the whole row's ranking.
+    var chunk_ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(chunk_ranks);
+    try ranksDescending(&chunk_ranks, chunk_max, s);
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try sliceLastAxis(&picked, chunk_ranks, 0, want, s);
+    // Ascending chunk ids lay the candidates out in ascending COLUMN id, so the
+    // stable rank below breaks candidate ties the way the whole row would.
+    var win = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win);
+    try mlx.check(mlx.mlx_sort_axis(&win, picked, -1, s));
+    var win_i32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win_i32);
+    try mlx.check(mlx.mlx_astype(&win_i32, win, .int32, s));
+
+    var win_col = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(win_col);
+    try mlx.check(mlx.mlx_expand_dims(&win_col, win_i32, -1, s));
+    dims[lead] = @intCast(want);
+    var gather_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gather_idx);
+    try mlx.check(mlx.mlx_broadcast_to(&gather_idx, win_col, &dims, lead + 2, s));
+    var cand_2d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_2d);
+    try mlx.check(mlx.mlx_take_along_axis(&cand_2d, blk, gather_idx, @intCast(lead), s));
+
+    // Column id of every candidate: chunk id * chunk + offset within the chunk.
+    const chunk_arr = mlx.mlx_array_new_int(@intCast(chunk));
+    defer _ = mlx.mlx_array_free(chunk_arr);
+    var base = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base);
+    try mlx.check(mlx.mlx_multiply(&base, win_col, chunk_arr, s));
+    var offsets = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(offsets);
+    try mlx.check(mlx.mlx_arange(&offsets, 0, @floatFromInt(chunk), 1, .int32, s));
+    var cand_ids_2d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids_2d);
+    try mlx.check(mlx.mlx_add(&cand_ids_2d, base, offsets, s));
+
+    dims[lead] = @intCast(want * chunk);
+    var cand_vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_vals);
+    try mlx.check(mlx.mlx_reshape(&cand_vals, cand_2d, &dims, lead + 1, s));
+    var cand_ids_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids_flat);
+    try mlx.check(mlx.mlx_reshape(&cand_ids_flat, cand_ids_2d, &dims, lead + 1, s));
+    // A padded tail column is -inf, so it only ranks when the row holds fewer
+    // than `want` finite values; clamp so the scatter stays in range regardless.
+    const last_col = mlx.mlx_array_new_int(@intCast(v - 1));
+    defer _ = mlx.mlx_array_free(last_col);
+    var cand_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ids);
+    try mlx.check(mlx.mlx_minimum(&cand_ids, cand_ids_flat, last_col, s));
+
+    var cand_ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cand_ranks);
+    try ranksDescending(&cand_ranks, cand_vals, s);
+    var sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel);
+    try sliceLastAxis(&sel, cand_ranks, 0, want, s);
+    try mlx.check(mlx.mlx_take_along_axis(vals, cand_vals, sel, -1, s));
+    try mlx.check(mlx.mlx_take_along_axis(ids, cand_ids, sel, -1, s));
+}
+
 /// Apply top-k filtering: keep only the top k logits, set the rest to -inf.
 fn applyTopK(res: *mlx.mlx_array, logits: mlx.mlx_array, k: u32, s: mlx.mlx_stream) !void {
-    // Per-ROW top-k. `mlx_topk` (no axis) flattens, which is indistinguishable
-    // from the right answer for the [1, V] rows every caller passed until the
-    // draft block arrived: on [m, V] it returns the k largest of the WHOLE
-    // block, so one row's cutoff masks every other row to -inf and softmax
-    // hands back NaN. A reduction helper that has only ever seen one row
-    // cannot reveal an axis bug.
-    var topk_vals = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(topk_vals);
-    try mlx.check(mlx.mlx_topk_axis(&topk_vals, logits, @intCast(k), -1, s));
+    // Per-ROW top-k by RANK: the k highest-ranked column ids, scattered back as a
+    // keep mask. A value cutoff (`logits >= kth largest`) keeps every token tied
+    // with the k-th, and bf16 logits tie at the top constantly on a 250k vocab —
+    // top_k 1 stopped being greedy.
+    const shape = mlx.getShape(logits);
+    const v: usize = @intCast(shape[shape.len - 1]);
+    if (k == 0 or k >= v) return mlx.check(mlx.mlx_array_set(res, logits));
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try topRanksDescending(&vals, &ids, logits, k, s);
+    try keepByIndex(res, logits, ids, s);
+}
 
-    // Get the minimum of the top-k values (the k-th largest) as cutoff
-    var cutoff = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cutoff);
-    try mlx.check(mlx.mlx_min_axis(&cutoff, topk_vals, -1, true, s));
-
-    // Mask: logits >= cutoff
+/// Mask `logits` to -inf everywhere except the per-row `keep_idx` columns.
+fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(logits);
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_zeros(&zeros, shape.ptr, shape.len, .bool_, s));
+    const t = mlx.mlx_array_new_bool(true);
+    defer _ = mlx.mlx_array_free(t);
     var mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mask);
-    try mlx.check(mlx.mlx_greater_equal(&mask, logits, cutoff, s));
-
-    // Replace masked-out logits with -inf
+    try mlx.check(mlx.mlx_put_along_axis(&mask, zeros, keep_idx, t, -1, s));
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
-/// Apply top-p (nucleus) sampling: mask logits outside the top-p probability mass.
-/// Works on the original (unsorted) logits by computing which tokens to keep.
-fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, s: mlx.mlx_stream) !void {
-    // Sort logits ascending to get sorted probabilities
-    var sorted_logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_logits);
-    try mlx.check(mlx.mlx_sort_axis(&sorted_logits, logits, -1, s));
+/// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
+/// mass. The nucleus is decided over ranked values and scattered back by column
+/// id, so a token tied with the cutoff value but outside the mass is masked
+/// (top_p -> 0 is greedy even on tied bf16 logits).
+///
+/// `nucleus_bound` is the caller's top-k. With top-k applied first the row holds
+/// exactly `k` finite columns, so the nucleus cannot reach past the k-shortlist
+/// and the cutoff is exact without ranking the row; 0 means the row is unfiltered
+/// and the nucleus is unbounded.
+fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, nucleus_bound: u32, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(logits);
+    const v: usize = @intCast(shape[shape.len - 1]);
+    const bounded = nucleus_bound > 0 and nucleus_bound < v;
 
-    // Softmax of sorted logits (ascending order: smallest probs first)
-    var sorted_probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_probs);
-    try mlx.check(mlx.mlx_softmax_axis(&sorted_probs, sorted_logits, -1, true, s));
+    var vals = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals);
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    if (bounded) {
+        try topRanksDescending(&vals, &ids, logits, nucleus_bound, s);
+    } else {
+        try ranksDescending(&ids, logits, s);
+        try mlx.check(mlx.mlx_take_along_axis(&vals, logits, ids, -1, s));
+    }
 
-    // Cumulative sum from smallest to largest
-    var cumsum = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cumsum);
-    try mlx.check(mlx.mlx_cumsum(&cumsum, sorted_probs, -1, false, true, s));
+    // f32 throughout: mlx instantiates cumsum at the INPUT dtype and a bf16
+    // accumulator loses nucleus tail mass. The ranked values ARE the row's
+    // finite entries (top-k left exactly k), so their softmax is the row's.
+    var vals_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vals_f32);
+    try mlx.check(mlx.mlx_astype(&vals_f32, vals, .float32, s));
+    var probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probs);
+    try mlx.check(mlx.mlx_softmax_axis(&probs, vals_f32, -1, true, s));
 
-    // Find the cutoff: tokens where cumsum <= (1 - top_p) are outside the nucleus
-    const threshold = mlx.mlx_array_new_float(1.0 - top_p);
+    // Mass STRICTLY above each rank — an exclusive scan down the ranking, so the
+    // term is a function of the shortlist alone (everything outranking a top-k
+    // column is itself top-k). Rank 0 sees 0, so the argmax is always kept.
+    var above = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(above);
+    try mlx.check(mlx.mlx_cumsum(&above, probs, -1, false, false, s));
+    const threshold = mlx.mlx_array_new_float(top_p);
     defer _ = mlx.mlx_array_free(threshold);
-
-    var outside_mask = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(outside_mask);
-    try mlx.check(mlx.mlx_less_equal(&outside_mask, cumsum, threshold, s));
-
-    // Set outside-nucleus logits to -inf in sorted space
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-    defer _ = mlx.mlx_array_free(neg_inf);
-
-    // where(outside_mask, -inf, sorted_logits) — mask out the low-prob tokens
-    try mlx.check(mlx.mlx_where(res, outside_mask, neg_inf, sorted_logits, s));
-
-    // Note: categorical sampling doesn't care about token ordering,
-    // but the sampled index will be in sorted space. We need to unsort.
-    // Since categorical returns an index into the logits array, and we want
-    // the original vocab index, we need to work in original space instead.
-
-    // Better approach: find the minimum logit value that's in the nucleus,
-    // then mask original logits below that threshold.
-    _ = mlx.mlx_array_free(res.*);
-    res.* = mlx.mlx_array_new();
-
-    // The cutoff logit is the smallest logit still in the nucleus.
-    // In sorted (ascending) order, tokens with cumsum > (1-top_p) are in nucleus.
-    // The first such token's logit value is our threshold.
-    // We can achieve this by: where(cumsum > 1-top_p, sorted_logits, +inf) then take min
     var in_nucleus = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(in_nucleus);
-    try mlx.check(mlx.mlx_greater(&in_nucleus, cumsum, threshold, s));
+    try mlx.check(mlx.mlx_less(&in_nucleus, above, threshold, s));
 
-    const pos_inf = mlx.mlx_array_new_float(std.math.inf(f32));
-    defer _ = mlx.mlx_array_free(pos_inf);
-
-    var nucleus_logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(nucleus_logits);
-    try mlx.check(mlx.mlx_where(&nucleus_logits, in_nucleus, sorted_logits, pos_inf, s));
-
-    // Min value = the cutoff
-    var min_val = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(min_val);
-    try mlx.check(mlx.mlx_min_axis(&min_val, nucleus_logits, -1, true, s));
-
-    // Mask original logits: keep if >= cutoff, else -inf
-    var keep_mask = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(keep_mask);
-    try mlx.check(mlx.mlx_greater_equal(&keep_mask, logits, min_val, s));
-
-    try mlx.check(mlx.mlx_where(res, keep_mask, logits, neg_inf, s));
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_zeros(&zeros, shape.ptr, shape.len, .bool_, s));
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_put_along_axis(&mask, zeros, ids, in_nucleus, -1, s));
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
 }
 
 /// Apply repeat penalty to already-generated tokens.
@@ -12568,6 +13056,37 @@ test "batched stacked seedless top_k top_p rows equal solo draws" {
     try testing.expectEqual(@as(u64, 1), sample_rows_evals);
     try testing.expectEqual(@as(i32, @intCast(solo0)), ids[0]);
     try testing.expectEqual(@as(i32, @intCast(solo1)), ids[1]);
+}
+
+test "top-k and top-p break exact ties by rank, not by value" {
+    // bf16 logits tie at the top constantly on a 250k vocab; a value cutoff
+    // keeps every tied token and top_k 1 / top_p -> 0 stop being greedy.
+    const s = mlx.gpuStream();
+    const data = [_]f32{
+        2.0, 5.0, 5.0, 5.0, 1.0,
+        0.1, 0.2, 9.0, 0.3, 0.4,
+    };
+    const shape = [_]c_int{ 2, 5 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    for ([_]bool{ true, false }) |use_k| {
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        if (use_k) try applyTopK(&masked, logits, 1, s) else try applyTopP(&masked, logits, 1e-6, 0, s);
+        try mlx.check(mlx.mlx_array_eval(masked));
+        const out = mlx.mlx_array_data_float32(masked).?[0..10];
+        var kept0: usize = 0;
+        for (out[0..5]) |v| kept0 += @intFromBool(v != -std.math.inf(f32));
+        try testing.expectEqual(@as(usize, 1), kept0);
+        for (out[5..10], 0..) |v, i| try testing.expect((v != -std.math.inf(f32)) == (i == 2));
+    }
+    // A 3-of-5 top-k on the tied row keeps exactly the three tied tokens.
+    var masked3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked3);
+    try applyTopK(&masked3, logits, 3, s);
+    try mlx.check(mlx.mlx_array_eval(masked3));
+    const out3 = mlx.mlx_array_data_float32(masked3).?[0..5];
+    for (out3, 0..) |v, i| try testing.expect((v != -std.math.inf(f32)) == (i >= 1 and i <= 3));
 }
 
 test "batched stacked seedless rows honour a suppress mask" {
@@ -13282,16 +13801,16 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
     // head_dim <= 128 rides MLX's fused SDPA — no materialized scores, no cap,
     // at ANY context length.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true, false));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true, false, false));
     // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
     // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
     // head_dim 256, so typical prompts must keep full prefill throughput.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false, false));
     // Degenerate inputs never cap.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true, false));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true, false, false));
 }
 
 test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel active" {
@@ -13301,21 +13820,21 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false, false));
 }
 
 test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
     // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true, false, false));
     // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false, false));
     // ctx 262144 (the PR-#69 255K case) -> 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true, false));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true, false, false));
     // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true, false));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true, false, false));
     // e4b geometry (8 heads) at 131072: exactly 2048.
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true, false, false));
 }
 
 test "boundedPrefillChunk: a 192-wide MLA score is budgeted, and the hd-256 policies stay hd-256" {
@@ -13324,14 +13843,14 @@ test "boundedPrefillChunk: a 192-wide MLA score is budgeted, and the hd-256 poli
     // qk width 192 on the composed path. 32 heads.
     //
     // Short prompts keep the full chunk: 32 * 8192 * 8192 * 2B = 4 GiB exactly.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 192, 32, 8192, false, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
     // Then it halves with the prompt, holding one score tensor at the budget.
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 16384, false, true));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 32768, false, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 16384, false, true, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 32768, false, true, false));
     // The 38201-token prompt that measured a +28.8 GB peak at chunk 8192:
     // 4 GiB / (32 * 38201 * 2) = 1757 -> floored to the 512 grain.
-    try testing.expectEqual(@as(usize, 1536), boundedPrefillChunk(8192, 192, 32, 38_201, false, true));
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 192, 32, 262_144, false, true));
+    try testing.expectEqual(@as(usize, 1536), boundedPrefillChunk(8192, 192, 32, 38_201, false, true, false));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
 
     // The two hd-256-measured policies must NOT adopt this arch:
     // - the fused-kernel branch (no score tensor) is hd-256-only,
@@ -13339,9 +13858,9 @@ test "boundedPrefillChunk: a 192-wide MLA score is budgeted, and the hd-256 poli
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
     // With the fused override on, a real hd-256 MoE takes the 4096 branch...
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 32, 8192, false, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 32, 8192, false, true, false));
     // ...and the 192-wide arch still gets its honest full chunk at the same shape.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 192, 32, 8192, false, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
 }
 
 test "MTP history window: threshold gate and chunk membership" {
@@ -13369,9 +13888,9 @@ test "MTP history window: threshold gate and chunk membership" {
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true, false, false));
     // Even the floor never raises a tiny explicit base.
-    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false));
+    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false, false));
 }
 
 test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE caps at 4096, dense keeps the full chunk" {
@@ -13384,20 +13903,31 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
     // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
     // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, false));
     // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
     // (gemma-26B@99K: +3% speed for +22 GB peak is a bad trade).
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true));
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, false));
     // Never raises a caller-lowered base.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false, false, false));
     // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
     // the formula-only policy.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false, false));
     // Fused head dims never cap regardless of arch.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false, false));
+}
+
+test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
+    std.debug.assert(transformer_mod.fused256_override == null);
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 400_000, false, true, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(2048, 256, 24, 8192, false, true, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, true));
 }
 
 test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
@@ -13408,11 +13938,11 @@ test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + sc
     // the score transient shrinks with it.
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false, false));
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
     // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false, false, false));
 }
 
 test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff length" {
@@ -14653,7 +15183,7 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const drafts = [_]mlx.mlx_array{ d0, d1 };
 
     // Greedy proposals (q == null): one-hot residuals.
-    var g = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, null, 2, s);
+    var g = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, null, 2, .{}, s);
     defer g.deinit();
     try mlx.check(mlx.mlx_array_eval(g.corr_samples));
     const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
@@ -14676,7 +15206,7 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const q1 = mlx.mlx_array_new_data(&q_data1, &q_shape, 2, .float32);
     defer _ = mlx.mlx_array_free(q1);
     const qs = [_]mlx.mlx_array{ q0, q1 };
-    var gs = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, &qs, 2, s);
+    var gs = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, &qs, 2, .{}, s);
     defer gs.deinit();
     try mlx.check(mlx.mlx_array_eval(gs.corr_samples));
     const corr2 = mlx.mlx_array_data_int32(gs.corr_samples) orelse return error.InvalidDtype;
@@ -14687,6 +15217,165 @@ test "batched corrections: point-mass residuals sample deterministically, accept
     const aq = mlx.mlx_array_data_float32(gs.accept_q) orelse return error.InvalidDtype;
     try testing.expectApproxEqAbs(@as(f32, 1.0), aq[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.0), aq[1], 1e-6);
+}
+
+test "seeded MTP draft and correction draws replay despite unrelated MLX random draws" {
+    const s = mlx.gpuStream();
+    const q_data = [_]f32{ 0.5, 0.5, 0.0, 0.0 };
+    const q_shape = [_]c_int{ 1, 4 };
+    const q = mlx.mlx_array_new_data(&q_data, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q);
+    const p_data = [_]f32{ 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const p = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(p);
+    const d_data: i32 = 3;
+    const d_shape = [_]c_int{1};
+    const d = mlx.mlx_array_new_data(&d_data, &d_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(d);
+    const drafts = [_]mlx.mlx_array{d};
+
+    var runs: [2][16][3]i32 = undefined;
+    for (&runs) |*run| {
+        for (run, 0..) |*out, index| {
+            const draft_params = SamplingParams{ .seed = 0xC0FFEE, .draw = @as(u64, @intCast(index)) * 2 };
+            const lazy_draft = try sampleFromProbsLazy(q, draft_params, s);
+            defer _ = mlx.mlx_array_free(lazy_draft);
+            try mlx.check(mlx.mlx_array_eval(lazy_draft));
+            try mlx.check(mlx.mlx_array_item_int32(&out[0], lazy_draft));
+
+            const correction_params = SamplingParams{ .seed = 0xC0FFEE, .draw = draft_params.draw + 1 };
+            var graph = try Generator.mtpBatchedAcceptGraph(p, &drafts, null, 1, correction_params, s);
+            defer graph.deinit();
+            try mlx.check(mlx.mlx_array_eval(graph.corr_samples));
+            const corrected = mlx.mlx_array_data_int32(graph.corr_samples) orelse return error.MlxArrayDataNull;
+            out[1] = corrected[0];
+            out[2] = corrected[1];
+        }
+
+        // A seeded replay must not depend on unrelated requests consuming the
+        // process-global MLX RNG between runs.
+        const unrelated = try sampleFromProbsLazy(q, SamplingParams{}, s);
+        defer _ = mlx.mlx_array_free(unrelated);
+        try mlx.check(mlx.mlx_array_eval(unrelated));
+    }
+    try testing.expectEqualSlices([3]i32, &runs[0], &runs[1]);
+    var all_same = true;
+    for (runs[0][1..]) |draw| all_same = all_same and std.mem.eql(i32, &draw, &runs[0][0]);
+    try testing.expect(!all_same);
+}
+
+test "MTP typical batched graph uses entropy floor and target-row correction" {
+    const s = mlx.gpuStream();
+    const p_data = [_]f32{ 0.5, 0.5, 0, 0, 0, 0, 0, 1 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const id: i32 = 0;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{draft};
+    var g = try Generator.mtpBatchedTypicalGraph(probs, &drafts, null, 1, 0.2, .{}, s);
+    defer g.deinit();
+    try mlx.check(mlx.mlx_array_eval(g.accept_p));
+    try mlx.check(mlx.mlx_array_eval(g.accept_q));
+    const p = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
+    const floor = mlx.mlx_array_data_float32(g.accept_q) orelse return error.InvalidDtype;
+    try testing.expectApproxEqAbs(@as(f32, 0.5), p[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), floor[0], 1e-6);
+    try testing.expect(g.accept_defer.ctx == null);
+    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
+    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
+    try testing.expect(corr[0] == 0 or corr[0] == 1);
+    try testing.expectEqual(@as(i32, 3), corr[1]);
+}
+
+test "MTP TokenV3 batched graph uses full pi for sampled and one-hot drafts" {
+    const s = mlx.gpuStream();
+    const p_data = [_]f32{ 0.8, 0.19, 0.01, 0, 0, 0, 0, 1 };
+    const p_shape = [_]c_int{ 1, 2, 4 };
+    const probs = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const id: i32 = 2;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{draft};
+    const q_data = [_]f32{ 0.1, 0.2, 0.7, 0 };
+    const q_shape = [_]c_int{ 1, 4 };
+    const q = mlx.mlx_array_new_data(&q_data, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q);
+    const qs = [_]mlx.mlx_array{q};
+
+    var sampled = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 1, 0.95, .{}, s);
+    defer sampled.deinit();
+    try mlx.check(mlx.mlx_array_eval(sampled.accept_p));
+    try mlx.check(mlx.mlx_array_eval(sampled.accept_q));
+    try mlx.check(mlx.mlx_array_eval(sampled.accept_defer));
+    const pi_draft = mlx.mlx_array_data_float32(sampled.accept_p) orelse return error.InvalidDtype;
+    const q_draft = mlx.mlx_array_data_float32(sampled.accept_q) orelse return error.InvalidDtype;
+    const deferred = mlx.mlx_array_data_bool(sampled.accept_defer) orelse return error.InvalidDtype;
+    try testing.expectApproxEqAbs(@as(f32, 0.007), pi_draft[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), q_draft[0], 1e-6);
+    try testing.expect(deferred[0]);
+    try mlx.check(mlx.mlx_array_eval(sampled.corr_samples));
+    const corr = mlx.mlx_array_data_int32(sampled.corr_samples) orelse return error.InvalidDtype;
+    try testing.expect(corr[0] == 0 or corr[0] == 1);
+    try testing.expectEqual(@as(i32, 3), corr[1]);
+
+    var onehot = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, null, 1, 0.95, .{}, s);
+    defer onehot.deinit();
+    try mlx.check(mlx.mlx_array_eval(onehot.accept_p));
+    const onehot_pi = mlx.mlx_array_data_float32(onehot.accept_p) orelse return error.InvalidDtype;
+    try testing.expectApproxEqAbs(@as(f32, 0.01), onehot_pi[0], 1e-6);
+    try testing.expect(onehot.accept_q.ctx == null);
+}
+
+test "MTP TokenV3 full Qwen3.8 vocabulary graph stays finite at depth three" {
+    const s = mlx.gpuStream();
+    const vocab: usize = 248_320;
+    const p_data = try testing.allocator.alloc(f32, 4 * vocab);
+    defer testing.allocator.free(p_data);
+    @memset(p_data, 0);
+    for (0..3) |row| {
+        p_data[row * vocab] = 0.8;
+        p_data[row * vocab + 1] = 0.19;
+        p_data[row * vocab + 2] = 0.01;
+    }
+    p_data[3 * vocab + 3] = 1.0;
+    const p_shape = [_]c_int{ 1, 4, @intCast(vocab) };
+    const probs = mlx.mlx_array_new_data(p_data.ptr, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const q_data = try testing.allocator.alloc(f32, vocab);
+    defer testing.allocator.free(q_data);
+    @memset(q_data, 0);
+    q_data[0] = 0.1;
+    q_data[1] = 0.2;
+    q_data[2] = 0.7;
+    const q_shape = [_]c_int{ 1, @intCast(vocab) };
+    const q = mlx.mlx_array_new_data(q_data.ptr, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q);
+    const draft_id: i32 = 2;
+    const id_shape = [_]c_int{1};
+    const draft = mlx.mlx_array_new_data(&draft_id, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(draft);
+    const drafts = [_]mlx.mlx_array{ draft, draft, draft };
+    const qs = [_]mlx.mlx_array{ q, q, q };
+    var g = try Generator.mtpBatchedTokenV3Graph(probs, &drafts, &qs, 3, 0.95, .{}, s);
+    defer g.deinit();
+    try mlx.check(mlx.mlx_array_eval(g.accept_p));
+    try mlx.check(mlx.mlx_array_eval(g.accept_defer));
+    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
+    const pi_draft = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
+    const deferred = mlx.mlx_array_data_bool(g.accept_defer) orelse return error.InvalidDtype;
+    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
+    for (0..3) |k| {
+        try testing.expectApproxEqAbs(@as(f32, 0.007), pi_draft[k], 1e-5);
+        try testing.expect(deferred[k]);
+        try testing.expect(corr[k] == 0 or corr[k] == 1);
+    }
+    try testing.expectEqual(@as(i32, 3), corr[3]);
 }
 
 test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
@@ -17276,5 +17965,317 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
         try testing.expectEqual(rr.accepted_tokens, br.accepted_tokens);
         try MtpChainTestSlot.equal(rg.mtp_hist_stash.?.ids, bg.mtp_hist_stash.?.ids, xfm.s, "cold resumed stash ids");
         try MtpChainTestSlot.equal(rg.mtp_hist_stash.?.hidden, bg.mtp_hist_stash.?.hidden, xfm.s, "cold resumed stash hidden");
+    }
+}
+
+/// Deterministic Gaussian logits (Box-Muller over an xorshift stream): diffuse
+/// enough that the nucleus for top_p 0.95 spans thousands of tokens, which is
+/// where a narrow cumulative accumulator loses the tail.
+fn samplerTestRow(host: []f32, seed: u64, sigma: f32) void {
+    var rng: u64 = seed | 1;
+    var i: usize = 0;
+    while (i < host.len) : (i += 2) {
+        var u: [2]f64 = undefined;
+        for (&u) |*d| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            d.* = (@as(f64, @floatFromInt(rng >> 11)) + 1.0) / 9007199254740994.0;
+        }
+        const r = @sqrt(-2.0 * @log(u[0]));
+        const a = 6.283185307179586 * u[1];
+        host[i] = @floatCast(r * @cos(a) * @as(f64, sigma));
+        if (i + 1 < host.len) host[i + 1] = @floatCast(r * @sin(a) * @as(f64, sigma));
+    }
+}
+
+/// Nucleus the sampler is meant to keep, in f64: ranked descending, a column is
+/// in when less than top_p of the mass outranks it.
+fn samplerTestExactKeep(allocator: std.mem.Allocator, row: []const f32, top_p: f32) !usize {
+    const sorted = try allocator.alloc(f64, row.len);
+    defer allocator.free(sorted);
+    for (row, sorted) |x, *d| d.* = @floatCast(x);
+    std.mem.sort(f64, sorted, {}, comptime std.sort.desc(f64));
+    const mx = sorted[0];
+    var z: f64 = 0;
+    for (sorted) |d| z += @exp(d - mx);
+    var above: f64 = 0;
+    var keep: usize = 0;
+    for (sorted) |d| {
+        if (above >= @as(f64, @floatCast(top_p))) break;
+        above += @exp(d - mx) / z;
+        keep += 1;
+    }
+    return keep;
+}
+
+/// Read an mlx array back as f32 host values. A slice is a strided VIEW, so the
+/// read goes through a contiguous copy and a flat reshape, never the base
+/// pointer.
+fn samplerTestReadFlat(allocator: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]f32 {
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, arr, .float32, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_contiguous(&dense, as_f32, false, s));
+    const flat_shape = [_]c_int{@intCast(n)};
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, dense, &flat_shape, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const out = try allocator.alloc(f32, n);
+    @memcpy(out, mlx.mlx_array_data_float32(flat).?[0..n]);
+    return out;
+}
+
+/// Bit equality of two mlx arrays read back as f32: both routes end in one
+/// `where` over the same logits, so agreeing on the kept columns is agreeing on
+/// every byte.
+fn samplerTestExpectSameBits(a: mlx.mlx_array, b: mlx.mlx_array, n: usize, s: mlx.mlx_stream) !void {
+    const ad = try samplerTestReadFlat(testing.allocator, a, n, s);
+    defer testing.allocator.free(ad);
+    const bd = try samplerTestReadFlat(testing.allocator, b, n, s);
+    defer testing.allocator.free(bd);
+    for (ad, bd, 0..) |x, y, i| {
+        if (@as(u32, @bitCast(x)) != @as(u32, @bitCast(y))) {
+            std.debug.print("mismatch at {d}: {d} vs {d}\n", .{ i, x, y });
+            return error.FilteredLogitsDiffer;
+        }
+    }
+}
+
+fn samplerTestKeptCount(row: []const f32) usize {
+    var n: usize = 0;
+    for (row) |x| {
+        if (x != -std.math.inf(f32)) n += 1;
+    }
+    return n;
+}
+
+test "sampler ranks break ties by the lowest original index" {
+    // The contract both filters and both of their routes share. mlx's stable
+    // merge sort is what delivers it; if a bump breaks stability this fails.
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 2.0, 5.0, 5.0, 5.0, 1.0, 5.0 };
+    const shape = [_]c_int{ 1, 6 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var ranks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ranks);
+    try ranksDescending(&ranks, logits, s);
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, ranks, .float32, s));
+    const got = try samplerTestReadFlat(testing.allocator, as_f32, 6, s);
+    defer testing.allocator.free(got);
+    // The four tied 5.0s come first in ascending column order, then 2.0, then 1.0.
+    try testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 5, 0, 4 }, got);
+}
+
+test "applyTopP keeps the exact nucleus on a bf16 vocab row" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 248320;
+    const host = try allocator.alloc(f32, v);
+    defer allocator.free(host);
+    const rounded = try allocator.alloc(f32, v);
+    defer allocator.free(rounded);
+
+    for ([_]u64{ 1, 2, 3, 4, 5, 6 }) |seed| {
+        samplerTestRow(host, seed *% 0x9E3779B97F4A7C15, 4.0);
+        const shape = [_]c_int{ 1, @intCast(v) };
+        const f32_row = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f32_row);
+        var bf16_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bf16_row);
+        try mlx.check(mlx.mlx_astype(&bf16_row, f32_row, .bfloat16, s));
+
+        // The reference reads the row the kernel sees: bf16-rounded values.
+        var rt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rt);
+        try mlx.check(mlx.mlx_astype(&rt, bf16_row, .float32, s));
+        const rt_host = try samplerTestReadFlat(allocator, rt, v, s);
+        defer allocator.free(rt_host);
+        @memcpy(rounded, rt_host);
+        const want = try samplerTestExactKeep(allocator, rounded, 0.95);
+
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try applyTopP(&res, bf16_row, 0.95, 0, s);
+        const res_host = try samplerTestReadFlat(allocator, res, v, s);
+        defer allocator.free(res_host);
+        // The boundary column's own probability is ~1e-5 here while the f32 scan
+        // carries ~1e-7 of error, so the exclusive mass can cross top_p one
+        // column early or late against the f64 reference. The defect this pins
+        // was 148 columns wide.
+        const got = samplerTestKeptCount(res_host);
+        const diff = @as(i64, @intCast(want)) - @as(i64, @intCast(got));
+        try testing.expect(diff >= -1 and diff <= 1);
+    }
+}
+
+test "topRanksDescending returns the exact top m values and column ids" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 3;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 1) *% 0xD1B54A32D192ED03, 4.0);
+        // Row 2 quantized to 0.25 steps: thousands of exact ties.
+        for (host[2 * v ..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+        const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(block);
+
+        for ([_]u32{ 1, 20, 257 }) |m| {
+            var vals = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(vals);
+            var ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ids);
+            try topRanksDescending(&vals, &ids, block, m, s);
+            // The whole row's ranking, restricted to its first m: the bar the
+            // shortlist has to reproduce, ties included.
+            var order = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(order);
+            try ranksDescending(&order, block, s);
+            var ref_ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_ids);
+            try sliceLastAxis(&ref_ids, order, 0, m, s);
+            var ref_vals = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_vals);
+            try mlx.check(mlx.mlx_take_along_axis(&ref_vals, block, ref_ids, -1, s));
+            var ids_f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ids_f);
+            try mlx.check(mlx.mlx_astype(&ids_f, ids, .float32, s));
+            var ref_ids_f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ref_ids_f);
+            try mlx.check(mlx.mlx_astype(&ref_ids_f, ref_ids, .float32, s));
+            try samplerTestExpectSameBits(vals, ref_vals, rows * m, s);
+            try samplerTestExpectSameBits(ids_f, ref_ids_f, rows * m, s);
+        }
+    }
+}
+
+test "applyTopK keeps exactly k columns, the highest ranked ones" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 248320;
+    const rows: usize = 3;
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 7) *% 0xD1B54A32D192ED03, 4.0);
+    // Row 1 quantized to 1.0 steps: a value cutoff would keep thousands here.
+    for (host[v..][0..v]) |*x| x.* = @round(x.*);
+    const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+    const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(block);
+
+    for ([_]u32{ 1, 20, 64 }) |k| {
+        var res = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(res);
+        try applyTopK(&res, block, k, s);
+        const rd = try samplerTestReadFlat(allocator, res, rows * v, s);
+        defer allocator.free(rd);
+        for (0..rows) |r| {
+            try testing.expectEqual(@as(usize, k), samplerTestKeptCount(rd[r * v ..][0..v]));
+        }
+        // Same columns as ranking the whole row.
+        var order = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(order);
+        try ranksDescending(&order, block, s);
+        var ref_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_ids);
+        try sliceLastAxis(&ref_ids, order, 0, k, s);
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try keepByIndex(&ref, block, ref_ids, s);
+        try samplerTestExpectSameBits(res, ref, rows * v, s);
+    }
+}
+
+test "shortlist top-p equals the whole row's ranking, ties and 248320-wide rows" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 4;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 11) *% 0xD1B54A32D192ED03, 4.0);
+        // Row 2: 0.25-step ties. Row 3: every column identical — the extreme the
+        // rank contract exists for.
+        for (host[2 * v ..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        for (host[3 * v ..][0..v]) |*x| x.* = 1.5;
+
+        const shape = [_]c_int{ @intCast(rows), @intCast(v) };
+        const block = mlx.mlx_array_new_data(host.ptr, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(block);
+
+        for ([_]struct { p: f32, k: u32 }{
+            .{ .p = 0.95, .k = 20 },
+            .{ .p = 0.8, .k = 50 },
+            .{ .p = 0.99, .k = 5 },
+            .{ .p = 0.5, .k = 1 },
+            .{ .p = 0.95, .k = 257 },
+            .{ .p = 1e-6, .k = 20 },
+        }) |cfg| {
+            var masked = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(masked);
+            try applyTopK(&masked, block, cfg.k, s);
+
+            var short = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(short);
+            try applyTopP(&short, masked, cfg.p, cfg.k, s);
+            var full = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(full);
+            try applyTopP(&full, masked, cfg.p, 0, s);
+            try samplerTestExpectSameBits(short, full, rows * v, s);
+
+            // Same filtered logits and the same key must draw the same token.
+            for (0..8) |d| {
+                const key = seedKey(.{ .seed = 12345, .draw = @intCast(d) });
+                defer _ = mlx.mlx_array_free(key);
+                var a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(a);
+                var b = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(b);
+                try mlx.check(mlx.mlx_random_categorical(&a, short, -1, key, s));
+                try mlx.check(mlx.mlx_random_categorical(&b, full, -1, key, s));
+                try samplerTestExpectSameBits(a, b, rows, s);
+            }
+        }
+    }
+}
+
+test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 8192;
+    const rows: usize = 3;
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    for (0..rows) |r| samplerTestRow(host[r * v ..][0..v], (r + 23) *% 0xD1B54A32D192ED03, 4.0);
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+    const block = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(block);
+
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try applyTopK(&masked, block, 20, s);
+    var short = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(short);
+    try applyTopP(&short, masked, 0.95, 20, s);
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    try applyTopP(&full, masked, 0.95, 0, s);
+    try samplerTestExpectSameBits(short, full, rows * v, s);
+
+    // Per-ROW cutoffs: a block-wide filter would mask whole rows to -inf.
+    const sd = try samplerTestReadFlat(allocator, short, rows * v, s);
+    defer allocator.free(sd);
+    for (0..rows) |r| {
+        const kept = samplerTestKeptCount(sd[r * v ..][0..v]);
+        try testing.expect(kept > 0 and kept <= 20);
     }
 }

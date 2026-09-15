@@ -25,6 +25,7 @@ const MLX_CHAT_ARCHS = new Set([
   // inherits the MoE rules: MTP + drafter default OFF. Note the mirror is
   // 68.5 GB against SMOKE_MAX_GB's 60 default, so it needs the cap raised.
   "bailing_hybrid",
+  "lfm2_moe", "lfm2_vl", "laguna", "inkling_mm_model", "muse_glimmer", "spark2_5", "qwen4_exp",
 ]);
 
 /** Block-diffusion models denoise a canvas instead of decoding token-by-token,

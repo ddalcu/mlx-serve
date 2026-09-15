@@ -14505,6 +14505,36 @@ fn logKvAttnFusedEngaged(view: *const DenseKVView, q: mlx.mlx_array, t_q: c_int)
 
 // ── Transformer ──
 
+/// K2-Horizon's `K2HorizonRMSNorm`: rms over each of `groups` equal channel
+/// groups of the last axis, then the full-width weight. `ones_cache` holds the
+/// weight-less rms_norm's ones vector across calls.
+fn groupedRmsNorm(x: mlx.mlx_array, w: mlx.mlx_array, groups: u32, eps: f32, ones_cache: *?mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(x);
+    const width = shape[shape.len - 1];
+    const gw: c_int = @divExact(width, @as(c_int, @intCast(groups)));
+    if (ones_cache.* == null) {
+        var ones = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{gw}, 1, mlx.mlx_array_dtype(x), s));
+        ones_cache.* = ones;
+    }
+    var g_shape: [8]c_int = undefined;
+    @memcpy(g_shape[0 .. shape.len - 1], shape[0 .. shape.len - 1]);
+    g_shape[shape.len - 1] = @intCast(groups);
+    g_shape[shape.len] = gw;
+    var grouped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(grouped);
+    try mlx.check(mlx.mlx_reshape(&grouped, x, g_shape[0 .. shape.len + 1].ptr, shape.len + 1, s));
+    var normed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(normed);
+    try mlx.check(mlx.mlx_fast_rms_norm(&normed, grouped, ones_cache.*.?, eps, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, normed, shape.ptr, shape.len, s));
+    var result = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&result, flat, w, s));
+    return result;
+}
+
 pub const Transformer = struct {
     config: ModelConfig,
     cache: KVCache,
@@ -14695,6 +14725,8 @@ pub const Transformer = struct {
 
     // MoE-specific (null/empty for standard models)
     moe_layers: ?[]MoeLayerWeights,
+    /// Construction-validated q4/g64 S=4 routed gate/up verifier lane.
+    verify_paired_gu_installed: bool = false,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
     // Pre-transposed plain-bf16 linear_attn weights owned by the Transformer
@@ -14744,6 +14776,7 @@ pub const Transformer = struct {
     gdn_ones_w: ?mlx.mlx_array = null, // ones([dk]) for parameter-free rms_norm
     gdn_q_scale: ?mlx.mlx_array = null, // bf16 scalar 1/dk
     gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
+    grouped_norm_ones: ?mlx.mlx_array = null, // k2_horizon: rms_norm ones weight, one group wide
     gdn_eps: ?mlx.mlx_array = null, // f32 scalar rms_norm_eps for the fused norm-gate kernel
     /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
     /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
@@ -15372,6 +15405,20 @@ pub const Transformer = struct {
             config.quant_group_size == 64 and
             config.quant_mode == .affine and
             mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
+        const verify_paired_gu_installed = blk: {
+            const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_PAIRED_GU") orelse break :blk false;
+            if (raw[0] == '0') break :blk false;
+            // A pack or chip outside the contract declines like every other
+            // shape-gated kernel; only a matching pack that disagrees with
+            // stock is a load error.
+            validatePairedGateUpPack(&config, moe_layers) catch |err| {
+                log.info("[mtp-verify] paired routed gate/up declined: {s}\n", .{@errorName(err)});
+                break :blk false;
+            };
+            try selfCheckPairedGateUpPack(s, moe_layers.?);
+            log.info("[mtp-verify] paired routed gate/up q4/g64 installed for {d} layers (S=4)\n", .{moe_layers.?.len});
+            break :blk true;
+        };
 
         return .{
             .config = config,
@@ -15436,6 +15483,7 @@ pub const Transformer = struct {
             .bert_emb_norm_w = mlx.mlx_array_new(),
             .bert_emb_norm_b = mlx.mlx_array_new(),
             .moe_layers = moe_layers,
+            .verify_paired_gu_installed = verify_paired_gu_installed,
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
             .moe_owned_bf16 = moe_owned_bf16,
@@ -16148,6 +16196,7 @@ pub const Transformer = struct {
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
         if (self.gdn_eps) |e| _ = mlx.mlx_array_free(e);
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
+        if (self.grouped_norm_ones) |o| _ = mlx.mlx_array_free(o);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
@@ -16888,6 +16937,14 @@ pub const Transformer = struct {
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
+        if (self.config.norm_groups > 1) {
+            // Only the residual-width norms are grouped; a per-head q/k norm
+            // is already one group per head.
+            const shape = mlx.getShape(x);
+            if (shape[shape.len - 1] == @as(c_int, @intCast(self.config.hidden_size))) {
+                return groupedRmsNorm(x, w, self.config.norm_groups, self.config.rms_norm_eps, @constCast(&self.grouped_norm_ones), self.s);
+            }
+        }
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_fast_rms_norm(&result, x, w, self.config.rms_norm_eps, self.s));
         return result;
@@ -28654,27 +28711,32 @@ pub const Transformer = struct {
                 }
             }
 
-            var gate_out_3d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(gate_out_3d);
-            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, projection_lhs, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
-            var gate_out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(gate_out);
-            try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
-            try self.addExpertBias(&gate_out, mw.switch_gate_bias, sorted_inds);
+            const expert_act = if (self.verify_paired_gu_installed and B == 1 and S == 4 and
+                self.verifyFeatureEnabled(.routing, skip_shared, B, S))
+                try verifyPairedGateUp(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs_idx, sorted_inds)
+            else blk: {
+                var gate_out_3d = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gate_out_3d);
+                try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, projection_lhs, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+                var gate_out = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(gate_out);
+                try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
+                try self.addExpertBias(&gate_out, mw.switch_gate_bias, sorted_inds);
 
-            var up_out_3d = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(up_out_3d);
-            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, projection_lhs, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
-            var up_out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(up_out);
-            try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
-            try self.addExpertBias(&up_out, mw.switch_up_bias, sorted_inds);
+                var up_out_3d = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(up_out_3d);
+                try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, projection_lhs, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+                var up_out = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(up_out);
+                try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
+                try self.addExpertBias(&up_out, mw.switch_up_bias, sorted_inds);
 
-            // gpt_oss swaps the activation itself, not just its inputs.
-            const expert_act = if (cfg.swiglu_limit > 0.0)
-                try self.computeGptOssSwiGLU(gate_out, up_out)
-            else
-                try self.computeGeglu(gate_out, up_out);
+                // gpt_oss swaps the activation itself, not just its inputs.
+                break :blk if (cfg.swiglu_limit > 0.0)
+                    try self.computeGptOssSwiGLU(gate_out, up_out)
+                else
+                    try self.computeGeglu(gate_out, up_out);
+            };
             defer _ = mlx.mlx_array_free(expert_act);
 
             // down: expand inner singleton → [N,1,intermediate] → gather_qmm → [N,1,hidden]
@@ -36813,6 +36875,230 @@ const VERIFY_EXPERT_REUSE_SOURCE =
 ;
 
 var verify_expert_reuse_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+// Adapted from MTPLX's mtplx/kernels/qwen4_m4_routed_glu.py (Apache-2.0).
+// Physical S=4 Qwen4 verifier: MLX's affine gather_qmv_fast arithmetic, with
+// the gate and up banks in the checkpoint's separate [E, 640, 2560] layout.
+// One 64-thread group owns eight gate/up output rows for one routed assignment.
+// The BF16 sigmoid lookup is the same table used by fusedSwiGLU; the JIT's
+// metal::exp rounding is not identical to MLX's metallib for every BF16 input.
+const VERIFY_PAIRED_GU_HEADER =
+    \\#include <metal_simdgroup>
+    \\#include <metal_stdlib>
+    \\using namespace metal;
+    \\constant constexpr uint PGU_H = 2560;
+    \\constant constexpr uint PGU_N = 640;
+    \\constant constexpr uint PGU_GS = 64;
+    \\constant constexpr uint PGU_VPT = 16;
+    \\constant constexpr uint PGU_BLOCK = PGU_VPT * 32;
+    \\constant constexpr uint PGU_BYTES_PER_ROW = PGU_H / 2;
+    \\constant constexpr uint PGU_GROUPS_PER_ROW = PGU_H / PGU_GS;
+    \\inline float pgu_load(const device bfloat* x, thread float* xt) {
+    \\  float sum = 0.0f;
+    \\  for (int i = 0; i < 16; i += 4) {
+    \\    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+    \\    xt[i] = x[i];
+    \\    xt[i + 1] = x[i + 1] / 16.0f;
+    \\    xt[i + 2] = x[i + 2] / 256.0f;
+    \\    xt[i + 3] = x[i + 3] / 4096.0f;
+    \\  }
+    \\  return sum;
+    \\}
+    \\inline float pgu_qdot(const device uchar* w, const thread float* xt, float scale, float bias, float sum) {
+    \\  float accum = 0.0f;
+    \\  const device ushort* ws = (const device ushort*)w;
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    accum += (xt[4*i] * (ws[i] & 0x000f) + xt[4*i+1] * (ws[i] & 0x00f0)
+    \\        + xt[4*i+2] * (ws[i] & 0x0f00) + xt[4*i+3] * (ws[i] & 0xf000));
+    \\  }
+    \\  return scale * accum + sum * bias;
+    \\}
+;
+
+const VERIFY_PAIRED_GU_SOURCE =
+    \\uint tile = threadgroup_position_in_grid.x;
+    \\uint selected = threadgroup_position_in_grid.y;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint out_base = tile * 8 + sg * 4;
+    \\uint row = lhs[selected];
+    \\uint expert = ids[selected];
+    \\const device bfloat* xv = x + row * PGU_H + lane * PGU_VPT;
+    \\size_t weight_offset = ((size_t)expert * PGU_N + out_base) * PGU_BYTES_PER_ROW + lane * 8;
+    \\size_t meta_offset = ((size_t)expert * PGU_N + out_base) * PGU_GROUPS_PER_ROW + lane / 4;
+    \\const device uchar* gwp = (const device uchar*)gw + weight_offset;
+    \\const device uchar* uwp = (const device uchar*)uw + weight_offset;
+    \\const device bfloat* gsp = gsc + meta_offset;
+    \\const device bfloat* gbp = gb + meta_offset;
+    \\const device bfloat* usp = usc + meta_offset;
+    \\const device bfloat* ubp = ub + meta_offset;
+    \\float gr[4] = {0.0f};
+    \\float ur[4] = {0.0f};
+    \\for (uint k = 0; k < PGU_H; k += PGU_BLOCK) {
+    \\  float xt[16];
+    \\  float sum = pgu_load(xv, xt);
+    \\  for (uint o = 0; o < 4; ++o) {
+    \\    gr[o] += pgu_qdot(gwp + o * PGU_BYTES_PER_ROW, xt,
+    \\        float(gsp[o * PGU_GROUPS_PER_ROW]), float(gbp[o * PGU_GROUPS_PER_ROW]), sum);
+    \\    ur[o] += pgu_qdot(uwp + o * PGU_BYTES_PER_ROW, xt,
+    \\        float(usp[o * PGU_GROUPS_PER_ROW]), float(ubp[o * PGU_GROUPS_PER_ROW]), sum);
+    \\  }
+    \\  xv += PGU_BLOCK;
+    \\  gwp += PGU_BLOCK / 2;
+    \\  uwp += PGU_BLOCK / 2;
+    \\  gsp += PGU_BLOCK / PGU_GS;
+    \\  gbp += PGU_BLOCK / PGU_GS;
+    \\  usp += PGU_BLOCK / PGU_GS;
+    \\  ubp += PGU_BLOCK / PGU_GS;
+    \\}
+    \\for (uint o = 0; o < 4; ++o) {
+    \\  gr[o] = simd_sum(gr[o]);
+    \\  ur[o] = simd_sum(ur[o]);
+    \\}
+    \\if (lane == 0) {
+    \\  for (uint o = 0; o < 4; ++o) {
+    \\    bfloat gt = bfloat(gr[o]);
+    \\    bfloat ut = bfloat(ur[o]);
+    \\    bfloat sig = sigtab[as_type<ushort>(gt)];
+    \\    bfloat act = gt * sig;
+    \\    y[(size_t)selected * PGU_N + out_base + o] = act * ut;
+    \\  }
+    \\}
+;
+
+var verify_paired_gu_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var verify_paired_gu_config: ?mlx.mlx_fast_metal_kernel_config = null;
+
+fn pairedGateUpArrayMatches(arr: mlx.mlx_array, dtype: mlx.mlx_dtype, dims: [3]c_int) bool {
+    if (arr.ctx == null or mlx.mlx_array_dtype(arr) != dtype or !std.mem.eql(c_int, mlx.getShape(arr), &dims)) return false;
+    const strides = mlx.mlx_array_strides(arr);
+    var expected: usize = 1;
+    var i: usize = 3;
+    while (i > 0) {
+        i -= 1;
+        if (strides[i] != expected) return false;
+        expected *= @intCast(dims[i]);
+    }
+    return true;
+}
+
+fn validatePairedGateUpPack(config: *const ModelConfig, layers_opt: ?[]MoeLayerWeights) !void {
+    if (!config.isQwen4() or config.hidden_size != 2560 or config.moe_intermediate_size != 640 or
+        config.num_experts != 512 or config.num_experts_per_tok != 10 or config.hidden_act != .silu or
+        config.swiglu_limit != 0.0 or !verifySharedHardware() or !swigluFusedEnabled())
+        return error.PairedGateUpUnsupportedModel;
+    const layers = layers_opt orelse return error.PairedGateUpMissingLayers;
+    if (layers.len != 48) return error.PairedGateUpWrongLayerCount;
+    const weight_shape = [3]c_int{ 512, 640, 320 };
+    const groups = [3]c_int{ 512, 640, 40 };
+    for (layers) |layer| {
+        const mw = switch (layer.mlp) {
+            .moe => |value| value,
+            else => return error.PairedGateUpNonMoeLayer,
+        };
+        if (mw.switch_gate_bias.ctx != null or mw.switch_up_bias.ctx != null or
+            !pairedGateUpArrayMatches(mw.switch_gate_w, .uint32, weight_shape) or
+            !pairedGateUpArrayMatches(mw.switch_up_w, .uint32, weight_shape) or
+            !pairedGateUpArrayMatches(mw.switch_gate_s, .bfloat16, groups) or
+            !pairedGateUpArrayMatches(mw.switch_up_s, .bfloat16, groups) or
+            !pairedGateUpArrayMatches(mw.switch_gate_b, .bfloat16, groups) or
+            !pairedGateUpArrayMatches(mw.switch_up_b, .bfloat16, groups))
+            return error.PairedGateUpInvalidWeightLayout;
+    }
+}
+
+fn selfCheckPairedGateUpPack(s: mlx.mlx_stream, layers: []MoeLayerWeights) !void {
+    var data: [4 * 2560]f32 = undefined;
+    for (&data, 0..) |*v, i| {
+        const centered: i32 = @as(i32, @intCast(i % 127)) - 63;
+        v.* = @as(f32, @floatFromInt(centered)) / 32.0;
+    }
+    const x32 = mlx.mlx_array_new_data(&data, &.{ 4, 2560 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+    var x3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x3);
+    try mlx.check(mlx.mlx_reshape(&x3, x, &.{ 4, 1, 2560 }, 3, s));
+    var lhs_data: [40]u32 = undefined;
+    var ids_data: [40]u32 = undefined;
+    for (&lhs_data, &ids_data, 0..) |*lhs_row, *id, i| {
+        lhs_row.* = @intCast(i % 4);
+        id.* = @intCast(i / 5);
+    }
+    const lhs = mlx.mlx_array_new_data(&lhs_data, &.{40}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(lhs);
+    const ids = mlx.mlx_array_new_data(&ids_data, &.{40}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+
+    for (layers) |layer| {
+        const mw = layer.mlp.moe;
+        var gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate);
+        try gatherExpertMm(&gate, x3, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, lhs, ids, 4, 64, .affine, true, s);
+        var up = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(up);
+        try gatherExpertMm(&up, x3, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs, ids, 4, 64, .affine, true, s);
+        const expected = (try fusedSwiGLU(s, gate, up)) orelse return error.PairedGateUpSelfCheckReferenceDeclined;
+        defer _ = mlx.mlx_array_free(expected);
+        const got = try verifyPairedGateUp(s, x, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs, ids);
+        defer _ = mlx.mlx_array_free(got);
+        var ref2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref2);
+        try mlx.check(mlx.mlx_reshape(&ref2, expected, &.{ 40, 640 }, 2, s));
+        if (!try qsaArraysAllEqual(ref2, got, s)) return error.PairedGateUpSelfCheckMismatch;
+    }
+}
+
+fn verifyPairedGateUp(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    gw: mlx.mlx_array,
+    gsc: mlx.mlx_array,
+    gb: mlx.mlx_array,
+    uw: mlx.mlx_array,
+    usc: mlx.mlx_array,
+    ub: mlx.mlx_array,
+    lhs: mlx.mlx_array,
+    ids: mlx.mlx_array,
+) !mlx.mlx_array {
+    const kernel = blk: {
+        if (verify_paired_gu_kernel) |value| break :blk value;
+        const ins = [_][*:0]const u8{ "x", "gw", "gsc", "gb", "uw", "usc", "ub", "lhs", "ids", "sigtab" };
+        const outs = [_][*:0]const u8{"y"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const value = mlx.mlx_fast_metal_kernel_new("verify_paired_gateup_q4g64", iv, ov, VERIFY_PAIRED_GU_SOURCE, VERIFY_PAIRED_GU_HEADER, true, false);
+        if (value.ctx == null) return error.MetalKernelCompileFailed;
+        verify_paired_gu_kernel = value;
+        break :blk value;
+    };
+    const cfg = blk: {
+        if (verify_paired_gu_config) |value| break :blk value;
+        const value = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ 40, 640 }, 2, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, 80 * 64, 40, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 64, 1, 1));
+        verify_paired_gu_config = value;
+        break :blk value;
+    };
+    const sigtab = try swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+    const inputs = [_]mlx.mlx_array{ x, gw, gsc, gb, uw, usc, ub, lhs, ids, sigtab };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kernel, iv, cfg, s));
+    var result = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_vector_array_get(&result, ov, 0));
+    return result;
+}
+
 const ExpertReuseKey = struct { rows: c_int, n: c_int, k: c_int };
 var verify_expert_reuse_cfgs = QsaCfgCache(ExpertReuseKey, 1){};
 
@@ -42152,6 +42438,75 @@ fn moeRowsSliceRow(s: mlx.mlx_stream, x: mlx.mlx_array, i: c_int) !mlx.mlx_array
     errdefer _ = mlx.mlx_array_free(sq);
     try mlx.check(mlx.mlx_squeeze(&sq, sl, s));
     return sq;
+}
+
+test "qwen4 verify paired gate-up preserves the sorted q4 g64 gather and SwiGLU bits" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x419475);
+    const rnd = prng.random();
+    swiglu_fused_override = true;
+    defer swiglu_fused_override = null;
+    const E: c_int = 8;
+    const M: c_int = 4;
+    const TOPK: c_int = 10;
+    const H: c_int = 2560;
+    const N: c_int = 640;
+    const gs: u32 = 64;
+    const gate = try moeRowsAffineBank(s, rnd, E, N, H, 4, gs);
+    defer {
+        _ = mlx.mlx_array_free(gate.w);
+        _ = mlx.mlx_array_free(gate.sc);
+        _ = mlx.mlx_array_free(gate.bi);
+    }
+    const up = try moeRowsAffineBank(s, rnd, E, N, H, 4, gs);
+    defer {
+        _ = mlx.mlx_array_free(up.w);
+        _ = mlx.mlx_array_free(up.sc);
+        _ = mlx.mlx_array_free(up.bi);
+    }
+    const x32 = try allocator.alloc(f32, @intCast(M * H));
+    defer allocator.free(x32);
+    for (x32) |*v| v.* = (rnd.float(f32) - 0.5) * 3.0;
+    const x_host = mlx.mlx_array_new_data(x32.ptr, &.{ M, H }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x_host);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x_host, .bfloat16, s));
+    var x3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x3);
+    try mlx.check(mlx.mlx_reshape(&x3, x, &.{ M, 1, H }, 3, s));
+
+    var lhs_data: [M * TOPK]u32 = undefined;
+    var ids_data: [M * TOPK]u32 = undefined;
+    for (&lhs_data, &ids_data, 0..) |*row, *id, i| {
+        row.* = @intCast(i % M);
+        id.* = @intCast(i / 5);
+    }
+    const lhs = mlx.mlx_array_new_data(&lhs_data, &.{M * TOPK}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(lhs);
+    const ids = mlx.mlx_array_new_data(&ids_data, &.{M * TOPK}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+
+    var g3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g3);
+    try gatherExpertMm(&g3, x3, gate.w, gate.sc, gate.bi, lhs, ids, 4, gs, .affine, true, s);
+    var up3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up3);
+    try gatherExpertMm(&up3, x3, up.w, up.sc, up.bi, lhs, ids, 4, gs, .affine, true, s);
+    const reference = (try fusedSwiGLU(s, g3, up3)) orelse return error.FusedSwigluDeclined;
+    defer _ = mlx.mlx_array_free(reference);
+    const got = try verifyPairedGateUp(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, lhs, ids);
+    defer _ = mlx.mlx_array_free(got);
+    const count: usize = @intCast(M * TOPK * N);
+    const expected_host = try allocator.alloc(f32, count);
+    defer allocator.free(expected_host);
+    const got_host = try allocator.alloc(f32, count);
+    defer allocator.free(got_host);
+    try testReadF32(reference, expected_host, s);
+    try testReadF32(got, got_host, s);
+    try testing.expectEqualSlices(f32, expected_host, got_host);
 }
 
 test "moe decode dispatch: rows vs sorted vs gatherQmv" {
@@ -60795,4 +61150,27 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         std.debug.print("[single-verify-exact] context={d} width={d} calls={any}\n", .{ prefix_len, width, after });
         position += width;
     }
+}
+
+test "groupedRmsNorm normalizes each channel group on its own rms" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const xs = [_]f32{ 1, 1, 1, 1, 3, 3, 3, 3 };
+    const ws = [_]f32{ 2, 2, 2, 2, 1, 1, 1, 1 };
+    const x_shape = [_]c_int{ 1, 1, 8 };
+    const w_shape = [_]c_int{8};
+    const x = mlx.mlx_array_new_data(&xs, &x_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const w = mlx.mlx_array_new_data(&ws, &w_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var ones_cache: ?mlx.mlx_array = null;
+    defer if (ones_cache) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    const out = try groupedRmsNorm(x, w, 2, 1e-6, &ones_cache, s);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    const got = mlx.mlx_array_data_float32(out).?[0..8];
+    const want = [_]f32{ 2, 2, 2, 2, 1, 1, 1, 1 };
+    for (got, want) |g, e| try std.testing.expectApproxEqAbs(e, g, 1e-4);
 }

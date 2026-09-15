@@ -2456,9 +2456,14 @@ struct ChatDetailView: View {
                                             appState.showSettings()
                                         }
                                     },
-                                    onDelete: {
-                                        appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    },
+                                    // Your message goes alone. A reply takes
+                                    // the model's turn above it with it, and
+                                    // only where the transcript can be cut.
+                                    onDelete: m.role == .user
+                                        ? { deleteKeepingPlace { appState.deleteMessage(in: sessionId, messageId: m.id) } }
+                                        : ChatTurn.footerDeletes(m, isLast: m.id == session?.messages.last?.id)
+                                            ? { deleteTurn(endingAt: m.id) }
+                                            : nil,
                                     // Both roles are editable, and they mean
                                     // different things. Editing YOUR message
                                     // is a re-ask: the turns after it answered
@@ -2513,6 +2518,16 @@ struct ChatDetailView: View {
                                             ownedHandles: owned,
                                             sessionId: sessionId).id(call.id)
                             }
+                        }
+                        // A property of the transcript's END, not of a row: the
+                        // turn stopped on something that carries no footer.
+                        if let last = session?.messages.last,
+                           ChatTurn.needsEndFooter(session?.messages ?? [],
+                                                   turnInFlight: composerState == .generatingHere) {
+                            TurnEndFooter(
+                                endedAt: last.timestamp,
+                                onRegenerate: canRegenerate ? { regenerateLastResponse() } : nil,
+                                onDelete: { deleteTurn(endingAt: last.id) })
                         }
                         // Live media generation, under the tool-call row that
                         // started it. These block chat decode on the one GPU for
@@ -3477,6 +3492,18 @@ struct ChatDetailView: View {
         .padding(.bottom, 4)
     }
 
+    /// A delete shortens the transcript at or above the control that asked for
+    /// it, so it rides the resize bracket a fold uses.
+    private func deleteKeepingPlace(_ change: @escaping () -> Void) {
+        applyScroll(.rowWillResize)
+        change()
+        DispatchQueue.main.async { DispatchQueue.main.async { applyScroll(.rowDidResize) } }
+    }
+
+    private func deleteTurn(endingAt id: UUID) {
+        deleteKeepingPlace { appState.deleteTurn(in: sessionId, endingAt: id) }
+    }
+
     private func cutTranscriptWindow() {
         windowSession = sessionId
         firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
@@ -4360,8 +4387,10 @@ struct MessageBubble: View {
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .contextMenu {
-            Button("Copy Message") { copyMessage() }
-            if onEdit != nil {
+            if !message.content.isEmpty {
+                Button("Copy Message") { copyMessage() }
+            }
+            if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
                 // question, editing the model's rewrites what it said.
                 Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
@@ -4376,7 +4405,8 @@ struct MessageBubble: View {
                 Button("Branch Chat From Here", action: onFork)
             }
             if onDelete != nil {
-                Button("Delete Message", role: .destructive) { onDelete?() }
+                // A reply takes the model's whole turn with it (`ChatTurn`).
+                Button(message.role == .user ? "Delete Message" : "Delete Turn", role: .destructive) { onDelete?() }
             }
         }
     }
@@ -4539,10 +4569,8 @@ struct MessageBubble: View {
 
     // MARK: - Footer (timestamp · actions · stats)
 
-    private var showsFooter: Bool {
-        message.role == .assistant && !message.isStreaming
-            && !message.isAgentSummary && !message.content.isEmpty
-    }
+    /// One predicate with the transcript's end footer, which is its negation.
+    private var showsFooter: Bool { ChatTurn.hasOwnFooter(message) }
 
     /// Left-aligned strip under a reply: time, actions, speed. Always visible,
     /// unlike the user turn's row: Regenerate and Continue have no other home.
@@ -4577,12 +4605,15 @@ struct MessageBubble: View {
             }
 
             HStack(spacing: 2) {
-                footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                // A generated picture has a footer and no text to copy or edit.
+                if !message.content.isEmpty {
+                    footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
                 // to open on a paragraph.
-                if onEdit != nil, message.role == .assistant {
+                if onEdit != nil, message.role == .assistant, !message.content.isEmpty {
                     footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
                         startEditing()
                     }
@@ -4602,7 +4633,7 @@ struct MessageBubble: View {
                                  action: onRegenerate)
                 }
                 if let onDelete {
-                    footerButton("trash", help: "Delete this message from the conversation",
+                    footerButton("trash", help: "Delete this turn from the conversation",
                                  action: onDelete)
                 }
             }
@@ -4652,6 +4683,23 @@ struct MessageBubble: View {
 
     private func footerButton(_ icon: String, help: String, flipped: Bool = false,
                               action: @escaping () -> Void) -> some View {
+        FooterIconButton(icon: icon, help: help, flipped: flipped, action: action)
+    }
+
+    private func copyMessage() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content, forType: .string)
+    }
+}
+
+/// One glyph of a footer's action row.
+private struct FooterIconButton: View {
+    let icon: String
+    let help: String
+    var flipped = false
+    let action: () -> Void
+
+    var body: some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
@@ -4663,10 +4711,32 @@ struct MessageBubble: View {
         .buttonStyle(.plain)
         .help(help)
     }
+}
 
-    private func copyMessage() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.content, forType: .string)
+/// The footer of a turn that ended without a reply to hang one on: cut while
+/// thinking, stopped after a tool result, an error card. Time of the last
+/// thing that happened, and the two ways out — try again, or take the turn
+/// away. It is what the transcript draws after its last row.
+private struct TurnEndFooter: View {
+    let endedAt: Date
+    var onRegenerate: (() -> Void)?
+    let onDelete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            StatPill(text: endedAt.formatted(date: .omitted, time: .shortened),
+                     expanded: endedAt.formatted(date: .numeric, time: .shortened))
+            HStack(spacing: 2) {
+                if let onRegenerate {
+                    FooterIconButton(icon: "arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                     action: onRegenerate)
+                }
+                FooterIconButton(icon: "trash", help: "Delete this turn from the conversation",
+                                 action: onDelete)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
     }
 }
 

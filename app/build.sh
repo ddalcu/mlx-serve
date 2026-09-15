@@ -342,7 +342,8 @@ STAGE_FRAMEWORKS=1
 if [ "$FAST_DEV" = "1" ] \
    && [ -f "$CONTENTS/Frameworks/libmlxc.dylib" ] \
    && [ -f "$CONTENTS/Frameworks/mlx.metallib" ] \
-   && [ ! "$MLX_STAGE_LIB/libmlxc.dylib" -nt "$CONTENTS/Frameworks/libmlxc.dylib" ]; then
+   && [ ! "$MLX_STAGE_LIB/libmlxc.dylib" -nt "$CONTENTS/Frameworks/libmlxc.dylib" ] \
+   && [ ! "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" -nt "$CONTENTS/Frameworks/libllama.dylib" ]; then
     STAGE_FRAMEWORKS=0
     echo "→ Reusing bundled frameworks (FAST_DEV)"
 fi

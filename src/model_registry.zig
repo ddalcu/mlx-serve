@@ -229,6 +229,11 @@ pub const LoadedModel = struct {
     /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
     /// of the MLX path. Mutually exclusive with the safetensors fields.
     ds4_engine: ?*arch_ds4.Ds4Engine = null,
+    /// The ONE ds4 session per model (a 131k-context session is ~13 GB of
+    /// buffers, so one per request starved the box under concurrency). Created
+    /// on first prefill, driven by one slot at a time (`session_busy`), freed
+    /// with the engine.
+    ds4_session: ?*arch_ds4.Ds4Session = null,
 
     /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
     /// when non-null the MLX fields stay null and request handlers route through
@@ -247,7 +252,7 @@ pub const LoadedModel = struct {
     video_engine: ?*gen_mod.VideoEngine = null,
     mesh_engine: ?*gen_mod.MeshEngine = null,
     /// Model-wide serialization gate for media generation — mirrors
-    /// `llama_session_busy`. A gen runs to completion on the inference thread
+    /// `session_busy`. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
     gen_busy: bool = false,
@@ -261,7 +266,7 @@ pub const LoadedModel = struct {
     /// dispatches each incoming prompt to the entry whose resident KV
     /// shares the longest prefix.
     ///
-    /// `llama_session_busy` remains a model-wide gate — `max_concurrent=1`
+    /// `session_busy` remains a model-wide gate — `max_concurrent=1`
     /// today means only one llama request runs at a time anyway, and
     /// adding per-entry concurrency would require an inference-thread
     /// refactor we intentionally don't ship tonight.
@@ -273,7 +278,10 @@ pub const LoadedModel = struct {
     /// `LoadParams.llama_cache_entries` at load time. 0 falls back to 1
     /// for safety — every llama prefill needs at least one session.
     llama_cache_max_entries: u32 = 1,
-    llama_session_busy: bool = false,
+    /// Model-wide claim on the persistent engine session (llama pool or
+    /// `ds4_session`): one request drives it at a time, taken in
+    /// `Scheduler.submit`, released in `complete`.
+    session_busy: bool = false,
     /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
     /// cache. 0 = libllama default (F16). Non-zero values are pulled from
     /// `LoadParams.llama_kv_type_{k,v}` at load time and read by
@@ -368,7 +376,11 @@ pub const LoadedModel = struct {
     pub fn deinit(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.deinit(self.allocator);
-        self.llama_session_busy = false;
+        self.session_busy = false;
+        if (self.ds4_session) |session| {
+            session.free();
+            self.ds4_session = null;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
@@ -530,7 +542,11 @@ pub const LoadedModel = struct {
     pub fn unloadResident(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.clearRetainingCapacity();
-        self.llama_session_busy = false;
+        self.session_busy = false;
+        if (self.ds4_session) |session| {
+            session.free();
+            self.ds4_session = null;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;

@@ -1090,6 +1090,42 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
+    // ── K2-Horizon (IFM) ────────────────────────────────────────────────
+    // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
+    // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
+    // inside a bare plural wrapper. Thinking is template-opened
+    // (`…assistant\n<ifm|think>\n`, decoded `<think>`).
+    .{
+        .family = "k2_horizon",
+        .name = "plural wrapper around newline-separated arg pairs",
+        .raw = "I'll check the weather.\n<tool_calls>\n<tool_call>get_weather\n" ++
+            "<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n" ++
+            "<arg_key>celsius</arg_key>\n<arg_value>true</arg_value>\n" ++
+            "</tool_call>\n</tool_calls>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "k2_horizon",
+        .name = "template-opened thought, then two calls in one wrapper",
+        .raw = "Two reads are needed.</think>\n<tool_calls>\n" ++
+            "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n</tool_call>\n" ++
+            "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>b.txt</arg_value>\n</tool_call>\n" ++
+            "</tool_calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = write_read_tools_schema,
+        .reasoning_contains = "Two reads",
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
     .{
         .family = "glm-bare",
         .name = "back-to-back calls with no wrapper each keep their own args",
@@ -1717,6 +1753,16 @@ const corpus = [_]Expect{
         .tool_name = "write_file",
         .tool_arg_key = "path",
         .tool_arg_value = "a.txt",
+    },
+    .{
+        // LIVE capture 2026-09-14 (K2-Horizon 7B, llmprobe agentic): a GLM
+        // call to a PARAMETERLESS tool has no <arg_key>, the one signal the
+        // GLM route keyed on, so it fell to the Hermes path and vanished.
+        .family = "k2",
+        .name = "GLM call with a bare name and no arguments",
+        .raw = "<tool_calls>\n<tool_call>list_files\n</tool_call>\n</tool_calls>",
+        .tool_name = "list_files",
+        .tool_count = 1,
     },
 };
 

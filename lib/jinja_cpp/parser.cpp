@@ -429,8 +429,24 @@ private:
             bool negate = false;
             if (is_identifier("not")) { ++current; negate = true; }
             auto test_id = parse_primary_expression();
-            // FIXME: tests can also be expressed like this: if x is eq 3
-            if (is(token::open_paren)) test_id = parse_call_expression(std::move(test_id));
+            if (is(token::open_paren)) {
+                test_id = parse_call_expression(std::move(test_id));
+            } else if (is_type<identifier>(test_id)) {
+                // `x is sameas true`, `x is divisibleby 3`: the argument-taking
+                // tests accept one bare primary after the test name.
+                const std::string & name = cast_stmt<identifier>(test_id)->val;
+                static const char * const with_arg[] = {
+                    "sameas", "divisibleby", "equalto", "eq", "ne", "lt", "le", "gt", "ge",
+                    "greaterthan", "lessthan", "in",
+                };
+                bool takes_arg = false;
+                for (auto n : with_arg) if (name == n) takes_arg = true;
+                if (takes_arg && !is(token::close_statement) && !is(token::close_expression)) {
+                    statements args;
+                    args.push_back(parse_primary_expression());
+                    test_id = mk_stmt<call_expression>(start_pos, std::move(test_id), std::move(args));
+                }
+            }
             operand = mk_stmt<test_expression>(start_pos, std::move(operand), negate, std::move(test_id));
         }
         return operand;

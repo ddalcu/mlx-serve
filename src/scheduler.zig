@@ -388,11 +388,15 @@ pub const NextResult = union(enum) {
 };
 
 fn firstMediaPlaceholder(
+    has_media: bool,
     tokens: []const u32,
     image_token_id: u32,
     audio_token_id: u32,
     video_token_id: u32,
 ) ?usize {
+    // The placeholder ids are ordinary vocabulary entries, so a text-only
+    // prompt can contain one; a boundary exists only where media rows do.
+    if (!has_media) return null;
     for (tokens, 0..) |token, i| {
         if ((image_token_id > 0 and token == image_token_id) or
             (audio_token_id > 0 and token == audio_token_id) or
@@ -447,9 +451,9 @@ pub const Slot = struct {
     /// Generator (constructed on inference thread post-prefill).
     legacy_gen: ?Generator,
 
-    /// Ds4 session for this slot. Created in `runPrefillDs4` when the slot's
-    /// model is `.ds4_engine`-backed; freed in `Slot.deinit`. Mutually
-    /// exclusive with `legacy_gen` (the MLX `Generator` path).
+    /// ds4 session for this slot, BORROWED from `model.ds4_session` (one
+    /// persistent session per model, claimed via `session_busy`) — never
+    /// freed here. Mutually exclusive with `legacy_gen` (the MLX path).
     ds4_session: ?*arch_ds4.Ds4Session = null,
     /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
     /// by pointer so we keep it on the slot.
@@ -465,10 +469,10 @@ pub const Slot = struct {
     /// dequantized embedding table; freed in `Slot.deinit`. Mutually
     /// exclusive with `legacy_gen` (the autoregressive MLX path).
     diffusion: ?*diffusion_mod.Runner = null,
-    /// True when this slot claimed `model.llama_session_busy` in `submit`. The
+    /// True when this slot claimed `model.session_busy` in `submit`. The
     /// single persistent context serves one request at a time; the claim is
     /// released in `complete()`. Tracked per-slot so only the holder releases.
-    llama_holds_session: bool = false,
+    holds_session: bool = false,
     /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
     llama_rng: u64 = 0,
 
@@ -645,6 +649,7 @@ pub const Slot = struct {
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
         const media_start = firstMediaPlaceholder(
+            params.vision_embeddings != null,
             full_prompt_owned,
             config.image_token_id,
             config.audio_token_id,
@@ -758,10 +763,10 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        if (self.ds4_session) |session| {
-            session.free();
-            self.ds4_session = null;
-        }
+        // ds4_session / llama_session are borrowed from the model (persistent
+        // across requests) — never freed here. The claim on them is released
+        // in Scheduler.complete; the sessions die with the model.
+        self.ds4_session = null;
         // llama_session is borrowed from model.llama_session (persistent across
         // requests) — do NOT free it here. The claim on it is released in
         // Scheduler.complete; the session itself is freed with the model.
@@ -1430,7 +1435,7 @@ pub const Scheduler = struct {
     submit_cond: std.Io.Condition,
     /// Signaled when a persistent engine session (llama) is released in
     /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
-    /// `queue_mu` together with `LoadedModel.llama_session_busy`.
+    /// `queue_mu` together with `LoadedModel.session_busy`.
     session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
@@ -1698,27 +1703,27 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        // Persistent-session engines (llama) reuse one KV context across
+        // Persistent-session engines (llama, ds4) reuse one KV context across
         // requests, so only one request may drive it at a time. Block here until
         // the model's session is free, then claim it (released in `complete`).
-        // ds4 keeps a per-slot session, so it isn't gated. This serializes
-        // concurrent llama requests (v1 scope) without spinning the inference
-        // thread, and lets the next request reuse the previous one's prompt KV.
-        if (params.model.llama_engine != null) {
-            while (params.model.llama_session_busy and !self.shutdown.load(.acquire)) {
+        // This serializes concurrent embedded-engine requests without spinning
+        // the inference thread, and lets the next request reuse the previous
+        // one's prompt KV.
+        if (params.model.llama_engine != null or params.model.ds4_engine != null) {
+            while (params.model.session_busy and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
             }
             if (self.shutdown.load(.acquire)) return error.Shutdown;
-            params.model.llama_session_busy = true;
-            slot.llama_holds_session = true;
+            params.model.session_busy = true;
+            slot.holds_session = true;
         }
 
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
-            if (slot.llama_holds_session) {
-                params.model.llama_session_busy = false;
-                slot.llama_holds_session = false;
+            if (slot.holds_session) {
+                params.model.session_busy = false;
+                slot.holds_session = false;
                 self.session_cond.broadcast(self.io);
             }
             return err;
@@ -1769,9 +1774,9 @@ pub const Scheduler = struct {
         // the next queued llama request can claim it AND reuse the KV prefix the
         // session now holds. Done before enqueueing cleanup so a waiting
         // submitter can proceed immediately.
-        if (slot.llama_holds_session) {
-            slot.model.llama_session_busy = false;
-            slot.llama_holds_session = false;
+        if (slot.holds_session) {
+            slot.model.session_busy = false;
+            slot.holds_session = false;
             self.session_cond.broadcast(self.io);
         }
 
@@ -2513,6 +2518,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
+    config.mtp_acceptance_override = o.mtp_acceptance;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -2730,8 +2736,10 @@ const DS4_MTP_MAX_TOKENS: usize = 17;
 /// size only when `--dspark` armed the runtime — so a `has_mtp` conjunct
 /// (false for DSpark by design) would leave DSpark unreachable, the
 /// dispatch-hole class. Pure + unit-tested; mirrors ds4's own CLI gate.
-fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32) bool {
-    return draft_tokens > 1 and temperature <= 0.0;
+/// A support-GGUF draft (legacy MTP head, DSpark) verifies by argmax, so it
+/// serves greedy requests only; the in-checkpoint head has a sampled arm.
+fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32, embedded: bool) bool {
+    return draft_tokens > 1 and (temperature <= 0.0 or embedded);
 }
 
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
@@ -2754,6 +2762,8 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
         .dspark = params.ds4_dspark,
+        .embedded_mtp = params.ds4_mtp and !params.ds4_ssd_streaming and
+            arch_ds4.ggufDeclaresEmbeddedMtp(sch.io, sch.allocator, params.ds4_path),
     });
     errdefer engine.close();
     // draft_tokens is the spec-readiness signal for BOTH support kinds
@@ -3988,6 +3998,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 1 << 20,
                 cfg.has_sliding_window,
                 cfg.isMoe(),
+                cfg.longCtxGated(),
                 pinned,
             ));
             xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
@@ -5333,12 +5344,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
-/// ds4 prefill: create a session sized to the configured ctx and sync it to
-/// the full prompt. ds4 internally reuses the common prefix between its live
-/// session cache and the new prompt, so the mlx-serve hot prefix cache stays
-/// out of the picture. `slot.prompt_tokens` reports the full prompt length;
-/// `cached_tokens` is left at 0 (ds4 doesn't expose its per-session reuse
-/// count back through the FFI).
+/// ds4 prefill: sync the model's ONE persistent session to the full prompt.
+/// ds4 keeps the common prefix against the session's live KV (the previous
+/// request's prompt + reply) and rebuilds only the tail, so the mlx-serve hot
+/// prefix cache stays out of the picture. `cached_tokens` is that prefix.
 fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !void {
     _ = sch;
     // Convert the slot's u32 prompt to ds4's i32 view. Sized once per
@@ -5354,14 +5363,22 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     // ds4's default. Larger ctx → larger KV scratch up front.
     const req_ctx: u32 = if (slot.model.config) |c| c.max_position_embeddings else 0;
     const ctx_size: i32 = @intCast(arch_ds4.clampSessionCtx(req_ctx));
-    var sess = try engine.createSession(ctx_size);
-    errdefer sess.free();
+    const sess = slot.model.ds4_session orelse blk: {
+        const created = try engine.createSession(ctx_size);
+        slot.model.ds4_session = created;
+        break :blk created;
+    };
 
-    try sess.sync(i32_prompt);
+    const cached = sess.commonPrefix(i32_prompt) catch 0;
+    sess.sync(i32_prompt) catch |err| {
+        // Leave nothing half-built behind for the next request.
+        sess.invalidate();
+        return err;
+    };
 
     slot.ds4_session = sess;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
-    slot.cached_tokens = 0;
+    slot.cached_tokens = @intCast(@max(cached, 0));
     slot.state = .decoding;
 }
 
@@ -5505,12 +5522,17 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     // verifies several more, advancing ds4's KV internally (no separate eval).
     // It emits `[sampled, accepted…]`, so this tick may push several tokens.
     // Mirrors ds4's own CLI loop; engages only under greedy sampling.
-    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature)) {
+    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature, engine.embedded_mtp)) {
         var spec_buf: [DS4_MTP_MAX_TOKENS]i32 = undefined;
         const done: i64 = @intCast(slot.completion_tokens);
         const cap: i64 = @intCast(slot.max_tokens);
         const remaining: i32 = @intCast(@max(@as(i64, 1), cap - done));
-        const n = session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..]) catch {
+        const spec = if (slot.sampling.temperature <= 0.0)
+            session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
+        else
+            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+        const n = spec catch {
+            session.invalidate();
             slot.markError("ds4_spec_failed");
             return;
         };
@@ -5539,7 +5561,10 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
 
     // Advance ds4's KV by feeding the freshly-sampled token. After this
     // the session is in the state expected by the NEXT decode tick.
-    try session.eval(next_id);
+    session.eval(next_id) catch |err| {
+        session.invalidate();
+        return err;
+    };
 
     if (slot.completion_tokens >= slot.max_tokens) {
         finishSlot(sch, slot, "length");
@@ -5555,14 +5580,17 @@ test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
     // (ds4_engine_mtp_draft_tokens) — a has_mtp conjunct here would leave
     // DSpark (has_mtp=false by design) permanently unreachable, the
     // engagement-blind dispatch-hole class.
-    try std.testing.expect(ds4MtpShouldEngage(4, 0.0));
-    try std.testing.expect(ds4MtpShouldEngage(2, -1.0));
+    try std.testing.expect(ds4MtpShouldEngage(4, 0.0, false));
+    try std.testing.expect(ds4MtpShouldEngage(2, -1.0, false));
     // DSpark block size (e.g. 16) engages the same way.
-    try std.testing.expect(ds4MtpShouldEngage(16, 0.0));
+    try std.testing.expect(ds4MtpShouldEngage(16, 0.0, false));
     // No ready draft (0), or 1 draft token, or sampling → regular decode.
-    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7));
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7, false));
+    // The in-checkpoint head (Qwen3.8 Flash Next, GLM 5.x) drafts under sampling too.
+    try std.testing.expect(ds4MtpShouldEngage(2, 0.7, true));
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.7, true));
 }
 
 /// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
@@ -6243,6 +6271,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
+            .mtp_acceptance = slot.model.config.?.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
@@ -6969,11 +6998,11 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
     const tokens = [_]u32{ 0, 11, 22, 33, 44 };
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
-    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
-    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
-    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(true, &tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(true, &tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(true, &tokens, 0, 0, 0) == null);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
@@ -9732,4 +9761,14 @@ test "transition pricing skips the first realized round after prime or width cha
     try testing.expect(!plannerPriceTransition(1, 1, false));
     try testing.expect(plannerPriceTransition(1, 2, false));
     try testing.expect(!plannerPriceTransition(2, 0, true));
+}
+
+test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {
+    // The ids are ordinary vocabulary entries, so a text-only prompt can carry
+    // one (live: a pasted source file held 248056 at index 18338 of a 73k
+    // prompt). A media boundary exists only where media rows do.
+    const image_id: u32 = 248056;
+    const text_only = [_]u32{ 7, 8, image_id, 9 };
+    try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }

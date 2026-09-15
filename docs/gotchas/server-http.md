@@ -1547,6 +1547,15 @@ First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 5
 
 `scheduler.modelDiskBytes` summed every `*.safetensors` in the directory. A third-party gemma-4 E4B pack shipped two shards no `weight_map` entry references; the bill was 2x the loaded size, so loading a small image model evicted the chat model. The index is the truth when present: `indexShardSet` reads `model.safetensors.index.json` and only named shards count. Guard: `test "modelDiskBytes bills only the shards the index names (issue #274)"`.
 
+
+## The SSD tier refused a volume with 117 GB usable (2026-09-14)
+
+`kv_disk_cache.volumeSpace` read `statfs.f_bavail`, which is what `df` prints and which excludes the purgeable space macOS frees on demand. The release box showed 36 GB free by df and 117 GB by Finder, so the tier declined every persist under its 64 GiB reserve and the Flash-Next SSD-first soak restored nothing after a restart. Fix: one ObjC probe, `msv_volume_free_for_use(path)`, returns `volumeAvailableCapacityForImportantUsage`; `volumeSpace` reports that as `free` (statfs stays the fallback and the total) and the ANE compile-cache cap reads the same probe. Guard: `test "volumeSpace: free is what the OS grants"` (red on this box: 117 GB expected, 36 GB found).
+
+## A stale index refused a complete pack (2026-09-14)
+
+The #274 filter trusted `model.safetensors.index.json` unconditionally. `mlx-community/gemma-3-12b-it-4bit` was re-sharded on the Hub from five shards to two, and a download made across that change carried the old index: every named shard was absent, both real shards were "not named by the index", the preflight billed 0.00 GB and the load failed `NoWeightFiles` as an "incomplete download". Shipped 26.8.11 through 26.9.2; found by the release smoke matrix. Fix: `indexShardSet` returns null when none of the shards it names exists in the directory (one warning), so both the loader and `modelDiskBytes` fall back to every `*.safetensors`. A partially present index still filters; a missing tensor is still a named load error (#217). Guard: `test "loadWeights ignores an index that names no shard on disk"`.
+
 ## The edit form dropped LoRA fields (issue #268, 2026-08-28)
 
 `gen.openaiEditFormToJson` rebuilds the multipart body into the JSON `mode:"edit"` request field by field; `lora_paths`/`lora_scales` were not in the list, so a client attaching adapters through the OpenAI surface got an un-adapted edit with a 200. Now forwarded verbatim (array forms as raw JSON text, scalar `lora_path` JSON-escaped) so `parseLoraFields` sees the same body the native endpoint would. Guard: the lora case in `test "openaiEditFormToJson: OpenAI multipart becomes our edit request"`.
@@ -2114,3 +2123,47 @@ Fix: `json_grammar` counts consecutive free-whitespace bytes (`ws_run`, carried 
 snapshots) and rejects past `MAX_FREE_WS` (16) between tokens and after the root, so
 the mask forces the next structural byte. Content is never constrained by it, only
 formatting. Guard: `free whitespace is capped so a masked model cannot idle forever`.
+
+## ds4 sessions were per request; embeddings segfaulted on an engine-backed model (2026-09-14)
+
+llmprobe against Qwen3.8-Flash-Next-Q2 through the embedded ds4 engine died with a
+bare `Killed: 9` a few minutes in, no crash report, at a different request each run.
+It was memory: `runPrefillDs4` created a fresh `ds4_session` per request and freed it
+in `Slot.deinit`, and at `--ctx-size 131072` each session is ~13 GB of context
+buffers. With `--max-concurrent 4` the concurrent phases of the suite held four of
+them (RSS 41 → 97 GB, free RAM 0.07 GB) until the kernel killed the process. The
+per-request session also meant ds4's own prompt-prefix reuse never fired
+(`cached_n=0` on every request).
+
+Fix: one persistent `LoadedModel.ds4_session`, created on first prefill, freed with
+the engine, driven by one slot at a time through the same `session_busy` claim the
+llama engine uses in `Scheduler.submit`/`complete`. Sync errors invalidate it so the
+next request rebuilds cold. A repeated prompt now reports the reused prefix.
+
+With that fixed the run reached `POST /v1/embeddings`, and `runEmbedRequest`
+unwrapped the null MLX transformer (ReleaseFast: SIGSEGV). `handleEmbeddings` now
+refuses engine-backed models by name before anything is queued.
+
+Guard: `tests/test_ds4_serve.sh` (repeat prompt reports `cached_tokens` > 0;
+embeddings return a named 400 and the server stays up).
+
+## A placeholder id in ordinary text capped every SSD restore (2026-09-15)
+
+Qwen3.8-Flash-Next, a text-only 73k-token chat whose pastes were repo sources: after a
+restart the SSD tier restored 16,384 of 73,398 tokens in 34 s where the RAM tier had
+matched 73,293. Every mid-session disk restore in that log landed on the same low
+checkpoint too, at prompt lengths from 61k to 229k.
+
+Cause: `scheduler.firstMediaPlaceholder` scanned the prompt for `image/audio/video_token_id`
+unconditionally. Those are ordinary vocabulary entries — this conversation held 248056 at
+index 18338 — so a text-only request got `media_start = 18338`, which is the disk lookup's
+`limit`. The donor whose checkpoints covered the whole prefix has none below 18338, so it
+was skipped entirely and a stale entry with a checkpoint at 16384 won. The tier itself was
+correct: replayed offline against the same files it picks the right entry.
+
+Fix: the helper takes `has_media` (`params.vision_embeddings != null`) and answers null
+without it — a boundary exists only where media rows do. The same value keys the commit's
+media state, so text entries no longer carry a bogus boundary into checkpoint inheritance
+and thinning. Live: 16,384/73,398 in 34.2 s becomes 73,293/73,375 in 1.6 s.
+
+Guard: `firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary`.

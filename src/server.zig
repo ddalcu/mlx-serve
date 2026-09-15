@@ -1156,6 +1156,22 @@ fn templateThinkOpener(template: []const u8) ?[]const u8 {
     return found;
 }
 
+/// The aliased atomic closer for the last non-whitespace prompt token, when
+/// that token is a K2 think opener (`Tokenizer.markerCloserFor`).
+fn promptOpenerMarkerCloser(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) ?u32 {
+    if (tok.marker_closers == null) return null;
+    var i = prompt_ids.len;
+    while (i > 0 and prompt_ids.len - i < 8) {
+        i -= 1;
+        const id = prompt_ids[i];
+        if (tok.markerCloserFor(id)) |closer| return closer;
+        const text = decodeTokens(allocator, lm, tok, prompt_ids[i..][0..1], false) catch return null;
+        defer allocator.free(text);
+        if (std.mem.trim(u8, text, "\n\r\t ").len != 0) return null;
+    }
+    return null;
+}
+
 /// Resolve a reasoning protocol from the rendered prompt and template. Tokenizer
 /// indexes and exact recovery suffixes are cached on the loaded model.
 fn resolveReasoningProtocol(
@@ -1195,6 +1211,14 @@ fn resolveReasoningProtocol(
             .bare => {
                 proto.kind = .bare_think;
                 if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
+                // K2 decodes its openers as `<think>` (alias); the prompt's
+                // opener token names the pack's own closer, and only that
+                // spelling is the boundary (a literal `</think>` in the
+                // reasoning is text).
+                if (promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids)) |id| {
+                    const text = tok.id_to_token.get(id) orelse return false;
+                    if (!proto.setCloser(text)) return false;
+                }
             },
             .suffixed => |suffix| {
                 proto.kind = .suffixed_think;
@@ -3974,6 +3998,7 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         billed,
     ));
 
@@ -4018,6 +4043,25 @@ fn qwen4RequestTestConfig() model_mod.ModelConfig {
     return cfg;
 }
 
+/// The geometry the served pack actually ships (`Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`):
+/// a narrower expert with a shared one beside it, and the GatedDeltaNet head counts
+/// `qwen4RequestTestConfig` leaves at zero. Both chunk-scaled terms of the bill read them, so
+/// the fixture's step is not the deployed one.
+fn qwen4DeployedTestConfig() model_mod.ModelConfig {
+    var cfg = qwen4RequestTestConfig();
+    cfg.moe_intermediate_size = 640;
+    cfg.num_experts_per_tok = 10;
+    cfg.shared_expert_intermediate_size = 640;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    return cfg;
+}
+
 test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
     const saved = transformer_mod.qsa_score_fused_override;
     defer transformer_mod.qsa_score_fused_override = saved;
@@ -4028,14 +4072,7 @@ test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
 
 /// The width a ladder rung actually forwards at for this prompt.
 fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
-    return @intCast(generate_mod.effectivePrefillChunk(
-        cfg.prefillScoreHeadDim(),
-        cfg.num_attention_heads,
-        @intCast(seq),
-        cfg.has_sliding_window,
-        cfg.isMoe(),
-        rung,
-    ));
+    return @intCast(rungWidth(cfg, seq, rung, cfg.longCtxGated()));
 }
 
 test "the load-time budget is reproducible: free RAM at load does not move it" {
@@ -4159,6 +4196,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
         0,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     try t.expect(perRequestPrefillChunkEnabled(&cfg));
@@ -4266,6 +4304,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
         0,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
@@ -4489,9 +4528,9 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     const available: u64 = 28_909 * MiB;
     const pin = cfg.pinned_prefill_chunk;
 
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
     try t.expect(4096 > pin);
 
     // The full 1M context fits at 4096 on this box under the one-copy history bill.
@@ -4527,12 +4566,17 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     var distinct: usize = 0;
     for (PREFILL_CHUNK_LADDER) |rung| {
         const width = widthForRung(&cfg, seq, rung);
-        if (width == prev_width) continue; // rungs 8192 and 4096 both forward at 4096
+        if (width == prev_width) continue; // a rung this arch narrows onto a width already walked
         prev_width = width;
         distinct += 1;
         const bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, width, .{});
-        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0, .{}));
-        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0, .{});
+        // A rung the long-context gate widened is taken only past its margin.
+        const needed = if (width > rungWidth(&cfg, seq, rung, false))
+            bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
+        else
+            bill;
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, 0, .{}));
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, 0, .{});
         if (width == floor_width) {
             try t.expectEqual(floor_width, under);
         } else {
@@ -4543,6 +4587,67 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
 
     // Nothing fits: the ladder floor, never 0 and never the load-time pin.
     try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+}
+
+test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by the estimator's margin" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const pin = cfg.pinned_prefill_chunk;
+
+    const wide_bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{});
+    const narrow_bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
+    try t.expect(wide_bill > narrow_bill);
+    // 8192 is a width only the gate offers: ungated, this rung forwards at 4096.
+    try t.expectEqual(@as(u32, 8192), widthForRung(&cfg, seq, 8192));
+    try t.expectEqual(@as(u64, 4096), rungWidth(&cfg, seq, 8192, false));
+
+    const with_margin = wide_bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100;
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
+    // The rungs the gate did not widen are still taken at their plain bill.
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 0, .{}));
+}
+
+test "prefillMemoryNeeded: the wider chunk bills every chunk-scaled term at the wider width" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const ffn: u64 = prefillFfnWidth(&cfg);
+    const stream: u64 = prefillStreamBytesPerToken(&cfg);
+    const dq: u64 = prefillDequantWeightBytes(&cfg);
+    const keys: u64 = cfg.prefillAttnKeys(seq);
+
+    const narrow = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, ffn, kv_bits, 4096, keys, stream, dq, .{});
+    const wide = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, ffn, kv_bits, 8192, keys, stream, dq, .{});
+
+    const mlp_step: u64 = 8 * 4096 * @max(@as(u64, cfg.hidden_size), ffn) * 2;
+    const envelope_step: u64 = @max(3 * mlp_step, mlp_step + 4096 * stream);
+    try t.expect(wide >= narrow + envelope_step * 5 / 4);
+    try t.expect(qsaMaskBytes(&cfg, 8192, seq) > qsaMaskBytes(&cfg, 4096, seq));
+}
+
+test "prefillNeededAtChunk: the deployed pack's 8192 step is at least the measured peak step" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4DeployedTestConfig();
+    const kv_bits: u64 = 8;
+
+    for ([_]u64{ 300_000, 326_351 }) |seq| {
+        for ([_]bool{ false, true }) |mtp_on| {
+            const narrow = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{ .mtp_on = mtp_on });
+            const wide = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{ .mtp_on = mtp_on });
+            // The widest active+cache step the 4096 -> 8192 trade measured on this pack was
+            // +3.3 GB; the bill for the step must not sit under what the box pays for it.
+            try t.expect(wide - narrow >= 3_300_000_000);
+        }
+    }
 }
 
 test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
@@ -4710,6 +4815,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         0,
         config.has_sliding_window,
         config.isMoe(),
+        config.longCtxGated(),
         config.pinned_prefill_chunk,
     ));
 
@@ -5374,6 +5480,12 @@ pub fn prefillNeededAtChunk(
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
+/// Headroom a rung must clear beyond its own bill when the long-context gate is what widened
+/// it: past that width the machine cap frozen at load no longer bounds the forward, and
+/// `prefillMemoryNeeded` is documented to UNDER-bill quantized prefill by about this much.
+/// Narrower rungs keep the plain bill, so no other admission decision moves.
+pub const PREFILL_WIDE_RUNG_MARGIN_PCT: u64 = 22;
+
 /// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
 pub var per_request_chunk_override: ?bool = null;
 
@@ -5403,28 +5515,33 @@ pub fn chooseRequestPrefillChunk(
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
     if (chunk_override > 0) return chunk_override;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
-        const width: u64 = @min(
-            @as(u64, generate_mod.effectivePrefillChunk(
-                config.prefillScoreHeadDim(),
-                config.num_attention_heads,
-                @intCast(seq),
-                config.has_sliding_window,
-                config.isMoe(),
-                rung,
-            )),
-            @as(u64, std.math.maxInt(u32)),
-        );
-        if (prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm) <= available) return @intCast(width);
+        const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
+        const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm);
+        const needed = if (width > rungWidth(config, seq, rung, false))
+            bill *| (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
+        else
+            bill;
+        if (needed <= available) return @intCast(width);
     }
-    return @intCast(generate_mod.effectivePrefillChunk(
-        config.prefillScoreHeadDim(),
-        config.num_attention_heads,
-        @intCast(seq),
-        config.has_sliding_window,
-        config.isMoe(),
-        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
-    ));
+    return @intCast(rungWidth(config, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], config.longCtxGated()));
+}
+
+/// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
+/// without the long-context gate, i.e. the width the load-time machine cap still bounds.
+fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
+    // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
+    return @min(
+        @as(u64, generate_mod.effectivePrefillChunk(
+            config.prefillScoreHeadDim(),
+            config.num_attention_heads,
+            @intCast(seq),
+            config.has_sliding_window,
+            config.isMoe(),
+            long_ctx_gated,
+            rung,
+        )),
+        @as(u64, std.math.maxInt(u32)),
+    );
 }
 
 /// Impure wrapper the scheduler reaches through `prefill_request_chunk`, mirroring
@@ -5652,7 +5769,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), chosen));
+        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
@@ -5880,6 +5997,7 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
 fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
     return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
         std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
         std.mem.indexOf(u8, tmpl, "thought") != null or
         std.mem.indexOf(u8, tmpl, "<|channel>") != null;
 }
@@ -7053,10 +7171,12 @@ fn handleEmbeddings(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    // Optional: engine-backed (GGUF/ds4) models have no MLX transformer. The
-    // scheduler path doesn't need it; only the no-scheduler fallback does, and
-    // it guards on this being present.
-    const xfm_opt = lm.transformer;
+    // Engine-backed (GGUF/ds4) models have no MLX transformer and both embed
+    // paths forward through it: refuse by name before anything is queued.
+    const xfm = lm.transformer orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model runs on an embedded engine (GGUF); embeddings are not supported. Load an MLX embedding model instead.", null);
+        return;
+    };
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
     const gen_mod = @import("generate.zig");
@@ -7203,10 +7323,6 @@ fn handleEmbeddings(
             return;
         };
     } else fallback: {
-        const xfm = xfm_opt orelse {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
-            return;
-        };
         break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
             log.err("  embedding error: {}\n", .{err});
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
@@ -21385,6 +21501,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     // Unpinned keeps the launch width — a model the sizer never ran on must
@@ -21396,6 +21513,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         unpinned_prefill_chunk,
     ));
     // An explicit --prefill-chunk outranks the pin in BOTH directions.
@@ -21411,6 +21529,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
 }
@@ -22716,12 +22835,14 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     const kv_bits: u64 = 8;
     const kv: u64 = 524_288;
     const cap = adaptCapFor(&cfg, 524_288);
+    // Starts at half the cap so one widen step lands exactly on the cap.
+    const from: u32 = cap / 2;
     const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
 
     var st: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 1), st.supporting);
-    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
 
     // Room for the wider chunk's bill but not its margin: never.
@@ -22730,15 +22851,15 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     try t.expect(between >= cost_up);
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st2));
+        try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, between, from, cap, &st2));
     }
 
     // A single unsupporting probe resets the run.
     var st3: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, between, from, cap, &st3));
     try t.expectEqual(@as(u8, 0), st3.supporting);
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st3));
 }
 
 test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
@@ -22925,14 +23046,16 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
     const headroom: u64 = at_short * 5 / 4 + 1;
     try t.expect(headroom < at_long * 5 / 4);
 
+    // Starts at half the cap so one widen step lands exactly on the cap.
+    const from: u32 = cap / 2;
     var st_short: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
-    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
 
     var st_long: generate_mod.AdaptiveWidthState = .{};
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, 2048, cap, &st_long));
+        try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, from, cap, &st_long));
     }
     try t.expectEqual(@as(u8, 0), st_long.supporting);
 

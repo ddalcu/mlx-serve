@@ -46,6 +46,7 @@ ARCHES=(
     "nemotron_h|yes|$GD/models-dl/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     "muse_glimmer|yes|$MD/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
     "spark2_5|yes|$MD/abenzerps/Spark-X2.5-4B-MLX-8bit"
+    "k2_horizon|yes|$MD/mlx-community/K2-Horizon-7B-oQ6e"
     "laguna|yes|$GD/models/poolside/Laguna-XS-2.1-NVFP4-mlx"
     "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
     "qwen4_exp|yes|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
