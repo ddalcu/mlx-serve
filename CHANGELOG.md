@@ -22,6 +22,8 @@
 
 ### Changes
 
+- Qwen3.8 Flash Next processes prompts faster by fusing hyper-connection and GatedDeltaNet prefill operations.
+
 - Restarting the server now reuses the whole of a long conversation from the SSD cache again. A text prompt that happened to contain the id the model uses for images made the disk cache treat the conversation as if it began there, so a 73k-token chat resumed from 16k and spent 34 seconds re-reading itself instead of 1.6.
 
 - New app icon. The tray footer is four tiles like the media row, and the power glyph is a red Quit.
