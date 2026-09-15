@@ -1140,6 +1140,13 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
+        // Every production caller swallows our error (the disk tier is best-effort end to
+        // end), and three writers inside can raise: persistSsmCheckpoints, writeChunkFile,
+        // appendSsmOnly. Drop the latch THIS call raised at the one funnel they all pass
+        // through — otherwise the next decode tick's checkErrorDecode charges it to an
+        // unrelated request. `writeSpecSidecar` swallows internally, so it keeps its own pair.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
@@ -1291,7 +1298,8 @@ pub const DiskTier = struct {
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
         var written_bytes: u64 = 0;
         var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
-            chunk_sizes.deinit(self.allocator);
+            // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
+            // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
         };
         errdefer ssm_res.deinit(self.allocator);
@@ -5494,6 +5502,52 @@ test "DiskTier: a head snap with no raw-history tensor drops the head half and a
     defer loaded.snap.deinit();
     try testing.expectEqual(@as(usize, 600), loaded.snap.step);
     try testing.expect(loaded.head_aux == null);
+}
+
+test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a foreign one" {
+    // Bar: the appendCommit funnel's errdefer removes only the error THIS call raised.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-funnel", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+
+    // Arm a LATCHING fault at the N-th checked op after this line; the commit
+    // must reach it (fired) and its errdefer must clear the latched message.
+    mlx.armLatchingFaultForTest(3);
+    try testing.expectError(error.MlxError, tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s));
+    const fired_own = mlx.latchingFaultFiredForTest();
+    const pending_own = mlx.errorPending();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired_own);
+    try testing.expect(!pending_own);
+
+    // A foreign latch predates the call and must survive it untouched.
+    mlx.latchErrorForTest("foreign pre-existing error");
+    mlx.armLatchingFaultForTest(3);
+    _ = tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s) catch {};
+    const fired_foreign = mlx.latchingFaultFiredForTest();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired_foreign);
+    var msg: [512]u8 = undefined;
+    try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
 }
 
 test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {

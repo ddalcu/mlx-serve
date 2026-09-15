@@ -589,11 +589,38 @@ pub const fault = struct {
     }
 };
 
+/// Test-only: like `fault`, but the injected failure also LATCHES the process-wide
+/// error — the state a real mlx-c raise leaves behind, which a best-effort caller
+/// must drop before returning.
+const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+var latch_remaining: u64 = 0;
+var latch_fired = false;
+
+fn latchFaultHit() bool {
+    if (latch_remaining == 0) return false;
+    latch_remaining -= 1;
+    if (latch_remaining != 0) return false;
+    latch_fired = true;
+    return true;
+}
+
+pub fn armLatchingFaultForTest(k: u64) void {
+    latch_remaining = k;
+    latch_fired = false;
+}
+pub fn latchingFaultFiredForTest() bool {
+    return latch_fired;
+}
+
 pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
     if (comptime builtin.is_test) {
         if (fault.hit()) return error.MlxError;
+        if (latchFaultHit()) {
+            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            return error.MlxError;
+        }
     }
 }
 
