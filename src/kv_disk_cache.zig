@@ -1572,6 +1572,11 @@ pub const DiskTier = struct {
     /// can hold a stale draft tail past it) and keyed `d{layer}.*` /
     /// `m{layer}.*` with the trunk chunks' kind suffixes.
     fn writeSpecSidecar(self: *DiskTier, dir_abs: []const u8, dflash: ?SpecCommit, mtp: ?SpecCommit, s: mlx.mlx_stream) !SpecSidecarResult {
+        // Best-effort by contract: the callers log the failure and keep going. The
+        // latch a raise plants is process-wide, so a write we already reported must
+        // drop what it set — or the next decode tick fails an unrelated request.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors\x00", .{dir_abs});
         defer self.allocator.free(path);
         if (dflash == null and mtp == null) {
@@ -1614,8 +1619,10 @@ pub const DiskTier = struct {
                 const sh = mlx.getShape(a.aux_state);
                 break :blk if (sh.len >= 2) sh[1] else 0;
             };
-            const rows_ok = hist == @as(c_int, @intCast(limit)) and
-                (a.aux_state.ctx != null or a.qsa_pooled.ctx != null);
+            // `qsa_rows` reports the checkpoint position even when the raw ring is
+            // gone, so a pooled-only head has no `h.aux` to write: the loader refuses
+            // a head half without it, and an empty array raises inside mlx.
+            const rows_ok = hist == @as(c_int, @intCast(limit)) and a.aux_state.ctx != null;
             if (rows_ok) {
                 try self.insertSpecArray(map, prefix, "h.aux", a.aux_state);
                 if (a.qsa_pooled.ctx != null) try self.insertSpecArray(map, prefix, "h.pooled", a.qsa_pooled);
@@ -5420,6 +5427,73 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     defer kv_only.snap.deinit();
     try testing.expectEqual(@as(usize, 600), kv_only.snap.step);
     try testing.expect(kv_only.head_aux == null);
+}
+
+test "DiskTier: a head snap with no raw-history tensor drops the head half and arms no MLX latch" {
+    // Bar: a pooled-only head (qsa_rows > 0, empty `aux_state`) writes no `h.aux` and leaves the latch clear.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 600;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+    try testing.expect(head_snap.aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 600), head_snap.qsa_rows);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+    try testing.expect(!mlx.errorPending());
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+    try testing.expect(!mlx.errorPending());
+
+    // A pooled bank without its raw history is not restorable: KV half only, head declined.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    try testing.expect(loaded.head_aux == null);
 }
 
 test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {

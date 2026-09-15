@@ -807,6 +807,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// Drop a latch a best-effort op raised and its caller already reported, so an
+/// optional write or a diagnostic can never become an unrelated request's
+/// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
+/// an error that was already latched belongs to someone else and stays.
+pub fn dropLatchedErrorUnless(had_error: bool) void {
+    if (!had_error and errorPending()) {
+        var buf: [512]u8 = undefined;
+        _ = takeError(&buf);
+    }
+}
+
 /// Release-build fault injection: `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal
 /// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
 const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";

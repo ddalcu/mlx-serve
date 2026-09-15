@@ -5009,3 +5009,25 @@ carries the same layout so batched decode stays bit-identical to solo. The reduc
 from the composed chain, so the parity test moved from bit identity to RMS error against the f32
 truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
 balance; hoist per lane, and A/B kernels only interleaved.
+
+
+## A best-effort sidecar write was failing the NEXT request (2026-09-15)
+
+`/v1/chat/completions` answered 500 `generation failed` on ~2.6% of requests, any prompt size: all 151
+failures in the log had `[mlx] expected a non-empty mlx_array (map.cpp:49)` -> `[disk-cache] spec
+persist failed` -> `[scheduler] batched decode aborted: MLX failure` immediately before them, and every
+`[mlx]` line in that log was that same message.
+
+Two bugs stacked. `insertSpecTensors` inserted `a.aux_state` whenever `rows_ok` held, and `rows_ok` was
+`hist == limit and (aux.ctx != null or pooled.ctx != null)` - an OR that arrived with the QSA raw keys
+turning into a 32-row ring with the pooled bank as the history (#381). `qsaHistoryRows` reports the
+checkpoint POSITION from `qsa_hist_rows` even with `aux_state.ctx == null`, so a pooled-only head passed
+the guard and the insert handed mlx an empty array: mlx-c threw, our handler latched. The throw was
+CAUGHT (spec persistence is best-effort - "a failed write costs the entry its spec, never the entry") -
+but the latch is process-wide and `checkErrorDecode` reads it once per tick, so the next request blamed
+itself for the previous one's disk write.
+
+Fix: `rows_ok` requires `aux_state.ctx != null` (the loader refuses a head half without `h.aux`), and
+`writeSpecSidecar` drops the latch it raised (`mlx.dropLatchedErrorUnless`), the guard the restore dump
+already carried: a swallowed MLX error is not swallowed until the latch is cleared. Guard: the "arms no
+MLX latch" DiskTier test, which reproduced the exact `map.cpp:49` message before the fix.
