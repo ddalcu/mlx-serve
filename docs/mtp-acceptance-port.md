@@ -30,10 +30,10 @@ Validation gates: pure toy-distribution math tests, GPU graph tests for the
 one-hot and sampled-proposal layouts, unchanged exact tests, live sampled MTP
 engagement, then matched llmprobe runs for both engines with
 `--sampling creative`, thinking explicitly off, the same probe version,
-prompt set and run count. The published llmprobe 0.6.7 CLI does not explicitly
-disable thinking on its timed or evaluation chat requests, so use an audited
-disposable bundle and capture outgoing request bodies. `--reasoning off` alone
-only omits `reasoning_effort` on evaluation requests.
+prompt set and run count. llmprobe 0.6.8+ turns thinking off on every request
+under `--reasoning off` (falling back to `enable_thinking: false` on mlx-serve)
+and says so in the banner; the 0.6.7 runs recorded here used a patched bundle
+for the same effect.
 
 On the Apple M5 Max, full llmprobe 0.6.7 runs with creative sampling,
 thinking explicitly off, three timed samples, sampled drafts, and MTP depth 3
