@@ -129,4 +129,3 @@ claim, and it is not the separate 164-task Python HumanEval suite.
 - [Full-request wall time](wall_s.png)
 - [Completion-token counts](completion_tokens.png)
 - [Machine-readable result rows](results.json)
-
