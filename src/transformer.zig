@@ -15408,7 +15408,13 @@ pub const Transformer = struct {
         const verify_paired_gu_installed = blk: {
             const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_PAIRED_GU") orelse break :blk false;
             if (raw[0] == '0') break :blk false;
-            try validatePairedGateUpPack(&config, moe_layers);
+            // A pack or chip outside the contract declines like every other
+            // shape-gated kernel; only a matching pack that disagrees with
+            // stock is a load error.
+            validatePairedGateUpPack(&config, moe_layers) catch |err| {
+                log.info("[mtp-verify] paired routed gate/up declined: {s}\n", .{@errorName(err)});
+                break :blk false;
+            };
             try selfCheckPairedGateUpPack(s, moe_layers.?);
             log.info("[mtp-verify] paired routed gate/up q4/g64 installed for {d} layers (S=4)\n", .{moe_layers.?.len});
             break :blk true;

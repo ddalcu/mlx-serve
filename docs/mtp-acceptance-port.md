@@ -59,10 +59,11 @@ benchmark path.
 `MLX_SERVE_MOE_VERIFY_PAIRED_GU=1` installs an opt-in physical-S=4 routed
 gate/up kernel at model load. It is limited to the Qwen3.8 Flash-Next pack with
 48 MoE layers, hidden width 2560, expert width 640, 512 experts, top-10 routing,
-and separate contiguous affine q4/group-64 gate and up banks. Installation
-checks that contract and bit-compares each layer against the stock sorted gather
-plus fused SwiGLU path before generation. Other shapes continue on the stock
-route; a failed installation stops model loading.
+separate contiguous affine q4/group-64 gate and up banks, and an M5-class GPU
+(`verifySharedHardware`). A pack or chip outside that contract declines with a
+`[mtp-verify] paired routed gate/up declined:` line and loads on the stock
+route. A matching pack is bit-compared per layer against the stock sorted gather
+plus fused SwiGLU path before generation; a self-check failure stops the load.
 
 The kernel adapts MTPLX's paired routed producer to this checkpoint's split
 banks and group size. In a two-order, six-pair 16K serving A/B on the same
