@@ -158,7 +158,7 @@ struct NewTaskSheet: View {
                 // keystroke that breaks and re-forms a valid schedule.
                 Group {
                     if let trigger = parsedTrigger {
-                        Label(L10n.text(ScheduleParser.describe(trigger)),
+                        Label(ScheduleParser.describe(trigger),
                               systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     } else {

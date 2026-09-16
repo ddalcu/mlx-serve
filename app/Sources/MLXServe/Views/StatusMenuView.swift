@@ -728,7 +728,7 @@ struct StatusMenuView: View {
             }
             Spacer()
             if info.bytesResident > 0 {
-                Text(L10n.text(MemoryInfo.format(Int64(clamping: info.bytesResident))))
+                Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
             }

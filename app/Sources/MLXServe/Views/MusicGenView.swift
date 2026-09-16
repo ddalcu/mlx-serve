@@ -255,7 +255,7 @@ struct MusicGenView: View {
                 // label, so the reason is readable before the mode is even
                 // selected — the whole point of #269.
                 ForEach(MusicTask.allCases, id: \.self) { t in
-                    Text(L10n.text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready))).tag(t)
+                    Text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready)).tag(t)
                 }
             }
             .labelsHidden().pickerStyle(.segmented)
@@ -311,7 +311,7 @@ struct MusicGenView: View {
                     HStack(spacing: 8) {
                         ProgressView(value: downloads.downloads[model.repo]?.progress ?? 0)
                             .progressViewStyle(.linear)
-                        Text(L10n.text(downloads.downloads[model.repo]?.percentFormatted ?? ""))
+                        Text(downloads.downloads[model.repo]?.percentFormatted ?? "")
                             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                         // Cancels ONLY this single-file fetch — a full pack
                         // download for the same repo is never touched.
@@ -695,7 +695,7 @@ struct MusicGenView: View {
                         Picker("", selection: $keyscale) {
                             Text("Auto").tag("")
                             ForEach(MusicOptions.keyscales, id: \.self) { key in
-                                Text(L10n.text(MusicOptions.keyLabel(key))).tag(key)
+                                Text(MusicOptions.keyLabel(key)).tag(key)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)

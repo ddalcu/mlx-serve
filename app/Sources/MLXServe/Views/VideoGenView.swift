@@ -1045,11 +1045,11 @@ struct VideoGenView: View {
                     Text("Chained windows: \(chainWindows)").font(.caption)
                 }
                 .help("Join several generations end to end, each starting from the last frame of the one before.")
-                Text(L10n.text(
+                Text(
                      chainWindows > 1
                      ? "\(chainWindows) windows joined end to end — about \(numFrames * chainWindows) frames, and roughly \(chainWindows)x the time of a single window."
                      : "Joins several generations end to end for a longer clip. Each window costs another full generation."
-))
+)
                     .font(.caption2).foregroundStyle(.secondary)
             }
 

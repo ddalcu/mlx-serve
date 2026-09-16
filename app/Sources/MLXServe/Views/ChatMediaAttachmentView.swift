@@ -257,7 +257,7 @@ struct MediaProgressCard: View {
                         .font(.caption.weight(.semibold))
                     Spacer(minLength: 8)
                     TimelineView(.periodic(from: progress.startedAt, by: 1)) { context in
-                        Text(L10n.text(progress.elapsedText(now: context.date)))
+                        Text(progress.elapsedText(now: context.date))
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }

@@ -186,7 +186,7 @@ struct ContextWindowDetail: View {
                 .font(.callout)
             Spacer()
             // Exact figures here — the pill rounds, this is where you check.
-            Text(L10n.text(value.formatted(.number.grouping(.automatic))))
+            Text(value.formatted(.number.grouping(.automatic)))
                 .font(.system(size: 12, design: .monospaced))
                 .fontWeight(emphasized ? .semibold : .regular)
         }

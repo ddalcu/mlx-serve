@@ -105,7 +105,7 @@ private struct TaskRow: View {
             }
             HStack(spacing: 6) {
                 Image(systemName: "clock").font(.caption2)
-                Text(L10n.text(ScheduleParser.describe(task.trigger)))
+                Text(ScheduleParser.describe(task.trigger))
                     .font(.caption)
                 AutonomyBadge(autonomy: task.autonomy)
             }
@@ -150,7 +150,7 @@ private struct TaskDetailView: View {
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     HStack(spacing: 10) {
-                        Label(L10n.text(ScheduleParser.describe(task.trigger)), systemImage: "clock")
+                        Label(ScheduleParser.describe(task.trigger), systemImage: "clock")
                         AutonomyBadge(autonomy: task.autonomy)
                         if task.useMCP {
                             Label("MCP", systemImage: "puzzlepiece.extension")

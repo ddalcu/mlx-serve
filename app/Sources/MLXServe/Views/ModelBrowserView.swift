@@ -448,7 +448,7 @@ private struct RecommendedModelTableRow: View {
 
             // Download size (on disk) and the quant it buys.
             VStack(alignment: .trailing, spacing: 2) {
-                Text(L10n.text(SystemMemoryInfo.preciseGB(pick.sizeGB)))
+                Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 if let quant = pick.quantLabel {
@@ -477,7 +477,7 @@ private struct RecommendedModelTableRow: View {
     /// how that fits what this Mac can give a model.
     private var memoryCell: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(L10n.text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB)))
+            Text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB))
                 .font(.caption.monospacedDigit().weight(.medium))
             HStack(spacing: 3) {
                 Image(systemName: fitIcon)
@@ -1363,14 +1363,14 @@ private struct ModelBrowserRow: View {
 
             // HF pull count
             if tier.showsPulls {
-                Text(L10n.text(formatCount(model.downloads ?? 0)))
+                Text(formatCount(model.downloads ?? 0))
                     .font(.callout.monospacedDigit())
                     .frame(width: ModelBrowserMetrics.pullsWidth, alignment: .trailing)
             }
 
             // Likes
             if tier.showsLikes {
-                Text(L10n.text(formatCount(model.likes ?? 0)))
+                Text(formatCount(model.likes ?? 0))
                     .font(.callout.monospacedDigit())
                     .frame(width: ModelBrowserMetrics.likesWidth, alignment: .trailing)
             }
@@ -1391,7 +1391,7 @@ private struct ModelBrowserRow: View {
 
             // Last updated
             if tier.showsUpdated {
-                Text(L10n.text(formatRelativeDate(model.lastModifiedDate)))
+                Text(formatRelativeDate(model.lastModifiedDate))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(width: ModelBrowserMetrics.updatedWidth, alignment: .trailing)
@@ -1553,7 +1553,7 @@ private struct ModelBrowserRow: View {
             VStack(spacing: 1) {
                 ProgressView(value: progress)
                     .frame(width: 50)
-                Text(L10n.text(state?.percentFormatted ?? ""))
+                Text(state?.percentFormatted ?? "")
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -1634,9 +1634,9 @@ private struct GgufQuantMenu: View {
                             Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
                         } label: {
                             let selected = path(of: quant) == appState.selectedModelPath
-                            Label(L10n.text(
+                            Label(
                                 selected ? "\(quant.label) — in use" : "\(quant.label) — use"
-),
+,
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -1743,9 +1743,9 @@ private struct MlxVariantMenu: View {
                             Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
                         } label: {
                             let selected = path(of: v) == appState.selectedModelPath
-                            Label(L10n.text(
+                            Label(
                                 selected ? "\(v.label) — in use" : "\(v.label) — use"
-),
+,
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -2029,7 +2029,7 @@ private struct LocalModelRow: View {
             Button("Delete", role: .destructive) { performDelete() }
                 .keyboardShortcut(.defaultAction)
         } message: {
-            Text(L10n.text(ModelRowActions.deleteMessage(model)))
+            Text(ModelRowActions.deleteMessage(model))
         }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
         .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }

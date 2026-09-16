@@ -710,7 +710,7 @@ private struct ModelFoldersSectionContent: View {
                         .font(.body)
                     Spacer(minLength: 12)
                     HStack(spacing: 8) {
-                        Text(L10n.text(configured ?? roots.downloadRoot))
+                        Text(configured ?? roots.downloadRoot)
                             .font(.caption.monospaced())
                             // An unreachable folder is shown in the warning
                             // colour rather than swapped for the fallback: the
@@ -1551,7 +1551,7 @@ private struct ContextSizeRow: View {
                             step: 1
                         )
                         .frame(width: 200)
-                        Text(L10n.text(Self.formatTokens(appState.serverOptions.ctxSize)))
+                        Text(Self.formatTokens(appState.serverOptions.ctxSize))
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 56, alignment: .trailing)
                     }
@@ -2622,7 +2622,7 @@ private struct VoiceCloneSectionContent: View {
                     ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
                         Section(L10n.text(group.language)) {
                             ForEach(group.voices, id: \.self) { v in
-                                Text(L10n.text(KokoroVoiceCatalog.displayName(for: v))).tag(v)
+                                Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
                             }
                         }
                     }
@@ -2781,7 +2781,7 @@ private struct SandboxSectionContent: View {
             explainer: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it."
         ) {
             HStack(spacing: 8) {
-                Text(L10n.text((currentWorkspace as NSString).abbreviatingWithTildeInPath))
+                Text((currentWorkspace as NSString).abbreviatingWithTildeInPath)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

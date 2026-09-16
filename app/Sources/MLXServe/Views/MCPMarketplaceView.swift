@@ -160,7 +160,7 @@ struct MCPMarketplaceView: View {
                                 Text(id).font(.body.weight(.medium))
                                 transportBadge(for: entry)
                             }
-                            Text(L10n.text(commandSummary(for: entry)))
+                            Text(commandSummary(for: entry))
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)

@@ -3959,7 +3959,7 @@ struct GeneratingIndicator: View {
                     .transition(.opacity)
                 Text("·")
                     .foregroundStyle(.tertiary)
-                Text(L10n.text(Self.formatElapsed(elapsed)))
+                Text(Self.formatElapsed(elapsed))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
@@ -4589,10 +4589,10 @@ struct MessageBubble: View {
                                                                 count: message.revisions.count))
                     }
                     .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
-                    Text(L10n.text(
+                    Text(
                                                 MessageRevisions.label(index: message.activeRevision,
                                                 count: message.revisions.count)
-))
+)
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                     footerButton("chevron.right", help: "Next version of this reply") {

@@ -148,7 +148,7 @@ struct VoiceTrayPanel: View {
                                           set: { appState.defaultAgentId = $0 })) {
                 Text("None (app defaults)").tag(UUID?.none)
                 ForEach(appState.agents.allAgents) { agent in
-                    Text(L10n.text(agentLabel(agent))).tag(UUID?.some(agent.id))
+                    Text(agentLabel(agent)).tag(UUID?.some(agent.id))
                 }
             }
             .labelsHidden()
