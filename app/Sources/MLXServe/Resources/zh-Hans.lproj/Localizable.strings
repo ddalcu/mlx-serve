@@ -909,6 +909,7 @@
 "This model is loaded and serving requests." = "该模型已加载并正在处理请求。";
 "This model will load when you start the server." = "该模型会在你启动服务器时加载。";
 "This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score)." = "这个模型会自行创作配乐。请在提示词中的 “overall_soundscape:” 后面描述它（配乐则写在 “non_diegetic_music:” 后面）。";
+"This request needed %@ tokens, but the model's context window holds only %@." = "这次请求需要 %@ 个 Token，但模型的上下文窗口只能容纳 %@。";
 "This request was larger than the model's context window." = "该请求超出了模型的上下文窗口。";
 "This resets every section — Server, Speculative Decoding, Performance, Per-Request Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. The running server keeps its current flags until you hit Restart Now." = "这会重置每一个区块 —— 服务器、投机解码、性能、每请求默认值、语音、Agent 沙盒和消息 —— 而不只是你当前看到的那一个。你的 Telegram 机器人令牌会保留，因为只有 @BotFather 才能重新签发它。在你点击“立即重启”之前，正在运行的服务器会保留当前的启动参数。";
 "This window: chat, models, tasks and media generation." = "这个窗口：聊天、模型、任务与媒体生成。";
