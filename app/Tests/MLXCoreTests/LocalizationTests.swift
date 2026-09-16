@@ -251,29 +251,100 @@ final class LocalizationTests: XCTestCase {
 
     // MARK: - Lookup guards
 
-    /// The sweep that wrapped runtime strings in `L10n` once called it with a
-    /// key transformed BEFORE lookup (`title.uppercased()`), which can never
-    /// hit: the table is keyed on the source literals, so render-time casing
-    /// must happen after resolution. Guards the ARGUMENT itself — any shape
-    /// (`uppercased`, `lowercased`, `capitalized`, a `String(...)` wrapper) and
-    /// any call site, rather than the one pattern that happened to exist.
-    func testNoL10nArgumentIsTransformedBeforeResolution() throws {
+    /// A key has to be *written* at the call site: a literal, an expression that
+    /// carries one, a plain member path (a runtime label the catalog may name),
+    /// or an allow-listed producer. Anything else — a formatted number, a
+    /// duration, a size, a path assembled from parts — is a value the table can
+    /// never hold, so the lookup is dead work. Checking transform spellings
+    /// alone is what let `state?.percentFormatted ?? ""` through: nothing there
+    /// is uppercased, wrapped or formatted, it simply cannot be a key.
+    func testEveryLookupArgumentCanBeAKey() throws {
         var calls = 0
         var offenders: [String] = []
         for file in try Self.sourceFiles() {
             let index = Self.callIndex(in: file.text)
             for arguments in (index["L10n.text"] ?? []) + (index["L10n.format"] ?? []) {
                 calls += 1
-                let key = arguments.split(separator: ",", maxSplits: 1).first.map(String.init) ?? arguments
-                for transform in [".uppercased(", ".lowercased(", ".capitalized", "String("]
-                where key.contains(transform) {
-                    offenders.append("\(file.name): L10n(\(key.trimmingCharacters(in: .whitespaces)))")
+                let key = Self.firstArgument(arguments)
+                if Self.looksLikeValue(key) {
+                    offenders.append("\(file.name): L10n(\(key.trimmingCharacters(in: .whitespacesAndNewlines)))")
                 }
             }
         }
         XCTAssertGreaterThan(calls, 200, "the scan stopped matching L10n call sites")
-        XCTAssertTrue(offenders.isEmpty, "L10n keys transformed before resolution: \(offenders)")
+        XCTAssertTrue(offenders.isEmpty,
+                      "lookup arguments that can never be a key:\n\(offenders.joined(separator: "\n"))")
     }
+
+    /// The first argument of a call, split at a top-level comma and honouring
+    /// string literals, so a comma inside copy does not truncate it.
+    private static func firstArgument(_ arguments: String) -> String {
+        let characters = Array(arguments)
+        var depth = 0
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            if character == "\"" {
+                var cursor = index + 1
+                while cursor < characters.count, characters[cursor] != "\"" {
+                    cursor += characters[cursor] == "\\" ? 2 : 1
+                }
+                index = cursor
+            } else if "([{".contains(character) {
+                depth += 1
+            } else if ")]}".contains(character) {
+                depth -= 1
+            } else if character == ",", depth == 0 {
+                return String(characters[0..<index])
+            }
+            index += 1
+        }
+        return arguments
+    }
+
+    private static func looksLikeValue(_ key: String) -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        // A transformed value can never be a key, whatever else it contains.
+        for transform in ["String(", ".uppercased(", ".lowercased(", ".capitalized", ".formatted("]
+        where trimmed.contains(transform) { return true }
+        if isLiteral(trimmed) || isPlainPath(trimmed) || containsLiteral(trimmed) { return false }
+        return !labelProducers.contains { trimmed.contains($0) }
+    }
+
+    /// `"…"` with something in it and no interpolation.
+    private static func isLiteral(_ text: String) -> Bool {
+        guard text.hasPrefix("\"") else { return false }
+        guard let (body, _) = takeQuoted(text.dropFirst()) else { return false }
+        return !body.isEmpty && !body.contains("\\(")
+    }
+
+    /// `title`, `m.lanDisplayName`, `state?.percentFormatted`.
+    private static func isPlainPath(_ text: String) -> Bool {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.? ")
+        return !text.isEmpty && text.allSatisfy { allowed.contains($0) } && !text.contains("??")
+    }
+
+    /// `copied ? "Copied" : "Copy"` — a literal spelling the value out.
+    private static func containsLiteral(_ text: String) -> Bool {
+        var rest = Substring(text)
+        while let quote = rest.firstIndex(of: "\"") {
+            guard let (body, remainder) = takeQuoted(rest[rest.index(after: quote)...]) else { break }
+            if !body.isEmpty && !body.contains("\\(") { return true }
+            rest = remainder
+        }
+        return false
+    }
+
+    /// Producers whose branches do yield catalog keys — model and variant
+    /// labels, tool names, preflight copy, status lines. Adding an entry needs
+    /// the same evidence as adding a key: a branch that resolves in the table.
+    private static let labelProducers = [
+        "actionLabel", "actionTitle", "buttonLabel", "caption",
+        "controller.partialTranscript", "defect?.explanation", "detail", "displayName",
+        "engineExplainer", "label", "lead", "modelPickerLabel", "placeholder", "pretty",
+        "run.summary ?? run.status.label", "shortMessage", "startupModelLabel", "statusLine", "title",
+    ]
 
     /// Every string literal that reaches an `L10n` lookup through a helper
     /// parameter has to exist in the catalog. Scoped to one helper in one file
