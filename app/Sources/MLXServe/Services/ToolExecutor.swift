@@ -829,11 +829,19 @@ struct BrowseHandler: ToolHandler {
             switch action {
             case "navigate":
                 guard let url = parameters["url"] else { throw ToolError.missingParameter("url") }
-                return try await browser.navigate(to: url)
+                return try await browser.navigate(to: url, workingDirectory: workingDirectory)
+            case "show":
+                await browser.requestShow()
+                guard let raw = parameters["url"] else { return "Browser window shown." }
+                guard let url = BrowserManager.resolveURL(raw, workingDirectory: workingDirectory) else {
+                    throw ToolError.executionFailed("Invalid URL: \(raw)")
+                }
+                let nav = try await browser.load(url)
+                return "\(nav)\nTitle: \(await browser.pageTitle)\nBrowser window shown to the user."
             case "readText":
                 // Navigate to URL first if provided, then read text
                 if let url = parameters["url"] {
-                    _ = try await browser.navigate(to: url)
+                    _ = try await browser.navigate(to: url, workingDirectory: workingDirectory)
                 }
                 return try await browser.readText()
             case "readHTML":

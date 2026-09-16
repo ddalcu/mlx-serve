@@ -120,7 +120,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         let json = AgentConfigs.opencodeJSON(
             baseURL: "http://localhost:11234", defaultModel: "gemma-4-e4b-it-4bit",
             entries: [AgentModelEntry(id: "gemma-4-e4b-it-4bit", budget: budget, vision: false)],
-            pinModel: true)
+            pinModel: true, compaction: true)
         XCTAssertTrue(tab.command.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"))
     }
 

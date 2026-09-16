@@ -130,10 +130,9 @@ pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) Reaso
 /// object and the chat-completions `reasoning_effort` string. Unknown efforts
 /// (model-dependent spec values like "xhigh") fall back to the default budget.
 pub fn effortBudget(effort: []const u8, default_budget: i32) i32 {
-    if (std.mem.eql(u8, effort, "minimal")) return 128;
-    if (std.mem.eql(u8, effort, "low")) return 512;
-    if (std.mem.eql(u8, effort, "medium")) return 2048;
-    if (std.mem.eql(u8, effort, "high")) return 8192;
+    if (std.mem.eql(u8, effort, "minimal")) return 1024;
+    if (std.mem.eql(u8, effort, "low")) return 2048;
+    if (std.mem.eql(u8, effort, "medium")) return 8192;
     return default_budget;
 }
 
@@ -754,11 +753,12 @@ const testing = std.testing;
 test "parseReasoning maps effort levels" {
     const v_low = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"low\"}", .{});
     defer v_low.deinit();
-    try testing.expectEqual(@as(i32, 512), parseReasoning(v_low.value, -1).budget);
+    try testing.expectEqual(@as(i32, 2048), parseReasoning(v_low.value, -1).budget);
 
+    // high is uncapped: the default budget rides through.
     const v_high = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"high\"}", .{});
     defer v_high.deinit();
-    try testing.expectEqual(@as(i32, 8192), parseReasoning(v_high.value, -1).budget);
+    try testing.expectEqual(@as(i32, -1), parseReasoning(v_high.value, -1).budget);
 
     try testing.expectEqual(false, parseReasoning(null, -1).enable);
     try testing.expectEqual(@as(i32, -1), parseReasoning(null, -1).budget);

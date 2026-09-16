@@ -145,6 +145,19 @@ final class CLILauncher: ObservableObject {
     }
 }
 
+/// Small-window alert before an agent launches: the agent takes the whole
+/// screen, so a line in its terminal is never seen.
+func warnIfSmallContext(agentId: String, context: Int) {
+    guard let text = AgentBudget.contextWarning(agentId: agentId, context: context) else { return }
+    MainActor.assumeIsolated {
+        let alert = NSAlert()
+        alert.messageText = "Small context window"
+        alert.informativeText = text
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+}
+
 /// One row in the launcher dropdown. `resolvedPath` is filled in after detection.
 struct LauncherCLI: Identifiable, Equatable {
     let id: String
@@ -217,6 +230,10 @@ extension LauncherCLI {
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
+            let settingsPath = (dir as NSString).appendingPathComponent("settings.json")
+            let existing = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "{}"
+            try? AgentConfigs.piSettingsJSON(existing: existing, context: budget.context)
+                .write(toFile: settingsPath, atomically: true, encoding: .utf8)
             // Global context file — pi injects it into every session's system
             // prompt (same builder the sandbox registry materializes in-guest).
             try? AgentConfigs.piAgentsMD(budget: budget)
@@ -414,7 +431,7 @@ extension LauncherCLI {
                 list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
             }
             return """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true))'
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
             if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi

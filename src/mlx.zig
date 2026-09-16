@@ -589,11 +589,38 @@ pub const fault = struct {
     }
 };
 
+/// Test-only: like `fault`, but the injected failure also LATCHES the process-wide
+/// error — the state a real mlx-c raise leaves behind, which a best-effort caller
+/// must drop before returning.
+const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+var latch_remaining: u64 = 0;
+var latch_fired = false;
+
+fn latchFaultHit() bool {
+    if (latch_remaining == 0) return false;
+    latch_remaining -= 1;
+    if (latch_remaining != 0) return false;
+    latch_fired = true;
+    return true;
+}
+
+pub fn armLatchingFaultForTest(k: u64) void {
+    latch_remaining = k;
+    latch_fired = false;
+}
+pub fn latchingFaultFiredForTest() bool {
+    return latch_fired;
+}
+
 pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
     if (comptime builtin.is_test) {
         if (fault.hit()) return error.MlxError;
+        if (latchFaultHit()) {
+            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            return error.MlxError;
+        }
     }
 }
 
@@ -805,6 +832,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     mlx_error_len = 0;
     mlx_error_latched.store(false, .release);
     return buf[0..n];
+}
+
+/// Drop a latch a best-effort op raised and its caller already reported, so an
+/// optional write or a diagnostic can never become an unrelated request's
+/// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
+/// an error that was already latched belongs to someone else and stays.
+pub fn dropLatchedErrorUnless(had_error: bool) void {
+    if (!had_error and errorPending()) {
+        var buf: [512]u8 = undefined;
+        _ = takeError(&buf);
+    }
 }
 
 /// Release-build fault injection: `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal

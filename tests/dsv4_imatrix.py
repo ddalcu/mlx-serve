@@ -30,6 +30,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import struct
 import sys
@@ -131,6 +132,21 @@ def pack_bits(q, bits):
         b[:, 1] = (w24 >> 8) & 0xFF
         b[:, 2] = (w24 >> 16) & 0xFF
         return np.ascontiguousarray(b.reshape(*lead, n * 3 // 8)).view(np.uint32)
+    if bits in (5, 6):
+        # mx.quantize packs DENSELY: element i at bit offset i*bits of a little-endian
+        # byte stream (straddling words), viewed as uint32.
+        per = 32 // math.gcd(bits, 32)          # values per whole number of words
+        assert n % per == 0, f"in_dim {n} not divisible by {per}"
+        g = q.reshape(-1, per).astype(np.uint16)
+        nbytes = per * bits // 8
+        acc = np.zeros((g.shape[0], nbytes + 1), dtype=np.uint16)
+        for k in range(per):
+            off = k * bits
+            v = g[:, k] << np.uint16(off % 8)
+            acc[:, off // 8] |= v & 0xFF
+            acc[:, off // 8 + 1] |= v >> 8
+        b = acc[:, :nbytes].astype(np.uint8)
+        return np.ascontiguousarray(b.reshape(*lead, n * bits // 8)).view(np.uint32)
     raise ValueError(f"unsupported bits {bits}")
 
 

@@ -88,6 +88,39 @@ pub fn canonicalRole(role: []const u8) []const u8 {
     return if (std.mem.eql(u8, role, "developer")) "system" else role;
 }
 
+/// Fold every `system` message past index 0 into the leading one (created
+/// when absent). Templates we serve raise on a system turn that is not first
+/// and the raise is a silent generic fallback. Returns the joined buffer the
+/// caller owns, null when nothing moved.
+pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
+    var extra: usize = 0;
+    for (messages.items[@min(messages.items.len, 1)..]) |m| {
+        if (std.mem.eql(u8, m.role, "system")) extra += 1;
+    }
+    if (extra == 0) return null;
+    const lead_is_system = messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system");
+    var joined = std.ArrayList(u8).empty;
+    errdefer joined.deinit(allocator);
+    if (lead_is_system) try joined.appendSlice(allocator, messages.items[0].content);
+    var i: usize = if (lead_is_system) 1 else 0;
+    while (i < messages.items.len) {
+        if (!std.mem.eql(u8, messages.items[i].role, "system")) {
+            i += 1;
+            continue;
+        }
+        if (joined.items.len > 0) try joined.appendSlice(allocator, "\n\n");
+        try joined.appendSlice(allocator, messages.items[i].content);
+        _ = messages.orderedRemove(i);
+    }
+    const text = try joined.toOwnedSlice(allocator);
+    if (lead_is_system) {
+        messages.items[0].content = text;
+    } else {
+        try messages.insert(allocator, 0, .{ .role = "system", .content = text });
+    }
+    return text;
+}
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
@@ -629,7 +662,7 @@ fn renderChatTemplate(
         .empty_string
     else
         .null_literal;
-    const messages_json = try serializeMessagesJsonOpts(allocator, effective_messages, empty_content);
+    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, empty_content, chat_config);
     defer allocator.free(messages_json);
 
     // Build extra context (bos_token, eos_token, enable_thinking, effort)
@@ -890,6 +923,21 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false);
+}
+
+/// K2-Horizon's template raises on an assistant turn with NO thinking field,
+/// so that family gets an empty `reasoning_content` where a client sent none
+/// (renders as the closed `<ifm|think>\n</ifm|think>` signature).
+fn templateRequiresReasoningField(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "'ifm|think'") != null;
+}
+
+pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template));
+}
+
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -959,6 +1007,8 @@ pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const
             // would still pass `is defined`-style checks.
             try buf.appendSlice(allocator, ",\"reasoning_content\":");
             try appendJsonString(allocator, &buf, rc);
+        } else if (reasoning_required and std.mem.eql(u8, msg.role, "assistant")) {
+            try buf.appendSlice(allocator, ",\"reasoning_content\":\"\"");
         }
 
         try buf.append(allocator, '}');
@@ -1070,6 +1120,15 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     return "xhigh";
 }
 
+/// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
+/// raises on anything else; each word picks a different think opener.
+fn k2EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "high";
+    if (std.mem.eql(u8, e, "medium")) return "medium";
+    if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
+    return "high";
+}
+
 /// `effort` is the client's raw `reasoning_effort` string (null when the
 /// request didn't send one) — today only the dsv4 family maps it into the
 /// template; other families keep their fixed vocabulary.
@@ -1134,7 +1193,11 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // everything else (incl. absent) stays the reference default.
     const dsv4_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
-    if (dsv4_style) {
+    if (templateRequiresReasoningField(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, k2EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (dsv4_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, dsv4EffortFor(effort));
         try buf.append(allocator, '"');
@@ -2236,7 +2299,19 @@ pub fn museHeaderSkipNext(skipping: bool, token_text: []const u8) bool {
 /// render ends with a CLOSED `</think>` block and must not match.
 pub fn promptTailOpensThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
-    return endsWithThinkOpenTag(trimmed) != null;
+    return endsWithThinkOpenTag(trimmed) != null or k2ThinkOpenerAt(trimmed) != null;
+}
+
+/// K2-Horizon's three RENDERED think openers (one per effort). The tokenizer
+/// decodes them all to `<think>`, so generated text never carries them; only
+/// the rendered prompt bytes do, and the closer must spell the same variant.
+const k2_think_openers = [_][]const u8{ "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>" };
+
+fn k2ThinkOpenerAt(trimmed_tail: []const u8) ?[]const u8 {
+    for (k2_think_openers) |opener| {
+        if (std.mem.endsWith(u8, trimmed_tail, opener)) return opener;
+    }
+    return null;
 }
 
 /// Narrow form used by generation-side phase switches. A suffixed reasoning
@@ -2306,7 +2381,13 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
     {
         return " to=user<|message|>";
     }
-    if (promptTailOpensThink(rendered[rendered.len -| 64 ..])) return "</think>";
+    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
+    if (k2ThinkOpenerAt(tail)) |opener| {
+        inline for (k2_think_openers) |o| {
+            if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
+        }
+    }
+    if (promptTailOpensThink(tail)) return "</think>";
     return "";
 }
 
@@ -4591,6 +4672,15 @@ fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8
 /// delimited by `<tool_sep` recovers with its CLOSED key/value pairs only;
 /// partial values are never salvaged.
 /// Earliest position at/after `from` where any of `needles` occurs, or null.
+fn isBareToolName(body: []const u8) bool {
+    const name = std.mem.trim(u8, body, " \t\n\r");
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
+    }
+    return true;
+}
+
 fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8) ?usize {
     var best: ?usize = null;
     for (needles) |n| {
@@ -5274,7 +5364,9 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
             const body = after_base + 1;
             const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
             const ak_at = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
-            break :blk ak_at < this_close;
+            // A parameterless GLM call has no <arg_key>: its whole body is
+            // the bare NAME, a shape neither the JSON nor `<function=` arms read.
+            break :blk ak_at < this_close or isBareToolName(text[body..this_close]);
         }) {
             name_start = after_base + 1;
         } else {
@@ -14341,4 +14433,81 @@ test "a model-opened think block latches from its own opener token" {
     try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
     try std.testing.expect(modelThinkOpener(true, "\n") == null);
     try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
+}
+
+test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-off closes the SAME one" {
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think>\n"));
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_faster>\n"));
+    try testing.expect(!promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|thinker>\n"));
+    try testing.expectEqualStrings("</ifm|think_fast>", contentChannelTail("", "<|ifm|im_start|>assistant\n<ifm|think_fast>\n", true));
+    try testing.expectEqualStrings("</ifm|think>", contentChannelTail("", "x<ifm|think>\n", true));
+    try testing.expectEqualStrings("</think>", contentChannelTail("", "x<think>\n", true));
+}
+
+test "K2-Horizon: assistant history always carries a thinking field, and the effort word is high|medium|low" {
+    const k2_tpl = "{%- set think_tag = 'ifm|think' -%}{%- set effort = reasoning_effort | default('high') -%}";
+    const cfg = ChatConfig{ .chat_template = k2_tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello" },
+        .{ .role = "assistant", .content = "again", .reasoning_content = "why" },
+    };
+    const json = try serializeMessagesJsonFor(testing.allocator, &messages, .null_literal, &cfg);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"hello\",\"reasoning_content\":\"\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"why\"") != null);
+    // Other families keep omitting the key.
+    const plain = ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const json2 = try serializeMessagesJsonFor(testing.allocator, messages[0..2], .null_literal, &plain);
+    defer testing.allocator.free(json2);
+    try testing.expect(std.mem.indexOf(u8, json2, "reasoning_content") == null);
+
+    const cases = [_]struct { in: ?[]const u8, want: []const u8 }{
+        .{ .in = null, .want = "high" },     .{ .in = "high", .want = "high" },     .{ .in = "xhigh", .want = "high" },
+        .{ .in = "max", .want = "high" },    .{ .in = "medium", .want = "medium" }, .{ .in = "low", .want = "low" },
+        .{ .in = "minimal", .want = "low" }, .{ .in = "none", .want = "low" },      .{ .in = "bogus", .want = "high" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c.want, k2EffortFor(c.in));
+    const extra = try serializeExtraContext(testing.allocator, &cfg, true, "xhigh");
+    defer testing.allocator.free(extra);
+    try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
+    // Live 2026-09-15: Claude Code carries SessionStart hook output as a
+    // `system`-role message INSIDE `messages`, after the top-level system
+    // prompt. Qwen's template raises on a system turn that is not first, and
+    // the raise is a silent generic fallback (the model loses its stop token).
+    const al = std.testing.allocator;
+    var msgs = std.ArrayList(Message).empty;
+    defer msgs.deinit(al);
+    try msgs.append(al, .{ .role = "system", .content = "You are S." });
+    try msgs.append(al, .{ .role = "system", .content = "hook output" });
+    try msgs.append(al, .{ .role = "user", .content = "hi" });
+    try msgs.append(al, .{ .role = "system", .content = "late note" });
+    const owned = try foldSystemMessages(al, &msgs);
+    defer if (owned) |o| al.free(o);
+    try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
+    try std.testing.expectEqualStrings("You are S.\n\nhook output\n\nlate note", msgs.items[0].content);
+    try std.testing.expectEqualStrings("user", msgs.items[1].role);
+
+    // No leading system: the fold creates one at index 0.
+    var lone = std.ArrayList(Message).empty;
+    defer lone.deinit(al);
+    try lone.append(al, .{ .role = "user", .content = "hi" });
+    try lone.append(al, .{ .role = "system", .content = "hook output" });
+    const owned2 = try foldSystemMessages(al, &lone);
+    defer if (owned2) |o| al.free(o);
+    try std.testing.expectEqualStrings("system", lone.items[0].role);
+    try std.testing.expectEqualStrings("hook output", lone.items[0].content);
+    try std.testing.expectEqual(@as(usize, 2), lone.items.len);
+
+    // Nothing to fold: untouched, nothing allocated.
+    var plain = std.ArrayList(Message).empty;
+    defer plain.deinit(al);
+    try plain.append(al, .{ .role = "system", .content = "You are S." });
+    try plain.append(al, .{ .role = "user", .content = "hi" });
+    try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
+    try std.testing.expectEqual(@as(usize, 2), plain.items.len);
 }

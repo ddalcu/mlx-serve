@@ -82,7 +82,7 @@ print(json.loads(urllib.request.urlopen(req, timeout=180).read())['choices'][0][
 
 fail=0
 check() { # name result pattern
-    if echo "$2" | grep -qiE "$3"; then
+    if grep -qiE "$3" <<< "$2"; then
         echo "  ✓ $1 → $(echo "$2" | head -1 | cut -c1-50)"
     else
         echo "  ✗ $1 → $(echo "$2" | head -1 | cut -c1-50) (expected: $3)"; fail=1

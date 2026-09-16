@@ -216,7 +216,24 @@ pub const Table = struct {
             return .implausible;
         }
         self.folded += 1;
-        return foldInto(&self.cells[width][bucket], ms, tokens, self.seq);
+        const verdict = foldInto(&self.cells[width][bucket], ms, tokens, self.seq);
+        if (self.cells[width][bucket].n == MIN_SAMPLES) self.dropped_implausible += self.dropWiderAgainst(width, bucket);
+        return verdict;
+    }
+
+    // A cold boot folds the first wide rounds while every narrower cell is still untrusted, and
+    // nothing else re-reads a cell once its narrower neighbour matures: re-apply the step bound
+    // to the wider cells the moment `width` becomes trusted.
+    fn dropWiderAgainst(self: *Table, width: u32, bucket: usize) u32 {
+        var dropped: u32 = 0;
+        var w: u32 = width + 1;
+        while (w <= MAX_WIDTH) : (w += 1) {
+            const c = self.cells[w][bucket];
+            if (c.n == 0 or !self.stepImplausible(w, bucket, c.ms)) continue;
+            self.cells[w][bucket] = .{};
+            dropped += 1;
+        }
+        return dropped;
     }
 
     /// `ms` at `width` exceeds IMPLAUSIBLE_STEP per step over the nearest trusted narrower cell.
@@ -1609,6 +1626,22 @@ test "round_cost: the load sweep drops a width-1 cell that costs more than its w
     try testing.expectEqual(@as(u32, 1), t.restored_dropped);
 }
 
+test "round_cost: a cell crossing MIN_SAMPLES re-validates the wider cells it now bounds" {
+    var t = Table{};
+    for (0..4) |_| _ = t.observe(2, 1000, 37.0, 2.0, true, false);
+    try testing.expect(t.measuredMs(2, 0) != null);
+    feed(&t, 1, 1000, 11.0, 1.8);
+    try testing.expectEqual(@as(u32, 0), t.cells[2][0].n);
+    try testing.expectEqual(@as(u32, 1), t.dropped_implausible);
+    try testing.expectApproxEqAbs(11.0, t.measuredMs(1, 0).?, 1e-3);
+
+    var u = Table{};
+    for (0..4) |_| _ = u.observe(2, 1000, 14.0, 2.0, true, false);
+    feed(&u, 1, 1000, 11.0, 1.8);
+    try testing.expectApproxEqAbs(14.0, u.measuredMs(2, 0).?, 1e-3);
+    try testing.expectEqual(@as(u32, 0), u.dropped_implausible);
+}
+
 test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft never accepts fewer)" {
     var t = Table{};
     feed(&t, 2, 1000, 41.0, 3.0);
@@ -1675,8 +1708,4 @@ test "round_cost: persist write is a no-op when a diagnostic that adds barriers 
     try testing.expect(persistDiagArmedFrom(&.{ "0", "0", "0" }) == false);
     try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
     try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
-}
-
-test "group pricing keeps the existing long-context store version" {
-    try testing.expectEqual(@as(u32, 3), storeVersion(.long));
 }

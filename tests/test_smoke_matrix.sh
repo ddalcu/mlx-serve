@@ -37,7 +37,7 @@ ARCHES=(
     "gemma3|no|$GD/models/mlx-community/gemma-3-12b-it-4bit"
     "qwen3_5|yes|$MD/mlx-community/Qwen3.5-0.8B-MLX-4bit|$MD/lmstudio-community/Qwen3.5-4B-MLX-4bit"
     "qwen3_5_27b|yes|$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
-    "qwen3_5_moe|yes|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
+    "qwen3_5_moe|yes|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
     "lfm2|yes|$MD/LiquidAI/LFM2.5-2.6B-MLX-mxfp4|$GD/models/mlx-community/LFM2.5-2.6B-8bit"
     "lfm2_moe|yes|$GD/models/LiquidAI/LFM2.5-8B-A1B-MLX-8bit"
     "lfm2_vl|yes|$MD/mlx-community/LFM2.5-VL-1.6B-4bit"
@@ -46,8 +46,9 @@ ARCHES=(
     "nemotron_h|yes|$GD/models-dl/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     "muse_glimmer|yes|$MD/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
     "spark2_5|yes|$MD/abenzerps/Spark-X2.5-4B-MLX-8bit"
+    "k2_horizon|yes|$MD/mlx-community/K2-Horizon-7B-oQ6e"
     "laguna|yes|$GD/models/poolside/Laguna-XS-2.1-NVFP4-mlx"
-    "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf"
+    "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|$GD/gguf/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
     "qwen4_exp|yes|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec}"
@@ -136,9 +137,9 @@ print(json.dumps({"c":c,"fr":fr,"usage":usage,"done":done}))' 2>/dev/null)
         r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 12*13? Answer with the number.\"}],\"max_tokens\":1200,\"temperature\":0,\"enable_thinking\":true}")
         c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
         local rsn; rsn=$(echo "$r" | J 'd["choices"][0]["message"].get("reasoning_content") or ""')
-        fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]')
-        # a budgeted answer may hit length while still thinking: then content may be empty legitimately
-        if [[ "$fr" == "length" && -z "$c" ]]; then skip "thinking on non-stream: content" "hit max_tokens inside the thought"; else
+        fr=$(echo "$r" | J '(d["choices"][0].get("finish_details") or {}).get("type") or d["choices"][0]["finish_reason"]')
+        # a budgeted or loop-cut answer may end inside the thought: then content may be empty legitimately
+        if [[ ( "$fr" == "length" || "$fr" == "repetition_loop" ) && -z "$c" ]]; then skip "thinking on non-stream: content" "ended inside the thought ($fr)"; else
         check "thinking on non-stream: content" "$([[ -n "$c" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"; fi
         check "thinking on non-stream: no tag leak" "$(printf '%s%s' "$c" "$rsn" | grep -Eq '<think>|<\|channel>' && echo 1 || echo 0)"
         r=$(curl -sN --max-time 300 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \

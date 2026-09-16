@@ -104,6 +104,27 @@ else
     echo -e "${RED}FAIL${NC} a status poll reloaded the model — eviction cannot win against it"; FAIL=1
 fi
 
+# A status poll must not be USE, either. /props is the only status route that
+# reaches it: the Ollama endpoints answer in handleOllamaEarly, above
+# ensureLoaded. /props shares handleConnection's
+# ensureLoaded/release pair with the generation routes, so a release that
+# restamps the idle clock lets a 1s watcher (or the app's 3s tray) hold every
+# model resident forever while the sweep sits armed and never fires.
+echo "  polling /props on a RESIDENT model must not pin it"
+[ "$(chat)" = "200" ] || { echo -e "${RED}FAIL${NC} could not reload for the polling arm"; FAIL=1; }
+[ "$(resident_count)" = "1" ] || { echo -e "${RED}FAIL${NC} not resident at the start of the polling arm"; FAIL=1; }
+POLLED_OUT=1
+for _ in $(seq 1 40); do          # 20s of polling against a 2s window
+    curl -fs "$BASE/props" >/dev/null 2>&1
+    sleep 0.5
+    if [ "$(resident_count)" = "0" ]; then POLLED_OUT=0; break; fi
+done
+if [ "$POLLED_OUT" = "0" ]; then
+    echo "    evicted while being polled"
+else
+    echo -e "${RED}FAIL${NC} /props polling pinned the model for 20s against a 2s window"; FAIL=1
+fi
+
 # Each cycle reloads the model while three unrefcounted readers of its retained
 # CPU state run against it.
 for i in $(seq 2 "$CYCLES"); do

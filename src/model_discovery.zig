@@ -53,6 +53,7 @@ const supported_model_types = [_][]const u8{
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -269,8 +270,18 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
             continue;
         };
     }
-    if (set.count() == 0) {
-        set.deinit(a);
+    // An index none of whose shards exist is stale (the repo was re-sharded
+    // after this index was written); the directory is then the set.
+    var any_present = false;
+    var keys = set.keyIterator();
+    while (keys.next()) |k| {
+        _ = dir.statFile(io, k.*, .{}) catch continue;
+        any_present = true;
+        break;
+    }
+    if (!any_present) {
+        log.warn("model.safetensors.index.json names no shard in this directory; loading every *.safetensors instead\n", .{});
+        freeShardSet(&set);
         return null;
     }
     return set;
@@ -637,6 +648,7 @@ pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_pa
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!isMtpGgufBasename(entry.name)) continue;
+        if (std.mem.eql(u8, entry.name, std.fs.path.basename(model_file_path))) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file) continue;
         return std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return null;
@@ -1490,6 +1502,26 @@ test "probeModelDir accepts a GGUF dir (register-by-path / /api/pull)" {
     defer allocator.free(probe.model_type);
     try testing.expectEqualStrings("gguf", probe.model_type);
     try testing.expectEqual(@as(?u64, 8), probe.bytes_on_disk);
+}
+
+test "findDs4MtpSidecar never returns the model file itself" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-IQ2-MTP.gguf", .data = "x" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model = try std.fmt.allocPrint(allocator, "{s}/Flash-Next-IQ2-MTP.gguf", .{path_buf[0..root_len]});
+    defer allocator.free(model);
+
+    try testing.expectEqual(@as(?[]u8, null), findDs4MtpSidecar(io, allocator, model));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-MTP-Q8.gguf", .data = "x" });
+    const found = findDs4MtpSidecar(io, allocator, model) orelse return error.TestExpectedSidecar;
+    defer allocator.free(found);
+    try testing.expectEqualStrings("Flash-Next-MTP-Q8.gguf", std.fs.path.basename(found));
 }
 
 test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {

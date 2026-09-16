@@ -5,6 +5,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
+const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -139,6 +140,8 @@ pub const ModelConfig = struct {
     num_key_value_heads: u32 = 8,
     head_dim: u32 = 256,
     rms_norm_eps: f32 = 1e-6,
+    /// K2-Horizon: every RMS norm normalizes `hidden_size / norm_groups`-wide channel groups on their own rms, then applies the full weight.
+    norm_groups: u32 = 1,
 
     // RoPE
     rope_theta: f32 = 1000000.0,
@@ -437,6 +440,8 @@ pub const ModelConfig = struct {
     ctx_override: u32 = 0,
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
     mtp_override: ?bool = null,
+    /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
+    mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -899,15 +904,6 @@ pub const ModelConfig = struct {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
     }
 
-    /// The width the KV cache's KEY buffer is laid out at — `head_dim` on every
-    /// symmetric arch, nope+rope on MLA. What a scheme with a shape constraint
-    /// (TurboQuant's Hadamard rotation needs a power of two) must validate
-    /// against; `head_dim` alone says 128 for an arch that caches 192-wide keys
-    /// and the refusal then fires mid-request instead of at load.
-    pub fn kvCacheKeyHeadDim(self: *const ModelConfig) u32 {
-        return if (self.isMla()) self.mlaQkHeadDim() else self.head_dim;
-    }
-
     /// The pooling op /v1/embeddings runs: the explicit signal, else masked
     /// mean (the historical default — correct for MiniLM and EmbeddingGemma).
     pub fn effectivePooling(self: *const ModelConfig) PoolingMode {
@@ -1004,6 +1000,11 @@ pub const ModelConfig = struct {
     pub fn isGemma4Layers(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "gemma4") or
             std.mem.eql(u8, self.model_type, "diffusion_gemma");
+    }
+
+    /// Additive + dedup-guarded, like every terminator merge here.
+    pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
+        for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -1139,6 +1140,9 @@ pub const ModelConfig = struct {
         // without reasoning ("17 - 9 = 8" where the thinking arm works the
         // word problem and answers "9 sheep are left").
         if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+        // k2_horizon: the template opens a think marker on every assistant
+        // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
+        if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
 
         return false;
     }
@@ -1333,6 +1337,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.gen_top_p = gd.top_p;
             config.gen_top_k = gd.top_k;
             config.gen_enable_thinking = gd.enable_thinking;
+            config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
         } else |_| {}
     } else |_| {}
     // Pooling (issue #116), priority: explicit config.json `pooling_mode`
@@ -1419,6 +1424,11 @@ pub const GenerationDefaults = struct {
     /// `default_chat_template_kwargs.enable_thinking` — the checkpoint's own
     /// thinking default. null when absent or not a bool.
     enable_thinking: ?bool = null,
+    /// `eos_token_id` (scalar or list): HF stops generation on these, and a
+    /// checkpoint may name the chat terminator ONLY here (K2-Horizon's
+    /// `<|ifm|im_end|>` rides beside config.json's `<|ifm|endoftext|>`).
+    eos_token_ids: [8]u32 = @splat(0),
+    num_eos: usize = 0,
 };
 
 /// Image-area limits parsed from a Qwen processor configuration.
@@ -1513,6 +1523,21 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
         switch (v) {
             .integer => |i| if (i > 0 and i <= 1000) {
                 gd.top_k = @intCast(i);
+            },
+            else => {},
+        }
+    }
+    if (root.get("eos_token_id")) |v| {
+        switch (v) {
+            .integer => |i| if (i >= 0) {
+                gd.eos_token_ids[0] = @intCast(i);
+                gd.num_eos = 1;
+            },
+            .array => |arr| for (arr.items) |item| {
+                if (item == .integer and item.integer >= 0 and gd.num_eos < gd.eos_token_ids.len) {
+                    gd.eos_token_ids[gd.num_eos] = @intCast(item.integer);
+                    gd.num_eos += 1;
+                }
             },
             else => {},
         }
@@ -3428,6 +3453,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.model_type = "llama";
         } else if (std.mem.eql(u8, model_type, "mistral")) {
             config.model_type = "mistral";
+        } else if (std.mem.eql(u8, model_type, "k2_horizon")) {
+            // IFM K2-Horizon dense (0.9B/3.7B/7B/32B): a Llama trunk whose
+            // RMS norms are GROUPED (`layernorm_num_groups`). The MoVA MoE
+            // sizes (`mova_num_experts` > 0) are a different attention and
+            // are not served.
+            config.model_type = "k2_horizon";
+            if (cfg_obj.get("layernorm_num_groups")) |v| {
+                if (v == .integer and v.integer > 1) config.norm_groups = @intCast(v.integer);
+            }
         } else {
             config.model_type = "unknown";
         }
@@ -3931,6 +3965,29 @@ test "loadWeights reads only the shards the index names (issue #274)" {
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
 
+test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00002.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001-of-00005.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
     // mlx-community/LFM2.5-2.6B-{8bit,nvfp4} declare `Lfm2ForCausalLM` with NO
     // text_config (just an empty `vision_config`), yet ship every weight under
@@ -4147,6 +4204,13 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
     try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
+    // k2_horizon: the template opens a think marker on every assistant turn
+    // and the pack declares no default; a declared off still wins.
+    const k2 = ModelConfig{ .model_type = "k2_horizon" };
+    try testing.expect(k2.defaultEnableThinking(false));
+    try testing.expect(k2.defaultEnableThinking(true));
+    const k2_off = ModelConfig{ .model_type = "k2_horizon", .gen_enable_thinking = false };
+    try testing.expect(!k2_off.defaultEnableThinking(false));
     // gpt_oss opts in with AND without tools. Unlike muse there is no
     // thinking-off prompt to commit: harmony's `Reasoning: low|medium|high`
     // sets depth, not presence, so the model opens an analysis channel on
@@ -4191,6 +4255,19 @@ test "parseGenerationDefaultsFromJson: reads default_chat_template_kwargs.enable
     try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": {\"enable_thinking\": \"yes\"}}",
     ).enable_thinking);
+}
+
+test "parseGenerationDefaultsFromJson: eos_token_id list merges additively into the stop set" {
+    const gd = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 250019]}");
+    try testing.expectEqual(@as(usize, 2), gd.num_eos);
+    var config = ModelConfig{};
+    config.addEosToken(1);
+    config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expect(config.isEosToken(250019));
+    const scalar = parseGenerationDefaultsFromJson("{\"eos_token_id\": 7}");
+    try testing.expectEqual(@as(u32, 7), scalar.eos_token_ids[0]);
+    try testing.expectEqual(@as(usize, 0), parseGenerationDefaultsFromJson("{\"eos_token_id\": \"x\"}").num_eos);
 }
 
 test "ModelConfig addEosToken" {
@@ -5956,11 +6033,6 @@ test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {
     // Attention scale is over the FULL qk head dim (192), not head_dim.
     try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
 
-    // The cache's KEY width is 192 — what a shape-constrained KV scheme must
-    // validate against (TurboQuant's Hadamard needs a power of two, and 192 is
-    // not one, so it is refused at LOAD instead of at the first MLA layer).
-    try testing.expectEqual(@as(u32, 192), config.kvCacheKeyHeadDim());
-    try testing.expect(!std.math.isPowerOfTwo(config.kvCacheKeyHeadDim()));
     // A negative bound selects fla's bounded-sigmoid arm.
     try testing.expect(config.kdaUsesBoundedGate());
 }
@@ -7197,4 +7269,31 @@ test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the c
     // ...while a config that DOES name a layer is unchanged.
     try testing.expect(!qwen4PleInstalledAt(&.{false}, 0));
     try testing.expect(qwen4PleInstalledAt(&.{true}, 0));
+}
+
+test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RMS norms" {
+    const json =
+        \\{
+        \\  "model_type": "k2_horizon",
+        \\  "hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 36,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+        \\  "hidden_act": "silu", "rms_norm_eps": 1e-06, "vocab_size": 250624,
+        \\  "layernorm_num_groups": 4, "query_key_norm": false, "attention_gate_func": null,
+        \\  "num_experts": 0, "sliding_window": null, "tie_word_embeddings": false,
+        \\  "max_position_embeddings": 524288, "rope_head_dim": 128,
+        \\  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("k2_horizon", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), config.norm_groups);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(f32, 10000000.0), config.rope_theta);
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(!config.has_sliding_window);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.has_pre_ff_norm);
 }

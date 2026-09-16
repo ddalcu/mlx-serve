@@ -109,6 +109,8 @@ pub const aliases = [_]Alias{
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
     .{ .name = "spark", .tag = "4b", .repo = "abenzerps/Spark-X2.5-4B-MLX-4bit", .is_default = true },
     .{ .name = "spark", .tag = "4b-8bit", .repo = "abenzerps/Spark-X2.5-4B-MLX-8bit" },
+    // IFM K2-Horizon dense. oMLX's 6-bit pack with 8-bit edge layers.
+    .{ .name = "k2", .tag = "7b", .repo = "mlx-community/K2-Horizon-7B-oQ6e", .is_default = true },
 };
 
 pub const Resolved = struct {

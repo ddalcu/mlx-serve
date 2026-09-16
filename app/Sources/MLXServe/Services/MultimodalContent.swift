@@ -63,7 +63,8 @@ enum MultimodalContent {
             ])
         }
 
-        for clip in audio {
+        // Same rule as a picture whose file is gone: no samples, no block.
+        for clip in audio where !clip.pcm.isEmpty {
             blocks.append([
                 "type": "input_audio",
                 "input_audio": [

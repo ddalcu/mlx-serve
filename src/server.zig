@@ -1130,6 +1130,50 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+/// One token id for `text`, or null when the tokenizer spells it in pieces.
+fn atomicTokenId(allocator: std.mem.Allocator, tok: *const Tokenizer, text: []const u8) ?u32 {
+    const ids = tok.encode(allocator, text) catch return null;
+    defer allocator.free(ids);
+    return if (ids.len == 1) ids[0] else null;
+}
+
+/// The in-stream thinking bound needs atomic think markers (bare `<think>`
+/// family, or a pack that aliases its own markers onto it).
+fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
+    if (lm.transformer == null) return false;
+    return tok.marker_closers != null or atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
+}
+
+/// Qwen's own thinking-budget recipe: the model is told time is up, then the
+/// closer is committed and the answer follows.
+const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
+
+/// Arm a decode-time thinking bound for this request, or null when nothing
+/// bounds it (no budget, thinking off, markers not atomic). `forced` is
+/// allocated; the caller frees it after generation.
+fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
+    if (budget < 0 or !enable_thinking or lm.transformer == null) return null;
+    const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
+        atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
+        log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
+        return null;
+    };
+    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
+    const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
+    if (opener == null and !opened) return null;
+
+    const stop_ids = tok.encode(allocator, THINK_BOUND_EARLY_STOP) catch return null;
+    defer allocator.free(stop_ids);
+    const sep_ids = tok.encode(allocator, "\n\n") catch return null;
+    defer allocator.free(sep_ids);
+    const forced = allocator.alloc(u32, stop_ids.len + 1 + sep_ids.len) catch return null;
+    @memcpy(forced[0..stop_ids.len], stop_ids);
+    forced[stop_ids.len] = closer;
+    @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
+    log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
+    return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+}
+
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
     const c = lm.config orelse return false;
     if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
@@ -1154,6 +1198,22 @@ fn templateThinkOpener(template: []const u8) ?[]const u8 {
         offset = start + len;
     }
     return found;
+}
+
+/// The aliased atomic closer for the last non-whitespace prompt token, when
+/// that token is a K2 think opener (`Tokenizer.markerCloserFor`).
+fn promptOpenerMarkerCloser(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) ?u32 {
+    if (tok.marker_closers == null) return null;
+    var i = prompt_ids.len;
+    while (i > 0 and prompt_ids.len - i < 8) {
+        i -= 1;
+        const id = prompt_ids[i];
+        if (tok.markerCloserFor(id)) |closer| return closer;
+        const text = decodeTokens(allocator, lm, tok, prompt_ids[i..][0..1], false) catch return null;
+        defer allocator.free(text);
+        if (std.mem.trim(u8, text, "\n\r\t ").len != 0) return null;
+    }
+    return null;
 }
 
 /// Resolve a reasoning protocol from the rendered prompt and template. Tokenizer
@@ -1195,6 +1255,14 @@ fn resolveReasoningProtocol(
             .bare => {
                 proto.kind = .bare_think;
                 if (!proto.setCloser(chat_mod.BARE_THINK_CLOSER)) return false;
+                // K2 decodes its openers as `<think>` (alias); the prompt's
+                // opener token names the pack's own closer, and only that
+                // spelling is the boundary (a literal `</think>` in the
+                // reasoning is text).
+                if (promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids)) |id| {
+                    const text = tok.id_to_token.get(id) orelse return false;
+                    if (!proto.setCloser(text)) return false;
+                }
             },
             .suffixed => |suffix| {
                 proto.kind = .suffixed_think;
@@ -1379,25 +1447,28 @@ fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
 
+/// A repetition-loop cut may land inside an otherwise recognizable tool call.
+/// Never emit that buffer as executable work: unlike a genuine max-token cut,
+/// this intentional stop must not ask clients to recover by compacting/retrying.
+fn shouldParseToolCalls(finish_details: ?[]const u8) bool {
+    const d = finish_details orelse return true;
+    return !std.mem.eql(u8, d, "repetition_loop");
+}
+
 /// The `finish_details` object emitted BESIDE `finish_reason` on a choice,
 /// or "" when there is nothing to say. Comes with its leading comma so call
 /// sites splice it straight into the choice literal.
 ///
-/// Why a sibling and not a new `finish_reason` value: clients key truncation
-/// recovery on "length" (see `toolCallFinishReason` above), so the wire reason
-/// cannot move — but "length" alone makes a server-cut repetition loop
-/// indistinguishable from a max_tokens truncation, which is how a run whose
-/// own status bar read "32.4%/66k" reported hitting an output limit neither
-/// side had set. OpenAI's own (deprecated) `finish_details` is the closest
-/// precedent, and conforming clients ignore keys they don't know.
+/// The loop guard uses `finish_reason: "stop"`; the sibling preserves why the
+/// server stopped without overloading "length" (which makes agents run output-
+/// or context-exhaustion recovery). OpenAI's deprecated `finish_details` is the
+/// closest precedent, and conforming clients ignore keys they don't know.
 fn finishDetailsField(reason: []const u8, details: ?[]const u8) []const u8 {
     const d = details orelse return "";
-    // Every emitter can OVERRIDE the slot's reason after the fact — a matched
-    // client stop sequence and a client-side stop both rewrite it to "stop".
-    // The cause describes a "length" cut and nothing else, so it is gated on
-    // the reason actually being emitted rather than on the slot's flag; a
-    // `finish_details: repetition_loop` next to `"stop"` contradicts itself.
-    if (!std.mem.eql(u8, reason, "length")) return "";
+    // Every emitter can override the slot's reason after the fact. Gate on the
+    // reason actually being emitted so a cause never accompanies a genuine
+    // length exhaustion, tool completion, or client disconnect.
+    if (!std.mem.eql(u8, reason, "stop")) return "";
     // One known value today; a switch here keeps an unknown string from
     // reaching the wire as an unescaped literal.
     if (std.mem.eql(u8, d, "repetition_loop")) return ",\"finish_details\":{\"type\":\"repetition_loop\"}";
@@ -2351,7 +2422,9 @@ fn handleConnection(
             return;
         },
     };
-    defer scheduler.release(lm);
+    // A status read must not look like use — see `isStatusRoute`.
+    const status_read = isStatusRoute(method, path);
+    defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
 
     // A model loaded on demand freezes its own auto-context here, for the same
     // reason the `--model` primary does at startup: the number we advertise is
@@ -3974,6 +4047,7 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         billed,
     ));
 
@@ -4018,6 +4092,25 @@ fn qwen4RequestTestConfig() model_mod.ModelConfig {
     return cfg;
 }
 
+/// The geometry the served pack actually ships (`Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit`):
+/// a narrower expert with a shared one beside it, and the GatedDeltaNet head counts
+/// `qwen4RequestTestConfig` leaves at zero. Both chunk-scaled terms of the bill read them, so
+/// the fixture's step is not the deployed one.
+fn qwen4DeployedTestConfig() model_mod.ModelConfig {
+    var cfg = qwen4RequestTestConfig();
+    cfg.moe_intermediate_size = 640;
+    cfg.num_experts_per_tok = 10;
+    cfg.shared_expert_intermediate_size = 640;
+    cfg.linear_num_key_heads = 16;
+    cfg.linear_num_value_heads = 48;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    return cfg;
+}
+
 test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
     const saved = transformer_mod.qsa_score_fused_override;
     defer transformer_mod.qsa_score_fused_override = saved;
@@ -4028,14 +4121,7 @@ test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
 
 /// The width a ladder rung actually forwards at for this prompt.
 fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 {
-    return @intCast(generate_mod.effectivePrefillChunk(
-        cfg.prefillScoreHeadDim(),
-        cfg.num_attention_heads,
-        @intCast(seq),
-        cfg.has_sliding_window,
-        cfg.isMoe(),
-        rung,
-    ));
+    return @intCast(rungWidth(cfg, seq, rung, cfg.longCtxGated()));
 }
 
 test "the load-time budget is reproducible: free RAM at load does not move it" {
@@ -4159,6 +4245,7 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
         0,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     try t.expect(perRequestPrefillChunkEnabled(&cfg));
@@ -4266,6 +4353,7 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
         0,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
@@ -4489,9 +4577,9 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     const available: u64 = 28_909 * MiB;
     const pin = cfg.pinned_prefill_chunk;
 
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
     try t.expect(4096 > pin);
 
     // The full 1M context fits at 4096 on this box under the one-copy history bill.
@@ -4527,12 +4615,17 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     var distinct: usize = 0;
     for (PREFILL_CHUNK_LADDER) |rung| {
         const width = widthForRung(&cfg, seq, rung);
-        if (width == prev_width) continue; // rungs 8192 and 4096 both forward at 4096
+        if (width == prev_width) continue; // a rung this arch narrows onto a width already walked
         prev_width = width;
         distinct += 1;
         const bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, width, .{});
-        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill, pin, 0, .{}));
-        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, bill - 1, pin, 0, .{});
+        // A rung the long-context gate widened is taken only past its margin.
+        const needed = if (width > rungWidth(&cfg, seq, rung, false))
+            bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
+        else
+            bill;
+        try t.expectEqual(width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, 0, .{}));
+        const under = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, 0, .{});
         if (width == floor_width) {
             try t.expectEqual(floor_width, under);
         } else {
@@ -4543,6 +4636,67 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
 
     // Nothing fits: the ladder floor, never 0 and never the load-time pin.
     try t.expectEqual(floor_width, chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+}
+
+test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by the estimator's margin" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const pin = cfg.pinned_prefill_chunk;
+
+    const wide_bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{});
+    const narrow_bill = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{});
+    try t.expect(wide_bill > narrow_bill);
+    // 8192 is a width only the gate offers: ungated, this rung forwards at 4096.
+    try t.expectEqual(@as(u32, 8192), widthForRung(&cfg, seq, 8192));
+    try t.expectEqual(@as(u64, 4096), rungWidth(&cfg, seq, 8192, false));
+
+    const with_margin = wide_bill * (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100;
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
+    // The rungs the gate did not widen are still taken at their plain bill.
+    try t.expectEqual(@as(u32, 4096), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 0, .{}));
+}
+
+test "prefillMemoryNeeded: the wider chunk bills every chunk-scaled term at the wider width" {
+    const t = std.testing;
+    const cfg = qwen4RequestTestConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 300_000;
+    const ffn: u64 = prefillFfnWidth(&cfg);
+    const stream: u64 = prefillStreamBytesPerToken(&cfg);
+    const dq: u64 = prefillDequantWeightBytes(&cfg);
+    const keys: u64 = cfg.prefillAttnKeys(seq);
+
+    const narrow = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, ffn, kv_bits, 4096, keys, stream, dq, .{});
+    const wide = prefillMemoryNeeded(seq, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.kvBytesPerToken(), cfg.head_dim, cfg.prefillScoreHeadDim(), cfg.hidden_size, ffn, kv_bits, 8192, keys, stream, dq, .{});
+
+    const mlp_step: u64 = 8 * 4096 * @max(@as(u64, cfg.hidden_size), ffn) * 2;
+    const envelope_step: u64 = @max(3 * mlp_step, mlp_step + 4096 * stream);
+    try t.expect(wide >= narrow + envelope_step * 5 / 4);
+    try t.expect(qsaMaskBytes(&cfg, 8192, seq) > qsaMaskBytes(&cfg, 4096, seq));
+}
+
+test "prefillNeededAtChunk: the deployed pack's 8192 step is at least the measured peak step" {
+    const qsa_fused_off = qsaScoreFusedOffGuard();
+    defer qsa_fused_off.deinit();
+    const t = std.testing;
+    const cfg = qwen4DeployedTestConfig();
+    const kv_bits: u64 = 8;
+
+    for ([_]u64{ 300_000, 326_351 }) |seq| {
+        for ([_]bool{ false, true }) |mtp_on| {
+            const narrow = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 4096, .{ .mtp_on = mtp_on });
+            const wide = prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{ .mtp_on = mtp_on });
+            // The widest active+cache step the 4096 -> 8192 trade measured on this pack was
+            // +3.3 GB; the bill for the step must not sit under what the box pays for it.
+            try t.expect(wide - narrow >= 3_300_000_000);
+        }
+    }
 }
 
 test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it" {
@@ -4710,6 +4864,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         0,
         config.has_sliding_window,
         config.isMoe(),
+        config.longCtxGated(),
         config.pinned_prefill_chunk,
     ));
 
@@ -5374,6 +5529,12 @@ pub fn prefillNeededAtChunk(
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
+/// Headroom a rung must clear beyond its own bill when the long-context gate is what widened
+/// it: past that width the machine cap frozen at load no longer bounds the forward, and
+/// `prefillMemoryNeeded` is documented to UNDER-bill quantized prefill by about this much.
+/// Narrower rungs keep the plain bill, so no other admission decision moves.
+pub const PREFILL_WIDE_RUNG_MARGIN_PCT: u64 = 22;
+
 /// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
 pub var per_request_chunk_override: ?bool = null;
 
@@ -5403,28 +5564,33 @@ pub fn chooseRequestPrefillChunk(
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
     if (chunk_override > 0) return chunk_override;
     for (PREFILL_CHUNK_LADDER) |rung| {
-        // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
-        const width: u64 = @min(
-            @as(u64, generate_mod.effectivePrefillChunk(
-                config.prefillScoreHeadDim(),
-                config.num_attention_heads,
-                @intCast(seq),
-                config.has_sliding_window,
-                config.isMoe(),
-                rung,
-            )),
-            @as(u64, std.math.maxInt(u32)),
-        );
-        if (prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm) <= available) return @intCast(width);
+        const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
+        const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, warm);
+        const needed = if (width > rungWidth(config, seq, rung, false))
+            bill *| (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
+        else
+            bill;
+        if (needed <= available) return @intCast(width);
     }
-    return @intCast(generate_mod.effectivePrefillChunk(
-        config.prefillScoreHeadDim(),
-        config.num_attention_heads,
-        @intCast(seq),
-        config.has_sliding_window,
-        config.isMoe(),
-        PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1],
-    ));
+    return @intCast(rungWidth(config, seq, PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], config.longCtxGated()));
+}
+
+/// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
+/// without the long-context gate, i.e. the width the load-time machine cap still bounds.
+fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
+    // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
+    return @min(
+        @as(u64, generate_mod.effectivePrefillChunk(
+            config.prefillScoreHeadDim(),
+            config.num_attention_heads,
+            @intCast(seq),
+            config.has_sliding_window,
+            config.isMoe(),
+            long_ctx_gated,
+            rung,
+        )),
+        @as(u64, std.math.maxInt(u32)),
+    );
 }
 
 /// Impure wrapper the scheduler reaches through `prefill_request_chunk`, mirroring
@@ -5652,7 +5818,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), chosen));
+        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
@@ -5880,6 +6046,7 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
 fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
     return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
         std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
         std.mem.indexOf(u8, tmpl, "thought") != null or
         std.mem.indexOf(u8, tmpl, "<|channel>") != null;
 }
@@ -6044,6 +6211,17 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_text_lm = lm.state != .ready or lm.transformer != null or
             lm.ds4_engine != null or lm.llama_engine != null,
     };
+}
+
+/// True for a read-only route that reports on a model without using it.
+/// `GET /props` is the only one: every other status endpoint either answers
+/// before `ensureLoaded` (the Ollama block returns from `handleOllamaEarly`,
+/// and `/health`, `/metrics`, `/v1/models` return above it) or is a real load
+/// (`/v1/load-model`). `/props` alone falls through to the shared
+/// `ensureLoaded`/release pair, so without this a poll stamps `last_used_ms`
+/// and a client polling faster than `--idle-evict-secs` pins every model.
+fn isStatusRoute(method: []const u8, path: []const u8) bool {
+    return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props");
 }
 
 /// True for the routes textGenRejectReason protects — used for the
@@ -7053,10 +7231,12 @@ fn handleEmbeddings(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    // Optional: engine-backed (GGUF/ds4) models have no MLX transformer. The
-    // scheduler path doesn't need it; only the no-scheduler fallback does, and
-    // it guards on this being present.
-    const xfm_opt = lm.transformer;
+    // Engine-backed (GGUF/ds4) models have no MLX transformer and both embed
+    // paths forward through it: refuse by name before anything is queued.
+    const xfm = lm.transformer orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model runs on an embedded engine (GGUF); embeddings are not supported. Load an MLX embedding model instead.", null);
+        return;
+    };
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
     const gen_mod = @import("generate.zig");
@@ -7203,10 +7383,6 @@ fn handleEmbeddings(
             return;
         };
     } else fallback: {
-        const xfm = xfm_opt orelse {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
-            return;
-        };
         break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
             log.err("  embedding error: {}\n", .{err});
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
@@ -7281,6 +7457,22 @@ fn truncateEmbeddingDims(embedding: []f32, dims: usize) []f32 {
     return out;
 }
 
+/// Text -> ids through the model's own vocabulary: an embedded engine's GGUF
+/// vocab, else the loaded BPE tokenizer (an engine model's `tok` is an empty stub).
+/// `add_special` reaches llama.cpp only.
+fn encodeText(allocator: std.mem.Allocator, lm: *const LoadedModel, tok: *const Tokenizer, text: []const u8, add_special: bool) ![]u32 {
+    const i32_ids = if (lm.ds4_engine) |engine|
+        try engine.tokenizeText(allocator, text)
+    else if (lm.llama_engine) |engine|
+        try engine.tokenizeText(allocator, text, add_special)
+    else
+        return tok.encode(allocator, text);
+    defer allocator.free(i32_ids);
+    const out = try allocator.alloc(u32, i32_ids.len);
+    for (i32_ids, out) |t, *o| o.* = @intCast(t);
+    return out;
+}
+
 fn handleTokenize(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -7305,19 +7497,7 @@ fn handleTokenize(
         return;
     }
 
-    const ids = if (lm.ds4_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, content.?);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else if (lm.llama_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, content.?, true);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else try tok.encode(allocator, content.?);
+    const ids = try encodeText(allocator, lm, tok, content.?, true);
     defer allocator.free(ids);
 
     var result = std.ArrayList(u8).empty;
@@ -7421,6 +7601,14 @@ const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 
 /// strings still enable). "none" is an explicit off (the gpt-5.1 default
 /// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
 /// stays in charge and existing clients see zero behavior change.
+/// The effort word is the ONLY lever when the template reads it and no
+/// decode-time bound can enforce a budget derived from it (a budget that is
+/// only a delivery cap fights the word: `chat.templateConsumesEffort`).
+fn effortWordOnly(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
+    const cc = lm.chat_config orelse return false;
+    return chat_mod.templateConsumesEffort(cc.chat_template) and !thinkMarkersAtomic(allocator, lm, tok);
+}
+
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
@@ -8068,7 +8256,7 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
@@ -8088,7 +8276,6 @@ fn handleChatCompletions(
         switch (kq.scheme) {
             .off => log.info("  kv-quant override: off (per-request)\n", .{}),
             .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
-            .turboquant_2, .turboquant_4 => log.info("  kv-quant override: turboquant {d}-bit (per-request)\n", .{kq.bits}),
         }
     }
     const kv_attn_explicit = parseKvAttnExplicit(root);
@@ -8396,6 +8583,13 @@ fn handleChatCompletions(
         }
     }
 
+    // A decode-time bound owns the budget; the surfaces then deliver the
+    // whole (closed) thought instead of trimming it.
+    var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
+    defer if (think_bound) |tb| allocator.free(tb.forced);
+    const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
+    if (think_bound) |*tb| sampling.think_bound = tb;
+
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
     const sub_ve = local_ve;
@@ -8403,13 +8597,13 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -8563,19 +8757,7 @@ fn handleCompletions(
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through
     // the loaded BPE tokenizer.
-    const prompt_ids = if (lm.ds4_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else if (lm.llama_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?, true);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else try tok.encode(allocator, prompt_text.?);
+    const prompt_ids = try encodeText(allocator, lm, tok, prompt_text.?, true);
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
@@ -9347,7 +9529,7 @@ fn handleNonStreamingGeneration(
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
     // Check for tool calls in the output
-    if (has_tools) {
+    if (has_tools and shouldParseToolCalls(result.finish_details)) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
@@ -9486,7 +9668,7 @@ fn handleNonStreamingGeneration(
             reasoning_allocated = true;
             // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
             // parity) so clients can budget visible content separately.
-            if (tok.encode(allocator, reasoning)) |rids| {
+            if (encodeText(allocator, lm, tok, reasoning, false)) |rids| {
                 defer allocator.free(rids);
                 usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
                 usage_details_allocated = true;
@@ -10654,7 +10836,7 @@ fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -14807,6 +14989,8 @@ fn handleAnthropicMessages(
         }
     }
 
+    if (try chat_mod.foldSystemMessages(allocator, &messages)) |joined| try content_allocs.append(allocator, joined);
+
     if (messages.items.len == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
         return;
@@ -14910,11 +15094,7 @@ fn handleAnthropicMessages(
     const output_cfg = parseAnthropicOutputConfig(root);
     var effort_word: ?[]const u8 = null;
     if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(
-            word,
-            server_config.default_reasoning_budget,
-            if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false,
-        );
+        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
         effort_word = cfg.effort;
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
@@ -15039,8 +15219,12 @@ fn handleAnthropicMessages(
     const tokenize_ns = tokenize_sw.read();
 
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
+    var system_chars: usize = 0;
+    for (messages.items) |msg| {
+        if (std.mem.eql(u8, msg.role, "system")) system_chars += msg.content.len;
+    }
+    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, tools_len, tool_msg_count,
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
@@ -15157,16 +15341,21 @@ fn handleAnthropicMessages(
         }
     }
 
+    var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
+    defer if (think_bound) |tb| allocator.free(tb.forced);
+    const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
+    if (think_bound) |*tb| sampling.think_bound = tb;
+
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -15320,7 +15509,7 @@ fn handleAnthropicNonStreaming(
     }
 
     // Check for tool calls
-    if (has_tools) {
+    if (has_tools and shouldParseToolCalls(result.finish_details)) {
         const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
@@ -16097,7 +16286,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = if (has_tools) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -17344,6 +17533,7 @@ fn handleResponsesInner(
             .finish_reason = if (stopped) "stop" else ts.finish_reason,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .finish_details = ts.finish_details,
         };
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
@@ -17399,7 +17589,7 @@ fn handleResponsesInner(
     const visible_text: []const u8 = think_split.content;
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
-    if (active_has_tools) {
+    if (active_has_tools and shouldParseToolCalls(result.finish_details)) {
         tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
@@ -17498,7 +17688,7 @@ fn handleResponsesInner(
     // split reasoning text — exact modulo merge boundaries).
     const reasoning_tok_count: u32 = blk: {
         const rt = reasoning_text orelse break :blk 0;
-        const rids = tok.encode(allocator, rt) catch break :blk 0;
+        const rids = encodeText(allocator, lm, tok, rt, false) catch break :blk 0;
         defer allocator.free(rids);
         break :blk @intCast(rids.len);
     };
@@ -17528,7 +17718,7 @@ fn handleResponsesInner(
     // ── store response ──
     if (should_store) {
         const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
-        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
+        storeResponse(stream.io, allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls, result.finish_details) catch |err| {
             log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -18531,8 +18721,8 @@ fn emitResponsesMessageEvents(
 }
 
 /// Persist a finished response to the in-memory store. The stored history is
-/// the input messages plus the assistant turn, deep-copied into the entry's
-/// arena so it stays valid across the request that produced it.
+/// the input messages plus a non-loop-cut assistant turn, deep-copied into
+/// the entry's arena so it stays valid across requests.
 fn storeResponse(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -18544,6 +18734,7 @@ fn storeResponse(
     visible_text: []const u8,
     reasoning_text: ?[]const u8,
     tool_calls: ?[]const chat_mod.ToolCall,
+    finish_details: ?[]const u8,
 ) !void {
     const sr = try gpa.create(responses_mod.StoredResponse);
     errdefer gpa.destroy(sr);
@@ -18551,32 +18742,11 @@ fn storeResponse(
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // Build the assistant message that produced this response.
-    var assistant_text_parts = std.ArrayList(u8).empty;
-    defer assistant_text_parts.deinit(a);
-    if (reasoning_text) |rt| {
-        try assistant_text_parts.appendSlice(a, "<think>");
-        try assistant_text_parts.appendSlice(a, rt);
-        try assistant_text_parts.appendSlice(a, "</think>");
-    }
-    try assistant_text_parts.appendSlice(a, visible_text);
-    const assistant_content = try a.dupe(u8, assistant_text_parts.items);
-
-    var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
-    if (tool_calls) |tcs| if (tcs.len > 0) {
-        const arr = try a.alloc(chat_mod.ToolCall, tcs.len);
-        for (tcs, 0..) |tc, i| {
-            arr[i] = .{
-                .id = try a.dupe(u8, tc.id),
-                .name = try a.dupe(u8, tc.name),
-                .arguments = try a.dupe(u8, tc.arguments),
-            };
-        }
-        assistant_tool_calls = arr;
-    };
+    // Keep the response retrievable, but never replay a loop-cut assistant turn.
+    const keep_assistant = shouldParseToolCalls(finish_details);
 
     // Deep-copy input messages.
-    const total_msgs = input_messages.len + 1; // +1 for assistant turn
+    const total_msgs = input_messages.len + @intFromBool(keep_assistant);
     const history = try a.alloc(chat_mod.Message, total_msgs);
     for (input_messages, 0..) |m, i| {
         history[i] = .{
@@ -18596,11 +18766,37 @@ fn storeResponse(
             .images = null,
         };
     }
-    history[total_msgs - 1] = .{
-        .role = try a.dupe(u8, "assistant"),
-        .content = assistant_content,
-        .tool_calls = assistant_tool_calls,
-    };
+    if (keep_assistant) {
+        // Build the assistant message that produced this response.
+        var assistant_text_parts = std.ArrayList(u8).empty;
+        defer assistant_text_parts.deinit(a);
+        if (reasoning_text) |rt| {
+            try assistant_text_parts.appendSlice(a, "<think>");
+            try assistant_text_parts.appendSlice(a, rt);
+            try assistant_text_parts.appendSlice(a, "</think>");
+        }
+        try assistant_text_parts.appendSlice(a, visible_text);
+        const assistant_content = try a.dupe(u8, assistant_text_parts.items);
+
+        var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
+        if (tool_calls) |tcs| if (tcs.len > 0) {
+            const arr = try a.alloc(chat_mod.ToolCall, tcs.len);
+            for (tcs, 0..) |tc, i| {
+                arr[i] = .{
+                    .id = try a.dupe(u8, tc.id),
+                    .name = try a.dupe(u8, tc.name),
+                    .arguments = try a.dupe(u8, tc.arguments),
+                };
+            }
+            assistant_tool_calls = arr;
+        };
+
+        history[total_msgs - 1] = .{
+            .role = try a.dupe(u8, "assistant"),
+            .content = assistant_content,
+            .tool_calls = assistant_tool_calls,
+        };
+    }
 
     sr.* = .{
         .id = try a.dupe(u8, resp_id),
@@ -19548,12 +19744,33 @@ test "shouldInjectResponsesJsonInstruction skips required tool turns" {
     try testing.expect(!shouldInjectResponsesJsonInstruction(true, true, "required"));
 }
 
+test "Responses history omits loop cuts while retaining the response and input" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
+    const calls = [_]chat_mod.ToolCall{.{ .id = "call_1", .name = "writeFile", .arguments = "{}" }};
+    try storeResponse(testing.io, testing.allocator, "loop", "model", "completed", "{\"status\":\"completed\"}", &messages, "loop fragment", "repeated thought", &calls, "repetition_loop");
+    const stored = global_response_store.?.map.get("loop").?;
+    try testing.expectEqualStrings("completed", stored.status);
+    try testing.expectEqualStrings("{\"status\":\"completed\"}", stored.body_json);
+    try testing.expectEqual(@as(usize, 1), stored.history.len);
+    try testing.expectEqualStrings("user", stored.history[0].role);
+    try testing.expectEqualStrings("hi", stored.history[0].content);
+
+    // A continuation keeps earlier input and its healthy assistant output.
+    try storeResponse(testing.io, testing.allocator, "next", "model", "completed", "{}", stored.history, "answer", null, null, null);
+    const next = global_response_store.?.map.get("next").?;
+    try testing.expectEqual(@as(usize, 2), next.history.len);
+    try testing.expectEqualStrings("hi", next.history[0].content);
+    try testing.expectEqualStrings("answer", next.history[1].content);
+}
+
 test "deinitGlobalResponseStore frees stored responses" {
     deinitGlobalResponseStore();
     defer deinitGlobalResponseStore();
 
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
-    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
+    try storeResponse(testing.io, testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null, null);
 
     if (global_response_store) |*store| {
         try testing.expectEqual(@as(usize, 1), store.map.count());
@@ -20574,10 +20791,18 @@ test "toolCallFinishReason preserves truncation over parsed tool calls" {
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("client_disconnect"));
 }
 
+test "repetition-loop cuts decline tool-call parsing" {
+    // The loop detector can fire inside a tool argument. The response must
+    // remain a safe terminal stop without emitting an executable fragment.
+    try std.testing.expect(shouldParseToolCalls(null));
+    try std.testing.expect(!shouldParseToolCalls("repetition_loop"));
+    try std.testing.expect(shouldParseToolCalls("unknown_future_detail"));
+}
+
 test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
     // Dispatch-hole class: a surface that reports the reason and drops the
-    // cause is silent — the response still validates, still says "length",
-    // and no output-equality test can see the missing field (the two
+    // cause is silent — the response still validates, and no output-equality
+    // test can see the missing field (the two
     // hardcoded `use_drafter=false` call sites lived for a month this way).
     // Needles are split with `++` so this test's own source can't match them.
     const t = std.testing;
@@ -20601,7 +20826,7 @@ test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
     try t.expect(std.mem.indexOf(u8, src, chunk) != null);
 
     // /v1/messages is DELIBERATELY not on this list: its envelope is
-    // Anthropic's, `anthropicStopReason` maps a loop cut to "max_tokens", and
+    // Anthropic's, `anthropicStopReason` maps a loop cut to "end_turn", and
     // inventing a key inside someone else's schema is worse than the gap.
     // The TRIM (which is what actually breaks the feedback loop) applies
     // there anyway — it happens where the text is decoded, not per surface.
@@ -20611,20 +20836,18 @@ test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
 test "finishDetailsField: the loop cause rides beside finish_reason, and only a known cause reaches the wire" {
     // Absent = the field is not emitted at all, so every ordinary response
     // is byte-identical to what it was before this existed.
-    try std.testing.expectEqualStrings("", finishDetailsField("length", null));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", null));
     try std.testing.expectEqualStrings(
         ",\"finish_details\":{\"type\":\"repetition_loop\"}",
-        finishDetailsField("length", "repetition_loop"),
+        finishDetailsField("stop", "repetition_loop"),
     );
     // An unknown value is DROPPED rather than interpolated: this string is
     // spliced into a JSON literal, and a literal is arbitrary bytes too (the
     // media-gen `sendError` class). A future cause adds an arm here.
-    try std.testing.expectEqualStrings("", finishDetailsField("length", "something new"));
-    try std.testing.expectEqualStrings("", finishDetailsField("length", "\",\"x\":\""));
-    // The cause describes a "length" cut. Every emitter may rewrite the reason
-    // after the slot set the flag (a matched stop sequence, a client stop), and
-    // a cause next to any other reason contradicts itself.
-    try std.testing.expectEqualStrings("", finishDetailsField("stop", "repetition_loop"));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", "something new"));
+    try std.testing.expectEqualStrings("", finishDetailsField("stop", "\",\"x\":\""));
+    // The cause belongs only beside the intentional loop stop.
+    try std.testing.expectEqualStrings("", finishDetailsField("length", "repetition_loop"));
     try std.testing.expectEqualStrings("", finishDetailsField("tool_calls", "repetition_loop"));
     try std.testing.expectEqualStrings("", finishDetailsField("client_disconnect", "repetition_loop"));
 }
@@ -20694,10 +20917,10 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
         // "none" is an explicit OFF (gpt-5.1 default), never an enable.
         .{ .body = "{\"reasoning_effort\":\"none\"}", .expect = .{ .enable = false, .budget = -1 } },
         // Known efforts enable thinking with the shared Responses budget map.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 128 } },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 512 } },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 2048 } },
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 1024 } },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 2048 } },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = -1 } },
         // Unknown efforts (xhigh, future values) enable with the default
         // budget — spec values are model-dependent, never reject them.
         .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .expect = .{ .enable = true, .budget = -1 } },
@@ -20719,12 +20942,15 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     }
 }
 
-test "parseReasoningEffort: a template that READS the effort word gets no budget from it" {
+test "parseReasoningEffort: a template that READS the effort word gets no budget from it unless a decode-time bound can enforce it" {
     // Two levers, one word. Where the template acts on `reasoning_effort` the
-    // word already shortens the THOUGHT; deriving a token budget from the same
-    // string only truncates what the client is SHOWN, so pi asking Qwen3.8 for
-    // `medium` got the model's unguided (long) thinking AND a 2048-token cut,
-    // followed by 25.9k tokens of invisible generation (live 2026-08-14).
+    // word already shortens the THOUGHT; a budget that is only a delivery cap
+    // fights it: pi asking Qwen3.8 for `medium` got the model's unguided (long)
+    // thinking AND a 2048-token cut, followed by 25.9k tokens of invisible
+    // generation (live 2026-08-14). The third argument is `effortWordOnly`:
+    // true when the template reads the word AND `armThinkBound` cannot close
+    // the thought at the budget (non-atomic markers). With atomic markers the
+    // budget is enforced in-stream and the word maps like everywhere else.
     // An EXPLICIT cap is someone asking on purpose and still applies — that is
     // `default_budget` here, which carries `--reasoning-budget`.
     const allocator = std.testing.allocator;
@@ -20738,10 +20964,11 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
         // Ling): the effort word reaches no template, so the budget is the ONLY
         // thing it does and every mapping stays exactly as it shipped.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 128 },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 512 },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 2048 },
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 1024 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 2048 },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        // high and xhigh are uncapped: pi's own ladder is 2048 / 8192 / 16384.
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = -1 },
         .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .consumes = false, .default_budget = -1, .want = -1 },
     };
     for (cases) |case| {
@@ -20804,7 +21031,7 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
     // A word maps through the ONE effortBudget table…
     const low = reasoningEffortFromWord("low", -1, false);
     try std.testing.expect(low.enable);
-    try std.testing.expectEqual(@as(i32, 512), low.budget);
+    try std.testing.expectEqual(@as(i32, 2048), low.budget);
     // …unless the template consumes the word (qwen3.8 class): then the word is
     // the lever and the budget stays the launch default.
     const consumed = reasoningEffortFromWord("low", -1, true);
@@ -20976,6 +21203,25 @@ test "isTextGenRoute covers exactly the guarded surfaces" {
     try std.testing.expect(!isTextGenRoute("POST", "/v1/embeddings"));
     try std.testing.expect(!isTextGenRoute("POST", "/api/embed"));
     try std.testing.expect(!isTextGenRoute("GET", "/v1/models"));
+}
+
+test "isStatusRoute: only /props reaches the shared release" {
+    try std.testing.expect(isStatusRoute("GET", "/props"));
+    // Generation is use.
+    try std.testing.expect(!isStatusRoute("POST", "/v1/chat/completions"));
+    try std.testing.expect(!isStatusRoute("POST", "/v1/completions"));
+    // An explicit load is use — it is the whole point of the request.
+    try std.testing.expect(!isStatusRoute("POST", "/v1/load-model"));
+    // The Ollama status routes never reach the release: `handleOllamaEarly`
+    // answers and returns above `ensureLoaded`, so listing them here would be
+    // dead code that reads as coverage. Measured — polling each of these
+    // against a resident model with a 5s window evicts on schedule.
+    try std.testing.expect(!isStatusRoute("GET", "/api/ps"));
+    try std.testing.expect(!isStatusRoute("GET", "/api/tags"));
+    try std.testing.expect(!isStatusRoute("GET", "/api/version"));
+    try std.testing.expect(!isStatusRoute("POST", "/api/show"));
+    // Method matters: the path alone is not the predicate.
+    try std.testing.expect(!isStatusRoute("POST", "/props"));
 }
 
 test "embedEffectiveLimit: tighter of flag and model window; zeros mean unbounded" {
@@ -21385,6 +21631,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
     // Unpinned keeps the launch width — a model the sizer never ran on must
@@ -21396,6 +21643,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         unpinned_prefill_chunk,
     ));
     // An explicit --prefill-chunk outranks the pin in BOTH directions.
@@ -21411,6 +21659,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         40_000,
         cfg.has_sliding_window,
         cfg.isMoe(),
+        cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
     ));
 }
@@ -21922,11 +22171,8 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS, .affine));
     try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS + 1, .affine));
     try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
-    // Auto never engages on non-affine schemes (TurboQuant needs the
-    // rotation undo the fused path doesn't implement; off has no triples).
+    // Auto never engages off (no triples to consume).
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_2));
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_4));
 }
 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
@@ -22716,12 +22962,14 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     const kv_bits: u64 = 8;
     const kv: u64 = 524_288;
     const cap = adaptCapFor(&cfg, 524_288);
+    // Starts at half the cap so one widen step lands exactly on the cap.
+    const from: u32 = cap / 2;
     const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
 
     var st: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 1), st.supporting);
-    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
     try t.expectEqual(@as(u8, 0), st.supporting); // and the count restarts at the new width
 
     // Room for the wider chunk's bill but not its margin: never.
@@ -22730,15 +22978,15 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     try t.expect(between >= cost_up);
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st2));
+        try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, between, from, cap, &st2));
     }
 
     // A single unsupporting probe resets the run.
     var st3: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, between, 2048, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, between, from, cap, &st3));
     try t.expectEqual(@as(u8, 0), st3.supporting);
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, 2048, cap, &st3));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st3));
 }
 
 test "the tail-merge gate reads the ARCH, not the installed hook (serve installs it for everyone)" {
@@ -22925,14 +23173,16 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
     const headroom: u64 = at_short * 5 / 4 + 1;
     try t.expect(headroom < at_long * 5 / 4);
 
+    // Starts at half the cap so one widen step lands exactly on the cap.
+    const from: u32 = cap / 2;
     var st_short: generate_mod.AdaptiveWidthState = .{};
-    try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
-    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, 2048, cap, &st_short));
+    try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
+    try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, short_kv, headroom, from, cap, &st_short));
 
     var st_long: generate_mod.AdaptiveWidthState = .{};
     var i: usize = 0;
     while (i < 8) : (i += 1) {
-        try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, 2048, cap, &st_long));
+        try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, long_kv, headroom, from, cap, &st_long));
     }
     try t.expectEqual(@as(u8, 0), st_long.supporting);
 

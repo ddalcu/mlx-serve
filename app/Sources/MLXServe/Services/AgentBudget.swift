@@ -29,7 +29,9 @@ enum AgentBudget {
     /// "enough for a one-shot whole-file write (8–11k measured)" was NOT enough:
     /// a flat 16384 truncated every large `write` at 262K context and looped a
     /// pi session for hours (2026-07-20). The budget scales with context
-    /// (context/4); this cap only bounds a degenerate runaway generation.
+    /// (context/2: thinking shares it, and one xhigh design turn on Qwen3.8
+    /// spent all of a 24k window's quarter); this cap only bounds a
+    /// degenerate runaway generation.
     private static let maxOutput = 65536
 
     /// The advertised context is declared to the CLI VERBATIM — no second margin.
@@ -45,8 +47,33 @@ enum AgentBudget {
     /// the correct, loud answer.
     static func forServerContext(_ advertised: Int?) -> Budget {
         guard let advertised, advertised > 0 else { return fallback }
-        let output = min(maxOutput, max(1024, advertised / 4))
+        let output = min(maxOutput, max(1024, advertised / 2))
         return Budget(context: advertised, output: output)
+    }
+
+    /// Room an agent keeps free before compacting, and what it keeps after: a
+    /// quarter of the window, capped where pi's and opencode2's own 20000-token
+    /// defaults (sized for 200k windows) take over. Twin of Zig `compactionReserve`.
+    static func compactionReserve(_ context: Int) -> Int {
+        min(20000, max(1024, context / 4))
+    }
+
+    /// Below this the agent's own fixed prompt leaves every turn compacting or
+    /// truncated: Claude Code sends 40-70k before the first word (tool + MCP
+    /// schemas, skills catalogue), opencode ~8k, pi ~2k. Twin of Zig `contextFloor`.
+    static func contextFloor(agentId: String) -> Int {
+        switch agentId {
+        case "claude": return 65536
+        case "opencode", "opencode2": return 32768
+        default: return 16384
+        }
+    }
+
+    /// Alert text, or nil when the window is enough.
+    static func contextWarning(agentId: String, context: Int) -> String? {
+        let floor = contextFloor(agentId: agentId)
+        guard context > 0, context < floor else { return nil }
+        return "The model advertises a \(context)-token context; \(agentId) needs \(floor)+ to work well. Raise Context size in Settings > Server, or expect compaction and truncated turns."
     }
 }
 
@@ -202,7 +229,7 @@ enum AgentConfigs {
                 const meta = row.meta || {};
                 const ctx = meta.context_length > 0 ? meta.context_length : FALLBACK_CONTEXT;
                 // Mirrors AgentBudget.forServerContext — keep the two in sync.
-                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 4)));
+                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 2)));
                 const image = Array.isArray(row.input_modalities) && row.input_modalities.includes("image");
                 return {
                   id: row.id,
@@ -250,8 +277,14 @@ enum AgentConfigs {
     /// own limits (never the loaded model's budget stamped on everything).
     /// `pinModel` writes a top-level `"model"` — opencode 2's TUI has no
     /// `--model` flag, so the config is the only place to select one.
+    /// `limit.output` is the room opencode keeps free before compacting (it
+    /// never sends max_tokens), so it carries the reserve, not the response
+    /// cap. `compaction` (opencode2) scales its global buffer/keep to the
+    /// pinned model's window: the defaults compact a 24k window before its
+    /// first reply.
     static func opencodeJSON(baseURL: String, defaultModel: String,
-                             entries: [AgentModelEntry], pinModel: Bool = false) -> String {
+                             entries: [AgentModelEntry], pinModel: Bool = false,
+                             compaction: Bool = false) -> String {
         var list = entries
         if !list.contains(where: { $0.id == defaultModel }) {
             list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
@@ -260,12 +293,18 @@ enum AgentConfigs {
         let models = list.map { e -> String in
             let attachment = e.vision ? " \"attachment\": true," : ""
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
-                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.output) } }"
+                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(AgentBudget.compactionReserve(e.budget.context)) } }"
         }.joined(separator: ",\n        ")
         let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
+        var compactionBlock = ""
+        if compaction {
+            let ctx = list.first { $0.id == defaultModel }?.budget.context ?? AgentBudget.fallback.context
+            let reserve = AgentBudget.compactionReserve(ctx)
+            compactionBlock = "\n  \"compaction\": { \"buffer\": \(reserve), \"keep\": { \"tokens\": \(min(15000, reserve)) } },"
+        }
         return """
         {
-          "$schema": "https://opencode.ai/config.json",\(pinned)
+          "$schema": "https://opencode.ai/config.json",\(pinned)\(compactionBlock)
           "provider": {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",
@@ -291,6 +330,23 @@ enum AgentConfigs {
         guard let parsed = URL(string: url), let host = parsed.host else { return false }
         if host == "localhost" || host == "::1" { return true }
         return host.hasPrefix("127.")
+    }
+
+    /// pi `settings.json`: compaction numbers scaled to the window, everything
+    /// else kept (theme, packages, the user's own `enabled`). pi compacts when
+    /// context exceeds window - reserveTokens and keeps keepRecentTokens; its
+    /// defaults (16384 / 20000) never compact a 24k window while max_tokens
+    /// shrinks to 1. Twin of Zig `mergePiSettingsJson`.
+    static func piSettingsJSON(existing: String, context: Int) -> String {
+        var obj = (try? JSONSerialization.jsonObject(with: Data(existing.utf8))) as? [String: Any] ?? [:]
+        var compaction = obj["compaction"] as? [String: Any] ?? [:]
+        let reserve = AgentBudget.compactionReserve(context)
+        compaction["reserveTokens"] = min(16384, reserve + 4096)
+        compaction["keepRecentTokens"] = reserve
+        obj["compaction"] = compaction
+        guard let out = try? JSONSerialization.data(withJSONObject: obj),
+              let s = String(data: out, encoding: .utf8) else { return "{}" }
+        return s.replacingOccurrences(of: "\\/", with: "/")
     }
 
     static func opencode2CliJSON(existing: String, baseURL: String, apiKey: String? = nil) -> String {

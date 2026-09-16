@@ -91,6 +91,24 @@ final class ChatForkTests: XCTestCase {
         XCTAssertEqual(ChatFork.prefix(messages, through: failure.id).map(\.content), ["one", "fine"])
     }
 
+    /// The picture is what the reader forked on; the round that made it comes
+    /// along.
+    func testForkingAtAGeneratedImageKeepsTheImageAndItsRound() {
+        var image = ChatMessage(role: .assistant, content: "")
+        image.media = [ChatMediaRef(kind: .image, path: "/tmp/a.png", prompt: "a cat")]
+        let messages = [user("draw a cat"), toolCaller(""), toolResult("ok"), image]
+        XCTAssertEqual(ChatFork.prefix(messages, through: image.id).count, 4)
+    }
+
+    /// A round that only thought is not something the model is ever handed
+    /// back (empty content is dropped from history), so the branch starts at
+    /// the reply above it rather than on a stranded thinking block.
+    func testForkingAtAThinkingOnlyRowTrimsToTheReplyAbove() {
+        let thought = ChatMessage(role: .assistant, content: "", reasoningContent: "hm")
+        let messages = [user("one"), assistant("fine"), thought]
+        XCTAssertEqual(ChatFork.prefix(messages, through: thought.id).map(\.content), ["one", "fine"])
+    }
+
     // MARK: - What the menu offers
 
     func testAForkableMessageOffersTheCommand() {

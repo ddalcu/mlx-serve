@@ -55,6 +55,9 @@ MODELS=(
     "gemma3-12b|Gemma 3 12B (fallback chat format)|$HOME/.mlx-serve/models/mlx-community/gemma-3-12b-it-qat-4bit|mlx|no"
     "e4b-gguf|Gemma 4 E4B GGUF (embedded llama.cpp engine)|$HOME/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf|gguf|no"
     "ds4-flash|DeepSeek-V4-Flash GGUF (embedded ds4 engine)|$HOME/.mlx-serve/models/antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf|gguf|no"
+    "qwen38-27b|Qwen 3.8 27B dense (think tags + XML tools)|$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit|mlx|yes"
+    "gemma4-26b-gguf|Gemma 4 26B-A4B GGUF (embedded llama.cpp engine)|/Volumes/G Drive SSD/gguf/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|gguf|no"
+    "flashnext-gguf|Qwen 3.8 Flash Next GGUF (embedded ds4 engine)|/Volumes/G Drive SSD/models-dl/antirez/qwen3.8-flash-next-gguf/Qwen3.8-Flash-Next-Q2.gguf|gguf|yes"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match
@@ -228,8 +231,10 @@ run_model() {
             -d "{\"model\":\"x\",\"messages\":[$PROMPT],\"max_tokens\":120,\"temperature\":0,\"enable_thinking\":true}")
         CONTENT=$(jget "$R" "(r['choices'][0]['message'].get('content') or '')")
         REASONING=$(jget "$R" "(r['choices'][0]['message'].get('reasoning_content') or '')")
-        check "[$logical] 2. truncated thinking: content empty" \
-            "$([ -z "$CONTENT" ] && echo 1 || echo 0)"
+        # A short thinker can close the thought inside the cap; only a cut thought must leave content empty.
+        FIN=$(jget "$R" "r['choices'][0]['finish_reason']")
+        check "[$logical] 2. truncated thinking: content empty when the cap cut the thought" \
+            "$([ "$FIN" != "length" ] || [ -z "$CONTENT" ] && echo 1 || echo 0)"
         check "[$logical] 2. truncated thinking: reasoning_content non-empty" \
             "$([ -n "$REASONING" ] && echo 1 || echo 0)"
 

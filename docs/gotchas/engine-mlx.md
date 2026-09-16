@@ -2,6 +2,17 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Every sampled token ranked the whole vocabulary; a shortlist is exact only if it ranks the way the row does
+`applyTopP` argsorted 248,320 logits per sampled token and `applyTopK` paid a second pass through `mlx_argpartition`. On Metal `Partition::eval_gpu` and `ArgPartition::eval_gpu` "direct partition to sort for now", so `mlx_topk` and `mlx_argpartition` ARE the multi-block merge sort and buy nothing. Qwen3.8-Flash-Next on M4 Max, MTP off: 65.0 tok/s greedy vs 60.5 at temperature 1 / top_p 0.95 / top_k 20.
+
+Fix: `topRanksDescending` takes the exact top `m` values AND column ids without ranking the row. Every element of a chunk is at most that chunk's max, so a chunk whose max is not among the `m` largest chunk maxima holds no top-`m` element; rank `V / chunk` maxima, gather the `m` winning chunks, rank their `m * chunk` candidates (balanced at `chunk = sqrt(V / m)`). `applyTopK` scatters the ids; with top_k set `applyTopP` reads the nucleus off the k-shortlist, since nothing below the row's top k can be in it.
+
+Under the rank contract (bdcf5a1: ties cut by rank, never value) the shortlist must break ties exactly as the whole row does, and three things carry that: `ranksDescending` is a stable ascending argsort of the NEGATED row (value desc, ties by lowest column id; mlx's merge sort is stable, an undocumented property a test pins directly); the chunk pick takes the LOWEST chunk ids among equal maxima (a tie group's contributing chunks are a prefix of its ascending-id list; taking the last `m` of an ascending argsort kept the wrong columns on an all-equal row); the winning chunks are sorted by id before the gather so candidates lie in ascending column order.
+
+The nucleus is the mass STRICTLY above each rank (exclusive scan, rank 0 sees zero so the argmax is always kept) over an f32 softmax of the ranked values (the row's finite entries, so the row's normalizer), and the scan runs in f32: mlx instantiates cumsum at the INPUT dtype and logits off a quantized `lm_head` are bf16, which dropped 148 of 3720 nucleus columns on one of six probe rows and made the sum depend on how many entries the scan walked.
+
+Guard: the shortlist route and the full-row route produce byte-identical filtered logits and draw the same token under the same key over `[m, V]` and `[B, L, V]` blocks at V 8192 and 248,320, six `(top_p, top_k)` settings, a 0.25-quantized row and an all-equal row; `applyTopK` keeps exactly k; the f64 nucleus reference may differ by one boundary column (its probability ~1e-5 against ~1e-7 of f32 scan error).
+
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 
@@ -102,8 +113,8 @@ AR (`next`) forwards `[1,1,d]` qmv; verify forwards `[1,K+1,d]` qmm. INT4 float 
 
 The same float-reduction issue compounds when **KV is also INT4** — see "KV cache quantization" below.
 
-### KV cache quantization (`--kv-quant {off, 4, 8, turbo2, turbo4}`)
-Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no new kernels). Storage swaps dense `[B,H,T,D]` bf16 buffers for a triple `(q, scales, biases)` where `q` is packed uint32 and `scales`/`biases` are per-group bf16; SDPA always reads dense data via `KVCache.denseView`, which dequantizes on the fly in quant mode. `--kv-quant` sets the **process default**; individual requests can override via the `kv_quant` body field on `/v1/chat/completions`, `/v1/messages`, `/v1/responses` (`"off"`, `4`, `8`, `"turbo2"`, `"turbo4"`). Memory: ~4× smaller at 4-bit (4.5 bits/elem including scale+bias overhead at group=64), ~2× at 8-bit. TurboQuant adds a Hadamard rotation before affine quant; `turbo2` halves bits-per-element again at the cost of an extra `[head_dim,head_dim]` matmul per K/V per token. Implemented in `src/kv_quant.zig` + `src/transformer.zig` (KVCache).
+### KV cache quantization (`--kv-quant {off, 4, 8}`)
+Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no new kernels). Storage swaps dense `[B,H,T,D]` bf16 buffers for a triple `(q, scales, biases)` where `q` is packed uint32 and `scales`/`biases` are per-group bf16; SDPA always reads dense data via `KVCache.denseView`, which dequantizes on the fly in quant mode. `--kv-quant` sets the **process default**; individual requests can override via the `kv_quant` body field on `/v1/chat/completions`, `/v1/messages`, `/v1/responses` (`"off"`, `4`, `8`). Memory: ~4× smaller at 4-bit (4.5 bits/elem including scale+bias overhead at group=64), ~2× at 8-bit. Implemented in `src/kv_quant.zig` + `src/transformer.zig` (KVCache).
 
 - **Equivalence thresholds** (`tests/test_kv_quant_equivalence.sh`, default 30/30; raise via env vars for stricter testing):
   - Gemma 4 E4B 4-bit weights: 30/30 passes; 8-bit KV stays identical past 60 in practice.
@@ -113,14 +124,12 @@ Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no ne
 - **Compounding with INT4 weights**: Both the existing weight-quant divergence (PLD/drafter note above) and KV-quant divergence stack. For byte-stable long-greedy at temp=0 on INT4-weight models: prefer `--kv-quant 8` if you need a quant; `--kv-quant off` if you don't.
 - **Drafter**: target's KV may be quantized; drafter cross-attends through `cache.denseView` so it never sees the quantized representation directly. Drafter's own cache stays dense. No special handling needed.
 - **Snapshot / prefix cache**: snapshot/restore copy 6 array handles per entry instead of 2 (4 extra for scale/bias); hot prefix cache works unchanged because it operates on `KVCacheSnapshot` opaquely. Each `HotEntry` records its scheme; `findBestMatch` filters by `(prompt_ids, has_tools, scheme)` so per-request overrides never produce a cross-scheme hit.
-- **TurboQuant (`turbo2`, `turbo4`)**: same affine-write/read path with a per-layer Hadamard rotation applied before quantization and undone after dequantization. `TurboState` builds `2 × num_layers` symmetric `[head_dim, head_dim]` bf16 matrices via Sylvester construction with per-layer column-sign flips (deterministic, no RNG seed). `head_dim` MUST be a power of two — caller passes via `KVCache.initWithConfigAndHeadDim`. State lives on `KVCache.quant_state` and refcount-shares through `snapshot`/`restore`. The rotation matters when inputs have outliers that would inflate per-group ranges in straight affine; on smooth data it can be slightly *worse* than straight affine because the rotation spreads tight local ranges into a wider global range.
-- **1-bit TurboQuant**: not yet shipped. `mlx_quantize`/`mlx_dequantize` only support bits ∈ {2,4,8} natively, so 1-bit requires a custom pack/unpack. Land alongside the future fused-kernel work.
+- **TurboQuant (`turbo2`, `turbo4`) was removed (2026-09-15)**: a per-layer Hadamard rotation before `mlx_quantize`, undone after. No fused path ever read it (every quantized kernel keys on the affine triple), so it dequantized and un-rotated the whole cache every token: 14% slower than affine at 4k and a third slower at 16k on Flash Next / M4 Max, plus its own traps (pow2 key width, MLA refusal, lazy rotation state, unpersistable to SSD).
 - **Extending the scheme** (e.g. fused quant-SDPA Metal kernel): the contract between cache and attention is `KVCache.denseView`. To add a new scheme:
   1. Add an enum variant to `kv_quant.Scheme`.
-  2. (Optional) Add per-cache state (e.g. `quant_state: ?TurboState` for rotation matrices).
-  3. Add `quantizeX` / `dequantizeX` functions in `src/kv_quant.zig`.
-  4. Extend the `switch (config.scheme)` arms in `KVCache.update` and `KVCache.denseView`.
-  SDPA call sites don't change. See top-of-file comment in `src/kv_quant.zig` for the worked TurboQuant example (now shipped).
+  2. Add `quantizeX` / `dequantizeX` functions in `src/kv_quant.zig`.
+  3. Extend the `switch (config.scheme)` arms in `KVCache.update` and `KVCache.denseView`.
+  SDPA call sites don't change. A scheme the fused kernels cannot read pays a whole-cache dequant per token — that is what killed TurboQuant.
 
 ### Hot prefix cache memory budget (`--prefix-cache-mem`)
 Wave 1.B — the hot prefix cache used to cap on entry count alone; with 4 KB-ctx entries on Gemma 4 E4B that's an 8 GB worst case. `--prefix-cache-mem N{KB,MB,GB}` (default 2 GB) caps resident KV bytes; `commit` evicts LRU entries until `current_kv_bytes + new_bytes <= budget`. `0`/`off` disables the byte cap (count cap still applies). Each `HotEntry` records its bytes at commit time (sum of `mlx_array_size × mlx_array_itemsize` across keys/values plus the scales/biases triples in quant mode). Log line: `[hot-cache] resident=X.XX / Y.YY MB (E entries)` on every commit / eviction.
@@ -216,7 +225,14 @@ A single `msv_attn_p256` CAUSAL dispatch scanning the whole KV monopolizes the G
 Stock MLX qmm_t picks a 32×32×32 tile that stalls at M≥2048 on qwen shapes. `prefillDqGemm` (M≥2048, affine 2/3/4/5/6/8, `MLX_SERVE_PREFILL_DQ_GEMM=0` kill) dequantizes weights to a bf16 [N,K] transient and runs the dense steel GEMM near-peak — the per-call dequant costs <1 ms and repeats sizes per layer (allocator-cache-friendly); decode/verify widths never route; numerics differ only by bf16 weight rounding (no-worse-than-stock pinned). Trap: `boundedPrefillChunk`'s score-budget formula once shrank the 64K chunk below the route's 2048 floor — it silently never engaged at 64K (the ladder's weakest rung) until the fused-causal chunk policy (`min(base, 4096)`, no formula shrink) replaced it.
 
 ### Sharpened-stochastic MTP drafting (Lightning scheme) LOSES to greedy argmax on low-entropy content — negative result, machinery kept opt-in (2026-07-22)
-Ported oMLX Lightning's scheme faithfully (drafts from a fixed sharper dist temp 0.6/top-p 0.95/top-k 20, full Leviathan `min(1,p/q)` accept, `normalize(max(p−q,0))` rejection — distribution-exact for ANY q, toy-vocab test). On low-entropy code/agent content greedy WINS: sharp acceptance is `1 − TV(p,q)`, greedy is `p(argmax_q)`; when the target is near-deterministic (temp-0.6 code sharpens p toward one-hot) `p(argmax) ≈ 1` while TV is dominated by the head's spread mass. Their "collapses to 10–20%" claim is about HIGH-entropy prose (the opposite regime). Keep it wired (`MLX_SERVE_MTP_DRAFT_GREEDY=0`) — the exact-residual machinery is correct and may win on prose.
+Ported oMLX Lightning's scheme faithfully (drafts from a fixed sharper dist temp 0.6/top-p 0.95/top-k 20, full Leviathan `min(1,p/q)` accept, `normalize(max(p−q,0))` rejection — distribution-exact for ANY q, toy-vocab test). On low-entropy code/agent content greedy WINS: sharp acceptance is `1 − TV(p,q)`, greedy is `p(argmax_q)`; when the target is near-deterministic (temp-0.6 code sharpens p toward one-hot) `p(argmax) ≈ 1` while TV is dominated by the head's spread mass. Their "collapses to 10–20%" claim is about HIGH-entropy prose (the opposite regime). Keep it wired (`MLX_SERVE_MTP_DRAFT_GREEDY=0`) — the exact-residual machinery is correct and may win on prose. **It does — see the next section; the proposal is now chosen per request.**
+
+### The greedy MTP proposal collapses on flat rows, and the sampled one only paid because it dropped the rerank (2026-09-15)
+On Qwen3.8-Flash-Next at temperature 1, `MLX_SERVE_MTP_FORCE_DEPTH=3` read per-index acceptance 0.50/0.22/0.09 on thinking prose against 0.97/0.81/0.63 on code: the greedy proposal accepts with `min(1, p_target[argmax])`, which is exactly `p(argmax)`, and on a flat row that is small — the third draft index essentially never accepted, the planner narrowed to width 0/1 and the MTP gain disappeared. The sampled proposal (`MLX_SERVE_MTP_DRAFT_GREEDY=0`) lifted per-draft acceptance 7–12 points everywhere it was asked and NETTED ZERO, because `q_probs != null` set `need_logits`: every draft step dropped the coarse 3-bit shortlist and paid the full 8-bit 675 MB lm_head readout (`corr` 0.53 → 2.6 ms, `predraft` 1.75 → 2.9 ms, +3.2 of the +4.2 ms round).
+Fix: sample the draft from the shortlist the rerank already builds. `rerankShortlist` stops before the argmax and hands back the 32 candidate ids plus their exact trunk-head logits; `shortlistProposal` filters those 32 through the SHARED sampler (`filteredProbsRows`, so a draft can never keep a token the target's filter would have cut), draws the draft from that row, and scatters it into a dense `[1, V]` q. q is zero off the shortlist, which costs nothing: Leviathan is exact for ANY q, and the residual `max(p−q,0)` is what reaches the rest of the vocabulary. Filtering INSIDE the shortlist (top_k over 32, a nucleus measured against the shortlist's mass) is an approximation of filtering the vocabulary and can only move the acceptance RATE.
+The proposal is chosen per REQUEST, not per process: `mtpDraftGreedyFor` reads the TARGET's own sampling (temperature at or below `MTP_SAMPLED_PROPOSAL_MIN_TEMP`, or `top_k == 1`, keeps the argmax), so a greedy request is untouched and `MLX_SERVE_MTP_DRAFT_GREEDY` stays as the A/B override.
+**A GROUP round is where the per-row loop hurts, and these kernels are launch-bound, not bytes-bound.** The concurrent path's rerank arm already stacks every row's mixer output into one `[N,1,H]`; the old sampled arm looped rows calling `probsAtLastPos` + `sampleFromProbsLazy` over `[1, V]` per row per step, and the group audit measured the `chain` lap 3.82 → 9.07 ms/round at N=4 — 85% of the sampled arm's whole penalty, while a full-vocab sort of 1 row and of 6 rows differ by 40%. So a sampled row now joins the rerank group (`mtpRowRerankMode` keys on `!= .full_logits`, one coarse readout and one head forward for a mixed group), and `shortlistProposalRows` runs ONE filtered block plus ONE categorical over the sampled rows' `[K, 32]`. It is gated on `sampleRowsHomogeneous` and no row carrying a seed — one categorical cannot carry a per-row key — and falls back to the per-row proposal otherwise.
+Trap: the draft TEMPERATURE is per family. 0.6 was swept on the dense 27B oQ4e sidecar head and is not evidence about any other head.
 
 **MTP round pipelining — the CPU graph-build was the recoverable overhead; our emit gap is ~0.03 ms so pre-draft buys little beyond early dispatch.** Three landed levers, each kill-switched and BIT-IDENTICAL to its off state (lazy sampling ops bind their PRNG key at graph BUILD): (1) **early dispatch** (`MLX_SERVE_MTP_EARLY_DISPATCH=0`) — `mlx_async_eval` the draft chain as soon as Phase 1 builds it, so it runs while the CPU builds Phases 2–4. (2) **cross-round pre-draft** (`MLX_SERVE_MTP_PREDRAFT=0`) — `nextMtp` tail builds+dispatches the next round's chunk A (plan after the EV update == head-of-round); mirrors oMLX `_step_mtp` but our scheduler has no Python-sized emit window, so it ≈ early-dispatch on totals (kept for the cheaper EV boundary sync). A `MtpPreDraft` owns every handle; consume asserts stash-XOR-predraft. (3) **GDN capture-tail trim** — the seq kernel emits `state_out` from registers and never writes `state_seq[T-1]` (partial accept reads ≤ T-2), so the final state is no longer a slice VIEW pinning the whole [T,…] buffer. Residual vs oMLX is GPU work (their round ≈ their AR forward), not scheduling.
 
@@ -2292,13 +2308,13 @@ Three holes the `bailing_hybrid` port left open, all of the same shape — a gen
 
 **`updateDense` learned that K and V can differ; `updateAffine` did not.** The dense write path was generalized to read each buffer's own head dim, and the MLA comment noted that "the quantized-KV fused kernels assume one head width for both, so MLA never opts in". That is true of the fused READ kernels and says nothing about the cache SCHEME: `--kv-quant 4|8` builds an `.affine` cache for whatever arch is loaded, and `updateAffine` solved `q_last`/`sc_last` once from `new_k`'s head dim and handed them to all six `growQuantBuf` calls. At K 192 / V 128 the value buffer came out 24 u32 wide while `new_vq.q` was 16, so `writeAtOffset` slice-updated a narrow chunk into a wide window — an mlx-level shape error, i.e. one we cannot catch. `truncate`'s affine arm had the same bug in view form (value scale/bias views sliced against the KEY scales' shape). The rule: a "K and V may differ" generalization is not done until every buffer in every scheme is sized from the operand it stores. Both are now covered by `KVCache affine quant carries an asymmetric K/V too`.
 
-**A lazily-built rotation refuses lazily.** TurboQuant needs a power-of-two width and MLA's key is 192, so it genuinely cannot serve this arch. But `TurboState` builds its Hadamard matrices at the first write, so the refusal (`error.NonPowerOfTwoHeadDim`) fired inside the first request that reached an MLA layer — a 500 mid-generation for something knowable at load. `initWithConfigAndHeadDim` had even taken a `head_dim` parameter and thrown it away (`_ = head_dim; // observed at first write`), while its own doc comment claimed "the scheduler's load path validates head_dim is pow2 at cache init". The parameter is now used — against `ModelConfig.kvCacheKeyHeadDim()`, because `head_dim` says 128 for an arch that caches 192-wide keys, so the declared field would have validated the wrong number. When a lazy constructor's constraint is knowable from config, check it eagerly and let the request path keep the lazy build.
+**A lazily-built rotation refuses lazily.** TurboQuant (since removed, see the KV cache quantization section) built its Hadamard matrices at the first write, so its power-of-two refusal fired inside the first request that reached an MLA layer instead of at load. When a lazy constructor's constraint is knowable from config, check it eagerly and let the request path keep the lazy build.
 
 **Two arms means the arm is selected, not defaulted.** `kda_gate_lower_bound` was declared "0 = plain -exp(A_log)·softplus form" and the forward then handed that 0 straight to the bounded chain, which computes `exp(0 · σ(…))` = 1: a forget gate that never forgets, on a checkpoint whose only difference was omitting the key. The parse refuses a non-negative bound that is PRESENT, but an absent one left the field at its default and the field's own comment unhonored. The fix is a predicate (`ModelConfig.kdaUsesBoundedGate`) both sides read, and the absent case routes to the softplus chain — which is elementwise, so with `A_log` already expanded per key channel it serves a per-channel gate with no new code. Whenever a config value's default means "the other formula", the selection belongs in a named predicate; a default that silently degenerates one branch is worse than either branch.
 
 ## The refusal was right and the process died anyway: a fallible re-init behind a deinit (2026-08-13)
 
-Making `KVCache.initWithConfigAndHeadDim` fallible was the previous section's fix — TurboQuant cannot serve a 192-wide MLA key, so say so at load instead of mid-request. It worked. `mlx-serve --model <Ling-3.0-tiny> --serve --kv-quant turbo4` printed the named refusal, correctly, and then died:
+Making the KVCache constructor fallible was the previous section's fix — a scheme that cannot serve a 192-wide MLA key should say so at load instead of mid-request. It worked. The refusal printed, correctly, and then the process died:
 
 ```
 --kv-quant turbo: cache key width 192 is not a power of two ...
@@ -2310,7 +2326,7 @@ The crash is not in the new check and not in the arch. Every site that re-applie
 
 ```zig
 xfm_ptr.cache.deinit();
-xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(...);
+xfm_ptr.cache = try KVCache.initWithConfig(...);
 ```
 
 Read that with an error in mind: `deinit` frees the entries slice and every mlx handle in it, `try` returns, and a FREED cache stays installed on the Transformer. The owner's own `deinit` then walks the same entries and frees all of it a second time. Four sites had the shape — the scheduler's cold load, main's offline path, `resetCache`, `tryRestoreCache` — because the pattern is the obvious way to write it and was correct for as long as the callee could not fail. **A constructor becoming fallible is a change to every caller that frees before calling it**, and nothing in the type system says so: the `try` was added at each site by the same patch that introduced the error, which is precisely when the freed-object window opened.
@@ -2318,7 +2334,7 @@ Read that with an error in mind: `deinit` frees the entries slice and every mlx 
 The fix is ordering, held in one place. `KVCache.reinit` builds the replacement, and only then frees and swaps:
 
 ```zig
-const fresh = try initWithConfigAndHeadDim(self.allocator, num_layers, config, head_dim);
+const fresh = try initWithConfig(self.allocator, num_layers, config);
 self.deinit();
 self.* = fresh;
 ```
@@ -4404,7 +4420,11 @@ Two footguns: `mlx_take_axis` needs unsigned indices (int32 aborts); quantized k
 
 Prefill and decode gathered; the width in between did not. At 2 ≤ S < 16 — an MTP or DFlash verify block — `qsaMaskFromQk` fell through to the dense `[S, kv]` bool mask and `gatedFullAttnWith` read the full `DenseKVView`. Under `--kv-quant 8` that view is a fresh dequant of the ENTIRE stored range, per layer, per verify forward: the arm that was supposed to make MTP cheap paid the whole cache twice a round.
 
-`qsaVerifyGatherAttn` (default on, `MLX_SERVE_QSA_VERIFY_GATHER=0` restores the mask; floor `QSA_VERIFY_GATHER_MIN_KV` = 16384, `MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV`) gathers a FIXED-size superset of the block's rows and dequantizes only those rows through the decode arm's `takeContig` + `dequantizeAffine` path. Fixed-size is the whole design constraint: a real set union has a data-dependent size, and learning it means a host sync inside a lazy decode graph.
+`qsaVerifyGatherAttn` (default on, `MLX_SERVE_QSA_VERIFY_GATHER=0` restores the mask; floor `qsaVerifyGatherMinKvFor`: 32768 on dense KV, 16384 quantized, `MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV` sets one for both) gathers a FIXED-size superset of the block's rows and dequantizes only those rows through the decode arm's `takeContig` + `dequantizeAffine` path. Fixed-size is the whole design constraint: a real set union has a data-dependent size, and learning it means a host sync inside a lazy decode graph.
+
+### The verify gather's floor was reasoned, not measured, and the M5 decode ladder dipped at 16k
+
+The M5 Max decode-vs-context chart for Flash Next had a V at 8k-16k under MTP (control 101 -> 89 -> 101, acceptance-mode arms 108 -> 103 -> 108) while the serial curve on the M4 Max was monotone (56 -> 51 tok/s, 1k -> 32k, every rep within 0.3). The dip lived in the MTP verify round: at fixed depth 6 (S=7) the round cost 59 ms at 8k, 66 ms at 17k and 68 ms at 34k, and with the gather forced off 59 / 62 / 69. `qsaVerifyGatherAttn`'s floor of 16384 was set from the union's size ("S=7 is 14336 rows, so below ~16k the union is most of the cache"), but on DENSE KV the gather COPIES its rows through `takeContig` while the mask arm reads the cache in place, so the copy only pays once the union is well under half the cache: -7% at 17k, break-even at 34k. Fix: `qsaVerifyGatherMinKvFor(quantized)` = 32768 dense, 16384 quantized (the quantized arm dequantizes only the gathered rows, its floor is unmeasured and keeps the old value); the selection site keys on `ctx.cache.config.scheme`, the arm on the view's triples. Per-rung acceptance is the other half of any such chart: the same rung's reps swung 55-73% per-draft acceptance on different text and tok/s followed it exactly, so a one-request-per-rung ladder cannot tell a cost dip from an acceptance dip. Harness: `~/claude-tmp/qsa-floor-0915/` (`run_arm.sh` boots one arm per floor, `probe.py` reads `timings`; ms/round = tokens / tok/s / `attempts`).
 
 Three things had to be got right, and two of them are counter-intuitive.
 
@@ -4709,6 +4729,21 @@ or neither. Then the persisted head shipped its history with a step of 0:
 `num_hidden_layers`, so `qwen4MtpAdvance` sets it and the commit refuses a
 snapshot whose step disagrees.
 
+## QSA trim budgets must include the transferred pooled bank (2026-09-14)
+
+A 496,263-token commit selected a 491,520-token prefix using a 56 MB checkpoint bill.
+That checkpoint did not yet carry the pooled QSA indexer bank: trimming moved the bank
+from the newest checkpoint onto it. Even after shedding all other checkpoints, the
+entry cost 11,936 MB against an 11,735 MB cap, so replacement evicted the only entry.
+
+`trimmedCheckpointBytes` prices the bank's sliced shape at each candidate position,
+replacing any bank already billed there. Only the final retained checkpoint gets
+that bill; lower checkpoints keep their own costs in the shedding simulation.
+Both the shedding and all-lower trim policies use it. The trim log reports bytes
+before shedding rather than asserting an unchecked `<=` relationship. Regression
+tests compare the estimate with materialized history across pooling boundaries and
+check that an oversized commit retains a budget-compliant, reusable prefix.
+
 ## QSA at long context: split-K, an exact select, one history copy (PR #363, qwen4_exp)
 
 - **Verify widths** (2 <= S < 16) spent ~50 dependent ops per layer and
@@ -4935,9 +4970,132 @@ donated, and assigned the handles fresh only after the grow and the writes. When
 failed (an MLX error, catchable since #353), the entry kept both freed handles and the next
 `resetCache` or `deinit` of that cache freed them again: SIGSEGV in `freeKVEntry`. Seen live when
 Qwen3-Embedding sub-batches shared the cache and a write failed on the batch dimension
-(`broadcast_shapes`). `updateAffine` already reset its handles at the free, and
-`updateTurboQuant` goes through it. Fix: reset the handles at the free; `writeAtOffset` releases
+(`broadcast_shapes`). `updateAffine` already reset its handles at the free. Fix: reset the handles at the free; `writeAtOffset` releases
 its result on the error path. A grow that fails after K but before V can leave their capacities
 apart; the error aborts that forward and the next request's reset restores a coherent pair.
 Guard (stale views): the `KVCache dense update` fault sweep over every checked op of an
 in-capacity and a growing update.
+
+## 3-bit experts fell off the fused MoE decode kernels; the fix is the pack unit (2026-09-13)
+
+The iQ-MLX 3.3 bpw Flash Next pack quantizes 67 of its expert layers at 3-bit gs128, and every
+fused MoE decode kernel (`gatherQmv`, gate+up, down+reduce, both rows variants) declined 3-bit,
+so those layers ran stock `gather_qmm`: 52.6 tok/s vs 55.5 on the 4-8 pack while reading 30%
+fewer expert bytes. First arm: a 32-value unit of three words per lane, one quant group per unit.
+Correct, but K=2560 is 80 units over 32 lanes, so half the lanes sat idle for a third of the loop,
+and the microbench read 83 us per gate+up+down pair against 73 us for 4-bit. Second arm: the pack
+unit is the byte triple mx.quantize really writes (8 values, value i at bit 3i), read through one
+`mlxserve_qpack<BITS>` loader so the body's `>> (i * BITS)` walk is unchanged; 74.8 us, on par
+with 4-bit. The header is shared with the nvfp4 variants (same source) or their kernels fail to
+compile at runtime. Live: 52.1 -> 54.7 tok/s single stream, +4% at two streams. The lesson the
+microbench taught: at <= 4 bits these kernels are ALU-bound (2/3/4-bit all ~72 us, 8-bit at
+bandwidth), so a narrower pack buys nothing unless the lanes stay balanced; the byte floor for
+3-bit is ~46 us and the gap is a per-value ALU count (shift, mask, convert, two FMAs), the same
+gap the 4-8 pack has. Guards: the 3-bit arms of the gatherQmv fp32-truth test, the gate+up and
+down+reduce bit-identity tests, and the rows-vs-solo test.
+
+## The MoE down+reduce kernel was reduction-bound, not byte-bound (2026-09-13)
+
+Splitting the gate+up and down+reduce timings showed the down kernel reading half the bytes of
+gate+up in the same wall time (4-bit: 8 MB in 33 us vs 16 MB in 41 us). Its layout gave every
+output row a whole simdgroup: K is the MoE intermediate (640 on Flash Next), so each lane held two
+or three packs and then paid a 32-lane `simd_sum`, four rows in series per simdgroup, with K/8 = 80
+packs over 32 lanes leaving 16 lanes idle for a third of the loop. Two experiments, both measured
+INTERLEAVED against the old kernel in one process (separate `zig build test` runs drifted 15%
+between identical kernels, enough to fake either verdict): hoisting the four rows' packs in the old
+layout LOST (34.6 vs 32.9 us); eight lanes per row with the packs hoisted per lane and a three-step
+`simd_shuffle_xor` reduce for all four rows at once took 34 -> 24 us at 2/3/4-bit and 43 -> 37 at
+8-bit. Four lanes per row spills the hoisted array (49 us); sixteen equals eight. The rows twin
+carries the same layout so batched decode stays bit-identical to solo. The reduction tree differs
+from the composed chain, so the parity test moved from bit identity to RMS error against the f32
+truth no worse than the chain's. Rule: a short-K kernel's cost is its reductions and its lane
+balance; hoist per lane, and A/B kernels only interleaved.
+
+## Prefill fusion must preserve the compiled BF16 chain
+
+An eager reference can hide rounding changes introduced by MLX compilation.
+HC prefill keeps the native inject matmul, rounds the mean reciprocal to BF16
+before multiplying (including HC=3/5/6/7), and derives HC/hidden dimensions from
+the config and weights. HC and GDN share an MLX-generated BF16 sigmoid table.
+The width bound includes the chunker's coalesced tail. Unsupported shapes use
+the composed path; `MLX_SERVE_HC_PREFILL=0` and `MLX_SERVE_GDN_PREFILL_FUSED=0`
+restore it. Guards compare HC against compiled write/mix and GDN against
+`computeGdnGate`, covering cold history, batch 2, tail widths and decline gates.
+
+The first cut carried the chunk width as a Metal template arg (`S` on the
+prework and norm-gate kernels, `M` on the HC mix). MLX compiles one pipeline per
+template set, so every NOVEL prompt length paid three JIT compiles: 700-token
+prefill 957 ms on a repeated length, 1060 ms on a new one (M4 Max), which is a
+net loss below ~1k tokens and invisible to llmprobe (a rung repeats one length).
+The width now rides in as a 0-dim int input (`seq` / `rows`, exposed as a plain
+scalar like `eps`) and only the sigmoid-table switch (`TAB`) is a template.
+### A group's sampled accept was a staircase of one-row filters (2026-09-15)
+On qwen4_exp a concurrent group's MTP round verifies every row in ONE row-axis forward whose lm_head
+projects the whole group at once — and then threw that block away. Each sampled row's `mtpRoundFinish`
+built its own `probsAllPositions` over its slice of it, its own accept graph, its own
+`mlx_async_eval`, and blocked on two host reads, N times in a row with the GPU idle across each read;
+the greedy rows had had their argmax pre-dispatched for the whole group since #412. Fix:
+`Transformer.verify_joined_logits` publishes the joined block, `mtpGroupVerify` hands it to row 0's
+state, and `mtpGroupSampledAccept` filters it once and builds every sampled row's accept graph onto
+the group's single eval, storing the terms on `MtpRoundState.accept_*`. No draw moves: each row still
+takes its own `mtpSamplingDraw` key and its own acceptance mode, and the accept test stays a host loop
+on the row's own prng. It declines to the per-row arm when the rows do not share a sampler, any row is
+seeded, or a row was padded past `1 + m`. Measured (forced depth 2, in-boot greedy control): the
+sampled rows' per-row `gap` excess over the greedy control — 1.78/1.18/0.59 ms at N=4, 0.57 ms at
+N=2 — goes to 0.02/0.01/0.01 and 0.00, and the N=4 creative round drops 1.5% while its greedy control
+moves 0.1%. Guard: a ragged three-row block test pinning each row's slice byte-identical to that row's
+own `probsAllPositions`, plus the decline predicate.
+
+### Two selections and two masks where one of each would do (2026-09-15)
+`applyTopK` and `applyTopP` were written as independent filters, and every sampling site composed
+them. After the rank-based rewrite that composition is redundant: `applyTopP` takes the caller's
+`top_k` as its nucleus bound, ranks exactly those k columns, and scatters its keep flags at those
+column ids — so the preceding `applyTopK` selects the same shortlist and masks a strict superset of
+what the nucleus keeps. `filterTopKTopP` therefore just skips it, which costs one fewer full-vocab
+selection and one fewer full-row `where` per filtered row (at V = 248320 the pair is ~0.7 ms of GPU).
+Byte-identical, because `where(mask_p, where(mask_k, x, -inf), -inf) == where(mask_p, x, -inf)` when
+mask_p is a subset of mask_k. Guard: byte identity against the two-pass composition over `[m, V]` and
+`[1, L, V]` at V = 8192 and 248320, six (top_p, top_k) settings including the degenerate ones, a
+tie-quantized row and an all-equal row.
+
+### Every block decoder that commits an argmax could commit a reserved id (2026-09-15)
+Every other path that turns logits into a token on this model masks the reserved set: the serial
+sampler (`sampleTokenLazy`), the sampled MTP verify (`probsAllPositions`) and the rerank draft select
+all take `suppress_mask`. The greedy MTP verify argmaxed the raw verify logits at both sites (the
+group's pre-dispatch and the solo finish), so a flagged special or one of the 243 padding rows past
+the defined vocabulary could be committed as the correction token — the one id class the request could
+never have drawn serially. Nothing was observed live (the model has to actually rank one of those
+columns first), which is exactly why it needed a test rather than a sighting. `verifyArgmax` masks
+first, with `-inf` in the logits' own dtype so a bf16 verify block is not widened to f32 on the greedy
+fast path. It is a CLASS, not one site: the gemma drafter and DFlash verify the same way and commit
+`verify_argmax[accepted]` as the next token, and both had the same bare argmax. PLD's per-position
+argmax and DFlash's draft and correction argmaxes are acceptance tests and proposals, never committed,
+and stay unmasked. The guard is the TYPE, not a scan: `verifyArgmax` returns a `CommittedArgmax` and is
+its only constructor, and every commit site — the two MTP sites, the drafter, DFlash,
+`MtpRoundState.verify_argmax`, `mtpAcceptRowGreedy` — takes that type, so a raw `mlx_array` argmax
+cannot reach a commit and a future decoder joins the class by construction. A name-keyed source scan
+was written first and was worse than nothing: it enumerated three functions and matched the literal
+`verify_argmax`, so the grouped path's `var am` slipped through it. Behaviour bar: the helper at each
+decoder's own block width — a block whose raw argmax is a padding id must yield the best legal id per
+position, and the unmasked arm must still yield the padding id.
+
+## A best-effort sidecar write was failing the NEXT request (2026-09-15)
+
+`/v1/chat/completions` answered 500 `generation failed` on ~2.6% of requests, any prompt size: all 151
+failures in the log had `[mlx] expected a non-empty mlx_array (map.cpp:49)` -> `[disk-cache] spec
+persist failed` -> `[scheduler] batched decode aborted: MLX failure` immediately before them, and every
+`[mlx]` line in that log was that same message.
+
+Two bugs stacked. `insertSpecTensors` inserted `a.aux_state` whenever `rows_ok` held, and `rows_ok` was
+`hist == limit and (aux.ctx != null or pooled.ctx != null)` - an OR that arrived with the QSA raw keys
+turning into a 32-row ring with the pooled bank as the history (#381). `qsaHistoryRows` reports the
+checkpoint POSITION from `qsa_hist_rows` even with `aux_state.ctx == null`, so a pooled-only head passed
+the guard and the insert handed mlx an empty array: mlx-c threw, our handler latched. The throw was
+CAUGHT (spec persistence is best-effort - "a failed write costs the entry its spec, never the entry") -
+but the latch is process-wide and `checkErrorDecode` reads it once per tick, so the next request blamed
+itself for the previous one's disk write.
+
+Fix: `rows_ok` requires `aux_state.ctx != null` (the loader refuses a head half without `h.aux`), and
+`writeSpecSidecar` drops the latch it raised (`mlx.dropLatchedErrorUnless`), the guard the restore dump
+already carried: a swallowed MLX error is not swallowed until the latch is cleared. Guard: the "arms no
+MLX latch" DiskTier test, which reproduced the exact `map.cpp:49` message before the fix.

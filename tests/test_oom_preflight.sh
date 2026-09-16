@@ -48,8 +48,21 @@ sleep 1
 # succeeds, then add a huge SPARSE dummy weight file to trip the pre-flight.
 rm -rf "$FAKE"; mkdir -p "$FAKE"
 for f in "$MODEL"/*; do ln -sf "$f" "$FAKE/$(basename "$f")"; done
-truncate -s 80G "$FAKE/zzz_oom_dummy.safetensors" 2>/dev/null || \
-    mkfile -n 80g "$FAKE/zzz_oom_dummy.safetensors"
+# Twice physical RAM: a fixed 80 GB is under "available" on a 128 GB box.
+DUMMY_GB=$(( $(sysctl -n hw.memsize) / 1073741824 * 2 ))
+truncate -s "${DUMMY_GB}G" "$FAKE/zzz_oom_dummy.safetensors" 2>/dev/null || \
+    mkfile -n "${DUMMY_GB}g" "$FAKE/zzz_oom_dummy.safetensors"
+# The pre-flight bills only the shards the index names (#274), so an indexed
+# model needs the dummy listed in its weight_map or it is dead weight.
+if [ -f "$MODEL/model.safetensors.index.json" ]; then
+    rm -f "$FAKE/model.safetensors.index.json"
+    python3 - "$MODEL/model.safetensors.index.json" "$FAKE/model.safetensors.index.json" <<'PY'
+import json, sys
+idx = json.load(open(sys.argv[1]))
+idx.setdefault("weight_map", {})["zzz_oom_dummy"] = "zzz_oom_dummy.safetensors"
+json.dump(idx, open(sys.argv[2], "w"))
+PY
+fi
 
 echo ""
 echo "── #47: pre-flight refusal must exit cleanly (no SIGSEGV) ──"

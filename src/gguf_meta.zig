@@ -10,6 +10,7 @@
 //!
 //! Routing rule (`preferredEngine`):
 //!   `general.architecture == "deepseek4"` AND lora-rank key present → ds4
+//!   a ds4-only arch (`deepseek41`, `qwen4exp`, `glm-dsa`, `glm5-next`) → ds4
 //!   otherwise → llama.cpp
 //!
 //! This replaces the basename-only heuristic in `model_discovery.zig`, which
@@ -33,6 +34,9 @@ pub const Info = struct {
     /// absent or not a string.
     architecture: ?[]u8 = null,
     has_ds4_lora_rank: bool = false,
+    /// `<arch>.nextn_predict_layers` > 0: the checkpoint carries its own MTP
+    /// head (ds4 arms it via `glm_mtp`; asking on a model without one refuses the open).
+    embedded_mtp: bool = false,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -40,9 +44,13 @@ pub const Info = struct {
     }
 };
 
+// Arch names only the ds4 converters write; llama.cpp has no loader for them.
+const ds4_only_archs = [_][]const u8{ "deepseek41", "qwen4exp", "glm-dsa", "glm5-next" };
+
 pub fn preferredEngine(info: Info) Engine {
     if (info.architecture) |a| {
         if (std.mem.eql(u8, a, "deepseek4") and info.has_ds4_lora_rank) return .ds4;
+        for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return .ds4;
     }
     return .llama;
 }
@@ -105,6 +113,7 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         // Match first, then advance.
         const is_arch = std.mem.eql(u8, key_buf, "general.architecture");
         const is_ds4_lora = std.mem.eql(u8, key_buf, "deepseek4.attention.output_lora_rank");
+        const is_nextn = std.mem.endsWith(u8, key_buf, ".nextn_predict_layers");
 
         const value_type = takeIntT(r, u32) catch return error.Truncated;
 
@@ -119,11 +128,13 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             // for routing. Skip past the value cleanly.
             try skipValue(r, value_type);
             info.has_ds4_lora_rank = true;
+        } else if (is_nextn and isNumeric(value_type)) {
+            info.embedded_mtp = (try takeNumeric(r, value_type)) > 0;
         } else {
             try skipValue(r, value_type);
         }
 
-        // Short-circuit once both probe keys are resolved — saves walking
+        // Short-circuit once the routing keys are resolved — saves walking
         // the (potentially huge) tokenizer/vocab arrays that come later.
         if (seen_arch and info.has_ds4_lora_rank) break;
     }
@@ -157,6 +168,24 @@ fn fixedTypeSize(ty: u32) ?u64 {
         TY_U32, TY_I32, TY_F32 => 4,
         TY_U64, TY_I64, TY_F64 => 8,
         else => null,
+    };
+}
+
+/// Integer value of a numeric KV as f64 (floats pass through; the callers
+/// only compare against zero).
+fn takeNumeric(r: *std.Io.Reader, ty: u32) Error!f64 {
+    return switch (ty) {
+        TY_U8 => @floatFromInt(takeIntT(r, u8) catch return error.Truncated),
+        TY_I8 => @floatFromInt(takeIntT(r, i8) catch return error.Truncated),
+        TY_U16 => @floatFromInt(takeIntT(r, u16) catch return error.Truncated),
+        TY_I16 => @floatFromInt(takeIntT(r, i16) catch return error.Truncated),
+        TY_U32 => @floatFromInt(takeIntT(r, u32) catch return error.Truncated),
+        TY_I32 => @floatFromInt(takeIntT(r, i32) catch return error.Truncated),
+        TY_U64 => @floatFromInt(takeIntT(r, u64) catch return error.Truncated),
+        TY_I64 => @floatFromInt(takeIntT(r, i64) catch return error.Truncated),
+        TY_F32 => @as(f32, @bitCast(takeIntT(r, u32) catch return error.Truncated)),
+        TY_F64 => @as(f64, @bitCast(takeIntT(r, u64) catch return error.Truncated)),
+        else => error.UnsupportedType,
     };
 }
 
@@ -285,6 +314,39 @@ test "preferredEngine: llama arch → llama" {
     try testing.expectEqualStrings("llama", info.architecture.?);
     try testing.expect(!info.has_ds4_lora_rank);
     try testing.expectEqual(Engine.llama, preferredEngine(info));
+}
+
+test "embedded MTP is read from <arch>.nextn_predict_layers" {
+    const with = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
+        .{ .key = "qwen4exp.nextn_predict_layers", .value = .{ .u32_v = 1 } },
+    });
+    defer testing.allocator.free(with);
+    var a = try parseBytes(testing.allocator, with);
+    defer a.deinit(testing.allocator);
+    try testing.expect(a.embedded_mtp);
+
+    const zero = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
+        .{ .key = "qwen4exp.nextn_predict_layers", .value = .{ .u32_v = 0 } },
+    });
+    defer testing.allocator.free(zero);
+    var b = try parseBytes(testing.allocator, zero);
+    defer b.deinit(testing.allocator);
+    try testing.expect(!b.embedded_mtp);
+}
+
+test "preferredEngine: ds4-only archs → ds4 without the lora key" {
+    // The ds4 converters write these arch names; llama.cpp cannot load them.
+    for ([_][]const u8{ "qwen4exp", "deepseek41", "glm-dsa", "glm5-next" }) |arch| {
+        const bytes = try buildHeader(testing.allocator, &.{
+            .{ .key = "general.architecture", .value = .{ .str = arch } },
+        });
+        defer testing.allocator.free(bytes);
+        var info = try parseBytes(testing.allocator, bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(Engine.ds4, preferredEngine(info));
+    }
 }
 
 test "preferredEngine: deepseek4 + lora_rank → ds4" {

@@ -35,6 +35,7 @@ struct MLXCoreApp: App {
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
+    @ObservedObject private var browser = BrowserManager.shared
     @Environment(\.openWindow) private var openWindow
 
     private func menuBarIcon(for status: ServerStatus) -> NSImage {
@@ -114,6 +115,11 @@ struct MLXCoreApp: App {
                 // the launcher panel can't reach SwiftUI's openWindow itself.
                 .onChange(of: appState.pendingChatOpenTick) { _, _ in
                     openAndFocus("chat")
+                }
+                // A tool handler has no SwiftUI environment: browse{show} bumps
+                // this on the manager and the scene opens the window.
+                .onChange(of: browser.showRequestTick) { _, _ in
+                    openAndFocus("browser")
                 }
 
         }

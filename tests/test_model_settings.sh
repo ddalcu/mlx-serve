@@ -44,7 +44,7 @@ sleep 0.5
 
 write_settings() { # write_settings <ctx> <kv>  — override for MODEL_A only
     cat >"$SETTINGS" <<JSON
-{ "$MODEL_A/": { "ctx_size": $1, "kv_quant": "$2" }, "not-a-model": 1 }
+{ "$MODEL_A/": { "ctx_size": $1, "kv_quant": "$2", "mtp_acceptance": "typical" }, "not-a-model": 1 }
 JSON
 }
 write_settings 4096 8
@@ -78,6 +78,7 @@ post() { # post <route> <json>
 check "[1] boot: context_length 4096 from the file (got $(row "$MODEL_A" ctx))" "$([ "$(row "$MODEL_A" ctx)" = "4096" ] && echo 1 || echo 0)"
 check "[1] boot: meta.kv_quant 8 from the file (got $(row "$MODEL_A" kv))" "$([ "$(row "$MODEL_A" kv)" = "8" ] && echo 1 || echo 0)"
 check "[1] log names the override" "$(grep -q "\[model-settings\] .*ctx=4096 kv=8" "$LOG" && echo 1 || echo 0)"
+check "[1] log names the MTP acceptance mode" "$(grep -q "\[model-settings\] .*accept=typical" "$LOG" && echo 1 || echo 0)"
 
 # [2] a second model keeps the globals
 CODE="$(post load-model "{\"model\":\"$MODEL_B\"}")"

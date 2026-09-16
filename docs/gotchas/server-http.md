@@ -2,6 +2,11 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A reasoning budget that only trims delivery cannot stop a thought from eating max_tokens 
+pi on Qwen3.8-Flash-Next with `contextWindow` 8k then 24k: every design turn came back `length` with empty content. Two causes, one per effort level. At `low` pi sends `reasoning_effort: low`; on Qwen3.8 the template reads the word, so since 2026-08-14 no budget was derived from it, and even where a budget applied it was a display trim after generation: nothing ever closed the think block. At `xhigh` no budget exists by design, and the launcher's output share (ctx/4 = 6144 at 24k, shrunk further by pi's per-turn estimate) was smaller than one thought. vLLM and SGLang enforce a thinking budget in-stream, Qwen's recipe: at the budget append "Considering the limited time by the user, I have to give the solution based on the thinking directly now." plus `</think>` and keep generating. Fix, both halves: `armThinkBound` resolves atomic opener/closer ids + the forced sequence per request and hangs a `ThinkBound` on the sampling params; `thinkBoundTick` (inside the pre-step guard every decode path runs) commits the forced tokens as one multi-token forward from any inter-tick state and routes the rest of the request regular; the surfaces get budget -1 so the closed thought streams whole. The effort word maps to a budget on consuming templates again, but only where the bound can arm. The launcher share moved to ctx/2 in all three copies. Not live-tested: the batched (N>1) path after a fire, and MTP-armed requests (the answer decodes plain, `.think_bound`). Guards: `ThinkBound` unit test, `tests/test_reasoning_budget_stream.sh` (stream + non-stream, closed thought, answer present), `budgetForContext` + `AgentBudgetTests`.
+
+The compaction half. pi at 83% of a 24k window kept sending `max_tokens` 774 then 1 and never compacted: it compacts past `window - reserveTokens` (16384) but keeps the last `keepRecentTokens` (20000), more than the whole conversation, so the cut point was the start and nothing happened. opencode2 on the same window compacted after EVERY reply, including before the first: its trigger is `tokens >= context - max(min(limit.output, 32000), buffer)` with `buffer` 20000, a 4.5k threshold on 24k, and each summary claimed files that were never written. Both defaults assume 200k windows. Fix: one `compactionReserve(ctx)` = min(20000, ctx/4) in Zig and Swift; pi gets `compaction.reserveTokens` (reserve + 4096, capped at its 16384 default) and `keepRecentTokens` (reserve) merged into `~/.mlx-serve/pi/settings.json`; opencode(2) `limit.output` IS the reserve (opencode never sends max_tokens, the field only sizes compaction), and opencode2's config gets `compaction: {buffer, keep.tokens}` for the pinned model's window. Big windows land on the agents' own defaults. Effort budgets moved to pi's ladder (low 2048, medium 8192, high uncapped). Guards: `compactionReserve`, `mergePiSettingsJson`, the opencode config tests, and their Swift twins.
+
 ### Idle eviction: a reload that leaked, three readers it could free underneath, and a status poll that undid it
 
 `--idle-evict-secs` parsed into `ModelRegistry` and nothing ever swept, so the flag was documented and inert. Adding the sweep surfaced two things the on-demand unload path had been hiding.
@@ -474,7 +479,7 @@ WHICH failure it is is the assertion: past the gate the answer is no longer the
 gate's 503. Verified red-on-revert, where it reproduces the reporter's 41.30 GiB
 exactly.
 
-## A loop cut that says only "length" reads as a limit nobody set (2026-08-05)
+## A loop cut must not say "length": clients treat it as context exhaustion (2026-08-05, updated 2026-08-31)
 
 A pi session against a collapse-prone 4-bit MoE repeated itself and then died with
 "Model stopped because it reached the maximum output token limit", while its own
@@ -496,22 +501,21 @@ End to end:
    the loop sooner, because the client re-sent the cut turn as history and the
    model read its own loop back. That is the error-echo class (Inkling
    name-salvage) with the server's own output as the error.
-4. `finish_reason: "length"` is deliberate and cannot move — `"stop"` became
-   `"tool_calls"` and presented a server-cut fragment as a completed write
-   (the 2026-07-14 php.html post-mortem). pi renders `length` the only way the
-   OpenAI schema allows. pi never set a `max_tokens` at all (the log shows the
-   unbounded sentinel `1073741823`), so the message names a limit neither side
-   imposed.
+4. The original `finish_reason: "length"` workaround prevented a cut tool-call
+   fragment from becoming `"tool_calls"`, but pi also treats any short length
+   stop as recoverable context pressure. At 46,190 / 262,144 prompt tokens it
+   compacted and retried. The wire reason is now `"stop"`; tool parsing is
+   independently suppressed when `finish_details.type` is `repetition_loop`.
 
 Two fixes, and the split between them is forced by the transport:
 
-- **The cause rides beside the reason.** `finish_details:{"type":
+- **The cause rides beside the stop.** `finish_details:{"type":
   "repetition_loop"}` on chat + completions, stream and non-stream. Unknown
   causes are dropped rather than interpolated (`finishDetailsField`) — this
   string is spliced into a JSON literal, and a literal is arbitrary bytes too.
-  `/v1/messages` is deliberately excluded: `anthropicStopReason` maps a loop cut
-  to `max_tokens` (the same misattribution), but inventing a key inside
-  Anthropic's schema is worse than the gap.
+  `/v1/messages` is deliberately excluded because inventing a sibling key
+  inside Anthropic's schema is worse than the gap; it now maps the stop honestly
+  to `end_turn` and suppresses any cut tool fragment.
 - **The trim is what breaks the spiral, and it only reaches non-streaming.**
   `generate.degenerateTail` returns where the degenerate span STARTS, not just
   that one exists: the exact tiers walk their cycle back past the repetitions
@@ -520,6 +524,12 @@ Two fixes, and the split between them is forced by the transport:
   near-repeat tier slides its 1024-token window back in 128-token steps while it
   keeps convicting — a restatement loop that ran 3000 tokens is degenerate for
   all 3000, and trimming only the window hands the rest back.
+
+For Responses, the returned envelope and response ID remain retrievable, but
+`previous_response_id` history excludes the loop-cut assistant turn, including
+its reasoning and tool calls. Streaming and non-streaming share this storage
+policy; completion status stays unchanged. Guard: `Responses history omits loop
+cuts while retaining the response and input` in server.zig.
 
 Why streaming keeps the tail: a delta cannot be retracted. It is worth being
 precise about why the tokens are already gone, because "with tools present the
@@ -1547,6 +1557,15 @@ First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 5
 
 `scheduler.modelDiskBytes` summed every `*.safetensors` in the directory. A third-party gemma-4 E4B pack shipped two shards no `weight_map` entry references; the bill was 2x the loaded size, so loading a small image model evicted the chat model. The index is the truth when present: `indexShardSet` reads `model.safetensors.index.json` and only named shards count. Guard: `test "modelDiskBytes bills only the shards the index names (issue #274)"`.
 
+
+## The SSD tier refused a volume with 117 GB usable (2026-09-14)
+
+`kv_disk_cache.volumeSpace` read `statfs.f_bavail`, which is what `df` prints and which excludes the purgeable space macOS frees on demand. The release box showed 36 GB free by df and 117 GB by Finder, so the tier declined every persist under its 64 GiB reserve and the Flash-Next SSD-first soak restored nothing after a restart. Fix: one ObjC probe, `msv_volume_free_for_use(path)`, returns `volumeAvailableCapacityForImportantUsage`; `volumeSpace` reports that as `free` (statfs stays the fallback and the total) and the ANE compile-cache cap reads the same probe. Guard: `test "volumeSpace: free is what the OS grants"` (red on this box: 117 GB expected, 36 GB found).
+
+## A stale index refused a complete pack (2026-09-14)
+
+The #274 filter trusted `model.safetensors.index.json` unconditionally. `mlx-community/gemma-3-12b-it-4bit` was re-sharded on the Hub from five shards to two, and a download made across that change carried the old index: every named shard was absent, both real shards were "not named by the index", the preflight billed 0.00 GB and the load failed `NoWeightFiles` as an "incomplete download". Shipped 26.8.11 through 26.9.2; found by the release smoke matrix. Fix: `indexShardSet` returns null when none of the shards it names exists in the directory (one warning), so both the loader and `modelDiskBytes` fall back to every `*.safetensors`. A partially present index still filters; a missing tensor is still a named load error (#217). Guard: `test "loadWeights ignores an index that names no shard on disk"`.
+
 ## The edit form dropped LoRA fields (issue #268, 2026-08-28)
 
 `gen.openaiEditFormToJson` rebuilds the multipart body into the JSON `mode:"edit"` request field by field; `lora_paths`/`lora_scales` were not in the list, so a client attaching adapters through the OpenAI surface got an un-adapted edit with a 200. Now forwarded verbatim (array forms as raw JSON text, scalar `lora_path` JSON-escaped) so `parseLoraFields` sees the same body the native endpoint would. Guard: the lora case in `test "openaiEditFormToJson: OpenAI multipart becomes our edit request"`.
@@ -1850,7 +1869,7 @@ other archs keep their previous arithmetic and advertised context.
 Design: `docs/reference.md`. The defects its review found, all in the
 eviction half: the spill read `appendCommit`'s bool ("nothing more to write")
 as "the SSD holds this session" and every silent skip (a declined volume, a
-prefix under `MIN_PERSIST_TOKENS`, TurboQuant, a short layer offset) returned
+prefix under `MIN_PERSIST_TOKENS`, a short layer offset) returned
 it too, so on a box under ~65 GiB free every idle entry was dropped with
 nothing written (`PersistOutcome`; only `.persisted` + an agreeing index
 + landed files + a stat license discarding RAM); the spill ignored
@@ -2114,3 +2133,62 @@ Fix: `json_grammar` counts consecutive free-whitespace bytes (`ws_run`, carried 
 snapshots) and rejects past `MAX_FREE_WS` (16) between tokens and after the root, so
 the mask forces the next structural byte. Content is never constrained by it, only
 formatting. Guard: `free whitespace is capped so a masked model cannot idle forever`.
+
+## ds4 sessions were per request; embeddings segfaulted on an engine-backed model (2026-09-14)
+
+llmprobe against Qwen3.8-Flash-Next-Q2 through the embedded ds4 engine died with a
+bare `Killed: 9` a few minutes in, no crash report, at a different request each run.
+It was memory: `runPrefillDs4` created a fresh `ds4_session` per request and freed it
+in `Slot.deinit`, and at `--ctx-size 131072` each session is ~13 GB of context
+buffers. With `--max-concurrent 4` the concurrent phases of the suite held four of
+them (RSS 41 → 97 GB, free RAM 0.07 GB) until the kernel killed the process. The
+per-request session also meant ds4's own prompt-prefix reuse never fired
+(`cached_n=0` on every request).
+
+Fix: one persistent `LoadedModel.ds4_session`, created on first prefill, freed with
+the engine, driven by one slot at a time through the same `session_busy` claim the
+llama engine uses in `Scheduler.submit`/`complete`. Sync errors invalidate it so the
+next request rebuilds cold. A repeated prompt now reports the reused prefix.
+
+With that fixed the run reached `POST /v1/embeddings`, and `runEmbedRequest`
+unwrapped the null MLX transformer (ReleaseFast: SIGSEGV). `handleEmbeddings` now
+refuses engine-backed models by name before anything is queued.
+
+Guard: `tests/test_ds4_serve.sh` (repeat prompt reports `cached_tokens` > 0;
+embeddings return a named 400 and the server stays up).
+
+## A placeholder id in ordinary text capped every SSD restore (2026-09-15)
+
+Qwen3.8-Flash-Next, a text-only 73k-token chat whose pastes were repo sources: after a
+restart the SSD tier restored 16,384 of 73,398 tokens in 34 s where the RAM tier had
+matched 73,293. Every mid-session disk restore in that log landed on the same low
+checkpoint too, at prompt lengths from 61k to 229k.
+
+Cause: `scheduler.firstMediaPlaceholder` scanned the prompt for `image/audio/video_token_id`
+unconditionally. Those are ordinary vocabulary entries — this conversation held 248056 at
+index 18338 — so a text-only request got `media_start = 18338`, which is the disk lookup's
+`limit`. The donor whose checkpoints covered the whole prefix has none below 18338, so it
+was skipped entirely and a stale entry with a checkpoint at 16384 won. The tier itself was
+correct: replayed offline against the same files it picks the right entry.
+
+Fix: the helper takes `has_media` (`params.vision_embeddings != null`) and answers null
+without it — a boundary exists only where media rows do. The same value keys the commit's
+media state, so text entries no longer carry a bogus boundary into checkpoint inheritance
+and thinning. Live: 16,384/73,398 in 34.2 s becomes 73,293/73,375 in 1.6 s.
+
+Guard: `firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary`.
+
+## Engine models counted reasoning with an empty tokenizer (2026-09-15)
+
+A thinking reply from a GGUF on the ds4 engine (Qwen3.8 Flash Next Q2) returned 375 chars of
+`reasoning_content` with `completion_tokens_details.reasoning_tokens: 0`; `/v1/responses`
+reported 0 too. Found by `tests/test_format_matrix.sh` on a new `flashnext-gguf` arm.
+
+Cause: an engine-backed model loads a stub CPU state whose `Tokenizer` has no vocabulary, and
+both usage sites re-encoded the split reasoning with `tok.encode`, which returns no ids. The
+prompt paths (`/tokenize`, `/v1/completions`) already branched on the engine, twice, by hand.
+
+Fix: `server.encodeText` owns the branch (ds4 vocab, llama.cpp vocab, else BPE) and all four
+sites call it. Live on ds4 / llama.cpp / MLX: 196 / 590 / 67 reasoning tokens.
+
+Guard: the format matrix's `usage reasoning_tokens > 0` check on a GGUF arm.

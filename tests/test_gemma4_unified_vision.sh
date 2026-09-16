@@ -31,7 +31,7 @@ fi
 
 ok()  { PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $1"; }
 bad() { FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $1"; [ -n "${2:-}" ] && echo "    $2"; }
-assert_contains() { if echo "$3" | grep -qi "$2"; then ok "$1"; else bad "$1" "missing '$2' in: $(echo "$3" | head -c 300)"; fi; }
+assert_contains() { if grep -qi "$2" <<< "$3"; then ok "$1"; else bad "$1" "missing '$2' in: $(echo "$3" | head -c 300)"; fi; }
 
 # Build a distinctive test image: a red ellipse on the left/center, a blue
 # rectangle on the right, on a light-gray background. Requires Pillow.

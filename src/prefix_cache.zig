@@ -166,8 +166,8 @@ const Entry = struct {
     /// against an entry that was committed under another config.
     ///
     /// Storing the full `KVQuantConfig` (not just `Scheme`) is what
-    /// distinguishes `affine 4` from `affine 8` and a future TurboQuant
-    /// `group_size` change — without that, a 4-bit entry would alias to an
+    /// distinguishes `affine 4` from `affine 8` and a `group_size` change —
+    /// without that, a 4-bit entry would alias to an
     /// 8-bit slot's findBestMatch lookup and crash SDPA with a packed-shape
     /// mismatch on restore. Repro: `tests/test_kv_quant_per_request.sh`.
     quant_config: kv_quant.KVQuantConfig,
@@ -660,8 +660,7 @@ pub const HotPrefixCache = struct {
     /// Wave 1.B: total KV bytes held by a snapshot — sum of `size * itemsize`
     /// across every initialized entry's storage arrays. mlx-c arrays carry
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
-    /// account for q, scales, biases together; future schemes (TurboQuant)
-    /// add `kv_quant.snapshotBytesExtra` for per-layer rotation state.
+    /// account for q, scales, biases together.
     fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
@@ -779,7 +778,7 @@ pub const HotPrefixCache = struct {
         if (cps) |list| {
             while (k < list.len and k < SHED_SIM_MAX) : (k += 1) {
                 pos_buf[k] = list[k].pos;
-                byte_buf[k] = ssmCheckpointBytes(&list[k]);
+                byte_buf[k] = trimmedCheckpointBytes(list, k);
             }
         }
         const total = if (cps) |list| list.len else 0;
@@ -789,6 +788,30 @@ pub const HotPrefixCache = struct {
 
     /// Stack bound for the shed simulation; a longer list falls back to billing every lower checkpoint.
     const SHED_SIM_MAX: usize = 128;
+
+    /// The last retained checkpoint inherits the latest checkpoint's pooled bank.
+    /// Price its sliced shape before allocating/copying any multi-GB KV prefix.
+    /// Captured aux state already contains the destination's pos % ratio leftover.
+    fn trimmedCheckpointBytes(list: []const SSMCheckpoint, index: usize) u64 {
+        const dst = &list[index];
+        const src = &list[list.len - 1];
+        var bytes = ssmCheckpointBytes(dst);
+        if (index == list.len - 1 or !checkpointHasQsaPooled(src)) return bytes;
+        if (dst.layers.len != src.layers.len) return bytes;
+        for (dst.layers, src.layers) |d, from| {
+            if (d.conv_state.ctx != null and mlx.mlx_array_size(d.conv_state) > 0) continue;
+            if (from.qsa_pooled.ctx == null) continue;
+            if (d.qsa_pooled.ctx != null)
+                bytes -= @as(u64, mlx.mlx_array_size(d.qsa_pooled)) * @as(u64, mlx.mlx_array_itemsize(d.qsa_pooled));
+            const shape = mlx.getShape(from.qsa_pooled);
+            const blocks: u64 = @intCast(shape[1]);
+            if (blocks == 0) continue;
+            const retained = @min(blocks, dst.pos / @as(usize, @intCast(@max(from.qsa_ratio, 1))));
+            bytes += (@as(u64, mlx.mlx_array_size(from.qsa_pooled)) / blocks) *
+                @as(u64, mlx.mlx_array_itemsize(from.qsa_pooled)) * retained;
+        }
+        return bytes;
+    }
 
     /// Bytes the checkpoints at or below a candidate trim point cost after the commit path's
     /// span-preserving shed to `allowance`; null when even the last survivor is over.
@@ -815,7 +838,7 @@ pub const HotPrefixCache = struct {
         return if (total <= allowance) total else null;
     }
 
-    /// The hybrid arm of `trimLenForBudget` as pure arithmetic over positions and per-checkpoint bytes.
+    /// Shared hybrid selector; checkpoints optionally supply the transferred QSA bank's bill.
     fn trimLenForBudgetPure(
         budget: u64,
         limit: usize,
@@ -823,7 +846,9 @@ pub const HotPrefixCache = struct {
         positions: []const usize,
         cp_bytes: []const u64,
         policy: transformer_mod.ThinPolicy,
+        cps: ?[]const SSMCheckpoint,
     ) ?usize {
+        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
         var k = positions.len;
         while (k > 0) {
             k -= 1;
@@ -832,7 +857,14 @@ pub const HotPrefixCache = struct {
             if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
             const rows = @as(u64, p) * row_bytes;
             if (rows > budget) continue;
-            if (shedSurvivorBytes(positions[0 .. k + 1], cp_bytes[0 .. k + 1], budget - rows, policy) != null) return p;
+            const candidate_bytes = if (cps) |list| blk: {
+                // Only the final survivor inherits the bank; lower checkpoints
+                // keep their original costs throughout the shed simulation.
+                @memcpy(byte_buf[0 .. k + 1], cp_bytes[0 .. k + 1]);
+                byte_buf[k] = trimmedCheckpointBytes(list, k);
+                break :blk byte_buf[0 .. k + 1];
+            } else cp_bytes[0 .. k + 1];
+            if (shedSurvivorBytes(positions[0 .. k + 1], candidate_bytes, budget - rows, policy) != null) return p;
         }
         return null;
     }
@@ -853,6 +885,7 @@ pub const HotPrefixCache = struct {
             if (p < MIN_CANCELLED_COMMIT_TOKENS) return null;
             var cps_cost: u64 = 0;
             for (list[0 .. k + 1]) |*cp| cps_cost += ssmCheckpointBytes(cp);
+            cps_cost = cps_cost - ssmCheckpointBytes(&list[k]) + trimmedCheckpointBytes(list, k);
             if (@as(u64, p) * row_bytes + cps_cost <= budget) return p;
         }
         return null;
@@ -881,7 +914,7 @@ pub const HotPrefixCache = struct {
                     pos_buf[i] = cp.pos;
                     byte_buf[i] = ssmCheckpointBytes(cp);
                 }
-                return trimLenForBudgetPure(budget, limit, row_bytes, pos_buf[0..list.len], byte_buf[0..list.len], self.cp_thin);
+                return trimLenForBudgetPure(budget, limit, row_bytes, pos_buf[0..list.len], byte_buf[0..list.len], self.cp_thin, list);
             }
         }
         if (row_bytes == 0) return null;
@@ -1698,7 +1731,7 @@ pub const HotPrefixCache = struct {
                     for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
                 }
                 new_bytes = new_kv_bytes + new_ssm_bytes;
-                log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} <= {d:.2} MB budget)\n", .{
+                log.info("  [hot-cache] trimmed oversized entry to {d}/{d} tokens ({d:.2} MB before checkpoint shedding; {d:.2} MB budget)\n", .{
                     tl,
                     tokens.len,
                     @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
@@ -2215,10 +2248,6 @@ pub const HotPrefixCache = struct {
     fn unpersistableReason(d: *kv_disk_cache.DiskTier, e: *const Entry) []const u8 {
         if (d.store_declined) return "store declined: volume is short";
         if (e.tokens.len < @as(usize, kv_disk_cache.MIN_PERSIST_TOKENS)) return "under the persist floor";
-        switch (e.snapshot.config.scheme) {
-            .off, .affine => {},
-            else => return "TurboQuant state does not survive a restore",
-        }
         const target = kv_disk_cache.persistTargetLen(e.snapshot.entries, e.snapshot.step, e.tokens.len);
         for (e.snapshot.entries) |*le| {
             if (le.initialized and le.offset < target) return "layer offset short of the range";
@@ -5657,6 +5686,73 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     }
 }
 
+test "HotPrefixCache: QSA trim checkpoint bill matches materialized history" {
+    const s = mlx.gpuStream();
+    var live = pcBuildQsaHybrid(s, 1027, 100.0);
+    defer pcFreeQsaHybrid(&live);
+    var cps: [2]SSMCheckpoint = undefined;
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 1027, s);
+    defer cps[1].deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(cps[1..], &live, s);
+    for ([_]usize{ 256, 257, 258, 259, 512, 1024, 1027 }) |pos| {
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, pos, s);
+        defer cps[0].deinit(testing.allocator);
+        const predicted = HotPrefixCache.trimmedCheckpointBytes(&cps, 0);
+        try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], pos, s);
+        try testing.expectEqual(predicted, ssmCheckpointBytes(&cps[0]));
+        // Pricing a checkpoint that already carries its bank must not double-bill it.
+        try testing.expectEqual(predicted, HotPrefixCache.trimmedCheckpointBytes(&cps, 0));
+    }
+}
+
+test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays reusable" {
+    const s = mlx.gpuStream();
+    for ([_]transformer_mod.ThinPolicy{ .min_span_recency, .min_span }) |policy| {
+        for ([_]bool{ false, true }) |replace| {
+            var toks: [1024]u32 = undefined;
+            for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+            var live = pcBuildQsaHybrid(s, 1024, 100.0);
+            defer pcFreeQsaHybrid(&live);
+            var cache = try KVCache.init(testing.allocator, 3);
+            defer cache.deinit();
+            try testFillCache(&cache, s, 3, toks.len);
+            var snap = try cache.snapshot();
+            defer snap.deinit();
+            const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
+            for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
+            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
+            // 768 KV rows and all small checkpoints fit, but the 768-row bank does not.
+            const budget = HotPrefixCache.snapshotRowBytes(&snap) * 768 + ssmCheckpointBytes(&cps[0]) * 4 + 1024;
+            var hc = HotPrefixCache.initWithMem(testing.allocator, 1, budget);
+            defer hc.deinit();
+            hc.cp_thin = policy;
+            hc.qsa_history_required = true;
+            if (replace) {
+                var seed = try KVCache.init(testing.allocator, 3);
+                defer seed.deinit();
+                try testFillCache(&seed, s, 3, 256);
+                const seed_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+                seed_cps[0] = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
+                try sliceQsaHistoryOntoCheckpoint(&seed_cps[0], &cps[3], 256, s);
+                _ = try hc.commitWithState(&seed, toks[0..256], false, 0, seed_cps, null, null);
+            }
+            const chosen = hc.trimLenForBudget(budget, toks.len, HotPrefixCache.snapshotRowBytes(&snap), cps);
+            _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
+            try testing.expectEqual(@as(?usize, 512), chosen);
+            try testing.expectEqual(@as(usize, 1), hc.entryCount());
+            try testing.expect(hc.current_kv_bytes <= budget);
+            try testing.expectEqual(@as(usize, 512), hc.entries.items[0].tokens.len);
+            var restored = pcEmptySsm();
+            defer pcFreeQsaHybrid(&restored);
+            var target = try KVCache.init(testing.allocator, 3);
+            defer target.deinit();
+            var moe_off: usize = 0;
+            const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &toks, false, 0, null, null);
+            try testing.expectEqual(@as(usize, 512), hit.matched);
+        }
+    }
+}
+
 test "HotPrefixCache: shed rescues an interior QSA bank" {
     const s = mlx.gpuStream();
     var toks: [30]u32 = undefined;
@@ -7425,7 +7521,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
     defer cache.deinit();
     try testFillCache(&cache, s, 1, 600);
 
-    // A is the oldest and unpersistable (TurboQuant); B is newer and persists; C is active.
+    // A is the oldest and unpersistable (a layer offset short of the persist target); B is newer and persists; C is active.
     {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -7440,7 +7536,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
         _ = try hc.commit(&cache, &tok_b, false);
         _ = try hc.commit(&cache, &tok_c, false);
         for (hc.entries.items) |*e| {
-            if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
+            if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.entries[0].offset = 300;
         }
         hc.ssd_idle_mem = hc.entries.items[0].kv_bytes;
         hc.spillIdleEntries(s);
@@ -7542,33 +7638,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
 
-    // Arm 3: TurboQuant, whose rotation state does not survive a restore.
-    {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        var buf: [512]u8 = undefined;
-        const root_len = try tmp.dir.realPath(io, &buf);
-        var cache = try KVCache.init(testing.allocator, 1);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 1, 600);
-
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.ssd_first = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tq", 0, 128);
-        defer hc.deinit();
-        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
-        _ = try hc.commit(&cache, &tokens_a, false);
-        _ = try hc.commit(&cache, &tokens_b, false);
-        // The scheme is flipped on the committed snapshot rather than on the live cache.
-        for (hc.entries.items) |*e| {
-            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
-        }
-        hc.spillIdleEntries(s);
-        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
-        try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    }
-
-    // Arm 4: a layer offset short of the persist target.
+    // Arm 3: a layer offset short of the persist target.
     {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -7846,7 +7916,7 @@ test "prefix cache: a 383k oversized hybrid entry trims instead of flat-declinin
         try testing.expect(@as(u64, end_anchored[0]) * row_bytes > budget);
         try testing.expectEqual(
             @as(?usize, null),
-            HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, end_anchored, bytes[0..16], .min_span_recency),
+            HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, end_anchored, bytes[0..16], .min_span_recency, null),
         );
     }
 
@@ -7861,7 +7931,7 @@ test "prefix cache: a 383k oversized hybrid entry trims instead of flat-declinin
     }
     try testing.expectEqual(@as(usize, 4096), pos[0]);
     try testing.expectEqual(@as(usize, 383_039), pos[n - 1]);
-    const tl = HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, pos[0..n], bytes[0..n], .min_span_recency) orelse
+    const tl = HotPrefixCache.trimLenForBudgetPure(budget, tokens, row_bytes, pos[0..n], bytes[0..n], .min_span_recency, null) orelse
         return error.NoTrimPoint;
     try testing.expect(tl >= 126_976);
     try testing.expect(std.mem.indexOfScalar(usize, pos[0..n], tl) != null);
@@ -7896,16 +7966,16 @@ test "prefix cache: a failed trimmed copy retries at the next-lower checkpoint" 
     const positions = [_]usize{ 4096, 8192, 12288 };
     const bytes = [_]u64{ 1024, 1024, 1024 };
     const budget: u64 = 60_000;
-    const tl = HotPrefixCache.trimLenForBudgetPure(budget, 100_000, 4, &positions, &bytes, .min_span_recency) orelse
+    const tl = HotPrefixCache.trimLenForBudgetPure(budget, 100_000, 4, &positions, &bytes, .min_span_recency, null) orelse
         return error.NoTrimPoint;
     try testing.expectEqual(@as(usize, 12288), tl);
     try testing.expectEqual(
         @as(?usize, 8192),
-        HotPrefixCache.trimLenForBudgetPure(budget, tl - 1, 4, &positions, &bytes, .min_span_recency),
+        HotPrefixCache.trimLenForBudgetPure(budget, tl - 1, 4, &positions, &bytes, .min_span_recency, null),
     );
     try testing.expectEqual(
         @as(?usize, null),
-        HotPrefixCache.trimLenForBudgetPure(budget, 255, 4, &positions, &bytes, .min_span_recency),
+        HotPrefixCache.trimLenForBudgetPure(budget, 255, 4, &positions, &bytes, .min_span_recency, null),
     );
 }
 
@@ -7939,7 +8009,7 @@ test "prefix cache: the ungated retention + trim arms reproduce the previous pol
     // shed arm: at position 1024 the shed can thin down to 20 bytes.
     try t.expectEqual(
         @as(?usize, 1024),
-        HotPrefixCache.trimLenForBudgetPure(25, 4096, 0, &positions, &bytes, .min_span),
+        HotPrefixCache.trimLenForBudgetPure(25, 4096, 0, &positions, &bytes, .min_span, null),
     );
     // ungated arm bills every lower checkpoint: 1024 costs all four (40), over the 25-byte budget.
     var all_lower_at_1024: u64 = 0;

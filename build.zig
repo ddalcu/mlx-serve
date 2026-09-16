@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("lib/xatlas"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-    // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
+    // `lib/ds4/` submodule pinned at 9139e2a and `src/arch/ds4.zig`. Kernel
     // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
@@ -523,11 +523,13 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options
     // ssd_streaming_* fields drive. Added upstream after the previous pin.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_ssd.c"), .flags = c_flags });
-    // Two-machine tensor parallelism + multi-GPU layer placement (pin efdadd4):
+    // Two-machine tensor parallelism + multi-GPU layer placement (pin 9139e2a):
     // ds4.c references ds4_tp_* and ds4_compute_layer_placement/ds4_layer_pack_print
     // unconditionally, so both TUs must link even though we never enable TP.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_tp.c"), .flags = c_flags });
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_layer_pack.c"), .flags = c_flags });
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_image.c"), .flags = c_flags });
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_engram.c"), .flags = c_flags });
     // Our own shim: exports sizeof/offsetof of the real C structs so the
     // ds4_ffi.zig layout test catches mirror drift (mid-struct-insert class).
     module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = c_flags });

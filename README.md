@@ -79,7 +79,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
-| KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
+| KV-cache quantization (4/8-bit) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
 | Sandboxed agent shell (isolated Linux VM) | ✅ | ❌ | ❌ | ❌ |

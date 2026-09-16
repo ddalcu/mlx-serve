@@ -524,6 +524,7 @@ class TestServer {
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
             var maxTokensHit = false
+            var truncationCause: TruncationNotice.Cause?
             let stream = api.streamChat(
                 port: appState.server.port,
                 messages: messages,
@@ -545,6 +546,7 @@ class TestServer {
                     case .toolCalls(let calls):
                         receivedToolCalls = calls
                     case .truncated(let cause):
+                        truncationCause = cause
                         maxTokensHit = true
                         appState.updateLastMessage(in: sessionId, truncation: .init(cause: cause, maxTokens: 0))
                     case .done:
@@ -556,6 +558,11 @@ class TestServer {
                 break
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            if TruncationNotice.endsTurn(cause: truncationCause) {
+                roundResults.append(["round": iteration + 1, "type": "repetition_loop"])
+                break
+            }
 
             // Truncation recovery
             if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
