@@ -41,6 +41,11 @@ struct FlowLayout: Layout {
         let width = rows.map { rowWidth($0, sizes) }.max() ?? 0
         let height = rows.reduce(0) { $0 + rowHeight($1, sizes) }
             + rowSpacing * CGFloat(max(0, rows.count - 1))
+        // Never report more than we were offered: this is what keeps a long
+        // menu label from setting the pane's minimum width. A subview wider
+        // than the offer overflows its row instead of widening the column,
+        // which is the safer of the two failures here (a column whose minimum
+        // exceeds what the split view gives it slides under the sidebar).
         return CGSize(width: min(width, maxWidth), height: height)
     }
 

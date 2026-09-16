@@ -20,7 +20,11 @@ enum SourceTrackLength {
             let body = offset + 8
             if id == "data" { dataBytes = size; break }
             if id == "fmt " {
-                guard body + 16 <= d.count else { return nil }
+                // The DECLARED size has to cover the fields too: a chunk
+                // claiming two bytes would otherwise have sixteen read out of
+                // it and answer a confident wrong duration. Format 1 is PCM,
+                // which is the only thing the doc above promises to measure.
+                guard size >= 16, body + 16 <= d.count, u16(d, body) == 1 else { return nil }
                 channels = u16(d, body + 2)
                 rate = u32(d, body + 4)
                 bits = u16(d, body + 14)

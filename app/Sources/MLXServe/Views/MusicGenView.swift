@@ -5,20 +5,6 @@ import AppKit
 /// natively by the embedded mlx-serve server (ACE-Step v1.5 XL Turbo). Same
 /// visual language as VoiceGenView/Model3DGenView: prompt + optional lyrics,
 /// model picker, duration, advanced section, and a player for the result.
-/// A menu wearing the chip. `.borderlessButton` hands the label to AppKit,
-/// which keeps the text and throws the background away, and draws its own
-/// indicator; `.button` renders the label as a real button, so the chip
-/// survives and the chevron can live inside it.
-private struct PaneChipMenu: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-            .menuIndicator(.hidden)
-            .fixedSize()
-    }
-}
-
 struct MusicGenView: View {
     @EnvironmentObject var service: MusicGenService
     @EnvironmentObject var server: ServerManager
@@ -32,9 +18,6 @@ struct MusicGenView: View {
     @State private var lyrics: String = ""
     /// Height of the lyrics editor — dragged by `lyricsResizeHandle`, sticky.
     @State private var lyricsHeight: Double = PromptEditorHeight.defaultHeight
-    /// Height when the current drag began (nil = not dragging); `translation`
-    /// is cumulative, so applying it to the live height compounds.
-    @State private var lyricsHeightAtDragStart: Double? = nil
     @State private var model: MusicModelPreset = .acestepXLTurbo8bit
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
     @State private var lanModel: String? = nil
@@ -166,6 +149,10 @@ struct MusicGenView: View {
                     // No Duration in a source task: the clip is the length, and
                     // the Source well already says how long that is.
                     if !sourceTask { durationSection }
+                    // The 8 is a compensation, not a taste: a drop-target
+                    // section carries `.padding(6)` for its dashed highlight
+                    // whether or not a drag is in the air, so the Voice pane's
+                    // well opens this gap for free and Duration does not.
                     advancedSection.padding(.top, 8)
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
@@ -276,38 +263,12 @@ struct MusicGenView: View {
         }
     }
 
-    /// Drag strip under the lyrics editor: a verse is a document, and 90pt of
-    /// it is a keyhole. Full width so it is easy to grab; the height sticks,
+    /// A verse is a document, and 90pt of it is a keyhole. The height sticks,
     /// clamped both ways so one dragged on a tall window cannot come back
     /// unusable.
     private var lyricsResizeHandle: some View {
-        Capsule()
-            .fill(Color.secondary.opacity(0.35))
-            .frame(width: 36, height: 4)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
-            .gesture(
-                // GLOBAL, never the default `.local`: the handle sits under the
-                // box it resizes, so growing the box moves the handle, and a
-                // translation measured in a space that moved subtracts its own
-                // effect — the box then tracks at half the cursor's speed and
-                // re-solves every frame.
-                DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                    .onChanged { v in
-                        let base = lyricsHeightAtDragStart ?? lyricsHeight
-                        if lyricsHeightAtDragStart == nil { lyricsHeightAtDragStart = base }
-                        lyricsHeight = PromptEditorHeight.clamp(base + v.translation.height)
-                    }
-                    .onEnded { _ in
-                        lyricsHeightAtDragStart = nil
-                        persist()
-                    }
-            )
-            .onHover { inside in
-                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
-            }
-            .help("Drag to resize the lyrics box.")
+        EditorResizeHandle(height: $lyricsHeight, onCommit: persist,
+                           help: "Drag to resize the lyrics box.")
     }
 
     /// The task actually in force: the mode control only exists on models
@@ -421,10 +382,12 @@ struct MusicGenView: View {
                             Button { clearSource() } label: { Image(systemName: "xmark.circle.fill") }
                                 .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear source")
                         }
-                        if let seconds = srcSeconds {
-                            Text("The new track will be \(SourceTrackLength.spoken(seconds: seconds)) long.")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
+                        // A header we cannot read leaves the pane with nothing
+                        // to say about length, which is the one thing a source
+                        // task decides for you.
+                        Text(srcSeconds.map { "The new track will be \(SourceTrackLength.spoken(seconds: $0)) long." }
+                             ?? "The new track will be exactly as long as this clip.")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             } else if srcBusy {
@@ -768,10 +731,11 @@ struct MusicGenView: View {
             // acestep-only block. Hiding them on Music 3 read as "this model
             // cannot do tempo", which its own model card contradicts.
             // Tempo, key and seed share a row when the pane is wide enough and
-            // WRAP when it is not: a fixed-width HStack here set the left
-            // pane's minimum width (~540 pt) above what the default window
-            // gives it, and the HSplitView pushed the whole column under the
-            // sidebar (live 2026-08-22, Music tab clipped at default size).
+            // WRAP when it is not. Never a fixed-width HStack: that set the
+            // left pane's minimum width (~540 pt) above what the default
+            // window gives it, and the HSplitView pushed the whole column
+            // under the sidebar (live 2026-08-22). `FlowLayout` reports no
+            // more width than it is offered, which is what holds that line.
             FlowLayout(spacing: 14, rowSpacing: 10) {
                 if model.supportsTempoAndKey {
                     advancedCell("Tempo (BPM)") {

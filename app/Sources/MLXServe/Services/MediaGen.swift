@@ -2085,6 +2085,16 @@ struct AudioGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
+
+    /// The reference clip this request may actually send: a model with its own
+    /// built-in voices takes no `ref_audio` (a named 400 server-side), and a
+    /// clip left behind by a model switch must not reach one from the pane OR
+    /// from the chat tool. Nil for no clip and for a model that cannot clone.
+    static func clonableReference(_ request: AudioGenRequest) -> String? {
+        guard request.model.supportsCloning else { return nil }
+        guard let path = request.refAudioPath, !path.isEmpty else { return nil }
+        return path
+    }
 }
 
 struct MusicGenRequest {

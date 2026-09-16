@@ -259,4 +259,18 @@ final class MediaGenSettingsTests: XCTestCase {
             VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
         XCTAssertEqual(old.promptHeight, PromptEditorHeight.defaultHeight)
     }
+
+    func testMusicSettingsClampAStaleLyricsHeightOnDecode() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(MusicGenSettings())) as! [String: Any]
+        obj["lyricsHeight"] = 9999.0
+        let decoded = try JSONDecoder().decode(
+            MusicGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.lyricsHeight, PromptEditorHeight.maxHeight)
+        // Absent key = an older build's blob → the default, not zero.
+        obj.removeValue(forKey: "lyricsHeight")
+        let old = try JSONDecoder().decode(
+            MusicGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.lyricsHeight, PromptEditorHeight.defaultHeight)
+    }
 }

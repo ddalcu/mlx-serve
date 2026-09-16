@@ -366,7 +366,11 @@ struct MediaDropWellFilled<Content: View>: View {
         content
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 84)
+            // `alignment:` is load-bearing — a bare `maxWidth: .infinity`
+            // CENTRES, so a row without a trailing Spacer (a converting
+            // spinner) would sit in the middle while every other state hugs
+            // the left.
+            .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
             .background(MediaDropWellBackground(isTargeted: isTargeted))
     }
 }
