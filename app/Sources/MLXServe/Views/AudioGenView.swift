@@ -410,37 +410,41 @@ struct VoiceGenView: View {
             Text("Reference voice").font(.subheadline.weight(.semibold))
 
             if let url = refAudioURL {
-                HStack(spacing: 8) {
-                    Image(systemName: "waveform.circle.fill").foregroundStyle(.green)
-                    Text(url.lastPathComponent)
-                        .font(.caption).lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    if clipPlayer.playingPath == url.path {
-                        Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
-                            .buttonStyle(.borderless).help("Stop preview")
-                    } else {
-                        Button { playReference(url) } label: { Image(systemName: "play.circle") }
-                            .buttonStyle(.borderless).help("Preview reference")
+                MediaDropWellFilled(isTargeted: isDropTargeted) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
+                        Text(url.lastPathComponent)
+                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        if clipPlayer.playingPath == url.path {
+                            Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                                .buttonStyle(.borderless).help("Stop preview")
+                        } else {
+                            Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                                .buttonStyle(.borderless).help("Preview reference")
+                        }
+                        Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                     }
-                    Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                 }
             } else if recorder.isRecording {
-                HStack(spacing: 10) {
-                    Image(systemName: "microphone.fill")
-                        .font(.caption)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.orange))
-                    ProgressView(value: Double(recorder.level)).frame(width: 120)
-                    Text(String(format: "%.1fs", recorder.duration))
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Spacer()
-                    Button { stopRecording() } label: {
-                        Label("Stop", systemImage: "stop.fill")
+                MediaDropWellFilled(isTargeted: isDropTargeted) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "microphone.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.orange))
+                        ProgressView(value: Double(recorder.level)).frame(width: 120)
+                        Text(String(format: "%.1fs", recorder.duration))
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Spacer()
+                        Button { stopRecording() } label: {
+                            Label("Stop", systemImage: "stop.fill")
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
                 }
             } else {
                 // Two ways in, one clip slot — the same well the picture panes
@@ -467,6 +471,8 @@ struct VoiceGenView: View {
                         .textFieldStyle(.roundedBorder)
                         .font(.caption)
                 }
+                // Its own step under the clip, not a caption of the well.
+                .padding(.top, 6)
             } else {
                 // The well already says how to add a clip and how long it wants
                 // one; what is left to say is what happens without it.

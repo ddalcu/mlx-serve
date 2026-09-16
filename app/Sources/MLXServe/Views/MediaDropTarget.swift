@@ -308,6 +308,10 @@ struct MediaDropWellOption: View {
             Text(caption)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                // A caption long enough to wrap centres every line, not just
+                // the block: a left-aligned second line under a centred first
+                // one reads as two different columns.
+                .multilineTextAlignment(.center)
         }
     }
 }
@@ -317,12 +321,15 @@ struct MediaDropWellOption: View {
 struct MediaDropWell: View {
     let title: String
     let systemImage: String
+    /// The line under the control. Defaults to what a drop target has to say;
+    /// a pane with something more useful to put there passes its own.
+    var caption: String = "or drag one here"
     let isTargeted: Bool
     let action: () -> Void
 
     var body: some View {
         MediaDropWellOption(title: title, systemImage: systemImage,
-                            caption: "or drag one here", action: action)
+                            caption: caption, action: action)
             .frame(maxWidth: .infinity, minHeight: 84)
             .background(MediaDropWellBackground(isTargeted: isTargeted))
     }
@@ -347,7 +354,24 @@ struct MediaDropWellPair: View {
     }
 }
 
-/// The well's own surface, so the two shapes cannot drift apart.
+/// The well once the slot HOLDS something: same surface, same floor height,
+/// whatever the pane wants inside it. The block is how you keep your place in
+/// a long form, so it must not disappear the moment you use it — it may grow
+/// past the floor, never shrink below it.
+struct MediaDropWellFilled<Content: View>: View {
+    let isTargeted: Bool
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 84)
+            .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// The well's own surface, so the shapes cannot drift apart.
 struct MediaDropWellBackground: View {
     let isTargeted: Bool
 
