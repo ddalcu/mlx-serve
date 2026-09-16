@@ -6,6 +6,7 @@
 " (with its built-in draft head)" = " （自带草稿头）";
 " The running server keeps its current flags until you hit Restart Now." = " 正在运行的服务器会保留当前启动参数，直到你点击“立即重启”。";
 " Your Telegram bot token is kept, since only @BotFather can reissue it." = " 你的 Telegram bot 令牌会保留，因为只有 @BotFather 才能重新签发。";
+" — trimmed to the video length" = " —— 已裁剪至视频长度";
 "%@ (network)" = "%@（网络）";
 "%@ available" = "%@ 个可用";
 "%@ chat column" = "%@ 聊天栏";
@@ -65,6 +66,9 @@
 "Add Provider" = "添加提供商";
 "Add Voice…" = "添加音色…";
 "Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later." = "添加一段音色录音用于克隆。录音会被归一化并保存在 ~/.mlx-serve/voice-clips，之后任何 Agent 都能使用。";
+"Add audio..." = "添加音频…";
+"Add clip..." = "添加片段…";
+"Add image..." = "添加图像…";
 "Add reference image…" = "添加参考图…";
 "Add retention_analysis: — it is the only place the model is told what to do with each reference." = "添加 retention_analysis: —— 这是唯一告诉模型如何处理每个参考素材的地方。";
 "Add the tools from every enabled Model Context Protocol server." = "添加来自每个已启用的 Model Context Protocol 服务器的工具。";
@@ -112,7 +116,9 @@
 "Attach Image, PDF, or Audio…" = "附加图像、PDF 或音频…";
 "Attach Image, Video, PDF, or Audio…" = "附加图像、视频、PDF 或音频…";
 "Attach Image, Video, or PDF…" = "附加图像、视频或 PDF…";
+"Audio" = "音频";
 "Audio generation" = "音频生成";
+"Audio guidance" = "音频引导";
 "Auto" = "自动";
 "Auto (server default)" = "自动（服务器默认）";
 "Auto = follow the server's --pld setting (and the adaptive gate). On/Off forces it." = "自动 = 遵循服务器的 --pld 设置（以及自适应门控）。开/关会强制覆盖。";
@@ -122,6 +128,7 @@
 "Automatic (measured: %lld tokens)" = "自动（实测：%lld Token）";
 "Automatically" = "自动";
 "Available to this task" = "本任务可用";
+"BEST MODELS FOR YOUR MAC" = "最适合你 Mac 的模型";
 "Back to the simple switches" = "回到简单开关";
 "Best all-rounder for everyday chat, writing, and quick questions." = "日常聊天、写作和快速问答的最佳全能选择。";
 "Best for creating images" = "最适合创建图像";
@@ -146,6 +153,7 @@
 "Browser window shown." = "已显示浏览器窗口。";
 "Built-in — duplicate it to make changes" = "内置 —— 复制一份即可修改";
 "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight." = "绕过安全检查：当可用内存看起来不足以容纳模型权重加上预热余量时，该检查会拒绝加载 MLX 模型。这个检查偏保守 —— macOS 会在模型加载过程中回收文件缓存 —— 所以如果你确定某个加载可以装下却被拒绝，就打开它。真正的过度占用可能让服务器直接崩溃。会传递 --skip-mem-preflight。";
+"CFG scale" = "CFG 强度";
 "CLI install isn't available in the App Store build (it can't symlink outside the sandbox). Download the CLI from GitHub, or use the direct-download build of the app." = "CLI 安装在 App Store 版本中不可用（它无法在沙盒外创建符号链接）。请从 GitHub 下载 CLI，或使用应用的可直接下载版本。";
 "Cancel" = "取消";
 "Cancel download" = "取消下载";
@@ -181,6 +189,7 @@
 "Clear the in-memory log buffer (does not affect the running server)" = "清除内存中的日志缓冲区（不影响正在运行的服务器）";
 "Click Restart Now to apply, or Discard to revert the unsaved server-launch fields." = "点击“立即重启”以应用，或点击“放弃”以还原未保存的服务器启动项。";
 "Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts." = "片段长度。LTX 在其 8N+1 阶梯上只生成 %lld–%lld 帧；滑块会自动吸附到有效帧数。";
+"Clips" = "片段";
 "Close" = "关闭";
 "Coder" = "程序员";
 "Coding & agents" = "编码与 Agent";
@@ -216,6 +225,7 @@
 "Couldn't convert the reference audio to 24 kHz mono." = "无法将参考音频转换为 24 kHz 单声道。";
 "Cover" = "翻唱";
 "Cover strength" = "翻唱强度";
+"Create" = "新建";
 "Create New Agent" = "新建 Agent";
 "Create Task" = "创建任务";
 "Curated servers" = "精选服务器";
@@ -226,6 +236,8 @@
 "DSpark draft stages (DeepSeek‑V4)" = "DSpark 草稿阶段（DeepSeek‑V4）";
 "Dark" = "深色";
 "Debug (verbose)" = "调试（详细）";
+"Decode" = "解码";
+"Decode speed" = "解码速度";
 "DeepSeek-V4 (ds4 engine)" = "DeepSeek-V4（ds4 引擎）";
 "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)" = "DeepSeek-V4-Flash（iQ-MLX 3.3 bpw）";
 "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only." = "DeepSeek‑V4‑Flash 自带 3 阶段的投机草稿（DSpark）。启用后会在启动时额外加载约 11 GB 的草稿权重，所以除非你主动开启，它都保持关闭 —— 而当这台 Mac 没有足够内存容纳模型 + 草稿 + 工作余量时，服务器仍会拒绝启用，转而正常提供服务。对于 DeepSeek‑V4 的 GGUF 文件，这改为启用内置 ds4 引擎的 DSpark 运行时，并使用随模型一同下载的 DSpark 支持 GGUF（没有该文件则不会有任何效果）。仅影响 DeepSeek‑V4 模型；且仅限贪心（temperature 0）请求。";
@@ -336,6 +348,7 @@
 "Filter" = "筛选";
 "Filter settings" = "筛选设置";
 "Filter your models..." = "筛选你的模型…";
+"First frame" = "首帧";
 "Fixed at %@ steps — this model is distilled for a %@-step schedule, so more steps cost time without adding detail." = "固定为 %@ 步 —— 该模型是按 %@ 步的调度蒸馏的，再增加步数只会耗时，不会增加细节。";
 "Follow @ddalcu on X" = "在 X 上关注 @ddalcu";
 "Force off" = "强制关闭";
@@ -350,6 +363,7 @@
 "GGUF Performance (llama.cpp)" = "GGUF 性能（llama.cpp）";
 "GGUF file-format version the engine reads." = "引擎读取的 GGUF 文件格式版本。";
 "GGUF format" = "GGUF 格式";
+"GPU-safe max" = "GPU 安全上限";
 "Gemma 3 12B (4-bit)" = "Gemma 3 12B（4-bit）";
 "Gemma 4 12B (4-bit)" = "Gemma 4 12B（4-bit）";
 "Gemma 4 12B (8-bit)" = "Gemma 4 12B（8-bit）";
@@ -392,6 +406,7 @@
 "Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0." = "引导强度 —— 视频跟随提示词的紧密程度。1.0 = 关闭：最快，画面也最自然。数值越高，贴合提示词越严格，但速度更慢，画面可能过饱和。LTX 默认为 3.0。";
 "HTTP port the server listens on (default 11234). Change if it conflicts with another local service." = "服务器监听的 HTTP 端口（默认 11234）。如果与其他本地服务冲突，请修改。";
 "Hands-free voice assistant — talk to the model with no chat window required. Speech-to-text and text-to-speech run locally on your Mac. When this popover is closed, feedback is audio-only; reopen it for status and controls." = "免提语音助手 —— 无需聊天窗口即可与模型对话。语音转文字与文字转语音都在你的 Mac 本地运行。关闭此浮出窗口后只有语音反馈；重新打开可查看状态与控件。";
+"Height" = "高度";
 "High" = "高";
 "Higher = finer mesh, more memory and time." = "数值越高，网格越精细，占用内存与耗时也越多。";
 "Higher = more expressive and varied." = "数值越高，表现力越强、变化越多。";
@@ -414,6 +429,7 @@
 "Image Generation" = "图像生成";
 "Image detail" = "图像细节";
 "Image generation" = "图像生成";
+"Images" = "图像";
 "In LM Studio’s models folder — manage it in LM Studio. MLX Core loads it read-only." = "在 LM Studio 的模型文件夹中 —— 请在 LM Studio 中管理。MLX Core 会以只读方式加载。";
 "In MTPLX’s models folder — manage it in MTPLX. MLX Core loads it read-only." = "在 MTPLX 的模型文件夹中 —— 请在 MTPLX 中管理。MLX Core 会以只读方式加载。";
 "In Memory" = "内存中";
@@ -449,6 +465,7 @@
 "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above." = "LTX-Video 在详细的 4–8 句提示词下表现最好。试试上方的示例或提示词技巧。";
 "Large" = "大";
 "Largest models" = "最大的模型";
+"Last frame" = "末帧";
 "Last model used" = "上次使用的模型";
 "Last request overflowed the context window." = "上一次请求超出了上下文窗口。";
 "Launch Claude Code…" = "启动 Claude Code…";
@@ -530,6 +547,7 @@
 "Model Settings for the selected model (context, KV cache, MTP)" = "所选模型的模型设置（上下文、KV cache、MTP）";
 "Model Settings…" = "模型设置…";
 "Model exceeds your Mac's RAM" = "模型超出了这台 Mac 的内存";
+"Model max" = "模型上限";
 "Model memory cap" = "模型内存上限";
 "Model not downloaded" = "模型未下载";
 "Model not loaded" = "模型未加载";
@@ -563,6 +581,7 @@
 "Neural Engine music boost" = "神经引擎音乐加速";
 "Neural Engine prefill boost" = "神经引擎预填充加速";
 "Neural Engine video boost" = "神经引擎视频加速";
+"New" = "新建";
 "New  ⌘N" = "新建  ⌘N";
 "New Agent" = "新建 Agent";
 "New Chat" = "新建聊天";
@@ -668,6 +687,7 @@
 "Plan (%lld steps)" = "计划（%lld 步）";
 "Play" = "播放";
 "Port" = "端口";
+"Prefill" = "预填充";
 "Prefix cache entries" = "前缀缓存条目数";
 "Prefix cache memory cap" = "前缀缓存内存上限";
 "Premium" = "高级";
@@ -717,6 +737,7 @@
 "Reject" = "拒绝";
 "Release notes" = "发行说明";
 "Release notes, benchmarks and what's coming next. Questions and bug reports are welcome there too." = "更新日志、基准测试以及后续计划。也欢迎在那里提问和报告问题。";
+"Remaining" = "剩余";
 "Remove photo" = "移除照片";
 "Remove the clip" = "移除片段";
 "Remove the clip — voice mode falls back to the system voice" = "移除该片段 —— 语音模式将回退到系统音色";
@@ -728,6 +749,7 @@
 "Rename…" = "重命名…";
 "Rendering audio" = "正在渲染音频";
 "Rendering video" = "正在渲染视频";
+"Repeat penalty" = "重复惩罚";
 "Repetition penalty" = "重复惩罚";
 "Request timeout (s)" = "请求超时（秒）";
 "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth." = "要求来自其他机器的请求提供此 API key（OpenAI/Anthropic/Ollama API + 索引页 + 指标）。通过 Authorization: Bearer、x-api-key、HTTP Basic 或 ?api_key= 发送。本机地址受信任，因此本应用从不需要它 —— 它在服务器暴露到网络时提供保护。留空 = 不鉴权。";
@@ -764,6 +786,7 @@
 "SSD cache size" = "SSD 缓存大小";
 "SSD prefix cache" = "SSD 前缀缓存";
 "SSD weight streaming" = "SSD 权重流式加载";
+"STG scale" = "STG 强度";
 "Same seed + prompt reproduces the track." = "相同的种子 + 提示词可复现同一首曲目。";
 "Sampling" = "采样";
 "Save" = "保存";
@@ -796,6 +819,7 @@
 "Server log verbosity. Use 'debug' to capture Jinja errors, KV cache hits and per-request token counts." = "服务器日志详细程度。使用 “debug” 可捕获 Jinja 错误、KV cache 命中和每请求 Token 数。";
 "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Flipping this ON (rather than leaving it untouched) also enables DeepSeek-V4's compressor-input requant — ~7% faster decode there, with rare wording-level artifacts. Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding." = "用注意力权重的量化副本来做解码，而这些权重本身以未量化（bf16）的形式提供：大多数层用 8-bit，最后五分之一用 4-bit，那里的量化误差影响小得多。像 poolside Laguna 这样的模型整体解码快约 25%。略有损失：回复措辞可能与精确的 bf16 解码不同，但实测答案质量不变（提示词读取和投机校验仍使用精确权重）。把它打开（而不是保持不动）还会启用 DeepSeek-V4 的 compressor 输入重新量化 —— 那里的解码快约 7%，偶有措辞层面的瑕疵。注意力已完全量化的模型不受影响。要按位精确的 bf16 解码请关闭它。";
 "Session cache entries" = "会话缓存条目数";
+"Sessions" = "会话";
 "Set by %@" = "由 %@ 设置";
 "Settings" = "设置";
 "Settings…" = "设置…";
@@ -847,14 +871,17 @@
 "Start the server to begin." = "启动服务器即可开始。";
 "Start the server to check drafter compatibility." = "启动服务器以检查草稿模型兼容性。";
 "Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server." = "应用启动时启动服务器。启动时是否预加载模型，取决于设置 ▸ 服务器中的“服务器启动时预加载模型”。";
+"Starters" = "入门模板";
 "Starting %@ session…" = "正在启动 %@ 会话…";
 "Starting..." = "正在启动…";
 "Starting…" = "正在启动…";
 "Status" = "状态";
 "Steadies motion and shape by re-running part of the model with its attention perturbed. 0 = off, which is the default. Around 1.0 helps wobbly motion; higher costs time and can flatten detail." = "通过对模型的一部分施加扰动的注意力并重跑，来稳定运动与形状。0 = 关闭，这是默认值。约 1.0 有助于改善抖动的运动；再调高会耗时，并可能让细节变得平坦。";
+"Steps" = "步数";
 "Steps (%lld)" = "步数（%lld）";
 "Steps in the second, full-resolution pass. Auto uses the reference schedule (3)." = "第二轮全分辨率渲染的步数。自动使用参考调度（3）。";
 "Stop" = "停止";
+"Stop (%.1fs)" = "停止（%.1fs）";
 "Stop background process %@" = "停止后台进程 %@";
 "Stop preview" = "停止试听";
 "Stop run" = "停止运行";
@@ -869,8 +896,10 @@
 "System" = "系统";
 "System RAM: %lld" = "系统内存：%lld";
 "System voice" = "系统音色";
+"THIS MAC" = "这台 Mac";
 "Telegram conversation (view only)" = "Telegram 会话（仅供查看）";
 "Telegram conversation — view only. Reply from your phone." = "Telegram 会话 —— 仅可查看。请在手机上回复。";
+"Temperature" = "温度";
 "Temperature (%@)" = "温度（%@）";
 "Templates" = "模板";
 "Tempo and key are written into the style prompt for this model — it has no separate fields for them." = "速度与调性会写进这个模型的风格提示词 —— 它没有单独的字段来设置这两项。";
@@ -920,6 +949,7 @@
 "Toggle a server on, fill in any required fields, then click Save. Servers spawn lazily the next time you send a message with MCP mode on." = "打开服务器开关，填好所有必填字段，然后点按保存。服务器会在你下次开启 MCP 模式发送消息时按需启动。";
 "TokenV3 (fastest, lossy)" = "TokenV3（最快，有损）";
 "Tokenize cache entries" = "分词缓存条目";
+"Tokens generated" = "生成的 Token";
 "Tokens guessed ahead" = "预先猜测的 Token 数";
 "Tokens per drafter round (default 4 = 3 drafter steps + 1 verify token)." = "每轮草稿提出的 Token 数（默认 4 = 3 步草稿 + 1 个验证 Token）。";
 "Tool Call" = "工具调用";
@@ -955,6 +985,7 @@
 "Use models shared by other Macs" = "使用其他 Mac 共享的模型";
 "Use the window, the menu-bar icon, or the mlx-serve command — whichever suits the moment." = "使用窗口、菜单栏图标或 mlx-serve 命令 —— 哪个合适就用哪个。";
 "Use with a coding agent" = "配合编码 Agent 使用";
+"Used" = "已用";
 "Variation" = "变体";
 "Variation strength" = "变化强度";
 "Video Generation" = "视频生成";
@@ -985,6 +1016,7 @@
 "Whether MLX dispatches to the M5 GPU's neural accelerators (NAX). The bundled MLX always ships the NAX kernels; \"on\" needs an M5-class GPU on macOS 26.2+." = "MLX 是否把计算分派给 M5 GPU 的神经加速器（NAX）。随应用附带的 MLX 始终包含 NAX kernel；要设为“开启”需要 macOS 26.2+ 上的 M5 级 GPU。";
 "Who you're talking to. An agent brings its own prompt, voice, tools, workspace and model; “None” uses the app's own settings, exactly as before. Say another agent's wake phrase to hand the conversation over mid-session." = "你在和谁对话。一个 Agent 会带上自己的提示词、音色、工具、工作区和模型；“无”则使用应用自身的设置，和以前完全一样。说出另一个 Agent 的唤醒词，即可在会话中途把对话交接过去。";
 "Wide" = "宽";
+"Width" = "宽度";
 "With only a last frame the model invents the opening and works toward it. Add a first frame to pin both ends." = "只给末帧时，模型会自行构想开场并朝它演进。加入首帧即可固定两端。";
 "Workspace" = "工作区";
 "Workspace…" = "工作区…";
@@ -1000,6 +1032,7 @@
 "You need a model to chat" = "你需要一个模型才能聊天";
 "You're on the latest release." = "你使用的是最新版本。";
 "Your Mac" = "你的 Mac";
+"Your agents" = "你的 Agent";
 "Your voices" = "你的音色";
 "a different approach" = "换一种做法";
 "a hands-on programmer that reads and edits real files" = "一个会读取并编辑真实文件的动手型程序员";
@@ -1034,6 +1067,7 @@
 "no working folder is set for this session — the agent's file tools always run confined to one, in every mode. Set a working folder (the folder icon on the Agent pill, or Settings → Agent Sandbox) and retry." = "本次会话没有设置工作文件夹 —— 无论哪种模式，Agent 的文件工具始终被限制在一个文件夹内运行。请设置一个工作文件夹（Agent 胶囊上的文件夹图标，或设置 → Agent 沙盒），然后重试。";
 "nothing found" = "未找到任何结果";
 "optional — audio-to-video" = "可选 —— 音频生视频";
+"optional — ends here" = "可选 —— 在此结束";
 "optional — the generation follows them" = "可选 —— 生成会跟随它们";
 "or drag one here" = "或把文件拖到这里";
 "or env var, e.g. OPENAI_API_KEY" = "或环境变量，例如 OPENAI_API_KEY";
