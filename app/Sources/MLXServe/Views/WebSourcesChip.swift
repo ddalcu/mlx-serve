@@ -64,7 +64,7 @@ struct FaviconView: View {
             } else {
                 ZStack {
                     monogramColor
-                    Text(L10n.text(String(domain.first ?? "?").uppercased()))
+                    Text(String(domain.first ?? "?").uppercased())
                         .font(.system(size: size * 0.6, weight: .semibold))
                         .foregroundStyle(.white)
                 }

@@ -460,7 +460,7 @@ struct StatusMenuView: View {
         let loadedModels = server.residentModels
         return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             TraySectionHeader(title: "In Memory",
-                              detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)
+                              detail: loadedModels.count > 1 ? L10n.format("%lld models", loadedModels.count) : nil)
             TrayCard {
                 if loadedModels.isEmpty {
                     Text("None loaded — models load on demand")

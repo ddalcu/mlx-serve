@@ -133,7 +133,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                     Button {
                         onDownload(preset)
                     } label: {
-                        Text(L10n.text(downloadLabel(preset)))
+                        Text(downloadLabel(preset))
                             .font(.caption.weight(.medium))
                     }
                     .buttonStyle(.bordered)

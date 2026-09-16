@@ -106,6 +106,59 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(L10n.format("Download %@ (%lld MB)", "flux", 512), "Download flux (512 MB)")
     }
 
+    /// The sweep that wrapped runtime strings in `L10n` once called it with a
+    /// key transformed BEFORE lookup (`title.uppercased()`), which can never
+    /// hit: the table is keyed on the source literals, so render-time casing
+    /// must happen after resolution. Guards the whole class, not the instance —
+    /// a "simplification" back to `L10n.text(x.uppercased())` fails here.
+    func testNoL10nKeysAreTransformedBeforeLookup() throws {
+        let sourcesRoot = Self.catalogURL
+            .deletingLastPathComponent()  // zh-Hans.lproj
+            .deletingLastPathComponent()  // Resources
+            .deletingLastPathComponent()  // MLXServe
+            .deletingLastPathComponent()  // Sources
+        let pattern = try NSRegularExpression(
+            pattern: #"L10n\.text\([A-Za-z0-9_.]+\.uppercased\(\)\)"#)
+        var offenders: [String] = []
+        let files = try FileManager.default
+            .enumerator(at: sourcesRoot, includingPropertiesForKeys: nil)!
+            .compactMap { ($0 as? URL)?.pathExtension == "swift" ? $0 as? URL : nil }
+        for url in files {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let matches = pattern.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            if !matches.isEmpty { offenders.append(url.lastPathComponent) }
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "L10n.text called with a key that is uppercased before resolution: \(offenders)")
+    }
+
+    /// Tray section headers render upper-cased, but every `TraySectionHeader`
+    /// title literal must be a translated catalog entry — "translated in the
+    /// file, unreachable at runtime" is the failure this pins down.
+    func testTraySectionHeaderTitlesAreTranslated() throws {
+        let view = Self.catalogURL
+            .deletingLastPathComponent()  // zh-Hans.lproj
+            .deletingLastPathComponent()  // Resources
+            .deletingLastPathComponent()  // MLXServe
+            .appendingPathComponent("Views/StatusMenuView.swift")
+        let source = try String(contentsOf: view, encoding: .utf8)
+        let pattern = try NSRegularExpression(
+            pattern: #"TraySectionHeader\(\s*title:\s*"([^"]+)""#)
+        let bundle = try XCTUnwrap(
+            Bundle(path: Self.catalogURL.deletingLastPathComponent().path))
+        var titles: [String] = []
+        for match in pattern.matches(in: source, range: NSRange(source.startIndex..., in: source)) {
+            let range = try XCTUnwrap(Range(match.range(at: 1), in: source))
+            titles.append(String(source[range]))
+        }
+        XCTAssertEqual(Set(titles), ["Server", "In Memory", "Media Generation"],
+                       "header call sites changed shape; update the expected set")
+        for title in titles {
+            XCTAssertNotEqual(bundle.localizedString(forKey: title, value: title, table: nil),
+                              title, "tray header \"\(title)\" is listed but not translated")
+        }
+    }
+
     private static func specs(_ text: String) -> [String] {
         let range = NSRange(text.startIndex..., in: text)
         return specifier.matches(in: text, range: range).compactMap {

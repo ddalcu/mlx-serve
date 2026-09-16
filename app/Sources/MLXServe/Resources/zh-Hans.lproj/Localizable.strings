@@ -26,6 +26,7 @@
 "%lld WEB SOURCE%@" = "%lld 个网页来源";
 "%lld bytes" = "%lld 字节";
 "%lld frames · ~%.1fs" = "%lld 帧 · ~%.1fs";
+"%lld models" = "%lld 个模型";
 "%lld of %lld selected" = "已选择 %lld / %lld";
 "%lld source%@" = "%lld 个来源";
 "%lld steps" = "%lld 步";
@@ -415,6 +416,7 @@
 "Image generation" = "图像生成";
 "In LM Studio’s models folder — manage it in LM Studio. MLX Core loads it read-only." = "在 LM Studio 的模型文件夹中 —— 请在 LM Studio 中管理。MLX Core 会以只读方式加载。";
 "In MTPLX’s models folder — manage it in MTPLX. MLX Core loads it read-only." = "在 MTPLX 的模型文件夹中 —— 请在 MTPLX 中管理。MLX Core 会以只读方式加载。";
+"In Memory" = "内存中";
 "In Osaurus’s models folder — manage it in Osaurus. MLX Core loads it read-only." = "在 Osaurus 的模型文件夹中 —— 请在 Osaurus 中管理。MLX Core 会以只读方式加载。";
 "In a custom models folder you added — MLX Core loads it read-only and won’t delete it." = "在你添加的自定义模型文件夹中 —— MLX Core 会以只读方式加载，且不会删除它。";
 "In the Hugging Face cache — manage with huggingface-cli. MLX Core loads it read-only." = "在 Hugging Face 缓存中 —— 请用 huggingface-cli 管理。MLX Core 会以只读方式加载。";
@@ -501,6 +503,7 @@
 "Maximum prompt + completion tokens. \"Auto\" fits the model to available " = "提示词 + 对话补全的最大 Token 数。“Auto” 会根据可用内存适配模型。";
 "May exceed your Mac's RAM (%lld GB total) at this length." = "此长度下可能超出你 Mac 的内存（共 %lld GB）。";
 "Media" = "媒体";
+"Media Generation" = "媒体生成";
 "Medium" = "中";
 "Memory & Tasks" = "记忆与任务";
 "Memory needed" = "所需内存";

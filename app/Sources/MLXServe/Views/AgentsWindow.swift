@@ -854,7 +854,7 @@ private struct AgentEditor: View {
                               alignment: .leading, spacing: 16) {
                         ForEach(AgentToolGroup.allCases, id: \.self) { group in
                             VStack(alignment: .leading, spacing: 6) {
-                                Text(L10n.text(group.title.uppercased()))
+                                Text(L10n.text(group.title).uppercased())
                                     .font(.caption2.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                     .kerning(0.5)

@@ -89,7 +89,7 @@ struct ModelSettingsSheet: View {
                     set: { override.ctxSize = $0 < 0 ? nil : $0 })) {
                     Text("Default").tag(-1)
                     ForEach(ContextSizeDisplay.presets, id: \.self) { n in
-                        Text(L10n.text(ContextSizeDisplay.formatTokens(n))).tag(n)
+                        Text(ContextSizeDisplay.formatTokens(n)).tag(n)
                     }
                 }
                 Picker("KV cache", selection: Binding(
