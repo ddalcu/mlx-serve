@@ -112,7 +112,7 @@ struct VoiceTrayPanel: View {
             // STATIC dot — color alone encodes the state. Do NOT animate this in
             // the tray: a continuously-redrawing view (a `repeatForever`
             // animation *or* a running `TimelineView(.animation)`) inside this
-            // LSUIElement app's MenuBarExtra(L10n.text(.window)) popover starves SwiftUI
+            // LSUIElement app's MenuBarExtra(.window) popover starves SwiftUI
             // Button hit-testing and wedges every tray button, while the model
             // Picker / voice Menu keep working from their own NSMenu tracking
             // loop. The breathe lives only in the in-window orb. See `VoiceTrayDot`.
