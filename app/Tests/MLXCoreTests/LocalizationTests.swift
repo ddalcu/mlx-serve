@@ -106,57 +106,204 @@ final class LocalizationTests: XCTestCase {
         XCTAssertEqual(L10n.format("Download %@ (%lld MB)", "flux", 512), "Download flux (512 MB)")
     }
 
-    /// The sweep that wrapped runtime strings in `L10n` once called it with a
-    /// key transformed BEFORE lookup (`title.uppercased()`), which can never
-    /// hit: the table is keyed on the source literals, so render-time casing
-    /// must happen after resolution. Guards the whole class, not the instance —
-    /// a "simplification" back to `L10n.text(x.uppercased())` fails here.
-    func testNoL10nKeysAreTransformedBeforeLookup() throws {
-        let sourcesRoot = Self.catalogURL
+    // MARK: - Lookup plumbing
+
+    /// Every Swift file under `Sources`, by name and text.
+    private static func sourceFiles() throws -> [(name: String, text: String)] {
+        let root = catalogURL
             .deletingLastPathComponent()  // zh-Hans.lproj
             .deletingLastPathComponent()  // Resources
             .deletingLastPathComponent()  // MLXServe
             .deletingLastPathComponent()  // Sources
-        let pattern = try NSRegularExpression(
-            pattern: #"L10n\.text\([A-Za-z0-9_.]+\.uppercased\(\)\)"#)
-        var offenders: [String] = []
-        let files = try FileManager.default
-            .enumerator(at: sourcesRoot, includingPropertiesForKeys: nil)!
-            .compactMap { ($0 as? URL)?.pathExtension == "swift" ? $0 as? URL : nil }
-        for url in files {
-            let text = try String(contentsOf: url, encoding: .utf8)
-            let matches = pattern.matches(in: text, range: NSRange(text.startIndex..., in: text))
-            if !matches.isEmpty { offenders.append(url.lastPathComponent) }
+        let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)!
+        return try walker.compactMap { element in
+            guard let url = element as? URL, url.pathExtension == "swift" else { return nil }
+            return (url.lastPathComponent, try String(contentsOf: url, encoding: .utf8))
         }
-        XCTAssertTrue(offenders.isEmpty,
-                      "L10n.text called with a key that is uppercased before resolution: \(offenders)")
     }
 
-    /// Tray section headers render upper-cased, but every `TraySectionHeader`
-    /// title literal must be a translated catalog entry — "translated in the
-    /// file, unreachable at runtime" is the failure this pins down.
-    func testTraySectionHeaderTitlesAreTranslated() throws {
-        let view = Self.catalogURL
-            .deletingLastPathComponent()  // zh-Hans.lproj
-            .deletingLastPathComponent()  // Resources
-            .deletingLastPathComponent()  // MLXServe
-            .appendingPathComponent("Views/StatusMenuView.swift")
-        let source = try String(contentsOf: view, encoding: .utf8)
-        let pattern = try NSRegularExpression(
-            pattern: #"TraySectionHeader\(\s*title:\s*"([^"]+)""#)
-        let bundle = try XCTUnwrap(
-            Bundle(path: Self.catalogURL.deletingLastPathComponent().path))
-        var titles: [String] = []
-        for match in pattern.matches(in: source, range: NSRange(source.startIndex..., in: source)) {
-            let range = try XCTUnwrap(Range(match.range(at: 1), in: source))
-            titles.append(String(source[range]))
+    /// Every call in one file, keyed by callee: `row(` → "row", `L10n.text(` →
+    /// "L10n.text". Argument text keeps balanced parens, so a nested call cannot
+    /// truncate the scan, and identifier boundaries are honoured — `row(` never
+    /// matches `someRow(`. Built once per file: scanning per helper is what made
+    /// this test take 18 seconds.
+    private static func callIndex(in text: String) -> [String: [String]] {
+        let characters = Array(text)
+        var index: [String: [String]] = [:]
+        var cursor = 0
+        while cursor < characters.count {
+            guard characters[cursor].isLetter || characters[cursor] == "_" else {
+                cursor += 1
+                continue
+            }
+            var name = ""
+            var end = cursor
+            while end < characters.count {
+                let character = characters[end]
+                if character.isLetter || character.isNumber || character == "_" {
+                    name.append(character)
+                    end += 1
+                } else if character == ".", end + 1 < characters.count,
+                          characters[end + 1].isLetter || characters[end + 1] == "_" {
+                    name.append(character)
+                    end += 1
+                } else {
+                    break
+                }
+            }
+            guard end < characters.count, characters[end] == "(" else {
+                cursor = max(end, cursor + 1)
+                continue
+            }
+            var depth = 0
+            var close = end
+            while close < characters.count {
+                if characters[close] == "(" { depth += 1 }
+                if characters[close] == ")" {
+                    depth -= 1
+                    if depth == 0 { break }
+                }
+                close += 1
+            }
+            if close < characters.count {
+                index[name, default: []].append(String(characters[(end + 1)..<close]))
+            }
+            // Keep walking INSIDE the argument list: most L10n calls are nested
+            // in Text(...)/Label(...) and would otherwise be skipped.
+            cursor = end + 1
         }
-        XCTAssertEqual(Set(titles), ["Server", "In Memory", "Media Generation"],
-                       "header call sites changed shape; update the expected set")
-        for title in titles {
-            XCTAssertNotEqual(bundle.localizedString(forKey: title, value: title, table: nil),
-                              title, "tray header \"\(title)\" is listed but not translated")
+        return index
+    }
+
+    /// `_ title: String` → `("_", "title")`; `label: String = ""` → `("label", "label")`.
+    private static func parameters(_ signature: String) -> [(label: String, parameter: String)] {
+        var parts: [String] = []
+        var depth = 0
+        var current = ""
+        for character in signature {
+            switch character {
+            case "(", "<", "[":
+                depth += 1
+                current.append(character)
+            case ")", ">", "]":
+                depth -= 1
+                current.append(character)
+            case "," where depth == 0:
+                parts.append(current)
+                current = ""
+            default:
+                current.append(character)
+            }
         }
+        parts.append(current)
+        return parts.compactMap { part in
+            guard let colon = part.firstIndex(of: ":") else { return nil }
+            let tokens = part[..<colon].split(separator: " ").map(String.init)
+            guard let first = tokens.first else { return nil }
+            return (first, tokens.count > 1 ? tokens[tokens.count - 1] : first)
+        }
+    }
+
+    /// Helpers whose body looks one of their parameters up in the catalog:
+    /// the function name, that parameter, and the external label call sites use.
+    private static func lookupHelpers(
+        in files: [(name: String, text: String)]
+    ) -> [(name: String, label: String)] {
+        let lookup = try! NSRegularExpression(
+            pattern: #"L10n\.(?:text|format)\(\s*([A-Za-z_]\w*)\s*[,)]"#)
+        let definition = try! NSRegularExpression(pattern: #"func\s+(\w+)\s*\(([^)]*)\)"#)
+        var seen = Set<String>()
+        var out: [(String, String)] = []
+        for file in files {
+            let ns = file.text as NSString
+            for match in lookup.matches(in: file.text, range: NSRange(location: 0, length: ns.length)) {
+                let parameter = ns.substring(with: match.range(at: 1))
+                let before = NSRange(location: 0, length: match.range.location)
+                guard let definition = definition.matches(in: file.text, range: before).last else { continue }
+                let name = ns.substring(with: definition.range(at: 1))
+                let signature = ns.substring(with: definition.range(at: 2))
+                for (label, candidate) in parameters(signature) where candidate == parameter {
+                    if seen.insert("\(name)(\(parameter))").inserted {
+                        out.append((name, label))
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// The literal passed as `label` — or positionally when the parameter is
+    /// unlabelled — inside one call's argument text.
+    private static func literalArgument(_ arguments: String, label: String) -> String? {
+        if label == "_" {
+            let trimmed = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("\"") else { return nil }
+            return takeQuoted(trimmed.dropFirst()).map(\.0)
+        }
+        let pattern = try! NSRegularExpression(
+            pattern: #"\b\#(NSRegularExpression.escapedPattern(for: label)):\s*\""#)
+        let ns = arguments as NSString
+        guard let match = pattern.firstMatch(in: arguments, range: NSRange(location: 0, length: ns.length))
+        else { return nil }
+        let rest = arguments[Range(match.range, in: arguments)!.upperBound...]
+        return takeQuoted(rest).map(\.0)
+    }
+
+    // MARK: - Lookup guards
+
+    /// The sweep that wrapped runtime strings in `L10n` once called it with a
+    /// key transformed BEFORE lookup (`title.uppercased()`), which can never
+    /// hit: the table is keyed on the source literals, so render-time casing
+    /// must happen after resolution. Guards the ARGUMENT itself — any shape
+    /// (`uppercased`, `lowercased`, `capitalized`, a `String(...)` wrapper) and
+    /// any call site, rather than the one pattern that happened to exist.
+    func testNoL10nArgumentIsTransformedBeforeResolution() throws {
+        var calls = 0
+        var offenders: [String] = []
+        for file in try Self.sourceFiles() {
+            let index = Self.callIndex(in: file.text)
+            for arguments in (index["L10n.text"] ?? []) + (index["L10n.format"] ?? []) {
+                calls += 1
+                let key = arguments.split(separator: ",", maxSplits: 1).first.map(String.init) ?? arguments
+                for transform in [".uppercased(", ".lowercased(", ".capitalized", "String("]
+                where key.contains(transform) {
+                    offenders.append("\(file.name): L10n(\(key.trimmingCharacters(in: .whitespaces)))")
+                }
+            }
+        }
+        XCTAssertGreaterThan(calls, 200, "the scan stopped matching L10n call sites")
+        XCTAssertTrue(offenders.isEmpty, "L10n keys transformed before resolution: \(offenders)")
+    }
+
+    /// Every string literal that reaches an `L10n` lookup through a helper
+    /// parameter has to exist in the catalog. Scoped to one helper in one file
+    /// it missed `sectionLabel` in another — this walks the helpers out of the
+    /// sources instead of a hand-written list.
+    ///
+    /// `latinLabels` are values that are deliberately rendered in Latin — HTTP
+    /// verbs and sampling symbols — where the lookup falls through to the
+    /// literal by design.
+    func testEveryLiteralReachingALookupHelperIsTranslated() throws {
+        let files = try Self.sourceFiles()
+        let calls = files.map { (name: $0.name, index: Self.callIndex(in: $0.text)) }
+        let keys = Set(try catalog().map(\.key))
+        let latinLabels: Set<String> = ["BASE", "Top-p"]
+        var sites = 0
+        var missing: [String] = []
+        for helper in Self.lookupHelpers(in: files) {
+            for file in calls {
+                for arguments in file.index[helper.name] ?? [] {
+                    guard let literal = Self.literalArgument(arguments, label: helper.label),
+                          !literal.contains("\\(") else { continue }
+                    sites += 1
+                    if latinLabels.contains(literal) || keys.contains(literal) { continue }
+                    missing.append("\(file.name): \"\(literal)\" reaching \(helper.name)")
+                }
+            }
+        }
+        XCTAssertGreaterThan(sites, 30, "the scan stopped finding literal call sites")
+        XCTAssertTrue(missing.isEmpty,
+                      "literals reaching a lookup with no catalog entry:\n\(missing.joined(separator: "\n"))")
     }
 
     private static func specs(_ text: String) -> [String] {
