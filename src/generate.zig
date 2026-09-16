@@ -92,6 +92,9 @@ pub const SpecDisableReason = enum {
     none,
     acceptance,
     max_ctx,
+    /// A thinking budget closed the thought through a plain forward; the spec
+    /// state is not resynced, the answer decodes regular.
+    think_bound,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
 };
@@ -571,7 +574,7 @@ pub const Constraint = struct {
 /// A forced recovery must leave room for the whole remaining transition AND
 /// at least one constrained answer token. At the ordinary completion cap the
 /// caller keeps the existing length-stop behavior — no reserve is created.
-fn forcedBoundaryCanContinue(completion_tokens: u32, max_tokens: u32, transition_tokens: usize) bool {
+pub fn forcedBoundaryCanContinue(completion_tokens: u32, max_tokens: u32, transition_tokens: usize) bool {
     return completion_tokens +| @as(u32, @intCast(transition_tokens)) + 1 <= max_tokens;
 }
 
@@ -666,6 +669,41 @@ pub const LogprobResult = struct {
     top_logprobs: []TokenLogprob, // top N alternatives (caller must free)
 };
 
+/// A thinking budget enforced while decoding: once `budget` tokens have been
+/// generated inside the think block, `forced` (an early-stop sentence, the
+/// pack's atomic closer, a separator) is committed through the model and the
+/// answer follows. Markers are single token ids, so only packs whose think
+/// tags are atomic tokens can be bound; `observe` walks the generated ids
+/// incrementally and `due` asks whether the tail is an open block at budget.
+pub const ThinkBound = struct {
+    budget: u32,
+    opener_id: ?u32,
+    closer_id: u32,
+    forced: []const u32,
+    in_think: bool,
+    count: u32 = 0,
+    cursor: usize = 0,
+    fired: bool = false,
+
+    pub fn observe(self: *ThinkBound, ids: []const u32) void {
+        while (self.cursor < ids.len) : (self.cursor += 1) {
+            const id = ids[self.cursor];
+            if (id == self.closer_id) {
+                self.in_think = false;
+            } else if (self.opener_id != null and id == self.opener_id.?) {
+                self.in_think = true;
+                self.count = 0;
+            } else if (self.in_think) {
+                self.count += 1;
+            }
+        }
+    }
+
+    pub fn due(self: *const ThinkBound) bool {
+        return !self.fired and self.in_think and self.count >= self.budget;
+    }
+};
+
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
     temperature: f32 = 1.0,
@@ -680,6 +718,9 @@ pub const SamplingParams = struct {
     /// grammar at byte level. Forces a synchronous sampling path (no lazy
     /// pipeline) since grammar advancement requires the realized token id.
     constraint: ?*Constraint = null,
+    /// In-stream thinking budget (`ThinkBound`), owned by the request handler
+    /// like `constraint`; null = no bound.
+    think_bound: ?*ThinkBound = null,
     /// Reserved-token suppression mask: `[vocab]` bool, true = the sampler
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
@@ -784,6 +825,65 @@ fn applySuppressMask(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: mlx.mlx_a
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
+}
+
+/// A scalar in the array's own dtype, so a masked bf16 block is not widened to
+/// f32 by its own `-inf`.
+fn scalarLike(v: f32, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const raw = mlx.mlx_array_new_float(v);
+    defer _ = mlx.mlx_array_free(raw);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, raw, mlx.mlx_array_dtype(like), s));
+    return out;
+}
+
+/// A greedy spec-verify argmax whose entries are COMMITTED as next tokens.
+/// `verifyArgmax` is its only constructor and every commit site takes this type,
+/// so a raw `mlx_argmax_axis` cannot reach a commit without the reserved-id mask.
+pub const CommittedArgmax = struct {
+    arr: mlx.mlx_array = .{ .ctx = null },
+
+    pub fn deinit(self: *CommittedArgmax) void {
+        if (self.arr.ctx != null) _ = mlx.mlx_array_free(self.arr);
+        self.arr = .{ .ctx = null };
+    }
+
+    pub fn present(self: CommittedArgmax) bool {
+        return self.arr.ctx != null;
+    }
+
+    /// The lazy handle, for an eval vector or a forced eval - never for a commit.
+    pub fn lazy(self: CommittedArgmax) mlx.mlx_array {
+        return self.arr;
+    }
+
+    /// The realized ids; the caller must have evaluated `lazy()` first.
+    pub fn ids(self: CommittedArgmax, len: usize) ![]const i32 {
+        const data = mlx.mlx_array_data_int32(self.arr) orelse return error.MlxArrayDataNull;
+        return data[0..len];
+    }
+};
+
+/// The greedy spec-verify argmax, over the reserved-id mask when the model has
+/// one. The sampled verify filters through `applySuppressMask` and the rerank
+/// draft select takes the mask, so without this the greedy verify was the one
+/// path that could commit a flagged special or a padding row past the defined
+/// vocabulary — ids the serial sampler can never draw.
+fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stream) !CommittedArgmax {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (mask) |m| {
+        const neg_inf = try scalarLike(-std.math.inf(f32), logits, s);
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var masked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked);
+        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        try mlx.check(mlx.mlx_argmax_axis(&out, masked, 2, false, s));
+    } else {
+        try mlx.check(mlx.mlx_argmax_axis(&out, logits, 2, false, s));
+    }
+    return .{ .arr = out };
 }
 
 /// A speculative decode step (PLD / drafter / MTP) cannot honor a grammar
@@ -3519,6 +3619,77 @@ pub const Generator = struct {
         return .{ .drained = token };
     }
 
+    pub const ForcedCommit = struct {
+        /// Tokens emitted by this call: any pending token plus every forced
+        /// token but the last, which stays as `next_token_id` for the next
+        /// regular tick to publish.
+        emitted: []const u32,
+        stopped: bool,
+    };
+
+    /// Commit `forced` through the model as ONE multi-token forward, from any
+    /// of the three inter-tick states (pipelined, spec exit, shim-seeded), and
+    /// leave the generator in the shim-seeded state a regular `next()` reads.
+    /// The caller routes every later tick through the regular path.
+    pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
+        std.debug.assert(forced.len > 0);
+        var emitted = std.ArrayList(u32).empty;
+        errdefer emitted.deinit(allocator);
+        var input = std.ArrayList(u32).empty;
+        defer input.deinit(allocator);
+
+        if (self.has_pending_token or self.has_pending_logits) {
+            // Pipelined or shim-seeded: `next_token_id` is in the cache, unpublished.
+            try self.resolvePendingToken();
+            if (try self.checkStop()) return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = true };
+            try self.generated_ids.append(allocator, self.next_token_id);
+            try emitted.append(allocator, self.next_token_id);
+            self.advanceStep(1);
+            if (self.has_pending_logits) {
+                _ = mlx.mlx_array_free(self.pending_logits);
+                self.has_pending_logits = false;
+            }
+        } else {
+            // Spec exit: `next_token_id` is decided but not in the cache.
+            try input.append(allocator, self.next_token_id);
+            try self.generated_ids.append(allocator, self.next_token_id);
+            try emitted.append(allocator, self.next_token_id);
+            self.advanceStep(1);
+        }
+        try input.appendSlice(allocator, forced);
+        for (forced[0 .. forced.len - 1]) |f| {
+            try self.generated_ids.append(allocator, f);
+            try emitted.append(allocator, f);
+        }
+        self.advanceStep(@intCast(forced.len - 1));
+        self.consecutive_pad = 0;
+        self.loop_guard_start = self.generated_ids.items.len;
+
+        const ids_i32 = try allocator.alloc(i32, input.items.len);
+        defer allocator.free(ids_i32);
+        for (input.items, 0..) |t, i| ids_i32[i] = @intCast(t);
+        const shape = [_]c_int{ 1, @intCast(input.items.len) };
+        const tok_input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tok_input);
+        const all_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+        defer _ = mlx.mlx_array_free(all_logits);
+        const shp = mlx.getShape(all_logits);
+        var logits = mlx.mlx_array_new();
+        const start = [_]c_int{ 0, shp[1] - 1, 0 };
+        const stop = [_]c_int{ shp[0], shp[1], shp[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&logits, all_logits, &start, 3, &stop, 3, &strides, 3, self.xfm.s));
+        const arr = [_]mlx.mlx_array{logits};
+        const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+        _ = mlx.mlx_async_eval(vec);
+        _ = mlx.mlx_vector_array_free(vec);
+        self.pending_logits = logits;
+        self.has_pending_logits = true;
+        self.next_token_id = forced[forced.len - 1];
+        self.mtp_hidden_stale = true;
+        return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
+    }
+
     /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
     /// Caller owns `tokens` (must `allocator.free` it).
     pub const PldStepResult = struct {
@@ -4398,11 +4569,12 @@ pub const Generator = struct {
         }
 
         // Build the greedy argmax tensor lazily; it'll be eval'd alongside
-        // the rest of the round below.
-        var verify_argmax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        // the rest of the round below. Its entries are COMMITTED, so they mask
+        // reserved ids like every other block decoder's.
+        var verify_argmax: CommittedArgmax = .{};
+        defer verify_argmax.deinit();
         if (!stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -4428,7 +4600,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             if (!stochastic) {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
             try mlx.check(mlx.mlx_async_eval(eval_vec));
@@ -4449,7 +4621,7 @@ pub const Generator = struct {
             // produced 0% acceptance on 26B/31B (verify ran longer than the
             // drafter chain, so the data buffer was read while the GPU was
             // still writing it).
-            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+            try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
         }
 
         var accepted: u32 = 0;
@@ -4472,9 +4644,7 @@ pub const Generator = struct {
         } else {
             // Bulk-read the [1, 1+m] argmax indices and scan for first
             // mismatch in CPU. No more GPU syncs in this branch.
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                return error.MlxArrayDataNull;
-            };
+            const argmax_data = try verify_argmax.ids(1 + m);
             var k: u32 = 0;
             while (k < m) : (k += 1) {
                 const target_argmax: u32 = @intCast(argmax_data[k]);
@@ -4515,9 +4685,7 @@ pub const Generator = struct {
             } else {
                 // Greedy: reuse the bulk-read argmax row. Already eval'd in
                 // the single async eval above; no GPU sync here.
-                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                    return error.MlxArrayDataNull;
-                };
+                const argmax_data = try verify_argmax.ids(1 + m);
                 break :blk @intCast(argmax_data[accepted]);
             }
         };
@@ -4986,10 +5154,11 @@ pub const Generator = struct {
                 try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
         }
-        var verify_argmax = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        // Committed entries: masked like every other block decoder's.
+        var verify_argmax: CommittedArgmax = .{};
+        defer verify_argmax.deinit();
         if (!stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -5001,7 +5170,7 @@ pub const Generator = struct {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             _ = mlx.mlx_vector_array_append_value(eval_vec, draft_ids);
-            if (!stochastic) _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+            if (!stochastic) _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             try mlx.check(mlx.mlx_async_eval(eval_vec));
         }
         var drafts = try allocator.alloc(u32, m);
@@ -5013,7 +5182,7 @@ pub const Generator = struct {
             const draft_data = mlx.mlx_array_data_int32(draft_ids) orelse return error.MlxArrayDataNull;
             for (drafts, 0..) |*d, idx| d.* = @intCast(draft_data[idx]);
         }
-        if (!stochastic) try mlx.check(mlx.mlx_array_eval(verify_argmax));
+        if (!stochastic) try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
 
         var accepted: u32 = 0;
         if (stochastic) {
@@ -5037,7 +5206,7 @@ pub const Generator = struct {
                 accepted += 1;
             }
         } else {
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+            const argmax_data = try verify_argmax.ids(1 + m);
             var k: u32 = 0;
             while (k < m) : (k += 1) {
                 if (@as(u32, @intCast(argmax_data[k])) != drafts[k]) break;
@@ -5077,7 +5246,7 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse return error.MlxArrayDataNull;
+                const argmax_data = try verify_argmax.ids(1 + m);
                 break :blk @intCast(argmax_data[accepted]);
             }
         };
@@ -6528,17 +6697,29 @@ pub const Generator = struct {
         retained: u32 = 0,
         verify_rollback: ?Transformer.VerifyRollback = null,
         verify_ctx: ?*ForwardCtx = null,
-        verify_argmax: mlx.mlx_array = .{ .ctx = null },
+        verify_argmax: CommittedArgmax = .{},
         verify_logits: mlx.mlx_array = .{ .ctx = null },
         new_hidden: mlx.mlx_array = .{ .ctx = null },
         verify_hidden_all: mlx.mlx_array = .{ .ctx = null },
+        /// The group's joined `[1, Σ(1+m_i), V]` verify block, held by the FIRST
+        /// row's state; the accept side filters it once for every sampled row.
+        group_logits: mlx.mlx_array = .{ .ctx = null },
+        /// Phase-4 terms the group prepared for this row (sampled rows only):
+        /// the accept graph's own outputs, whichever acceptance mode built them.
+        /// `accept_p` null-ctx = this row builds its own in the finish.
+        accept_p: mlx.mlx_array = .{ .ctx = null },
+        accept_q: mlx.mlx_array = .{ .ctx = null },
+        accept_defer: mlx.mlx_array = .{ .ctx = null },
+        corr: mlx.mlx_array = .{ .ctx = null },
 
         pub fn deinit(self: *MtpRoundState, allocator: std.mem.Allocator) void {
             self.chain.deinit(allocator);
             if (self.kv_snap) |*snap| snap.deinit();
             _ = mlx.mlx_array_free(self.verify_input);
-            if (self.verify_argmax.ctx != null) _ = mlx.mlx_array_free(self.verify_argmax);
+            self.verify_argmax.deinit();
             if (self.verify_logits.ctx != null) _ = mlx.mlx_array_free(self.verify_logits);
+            if (self.group_logits.ctx != null) _ = mlx.mlx_array_free(self.group_logits);
+            self.releasePreparedAccept();
             if (self.new_hidden.ctx != null) _ = mlx.mlx_array_free(self.new_hidden);
             if (self.verify_hidden_all.ctx != null) _ = mlx.mlx_array_free(self.verify_hidden_all);
             if (self.verify_ctx) |ctx| {
@@ -6549,11 +6730,27 @@ pub const Generator = struct {
                 saved.deinit();
             }
         }
+
+        /// Drop the group-prepared Phase-4 terms, so the row's finish builds its own.
+        pub fn releasePreparedAccept(self: *MtpRoundState) void {
+            inline for (.{ &self.accept_p, &self.accept_q, &self.accept_defer, &self.corr }) |slot| {
+                if (slot.ctx != null) {
+                    _ = mlx.mlx_array_free(slot.*);
+                    slot.* = .{ .ctx = null };
+                }
+            }
+        }
     };
 
     pub const MtpRowVerdict = struct { accepted: u32, next_pending: u32 };
 
-    pub fn mtpAcceptRowGreedy(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
+    /// One row's greedy verdict. Takes the committed-argmax wrapper, so no raw
+    /// argmax can reach a commit; `mtpGreedyVerdict` is the pure core.
+    pub fn mtpAcceptRowGreedy(am: CommittedArgmax, len: u32, drafts: []const u32, completion: u32, max_tokens: u32) !MtpRowVerdict {
+        return mtpGreedyVerdict(try am.ids(len), drafts, completion, max_tokens);
+    }
+
+    pub fn mtpGreedyVerdict(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
         var accepted: u32 = 0;
         while (accepted < drafts.len and @as(u32, @intCast(am[accepted])) == drafts[accepted]) accepted += 1;
         accepted = capAcceptedForTokenBudget(accepted, completion, max_tokens);
@@ -6973,6 +7170,8 @@ pub const Generator = struct {
             st.verify_logits = out_logits[i];
             st.new_hidden = out_last[i];
             st.verify_hidden_all = out_all[i];
+            // Row 0 owns the joined block for the round when the lm_head ran once.
+            if (i == 0) st.group_logits = xfm.takeJoinedVerifyLogits();
             if (st.tracing) {
                 gen.mtp_trace.add(.verify, row_ns[i]);
                 const laps = xfm.verify_laps;
@@ -7005,25 +7204,106 @@ pub const Generator = struct {
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         errdefer for (states[0..n]) |st| {
-            if (st.verify_argmax.ctx != null) {
-                _ = mlx.mlx_array_free(st.verify_argmax);
-                st.verify_argmax = .{ .ctx = null };
-            }
+            st.verify_argmax.deinit();
+            st.releasePreparedAccept();
         };
         for (gens[0..n], states[0..n]) |gen, st| {
             for (st.chain.draft_arrs[0..st.chain.m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.new_hidden);
             _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_hidden_all);
             if (gen.sampling.temperature > 0.01) continue;
-            var am = mlx.mlx_array_new();
-            mlx.check(mlx.mlx_argmax_axis(&am, st.verify_logits, 2, false, s)) catch |e| {
-                _ = mlx.mlx_array_free(am);
-                return e;
-            };
-            st.verify_argmax = am;
-            _ = mlx.mlx_vector_array_append_value(eval_vec, am);
+            st.verify_argmax = try verifyArgmax(st.verify_logits, gen.sampling.suppress_mask, s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.verify_argmax.lazy());
         }
+        try mtpGroupSampledAccept(gens[0..n], states[0..n], eval_vec, s);
         try mlx.check(mlx.mlx_async_eval(eval_vec));
+    }
+
+    /// Whether ONE filtered block can serve every sampled row of a group: the
+    /// filter is per REQUEST, and one categorical cannot carry a per-row key.
+    fn mtpGroupAcceptBatchable(params: []const SamplingParams) bool {
+        if (params.len == 0) return false;
+        return sampleRowsHomogeneous(params) and !sampleRowsAnySeed(params);
+    }
+
+    /// Phase 4 for the sampled rows of a group, built together: ONE
+    /// `probsAllPositions` over their joined verify logits — the block the
+    /// lm_head already projected in one go — and each row's accept graph on the
+    /// group's single async eval, instead of a build-wait-build staircase per
+    /// row. Declines (every row then builds its own in `mtpRoundFinish`) when
+    /// the rows do not share one sampler, any row is seeded, or a row was
+    /// padded past `1 + m`.
+    fn mtpGroupSampledAccept(
+        gens: []const *Generator,
+        states: []const *MtpRoundState,
+        eval_vec: mlx.mlx_vector_array,
+        s: mlx.mlx_stream,
+    ) !void {
+        if (!mtpBatchCorrEnabled()) return;
+        var rows: [MTP_GROUP_ROWS_MAX]usize = undefined;
+        var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
+        var k: usize = 0;
+        for (gens, states, 0..) |gen, st, i| {
+            if (gen.sampling.temperature <= 0.01) continue;
+            if (st.chain.m == 0 or st.verify_len != 1 + st.chain.m) return;
+            rows[k] = i;
+            params[k] = gen.sampling;
+            k += 1;
+        }
+        if (k == 0 or !mtpGroupAcceptBatchable(params[0..k])) return;
+
+        // Offsets of each sampled row in the block, ascending: the projection's
+        // own `offset += row.seq` walk, which is why the joined array can stand
+        // in for the concatenation whenever every row of it is sampled.
+        var offs: [MTP_GROUP_ROWS_MAX]c_int = undefined;
+        var total: c_int = 0;
+        for (rows[0..k], 0..) |i, j| {
+            offs[j] = total;
+            total += @intCast(states[i].verify_len);
+        }
+
+        const joined = states[0].group_logits;
+        const use_joined = k == gens.len and joined.ctx != null and
+            mlx.getShape(joined).len == 3 and mlx.getShape(joined)[1] == total;
+        var block = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(block);
+        if (use_joined) {
+            try mlx.check(mlx.mlx_array_set(&block, joined));
+        } else {
+            var parts: [MTP_GROUP_ROWS_MAX]mlx.mlx_array = undefined;
+            for (rows[0..k], 0..) |i, j| parts[j] = states[i].verify_logits;
+            const vec = mlx.mlx_vector_array_new_data(&parts, k);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&block, vec, 1, s));
+        }
+
+        const probs = try groupProbsBlock(block, params[0], s);
+        defer _ = mlx.mlx_array_free(probs);
+        for (rows[0..k], 0..) |i, j| {
+            const st = states[i];
+            const row_probs = try groupProbsRow(probs, offs[j], st.verify_len, s);
+            defer _ = mlx.mlx_array_free(row_probs);
+            // The row's OWN acceptance mode, threshold and draw index: only the
+            // filter is shared, so a seeded row keeps its own key.
+            const gen = gens[i];
+            const bg = try gen.mtp_accept_graph(
+                row_probs,
+                st.chain.draft_arrs[0..st.chain.m],
+                if (st.chain.q_probs) |qs| qs[0..st.chain.m] else null,
+                st.chain.m,
+                gen.mtp_accept_param,
+                gen.mtpSamplingDraw(gen.sampling),
+                s,
+            );
+            st.accept_p = bg.accept_p;
+            st.accept_q = bg.accept_q;
+            st.accept_defer = bg.accept_defer;
+            st.corr = bg.corr_samples;
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_p);
+            if (st.accept_q.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_q);
+            if (st.accept_defer.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, st.accept_defer);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, st.corr);
+        }
     }
 
     /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
@@ -7118,7 +7398,20 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(corr_batch);
         };
 
-        if (stochastic and mtpBatchCorrEnabled()) {
+        // The group already built and dispatched this row's Phase 4 with the rest
+        // of the round (`mtpGroupSampledAccept`); nothing here but the handover.
+        const prepared = stochastic and st.accept_p.ctx != null;
+        if (prepared) {
+            _ = mlx.mlx_array_free(accept_p_vec);
+            accept_p_vec = st.accept_p;
+            accept_q_vec = st.accept_q;
+            accept_defer_vec = st.accept_defer;
+            corr_batch = st.corr;
+            st.accept_p = .{ .ctx = null };
+            st.accept_q = .{ .ctx = null };
+            st.accept_defer = .{ .ctx = null };
+            st.corr = .{ .ctx = null };
+        } else if (stochastic and mtpBatchCorrEnabled()) {
             const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
             defer _ = mlx.mlx_array_free(probs_all);
             const bg = try self.mtp_accept_graph(
@@ -7252,12 +7545,12 @@ pub const Generator = struct {
             }
         }
 
-        const group_argmax = st.verify_argmax.ctx != null;
-        var verify_argmax = if (group_argmax) st.verify_argmax else mlx.mlx_array_new();
-        st.verify_argmax = .{ .ctx = null };
-        defer _ = mlx.mlx_array_free(verify_argmax);
+        const group_argmax = st.verify_argmax.present();
+        var verify_argmax = st.verify_argmax;
+        st.verify_argmax = .{};
+        defer verify_argmax.deinit();
         if (!group_argmax and !stochastic) {
-            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
+            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
         }
         _ = mlx.mlx_array_free(verify_logits);
         verify_logits = .{ .ctx = null };
@@ -7267,8 +7560,9 @@ pub const Generator = struct {
         }
 
         // ── Phase 4b: one batched async eval for the whole round ──
+        // A prepared row rode the group's eval; everything here is already on it.
         const dispatch_lap = SubLap.start(tracing, self.timer.io);
-        {
+        if (!prepared) {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
@@ -7282,7 +7576,7 @@ pub const Generator = struct {
                     for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
                 }
             } else {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
             _ = mlx.mlx_vector_array_append_value(eval_vec, verify_hidden_all);
@@ -7299,7 +7593,7 @@ pub const Generator = struct {
         if (!stochastic) {
             // Separate graph branch from the draft chain — force it before
             // bulk-reading (see the v26.5.6 0%-acceptance note in nextDrafter).
-            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+            try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
         }
         wait_lap.stop(&self.mtp_trace, .wait);
 
@@ -7334,10 +7628,7 @@ pub const Generator = struct {
                 self.max_tokens,
             );
         } else {
-            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
-                return error.MlxArrayDataNull;
-            };
-            const verdict = mtpAcceptRowGreedy(argmax_data[0..st.verify_len], drafts[0..m], self.completion_tokens, self.max_tokens);
+            const verdict = try mtpAcceptRowGreedy(verify_argmax, st.verify_len, drafts[0..m], self.completion_tokens, self.max_tokens);
             accepted = verdict.accepted;
             greedy_next_pending = verdict.next_pending;
         }
@@ -10546,15 +10837,9 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0) {
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopK(&masked, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = masked;
-    }
-    if (sampling.top_p < 1.0) {
-        var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -10565,6 +10850,26 @@ fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.
     _ = mlx.mlx_array_free(current);
     current = .{ .ctx = null };
     return probs;
+}
+
+/// The target densities of a whole GROUP of verify rows in one filtered block:
+/// the rows' `[1, Σ(1+m_i), V]` logits filtered as one. The filter is row-wise
+/// on the last axis, so a row's slice of this block is byte-for-byte the
+/// `probsAllPositions` of that row alone.
+fn groupProbsBlock(block_logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    return probsAllPositions(block_logits, sampling, s);
+}
+
+/// One row's `[1, 1+m, V]` densities as a VIEW into the group's block.
+fn groupProbsRow(block_probs: mlx.mlx_array, offset: c_int, len: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(block_probs);
+    const start = [_]c_int{ 0, offset, 0 };
+    const stop = [_]c_int{ shape[0], offset + @as(c_int, @intCast(len)), shape[2] };
+    const strides = [_]c_int{ 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, block_probs, &start, 3, &stop, 3, &strides, 3, s));
+    return out;
 }
 
 /// Lazy log-confidence of one MTP draft: `logits[draft] − logsumexp(logits)`
@@ -10673,15 +10978,9 @@ fn filteredProbsRows(owned_rows: mlx.mlx_array, sampling: SamplingParams, s: mlx
         _ = mlx.mlx_array_free(current);
         current = scaled;
     }
-    if (sampling.top_k > 0) {
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var masked = mlx.mlx_array_new();
-        applyTopK(&masked, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = masked;
-    }
-    if (sampling.top_p < 1.0) {
-        var masked = mlx.mlx_array_new();
-        applyTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&masked, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = masked;
     }
@@ -11091,18 +11390,10 @@ pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: ml
         current = next;
     }
 
-    // Apply top-k filtering (lazy)
-    if (sampling.top_k > 0) {
+    // Apply top-k and top-p in one pass (lazy)
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopK(&next, current, sampling.top_k, s) catch {};
-        _ = mlx.mlx_array_free(current);
-        current = next;
-    }
-
-    // Apply top-p filtering (lazy)
-    if (sampling.top_p < 1.0) {
-        var next = mlx.mlx_array_new();
-        applyTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
+        filterTopKTopP(&next, current, sampling.top_p, sampling.top_k, s) catch {};
         _ = mlx.mlx_array_free(current);
         current = next;
     }
@@ -11281,19 +11572,9 @@ fn sampleRowsLazy(row_logits: []const mlx.mlx_array, params: []const SamplingPar
         _ = mlx.mlx_array_free(current);
         current = next;
     }
-    if (p0.top_k > 0) {
+    if (p0.top_k > 0 or p0.top_p < 1.0) {
         var next = mlx.mlx_array_new();
-        applyTopK(&next, current, p0.top_k, s) catch {
-            _ = mlx.mlx_array_free(next);
-            next = current;
-            current = mlx.mlx_array_new();
-        };
-        if (current.ctx != null) _ = mlx.mlx_array_free(current);
-        current = next;
-    }
-    if (p0.top_p < 1.0) {
-        var next = mlx.mlx_array_new();
-        applyTopP(&next, current, p0.top_p, p0.top_k, s) catch {
+        filterTopKTopP(&next, current, p0.top_p, p0.top_k, s) catch {
             _ = mlx.mlx_array_free(next);
             next = current;
             current = mlx.mlx_array_new();
@@ -11784,6 +12065,9 @@ pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pa
 /// few dozen tokens instead of running all the way to `max_tokens`.
 pub const degenerate_loop_max_period: usize = 8;
 pub const degenerate_loop_reps: usize = 16;
+/// A short cycle must also cover this many tokens before it convicts: at
+/// period 1 or 2, 16 reps is a digit row or a zeroed array, not a loop.
+pub const degenerate_loop_min_span: usize = 128;
 // Tier 2 (2026-08-02 shooter wrap-up class): a two-sentence cycle of ~58
 // tokens repeated 26 times evaded the 8-token tier. Long periods demand
 // fewer reps — 10 verbatim repetitions of a 9..64-token cycle is
@@ -11791,6 +12075,11 @@ pub const degenerate_loop_reps: usize = 16;
 // code repeat a handful of times, not ten).
 pub const degenerate_loop_long_max_period: usize = 64;
 pub const degenerate_loop_long_reps: usize = 10;
+/// ...except when the "line" is a tile-map row (2026-09-15: a 27B wrote ten
+/// identical `"100000000000000000000001",` rows, a 28-token cycle, in an
+/// honest map file). The long tier also demands this much cycling: 37 such
+/// rows, or a 58-token sentence 18 times. A real loop still dies in ~13 s.
+pub const degenerate_loop_long_min_span: usize = 1024;
 
 // Tier 3 (2026-08-04 agent-traffic class): a restatement loop that VARIES its
 // phrasing has no exact cycle at any period, so both tiers above are blind by
@@ -11857,7 +12146,7 @@ fn DistinctSet(comptime cap: usize) type {
     };
 }
 
-/// The two-ratio judgement over ONE window-sized span. Split out so the trim
+/// The three-ratio judgement over ONE window-sized span. Split out so the trim
 /// search can slide the same window backwards without re-deriving the rule.
 fn nearRepeatWindowIsDegenerate(window: []const u32) bool {
     // Load factor 0.5 keeps the linear probe short even when every entry is
@@ -11886,25 +12175,31 @@ fn nearRepeatWindowIsDegenerate(window: []const u32) bool {
     // Requiring all THREE keeps the tier's reluctance in the direction that
     // matters — a missed loop still ends at max_tokens, a false cut destroys
     // work that was going fine.
+    return halfNovelty(window, near_repeat_ngram) <= near_repeat_max_novelty;
+}
+
+/// Share of the window's second-half distinct n-grams absent from its first
+/// half. 1.0 when the second half has no n-grams at all (nothing new because
+/// there is nothing) is the loop reading, so that case returns 0.
+fn halfNovelty(window: []const u32, n: usize) f32 {
     var first_half = DistinctSet(near_repeat_window * 2){};
     const mid = window.len / 2;
     var fi: usize = 0;
-    while (fi + near_repeat_ngram <= mid) : (fi += 1) {
-        _ = first_half.insert(gramHash(window[fi .. fi + near_repeat_ngram]));
+    while (fi + n <= mid) : (fi += 1) {
+        _ = first_half.insert(gramHash(window[fi .. fi + n]));
     }
     var second_half = DistinctSet(near_repeat_window * 2){};
     var novel: usize = 0;
     var distinct_second: usize = 0;
     var si: usize = mid;
-    while (si + near_repeat_ngram <= window.len) : (si += 1) {
-        const h = gramHash(window[si .. si + near_repeat_ngram]);
+    while (si + n <= window.len) : (si += 1) {
+        const h = gramHash(window[si .. si + n]);
         if (!second_half.insert(h)) continue; // count each distinct gram once
         distinct_second += 1;
         if (!first_half.contains(h)) novel += 1;
     }
-    if (distinct_second == 0) return true; // nothing new because there is nothing
-    const novelty = @as(f32, @floatFromInt(novel)) / @as(f32, @floatFromInt(distinct_second));
-    return novelty <= near_repeat_max_novelty;
+    if (distinct_second == 0) return 0;
+    return @as(f32, @floatFromInt(novel)) / @as(f32, @floatFromInt(distinct_second));
 }
 
 /// One hash for both the ratio pass and the novelty pass — two spellings of
@@ -11928,6 +12223,8 @@ pub fn isNearRepeatTailLoop(tokens: []const u32) bool {
 /// however long the loop ran — sizing a set to the FULL span instead would
 /// put tens of KB on the inference thread's stack.
 pub const near_repeat_step: usize = 128;
+/// Live 2026-09-15: a 27B wrote five 24x19 maps of identical rows in 2.8k tokens.
+pub const near_repeat_min_span: usize = 4096;
 pub const near_repeat_max_lookback: usize = 8192;
 
 /// A convicted degenerate tail: which tier saw it, and where the degenerate
@@ -11953,11 +12250,11 @@ pub const DegenerateTail = struct {
 /// `reps` times at the tail, or null. `isDegenerateTailLoopRange` is this
 /// predicate — one implementation, so the detector and the trim can never
 /// disagree about what was convicted.
-fn exactCyclePeriod(tokens: []const u32, min_period: usize, max_period: usize, reps: usize) ?usize {
+fn exactCyclePeriod(tokens: []const u32, min_period: usize, max_period: usize, reps: usize, min_span: usize) ?usize {
     if (max_period == 0 or reps < 2) return null;
     var p: usize = @max(min_period, 1);
     while (p <= max_period) : (p += 1) {
-        const span = p * reps;
+        const span = @max(p * reps, min_span);
         if (tokens.len < span) continue;
         const tail = tokens[tokens.len - span ..];
         var periodic = true;
@@ -11988,7 +12285,7 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 /// `scheduler.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
 pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
-    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps)) |p| {
+    if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps, degenerate_loop_min_span)) |p| {
         return .{ .tier = .exact_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (exactCyclePeriod(
@@ -11996,6 +12293,7 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         degenerate_loop_max_period + 1,
         degenerate_loop_long_max_period,
         degenerate_loop_long_reps,
+        degenerate_loop_long_min_span,
     )) |p| {
         return .{ .tier = .long_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
@@ -12015,6 +12313,12 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         if (!nearRepeatWindowIsDegenerate(tokens[cand .. cand + near_repeat_window])) break;
         start = cand;
     }
+    // A file of near-identical rows (a lazy tile map, a zero-heavy table)
+    // reads as a loop under every content measure; what it does that a loop
+    // never does is END. Convict only once the degenerate span has outrun any
+    // such file — a real restatement loop is still cut at ~4k tokens instead
+    // of max_tokens, and a false cut destroys work.
+    if (tokens.len - start < near_repeat_min_span) return null;
     return .{ .tier = .near_repeat, .start = start };
 }
 
@@ -12054,13 +12358,13 @@ pub const StallClock = struct {
 /// Pure and cheap: only the trailing `max_period * reps` ids are inspected, so
 /// cost is independent of total generated length.
 pub fn isDegenerateTailLoop(tokens: []const u32, max_period: usize, reps: usize) bool {
-    return isDegenerateTailLoopRange(tokens, 1, max_period, reps);
+    return exactCyclePeriod(tokens, 1, max_period, reps, degenerate_loop_min_span) != null;
 }
 
 /// Range variant so a long-period tier can scan 9..64 without also lowering
 /// the rep threshold for short cycles (a few "ha ha ha" reps stay legal).
 pub fn isDegenerateTailLoopRange(tokens: []const u32, min_period: usize, max_period: usize, reps: usize) bool {
-    return exactCyclePeriod(tokens, min_period, max_period, reps) != null;
+    return exactCyclePeriod(tokens, min_period, max_period, reps, 0) != null;
 }
 
 /// Compute a pooled (per the model's `pooling_mode` — mean by default),
@@ -12441,30 +12745,17 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     // sampling knob.
     const logprobs_logits = last_logits;
 
-    // Apply top-k filtering
-    var after_topk = mlx.mlx_array_new();
-    var topk_owned = false;
-    defer if (topk_owned) {
-        _ = mlx.mlx_array_free(after_topk);
+    // Apply top-k and top-p in one pass
+    var filtered = mlx.mlx_array_new();
+    var filtered_owned = false;
+    defer if (filtered_owned) {
+        _ = mlx.mlx_array_free(filtered);
     };
 
-    if (sampling.top_k > 0) {
-        try applyTopK(&after_topk, current, sampling.top_k, s);
-        current = after_topk;
-        topk_owned = true;
-    }
-
-    // Apply top-p (nucleus) sampling
-    var after_topp = mlx.mlx_array_new();
-    var topp_owned = false;
-    defer if (topp_owned) {
-        _ = mlx.mlx_array_free(after_topp);
-    };
-
-    if (sampling.top_p < 1.0) {
-        try applyTopP(&after_topp, current, sampling.top_p, sampling.top_k, s);
-        current = after_topp;
-        topp_owned = true;
+    if (sampling.top_k > 0 or sampling.top_p < 1.0) {
+        try filterTopKTopP(&filtered, current, sampling.top_p, sampling.top_k, s);
+        current = filtered;
+        filtered_owned = true;
     }
 
     // Sample from categorical distribution
@@ -12875,6 +13166,16 @@ fn keepByIndex(res: *mlx.mlx_array, logits: mlx.mlx_array, keep_idx: mlx.mlx_arr
     const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
     defer _ = mlx.mlx_array_free(neg_inf);
     try mlx.check(mlx.mlx_where(res, mask, logits, neg_inf, s));
+}
+
+/// Top-k and top-p in ONE pass. A bounded `applyTopP` ranks the row's top
+/// `top_k` columns and scatters its keep flags at exactly those column ids, so a
+/// preceding `applyTopK` selects the same shortlist and masks a SUPERSET of what
+/// the nucleus keeps — one full-vocab selection and one full-row `where` of pure
+/// tax on every filtered row. Byte-identical to the pair either way round.
+fn filterTopKTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
+    if (top_p >= 1.0) return applyTopK(res, logits, top_k, s);
+    return applyTopP(res, logits, top_p, top_k, s);
 }
 
 /// Apply top-p (nucleus) sampling: mask logits outside the top-p probability
@@ -13729,20 +14030,78 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
         defer ids.deinit(testing.allocator);
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 }); // some real prefix
         var k: usize = 0;
-        while (k < R + 4) : (k += 1) {
+        while (k < degenerate_loop_min_span / 3 + 1) : (k += 1) {
             try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 }); // <|channel>,thought,\n
         }
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
 
-    // A single token stuck on repeat (period 1) also counts once it passes R.
+    // A single token stuck on repeat (period 1) counts once it fills the span.
     {
         var ids = std.ArrayList(u32).empty;
         defer ids.deinit(testing.allocator);
         var k: usize = 0;
-        while (k < R + 2) : (k += 1) try ids.append(testing.allocator, 42);
+        while (k < degenerate_loop_min_span + 1) : (k += 1) try ids.append(testing.allocator, 42);
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
+}
+
+test "ThinkBound: counts only tokens inside the think block and fires at the budget" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, 31, CLOSE, 32 };
+    var tb = ThinkBound{ .budget = 3, .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = false };
+
+    // Content before any opener never counts.
+    tb.observe(&[_]u32{ 1, 2, 3, 4, 5 });
+    try testing.expect(!tb.due());
+
+    // Opened by the model: the budget counts from the opener.
+    tb.observe(&[_]u32{ 1, 2, 3, 4, 5, OPEN, 6, 7 });
+    try testing.expect(!tb.due());
+    tb.observe(&[_]u32{ 1, 2, 3, 4, 5, OPEN, 6, 7, 8 });
+    try testing.expect(tb.due());
+
+    // A model that closed on its own is never forced.
+    var closed = ThinkBound{ .budget = 3, .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    closed.observe(&[_]u32{ 6, 7, CLOSE, 8, 9, 10, 11 });
+    try testing.expect(!closed.due());
+
+    // Prompt-opened: the count starts at token 0 and the forced closer ends it.
+    var po = ThinkBound{ .budget = 2, .opener_id = null, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    po.observe(&[_]u32{ 6, 7 });
+    try testing.expect(po.due());
+    po.fired = true;
+    po.observe(&[_]u32{ 6, 7, 30, 31, CLOSE, 32, 40 });
+    try testing.expect(!po.in_think);
+    try testing.expect(!po.due());
+}
+
+test "degenerateTail: a short exact cycle convicts only past the minimum span" {
+    const al = testing.allocator;
+    // Live 2026-09-15 (pi, Qwen3.8 per-digit tokenizer): a 24-wide map wall
+    // row "111111111111111111111111" is 24 identical tokens and was cut as a
+    // period-1 loop mid-thought. Short cycles are common in honest code (digit
+    // rows, zeroed arrays), so the bar is a SPAN of identical cycling, not a
+    // rep count that period 1 reaches in a few dozen bytes.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(al);
+    try ids.appendSlice(al, &[_]u32{ 7, 8, 9, 1 });
+    for (0..24) |_| try ids.append(al, 16);
+    try testing.expect(degenerateTail(ids.items) == null);
+
+    // A 32-element zeroed row: `0, 0, 0, ...` is a period-2 cycle of 64 tokens.
+    var zeros = std.ArrayList(u32).empty;
+    defer zeros.deinit(al);
+    try zeros.appendSlice(al, &[_]u32{ 7, 8, 9, 1 });
+    for (0..32) |_| try zeros.appendSlice(al, &[_]u32{ 15, 11 });
+    try testing.expect(degenerateTail(zeros.items) == null);
+
+    // Stuck for real: one token past the span is a loop and trims to one copy.
+    for (24..degenerate_loop_min_span) |_| try ids.append(al, 16);
+    const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
+    try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
+    try testing.expectEqual(@as(usize, 5), d.start);
 }
 
 /// Build `n` tokens by cycling through `phrasings`, which share a vocabulary.
@@ -13825,6 +14184,39 @@ test "isNearRepeatTailLoop leaves legitimately repetitive output alone" {
     }
 }
 
+test "degenerateTail acquits a low-entropy STRUCTURED file that ends inside the span bar" {
+    // Live 2026-09-15 under pi: a tool call rewriting five 24x19 tile maps of
+    // '0'/'1' on a per-digit tokenizer was cut as a near-repeat loop at window
+    // fill and the agent got an empty turn. Six distinct tokens and sixteen
+    // possible 4-grams satisfy every content ratio by construction, and the
+    // real 27B output (rows nearly all `100000000000000000000001`) is
+    // indistinguishable from a loop by content. What such a file does, and a
+    // loop never does, is END: the bar is the degenerate SPAN.
+    const al = testing.allocator;
+    const Shape = enum { bit_grid, lazy_map, hex_dump };
+    for ([_]Shape{ .bit_grid, .lazy_map, .hex_dump }) |shape| {
+        var ids = std.ArrayList(u32).empty;
+        defer ids.deinit(al);
+        var seed: u32 = 777;
+        var row: usize = 0;
+        while (ids.items.len < 2800) : (row += 1) {
+            try ids.append(al, 200); // '"'
+            for (0..24) |col| {
+                seed = seed *% 1664525 +% 1013904223;
+                const r = seed >> 16;
+                const tok: u32 = switch (shape) {
+                    .bit_grid => if (col == 0 or col == 23 or row % 19 == 0) 101 else @as(u32, if (r % 10 < 3) 101 else 100),
+                    .lazy_map => if (col == 0 or col == 23 or row % 19 == 0 or (row % 5 == 0 and col != 10)) 101 else 100,
+                    .hex_dump => 100 + r % 16,
+                };
+                try ids.append(al, tok);
+            }
+            try ids.appendSlice(al, &[_]u32{ 200, 201, 202 }); // '"', ',', '\n'
+        }
+        try testing.expect(degenerateTail(ids.items) == null);
+    }
+}
+
 test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output" {
     const P = degenerate_loop_max_period;
     const R = degenerate_loop_reps;
@@ -13903,14 +14295,14 @@ test "isNearRepeatTailLoop leaves PROCEDURAL code alone — it recycles a vocabu
 
 test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
     const al = testing.allocator;
-    // 20 identical 3-token cycles after a real prefix. The cut is a
-    // truncation, so what is emitted should still SHOW what the model got
-    // stuck on — one copy of the cycle survives, the other 19 do not.
+    // Identical 3-token cycles past the span bar after a real prefix. The cut
+    // is a truncation, so what is emitted should still SHOW what the model got
+    // stuck on — one copy of the cycle survives, the rest do not.
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(al);
     try ids.appendSlice(al, &[_]u32{ 7, 8, 9, 10 });
     var k: usize = 0;
-    while (k < 20) : (k += 1) try ids.appendSlice(al, &[_]u32{ 101, 102, 103 });
+    while (k < degenerate_loop_min_span / 3 + 1) : (k += 1) try ids.appendSlice(al, &[_]u32{ 101, 102, 103 });
 
     const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
@@ -13942,7 +14334,7 @@ test "degenerateTail: the trim start walks back PAST the near-repeat window" {
     var loop = std.ArrayList(u32).empty;
     defer loop.deinit(al);
     var rng: u32 = 12345;
-    while (loop.items.len < 3000) {
+    while (loop.items.len < near_repeat_min_span + 1000) {
         rng = rng *% 1664525 +% 1013904223;
         try loop.appendSlice(al, phrasings[(rng >> 16) % phrasings.len]);
     }
@@ -13973,7 +14365,7 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     var cycle: [40]u32 = undefined;
     for (&cycle, 0..) |*v, i| v.* = @intCast(500 + i);
     var k: usize = 0;
-    while (k < degenerate_loop_long_reps + 2) : (k += 1) try ids.appendSlice(al, &cycle);
+    while (k < degenerate_loop_long_min_span / cycle.len + 1) : (k += 1) try ids.appendSlice(al, &cycle);
 
     const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
@@ -17686,7 +18078,7 @@ test "a block decoder's entry token stops the round before it drafts" {
 }
 
 test "group acceptance: every row's verdict comes from its OWN am, at any accept position" {
-    const accept = Generator.mtpAcceptRowGreedy;
+    const accept = Generator.mtpGreedyVerdict;
     {
         const am = [_]i32{ 11, 22, 33 };
         const drafts = [_]u32{ 11, 22 };
@@ -18870,4 +19262,173 @@ test "shortlist top-p holds on rank-3 [B, L, V] blocks" {
         const kept = samplerTestKeptCount(sd[r * v ..][0..v]);
         try testing.expect(kept > 0 and kept <= 20);
     }
+}
+
+test "a group's joined probability block slices row-for-row into the per-row filter" {
+    // Ragged widths, three rows: the axis-bug class ("one row cannot reveal an
+    // axis bug"), and the offsets the projection's own walk produces.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 8192;
+    const widths = [_]u32{ 3, 2, 4 };
+    const sampling = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+
+    var rows: [widths.len]mlx.mlx_array = undefined;
+    var built: usize = 0;
+    defer for (rows[0..built]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (widths, 0..) |w, r| {
+        const host = try allocator.alloc(f32, @as(usize, w) * v);
+        defer allocator.free(host);
+        for (0..w) |p| samplerTestRow(host[p * v ..][0..v], (r * 8 + p + 1) *% 0xD1B54A32D192ED03, 4.0);
+        const shape = [_]c_int{ 1, @intCast(w), @intCast(v) };
+        const f32_rows = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32_rows);
+        rows[r] = mlx.mlx_array_new();
+        built = r + 1;
+        // bf16 like the verify block the lm_head produces.
+        try mlx.check(mlx.mlx_astype(&rows[r], f32_rows, .bfloat16, s));
+    }
+
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    {
+        const vec = mlx.mlx_vector_array_new_data(&rows, widths.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, s));
+    }
+    const block = try groupProbsBlock(joined, sampling, s);
+    defer _ = mlx.mlx_array_free(block);
+
+    var offset: c_int = 0;
+    for (widths, 0..) |w, r| {
+        const got = try groupProbsRow(block, offset, w, s);
+        defer _ = mlx.mlx_array_free(got);
+        const want = try probsAllPositions(rows[r], sampling, s);
+        defer _ = mlx.mlx_array_free(want);
+        const g_shape = mlx.getShape(got);
+        try testing.expectEqual(@as(c_int, 1), g_shape[0]);
+        try testing.expectEqual(@as(c_int, @intCast(w)), g_shape[1]);
+        try samplerTestExpectSameBits(got, want, @as(usize, w) * v, s);
+        offset += @intCast(w);
+    }
+}
+
+test "the group accept block declines a mixed sampler and any seeded row" {
+    const a = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+    var b = a;
+    b.top_k = 40;
+    var seeded = a;
+    seeded.seed = 7;
+    try testing.expect(Generator.mtpGroupAcceptBatchable(&.{ a, a }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{ a, b }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{ a, seeded }));
+    try testing.expect(!Generator.mtpGroupAcceptBatchable(&.{}));
+}
+
+/// The composition every sampling site ran before `filterTopKTopP`: top-k, then
+/// top-p bounded by that same k. The reference the one-pass filter is pinned to.
+fn samplerTestComposed(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, top_k: u32, s: mlx.mlx_stream) !void {
+    var after_k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(after_k);
+    if (top_k > 0) {
+        try applyTopK(&after_k, logits, top_k, s);
+    } else {
+        try mlx.check(mlx.mlx_array_set(&after_k, logits));
+    }
+    if (top_p < 1.0) return applyTopP(res, after_k, top_p, top_k, s);
+    return mlx.check(mlx.mlx_array_set(res, after_k));
+}
+
+test "filterTopKTopP is byte-identical to the two-pass composition" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const Setting = struct { p: f32, k: u32 };
+    const settings = [_]Setting{
+        .{ .p = 0.95, .k = 20 }, .{ .p = 0.9, .k = 1 },  .{ .p = 1.0, .k = 20 },
+        .{ .p = 0.95, .k = 0 },  .{ .p = 0.5, .k = 50 }, .{ .p = 0.95, .k = 999999 },
+    };
+    for ([_]usize{ 8192, 248320 }) |v| {
+        const rows: usize = 3;
+        const host = try allocator.alloc(f32, rows * v);
+        defer allocator.free(host);
+        samplerTestRow(host[0..v], 0x9E3779B97F4A7C15, 4.0);
+        // Row 1 quantized to 0.25 steps: thousands of exact ties at the cutoff.
+        samplerTestRow(host[v..][0..v], 0xD1B54A32D192ED03, 4.0);
+        for (host[v..][0..v]) |*x| x.* = @round(x.* * 4.0) / 4.0;
+        // Row 2 all equal: every column ties, so the ranking alone decides.
+        @memset(host[2 * v ..][0..v], 1.25);
+
+        // `[m, V]` and `[1, L, V]`: the mask must stay per ROW on both ranks.
+        for ([_]usize{ 2, 3 }) |rank| {
+            const shape2 = [_]c_int{ @intCast(rows), @intCast(v) };
+            const shape3 = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+            const shape: []const c_int = if (rank == 2) &shape2 else &shape3;
+            const f32_block = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_block);
+            var block = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(block);
+            try mlx.check(mlx.mlx_astype(&block, f32_block, .bfloat16, s));
+            for (settings) |cfg| {
+                var want = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(want);
+                try samplerTestComposed(&want, block, cfg.p, cfg.k, s);
+                var got = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(got);
+                try filterTopKTopP(&got, block, cfg.p, cfg.k, s);
+                samplerTestExpectSameBits(got, want, rows * v, s) catch |e| {
+                    std.debug.print("v={d} rank={d} top_p={d} top_k={d}\n", .{ v, rank, cfg.p, cfg.k });
+                    return e;
+                };
+            }
+        }
+    }
+}
+
+test "no block decoder commits an argmax over a suppressed id" {
+    // A row whose raw argmax is a padding id past the defined vocabulary, plus a
+    // flagged special: both must lose to the best legal column. Run at the block
+    // widths the committing decoders verify at (MTP and the gemma drafter `1 + m`,
+    // DFlash a whole block), so a per-position axis bug cannot hide. WHICH decoders
+    // are covered is a compile-time property: every commit site takes a
+    // `CommittedArgmax`, and only `verifyArgmax` returns one.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const v: usize = 512;
+    const defined: usize = 500;
+    const flagged = [_]u32{7};
+    for ([_]usize{ 2, 3, 5 }) |rows| try suppressedArgmaxCase(allocator, s, v, defined, &flagged, rows);
+}
+
+fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usize, defined: usize, flagged: []const u32, rows: usize) !void {
+    const host = try allocator.alloc(f32, rows * v);
+    defer allocator.free(host);
+    @memset(host, 0.0);
+    for (0..rows) |r| {
+        const row = host[r * v ..][0..v];
+        row[505] = 9.0; // padding row: highest of all
+        row[7] = 8.0; // flagged special: second
+        row[100 + r] = 7.0; // the best LEGAL id, different per position
+    }
+    const shape = [_]c_int{ 1, @intCast(rows), @intCast(v) };
+    const f32_block = mlx.mlx_array_new_data(host.ptr, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(f32_block);
+    var block = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(block);
+    try mlx.check(mlx.mlx_astype(&block, f32_block, .bfloat16, s));
+    const mask = try buildSuppressMask(flagged, defined, v, s);
+    defer _ = mlx.mlx_array_free(mask);
+
+    var raw = try verifyArgmax(block, null, s);
+    defer raw.deinit();
+    const raw_ids = try samplerTestReadFlat(allocator, raw.lazy(), rows, s);
+    defer allocator.free(raw_ids);
+    for (raw_ids) |id| try testing.expectEqual(@as(f32, 505), id);
+
+    var masked = try verifyArgmax(block, mask, s);
+    defer masked.deinit();
+    const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
+    defer allocator.free(ids);
+    for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
 }

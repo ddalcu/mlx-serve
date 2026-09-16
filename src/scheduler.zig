@@ -600,13 +600,11 @@ pub const Slot = struct {
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
         const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
 
-        // Per-slot KVCache, honoring the process-level kv-quant setting.
-        // TurboQuant schemes need `head_dim` at construction time for the
-        // per-layer rotation matrices; other schemes ignore it. For embedded
-        // slots the engine owns its own cache — we initialize a zero-layer
-        // shell so `Slot.deinit` is symmetric with the MLX path.
+        // Per-slot KVCache, honoring the process-level kv-quant setting. For
+        // embedded slots the engine owns its own cache — we initialize a
+        // zero-layer shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
-        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.kvCacheKeyHeadDim());
+        var cache = try KVCache.initWithConfig(allocator, slot_kv_layers, kv_quant_config);
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -2366,7 +2364,7 @@ pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfi
     if (!c.longCtxGated()) return @intCast(cache.step);
     const raw: u32 = @intCast(cache.kvLenForBatching());
     const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len, any_mrope);
-    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len));
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.scheme == .affine));
     return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
 }
 
@@ -3556,7 +3554,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
     const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
     if (kv_quant_config.scheme != .off) {
-        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config, params.config.kvCacheKeyHeadDim());
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
     try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
@@ -6787,7 +6785,42 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }
-    return false;
+    return thinkBoundTick(sch, slot, gen);
+}
+
+/// A thinking budget at its limit: commit the early-stop line and the closer
+/// through the model this tick, and decode the answer regular from here on
+/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    tb.observe(gen.generated_ids.items);
+    if (!tb.due()) return false;
+    tb.fired = true;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
+        log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
+        return false;
+    }
+    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    defer slot.allocator.free(r.emitted);
+    for (r.emitted) |t| {
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+    if (r.stopped) {
+        finishSlot(sch, slot, gen.finish_reason);
+        return true;
+    }
+    gen.spec_disabled_runtime = true;
+    gen.spec_disable_reason = .think_bound;
+    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    return true;
+}
+
+fn thinkBoundFired(gen: *const Generator) bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    return tb.fired;
 }
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
@@ -6838,7 +6871,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode: SpecTickMode = if (Planner.enabled() and slot.planner_force_plain) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
@@ -9051,8 +9084,8 @@ test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not 
     try testing.expect(loopStopReason(ids.items) == null);
 
     // Collapse into a short cycle (the php.html shape: "server-side scripting
-    // language, " ≈ a 6-token cycle) past the guard's rep threshold.
-    for (0..generate_mod.degenerate_loop_reps + 1) |_| {
+    // language, " ≈ a 6-token cycle) past the guard's span threshold.
+    for (0..generate_mod.degenerate_loop_min_span / 6 + 1) |_| {
         for ([_]u32{ 101, 202, 303, 404, 505, 606 }) |t| {
             try ids.append(testing.allocator, t);
         }
@@ -9072,13 +9105,13 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     defer ids.deinit(testing.allocator);
     for (0..30) |i| try ids.append(testing.allocator, @as(u32, @intCast(i * 3 + 11)));
 
-    // 58-token cycle, 9 reps: below the tier-2 threshold — NOT cut.
+    // 58-token cycle, one rep short of the tier's span bar: NOT cut.
     var cycle: [58]u32 = undefined;
     for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(1000 + i));
-    for (0..9) |_| try ids.appendSlice(testing.allocator, &cycle);
+    for (0..generate_mod.degenerate_loop_long_min_span / cycle.len) |_| try ids.appendSlice(testing.allocator, &cycle);
     try testing.expect(loopStopReason(ids.items) == null);
 
-    // Tenth repetition crosses it — cut as an intentional stop.
+    // The next repetition crosses it — cut as an intentional stop.
     try ids.appendSlice(testing.allocator, &cycle);
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("stop", reason);
@@ -9088,7 +9121,7 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
-    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
 
@@ -9107,7 +9140,7 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
 
     // A new loop wholly inside the constrained answer retains the existing
     // stop/repetition result, with an absolute trim point for response code.
-    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
     }
     const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
@@ -9147,7 +9180,7 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         &[_]u32{ 40, 41, 42, 43, 44, 45, 50, 46 },
     };
     var i: usize = 0;
-    while (ids.items.len < generate_mod.near_repeat_window + 32) : (i += 1) {
+    while (ids.items.len < generate_mod.near_repeat_min_span + 32) : (i += 1) {
         try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
@@ -9595,9 +9628,7 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     var b = a;
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
-    b = a;
-    b.scheme = .turboquant_4;
-    try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {

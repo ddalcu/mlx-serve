@@ -51,7 +51,7 @@ echo "[ok] booting ds4 server on port $PORT (gguf: $(basename "$GGUF"))"
 SERVER_PID=$!
 
 # Wait for /health to flip green (engine open takes a few seconds).
-for i in $(seq 1 60); do
+for i in $(seq 1 "${DS4_BOOT_WAIT_SECS:-300}"); do
     if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
         echo "[ok] server up after ${i}s"
         break

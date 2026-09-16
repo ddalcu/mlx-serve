@@ -5,47 +5,116 @@ import WebKit
 class BrowserManager: ObservableObject {
     static let shared = BrowserManager()
 
+    // Mirrored from the webView by KVO, so link clicks, back/forward and
+    // same-document pushState reach the URL bar, not only tool navigations.
     @Published var currentURL: String = ""
     @Published var pageTitle: String = ""
     @Published var isLoading: Bool = false
+    @Published var canGoBack: Bool = false
+    @Published var canGoForward: Bool = false
+    /// Bumped by `requestShow`; the app scene opens the Browser window on change.
+    @Published var showRequestTick = 0
 
     /// Always available — created eagerly so tools work without the Browser window.
     let webView: WKWebView
 
+    /// Never shown: the frame `window.outerWidth/outerHeight` is read from
+    /// while no Browser pane holds the webView (0 reads as a headless bot).
+    let hostWindow: NSWindow
+    private let uiDelegate = WindowFrameUIDelegate()
+    private let navDelegate = NavigationDelegate()
+    private var observations: [NSKeyValueObservation] = []
+
     private init() {
         let config = WKWebViewConfiguration()
         config.preferences.isElementFullscreenEnabled = true
-        self.webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1024, height: 768), configuration: config)
+        let frame = NSRect(x: 0, y: 0, width: 1024, height: 768)
+        self.webView = WKWebView(frame: frame, configuration: config)
         webView.allowsBackForwardNavigationGestures = true
+        hostWindow = NSWindow(contentRect: frame, styleMask: [.titled, .resizable],
+                              backing: .buffered, defer: false)
+        hostWindow.isReleasedWhenClosed = false
+        hostWindow.isExcludedFromWindowsMenu = true
+        hostWindow.contentView = webView
+        webView.uiDelegate = uiDelegate
+        webView.navigationDelegate = navDelegate
+        observations = [
+            webView.observe(\.url, options: [.initial, .new]) { [weak self] wv, _ in
+                MainActor.assumeIsolated { self?.currentURL = wv.url?.absoluteString ?? "" }
+            },
+            webView.observe(\.title, options: [.initial, .new]) { [weak self] wv, _ in
+                MainActor.assumeIsolated { self?.pageTitle = wv.title ?? "" }
+            },
+            webView.observe(\.isLoading, options: [.initial, .new]) { [weak self] wv, _ in
+                MainActor.assumeIsolated { self?.isLoading = wv.isLoading }
+            },
+            webView.observe(\.canGoBack, options: [.initial, .new]) { [weak self] wv, _ in
+                MainActor.assumeIsolated { self?.canGoBack = wv.canGoBack }
+            },
+            webView.observe(\.canGoForward, options: [.initial, .new]) { [weak self] wv, _ in
+                MainActor.assumeIsolated { self?.canGoForward = wv.canGoForward }
+            },
+        ]
     }
 
-    func navigate(to urlString: String) async throws -> String {
-        // Auto-fix missing scheme — models often omit https://
-        var normalized = urlString
-        if !normalized.hasPrefix("http://") && !normalized.hasPrefix("https://") {
-            normalized = "https://" + normalized
-        }
-        guard let url = URL(string: normalized) else {
-            throw ToolError.executionFailed("Invalid URL: \(urlString)")
-        }
+    func requestShow() { showRequestTick += 1 }
 
-        let navResult = try await withThrowingTaskGroup(of: String.self) { group in
+    /// What a model-typed target means: an explicit scheme as is, a path on disk
+    /// (absolute, or relative to the working directory) as file://, a loopback
+    /// host as http:// (a dev server has no certificate), anything else https://.
+    nonisolated static func resolveURL(_ raw: String, workingDirectory: String?) -> URL? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        if s.contains("://") { return URL(string: s) }
+        if s.hasPrefix("/") || s.hasPrefix("~") {
+            return URL(fileURLWithPath: (s as NSString).expandingTildeInPath)
+        }
+        if let wd = workingDirectory {
+            let path = (wd as NSString).appendingPathComponent(s)
+            if FileManager.default.fileExists(atPath: path) {
+                return URL(fileURLWithPath: (path as NSString).standardizingPath)
+            }
+        }
+        let host = s.split(whereSeparator: { $0 == "/" || $0 == ":" }).first.map(String.init) ?? ""
+        let loopback = ["localhost", "127.0.0.1", "0.0.0.0", "[", "::1"].contains { host.hasPrefix($0) }
+        return URL(string: (loopback ? "http://" : "https://") + s)
+    }
+
+    /// Re-parents the webView back into the hidden host once a pane lets go of it.
+    func returnToHost() {
+        guard webView.window !== hostWindow else { return }
+        webView.removeFromSuperview()
+        hostWindow.contentView = webView
+    }
+
+    /// Loads `url` and returns once the navigation finished (30 s cap).
+    func load(_ url: URL) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask { @MainActor in
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-                    let delegate = NavigationDelegate(continuation: continuation)
-                    self.webView.navigationDelegate = delegate
-                    objc_setAssociatedObject(self.webView, "navDelegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-                    self.webView.load(URLRequest(url: url))
+                    self.navDelegate.begin(continuation)
+                    if url.isFileURL {
+                        self.webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+                    } else {
+                        self.webView.load(URLRequest(url: url))
+                    }
                 }
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: 30_000_000_000)
-                throw ToolError.executionFailed("Navigation timed out after 30s: \(urlString)")
+                throw ToolError.executionFailed("Navigation timed out after 30s: \(url.absoluteString)")
             }
             let result = try await group.next()!
             group.cancelAll()
             return result
         }
+    }
+
+    func navigate(to urlString: String, workingDirectory: String? = nil) async throws -> String {
+        guard let url = Self.resolveURL(urlString, workingDirectory: workingDirectory) else {
+            throw ToolError.executionFailed("Invalid URL: \(urlString)")
+        }
+        let navResult = try await load(url)
 
         // Auto-read page content after navigation
         try await Task.sleep(nanoseconds: 500_000_000) // let JS render
@@ -206,42 +275,43 @@ class BrowserManager: ObservableObject {
 
 // MARK: - Navigation Delegate
 
-private class NavigationDelegate: NSObject, WKNavigationDelegate {
-    let continuation: CheckedContinuation<String, Error>
-    var finished = false
+/// WebKit answers the page's window-frame query with a ZERO rect unless the UI
+/// delegate implements this (private) selector; hosting alone never sets it.
+/// Compiled out for the store, whose binary must carry no private selector.
+private final class WindowFrameUIDelegate: NSObject, WKUIDelegate {
+    #if !MAS_BUILD
+    @objc func _webView(_ webView: WKWebView, getWindowFrameWithCompletionHandler handler: @escaping (CGRect) -> Void) {
+        handler(webView.window?.frame ?? .zero)
+    }
+    #endif
+}
 
-    init(continuation: CheckedContinuation<String, Error>) {
-        self.continuation = continuation
+/// One delegate for the webView's whole life; a tool navigation parks its
+/// continuation here and the next finish or failure resolves it.
+private final class NavigationDelegate: NSObject, WKNavigationDelegate {
+    private var pending: CheckedContinuation<String, Error>?
+
+    func begin(_ continuation: CheckedContinuation<String, Error>) {
+        pending?.resume(throwing: ToolError.executionFailed("Navigation superseded"))
+        pending = continuation
+    }
+
+    private func finish(_ result: Result<String, Error>) {
+        guard let c = pending else { return }
+        pending = nil
+        c.resume(with: result)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard !finished else { return }
-        finished = true
-        let url = webView.url?.absoluteString ?? ""
-        Task { @MainActor in
-            BrowserManager.shared.currentURL = url
-            BrowserManager.shared.pageTitle = webView.title ?? ""
-            BrowserManager.shared.isLoading = false
-        }
-        continuation.resume(returning: "Navigated to \(url)")
+        finish(.success("Navigated to \(webView.url?.absoluteString ?? "")"))
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        guard !finished else { return }
-        finished = true
-        Task { @MainActor in
-            BrowserManager.shared.isLoading = false
-        }
-        continuation.resume(throwing: ToolError.executionFailed("Navigation failed: \(error.localizedDescription)"))
+        finish(.failure(ToolError.executionFailed("Navigation failed: \(error.localizedDescription)")))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        guard !finished else { return }
-        finished = true
-        Task { @MainActor in
-            BrowserManager.shared.isLoading = false
-        }
-        continuation.resume(throwing: ToolError.executionFailed("Navigation failed: \(error.localizedDescription)"))
+        finish(.failure(ToolError.executionFailed("Navigation failed: \(error.localizedDescription)")))
     }
 }
 

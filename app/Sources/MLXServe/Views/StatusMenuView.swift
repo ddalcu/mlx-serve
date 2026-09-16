@@ -1064,6 +1064,7 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
     let budget = AgentBudget.forServerContext(serverContextLength)
+    warnIfSmallContext(agentId: "claude", context: budget.context)
     let scriptContent = """
     #!/bin/zsh -l
     \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))

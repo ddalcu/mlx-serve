@@ -274,7 +274,7 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     const old_kv_flag = Transformer.mtp_head_kv_quant_flag;
     defer Transformer.mtp_head_kv_quant_flag = old_kv_flag;
     Transformer.mtp_head_kv_quant_flag = true;
-    try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8), config.kvCacheKeyHeadDim());
+    try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8));
     try xfm.qwen4MtpApplyKvQuant(transformer_mod.KVQuantConfig.affine(8));
     try testing.expect(xfm.qwen4BuildDraftRerank());
     try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm));

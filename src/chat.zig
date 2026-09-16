@@ -88,6 +88,39 @@ pub fn canonicalRole(role: []const u8) []const u8 {
     return if (std.mem.eql(u8, role, "developer")) "system" else role;
 }
 
+/// Fold every `system` message past index 0 into the leading one (created
+/// when absent). Templates we serve raise on a system turn that is not first
+/// and the raise is a silent generic fallback. Returns the joined buffer the
+/// caller owns, null when nothing moved.
+pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
+    var extra: usize = 0;
+    for (messages.items[@min(messages.items.len, 1)..]) |m| {
+        if (std.mem.eql(u8, m.role, "system")) extra += 1;
+    }
+    if (extra == 0) return null;
+    const lead_is_system = messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system");
+    var joined = std.ArrayList(u8).empty;
+    errdefer joined.deinit(allocator);
+    if (lead_is_system) try joined.appendSlice(allocator, messages.items[0].content);
+    var i: usize = if (lead_is_system) 1 else 0;
+    while (i < messages.items.len) {
+        if (!std.mem.eql(u8, messages.items[i].role, "system")) {
+            i += 1;
+            continue;
+        }
+        if (joined.items.len > 0) try joined.appendSlice(allocator, "\n\n");
+        try joined.appendSlice(allocator, messages.items[i].content);
+        _ = messages.orderedRemove(i);
+    }
+    const text = try joined.toOwnedSlice(allocator);
+    if (lead_is_system) {
+        messages.items[0].content = text;
+    } else {
+        try messages.insert(allocator, 0, .{ .role = "system", .content = text });
+    }
+    return text;
+}
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
@@ -14439,4 +14472,42 @@ test "K2-Horizon: assistant history always carries a thinking field, and the eff
     const extra = try serializeExtraContext(testing.allocator, &cfg, true, "xhigh");
     defer testing.allocator.free(extra);
     try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
+    // Live 2026-09-15: Claude Code carries SessionStart hook output as a
+    // `system`-role message INSIDE `messages`, after the top-level system
+    // prompt. Qwen's template raises on a system turn that is not first, and
+    // the raise is a silent generic fallback (the model loses its stop token).
+    const al = std.testing.allocator;
+    var msgs = std.ArrayList(Message).empty;
+    defer msgs.deinit(al);
+    try msgs.append(al, .{ .role = "system", .content = "You are S." });
+    try msgs.append(al, .{ .role = "system", .content = "hook output" });
+    try msgs.append(al, .{ .role = "user", .content = "hi" });
+    try msgs.append(al, .{ .role = "system", .content = "late note" });
+    const owned = try foldSystemMessages(al, &msgs);
+    defer if (owned) |o| al.free(o);
+    try std.testing.expectEqual(@as(usize, 2), msgs.items.len);
+    try std.testing.expectEqualStrings("You are S.\n\nhook output\n\nlate note", msgs.items[0].content);
+    try std.testing.expectEqualStrings("user", msgs.items[1].role);
+
+    // No leading system: the fold creates one at index 0.
+    var lone = std.ArrayList(Message).empty;
+    defer lone.deinit(al);
+    try lone.append(al, .{ .role = "user", .content = "hi" });
+    try lone.append(al, .{ .role = "system", .content = "hook output" });
+    const owned2 = try foldSystemMessages(al, &lone);
+    defer if (owned2) |o| al.free(o);
+    try std.testing.expectEqualStrings("system", lone.items[0].role);
+    try std.testing.expectEqualStrings("hook output", lone.items[0].content);
+    try std.testing.expectEqual(@as(usize, 2), lone.items.len);
+
+    // Nothing to fold: untouched, nothing allocated.
+    var plain = std.ArrayList(Message).empty;
+    defer plain.deinit(al);
+    try plain.append(al, .{ .role = "system", .content = "You are S." });
+    try plain.append(al, .{ .role = "user", .content = "hi" });
+    try std.testing.expect((try foldSystemMessages(al, &plain)) == null);
+    try std.testing.expectEqual(@as(usize, 2), plain.items.len);
 }

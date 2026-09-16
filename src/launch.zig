@@ -11,7 +11,7 @@
 //! Flow: probe the server; if it's down, start the MLX Core app (`open -g -a`)
 //! and wait — no app installed means instructions, not a mystery. Then read
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
-//! (AgentBudget's formula: output = clamp(ctx/4, 1024, 65536) — never a
+//! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
 //! hardcoded window), write the agent's config, and exec it through a login
 //! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
@@ -28,7 +28,14 @@ pub const FALLBACK_BUDGET = Budget{ .context = 32768, .output = 8192 };
 /// Mirrors Swift `AgentBudget.forServerContext`.
 pub fn budgetForContext(ctx: u64) Budget {
     if (ctx == 0) return FALLBACK_BUDGET;
-    return .{ .context = ctx, .output = @min(65536, @max(1024, ctx / 4)) };
+    return .{ .context = ctx, .output = @min(65536, @max(1024, ctx / 2)) };
+}
+
+/// Room an agent keeps free before compacting, and what it keeps after: a
+/// quarter of the window, capped where pi's and opencode2's own 20000-token
+/// defaults (sized for 200k windows) take over.
+pub fn compactionReserve(ctx: u64) u64 {
+    return @min(20000, @max(1024, ctx / 4));
 }
 
 /// One chat-capable /v1/models row as declared to an agent CLI.
@@ -155,11 +162,26 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
 /// the JSON must stay single-quote-free.
 /// `pin_model` writes a top-level `"model"` — opencode 2's TUI has no
 /// `--model` flag, so the config is the only place to select one.
-pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry, pin_model: ?[]const u8) ![]u8 {
+/// `limit.output` is the room opencode keeps free before compacting (it
+/// never sends max_tokens), so it carries the reserve, not the response cap.
+/// `compaction` (opencode2) scales its global buffer/keep to the pinned
+/// model's window: the defaults compact a 24k window before its first reply.
+pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries: []const Entry, pin_model: ?[]const u8, compaction: bool) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"$schema\": \"https://opencode.ai/config.json\", ");
     if (pin_model) |m| try out.print(allocator, "\"model\": \"mlx/{s}\", ", .{m});
+    if (compaction) {
+        var ctx: u64 = FALLBACK_BUDGET.context;
+        for (entries) |e| {
+            if (pin_model == null or std.mem.eql(u8, e.id, pin_model.?)) {
+                ctx = e.budget.context;
+                break;
+            }
+        }
+        const reserve = compactionReserve(ctx);
+        try out.print(allocator, "\"compaction\": {{\"buffer\": {d}, \"keep\": {{\"tokens\": {d}}}}}, ", .{ reserve, @min(15000, reserve) });
+    }
     try out.print(allocator,
         \\"provider": {{"mlx": {{"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {{"baseURL": "{s}/v1"}}, "models": {{
     , .{base_url});
@@ -170,7 +192,7 @@ pub fn opencodeJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
             e.id,
             if (e.vision) " \"attachment\": true," else "",
             e.budget.context,
-            e.budget.output,
+            compactionReserve(e.budget.context),
         });
     }
     try out.appendSlice(allocator, "}}}}");
@@ -265,6 +287,37 @@ pub fn mergeOpencode2CliJson(
 
     var obj = parsed.value.object;
     try obj.put(a, "plugins", .{ .array = kept });
+    parsed.value = .{ .object = obj };
+    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+/// pi `settings.json`: compaction numbers scaled to the window, everything
+/// else (theme, packages, the user's own `enabled`) kept. pi compacts when
+/// context exceeds window - reserveTokens and keeps keepRecentTokens; its
+/// defaults (16384 / 20000) never compact a 24k window while max_tokens
+/// shrinks to 1.
+pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, ctx: u64) ![]u8 {
+    const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+    const body = if (trimmed.len == 0) "{}" else existing;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch
+        try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    if (parsed.value != .object) {
+        parsed.deinit();
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    }
+    defer parsed.deinit();
+    const a = parsed.arena.allocator();
+
+    var compaction: std.json.ObjectMap = .empty;
+    if (parsed.value.object.get("compaction")) |c| {
+        if (c == .object) compaction = c.object;
+    }
+    const reserve = compactionReserve(ctx);
+    try compaction.put(a, "reserveTokens", .{ .integer = @intCast(@min(16384, reserve + 4096)) });
+    try compaction.put(a, "keepRecentTokens", .{ .integer = @intCast(reserve) });
+
+    var obj = parsed.value.object;
+    try obj.put(a, "compaction", .{ .object = compaction });
     parsed.value = .{ .object = obj };
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
@@ -376,9 +429,23 @@ fn appendExtras(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: [
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
 /// prepareConfig / scriptBody.
+/// Below this the agent's own fixed prompt leaves every turn compacting or
+/// truncated: Claude Code sends 40-70k before the first word (tool + MCP
+/// schemas, skills catalogue), opencode ~8k, pi ~2k.
+pub fn contextFloor(kind: AgentKind) u64 {
+    return switch (kind) {
+        .claude => 65536,
+        .opencode, .opencode2 => 32768,
+        else => 16384,
+    };
+}
+
 pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_config: ?[]const u8, extras: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    if (budget.context > 0 and budget.context < contextFloor(kind)) {
+        try out.print(allocator, "echo 'mlx-serve: the model advertises a {d}-token context; {s} needs {d}+ to work well (raise --ctx-size or Settings > Server > Context size).' >&2\n", .{ budget.context, @tagName(kind), contextFloor(kind) });
+    }
     switch (kind) {
         .claude => {
             try out.print(allocator,
@@ -642,6 +709,14 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             const json = try piModelsJson(allocator, base_url, entries);
             defer allocator.free(json);
             try writeAgentFile(allocator, io, "pi", "models.json", json);
+            const settings_path = try std.fmt.allocPrint(allocator, "{s}/.mlx-serve/pi/settings.json", .{homeDir()});
+            defer allocator.free(settings_path);
+            const existing = std.Io.Dir.cwd().readFileAlloc(io, settings_path, allocator, .limited(1 << 20)) catch
+                try allocator.dupe(u8, "{}");
+            defer allocator.free(existing);
+            const settings = try mergePiSettingsJson(allocator, existing, budget.context);
+            defer allocator.free(settings);
+            try writeAgentFile(allocator, io, "pi", "settings.json", settings);
         },
         .omp => {
             const yml = try ompModelsYml(allocator, base_url, entries);
@@ -817,7 +892,7 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     };
 
     const oc_config: ?[]u8 = if (parsed.kind == .opencode or parsed.kind == .opencode2)
-        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null)
+        try opencodeJson(allocator, base_url, models.entries, if (parsed.kind == .opencode2) chosen.id else null, parsed.kind == .opencode2)
     else
         null;
     defer if (oc_config) |c| allocator.free(c);
@@ -864,11 +939,14 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
 const t = std.testing;
 
-test "budgetForContext mirrors AgentBudget: ctx/4 clamped to [1024, 65536], 0 = fallback" {
+test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = fallback" {
+    // Thinking shares the response cap: a 24k window at ctx/4 gave pi 6144,
+    // which one xhigh design turn on Qwen3.8 spent entirely on thinking.
     try t.expectEqual(FALLBACK_BUDGET, budgetForContext(0));
-    try t.expectEqual(Budget{ .context = 4096, .output = 1024 }, budgetForContext(4096));
+    try t.expectEqual(Budget{ .context = 4096, .output = 2048 }, budgetForContext(4096));
     try t.expectEqual(Budget{ .context = 2048, .output = 1024 }, budgetForContext(2048));
-    try t.expectEqual(Budget{ .context = 90112, .output = 22528 }, budgetForContext(90112));
+    try t.expectEqual(Budget{ .context = 24576, .output = 12288 }, budgetForContext(24576));
+    try t.expectEqual(Budget{ .context = 90112, .output = 45056 }, budgetForContext(90112));
     try t.expectEqual(Budget{ .context = 1048576, .output = 65536 }, budgetForContext(1048576));
 }
 
@@ -903,7 +981,7 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
     };
     const pi_json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", &entries);
     defer t.allocator.free(pi_json);
-    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    const oc_json = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
     defer t.allocator.free(oc_json);
     for ([_][]const u8{ pi_json, oc_json }) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
@@ -911,6 +989,66 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
         // opencode's config rides single-quoted inside the launch script.
         try t.expect(std.mem.indexOf(u8, json, "'") == null);
     }
+}
+
+test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {
+    // pi keeps 20000 recent tokens and opencode2 reserves a 20000 buffer by
+    // default; both assume a 200k window. A 24k window compacted before its
+    // first reply (opencode2) or never (pi).
+    try t.expectEqual(@as(u64, 6144), compactionReserve(24576));
+    try t.expectEqual(@as(u64, 2048), compactionReserve(8192));
+    try t.expectEqual(@as(u64, 1024), compactionReserve(2048));
+    try t.expectEqual(@as(u64, 20000), compactionReserve(262144));
+}
+
+test "pi settings.json merge scales compaction to the window and keeps the rest" {
+    const existing =
+        \\{"theme":"dark","defaultProvider":"mlx","compaction":{"enabled":false,"reserveTokens":1}}
+    ;
+    const json = try mergePiSettingsJson(t.allocator, existing, 24576);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try t.expectEqualStrings("dark", obj.get("theme").?.string);
+    const c = obj.get("compaction").?.object;
+    // The user's own enabled flag survives; the numbers are ours.
+    try t.expectEqual(false, c.get("enabled").?.bool);
+    try t.expectEqual(@as(i64, 10240), c.get("reserveTokens").?.integer);
+    try t.expectEqual(@as(i64, 6144), c.get("keepRecentTokens").?.integer);
+
+    // A big window keeps pi's own defaults (16384 / 20000); an empty file is fine.
+    const big = try mergePiSettingsJson(t.allocator, "", 262144);
+    defer t.allocator.free(big);
+    const bp = try std.json.parseFromSlice(std.json.Value, t.allocator, big, .{});
+    defer bp.deinit();
+    const bc = bp.value.object.get("compaction").?.object;
+    try t.expectEqual(@as(i64, 16384), bc.get("reserveTokens").?.integer);
+    try t.expectEqual(@as(i64, 20000), bc.get("keepRecentTokens").?.integer);
+}
+
+test "opencode config: limit.output is the compaction reserve, opencode2 gets a scaled compaction block" {
+    // opencode never sends max_tokens; `limit.output` is only the room it
+    // keeps free before compacting, and opencode2 compacts at
+    // context - max(min(output, 32000), buffer) with buffer defaulting to 20000.
+    const entries = [_]Entry{
+        .{ .id = "m1", .budget = budgetForContext(24576), .vision = false, .loaded = true },
+    };
+    const v1 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null, false);
+    defer t.allocator.free(v1);
+    const p1 = try std.json.parseFromSlice(std.json.Value, t.allocator, v1, .{});
+    defer p1.deinit();
+    const limit = p1.value.object.get("provider").?.object.get("mlx").?.object.get("models").?.object.get("m1").?.object.get("limit").?.object;
+    try t.expectEqual(@as(i64, 6144), limit.get("output").?.integer);
+    try t.expect(p1.value.object.get("compaction") == null);
+
+    const v2 = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
+    defer t.allocator.free(v2);
+    const p2 = try std.json.parseFromSlice(std.json.Value, t.allocator, v2, .{});
+    defer p2.deinit();
+    const c = p2.value.object.get("compaction").?.object;
+    try t.expectEqual(@as(i64, 6144), c.get("buffer").?.integer);
+    try t.expectEqual(@as(i64, 6144), c.get("keep").?.object.get("tokens").?.integer);
 }
 
 test "aider metadata: litellm keys per openai/<id> entry" {
@@ -1067,11 +1205,11 @@ test "opencode2 script exports XDG_CONFIG_HOME, OPENCODE_CONFIG_CONTENT, and inv
 
 test "opencodeJson pins the default model only when asked" {
     const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = false }};
-    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null);
+    const plain = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, null, false);
     defer t.allocator.free(plain);
     try t.expect(std.mem.indexOf(u8, plain, "\"model\"") == null);
 
-    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1");
+    const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
     defer t.allocator.free(pinned);
     try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
 }

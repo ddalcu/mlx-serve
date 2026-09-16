@@ -47,7 +47,7 @@ final class AgentModelListTests: XCTestCase {
         XCTAssertEqual(entries[0].budget, AgentBudget.forServerContext(262144))
         XCTAssertEqual(entries[1].budget, AgentBudget.forServerContext(32768))
         XCTAssertEqual(entries[0].budget.output, 65536)
-        XCTAssertEqual(entries[1].budget.output, 8192)
+        XCTAssertEqual(entries[1].budget.output, 16384)
     }
 
     func testChatEntriesIncludeLanPeersWithEmptyCapsAndFlagVision() {
@@ -96,9 +96,9 @@ final class AgentModelListTests: XCTestCase {
     func testPiExtensionMirrorsTheAgentBudgetRule() {
         // The extension computes per-model maxTokens where Swift can't reach
         // (live fetch, in-guest). The rule must be AgentBudget.forServerContext
-        // verbatim: min(65536, max(1024, ctx/4)), fallback context 32768.
+        // verbatim: min(65536, max(1024, ctx/2)), fallback context 32768.
         let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://h:1")
-        XCTAssertTrue(js.contains("Math.min(65536, Math.max(1024, Math.floor(ctx / 4)))"),
+        XCTAssertTrue(js.contains("Math.min(65536, Math.max(1024, Math.floor(ctx / 2)))"),
                       "budget rule drifted from AgentBudget: \(js)")
         XCTAssertTrue(js.contains("32768"), "fallback context missing")
     }
@@ -159,7 +159,7 @@ final class AgentModelListTests: XCTestCase {
         let gemma = try XCTUnwrap(models["gemma-4-12b"] as? [String: Any])
         let limit = try XCTUnwrap(gemma["limit"] as? [String: Any])
         XCTAssertEqual(limit["context"] as? Int, 131072)
-        XCTAssertEqual(limit["output"] as? Int, 32768)
+        XCTAssertEqual(limit["output"] as? Int, AgentBudget.compactionReserve(131072))
         XCTAssertEqual(gemma["attachment"] as? Bool, true, "vision entry allows image attachments")
         let qwen = try XCTUnwrap(models["qwen3.6-27b"] as? [String: Any])
         XCTAssertNil(qwen["attachment"], "non-vision entries stay minimal")

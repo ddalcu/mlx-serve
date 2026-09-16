@@ -87,6 +87,11 @@ enum ChatMetrics {
     static var proseLineHeightMultiple: CGFloat { compactMode ? 1.15 : 1.4 }
     static let codeLineHeightMultiple: CGFloat = 1.2
 
+    /// One step of list nesting: enough to read as a level beside the marker's
+    /// own hanging indent, not so much that a three-deep outline runs out of
+    /// column.
+    static let listIndentStep: CGFloat = 18
+
     /// The user's bubble is plain SwiftUI `Text`, where leading is extra points
     /// rather than a multiple. Tighter than the reply on purpose. Never below
     /// zero: negative leading overlaps lines.

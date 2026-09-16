@@ -87,4 +87,51 @@ final class MarkdownBlockStylingTests: XCTestCase {
         XCTAssertNil(attribute(.inlineCodeGround, at: "some", in: "some `code` here"))
         XCTAssertNil(attribute(.backgroundColor, at: "some", in: "some `code` here"))
     }
+
+    // MARK: - Thematic break
+
+    /// Whether the run containing `needle` is drawn as a bordered block.
+    private func isBorderedBlock(_ needle: String, in source: String) -> Bool {
+        guard let style = attribute(.paragraphStyle, at: needle, in: source) as? NSParagraphStyle,
+              let block = style.textBlocks.first
+        else { return false }
+        return block.width(for: .border, edge: .minY) > 0
+    }
+
+    /// `---` between sections is a rule. It used to render as three hyphens in
+    /// a paragraph of their own.
+    func testAThematicBreakIsARuleNotThreeHyphens() {
+        let out = attributed("before\n\n---\n\nafter").string
+        XCTAssertTrue(out.contains("before") && out.contains("after"), out)
+        XCTAssertFalse(out.contains("---"), out)
+    }
+
+    func testTheRuleIsDrawnAsABorderedBlock() {
+        XCTAssertTrue(isBorderedBlock("\u{00A0}", in: "before\n\n---\n\nafter"),
+                      "the rule is a bordered block, like the quote bar")
+    }
+
+    func testTheOtherTwoSpellingsAreRulesToo() {
+        XCTAssertFalse(attributed("a\n\n***\n\nb").string.contains("***"))
+        XCTAssertFalse(attributed("a\n\n___\n\nb").string.contains("___"))
+    }
+
+    /// Two hyphens are not a rule, and neither is a line that carries text.
+    func testALineThatIsNotOnlyTheRuleStaysText() {
+        XCTAssertTrue(attributed("--").string.contains("--"))
+        XCTAssertTrue(attributed("--- and more").string.contains("--- and more"))
+    }
+
+    // MARK: - Strikethrough
+
+    /// Foundation parses `~~` into an intent; nothing read it, so the span
+    /// rendered as ordinary prose.
+    func testStrikethroughIsStruckThrough() {
+        let value = attribute(.strikethroughStyle, at: "gone", in: "this is ~~gone~~ now") as? Int
+        XCTAssertEqual(value, NSUnderlineStyle.single.rawValue)
+    }
+
+    func testProseAroundItIsNotStruckThrough() {
+        XCTAssertNil(attribute(.strikethroughStyle, at: "this", in: "this is ~~gone~~ now"))
+    }
 }

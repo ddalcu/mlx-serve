@@ -2776,8 +2776,8 @@ pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
     return qsaVerifyGatherEnabled();
 }
 
-pub fn qsaBatchedGatherFloor(seq_len: c_int) c_int {
-    if (seq_len >= 2) return @max(qsaGatherMinKv(), qsaVerifyGatherMinKv());
+pub fn qsaBatchedGatherFloor(seq_len: c_int, quantized: bool) c_int {
+    if (seq_len >= 2) return @max(qsaGatherMinKv(), qsaVerifyGatherMinKvFor(quantized));
     return qsaGatherMinKv();
 }
 
@@ -4977,7 +4977,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaDecodeGatherEnabled();
     _ = qsaHistoryShareEnabled();
     _ = qsaVerifyGatherEnabled();
-    _ = qsaVerifyGatherMinKv();
+    _ = qsaVerifyGatherMinKvFor(false);
     _ = qsaSelectEnabledWarm();
     _ = qsaSelectSplitEnabled();
     _ = qsaSelectTg();
@@ -5863,22 +5863,47 @@ pub fn qsaVerifyGatherEnabled() bool {
 }
 
 /// The union is FIXED-size (S * budget blocks): at the production budget
-/// (512 blocks of 4) S=7 is 14336 rows, so below ~16k keys the union is most
-/// of the cache and the dense mask arm — which reads each key once — wins.
-/// MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV.
-pub const QSA_VERIFY_GATHER_MIN_KV_DEFAULT: c_int = 16384;
-var qsa_verify_gather_min_kv_cached: ?c_int = null;
+/// (512 blocks of 4) S=7 is 14336 rows. On dense KV the gather COPIES those
+/// rows while the mask arm reads the cache in place, so the copy only pays
+/// once the union is well under half the cache (M4 Max, S=7: gather loses 7%
+/// at 17k keys, breaks even at 34k). Quantized KV dequantizes only the
+/// gathered rows, so its floor stays lower. MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV
+/// sets ONE floor for both.
+pub const QSA_VERIFY_GATHER_MIN_KV_DENSE: c_int = 32768;
+pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
+var qsa_verify_gather_min_kv_env: ?c_int = null;
+var qsa_verify_gather_min_kv_env_read = false;
 pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
-pub fn qsaVerifyGatherMinKv() c_int {
+/// `quantized` = the arm will dequantize only the gathered rows, i.e. the
+/// view carries affine triples (`DenseKVView.has_quant_triple`).
+pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     if (qsa_verify_gather_min_kv_override) |v| return v;
-    if (qsa_verify_gather_min_kv_cached) |v| return v;
-    var v: c_int = QSA_VERIFY_GATHER_MIN_KV_DEFAULT;
-    if (std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV")) |raw| {
-        v = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
+    if (!qsa_verify_gather_min_kv_env_read) {
+        qsa_verify_gather_min_kv_env_read = true;
+        if (std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV")) |raw| {
+            qsa_verify_gather_min_kv_env = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch null;
+        }
     }
-    qsa_verify_gather_min_kv_cached = v;
-    return v;
+    if (qsa_verify_gather_min_kv_env) |v| return v;
+    return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
+}
+
+test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
+    const prev_o = qsa_verify_gather_min_kv_override;
+    const prev_e = qsa_verify_gather_min_kv_env;
+    defer {
+        qsa_verify_gather_min_kv_override = prev_o;
+        qsa_verify_gather_min_kv_env = prev_e;
+    }
+    qsa_verify_gather_min_kv_override = null;
+    qsa_verify_gather_min_kv_env = null;
+    qsa_verify_gather_min_kv_env_read = true;
+    try std.testing.expectEqual(@as(c_int, 32768), qsaVerifyGatherMinKvFor(false));
+    try std.testing.expectEqual(@as(c_int, 16384), qsaVerifyGatherMinKvFor(true));
+    qsa_verify_gather_min_kv_override = 4096;
+    try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(false));
+    try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(true));
 }
 
 /// Geometry of the verify-width QSA gather — pure arithmetic, the ONE owner
@@ -6157,7 +6182,7 @@ pub fn qsaVerifyGatherAttn(
     if (ks[3] != head_dim) return dq.no(.geometry);
     const vs = mlx.getShape(kv_view.v);
     if (vs.len != 4 or vs[0] != 1 or vs[1] != h_kv or vs[2] != kv or vs[3] != head_dim) return dq.no(.geometry);
-    if (kv <= qsaVerifyGatherMinKv()) return dq.no(.kv_floor);
+    if (kv <= qsaVerifyGatherMinKvFor(kv_view.has_quant_triple)) return dq.no(.kv_floor);
 
     const geom = QsaVerifyGeom.compute(seq_len, kv, ratio, kb) orelse return dq.no(.width);
     if (geom.k_blocks <= 0 or geom.rows <= 0 or geom.rows >= kv) return dq.no(.no_win);
@@ -6942,9 +6967,7 @@ pub const DenseKVView = struct {
     owned: bool,
 
     /// Borrowed quant triples. Set to `.ctx = null` when not applicable
-    /// (scheme == .off, or scheme is a TurboQuant variant — those need
-    /// the rotation undo step which the v1 fused path doesn't implement).
-    /// Read-only; the cache owns these handles.
+    /// (scheme == .off). Read-only; the cache owns these handles.
     k_triple_q: mlx.mlx_array = .{ .ctx = null },
     k_triple_scales: mlx.mlx_array = .{ .ctx = null },
     k_triple_biases: mlx.mlx_array = .{ .ctx = null },
@@ -7118,12 +7141,6 @@ pub const KVCache = struct {
     step: usize, // absolute sequence position (not affected by sliding window trimming)
     allocator: std.mem.Allocator,
     config: KVQuantConfig,
-    /// Wave 2 — per-cache rotation matrices for the TurboQuant schemes.
-    /// `null` for `off` and `affine`. Built once at `initWithConfig` time
-    /// when the scheme is `turboquant_*`; reused across all updates. Lives
-    /// on the cache so `snapshot`/`restore` can refcount-share through it
-    /// (immutable post-init, safe to alias across snapshots).
-    quant_state: ?kv_quant.TurboState,
     /// Capacity, in tokens, this cache was asked to hold up front (the admission bill's
     /// `reservedCacheTokens`). A grow is not in place, so a long prefill's peak carried a
     /// second copy of ~6 GB of KV at 458k; reserving on the first grow removes the transient.
@@ -7134,39 +7151,12 @@ pub const KVCache = struct {
     }
 
     pub fn initWithConfig(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig) !KVCache {
-        return initWithConfigAndHeadDim(allocator, num_layers, config, 0);
-    }
-
-    /// TurboQuant schemes need a per-layer rotation-matrix slot. The actual
-    /// matrix dimension isn't known yet — Gemma 4's cached K is at
-    /// `2 * head_dim`, some archs differ per layer or between K/V — so we
-    /// allocate empty slots here and `updateTurboQuant` lazy-builds the real
-    /// matrix from the observed K/V last-dim on first write. `head_dim` is
-    /// accepted but only used to fail-fast on obviously-bad configs.
-    pub fn initWithConfigAndHeadDim(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig, head_dim: u32) !KVCache {
         const entries = try allocator.alloc(KVCacheEntry, num_layers);
         errdefer allocator.free(entries);
         for (entries) |*e| {
             e.* = newEmptyKVEntry();
         }
-        var qs: ?kv_quant.TurboState = null;
-        switch (config.scheme) {
-            .turboquant_2, .turboquant_4 => {
-                // Rotation matrices are built lazily at the first write (the
-                // real widths come off the arrays), but the pow2 constraint is
-                // knowable NOW from the arch's own key width — and a scheme
-                // that cannot serve this arch must say so at LOAD, not on the
-                // first request that reaches an MLA layer. 0 = caller has no
-                // width to offer (test shells), stay lazy.
-                if (head_dim != 0 and !std.math.isPowerOfTwo(head_dim)) {
-                    log.err("--kv-quant turbo: cache key width {d} is not a power of two (TurboQuant's Hadamard rotation requires one); use --kv-quant off|4|8\n", .{head_dim});
-                    return error.NonPowerOfTwoHeadDim;
-                }
-                qs = try kv_quant.TurboState.initLazy(allocator, num_layers);
-            },
-            else => {},
-        }
-        return .{ .entries = entries, .step = 0, .allocator = allocator, .config = config, .quant_state = qs };
+        return .{ .entries = entries, .step = 0, .allocator = allocator, .config = config };
     }
 
     pub fn deinit(self: *KVCache) void {
@@ -7174,23 +7164,17 @@ pub const KVCache = struct {
             freeKVEntry(e);
         }
         self.allocator.free(self.entries);
-        if (self.quant_state) |*qs| qs.deinit();
-        self.quant_state = null;
     }
 
     /// Swap this cache for a freshly-built one under `config`. BUILD FIRST,
-    /// then free: `initWithConfigAndHeadDim` is fallible (a scheme that cannot
-    /// serve the arch's key width refuses at load), and every caller reached
-    /// it through `cache.deinit(); cache = try init(...)`. On the error path
-    /// that left a FREED cache installed on the Transformer, whose own
-    /// `deinit` then freed every handle a second time — an EXC_BAD_ACCESS in
-    /// `mlx_array_free` several frames away from the refusal that caused it
-    /// (live: `--kv-quant turbo4` on an MLA arch printed its named refusal and
-    /// then died). The class is "a fallible re-init behind a deinit"; keeping
-    /// the order inside ONE helper is what stops it recurring, so the call
-    /// sites are scan-pinned to use it.
-    pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig, head_dim: u32) !void {
-        const fresh = try initWithConfigAndHeadDim(self.allocator, num_layers, config, head_dim);
+    /// then free: `initWithConfig` is fallible, and a caller that reached it
+    /// through `cache.deinit(); cache = try init(...)` left a FREED cache
+    /// installed on the Transformer on the error path, whose own `deinit`
+    /// then freed every handle a second time. The class is "a fallible
+    /// re-init behind a deinit"; keeping the order inside ONE helper is what
+    /// stops it recurring, so the call sites are scan-pinned to use it.
+    pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig) !void {
+        const fresh = try initWithConfig(self.allocator, num_layers, config);
         self.deinit();
         self.* = fresh;
     }
@@ -7361,7 +7345,6 @@ pub const KVCache = struct {
         switch (self.config.scheme) {
             .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
             .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq),
-            .turboquant_2, .turboquant_4 => return self.updateTurboQuant(layer, new_k, new_v, s, max_seq),
         }
     }
 
@@ -7474,57 +7457,6 @@ pub const KVCache = struct {
             row_vq.biases = try sliceStackedRow(s, new_vq.biases, i);
             try cache.writeAffineChunk(layer, row_kq, row_vq, s, max_seq);
         }
-    }
-
-    /// Wave 2 — TurboQuant write path. Rotate K and V by the per-layer
-    /// Hadamard matrices, then re-use the affine grow/write/view machinery.
-    /// Read-back at SDPA time dequantizes + rotates back via `denseView`.
-    fn updateTurboQuant(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
-        const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
-        // Lazy-init: observe the actual K and V last-dims from the incoming
-        // tensors. Gemma 4 stores K at 2x head_dim; some archs split K/V
-        // dims; lazy construction sidesteps all of that.
-        const k_shape = mlx.getShape(new_k);
-        const v_shape = mlx.getShape(new_v);
-        const k_n: u32 = @intCast(k_shape[k_shape.len - 1]);
-        const v_n: u32 = @intCast(v_shape[v_shape.len - 1]);
-        const rk = try qs.ensureKLayer(s, layer, k_n);
-        const rv = try qs.ensureVLayer(s, layer, v_n);
-
-        // Rotate inputs along the last axis. Free as soon as the quantize
-        // call produces the affine triples — those become the stored cache
-        // contents.
-        const rotated_k = try kv_quant.rotateLastDim(s, new_k, rk);
-        defer _ = mlx.mlx_array_free(rotated_k);
-        const rotated_v = try kv_quant.rotateLastDim(s, new_v, rv);
-        defer _ = mlx.mlx_array_free(rotated_v);
-
-        // Hand off to the affine writer for the grow/slice_update/view work.
-        // The dense view it returns is rotated K/V — undo the rotation
-        // before handing back to SDPA. We can't call updateAffine directly
-        // because it dequantizes-without-rotate at the end; emit a thin
-        // helper that returns the rotated views and we rotate-back here.
-        const rotated_view = try self.updateAffineRotated(layer, rotated_k, rotated_v, s, max_seq);
-
-        // Now rotate the dense view back to the original basis for SDPA.
-        var dense_k = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(dense_k);
-        try mlx.check(mlx.mlx_matmul(&dense_k, rotated_view.k, rk, s));
-        var dense_v = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(dense_v);
-        try mlx.check(mlx.mlx_matmul(&dense_v, rotated_view.v, rv, s));
-
-        // Free the temporary rotated-basis dense view; we own a fresh one.
-        var rv_mut = rotated_view;
-        rv_mut.deinit();
-        return .{ .k = dense_k, .v = dense_v, .owned = true };
-    }
-
-    /// Variant of `updateAffine` that returns the rotated-basis dense view
-    /// instead of an unrotated one. Only called from `updateTurboQuant`,
-    /// which rotates the result back before handing to SDPA.
-    fn updateAffineRotated(self: *KVCache, layer: u32, rk_in: mlx.mlx_array, rv_in: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
-        return self.updateAffine(layer, rk_in, rv_in, s, max_seq);
     }
 
     fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -7793,25 +7725,6 @@ pub const KVCache = struct {
                     .bits = self.config.bits,
                     .group_size = self.config.group_size,
                 };
-            },
-            .turboquant_2, .turboquant_4 => {
-                if (!entry.initialized) {
-                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
-                }
-                const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
-                // If we're reading before any write, the rotation matrices
-                // aren't built yet — fall back to the raw view (which is
-                // empty anyway when `initialized=false`, handled above).
-                const li: usize = @intCast(layer);
-                if (qs.rk_dim[li] == 0 or qs.rv_dim[li] == 0) {
-                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
-                }
-                const rk = qs.rk[li];
-                const rv = qs.rv[li];
-                const dense_k = try kv_quant.dequantizeTurbo(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, rk, self.config.group_size, self.config.bits);
-                errdefer _ = mlx.mlx_array_free(dense_k);
-                const dense_v = try kv_quant.dequantizeTurbo(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, rv, self.config.group_size, self.config.bits);
-                return .{ .k = dense_k, .v = dense_v, .owned = true };
             },
         }
     }
@@ -13505,9 +13418,7 @@ pub const ForwardCtx = struct {
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
     /// instead of dequantizing through `DenseKVView`. Only effective when
-    /// the cache scheme is .affine — TurboQuant + .off ignore this flag
-    /// (TurboQuant needs the rotation undo step, which the fused path
-    /// doesn't yet implement; .off has no quant triple to consume).
+    /// the cache scheme is .affine (.off has no quant triple to consume).
     /// Default false → unchanged dense SDPA path.
     kv_attn_fused: bool = false,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
@@ -14617,6 +14528,11 @@ pub const Transformer = struct {
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,
     verify_laps: VerifyLaps = .{},
+    /// The joined `[1, Σ(1+m_i), V]` logits of the last row-axis verify whose
+    /// lm_head ran once for the whole group, so the accept side can filter the
+    /// block once instead of one slice per row. Null whenever the projection
+    /// ran per row; the next verify releases it.
+    verify_joined_logits: mlx.mlx_array = .{ .ctx = null },
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
@@ -15499,7 +15415,7 @@ pub const Transformer = struct {
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
         const prev_config = self.cache.config;
-        try self.cache.reinit(self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
+        try self.cache.reinit(self.config.num_hidden_layers, prev_config);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 ssmFreeSpecCapture(e);
@@ -15537,7 +15453,7 @@ pub const Transformer = struct {
 
         // Full prefix match with tokens remaining — restore cached state.
         const prev_config = self.cache.config;
-        try self.cache.reinit(self.config.num_hidden_layers, prev_config, self.config.kvCacheKeyHeadDim());
+        try self.cache.reinit(self.config.num_hidden_layers, prev_config);
         self.cache.step = pc.kv_step;
         for (pc.kv_entries, 0..) |src, i| {
             if (src.initialized) {
@@ -16171,6 +16087,7 @@ pub const Transformer = struct {
     }
 
     pub fn deinit(self: *Transformer) void {
+        self.releaseJoinedVerifyLogits();
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -17947,7 +17864,7 @@ pub const Transformer = struct {
             const n_layers = xfm.config.num_hidden_layers;
             const sl = try alloc.create(SpecWarmSlot);
             errdefer alloc.destroy(sl);
-            var cache = try KVCache.initWithConfigAndHeadDim(alloc, n_layers, kv_config, xfm.config.kvCacheKeyHeadDim());
+            var cache = try KVCache.initWithConfig(alloc, n_layers, kv_config);
             errdefer cache.deinit();
             sl.* = .{ .cache = cache, .entries = try alloc.alloc(SSMCacheEntry, n_layers) };
             for (sl.entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
@@ -18811,8 +18728,8 @@ pub const Transformer = struct {
             // Fused-attn opt-in: consume the cache's quant triples directly
             // via the packed decode kernel. Only when the request opts in AND
             // `kvAttnFusedEligible` passes (scheme .affine with triples,
-            // decode width only — verify/prefill widths read dense SDPA,
-            // TurboQuant always does). A DECLINED kernel falls through to
+            // decode width only — verify/prefill widths read dense SDPA).
+            // A DECLINED kernel falls through to
             // the dense arms below: the composed qmm chain measured a −17%
             // decode LOSS on the shapes the kernel does not serve (gemma4
             // full-attn, gqa 16 x dk 512, 2026-08-15) and never serves now.
@@ -19565,6 +19482,7 @@ pub const Transformer = struct {
         }
         if (row_ns) |ns| @memset(ns[0..token_rows.len], 0);
         self.verify_laps = .{};
+        self.releaseJoinedVerifyLogits();
         var rollback: [MAX_BATCH_ROWS]VerifyRollback = undefined;
         var n_rollback: usize = 0;
         defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
@@ -19658,6 +19576,22 @@ pub const Transformer = struct {
             @memcpy(out[0..n_rollback], rollback[0..n_rollback]);
             n_rollback = 0;
         }
+    }
+
+    /// Drop the published joined verify block. Called before every row-axis
+    /// verify and at teardown; the accept side takes ownership when it wants it.
+    pub fn releaseJoinedVerifyLogits(self: *Transformer) void {
+        if (self.verify_joined_logits.ctx == null) return;
+        _ = mlx.mlx_array_free(self.verify_joined_logits);
+        self.verify_joined_logits = .{ .ctx = null };
+    }
+
+    /// Hand the joined verify block to the caller (null when the projection ran
+    /// per row).
+    pub fn takeJoinedVerifyLogits(self: *Transformer) mlx.mlx_array {
+        const out = self.verify_joined_logits;
+        self.verify_joined_logits = .{ .ctx = null };
+        return out;
     }
 
     /// Row `i` of `[N, S, V]` logits as an owned `[1, S, V]` array, for every row.
@@ -21223,7 +21157,7 @@ pub const Transformer = struct {
         // higher than the prefill/decode one — the union is fixed-size.
         const want_blocks = batch == 1 and kv > qsaGatherMinKv() and qsaGatherEnabled() and
             (seq_len >= FUSED256_MIN_Q_LEN or (seq_len == 1 and qsaDecodeGatherEnabled()) or
-                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKv()));
+                (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN and qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(ctx.cache.config.scheme == .affine)));
         if (want_blocks) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
@@ -21623,7 +21557,7 @@ pub const Transformer = struct {
         entry.spec_state_seq = .{ .ctx = null };
         entry.spec_conv_input = .{ .ctx = null };
         entry.spec_ple_input = .{ .ctx = null };
-        const cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers + 1, m.cache.config, self.config.kvCacheKeyHeadDim());
+        const cache = try KVCache.initWithConfig(self.allocator, self.config.num_hidden_layers + 1, m.cache.config);
         return .{ .cache = cache, .entry = entry };
     }
 
@@ -21655,7 +21589,7 @@ pub const Transformer = struct {
     /// Reset the MTP head's per-request state (KV, indexer keys, position).
     pub fn qwen4MtpReset(self: *Transformer) !void {
         const m = &(self.qwen4_mtp orelse return);
-        try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config, self.config.kvCacheKeyHeadDim());
+        try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
         ssmFreeQsaState(&m.entry);
         m.qsa_marks.deinit();
         m.seq_offset = 0;
@@ -21693,7 +21627,7 @@ pub const Transformer = struct {
         const cfg = qwen4MtpHeadKvConfig(trunk);
         const n_layers: u32 = self.config.num_hidden_layers + 1;
         if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
-        try m.cache.reinit(n_layers, cfg, self.config.kvCacheKeyHeadDim());
+        try m.cache.reinit(n_layers, cfg);
     }
 
     test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
@@ -22726,7 +22660,9 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(joined);
             try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 1, self.s));
             if (try verifyLmHeadProjection(self.s, joined, self.lm_head_w, self.lm_head_s, self.lm_head_b, lmhead_widths[0..initialized])) |logits| {
-                defer _ = mlx.mlx_array_free(logits);
+                // The block stays published for the accept side; `out_logits`
+                // are views of it either way.
+                self.verify_joined_logits = logits;
                 var offset: c_int = 0;
                 for (rows[0..initialized], 0..) |row, i| {
                     try mlx.check(mlx.mlx_slice(&out_logits[i], logits, &.{ 0, offset, 0 }, 3, &.{ 1, offset + row.seq, mlx.getShape(logits)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
@@ -38527,27 +38463,6 @@ test "KVCache carries a V head dim narrower than K (MLA 192/128)" {
     try mlx.check(mlx.mlx_array_eval(cache.entries[0].value_view));
 }
 
-test "KVCache.truncate recreates turbo scale/bias views" {
-    const s = mlx.gpuStream();
-    var cache = try KVCache.initWithConfigAndHeadDim(testing.allocator, 1, kv_quant.KVQuantConfig.turboquant(2), 128);
-    defer cache.deinit();
-    {
-        const k = testKVWide(5, 128, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = testKVWide(5, 128, s);
-        defer _ = mlx.mlx_array_free(v);
-        var dv = try cache.update(0, k, v, s, 0);
-        defer dv.deinit();
-    }
-    try testing.expectEqual(@as(usize, 5), cache.entries[0].offset);
-    try cache.truncate(3, s);
-    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
-    try testing.expectEqual(@as(c_int, 3), mlx.getShape(cache.entries[0].key_scales_view)[2]);
-    try testing.expectEqual(@as(c_int, 3), mlx.getShape(cache.entries[0].value_scales_view)[2]);
-    try mlx.check(mlx.mlx_array_eval(cache.entries[0].key_scales_view));
-    try mlx.check(mlx.mlx_array_eval(cache.entries[0].value_scales_view));
-}
-
 test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
     // The QUANTIZED write path solved every buffer's packed and scale widths
     // from K's head dim, so at K 192 / V 128 the value buffer was 24 u32 wide
@@ -38621,39 +38536,17 @@ test "KVCache affine quant carries an asymmetric K/V too (--kv-quant on MLA)" {
     try testing.expectEqual(@as(c_int, 128), mlx.getShape(restored.v)[3]);
 }
 
-test "TurboQuant refuses a non-pow2 cache key width at INIT, not mid-request" {
-    // The rotation matrices are built lazily from the real arrays, so an MLA
-    // arch's 192-wide key reached `NonPowerOfTwoHeadDim` only once a request
-    // touched an MLA layer — a 500 mid-generation for a condition knowable at
-    // load. `kvCacheKeyHeadDim()` is the width to check: `head_dim` says 128.
-    const t = std.testing;
-    try t.expectError(error.NonPowerOfTwoHeadDim, KVCache.initWithConfigAndHeadDim(
-        t.allocator,
-        4,
-        kv_quant.KVQuantConfig.turboquant(4),
-        192,
-    ));
-    // Symmetric archs are unaffected (128, and Gemma 4's doubled 256).
-    for ([_]u32{ 128, 256 }) |d| {
-        var ok = try KVCache.initWithConfigAndHeadDim(t.allocator, 4, kv_quant.KVQuantConfig.turboquant(4), d);
-        ok.deinit();
-    }
-    // A width of 0 means "caller has none to offer" — stays lazy, as before.
-    var lazy = try KVCache.initWithConfigAndHeadDim(t.allocator, 4, kv_quant.KVQuantConfig.turboquant(4), 0);
-    lazy.deinit();
-}
-
 test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
-    // The refusal above is correct and the process died anyway: every re-init
-    // site read `cache.deinit(); cache = try init(...)`, so the error path
-    // left a FREED cache installed on the Transformer and its owner's deinit
-    // freed every handle a second time — EXC_BAD_ACCESS in `mlx_array_free`,
-    // several frames from the refusal that caused it, on a launch flag the
-    // server had just refused BY NAME (`--kv-quant turbo4` on an MLA arch).
-    // Under the testing allocator the pre-fix order trips the same double
+    // Every re-init site once read `cache.deinit(); cache = try init(...)`, so
+    // a failed init left a FREED cache installed on the Transformer and its
+    // owner's deinit freed every handle a second time — EXC_BAD_ACCESS in
+    // `mlx_array_free`, several frames from the refusal that caused it. The
+    // refusal here is the allocator's (the entries alloc of the second init);
+    // under the testing allocator the pre-fix order trips the same double
     // free on this test's own `defer`.
     const s = mlx.gpuStream();
-    var cache = try KVCache.initWithConfig(testing.allocator, 2, kv_quant.KVQuantConfig.affine(8));
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var cache = try KVCache.initWithConfig(failing.allocator(), 2, kv_quant.KVQuantConfig.affine(8));
     defer cache.deinit();
 
     // Real handles in the cache, so a double free has something to land on.
@@ -38667,11 +38560,8 @@ test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     }
     try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
 
-    // The refusal, at the width the live crash used.
-    try testing.expectError(
-        error.NonPowerOfTwoHeadDim,
-        cache.reinit(2, kv_quant.KVQuantConfig.turboquant(4), 192),
-    );
+    try testing.expectError(error.OutOfMemory, cache.reinit(2, kv_quant.KVQuantConfig.affine(4)));
+    failing.fail_index = std.math.maxInt(usize);
 
     // Untouched: same scheme, same contents, same entry count...
     try testing.expectEqual(kv_quant.Scheme.affine, cache.config.scheme);
@@ -38693,7 +38583,7 @@ test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
 
     // A re-init that SUCCEEDS still swaps — the fix must not turn the helper
     // into a no-op: new scheme, fresh entries, offsets back to zero.
-    try cache.reinit(2, kv_quant.KVQuantConfig.affine(4), 192);
+    try cache.reinit(2, kv_quant.KVQuantConfig.affine(4));
     try testing.expectEqual(@as(u8, 4), cache.config.bits);
     try testing.expectEqual(@as(usize, 0), cache.entries[0].offset);
     try testing.expect(!cache.entries[0].initialized);
@@ -38726,7 +38616,7 @@ test "every live KV cache re-init goes through reinit, which builds before it fr
     const src = @embedFile("transformer.zig");
     const at = std.mem.indexOf(u8, src, "pub fn re" ++ "init(self: *KVCache") orelse
         return error.MissingReinitHelper;
-    const build_at = std.mem.indexOfPos(u8, src, at, "initWithConfigAndHeadDim") orelse
+    const build_at = std.mem.indexOfPos(u8, src, at, "initWithConfig(") orelse
         return error.MissingReinitBuild;
     const free_at = std.mem.indexOfPos(u8, src, at, "self." ++ "deinit()") orelse
         return error.MissingReinitFree;
@@ -39912,14 +39802,13 @@ test "batched KV append: per-layer op count is quantize-once plus per-slot write
     try testing.expect((bat_at[2] - bat_at[0]) < (solo_at[2] - solo_at[0]));
 }
 
-test "batched KV append: dense, affine-4, and turbo stay on the per-slot path" {
+test "batched KV append: dense and affine-4 stay on the per-slot path" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = testing.allocator;
     const s = mlx.gpuStream();
     const schemes = [_]kv_quant.KVQuantConfig{
         kv_quant.KVQuantConfig.dense,
         kv_quant.KVQuantConfig.affine(4),
-        kv_quant.KVQuantConfig.turboquant(4),
     };
     for (schemes) |cfg| {
         var solo: [2]KVCache = .{ try KVCache.initWithConfig(alloc, 1, cfg), try KVCache.initWithConfig(alloc, 1, cfg) };
@@ -51718,7 +51607,7 @@ test "qsa sparse attn: the width gate, the kill switch and the quant preconditio
     }
     // A dense cache past the verify floor (16384): `qsaVerifyGatherAttn` serves.
     {
-        const big_kv: c_int = 20000;
+        const big_kv: c_int = QSA_VERIFY_GATHER_MIN_KV_DENSE + 4000;
         const kbig = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, big_kv, 256 }, s);
         defer _ = mlx.mlx_array_free(kbig);
         const vbig = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, big_kv, 256 }, s);
@@ -51812,7 +51701,7 @@ test "qsa verify gather: the S=2..15 branch is reachable from the selection arm"
     const stmt_end = std.mem.indexOfPos(u8, src, at, ";") orelse src.len;
     const stmt = src[at..stmt_end];
     const verify_gate = "qsaVerify" ++ "GatherEnabled()";
-    const verify_min = "qsaVerify" ++ "GatherMinKv()";
+    const verify_min = "qsaVerify" ++ "GatherMinKvFor(";
     if (std.mem.indexOf(u8, stmt, verify_gate) == null) return error.SelectionArmMissesVerifyWidths;
     if (std.mem.indexOf(u8, stmt, verify_min) == null) return error.SelectionArmMissesVerifyFloor;
 
@@ -60281,7 +60170,7 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     }
     for (0..2) |i| try testing.expectEqualSlices(i32, solo_am[i], grp_am[i]);
 
-    const accept = gen_mod.Generator.mtpAcceptRowGreedy;
+    const accept = gen_mod.Generator.mtpGreedyVerdict;
     var base: [2]gen_mod.Generator.MtpRowVerdict = undefined;
     for (0..2) |i| {
         const solo_v = accept(solo_am[i], drafts[i][0 .. S_row[i] - 1], 0, 400);

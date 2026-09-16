@@ -43,10 +43,12 @@ def tok(t):
     return json.load(r)["tokens"]
 a, b = tok(solo.rstrip("\n")), tok(conc.rstrip("\n"))
 idx = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
-body = {"model": "mlx-serve", "messages": [{"role": "user", "content": prompt}], "max_tokens": 150, "temperature": 0, "logprobs": True, "top_logprobs": 2, "enable_mtp": False}
+# Score the gap on the SHARED prefix: a serial run diverges from both at its own near-tie.
+r = urllib.request.urlopen(urllib.request.Request(base + "/detokenize", json.dumps({"tokens": a[:idx]}).encode(), {"Content-Type": "application/json"}))
+prefix = json.load(r)["content"]
+body = {"model": "mlx-serve", "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": prefix}], "continue_final_message": True, "max_tokens": 1, "temperature": 0, "logprobs": True, "top_logprobs": 2, "enable_mtp": False}
 r = urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}))
-c = json.load(r)["choices"][0]["logprobs"]["content"]
-t = c[min(idx, len(c) - 1)]["top_logprobs"]
+t = json.load(r)["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
 print(round(t[0]["logprob"] - t[1]["logprob"], 4), idx)
 PYEOF
 )

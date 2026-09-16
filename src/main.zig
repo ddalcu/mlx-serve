@@ -243,10 +243,8 @@ fn printUsage(io: std.Io) void {
         \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
-        \\                        turbo2, turbo4          — Hadamard-rotated
-        \\                          affine at 2/4 bits; lower distortion at
-        \\                          comparable storage. Per-request override
-        \\                          via the `kv_quant` body field.
+        \\                          Per-request override via the `kv_quant`
+        \\                          body field.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -539,8 +537,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
-    // Off by default — only `.affine` cache scheme is supported by the
-    // v1 fused path; TurboQuant + dense schemes ignore it.
+    // Off by default — only the `.affine` cache scheme has a fused path.
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
@@ -918,12 +915,8 @@ pub fn main(init: std.process.Init) !void {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
             } else if (std.mem.eql(u8, args[i], "8")) {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
-            } else if (std.mem.eql(u8, args[i], "turbo2")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(2);
-            } else if (std.mem.eql(u8, args[i], "turbo4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(4);
             } else {
-                log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
@@ -1181,7 +1174,6 @@ pub fn main(init: std.process.Init) !void {
     switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
-        .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
 
@@ -1480,7 +1472,7 @@ pub fn main(init: std.process.Init) !void {
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
         if (kv_quant_config.scheme != .off) {
-            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config, config.kvCacheKeyHeadDim());
+            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
         }
         try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
 

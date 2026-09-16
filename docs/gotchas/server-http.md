@@ -2,6 +2,11 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### A reasoning budget that only trims delivery cannot stop a thought from eating max_tokens 
+pi on Qwen3.8-Flash-Next with `contextWindow` 8k then 24k: every design turn came back `length` with empty content. Two causes, one per effort level. At `low` pi sends `reasoning_effort: low`; on Qwen3.8 the template reads the word, so since 2026-08-14 no budget was derived from it, and even where a budget applied it was a display trim after generation: nothing ever closed the think block. At `xhigh` no budget exists by design, and the launcher's output share (ctx/4 = 6144 at 24k, shrunk further by pi's per-turn estimate) was smaller than one thought. vLLM and SGLang enforce a thinking budget in-stream, Qwen's recipe: at the budget append "Considering the limited time by the user, I have to give the solution based on the thinking directly now." plus `</think>` and keep generating. Fix, both halves: `armThinkBound` resolves atomic opener/closer ids + the forced sequence per request and hangs a `ThinkBound` on the sampling params; `thinkBoundTick` (inside the pre-step guard every decode path runs) commits the forced tokens as one multi-token forward from any inter-tick state and routes the rest of the request regular; the surfaces get budget -1 so the closed thought streams whole. The effort word maps to a budget on consuming templates again, but only where the bound can arm. The launcher share moved to ctx/2 in all three copies. Not live-tested: the batched (N>1) path after a fire, and MTP-armed requests (the answer decodes plain, `.think_bound`). Guards: `ThinkBound` unit test, `tests/test_reasoning_budget_stream.sh` (stream + non-stream, closed thought, answer present), `budgetForContext` + `AgentBudgetTests`.
+
+The compaction half. pi at 83% of a 24k window kept sending `max_tokens` 774 then 1 and never compacted: it compacts past `window - reserveTokens` (16384) but keeps the last `keepRecentTokens` (20000), more than the whole conversation, so the cut point was the start and nothing happened. opencode2 on the same window compacted after EVERY reply, including before the first: its trigger is `tokens >= context - max(min(limit.output, 32000), buffer)` with `buffer` 20000, a 4.5k threshold on 24k, and each summary claimed files that were never written. Both defaults assume 200k windows. Fix: one `compactionReserve(ctx)` = min(20000, ctx/4) in Zig and Swift; pi gets `compaction.reserveTokens` (reserve + 4096, capped at its 16384 default) and `keepRecentTokens` (reserve) merged into `~/.mlx-serve/pi/settings.json`; opencode(2) `limit.output` IS the reserve (opencode never sends max_tokens, the field only sizes compaction), and opencode2's config gets `compaction: {buffer, keep.tokens}` for the pinned model's window. Big windows land on the agents' own defaults. Effort budgets moved to pi's ladder (low 2048, medium 8192, high uncapped). Guards: `compactionReserve`, `mergePiSettingsJson`, the opencode config tests, and their Swift twins.
+
 ### Idle eviction: a reload that leaked, three readers it could free underneath, and a status poll that undid it
 
 `--idle-evict-secs` parsed into `ModelRegistry` and nothing ever swept, so the flag was documented and inert. Adding the sweep surfaced two things the on-demand unload path had been hiding.
@@ -1864,7 +1869,7 @@ other archs keep their previous arithmetic and advertised context.
 Design: `docs/reference.md`. The defects its review found, all in the
 eviction half: the spill read `appendCommit`'s bool ("nothing more to write")
 as "the SSD holds this session" and every silent skip (a declined volume, a
-prefix under `MIN_PERSIST_TOKENS`, TurboQuant, a short layer offset) returned
+prefix under `MIN_PERSIST_TOKENS`, a short layer offset) returned
 it too, so on a box under ~65 GiB free every idle entry was dropped with
 nothing written (`PersistOutcome`; only `.persisted` + an agreeing index
 + landed files + a stat license discarding RAM); the spill ignored
@@ -2172,3 +2177,18 @@ media state, so text entries no longer carry a bogus boundary into checkpoint in
 and thinning. Live: 16,384/73,398 in 34.2 s becomes 73,293/73,375 in 1.6 s.
 
 Guard: `firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary`.
+
+## Engine models counted reasoning with an empty tokenizer (2026-09-15)
+
+A thinking reply from a GGUF on the ds4 engine (Qwen3.8 Flash Next Q2) returned 375 chars of
+`reasoning_content` with `completion_tokens_details.reasoning_tokens: 0`; `/v1/responses`
+reported 0 too. Found by `tests/test_format_matrix.sh` on a new `flashnext-gguf` arm.
+
+Cause: an engine-backed model loads a stub CPU state whose `Tokenizer` has no vocabulary, and
+both usage sites re-encoded the split reasoning with `tok.encode`, which returns no ids. The
+prompt paths (`/tokenize`, `/v1/completions`) already branched on the engine, twice, by hand.
+
+Fix: `server.encodeText` owns the branch (ds4 vocab, llama.cpp vocab, else BPE) and all four
+sites call it. Live on ds4 / llama.cpp / MLX: 196 / 590 / 67 reasoning tokens.
+
+Guard: the format matrix's `usage reasoning_tokens > 0` check on a GGUF arm.

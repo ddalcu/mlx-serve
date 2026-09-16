@@ -166,8 +166,8 @@ const Entry = struct {
     /// against an entry that was committed under another config.
     ///
     /// Storing the full `KVQuantConfig` (not just `Scheme`) is what
-    /// distinguishes `affine 4` from `affine 8` and a future TurboQuant
-    /// `group_size` change — without that, a 4-bit entry would alias to an
+    /// distinguishes `affine 4` from `affine 8` and a `group_size` change —
+    /// without that, a 4-bit entry would alias to an
     /// 8-bit slot's findBestMatch lookup and crash SDPA with a packed-shape
     /// mismatch on restore. Repro: `tests/test_kv_quant_per_request.sh`.
     quant_config: kv_quant.KVQuantConfig,
@@ -660,8 +660,7 @@ pub const HotPrefixCache = struct {
     /// Wave 1.B: total KV bytes held by a snapshot — sum of `size * itemsize`
     /// across every initialized entry's storage arrays. mlx-c arrays carry
     /// their shape + dtype so this is exact, not a heuristic. Quant schemes
-    /// account for q, scales, biases together; future schemes (TurboQuant)
-    /// add `kv_quant.snapshotBytesExtra` for per-layer rotation state.
+    /// account for q, scales, biases together.
     fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
@@ -2249,10 +2248,6 @@ pub const HotPrefixCache = struct {
     fn unpersistableReason(d: *kv_disk_cache.DiskTier, e: *const Entry) []const u8 {
         if (d.store_declined) return "store declined: volume is short";
         if (e.tokens.len < @as(usize, kv_disk_cache.MIN_PERSIST_TOKENS)) return "under the persist floor";
-        switch (e.snapshot.config.scheme) {
-            .off, .affine => {},
-            else => return "TurboQuant state does not survive a restore",
-        }
         const target = kv_disk_cache.persistTargetLen(e.snapshot.entries, e.snapshot.step, e.tokens.len);
         for (e.snapshot.entries) |*le| {
             if (le.initialized and le.offset < target) return "layer offset short of the range";
@@ -7526,7 +7521,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
     defer cache.deinit();
     try testFillCache(&cache, s, 1, 600);
 
-    // A is the oldest and unpersistable (TurboQuant); B is newer and persists; C is active.
+    // A is the oldest and unpersistable (a layer offset short of the persist target); B is newer and persists; C is active.
     {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -7541,7 +7536,7 @@ test "SSD-first: the allowance is a HARD cap, shed in two tiers (durable first)"
         _ = try hc.commit(&cache, &tok_b, false);
         _ = try hc.commit(&cache, &tok_c, false);
         for (hc.entries.items) |*e| {
-            if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
+            if (std.mem.eql(u32, e.tokens, &tok_a)) e.snapshot.entries[0].offset = 300;
         }
         hc.ssd_idle_mem = hc.entries.items[0].kv_bytes;
         hc.spillIdleEntries(s);
@@ -7643,33 +7638,7 @@ test "SSD-first: a silent SKIP is not a durable copy — the idle entry stays re
         try testing.expectEqual(@as(usize, 2), hc.entryCount());
     }
 
-    // Arm 3: TurboQuant, whose rotation state does not survive a restore.
-    {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        var buf: [512]u8 = undefined;
-        const root_len = try tmp.dir.realPath(io, &buf);
-        var cache = try KVCache.init(testing.allocator, 1);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 1, 600);
-
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.ssd_first = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, buf[0..root_len], "fp-tq", 0, 128);
-        defer hc.deinit();
-        hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
-        _ = try hc.commit(&cache, &tokens_a, false);
-        _ = try hc.commit(&cache, &tokens_b, false);
-        // The scheme is flipped on the committed snapshot rather than on the live cache.
-        for (hc.entries.items) |*e| {
-            if (std.mem.eql(u32, e.tokens, &tokens_a)) e.snapshot.config = .{ .scheme = .turboquant_4, .bits = 4, .group_size = 64 };
-        }
-        hc.spillIdleEntries(s);
-        try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
-        try testing.expectEqual(@as(usize, 2), hc.entryCount());
-    }
-
-    // Arm 4: a layer offset short of the persist target.
+    // Arm 3: a layer offset short of the persist target.
     {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();

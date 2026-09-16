@@ -177,7 +177,6 @@ export function planCells(rep, opts = {}) {
   if (kvCheck) {
     cells.push(
       { id: "kv4", label: "KV 4-bit (crash check)", flags: ["--kv-quant", "4"], expectSpec: null, kv: true },
-      { id: "kv-turbo4", label: "KV TurboQuant-4 (crash check)", flags: ["--kv-quant", "turbo4"], expectSpec: null, kv: true },
     );
   }
   return cells;

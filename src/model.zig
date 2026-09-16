@@ -904,15 +904,6 @@ pub const ModelConfig = struct {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
     }
 
-    /// The width the KV cache's KEY buffer is laid out at — `head_dim` on every
-    /// symmetric arch, nope+rope on MLA. What a scheme with a shape constraint
-    /// (TurboQuant's Hadamard rotation needs a power of two) must validate
-    /// against; `head_dim` alone says 128 for an arch that caches 192-wide keys
-    /// and the refusal then fires mid-request instead of at load.
-    pub fn kvCacheKeyHeadDim(self: *const ModelConfig) u32 {
-        return if (self.isMla()) self.mlaQkHeadDim() else self.head_dim;
-    }
-
     /// The pooling op /v1/embeddings runs: the explicit signal, else masked
     /// mean (the historical default — correct for MiniLM and EmbeddingGemma).
     pub fn effectivePooling(self: *const ModelConfig) PoolingMode {
@@ -6042,11 +6033,6 @@ test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {
     // Attention scale is over the FULL qk head dim (192), not head_dim.
     try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
 
-    // The cache's KEY width is 192 — what a shape-constrained KV scheme must
-    // validate against (TurboQuant's Hadamard needs a power of two, and 192 is
-    // not one, so it is refused at LOAD instead of at the first MLA layer).
-    try testing.expectEqual(@as(u32, 192), config.kvCacheKeyHeadDim());
-    try testing.expect(!std.math.isPowerOfTwo(config.kvCacheKeyHeadDim()));
     // A negative bound selects fla's bounded-sigmoid arm.
     try testing.expect(config.kdaUsesBoundedGate());
 }

@@ -1130,6 +1130,50 @@ fn promptOpensThink(
     return chat_mod.promptTailOpensThink(tail);
 }
 
+/// One token id for `text`, or null when the tokenizer spells it in pieces.
+fn atomicTokenId(allocator: std.mem.Allocator, tok: *const Tokenizer, text: []const u8) ?u32 {
+    const ids = tok.encode(allocator, text) catch return null;
+    defer allocator.free(ids);
+    return if (ids.len == 1) ids[0] else null;
+}
+
+/// The in-stream thinking bound needs atomic think markers (bare `<think>`
+/// family, or a pack that aliases its own markers onto it).
+fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
+    if (lm.transformer == null) return false;
+    return tok.marker_closers != null or atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
+}
+
+/// Qwen's own thinking-budget recipe: the model is told time is up, then the
+/// closer is committed and the answer follows.
+const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
+
+/// Arm a decode-time thinking bound for this request, or null when nothing
+/// bounds it (no budget, thinking off, markers not atomic). `forced` is
+/// allocated; the caller frees it after generation.
+fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
+    if (budget < 0 or !enable_thinking or lm.transformer == null) return null;
+    const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
+        atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
+        log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
+        return null;
+    };
+    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
+    const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
+    if (opener == null and !opened) return null;
+
+    const stop_ids = tok.encode(allocator, THINK_BOUND_EARLY_STOP) catch return null;
+    defer allocator.free(stop_ids);
+    const sep_ids = tok.encode(allocator, "\n\n") catch return null;
+    defer allocator.free(sep_ids);
+    const forced = allocator.alloc(u32, stop_ids.len + 1 + sep_ids.len) catch return null;
+    @memcpy(forced[0..stop_ids.len], stop_ids);
+    forced[stop_ids.len] = closer;
+    @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
+    log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
+    return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+}
+
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
     const c = lm.config orelse return false;
     if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
@@ -7413,6 +7457,22 @@ fn truncateEmbeddingDims(embedding: []f32, dims: usize) []f32 {
     return out;
 }
 
+/// Text -> ids through the model's own vocabulary: an embedded engine's GGUF
+/// vocab, else the loaded BPE tokenizer (an engine model's `tok` is an empty stub).
+/// `add_special` reaches llama.cpp only.
+fn encodeText(allocator: std.mem.Allocator, lm: *const LoadedModel, tok: *const Tokenizer, text: []const u8, add_special: bool) ![]u32 {
+    const i32_ids = if (lm.ds4_engine) |engine|
+        try engine.tokenizeText(allocator, text)
+    else if (lm.llama_engine) |engine|
+        try engine.tokenizeText(allocator, text, add_special)
+    else
+        return tok.encode(allocator, text);
+    defer allocator.free(i32_ids);
+    const out = try allocator.alloc(u32, i32_ids.len);
+    for (i32_ids, out) |t, *o| o.* = @intCast(t);
+    return out;
+}
+
 fn handleTokenize(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -7437,19 +7497,7 @@ fn handleTokenize(
         return;
     }
 
-    const ids = if (lm.ds4_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, content.?);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else if (lm.llama_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, content.?, true);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else try tok.encode(allocator, content.?);
+    const ids = try encodeText(allocator, lm, tok, content.?, true);
     defer allocator.free(ids);
 
     var result = std.ArrayList(u8).empty;
@@ -7553,6 +7601,14 @@ const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 
 /// strings still enable). "none" is an explicit off (the gpt-5.1 default
 /// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
 /// stays in charge and existing clients see zero behavior change.
+/// The effort word is the ONLY lever when the template reads it and no
+/// decode-time bound can enforce a budget derived from it (a budget that is
+/// only a delivery cap fights the word: `chat.templateConsumesEffort`).
+fn effortWordOnly(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
+    const cc = lm.chat_config orelse return false;
+    return chat_mod.templateConsumesEffort(cc.chat_template) and !thinkMarkersAtomic(allocator, lm, tok);
+}
+
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
@@ -8200,7 +8256,7 @@ fn handleChatCompletions(
     // Either switch turns thinking on; effort "none" alone never does.
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
-    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false);
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
     var enable_thinking = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinking(tools_json != null));
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
@@ -8220,7 +8276,6 @@ fn handleChatCompletions(
         switch (kq.scheme) {
             .off => log.info("  kv-quant override: off (per-request)\n", .{}),
             .affine => log.info("  kv-quant override: affine {d}-bit (per-request)\n", .{kq.bits}),
-            .turboquant_2, .turboquant_4 => log.info("  kv-quant override: turboquant {d}-bit (per-request)\n", .{kq.bits}),
         }
     }
     const kv_attn_explicit = parseKvAttnExplicit(root);
@@ -8528,6 +8583,13 @@ fn handleChatCompletions(
         }
     }
 
+    // A decode-time bound owns the budget; the surfaces then deliver the
+    // whole (closed) thought instead of trimming it.
+    var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
+    defer if (think_bound) |tb| allocator.free(tb.forced);
+    const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
+    if (think_bound) |*tb| sampling.think_bound = tb;
+
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
     const sub_ve = local_ve;
@@ -8535,13 +8597,13 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -8695,19 +8757,7 @@ fn handleCompletions(
     // Tokenize prompt directly (no chat template). ds4-backed models
     // tokenize through the engine's GGUF vocab; MLX models go through
     // the loaded BPE tokenizer.
-    const prompt_ids = if (lm.ds4_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else if (lm.llama_engine) |engine| blk: {
-        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?, true);
-        defer allocator.free(i32_ids);
-        const out = try allocator.alloc(u32, i32_ids.len);
-        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
-        break :blk out;
-    } else try tok.encode(allocator, prompt_text.?);
+    const prompt_ids = try encodeText(allocator, lm, tok, prompt_text.?, true);
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
@@ -9618,7 +9668,7 @@ fn handleNonStreamingGeneration(
             reasoning_allocated = true;
             // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
             // parity) so clients can budget visible content separately.
-            if (tok.encode(allocator, reasoning)) |rids| {
+            if (encodeText(allocator, lm, tok, reasoning, false)) |rids| {
                 defer allocator.free(rids);
                 usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
                 usage_details_allocated = true;
@@ -14939,6 +14989,8 @@ fn handleAnthropicMessages(
         }
     }
 
+    if (try chat_mod.foldSystemMessages(allocator, &messages)) |joined| try content_allocs.append(allocator, joined);
+
     if (messages.items.len == 0) {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
         return;
@@ -15042,11 +15094,7 @@ fn handleAnthropicMessages(
     const output_cfg = parseAnthropicOutputConfig(root);
     var effort_word: ?[]const u8 = null;
     if (output_cfg.effort) |word| {
-        const cfg = reasoningEffortFromWord(
-            word,
-            server_config.default_reasoning_budget,
-            if (lm.chat_config) |cc| chat_mod.templateConsumesEffort(cc.chat_template) else false,
-        );
+        const cfg = reasoningEffortFromWord(word, server_config.default_reasoning_budget, effortWordOnly(allocator, lm, tok));
         effort_word = cfg.effort;
         if (!budget_explicit) reasoning_budget = cfg.budget;
         enable_thinking = if (root.get("thinking") == null) cfg.enable else (enable_thinking or cfg.enable);
@@ -15171,8 +15219,12 @@ fn handleAnthropicMessages(
     const tokenize_ns = tokenize_sw.read();
 
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
+    var system_chars: usize = 0;
+    for (messages.items) |msg| {
+        if (std.mem.eql(u8, msg.role, "system")) system_chars += msg.content.len;
+    }
+    log.info("POST /v1/messages ({d} msgs, max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream, enable_thinking, system_chars, tools_len, tool_msg_count,
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
@@ -15289,16 +15341,21 @@ fn handleAnthropicMessages(
         }
     }
 
+    var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
+    defer if (think_bound) |tb| allocator.free(tb.forced);
+    const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
+    if (think_bound) |*tb| sampling.think_bound = tb;
+
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -17631,7 +17688,7 @@ fn handleResponsesInner(
     // split reasoning text — exact modulo merge boundaries).
     const reasoning_tok_count: u32 = blk: {
         const rt = reasoning_text orelse break :blk 0;
-        const rids = tok.encode(allocator, rt) catch break :blk 0;
+        const rids = encodeText(allocator, lm, tok, rt, false) catch break :blk 0;
         defer allocator.free(rids);
         break :blk @intCast(rids.len);
     };
@@ -20860,10 +20917,10 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
         // "none" is an explicit OFF (gpt-5.1 default), never an enable.
         .{ .body = "{\"reasoning_effort\":\"none\"}", .expect = .{ .enable = false, .budget = -1 } },
         // Known efforts enable thinking with the shared Responses budget map.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 128 } },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 512 } },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 2048 } },
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 1024 } },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 2048 } },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = -1 } },
         // Unknown efforts (xhigh, future values) enable with the default
         // budget — spec values are model-dependent, never reject them.
         .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .expect = .{ .enable = true, .budget = -1 } },
@@ -20885,12 +20942,15 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     }
 }
 
-test "parseReasoningEffort: a template that READS the effort word gets no budget from it" {
+test "parseReasoningEffort: a template that READS the effort word gets no budget from it unless a decode-time bound can enforce it" {
     // Two levers, one word. Where the template acts on `reasoning_effort` the
-    // word already shortens the THOUGHT; deriving a token budget from the same
-    // string only truncates what the client is SHOWN, so pi asking Qwen3.8 for
-    // `medium` got the model's unguided (long) thinking AND a 2048-token cut,
-    // followed by 25.9k tokens of invisible generation (live 2026-08-14).
+    // word already shortens the THOUGHT; a budget that is only a delivery cap
+    // fights it: pi asking Qwen3.8 for `medium` got the model's unguided (long)
+    // thinking AND a 2048-token cut, followed by 25.9k tokens of invisible
+    // generation (live 2026-08-14). The third argument is `effortWordOnly`:
+    // true when the template reads the word AND `armThinkBound` cannot close
+    // the thought at the budget (non-atomic markers). With atomic markers the
+    // budget is enforced in-stream and the word maps like everywhere else.
     // An EXPLICIT cap is someone asking on purpose and still applies — that is
     // `default_budget` here, which carries `--reasoning-budget`.
     const allocator = std.testing.allocator;
@@ -20904,10 +20964,11 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
         // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
         // Ling): the effort word reaches no template, so the budget is the ONLY
         // thing it does and every mapping stays exactly as it shipped.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 128 },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 512 },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 2048 },
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 1024 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 2048 },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 8192 },
+        // high and xhigh are uncapped: pi's own ladder is 2048 / 8192 / 16384.
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = -1 },
         .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .consumes = false, .default_budget = -1, .want = -1 },
     };
     for (cases) |case| {
@@ -20970,7 +21031,7 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
     // A word maps through the ONE effortBudget table…
     const low = reasoningEffortFromWord("low", -1, false);
     try std.testing.expect(low.enable);
-    try std.testing.expectEqual(@as(i32, 512), low.budget);
+    try std.testing.expectEqual(@as(i32, 2048), low.budget);
     // …unless the template consumes the word (qwen3.8 class): then the word is
     // the lever and the budget stays the launch default.
     const consumed = reasoningEffortFromWord("low", -1, true);
@@ -22110,11 +22171,8 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS, .affine));
     try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS + 1, .affine));
     try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
-    // Auto never engages on non-affine schemes (TurboQuant needs the
-    // rotation undo the fused path doesn't implement; off has no triples).
+    // Auto never engages off (no triples to consume).
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_2));
-    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_4));
 }
 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {

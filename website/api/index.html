@@ -149,7 +149,7 @@ print(r.choices[0].message.content)</pre></div>
       <tr><td><code>enable_thinking</code></td><td>Toggle thinking/reasoning on models that support it; reasoning arrives as <code>reasoning_content</code>, never leaked into the visible text.</td></tr>
       <tr><td><code>reasoning_effort</code></td><td>OpenAI's <code>"low"</code> / <code>"medium"</code> / <code>"high"</code>, mapped to a thinking budget (or to the model's own effort setting where it has one, like DeepSeek V4).</td></tr>
       <tr><td><code>reasoning_budget_tokens</code></td><td>Cap thinking tokens per request. An explicit value outranks <code>reasoning_effort</code>.</td></tr>
-      <tr><td><code>kv_quant</code></td><td>Per-request KV-cache quantization: <code>"off"</code>, <code>4</code>, <code>8</code>, <code>"turbo2"</code>, <code>"turbo4"</code>.</td></tr>
+      <tr><td><code>kv_quant</code></td><td>Per-request KV-cache quantization: <code>"off"</code>, <code>4</code>, <code>8</code>.</td></tr>
       <tr><td><code>kv_attn_mode</code></td><td>Read path for a quantized KV cache: <code>"auto"</code> (default), <code>"dense"</code>, <code>"fused"</code>. Fused reads the packed cache in place and pays off at long context.</td></tr>
       <tr><td><code>enable_pld</code> / <code>enable_drafter</code> / <code>enable_mtp</code></td><td>Per-request control over the three speculative-decoding paths (<a href="../speculative-decoding/">deep dive</a>). Defaults are already sensible — outputs stay equivalent either way.</td></tr>
     </table>

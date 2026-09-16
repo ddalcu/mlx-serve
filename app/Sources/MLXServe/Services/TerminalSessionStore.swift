@@ -115,9 +115,11 @@ final class TerminalSessionStore: ObservableObject {
                 sessions.markFailed(id, message: "the server isn't running — load a model first; \(cli.displayName) talks to it")
                 return
             }
+            let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
+            warnIfSmallContext(agentId: cli.id, context: budget.context)
             let cmd = CLILauncher.launchCommand(
                 cli, baseURL: server.baseURL, servedModelId: server.chatModelId ?? "mlx-serve",
-                budget: AgentBudget.forServerContext(server.chatModelInfo?.contextLength),
+                budget: budget,
                 entries: AgentModelEntry.chatEntries(from: server.allModels),
                 workingDirectory: workspace)
             install(handle: makeHandle(id: id, executable: cmd.executable, args: cmd.args), cli: nil, for: id)
