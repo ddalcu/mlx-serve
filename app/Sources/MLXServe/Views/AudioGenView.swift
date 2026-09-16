@@ -92,8 +92,13 @@ struct AudioHistoryShelf: View {
     private func row(_ path: String) -> some View {
         let playing = playingPath == path
         return HStack(spacing: 8) {
-            Image(systemName: playing ? "speaker.wave.2.fill" : "waveform")
+            // The same glyph throughout — what says it is playing is that it
+            // MOVES, and a row that stopped has to look like the ones that
+            // never started.
+            Image(systemName: "waveform")
                 .foregroundStyle(playing ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .symbolEffect(.variableColor.iterative.dimInactiveLayers.nonReversing,
+                              options: .repeat(.continuous), isActive: playing)
                 .frame(width: 16)
             Text(URL(fileURLWithPath: path).lastPathComponent)
                 .font(.caption)
@@ -125,11 +130,20 @@ struct AudioHistoryShelf: View {
     }
 }
 
+/// Which of the Voice pane's inputs the chosen model actually takes.
+enum VoiceGenInputs {
+    /// A model that speaks in its own built-in voices takes no `ref_audio`
+    /// (a named 400 server-side), so the whole section goes away rather than
+    /// asking for a clip nothing would read.
+    static func showsReference(_ model: AudioModelPreset) -> Bool {
+        model.supportsCloning
+    }
+}
+
 /// Voice tab — neural TTS with zero-shot voice cloning, run natively by the
 /// embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
 /// picker, the text to speak, a reference-voice section (record or pick a file)
-/// with an optional transcript, and a player for the result. (Extracted
-/// verbatim from the pre-tabs AudioGenView — zero behavior change.)
+/// with an optional transcript, and a player for the result.
 struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
@@ -214,12 +228,16 @@ struct VoiceGenView: View {
     private var readyView: some View {
         HSplitView {
             ScrollView {
+                // The model decides what the rest of the pane means — whether
+                // there is a voice to clone at all, and how long a reference
+                // it wants — so it is read before the inputs it governs.
                 VStack(alignment: .leading, spacing: 14) {
-                    textSection
                     modelSection
-                    referenceSection
-                    if showAdvanced { advancedSection } else { advancedToggle }
-                    actionRow
+                    textSection
+                    if VoiceGenInputs.showsReference(model) { referenceSection }
+                    advancedSection
+                    // Generate stands apart from the settings it acts on.
+                    actionRow.padding(.top, 14)
                 }
                 .padding(16)
             }
@@ -256,14 +274,9 @@ struct VoiceGenView: View {
     private var textSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Text to speak").font(.subheadline.weight(.semibold))
+                Text("Text to be generated").font(.subheadline.weight(.semibold))
                 Spacer()
-                Button { toggleDictation() } label: {
-                    Image(systemName: dictating ? "mic.fill" : "mic")
-                        .foregroundStyle(dictating ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
-                }
-                .buttonStyle(.borderless)
-                .help(dictating ? "Stop dictation" : "Dictate the text to speak")
+                dictationButton
             }
             TextEditor(text: $text)
                 .font(.body)
@@ -271,11 +284,6 @@ struct VoiceGenView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
-            if dictating {
-                Text(dictationPartial.isEmpty ? "Listening…" : dictationPartial)
-                    .font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
             if let err = dictationError {
                 Text(err).font(.caption2).foregroundStyle(.orange)
             }
@@ -283,6 +291,34 @@ struct VoiceGenView: View {
     }
 
     // MARK: - Dictation
+
+    /// Start, state and stop in ONE control: a running mic is the loudest thing
+    /// in the pane, and the way to end it is the thing you are already looking
+    /// at. The partial transcript is not shown — every finished utterance lands
+    /// in the editor below, which is where you would read it anyway.
+    private var dictationButton: some View {
+        Button { toggleDictation() } label: {
+            HStack(spacing: 5) {
+                Image(systemName: dictating ? "microphone.fill" : "microphone")
+                Text(dictating ? "Listening…" : "Speak it")
+                if dictating { Image(systemName: "stop.fill") }
+            }
+            .font(.caption)
+            .foregroundStyle(dictating ? AnyShapeStyle(Color.white) : AnyShapeStyle(.primary))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(
+                // The pane's other buttons are bordered controls, so this one
+                // takes their corner, not a pill's.
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(dictating
+                          ? AnyShapeStyle(Color.orange)
+                          : AnyShapeStyle(Color.primary.opacity(0.08)))
+            )
+        }
+        .buttonStyle(.plain)
+        .help(dictating ? "Stop dictation" : "Dictate the text instead of typing it")
+    }
 
     private func toggleDictation() {
         dictating ? stopDictation() : startDictation()
@@ -325,8 +361,31 @@ struct VoiceGenView: View {
     }
 
     /// Best-per-capability up front, everything else behind "Other Models", and
-    /// the Download button ON the model — see `MediaModelChooser`.
+    /// the Download button ON the model — see `MediaModelChooser`. The transfer
+    /// bar and residency both belong to the model, not to the output, so they
+    /// sit with it rather than beside Generate.
     private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            modelChooser
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
+            }
+        }
+    }
+
+    /// Residency rides the switcher's row: it is a property of the model, and
+    /// the only thing about it the pane still has to say once it is picked.
+    private var keepResidentToggle: AnyView {
+        AnyView(
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .controlSize(.small)
+                .fixedSize()
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+        )
+    }
+
+    private var modelChooser: some View {
         MediaModelChooser.pane(
             all: AudioModelPreset.all,
             onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
@@ -341,18 +400,14 @@ struct VoiceGenView: View {
             bundleOf: { $0.bundle },
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },
-            persist: persist)
+            persist: persist,
+            accessory: keepResidentToggle)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var referenceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Reference voice").font(.subheadline.weight(.semibold))
-                Spacer()
-                Text("~\(model.recommendedRefSeconds)s recommended")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+            Text("Reference voice").font(.subheadline.weight(.semibold))
 
             if let url = refAudioURL {
                 HStack(spacing: 8) {
@@ -372,29 +427,36 @@ struct VoiceGenView: View {
                 }
             } else if recorder.isRecording {
                 HStack(spacing: 10) {
-                    Image(systemName: "mic.fill").foregroundStyle(.red)
+                    Image(systemName: "microphone.fill")
+                        .font(.caption)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.orange))
                     ProgressView(value: Double(recorder.level)).frame(width: 120)
                     Text(String(format: "%.1fs", recorder.duration))
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     Spacer()
                     Button { stopRecording() } label: {
-                        Label("Stop", systemImage: "stop.circle.fill")
+                        Label("Stop", systemImage: "stop.fill")
                     }
                     .buttonStyle(.bordered)
                 }
             } else {
-                HStack(spacing: 8) {
-                    Button { chooseReferenceFile() } label: {
-                        Label("Choose file…", systemImage: "folder")
-                            .font(.caption).frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    Button { startRecording() } label: {
-                        Label("Record", systemImage: "mic")
-                            .font(.caption).frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                }
+                // Two ways in, one clip slot — the same well the picture panes
+                // use, split down the middle.
+                MediaDropWellPair(
+                    isTargeted: isDropTargeted,
+                    leading: MediaDropWellOption(
+                        title: "Choose audio file…",
+                        systemImage: "waveform.badge.plus",
+                        caption: "or drag one here",
+                        action: chooseReferenceFile),
+                    trailing: MediaDropWellOption(
+                        title: "Record audio…",
+                        systemImage: "microphone.badge.plus",
+                        caption: "~\(model.recommendedRefSeconds)s recommended",
+                        action: startRecording))
             }
 
             if refAudioURL != nil {
@@ -406,7 +468,9 @@ struct VoiceGenView: View {
                         .font(.caption)
                 }
             } else {
-                Text("Pick, record or drag in ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
+                // The well already says how to add a clip and how long it wants
+                // one; what is left to say is what happens without it.
+                Text("Without a reference, the model's default voice is used.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -422,58 +486,58 @@ struct VoiceGenView: View {
         }
     }
 
-    private var advancedToggle: some View {
+    /// One header in both states: same words, same chevron on the same side,
+    /// and the whole row is the control — a disclosure you can only close by
+    /// finding a 12-point glyph is a disclosure that stays open.
+    private var advancedHeader: some View {
         Button {
-            withAnimation { showAdvanced = true }
+            withAnimation { showAdvanced.toggle() }
         } label: {
-            Label("Advanced options", systemImage: "chevron.right").font(.caption)
+            HStack(spacing: 4) {
+                Image(systemName: showAdvanced ? "chevron.down" : "chevron.right")
+                Text("Advanced options")
+                Spacer()
+            }
+            // A section heading like the others: a disclosure is still a
+            // section, and it sits in their column.
+            .font(.subheadline.weight(.semibold))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.primary)
     }
 
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Advanced").font(.caption.weight(.semibold))
-                Spacer()
-                Button { withAnimation { showAdvanced = false } } label: { Image(systemName: "chevron.down") }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
+            advancedHeader
+            if showAdvanced {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Speed (\(String(format: "%.2fx", speed)))").font(.caption)
+                    Slider(value: $speed, in: 0.5...2.0, step: 0.05)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Temperature (\(String(format: "%.2f", temperature)))").font(.caption)
+                    Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
+                    Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Speed (\(String(format: "%.2fx", speed)))").font(.caption)
-                Slider(value: $speed, in: 0.5...2.0, step: 0.05)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Temperature (\(String(format: "%.2f", temperature)))").font(.caption)
-                Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
-                Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
-            }
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
-                .font(.caption)
-                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
     private var actionRow: some View {
-        VStack(spacing: 8) {
-            if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
-            }
-            HStack {
-                if service.isRunning {
-                    Button(role: .destructive) { service.cancel() } label: {
-                        Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                } else {
-                    Button { tryGenerate() } label: {
-                        Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+        HStack {
+            if service.isRunning {
+                Button(role: .destructive) { service.cancel() } label: {
+                    Label("Cancel", systemImage: "stop.fill").frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
+            } else {
+                Button { tryGenerate() } label: {
+                    Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
             }
         }
     }
@@ -515,24 +579,26 @@ struct VoiceGenView: View {
     }
 
     private func completedPreview(path: String) -> some View {
-        VStack(spacing: 12) {
+        // One control, two states: pausing left the shelf lit under a clip
+        // that had stopped making sound, so there is no pause any more.
+        let playing = clipPlayer.playingPath == path
+        return VStack(spacing: 12) {
             Image(systemName: "waveform.circle.fill")
                 .font(.system(size: 64)).foregroundStyle(.tint)
-            HStack(spacing: 10) {
-                Button { clipPlayer.play(path) } label: {
-                    Label("Play", systemImage: "play.fill")
-                }
-                .buttonStyle(.bordered)
-                Button { clipPlayer.pause() } label: {
-                    Label("Pause", systemImage: "pause.fill")
-                }
-                .buttonStyle(.bordered)
+                .symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing,
+                              options: .repeat(.continuous), isActive: playing)
+            Button {
+                playing ? clipPlayer.stop() : clipPlayer.play(path)
+            } label: {
+                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill")
             }
+            .buttonStyle(.bordered)
+            // The name and the way to reach the file belong together, centred
+            // under the clip they describe.
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
-                Spacer()
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
@@ -649,11 +715,14 @@ struct VoiceGenView: View {
 
     private func tryGenerate() {
         stopDictation() // the open mic would pick up the played result
+        // A clip the pane is no longer showing must not still shape the
+        // request: the same predicate decides both.
+        let clones = VoiceGenInputs.showsReference(model)
         let req = AudioGenRequest(
             model: model,
             text: text,
-            refAudioPath: refAudioURL?.path,
-            refText: refText,
+            refAudioPath: clones ? refAudioURL?.path : nil,
+            refText: clones ? refText : "",
             speed: speed,
             temperature: temperature,
             keepResident: keepResident,
