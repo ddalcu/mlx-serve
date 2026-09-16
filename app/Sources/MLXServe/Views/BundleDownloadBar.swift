@@ -68,7 +68,9 @@ struct BundleDownloadBar: View {
                 .buttonStyle(.plain)
                 .help("Cancel download")
             }
-            let label = a.count > 1 ? "Downloading model \(a.index)/\(a.count): " : "Downloading: "
+            let label = a.count > 1
+                ? L10n.format("Downloading model %lld/%lld: ", Int64(a.index), Int64(a.count))
+                : L10n.text("Downloading: ")
             Text(label + (a.state.currentFile.isEmpty ? a.state.statusText : a.state.currentFile))
                 .font(.system(size: 9)).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)

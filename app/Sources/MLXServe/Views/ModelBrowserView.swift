@@ -1635,8 +1635,8 @@ private struct GgufQuantMenu: View {
                         } label: {
                             let selected = path(of: quant) == appState.selectedModelPath
                             Label(
-                                selected ? "\(quant.label) — in use" : "\(quant.label) — use"
-,
+                                L10n.format(selected ? "%@ — in use" : "%@ — use",
+                                            L10n.text(quant.label)),
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -1744,8 +1744,8 @@ private struct MlxVariantMenu: View {
                         } label: {
                             let selected = path(of: v) == appState.selectedModelPath
                             Label(
-                                selected ? "\(v.label) — in use" : "\(v.label) — use"
-,
+                                L10n.format(selected ? "%@ — in use" : "%@ — use",
+                                            L10n.text(v.label)),
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }

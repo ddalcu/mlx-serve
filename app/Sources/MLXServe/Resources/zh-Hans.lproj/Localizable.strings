@@ -20,8 +20,10 @@
 "%@ total" = "%@ 总计";
 "%@ · file no longer on disk" = "%@ · 文件已不在磁盘上";
 "%@ — file no longer on disk" = "%@ —— 文件已不在磁盘上";
+"%@ — in use" = "%@ —— 使用中";
 "%@ — no longer installed" = "%@ —— 已不再安装";
 "%@ — not in %@'s capabilities" = "%@ —— 不在 %@ 的能力范围内";
+"%@ — use" = "%@ —— 使用";
 "%@, %lld steps, %lld frames (~%.1fs)" = "%@，%lld 步，%lld 帧（~%.1fs）";
 "%@: browse and search only — its %@-token window has no room for the rest." = "%@：仅能浏览和搜索 —— 它的 %@ Token 上下文窗口容不下其余工具。";
 "%lld WEB SOURCE%@" = "%lld 个网页来源";
@@ -32,6 +34,7 @@
 "%lld source%@" = "%lld 个来源";
 "%lld steps" = "%lld 步";
 "%lld tool%@" = "%lld 个工具";
+"%lld windows joined end to end — about %lld frames, and roughly %lldx the time of a single window." = "%lld 个窗口首尾相接 —— 约 %lld 帧，耗时约为单个窗口的 %lld 倍。";
 "(missing command or url)" = "（缺少 command 或 url）";
 "(no arguments)" = "（无参数）";
 "(server has produced no output yet)" = "（服务器尚未产生任何输出）";
@@ -160,7 +163,7 @@
 "Cap on candidate tokens per step. 0 = follow the model's own recommendation from generation_config.json (Qwen 3.6: 20, Gemma 4: 64); explicit values override it server-wide after a restart." = "每步候选 Token 数的上限。0 = 采用模型在 generation_config.json 中的自身建议（Qwen 3.6：20，Gemma 4：64）；显式设置的数值会在重启后于服务器范围内覆盖它。";
 "Capabilities, model, workspace and sampling. Most agents need none of these." = "能力、模型、工作区与采样。多数 Agent 都不需要这些。";
 "Capability" = "能力";
-"Chained windows: %@" = "链式窗口：%@";
+"Chained windows: %lld" = "链式窗口：%lld";
 "Change Directory" = "切换目录";
 "Change Model" = "更换模型";
 "Change the symbol" = "更换图标";
@@ -291,7 +294,9 @@
 "Downloaded and ready to use" = "已下载，可直接使用";
 "Downloaded by MLX Core" = "由 MLX Core 下载";
 "Downloading %@ %@" = "正在下载 %@ %@";
+"Downloading model %lld/%lld: " = "正在下载模型 %lld/%lld：";
 "Downloading the update…" = "正在下载更新…";
+"Downloading: " = "正在下载：";
 "Downloads" = "下载";
 "Drafter" = "草稿模型";
 "Drafter block size" = "草稿模型块大小";
@@ -453,6 +458,7 @@
 "Interface" = "界面";
 "Interrupted" = "已中断";
 "Join several generations end to end, each starting from the last frame of the one before." = "将多段生成首尾相接，每段都从前一段的最后一帧开始。";
+"Joins several generations end to end for a longer clip. Each window costs another full generation." = "将多段生成首尾相接，以获得更长的片段。每个窗口都要多消耗一整次生成。";
 "Jump to the latest message" = "跳到最新消息";
 "KV cache quantization" = "KV cache 量化";
 "Keep model loaded after generating" = "生成后保持模型常驻";
