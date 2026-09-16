@@ -9,9 +9,14 @@ var announced = false;
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
 pub const max_seq: c_int = 8192 + @as(c_int, @intCast(@import("generate.zig").TAIL_MERGE_MAX)) - 1;
 
+var enabled_env: ?bool = null;
+
 pub fn enabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_HC_PREFILL") orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    if (enabled_env) |on| return on;
+    const raw = std.c.getenv("MLX_SERVE_HC_PREFILL");
+    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    enabled_env = on;
+    return on;
 }
 
 pub fn eligible(batch: c_int, seq: c_int, hc: u32, hidden: u32, inject: mlx.mlx_array, dtype: mlx.mlx_dtype) bool {

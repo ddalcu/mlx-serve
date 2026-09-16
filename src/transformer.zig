@@ -33059,13 +33059,17 @@ pub const GdnPrework = struct {
 pub const GDN_FUSED_MAX_ROWS: c_int = 16;
 
 var gdn_prefill_fused_override: ?bool = null;
+var gdn_prefill_fused_env: ?bool = null;
 var gdn_prefill_engaged = false;
 
 fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("hc_prefill.zig").max_seq, batch)) return false;
     if (gdn_prefill_fused_override) |on| return on;
-    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    if (gdn_prefill_fused_env) |on| return on;
+    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED");
+    const on = raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
+    gdn_prefill_fused_env = on;
+    return on;
 }
 
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
@@ -33245,9 +33249,10 @@ pub fn gdnNormGateFused(
     batch: c_int,
     seq: c_int,
 ) !?mlx.mlx_array {
-    if (!gdnDecodeFusedEnabled()) return null;
     if (dv != 128) return null;
-    if (!gdnPrefillFusedFor(seq, batch) and (seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
+    const prefill = gdnPrefillFusedFor(seq, batch);
+    if (!prefill and !gdnDecodeFusedEnabled()) return null;
+    if (!prefill and (seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if (mlx.mlx_array_dtype(arr) != .bfloat16) {
             if (!gdn_normgate_declined) {
