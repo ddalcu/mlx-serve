@@ -13,14 +13,14 @@
 "%@ has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/." = "%@ 目前还没有可下载版本 —— 请用仓库中匹配的脚本在本机转换权重（见其 README）。转换后的权重会安装到 ~/.mlx-serve/models/local/。";
 "%@ in Sandbox" = "在沙盒中 %@";
 "%@ is taken by another app — kept %@." = "%@ 已被其他应用占用 —— 已保留 %@。";
-"%@ model%@" = "%@ 模型%@";
+"%@ model%@ on disk" = "磁盘上有 %@ 个模型";
 "%@ of memory · about %@ usable for models" = "%@ 内存 · 约 %@ 可供模型使用";
 "%@ token%@" = "%@ 个 Token";
 "%@ total" = "%@ 总计";
 "%@ · file no longer on disk" = "%@ · 文件已不在磁盘上";
 "%@ — file no longer on disk" = "%@ —— 文件已不在磁盘上";
 "%@ — no longer installed" = "%@ —— 已不再安装";
-"%@ — not in %@" = "%@ —— 不在 %@ 中";
+"%@ — not in %@'s capabilities" = "%@ —— 不在 %@ 的能力范围内";
 "%@, %lld steps, %lld frames (~%.1fs)" = "%@，%lld 步，%lld 帧（~%.1fs）";
 "%@: browse and search only — its %@-token window has no room for the rest." = "%@：仅能浏览和搜索 —— 它的 %@ Token 上下文窗口容不下其余工具。";
 "%lld WEB SOURCE%@" = "%lld 个网页来源";
@@ -195,7 +195,7 @@
 "Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run" = "将编码 Agent CLI（Claude Code、pi、oh-my-pi、OpenCode、Codex、hermes、aider）连接到此服务器 —— 显示需要运行的终端命令";
 "Connect external tools via the Model Context Protocol" = "通过 Model Context Protocol 连接外部工具";
 "Connect from your terminal:" = "从终端连接：";
-"Connected — %lld tool%@" = "已连接 —— %lld 个工具";
+"Connected — %lld tool%@ available" = "已连接 —— 有 %lld 个工具可用";
 "Connecting…" = "正在连接…";
 "Context size" = "上下文长度";
 "Context window" = "上下文窗口";
@@ -386,7 +386,7 @@
 "Give this style a name to reuse it from the Examples menu." = "给这个风格起个名字，即可从“示例”菜单中重复使用。";
 "Global gain" = "全局增益";
 "Go ahead…" = "请说吧…";
-"Guidance (%@" = "引导 (%@";
+"Guidance (%@)" = "引导（%@）";
 "Guidance scale" = "引导强度";
 "Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0." = "引导强度 —— 视频跟随提示词的紧密程度。1.0 = 关闭：最快，画面也最自然。数值越高，贴合提示词越严格，但速度更慢，画面可能过饱和。LTX 默认为 3.0。";
 "HTTP port the server listens on (default 11234). Change if it conflicts with another local service." = "服务器监听的 HTTP 端口（默认 11234）。如果与其他本地服务冲突，请修改。";
@@ -450,7 +450,7 @@
 "Last model used" = "上次使用的模型";
 "Last request overflowed the context window." = "上一次请求超出了上下文窗口。";
 "Launch Claude Code…" = "启动 Claude Code…";
-"Launch a coding agent — on this Mac (%@" = "启动编码 Agent —— 在这台 Mac 上（%@";
+"Launch a coding agent — on this Mac (%@) or inside the sandbox (pi, hermes)" = "启动编码 Agent —— 在这台 Mac 上（%@）或在沙盒内（pi、hermes）";
 "Layer weights (%lld numbers, comma or space separated)" = "层权重（%lld 个数字，用逗号或空格分隔）";
 "Leave it empty to go back to the automatic name." = "留空即可恢复为自动命名。";
 "Length: same as the source clip." = "长度：与源音频片段相同。";
@@ -830,7 +830,7 @@
 "Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own." = "投机解码草稿模型 —— 需在设置中与 Gemma 4 基础模型搭配使用，无法单独加载。";
 "Speech & sound" = "语音与声音";
 "Speech Recognition is off" = "语音识别已关闭";
-"Speed (%@" = "速度 (%@";
+"Speed (%@)" = "速度（%@）";
 "Spotlight-style prompt panel on %@: summon it from any app, ask the local model, and press ⌘↩ to continue in the chat window. If nothing happens on %@, macOS may be using it for input-source switching (System Settings → Keyboard → Keyboard Shortcuts → Input Sources)." = "%@ 上的 Spotlight 式提示词面板：在任何应用中唤出它，向本地模型提问，按 ⌘↩ 即可在聊天窗口中继续。如果在 %@ 上没有任何反应，macOS 可能把它用于切换输入法（系统设置 → 键盘 → 键盘快捷键 → 输入法）。";
 "Star on GitHub" = "在 GitHub 上点亮 Star";
 "Star the project on GitHub" = "在 GitHub 上为项目加 star";
@@ -868,7 +868,7 @@
 "System voice" = "系统音色";
 "Telegram conversation (view only)" = "Telegram 会话（仅供查看）";
 "Telegram conversation — view only. Reply from your phone." = "Telegram 会话 —— 仅可查看。请在手机上回复。";
-"Temperature (%@" = "温度 (%@";
+"Temperature (%@)" = "温度（%@）";
 "Templates" = "模板";
 "Tempo and key are written into the style prompt for this model — it has no separate fields for them." = "速度与调性会写进这个模型的风格提示词 —— 它没有单独的字段来设置这两项。";
 "Terminal" = "终端";
@@ -955,7 +955,6 @@
 "Variation strength" = "变化强度";
 "Video Generation" = "视频生成";
 "Video generation" = "视频生成";
-"View" = "查看";
 "View Releases ↗" = "查看版本发布 ↗";
 "Vision (image input)" = "视觉（图像输入）";
 "Vocal to BGM" = "人声转背景音乐";
