@@ -1,3 +1,5 @@
+[English](api.md) · [简体中文](zh-CN/api.md)
+
 # HTTP API
 
 Everything lives on one port (`http://localhost:11234` by default): OpenAI, Anthropic and Ollama wire protocols, plus native media generation endpoints.

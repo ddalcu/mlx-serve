@@ -1,3 +1,5 @@
+[English](performance.md) · [简体中文](zh-CN/performance.md)
+
 # Performance & tuning
 
 Apple M4 Max, identical weights per engine. [benchmarks.md](../benchmarks.md) tracks decode tok/s release by release, plus the current head-to-head against other engines. Numbers come from `tests/bench.sh`, which boots the server and lets [llmprobe](https://github.com/ddalcu/llmprobe) take them: warmup discarded, median of three, same protocol for everyone.
