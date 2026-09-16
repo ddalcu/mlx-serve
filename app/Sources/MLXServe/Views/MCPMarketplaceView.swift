@@ -160,7 +160,7 @@ struct MCPMarketplaceView: View {
                                 Text(id).font(.body.weight(.medium))
                                 transportBadge(for: entry)
                             }
-                            Text(commandSummary(for: entry))
+                            Text(L10n.text(commandSummary(for: entry)))
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -385,7 +385,7 @@ private struct MCPCatalogRow: View {
                     .frame(width: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(entry.name).font(.body.weight(.semibold))
-                    Text(entry.description)
+                    Text(L10n.text(entry.description))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -397,7 +397,7 @@ private struct MCPCatalogRow: View {
                     .onChange(of: isEnabled) { _, _ in onToggle() }
             }
             if case .failed(let detail) = status {
-                Label(detail, systemImage: "exclamationmark.triangle.fill")
+                Label(L10n.text(detail), systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .lineLimit(4)
@@ -412,7 +412,7 @@ private struct MCPCatalogRow: View {
                     .padding(.leading, 38)
                 }
                 if let notes = entry.notes {
-                    Text(notes)
+                    Text(L10n.text(notes))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.leading, 38)
@@ -465,21 +465,21 @@ private struct MCPCatalogRow: View {
         )
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
-                Text(input.label)
+                Text(L10n.text(input.label))
                     .font(.caption.weight(.medium))
                 if input.required {
                     Text("*").foregroundStyle(.red).font(.caption)
                 }
             }
             if input.isSecret {
-                SecureField(input.placeholder ?? "", text: binding)
+                SecureField(L10n.text(input.placeholder ?? ""), text: binding)
                     .textFieldStyle(.roundedBorder)
             } else {
-                TextField(input.placeholder ?? "", text: binding)
+                TextField(L10n.text(input.placeholder ?? ""), text: binding)
                     .textFieldStyle(.roundedBorder)
             }
             if let help = input.helpText {
-                Text(help).font(.caption2).foregroundStyle(.secondary)
+                Text(L10n.text(help)).font(.caption2).foregroundStyle(.secondary)
             }
         }
     }

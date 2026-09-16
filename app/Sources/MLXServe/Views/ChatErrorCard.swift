@@ -20,10 +20,10 @@ struct ChatErrorCard: View {
                 .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text(notice.headline)
+                Text(L10n.text(notice.headline))
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.red)
-                Text(notice.detail)
+                Text(L10n.text(notice.detail))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

@@ -64,7 +64,7 @@ struct FaviconView: View {
             } else {
                 ZStack {
                     monogramColor
-                    Text(String(domain.first ?? "?").uppercased())
+                    Text(L10n.text(String(domain.first ?? "?").uppercased()))
                         .font(.system(size: size * 0.6, weight: .semibold))
                         .foregroundStyle(.white)
                 }
@@ -139,12 +139,12 @@ struct WebSourcesChip: View {
         } label: {
             HStack(spacing: 10) {
                 FaviconView(domain: source.domain, size: 20)
-                Text(source.title)
+                Text(L10n.text(source.title))
                     .font(.callout)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 8)
-                Text(source.domain)
+                Text(L10n.text(source.domain))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

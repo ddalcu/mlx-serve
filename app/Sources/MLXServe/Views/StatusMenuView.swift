@@ -215,7 +215,7 @@ struct StatusMenuView: View {
         HStack(spacing: 8) {
             Text("MLX Core")
                 .font(.headline)
-            Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+            Text(L10n.text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 6)
@@ -271,7 +271,7 @@ struct StatusMenuView: View {
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
-                        Text(server.lastError)
+                        Text(L10n.text(server.lastError))
                             .font(.caption2)
                             .foregroundStyle(.red)
                             .lineLimit(4)
@@ -305,42 +305,42 @@ struct StatusMenuView: View {
             if !mlxServe.isEmpty {
                 Section("MLX-Serve Models") {
                     ForEach(mlxServe) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !lmStudio.isEmpty {
-                Section(LocalModelSource.lmStudio.sectionTitle) {
+                Section(L10n.text(LocalModelSource.lmStudio.sectionTitle)) {
                     ForEach(lmStudio) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !mtplx.isEmpty {
-                Section(LocalModelSource.mtplx.sectionTitle) {
+                Section(L10n.text(LocalModelSource.mtplx.sectionTitle)) {
                     ForEach(mtplx) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !osaurus.isEmpty {
-                Section(LocalModelSource.osaurus.sectionTitle) {
+                Section(L10n.text(LocalModelSource.osaurus.sectionTitle)) {
                     ForEach(osaurus) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !huggingFace.isEmpty {
                 Section("Hugging Face Cache") {
                     ForEach(huggingFace) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !custom.isEmpty {
                 Section("Custom Folder") {
                     ForEach(custom) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
@@ -351,22 +351,22 @@ struct StatusMenuView: View {
             let network = lanChat.filter { $0.provider == nil }
             let providers = lanChat.filter { $0.provider != nil }
             if !network.isEmpty {
-                Section(ModelPalette.networkSection) {
+                Section(L10n.text(ModelPalette.networkSection)) {
                     ForEach(network, id: \.name) { m in
-                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
                     }
                 }
             }
             if !providers.isEmpty {
-                Section(ModelPalette.providersSection) {
+                Section(L10n.text(ModelPalette.providersSection)) {
                     ForEach(providers, id: \.name) { m in
-                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
                     }
                 }
             }
             if case .available = AppleFoundationChat.availability {
-                Section(ModelPalette.onDeviceSection) {
-                    Text(AppleFoundationChat.displayName).tag(ChatModelSelection.appleTag)
+                Section(L10n.text(ModelPalette.onDeviceSection)) {
+                    Text(L10n.text(AppleFoundationChat.displayName)).tag(ChatModelSelection.appleTag)
                 }
             }
         }
@@ -413,7 +413,7 @@ struct StatusMenuView: View {
                 } else if let systemImageName = control.systemImageName {
                     Image(systemName: systemImageName)
                 }
-                Text(control.title)
+                Text(L10n.text(control.title))
             }
             .frame(maxWidth: .infinity)
         }
@@ -440,7 +440,7 @@ struct StatusMenuView: View {
             if let engine = appState.localModels
                 .first(where: { $0.path == appState.selectedModelPath })?.engine
             {
-                Text(engine.displayName)
+                Text(L10n.text(engine.displayName))
                     .help("Engine the selected model runs on")
             }
         }
@@ -505,7 +505,7 @@ struct StatusMenuView: View {
 
     @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
         HStack {
-            Text(label).foregroundStyle(.secondary)
+            Text(L10n.text(label)).foregroundStyle(.secondary)
             Spacer()
             Text(value).monospacedDigit()
         }
@@ -715,7 +715,7 @@ struct StatusMenuView: View {
             }
             // Speculative-decoding speedup badge (MTP / drafter).
             if let badge = info.specDecodeBadge {
-                Text(badge)
+                Text(L10n.text(badge))
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.green)
                     .padding(.horizontal, 5)
@@ -728,7 +728,7 @@ struct StatusMenuView: View {
             }
             Spacer()
             if info.bytesResident > 0 {
-                Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
+                Text(L10n.text(MemoryInfo.format(Int64(clamping: info.bytesResident))))
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
             }
@@ -1012,7 +1012,7 @@ struct EndpointsSection: View {
                             .font(.system(size: 9, weight: .bold, design: .monospaced))
                             .foregroundStyle(.green)
                             .frame(width: 30, alignment: .leading)
-                        Text(baseURL + "/")
+                        Text(L10n.text(baseURL + "/"))
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.blue)
                             .lineLimit(1)
@@ -1041,11 +1041,11 @@ struct EndpointsSection: View {
     private func copyRow(method: String, display: String,
                          copyKey: String, copyString: String) -> some View {
         HStack(spacing: 4) {
-            Text(method)
+            Text(L10n.text(method))
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(method == "GET" ? .green : .blue)
                 .frame(width: 30, alignment: .leading)
-            Text(display)
+            Text(L10n.text(display))
                 .font(.system(size: 10, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -1148,7 +1148,7 @@ struct ServerLogWindowView: View {
     private var toolbar: some View {
         HStack(spacing: 10) {
             StatusDot(status: server.status)
-            Text(statusLabel)
+            Text(L10n.text(statusLabel))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             Text("·")
@@ -1174,7 +1174,7 @@ struct ServerLogWindowView: View {
             Button {
                 copyLog()
             } label: {
-                Label(copied ? "Copied" : "Copy",
+                Label(L10n.text(copied ? "Copied" : "Copy"),
                       systemImage: copied ? "checkmark" : "doc.on.doc")
             }
             .controlSize(.small)

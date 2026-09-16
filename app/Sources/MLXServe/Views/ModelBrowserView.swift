@@ -112,7 +112,7 @@ private struct ModelBrowserSectionBar: View {
             HStack(spacing: 5) {
                 Image(systemName: item.systemImage)
                     .font(.system(size: 11, weight: .medium))
-                Text(item.title).font(.callout).lineLimit(1)
+                Text(L10n.text(item.title)).font(.callout).lineLimit(1)
                 if item == .downloads, isDownloading {
                     ProgressView()
                         .controlSize(.small)
@@ -120,7 +120,7 @@ private struct ModelBrowserSectionBar: View {
                         .frame(width: 10)
                 }
                 if let badge = badges.badge(for: item) {
-                    Text(badge)
+                    Text(L10n.text(badge))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(isSelected ? .primary : .secondary)
                         .padding(.horizontal, 5)
@@ -279,7 +279,7 @@ private struct RecommendedModelTable: View {
             Image(systemName: family.systemImage)
                 .font(.caption)
                 .foregroundStyle(family.tint)
-            Text(family.title)
+            Text(L10n.text(family.title))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
@@ -341,7 +341,7 @@ private struct MiniCapability: View {
     private var tip: some View {
         VStack(alignment: .leading, spacing: 3) {
             ForEach(CapabilityTip.lines(for: pick), id: \.self) { line in
-                Text(line).font(.caption)
+                Text(L10n.text(line)).font(.caption)
             }
         }
         .padding(.horizontal, 8)
@@ -430,13 +430,13 @@ private struct RecommendedModelTableRow: View {
                                 .foregroundStyle(.tint)
                         }
                     }
-                    Text(pick.tagline)
+                    Text(L10n.text(pick.tagline))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .help(pick.blurb)
+                .help(L10n.text(pick.blurb))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -448,11 +448,11 @@ private struct RecommendedModelTableRow: View {
 
             // Download size (on disk) and the quant it buys.
             VStack(alignment: .trailing, spacing: 2) {
-                Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
+                Text(L10n.text(SystemMemoryInfo.preciseGB(pick.sizeGB)))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                 if let quant = pick.quantLabel {
-                    Text(quant)
+                    Text(L10n.text(quant))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -477,17 +477,18 @@ private struct RecommendedModelTableRow: View {
     /// how that fits what this Mac can give a model.
     private var memoryCell: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB))
+            Text(L10n.text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB)))
                 .font(.caption.monospacedDigit().weight(.medium))
             HStack(spacing: 3) {
                 Image(systemName: fitIcon)
                     .font(.system(size: 9))
-                Text(fit.label)
+                Text(L10n.text(fit.label))
                     .font(.caption2)
             }
             .foregroundStyle(fitColor)
         }
-        .help("Needs about \(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB)) — your Mac can use about \(memory.usableLabel) for a model.")
+        .help(L10n.format("Needs about %@ — your Mac can use about %@ for a model.",
+                          SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB), memory.usableLabel))
     }
 
     private var fitIcon: String {
@@ -567,7 +568,7 @@ private struct RecommendedModelTableRow: View {
             }
         } else if let state, state.status == .failed {
             VStack(alignment: .trailing, spacing: 2) {
-                Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry") { startDownload() }
+                Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry")) { startDownload() }
                     .controlSize(.small)
                 if let error = state.error {
                     Text(error)
@@ -577,7 +578,7 @@ private struct RecommendedModelTableRow: View {
                 }
             }
         } else {
-            Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download") { startDownload() }
+            Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download")) { startDownload() }
                 .controlSize(.small)
         }
     }
@@ -630,7 +631,7 @@ private struct DiscoverPane: View {
                 // ds4), or Both. Re-runs the search on change.
                 Picker("Format", selection: $searchService.format) {
                     ForEach(ModelFormat.allCases) { f in
-                        Text(f.label).tag(f)
+                        Text(L10n.text(f.label)).tag(f)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -789,7 +790,7 @@ private struct MyModelsPane: View {
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
-                            Text(group.title)
+                            Text(L10n.text(group.title))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -800,7 +801,7 @@ private struct MyModelsPane: View {
                     }
 
                     if groups.isEmpty {
-                        Text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”")
+                        Text(L10n.text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”"))
                             .foregroundStyle(.secondary)
                             .padding(40)
                     }
@@ -952,8 +953,8 @@ private struct ModelGroupSection<Content: View>: View {
                     .foregroundStyle(tint)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.subheadline.weight(.semibold))
-                    Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.subheadline.weight(.semibold))
+                    Text(L10n.text(subtitle)).font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -1002,10 +1003,10 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
         HStack(alignment: .top, spacing: 12) {
             Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
-                Text(preset.name)
+                Text(L10n.text(preset.name))
                     .font(.callout.weight(.medium))
 
-                Text(preset.description)
+                Text(L10n.text(preset.description))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1038,7 +1039,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             VStack(alignment: .trailing, spacing: 4) {
-                Text(bundle.approxSizeLabel)
+                Text(L10n.text(bundle.approxSizeLabel))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 actionControl
@@ -1203,7 +1204,7 @@ private struct ModelUseBadge: View {
             default:
                 EmptyView()
             }
-            Text(state.label)
+            Text(L10n.text(state.label))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(tint)
                 .lineLimit(1)
@@ -1282,7 +1283,7 @@ private struct SortableHeader: View {
                 searchService.sort(by: field)
             } label: {
                 HStack(spacing: 2) {
-                    Text(title)
+                    Text(L10n.text(title))
                     if isActive {
                         Image(systemName: searchService.sortDescending ? "chevron.down" : "chevron.up")
                             .font(.system(size: 8))
@@ -1293,7 +1294,7 @@ private struct SortableHeader: View {
             .buttonStyle(.plain)
             .foregroundStyle(isActive ? .primary : .secondary)
         } else {
-            Text(title)
+            Text(L10n.text(title))
         }
     }
 }
@@ -1318,11 +1319,11 @@ private struct ModelBrowserRow: View {
             // Model name — takes all remaining space; click opens the card.
             Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.modelName)
+                Text(L10n.text(model.modelName))
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 6) {
-                    Text(model.author)
+                    Text(L10n.text(model.author))
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -1342,7 +1343,7 @@ private struct ModelBrowserRow: View {
             // Quantization badge
             Group {
                 if let quant = model.quantization {
-                    Text(quant)
+                    Text(L10n.text(quant))
                         .font(.system(size: 10).weight(.medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -1356,20 +1357,20 @@ private struct ModelBrowserRow: View {
             .frame(width: ModelBrowserMetrics.quantWidth, alignment: .leading)
 
             // Size (parsed from model name)
-            Text(model.modelSize)
+            Text(L10n.text(model.modelSize))
                 .font(.callout.monospacedDigit())
                 .frame(width: ModelBrowserMetrics.sizeWidth, alignment: .trailing)
 
             // HF pull count
             if tier.showsPulls {
-                Text(formatCount(model.downloads ?? 0))
+                Text(L10n.text(formatCount(model.downloads ?? 0)))
                     .font(.callout.monospacedDigit())
                     .frame(width: ModelBrowserMetrics.pullsWidth, alignment: .trailing)
             }
 
             // Likes
             if tier.showsLikes {
-                Text(formatCount(model.likes ?? 0))
+                Text(L10n.text(formatCount(model.likes ?? 0)))
                     .font(.callout.monospacedDigit())
                     .frame(width: ModelBrowserMetrics.likesWidth, alignment: .trailing)
             }
@@ -1382,7 +1383,7 @@ private struct ModelBrowserRow: View {
                 Circle()
                     .fill(fitnessColor)
                     .frame(width: 8, height: 8)
-                Text(model.ramEstimate)
+                Text(L10n.text(model.ramEstimate))
                     .font(.callout.monospacedDigit())
                     .lineLimit(1)
             }
@@ -1390,7 +1391,7 @@ private struct ModelBrowserRow: View {
 
             // Last updated
             if tier.showsUpdated {
-                Text(formatRelativeDate(model.lastModifiedDate))
+                Text(L10n.text(formatRelativeDate(model.lastModifiedDate)))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .frame(width: ModelBrowserMetrics.updatedWidth, alignment: .trailing)
@@ -1531,14 +1532,14 @@ private struct ModelBrowserRow: View {
                 downloadingCell(progress: progress)
 
             case .failed(let resumable):
-                Button(resumable ? "Resume" : "Retry") {
+                Button(L10n.text(resumable ? "Resume" : "Retry")) {
                     startDownload()
                 }
                 .font(.callout)
                 .controlSize(.small)
 
             case .notDownloaded(let resumable):
-                Button(resumable ? "Resume" : "Download") {
+                Button(L10n.text(resumable ? "Resume" : "Download")) {
                     startDownload()
                 }
                 .font(.callout)
@@ -1552,7 +1553,7 @@ private struct ModelBrowserRow: View {
             VStack(spacing: 1) {
                 ProgressView(value: progress)
                     .frame(width: 50)
-                Text(state?.percentFormatted ?? "")
+                Text(L10n.text(state?.percentFormatted ?? ""))
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -1633,8 +1634,9 @@ private struct GgufQuantMenu: View {
                             Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
                         } label: {
                             let selected = path(of: quant) == appState.selectedModelPath
-                            Label(
-                                selected ? "\(quant.label) — in use" : "\(quant.label) — use",
+                            Label(L10n.text(
+                                selected ? "\(quant.label) — in use" : "\(quant.label) — use"
+),
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -1642,14 +1644,14 @@ private struct GgufQuantMenu: View {
                 }
             }
 
-            Section(m.onDisk.isEmpty ? "Choose a quant" : "Download another") {
+            Section(L10n.text(m.onDisk.isEmpty ? "Choose a quant" : "Download another")) {
                 if !loaded {
                     Text("Loading quants…")
                 } else if m.available.isEmpty {
-                    Text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded")
+                    Text(L10n.text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded"))
                 } else {
                     ForEach(m.available) { quant in
-                        Button(quant.label) {
+                        Button(L10n.text(quant.label)) {
                             // Pass the whole quant — a sharded one pulls every
                             // shard into `<model>/<quant>/`.
                             downloads.startGguf(repoId: repoId, quant: quant) {
@@ -1665,16 +1667,18 @@ private struct GgufQuantMenu: View {
                 // user didn't ask to delete.
                 Menu("Delete") {
                     ForEach(m.onDisk) { quant in
-                        Button(quant.label, role: .destructive) { pendingDelete = quant }
+                        Button(L10n.text(quant.label), role: .destructive) { pendingDelete = quant }
                     }
                 }
             }
         } label: {
-            Text(GgufQuantMenuModel.buttonLabel(
+            Text(L10n.text(
+                GgufQuantMenuModel.buttonLabel(
                 onDisk: m.onDisk,
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
-            ))
+            )
+))
         }
         .font(.callout)
         .controlSize(.small)
@@ -1739,8 +1743,9 @@ private struct MlxVariantMenu: View {
                             Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
                         } label: {
                             let selected = path(of: v) == appState.selectedModelPath
-                            Label(
-                                selected ? "\(v.label) — in use" : "\(v.label) — use",
+                            Label(L10n.text(
+                                selected ? "\(v.label) — in use" : "\(v.label) — use"
+),
                                 systemImage: selected ? "checkmark.circle.fill" : "checkmark"
                             )
                         }
@@ -1748,12 +1753,12 @@ private struct MlxVariantMenu: View {
                 }
             }
 
-            Section(m.onDisk.isEmpty ? "Choose a quantization" : "Download another") {
+            Section(L10n.text(m.onDisk.isEmpty ? "Choose a quantization" : "Download another")) {
                 if m.available.isEmpty {
                     Text("Every quantization is downloaded")
                 } else {
                     ForEach(m.available) { v in
-                        Button(title(v)) {
+                        Button(L10n.text(title(v))) {
                             downloads.startMlxVariant(repoId: repoId, variant: v) {
                                 appState.refreshModels()
                             }
@@ -1767,16 +1772,18 @@ private struct MlxVariantMenu: View {
                 // the user didn't ask to delete.
                 Menu("Delete") {
                     ForEach(m.onDisk) { v in
-                        Button(v.label, role: .destructive) { pendingDelete = v }
+                        Button(L10n.text(v.label), role: .destructive) { pendingDelete = v }
                     }
                 }
             }
         } label: {
-            Text(MlxVariantMenuModel.buttonLabel(
+            Text(L10n.text(
+                MlxVariantMenuModel.buttonLabel(
                 onDisk: m.onDisk,
                 failed: state?.status == .failed,
                 hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
-            ))
+            )
+))
         }
         .font(.callout)
         .controlSize(.small)
@@ -1857,7 +1864,7 @@ private struct LocalModelRow: View {
                     // The READABLE name. `displayLabel` (the repo id, plus a
                     // quant suffix so two quants of one GGUF repo are two
                     // distinguishable rows) survives as the subtext below —
-                    Text(ModelDisplayName.pretty(model.displayLabel))
+                    Text(L10n.text(ModelDisplayName.pretty(model.displayLabel)))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                     // Drafter checkpoints are real, supported models — they
@@ -1868,7 +1875,7 @@ private struct LocalModelRow: View {
                     // alternative — hiding it — is how two junk folders sat in
                     // this library unnoticed while the server registered both.
                     if let defect = model.defect {
-                        Text(defect.label)
+                        Text(L10n.text(defect.label))
                             .font(.system(size: 10).weight(.medium))
                             .foregroundStyle(.orange)
                             .padding(.horizontal, 5).padding(.vertical, 1)
@@ -1885,7 +1892,7 @@ private struct LocalModelRow: View {
                     }
                 }
                 // The id itself, under the readable name.
-                Text(model.displayLabel)
+                Text(L10n.text(model.displayLabel))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -1897,7 +1904,7 @@ private struct LocalModelRow: View {
                 HStack(spacing: 6) {
                     // For a broken folder the architecture summary is noise —
                     // what it IS matters less than why it cannot load.
-                    Text(model.defect?.explanation ?? model.metadataSummary)
+                    Text(L10n.text(model.defect?.explanation ?? model.metadataSummary))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1933,7 +1940,7 @@ private struct LocalModelRow: View {
             .disabled(cardRequest == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(model.sizeFormatted)
+            Text(L10n.text(model.sizeFormatted))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 90, alignment: .trailing)
@@ -2022,7 +2029,7 @@ private struct LocalModelRow: View {
             Button("Delete", role: .destructive) { performDelete() }
                 .keyboardShortcut(.defaultAction)
         } message: {
-            Text(ModelRowActions.deleteMessage(model))
+            Text(L10n.text(ModelRowActions.deleteMessage(model)))
         }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
         .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
@@ -2075,7 +2082,7 @@ private struct ActiveDownloadRow: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(modelName)
+                Text(L10n.text(modelName))
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
 
@@ -2115,7 +2122,7 @@ private struct ActiveDownloadRow: View {
                 }
                 .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
-                Button(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry") {
+                Button(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry")) {
                     downloads.start(repoId: repoId) { appState.refreshModels() }
                 }
                 .font(.callout)

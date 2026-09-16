@@ -62,7 +62,7 @@ struct TrayStatusChip: View {
             Circle()
                 .fill(model.tone.color)
                 .frame(width: 6, height: 6)
-            Text(model.label)
+            Text(L10n.text(model.label))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
         }
@@ -87,12 +87,12 @@ struct TraySectionHeader: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(title.uppercased())
+            Text(L10n.text(title.uppercased()))
                 .font(.caption2.weight(.semibold))
                 .tracking(0.6)
             Spacer(minLength: 0)
             if let detail {
-                Text(detail)
+                Text(L10n.text(detail))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -159,10 +159,10 @@ struct TrayFeatureRow<Trailing: View>: View {
                 .foregroundStyle(isOn ? tint : Color.secondary)
                 .frame(width: 17)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
+                Text(L10n.text(title))
                     .font(.subheadline.weight(.medium))
                 if let subtitle {
-                    Text(subtitle)
+                    Text(L10n.text(subtitle))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -194,7 +194,7 @@ struct TrayDisclosureHeader<Accessory: View>: View {
                         .font(.caption2.weight(.semibold))
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 9)
-                    Text(title)
+                    Text(L10n.text(title))
                         .font(.subheadline.weight(.medium))
                     Spacer(minLength: 0)
                 }
@@ -226,7 +226,7 @@ struct TrayAccessoryButton: View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Image(systemName: icon)
-                Text(title)
+                Text(L10n.text(title))
             }
             .font(.caption)
         }
@@ -282,7 +282,7 @@ struct TrayTileFace: View {
             Image(systemName: icon)
                 .font(.system(size: 15, weight: .regular))
                 .foregroundStyle(isEnabled ? tint : Color.secondary)
-            Text(title)
+            Text(L10n.text(title))
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(isEnabled ? .primary : .secondary)
                 .lineLimit(1)

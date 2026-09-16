@@ -203,7 +203,7 @@ struct CLISetupInstructionsView: View {
             // this popover's width.
             Picker("", selection: $selectedId) {
                 ForEach(tabs) { tab in
-                    Text(tab.title).tag(tab.id)
+                    Text(L10n.text(tab.title)).tag(tab.id)
                 }
             }
             .pickerStyle(.menu)
@@ -211,7 +211,7 @@ struct CLISetupInstructionsView: View {
 
             if let tab = selected {
                 ScrollView([.vertical, .horizontal]) {
-                    Text(tab.command)
+                    Text(L10n.text(tab.command))
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -222,7 +222,7 @@ struct CLISetupInstructionsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
                 HStack {
-                    Text(tab.installHint)
+                    Text(L10n.text(tab.installHint))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -233,7 +233,7 @@ struct CLISetupInstructionsView: View {
                         copied = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
                     } label: {
-                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        Label(L10n.text(copied ? "Copied" : "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
                     }
                 }
             }

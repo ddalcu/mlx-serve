@@ -29,9 +29,9 @@ struct PlanCardView: View {
                         .frame(width: 16)
                         .foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(step.description)
+                        Text(L10n.text(step.description))
                             .font(.caption)
-                        Text(step.tool.displayName)
+                        Text(L10n.text(step.tool.displayName))
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
@@ -135,7 +135,7 @@ struct ToolResultBlockView: View {
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             ScrollView {
-                Text(truncatedOutput)
+                Text(L10n.text(truncatedOutput))
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -151,7 +151,7 @@ struct ToolResultBlockView: View {
             HStack(spacing: 6) {
                 Image(systemName: step.tool.icon)
                     .foregroundStyle(.secondary)
-                Text(step.description)
+                Text(L10n.text(step.description))
                     .font(.caption)
                     .lineLimit(1)
                 Spacer()

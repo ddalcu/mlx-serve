@@ -104,7 +104,7 @@ struct SeedField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             HStack(spacing: 6) {
                 field
                 Button {
@@ -129,7 +129,7 @@ struct SeedField: View {
     }
 
     private var field: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption.monospacedDigit())
                 .frame(width: 160)

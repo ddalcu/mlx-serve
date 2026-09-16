@@ -92,7 +92,7 @@ struct NewTaskSheet: View {
     /// "New Task" assumes the reader already knows.
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(isEditing ? "Edit Task" : "New Task")
+            Text(L10n.text(isEditing ? "Edit Task" : "New Task"))
                 .font(.title3.weight(.semibold))
             Text("A goal the agent runs on its own, on a schedule.")
                 .font(.subheadline)
@@ -158,7 +158,7 @@ struct NewTaskSheet: View {
                 // keystroke that breaks and re-forms a valid schedule.
                 Group {
                     if let trigger = parsedTrigger {
-                        Label(ScheduleParser.describe(trigger),
+                        Label(L10n.text(ScheduleParser.describe(trigger)),
                               systemImage: "checkmark.circle.fill")
                             .foregroundStyle(.green)
                     } else {
@@ -179,7 +179,7 @@ struct NewTaskSheet: View {
         let selected = scheduleText.trimmingCharacters(in: .whitespaces)
             .caseInsensitiveCompare(value) == .orderedSame
         return Button { scheduleText = value } label: {
-            Text(title)
+            Text(L10n.text(title))
                 .font(.caption.weight(.medium))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
@@ -197,12 +197,12 @@ struct NewTaskSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 Picker("", selection: $autonomy) {
                     ForEach(TaskAutonomy.allCases, id: \.self) { level in
-                        Text(level.shortLabel).tag(level)
+                        Text(L10n.text(level.shortLabel)).tag(level)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                Label(autonomy.blurb,
+                Label(L10n.text(autonomy.blurb),
                       systemImage: autonomy == .yolo ? "exclamationmark.octagon.fill" : "info.circle")
                     .font(.caption)
                     .foregroundStyle(autonomy == .yolo ? Color.red : .secondary)
@@ -227,7 +227,7 @@ struct NewTaskSheet: View {
                         .foregroundStyle(.secondary)
                     Text("Options").font(.subheadline.weight(.semibold))
                     if !showOptions, let summary = optionsSummary {
-                        Text(summary)
+                        Text(L10n.text(summary))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -291,7 +291,7 @@ struct NewTaskSheet: View {
             Spacer()
             Button("Cancel") { dismiss() }
                 .keyboardShortcut(.cancelAction)
-            Button(isEditing ? "Save" : "Create Task") { submit() }
+            Button(L10n.text(isEditing ? "Save" : "Create Task")) { submit() }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canSave)
                 .keyboardShortcut(.defaultAction)
@@ -307,10 +307,10 @@ struct NewTaskSheet: View {
     private func field<Content: View>(_ title: String, hint: String? = nil,
                                       @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.subheadline.weight(.semibold))
+            Text(L10n.text(title)).font(.subheadline.weight(.semibold))
             content()
             if let hint {
-                Text(hint)
+                Text(L10n.text(hint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

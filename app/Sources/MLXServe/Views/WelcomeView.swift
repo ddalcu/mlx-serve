@@ -263,9 +263,9 @@ struct WelcomeView: View {
                 .foregroundColor(.accentColor)
                 .frame(width: 26, alignment: .center)
             VStack(alignment: .leading, spacing: 2) {
-                Text(surface.title)
+                Text(L10n.text(surface.title))
                     .font(.headline)
-                Text(caption(for: surface))
+                Text(L10n.text(caption(for: surface)))
                     .font(.callout)
                     .foregroundStyle(captionStyle(for: surface))
                     .lineLimit(2)
@@ -374,7 +374,7 @@ struct WelcomeView: View {
     /// One small-caps label inside the panel. Same treatment as the tray's
     /// section headers, so the two surfaces read as one design.
     private func panelLabel(_ text: String) -> some View {
-        Text(text)
+        Text(L10n.text(text))
             .font(.caption2.weight(.semibold))
             .tracking(0.6)
             .foregroundStyle(.secondary)
@@ -397,7 +397,7 @@ struct WelcomeView: View {
             Button {
                 leave(.startChatting)
             } label: {
-                Text(hasChatModels ? "Start Chatting" : "Continue")
+                Text(L10n.text(hasChatModels ? "Start Chatting" : "Continue"))
                     .font(.headline)
                     .frame(minWidth: 150)
                     .padding(.vertical, 4)
@@ -438,7 +438,7 @@ struct WelcomeView: View {
             Button {
                 installCLI(target: target)
             } label: {
-                Text(cliInstalling ? "Installing…" : "Install")
+                Text(L10n.text(cliInstalling ? "Installing…" : "Install"))
                     .font(.callout.weight(.semibold))
             }
             .controlSize(.large)
@@ -525,10 +525,10 @@ private struct WelcomeFeatureCard: View {
                     .frame(width: 24, alignment: .center)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(feature.title)
+                    Text(L10n.text(feature.title))
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.primary)
-                    Text(feature.description)
+                    Text(L10n.text(feature.description))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.leading)
@@ -588,7 +588,7 @@ private struct WelcomeModelRow: View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(entry.category)
+                    Text(L10n.text(entry.category))
                         .font(.caption2.weight(.semibold))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
@@ -603,7 +603,7 @@ private struct WelcomeModelRow: View {
                             .help("Recommended for your Mac")
                     }
                 }
-                Text(entry.strength)
+                Text(L10n.text(entry.strength))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -630,7 +630,7 @@ private struct WelcomeModelRow: View {
         } else if let state, state.status == .downloading {
             VStack(spacing: 2) {
                 ProgressView(value: state.progress).frame(width: 58)
-                Text(state.percentFormatted)
+                Text(L10n.text(state.percentFormatted))
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -638,7 +638,7 @@ private struct WelcomeModelRow: View {
             Button {
                 startDownload()
             } label: {
-                Text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Get")
+                Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Get"))
                     .font(.caption.weight(.semibold))
             }
             .controlSize(.small)

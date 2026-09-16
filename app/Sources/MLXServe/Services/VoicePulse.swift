@@ -3,7 +3,7 @@ import Foundation
 /// Time-driven "breathe" math for the in-window voice orb (`VoiceOrbView`).
 ///
 /// IMPORTANT — orb only, never the tray. A continuously-firing breathe wedges
-/// SwiftUI `Button` hit-testing when it's hosted inside the `MenuBarExtra(.window)`
+/// SwiftUI `Button` hit-testing when it's hosted inside the `MenuBarExtra(L10n.text(.window))`
 /// popover of this `LSUIElement` app: the tray's buttons stop responding to
 /// clicks while AppKit pop-up controls (the model `Picker`, the voice `Menu`)
 /// keep working from their own event-tracking loop — the "tray locks up but the

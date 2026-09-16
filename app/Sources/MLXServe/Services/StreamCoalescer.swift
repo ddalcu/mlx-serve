@@ -5,7 +5,7 @@ import Foundation
 ///
 /// **Why this exists — the tray-popover freeze.** The chat/agent engine writes
 /// streamed tokens into `AppState.chatSessions`, which is `@Published`; every
-/// write fires `AppState.objectWillChange`. While the `MenuBarExtra(.window)`
+/// write fires `AppState.objectWillChange`. While the `MenuBarExtra(L10n.text(.window))`
 /// tray popover is open during the assistant's answer (the hands-free voice
 /// case), that per-token churn re-renders the whole popover dozens-to-hundreds
 /// of times a second. In this `LSUIElement` accessory app the popover lives in a

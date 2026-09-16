@@ -6,7 +6,7 @@ import Foundation
 /// state, with **no** `TimelineView`, no time input, and no per-frame redraw.
 ///
 /// Why it must be static — and why this is NOT the same as the in-window orb:
-/// MLX Core is an `LSUIElement` accessory app, so the `MenuBarExtra(.window)`
+/// MLX Core is an `LSUIElement` accessory app, so the `MenuBarExtra(L10n.text(.window))`
 /// popover is hosted in a non-key panel. A continuously redrawing view there —
 /// a `repeatForever` animation *or* a running `TimelineView(.animation)` —
 /// saturates the popover's run loop in the default mode and starves SwiftUI

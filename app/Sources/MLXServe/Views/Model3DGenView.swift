@@ -94,7 +94,7 @@ struct Model3DGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 

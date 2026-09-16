@@ -548,7 +548,7 @@ struct CLILauncherMenuItems: View {
                     Button {
                         openHostCLI(cli)
                     } label: {
-                        Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                        Label(L10n.text(cli.displayName), systemImage: cli.iconSystemName ?? "terminal")
                     }
                 }
             }

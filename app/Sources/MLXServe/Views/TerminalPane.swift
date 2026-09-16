@@ -20,7 +20,7 @@ struct TerminalPane: View {
                 content(session)
                 Divider()
                 HStack(spacing: 8) {
-                    Label(session.workspace, systemImage: "folder")
+                    Label(L10n.text(session.workspace), systemImage: "folder")
                         .font(.caption2).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                     Spacer()
@@ -65,7 +65,7 @@ struct TerminalPane: View {
                     .textSelection(.enabled)
                 HStack {
                     if let fix = TerminalFailureFix.for(message: message) {
-                        Button(fix.title) { apply(fix, to: session.id) }
+                        Button(L10n.text(fix.title)) { apply(fix, to: session.id) }
                             .keyboardShortcut(.defaultAction)
                     }
                     Button("Retry") { terminals.retry(session.id) }
@@ -113,7 +113,7 @@ struct TerminalPane: View {
             HStack(spacing: 6) {
                 Text("Connect from your terminal:")
                     .font(.caption2).foregroundStyle(.secondary)
-                Text(cmd)
+                Text(L10n.text(cmd))
                     .font(.caption2.monospaced())
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -125,7 +125,7 @@ struct TerminalPane: View {
                     copiedSsh = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedSsh = false }
                 } label: {
-                    Label(copiedSsh ? "Copied" : "Copy", systemImage: copiedSsh ? "checkmark" : "doc.on.doc")
+                    Label(L10n.text(copiedSsh ? "Copied" : "Copy"), systemImage: copiedSsh ? "checkmark" : "doc.on.doc")
                         .labelStyle(.iconOnly)
                 }
                 .buttonStyle(.borderless)

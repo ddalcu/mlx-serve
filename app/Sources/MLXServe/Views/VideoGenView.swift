@@ -210,7 +210,7 @@ struct VideoGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -223,7 +223,7 @@ struct VideoGenView: View {
                 Spacer()
                 Menu("Examples") {
                     ForEach(examplePrompts, id: \.title) { ex in
-                        Button(ex.title) { prompt = ex.body }
+                        Button(L10n.text(ex.title)) { prompt = ex.body }
                     }
                 }
                 .menuStyle(.borderlessButton)
@@ -242,7 +242,7 @@ struct VideoGenView: View {
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
-                    Text(H3PromptExamples.placeholder(for: model.promptFormat))
+                    Text(L10n.text(H3PromptExamples.placeholder(for: model.promptFormat)))
                         .font(.body)
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
@@ -252,7 +252,7 @@ struct VideoGenView: View {
             }
             promptResizeHandle
             if let hint = promptHint {
-                Text(hint).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(hint)).font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -324,13 +324,13 @@ struct VideoGenView: View {
             Text("Quality").font(.subheadline.weight(.semibold))
             Picker("", selection: $quality) {
                 ForEach(QualityPreset.allCases) { q in
-                    Text(q.label).tag(q)
+                    Text(L10n.text(q.label)).tag(q)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-            Text(qualityHint)
+            Text(L10n.text(qualityHint))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -344,7 +344,8 @@ struct VideoGenView: View {
         // Gated on the capability so a stale clip can't make H3 claim it.
         let label = (model.supportsAudioInput && audioURL != nil && s.mode == .oneStage)
             ? "2-stage (audio-to-video)" : modeLabel(s.mode)
-        return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
+        return L10n.format("%@, %lld steps, %lld frames (~%.1fs)",
+                           L10n.text(label), Int64(s.steps), Int64(s.numFrames), durationSec)
     }
 
     private func modeLabel(_ m: VideoPipelineMode) -> String {
@@ -360,7 +361,7 @@ struct VideoGenView: View {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
                 ForEach(model.resolutionOptions()) { r in
-                    Text(r.label).tag(r)
+                    Text(L10n.text(r.label)).tag(r)
                 }
             }
             .labelsHidden()
@@ -373,7 +374,7 @@ struct VideoGenView: View {
             // note is about the combination, not the resolution.
             if model.settings(quality).mode != .oneStage,
                let note = model.twoStageCanvasNote(width: effectiveSize.width, height: effectiveSize.height) {
-                Text(note).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(note)).font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -391,7 +392,7 @@ struct VideoGenView: View {
                 labelledSizeField("Height", text: $customHeightText)
             }
             if let hint = verdict.hint {
-                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
             }
@@ -400,7 +401,7 @@ struct VideoGenView: View {
 
     private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(L10n.text(title)).font(.caption2).foregroundStyle(.secondary)
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 80)
@@ -430,7 +431,7 @@ struct VideoGenView: View {
             HStack {
                 Text("Frames").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(numFrames) frames · ~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
+                Text(L10n.format("%lld frames · ~%.1fs", Int64(numFrames), Double(numFrames) / Double(fps)))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -438,10 +439,10 @@ struct VideoGenView: View {
             // slider can only land on generatable lengths (9, 17, 25, … maxFrames).
             frameSlider
             if let warn = frameRAMWarning {
-                Text(warn).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(warn)).font(.caption2).foregroundStyle(.orange)
             }
             if let advice = model.framesAdvisory(numFrames) {
-                Text(advice).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(advice)).font(.caption2).foregroundStyle(.orange)
             }
         }
     }
@@ -466,7 +467,8 @@ struct VideoGenView: View {
             in: 0...Double(maxIdx),
             step: 1
         )
-        .help("Clip length. LTX only generates \(opts.first ?? 9)–\(opts.last ?? 193) frames on its 8N+1 ladder; the slider snaps to valid counts.")
+        .help(L10n.format("Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts.",
+                          Int64(opts.first ?? 9), Int64(opts.last ?? 193)))
     }
 
     /// Always show every option up to the model's hard cap. The user can
@@ -506,7 +508,7 @@ struct VideoGenView: View {
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
-            return "May exceed your Mac's RAM (\(total) GB total) at this length."
+            return L10n.format("May exceed your Mac's RAM (%lld GB total) at this length.", Int64(total))
         }
         // Ask whether THIS configuration fits, not whether it is longer than
         // the cap: the cap has a floor, so "cap == 124" means both "124 frames
@@ -579,9 +581,9 @@ struct VideoGenView: View {
                               isTargeted: Binding<Bool>, help: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(title).font(.subheadline.weight(.semibold))
+                Text(L10n.text(title)).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(note)
+                Text(L10n.text(note))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -666,13 +668,13 @@ struct VideoGenView: View {
                                    into: $refAudioURLs)
                 }
                 if let note = H3RefLimits.totalNote(attached: refFilesAttached) {
-                    Text(note).font(.caption2).foregroundStyle(.orange)
+                    Text(L10n.text(note)).font(.caption2).foregroundStyle(.orange)
                 }
 
                 if !refImageURLs.isEmpty {
                     Picker("Image detail", selection: $refImageSize) {
                         ForEach(RefImageSizing.allCases, id: \.self) { s in
-                            Text(s.label).tag(s)
+                    Text(L10n.text(s.label)).tag(s)
                         }
                     }
                     .font(.caption)
@@ -706,7 +708,7 @@ struct VideoGenView: View {
                          add: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                Text(L10n.text(title)).font(.caption.weight(.medium)).foregroundStyle(.secondary)
                 Spacer()
                 Text("\(urls.wrappedValue.count)/\(limit)")
                     .font(.caption2)
@@ -735,7 +737,7 @@ struct VideoGenView: View {
             // note under the section saying why.
             if refRemaining(perType: limit, current: urls.wrappedValue.count) > 0 {
                 Button(action: add) {
-                    Label(addLabel, systemImage: systemImage)
+                    Label(L10n.text(addLabel), systemImage: systemImage)
                         .font(.caption)
                         .frame(maxWidth: .infinity)
                 }
@@ -765,7 +767,7 @@ struct VideoGenView: View {
                 HStack {
                     Text("Sound").font(.subheadline.weight(.semibold))
                     Spacer()
-                    Text(model.generatesAudio ? "generated with the video" : "not supported")
+                    Text(L10n.text(model.generatesAudio ? "generated with the video" : "not supported"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -850,7 +852,7 @@ struct VideoGenView: View {
                     Button {
                         tts.generate(AudioGenRequest(model: preset, text: speechText), server: server)
                     } label: {
-                        Label(audioURL == nil ? "Create speech" : "Recreate speech", systemImage: "waveform")
+                        Label(L10n.text(audioURL == nil ? "Create speech" : "Recreate speech"), systemImage: "waveform")
                             .font(.caption)
                     }
                     .buttonStyle(.bordered)
@@ -880,7 +882,7 @@ struct VideoGenView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let d = audioDuration {
-                    Text(String(format: "%.1fs%@", d, clipOutlastsVideo ? " — trimmed to the video length" : ""))
+                    Text(L10n.text(String(format: "%.1fs%@", d, clipOutlastsVideo ? " — trimmed to the video length" : "")))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -985,12 +987,12 @@ struct VideoGenView: View {
             // Steps — more steps = more detail/smoother motion, but slower.
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
-            Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
+            Text(L10n.text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp))
                 .font(.caption2).foregroundStyle(.secondary)
             // The low end is REACHABLE and only advised against, so the pane
             // can load a community few-step adapter the way the server can.
             if let advice = model.stepsAdvisory(steps: steps, distilled: distilledSampling) {
-                Text(advice).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(advice)).font(.caption2).foregroundStyle(.orange)
             }
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
@@ -1043,9 +1045,11 @@ struct VideoGenView: View {
                     Text("Chained windows: \(chainWindows)").font(.caption)
                 }
                 .help("Join several generations end to end, each starting from the last frame of the one before.")
-                Text(chainWindows > 1
+                Text(L10n.text(
+                     chainWindows > 1
                      ? "\(chainWindows) windows joined end to end — about \(numFrames * chainWindows) frames, and roughly \(chainWindows)x the time of a single window."
-                     : "Joins several generations end to end for a longer clip. Each window costs another full generation.")
+                     : "Joins several generations end to end for a longer clip. Each window costs another full generation."
+))
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -1179,7 +1183,7 @@ struct VideoGenView: View {
             Circle()
                 .fill(service.residency?.loaded == true ? Color.green : Color.secondary.opacity(0.4))
                 .frame(width: 7, height: 7)
-            Text(residencyText)
+            Text(L10n.text(residencyText))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1262,9 +1266,9 @@ struct VideoGenView: View {
     private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
                 Spacer()
-                Text(String(format: "%.1f", value.wrappedValue))
+                Text(L10n.text(String(format: "%.1f", value.wrappedValue)))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -1277,7 +1281,7 @@ struct VideoGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
                 Spacer()
                 Text("\(value.wrappedValue)")
                     .font(.caption.monospacedDigit())
@@ -1322,7 +1326,7 @@ struct VideoGenView: View {
                 }
             }
             if !service.isRunning, let est = timeEstimate {
-                Text(est)
+                Text(L10n.text(est))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")

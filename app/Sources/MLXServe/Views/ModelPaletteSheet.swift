@@ -95,7 +95,7 @@ struct ModelPaletteSheet: View {
                                     .id(entry.index)
                             }
                         } header: {
-                            Text(section)
+                            Text(L10n.text(section))
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -126,11 +126,11 @@ struct ModelPaletteSheet: View {
                     .foregroundStyle(row.tag == currentTag ? Color.accentColor : .secondary)
                     .frame(width: 16)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(row.title)
+                    Text(L10n.text(row.title))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                     if !row.detail.isEmpty {
-                        Text(row.detail)
+                        Text(L10n.text(row.detail))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -149,7 +149,7 @@ struct ModelPaletteSheet: View {
     private var emptyState: some View {
         VStack(spacing: 10) {
             Spacer()
-            Text(rows.isEmpty ? "No chat models on this Mac" : "No models match “\(query)”")
+            Text(L10n.text(rows.isEmpty ? "No chat models on this Mac" : "No models match “\(query)”"))
                 .foregroundStyle(.secondary)
             // With nothing to pick, the one useful thing is the way to get a
             // model — the same door the pill's last row opens.
