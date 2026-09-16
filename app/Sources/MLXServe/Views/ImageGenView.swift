@@ -229,7 +229,7 @@ struct ImageGenView: View {
                         HStack {
                             Text("Variation strength").font(.caption)
                             Spacer()
-                            Text(L10n.text(String(format: "%.0f%%", strength * 100)))
+                            Text(String(format: "%.0f%%", strength * 100))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -505,7 +505,7 @@ struct ImageGenView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Guidance scale").font(.caption)
                     Stepper(value: $guidanceScale, in: 1...20, step: 0.5) {
-                        Text(L10n.text(String(format: "%.1f", guidanceScale)))
+                        Text(String(format: "%.1f", guidanceScale))
                     }
                     .onChange(of: guidanceScale) { _, _ in guard !hydrating else { return }; persist() }
                 }
@@ -530,7 +530,7 @@ struct ImageGenView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Global gain").font(.caption)
                     Stepper(value: $condGain, in: 0...4, step: 0.1) {
-                        Text(L10n.text(String(format: "%.1f", condGain)))
+                        Text(String(format: "%.1f", condGain))
                     }
                     .onChange(of: condGain) { _, _ in guard !hydrating else { return }; persist() }
                 }
@@ -703,7 +703,7 @@ struct ImageGenView: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(label)).font(.caption)
             Stepper(value: value, step: step) {
-                Text(L10n.text(String(value.wrappedValue)))
+                Text(String(value.wrappedValue))
             }
         }
     }

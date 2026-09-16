@@ -1161,7 +1161,7 @@ private struct AgentEditor: View {
                     endLabels(ends, dimmed: isDefault)
                 }
                 .frame(width: 160)
-                Text(L10n.text(String(format: "%.2f", value.wrappedValue ?? seed)))
+                Text(String(format: "%.2f", value.wrappedValue ?? seed))
                     .font(.caption.monospaced())
                     .foregroundStyle(isDefault ? .secondary : .primary)
                     .frame(width: Self.valueColumnWidth, alignment: .trailing)

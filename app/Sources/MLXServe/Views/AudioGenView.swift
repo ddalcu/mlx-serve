@@ -374,7 +374,7 @@ struct VoiceGenView: View {
                 HStack(spacing: 10) {
                     Image(systemName: "mic.fill").foregroundStyle(.red)
                     ProgressView(value: Double(recorder.level)).frame(width: 120)
-                    Text(L10n.text(String(format: "%.1fs", recorder.duration)))
+                    Text(String(format: "%.1fs", recorder.duration))
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     Spacer()
                     Button { stopRecording() } label: {

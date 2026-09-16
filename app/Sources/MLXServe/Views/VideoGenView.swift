@@ -882,7 +882,7 @@ struct VideoGenView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let d = audioDuration {
-                    Text(L10n.text(String(format: "%.1fs%@", d, clipOutlastsVideo ? " — trimmed to the video length" : "")))
+                    Text(String(format: "%.1fs%@", d, clipOutlastsVideo ? L10n.text(" — trimmed to the video length") : ""))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -1268,7 +1268,7 @@ struct VideoGenView: View {
             HStack {
             Text(L10n.text(label)).font(.caption)
                 Spacer()
-                Text(L10n.text(String(format: "%.1f", value.wrappedValue)))
+                Text(String(format: "%.1f", value.wrappedValue))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }

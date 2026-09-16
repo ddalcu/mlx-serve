@@ -318,7 +318,7 @@ private struct MicButton: View {
                 Image(systemName: recorder.isRecording ? "stop.fill" : "mic.fill")
                     .font(.system(size: 12, weight: .medium))
                 if recorder.isRecording {
-                    Text(L10n.text(timeString(recorder.duration)))
+                    Text(timeString(recorder.duration))
                         .font(.caption2.monospacedDigit().weight(.medium))
                 }
             }

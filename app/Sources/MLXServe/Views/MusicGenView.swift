@@ -371,7 +371,7 @@ struct MusicGenView: View {
                     HStack(spacing: 6) {
                         Text("Cover strength").font(.caption)
                         Spacer()
-                        Text(L10n.text(String(format: "%.2f", coverStrength))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", coverStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                     Slider(value: $coverStrength, in: 0...1, step: 0.05)
                     Text("How many of the steps follow the source. 1 keeps it all the way; lower lets the caption take over for the last steps.")
@@ -381,7 +381,7 @@ struct MusicGenView: View {
                     HStack(spacing: 6) {
                         Text("Noise strength").font(.caption)
                         Spacer()
-                        Text(L10n.text(String(format: "%.2f", coverNoiseStrength))).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", coverNoiseStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                     Slider(value: $coverNoiseStrength, in: 0...1, step: 0.05)
                     Text("0 starts from pure noise (the default). Higher starts closer to the original audio, so more of it comes through.")

@@ -2395,7 +2395,7 @@ private struct RequestDefaultsSectionContent: View {
                 VStack(alignment: .trailing, spacing: 4) {
                     HStack(spacing: 8) {
                         Slider(value: opts.defaultTemperature, in: 0...2, step: 0.05)
-                        Text(L10n.text(String(format: "%.2f", appState.serverOptions.defaultTemperature)))
+                        Text(String(format: "%.2f", appState.serverOptions.defaultTemperature))
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 36, alignment: .trailing)
                     }
@@ -2408,7 +2408,7 @@ private struct RequestDefaultsSectionContent: View {
                 VStack(alignment: .trailing, spacing: 4) {
                     HStack(spacing: 8) {
                         Slider(value: opts.defaultTopP, in: 0.1...1.0, step: 0.01)
-                        Text(L10n.text(String(format: "%.2f", appState.serverOptions.defaultTopP)))
+                        Text(String(format: "%.2f", appState.serverOptions.defaultTopP))
                             .font(.body.monospacedDigit())
                             .frame(minWidth: 36, alignment: .trailing)
                     }
@@ -2443,7 +2443,7 @@ private struct RequestDefaultsSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer) {
                 HStack(spacing: 8) {
                     Slider(value: opts.defaultRepeatPenalty, in: 1.0...2.0, step: 0.01)
-                    Text(L10n.text(String(format: "%.2f", appState.serverOptions.defaultRepeatPenalty)))
+                    Text(String(format: "%.2f", appState.serverOptions.defaultRepeatPenalty))
                         .font(.body.monospacedDigit())
                         .frame(minWidth: 40, alignment: .trailing)
                 }
@@ -2453,7 +2453,7 @@ private struct RequestDefaultsSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer) {
                 HStack(spacing: 8) {
                     Slider(value: opts.defaultPresencePenalty, in: 0.0...2.0, step: 0.01)
-                    Text(L10n.text(String(format: "%.2f", appState.serverOptions.defaultPresencePenalty)))
+                    Text(String(format: "%.2f", appState.serverOptions.defaultPresencePenalty))
                         .font(.body.monospacedDigit())
                         .frame(minWidth: 40, alignment: .trailing)
                 }
@@ -2690,7 +2690,7 @@ private struct VoiceCloneSectionContent: View {
                 Button { chooseVoiceFile() } label: { Label("Choose file…", systemImage: "folder") }
                 if recorder.isRecording {
                     Button(role: .destructive) { stopRecording() } label: {
-                        Label(L10n.text(String(format: "Stop (%.1fs)", recorder.duration)), systemImage: "stop.circle")
+                        Label(L10n.format("Stop (%.1fs)", recorder.duration), systemImage: "stop.circle")
                     }
                 } else {
                     Button { startRecording() } label: { Label("Record", systemImage: "mic") }
