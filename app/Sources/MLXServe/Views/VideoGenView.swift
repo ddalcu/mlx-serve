@@ -22,9 +22,6 @@ struct VideoGenView: View {
     @State private var prompt: String = ""
     /// Height of the prompt editor — dragged by `promptResizeHandle`, sticky.
     @State private var promptHeight: Double = PromptEditorHeight.defaultHeight
-    /// Height when the current drag began (nil = not dragging); `translation`
-    /// is cumulative from the gesture's start, so it needs an anchor.
-    @State private var promptHeightAtDragStart: Double? = nil
     @State private var showAdvanced: Bool = false
     @State private var model: VideoModelPreset = .ltx23Q4
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
@@ -221,7 +218,7 @@ struct VideoGenView: View {
             HStack(spacing: 8) {
                 Text("Prompt").font(.subheadline.weight(.semibold))
                 Spacer()
-                Menu("Examples") {
+                Menu("Templates") {
                     ForEach(examplePrompts, id: \.title) { ex in
                         Button(ex.title) { prompt = ex.body }
                     }
@@ -257,33 +254,12 @@ struct VideoGenView: View {
         }
     }
 
-    /// Drag strip under the prompt editor. H3's format is a multi-section
-    /// document, so 110pt is a keyhole — full width so it's easy to grab, and
-    /// the height sticks (clamped on the way in and out, so a value dragged on
-    /// a taller window can't come back unusable).
+    /// H3's format is a multi-section document, so 110pt is a keyhole. The
+    /// height sticks (clamped on the way in and out, so a value dragged on a
+    /// taller window can't come back unusable).
     private var promptResizeHandle: some View {
-        Capsule()
-            .fill(Color.secondary.opacity(0.35))
-            .frame(width: 36, height: 4)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 3)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 1)
-                    .onChanged { v in
-                        let base = promptHeightAtDragStart ?? promptHeight
-                        if promptHeightAtDragStart == nil { promptHeightAtDragStart = base }
-                        promptHeight = PromptEditorHeight.clamp(base + v.translation.height)
-                    }
-                    .onEnded { _ in
-                        promptHeightAtDragStart = nil
-                        persist()
-                    }
-            )
-            .onHover { inside in
-                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
-            }
-            .help("Drag to resize the prompt box.")
+        EditorResizeHandle(height: $promptHeight, onCommit: persist,
+                           help: "Drag to resize the prompt box.")
     }
 
     /// Soft caption under the prompt field. Per-BACKEND: LTX's "4–8 sentences"

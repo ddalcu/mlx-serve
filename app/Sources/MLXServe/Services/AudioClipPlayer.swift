@@ -21,7 +21,9 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
     /// a single pane with a single shelf.
     static let shared = AudioClipPlayer()
 
-    /// The file currently playing (or paused), else nil. Drives shelf highlight.
+    /// The file currently playing, else nil. Drives shelf highlight, which is
+    /// why there is no pause: a paused clip kept the shelf lit under something
+    /// that had stopped making sound.
     @Published private(set) var playingPath: String?
 
     private var sound: NSSound?
@@ -34,16 +36,6 @@ final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
         sound = s
         playingPath = path
         s.play()
-    }
-
-    /// Pause in place; `play` the same path (or `resume`) starts it again.
-    func pause() {
-        sound?.pause()
-    }
-
-    /// Resume a paused clip; no-op if nothing is loaded.
-    func resume() {
-        sound?.resume()
     }
 
     /// Stop and forget the current clip.

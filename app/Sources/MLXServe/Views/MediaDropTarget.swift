@@ -287,12 +287,14 @@ extension View {
     }
 }
 
-/// The empty state's target: something to see and aim at, rather than a bare
-/// button inside an invisible drop region.
-struct MediaDropWell: View {
+/// One way into a slot: what it is, the control that does it, and the line
+/// underneath saying what else would work. The BUTTON is the click target, not
+/// the column around it — a tap gesture wrapping a button is the swallowed
+/// click.
+struct MediaDropWellOption: View {
     let title: String
     let systemImage: String
-    let isTargeted: Bool
+    let caption: String
     let action: () -> Void
 
     var body: some View {
@@ -303,14 +305,82 @@ struct MediaDropWell: View {
             Button(title, action: action)
                 .buttonStyle(.link)
                 .font(.caption)
-            Text("or drag one here")
+            Text(caption)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                // A caption long enough to wrap centres every line, not just
+                // the block: a left-aligned second line under a centred first
+                // one reads as two different columns.
+                .multilineTextAlignment(.center)
+        }
+    }
+}
+
+/// The empty state's target: something to see and aim at, rather than a bare
+/// button inside an invisible drop region.
+struct MediaDropWell: View {
+    let title: String
+    let systemImage: String
+    /// The line under the control. Defaults to what a drop target has to say;
+    /// a pane with something more useful to put there passes its own.
+    var caption: String = "or drag one here"
+    let isTargeted: Bool
+    let action: () -> Void
+
+    var body: some View {
+        MediaDropWellOption(title: title, systemImage: systemImage,
+                            caption: caption, action: action)
+            .frame(maxWidth: .infinity, minHeight: 84)
+            .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// Two ways into ONE slot, in one well. The drop region is still the whole
+/// rectangle — the halves are aim points for the two things a click can do,
+/// not two targets.
+struct MediaDropWellPair: View {
+    let isTargeted: Bool
+    let leading: MediaDropWellOption
+    let trailing: MediaDropWellOption
+
+    var body: some View {
+        HStack(spacing: 0) {
+            leading.frame(maxWidth: .infinity)
+            Divider().frame(height: 52)
+            trailing.frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, minHeight: 84)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.secondary.opacity(isTargeted ? 0.12 : 0.06))
-        )
+        .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// The well once the slot HOLDS something: same surface, same floor height,
+/// whatever the pane wants inside it. The block is how you keep your place in
+/// a long form, so it must not disappear the moment you use it — it may grow
+/// past the floor, never shrink below it.
+struct MediaDropWellFilled<Content: View>: View {
+    let isTargeted: Bool
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            // `alignment:` is load-bearing — a bare `maxWidth: .infinity`
+            // CENTRES, so a row without a trailing Spacer (a converting
+            // spinner) would sit in the middle while every other state hugs
+            // the left.
+            .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
+            .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// The well's own surface, so the shapes cannot drift apart.
+struct MediaDropWellBackground: View {
+    let isTargeted: Bool
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.secondary.opacity(isTargeted ? 0.12 : 0.06))
     }
 }

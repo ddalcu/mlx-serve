@@ -251,6 +251,9 @@ struct MusicGenSettings: Codable, Equatable {
     /// The draft (see `AudioGenSettings.text`).
     var prompt: String = ""
     var lyrics: String = ""
+    /// Height of the lyrics editor, dragged by its handle (see the video
+    /// pane's prompt box).
+    var lyricsHeight: Double = PromptEditorHeight.defaultHeight
     var refAudioPath: String? = nil
     /// Source-audio task state (ACE-Step cover / complete), part of the draft.
     var task: MusicTask = .text2music
@@ -305,6 +308,9 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .lyricsHeight) {
+            lyricsHeight = PromptEditorHeight.clamp(v)
+        }
         refAudioPath = try c.decodeIfPresent(String.self, forKey: .refAudioPath)
         if let v = try c.decodeIfPresent(MusicTask.self, forKey: .task) { task = v }
         srcAudioPath = try c.decodeIfPresent(String.self, forKey: .srcAudioPath)
