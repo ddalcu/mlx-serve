@@ -255,7 +255,7 @@ struct MusicGenView: View {
                 // label, so the reason is readable before the mode is even
                 // selected — the whole point of #269.
                 ForEach(MusicTask.allCases, id: \.self) { t in
-                    Text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready)).tag(t)
+                    Text(L10n.text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready))).tag(t)
                 }
             }
             .labelsHidden().pickerStyle(.segmented)

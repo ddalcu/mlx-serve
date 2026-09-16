@@ -342,7 +342,7 @@ final class LocalizationTests: XCTestCase {
     private static let labelProducers = [
         "actionLabel", "actionTitle", "buttonLabel", "caption",
         "controller.partialTranscript", "defect?.explanation", "detail", "displayName",
-        "engineExplainer", "label", "lead", "modelPickerLabel", "placeholder", "pretty",
+        "engineExplainer", "label", "lead", "modeLabel", "modelPickerLabel", "placeholder", "pretty",
         "run.summary ?? run.status.label", "shortMessage", "startupModelLabel", "statusLine", "title",
     ]
 
