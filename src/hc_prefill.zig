@@ -39,7 +39,7 @@ fn getKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     if (kernels[which]) |k| return k;
     const ni = [_][*:0]const u8{ "x", "w", "eps", "wo", "wi" };
     const no = [_][*:0]const u8{ "normed", "stream" };
-    const mi = [_][*:0]const u8{ "up", "normed", "sigtab" };
+    const mi = [_][*:0]const u8{ "up", "normed", "sigtab", "rows" };
     const mo = [_][*:0]const u8{"out"};
     const ins = if (which == 0) mlx.mlx_vector_string_new_data(&ni, ni.len) else mlx.mlx_vector_string_new_data(&mi, mi.len);
     defer _ = mlx.mlx_vector_string_free(ins);
@@ -131,10 +131,11 @@ pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batc
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, batch * seq * hidden, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", batch * seq));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", hc));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", hidden));
-    const ins = mlx.mlx_vector_array_new_data(&.{ up, normalized, try sigmoidTable(s) }, 3);
+    const rows = mlx.mlx_array_new_int(batch * seq);
+    defer _ = mlx.mlx_array_free(rows);
+    const ins = mlx.mlx_vector_array_new_data(&.{ up, normalized, try sigmoidTable(s), rows }, 4);
     defer _ = mlx.mlx_vector_array_free(ins);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);

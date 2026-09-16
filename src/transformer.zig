@@ -32966,8 +32966,8 @@ const GDN_PREWORK_SOURCE =
     \\// Grid row = b*S + r over the batch: q/k/v/g/beta/b/a are [B,S,..] flat
     \\// so `row` indexes them directly; the conv taps + next state are per batch.
     \\uint row = threadgroup_position_in_grid.y;
-    \\uint b = row / uint(S);
-    \\uint r = row - b * uint(S);
+    \\uint b = row / uint(seq);
+    \\uint r = row - b * uint(seq);
     \\uint logical_head = threadgroup_position_in_grid.z;
     \\constexpr uint q_heads = uint(HK);
     \\constexpr uint k_head_base = uint(HK);
@@ -32994,7 +32994,7 @@ const GDN_PREWORK_SOURCE =
     \\    const T conv = T(acc);
     \\    // MLX's unary Sigmoid formula (unary_ops.h), verbatim, in the tensor dtype.
     \\    T sig;
-    \\    if constexpr (S >= 17) sig = sigtab[as_type<ushort>(conv)];
+    \\    if constexpr (TAB) sig = sigtab[as_type<ushort>(conv)];
     \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); sig = conv < T(0) ? sy : T(1) - sy; }
     \\    const T act = conv * sig;
     \\    activated[i] = act;
@@ -33028,7 +33028,7 @@ const GDN_PREWORK_SOURCE =
     \\        // bf16 add, f32 precise exp / log1p / exp, bf16 store.
     \\        const T bv = b_in[row * uint(BSTRIDE) + uint(BOFF) + head];
     \\        T bsig;
-    \\        if constexpr (S >= 17) bsig = sigtab[as_type<ushort>(bv)];
+    \\        if constexpr (TAB) bsig = sigtab[as_type<ushort>(bv)];
     \\        else { T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); bsig = bv < T(0) ? by : T(1) - by; }
     \\        beta_out[row * uint(HV) + head] = bsig;
     \\        const T apd = T(float(a_in[row * uint(ASTRIDE) + uint(AOFF) + head]) + float(dt_bias[head]));
@@ -33038,8 +33038,8 @@ const GDN_PREWORK_SOURCE =
     \\    }
     \\}
     \\// Next conv state = rows [S, S+NKEEP) of concat(conv_state, qkv).
-    \\if (r + uint(NKEEP) >= uint(S)) {
-    \\    uint state_row = r + uint(NKEEP) - uint(S);
+    \\if (r + uint(NKEEP) >= uint(seq)) {
+    \\    uint state_row = r + uint(NKEEP) - uint(seq);
     \\    uint raw_base = row * uint(QSTRIDE) + uint(QOFF) + channel_base + lane * 4;
     \\    uint state_base = (b * uint(NKEEP) + state_row) * uint(C) + channel_base + lane * 4;
     \\    for (uint i = 0; i < 4; ++i) {
@@ -33047,8 +33047,8 @@ const GDN_PREWORK_SOURCE =
     \\    }
     \\}
     \\if (r == 0) {
-    \\    for (uint rr = 0; rr + uint(S) < uint(NKEEP); ++rr) {
-    \\        uint src_base = (b * uint(NKEEP) + rr + uint(S)) * uint(C) + channel_base + lane * 4;
+    \\    for (uint rr = 0; rr + uint(seq) < uint(NKEEP); ++rr) {
+    \\        uint src_base = (b * uint(NKEEP) + rr + uint(seq)) * uint(C) + channel_base + lane * 4;
     \\        uint dst_base = (b * uint(NKEEP) + rr) * uint(C) + channel_base + lane * 4;
     \\        for (uint i = 0; i < 4; ++i) {
     \\            conv_out[dst_base + i] = conv_state[src_base + i];
@@ -33087,7 +33087,7 @@ pub fn gdnDecodeFusedEnabled() bool {
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     if (gdn_prework_kernel) |k| return k;
-    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab" };
+    const input_names = [_][*:0]const u8{ "qkv", "conv_state", "conv_w", "q_scale", "k_scale", "b_in", "a_in", "A_log", "dt_bias", "sigtab", "seq" };
     const output_names = [_][*:0]const u8{ "q_out", "k_out", "v_out", "conv_out", "g_out", "beta_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -33200,14 +33200,16 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, in.batch * in.seq, 2 * in.hk + in.hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "S", in.seq }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off } };
+        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(in.seq >= 17)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         gdn_prework_cfg = config;
         gdn_prework_cfg_key = key;
     }
 
     const kernel = try getGdnPreworkKernel();
-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try @import("hc_prefill.zig").sigmoidTable(s) else in.qkv };
+    const seq_arr = mlx.mlx_array_new_int(in.seq);
+    defer _ = mlx.mlx_array_free(seq_arr);
+    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try @import("hc_prefill.zig").sigmoidTable(s) else in.qkv, seq_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -33264,7 +33266,7 @@ const GDN_NORMGATE_SOURCE =
     \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
     \\    const T zv = z[zbase + i];
     \\    T sig;
-    \\    if constexpr (S >= 17) sig = sigtab[as_type<ushort>(zv)];
+    \\    if constexpr (TAB) sig = sigtab[as_type<ushort>(zv)];
     \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); sig = zv < T(0) ? sy : T(1) - sy; }
     \\    // swish gate: silu(z) * normed (qwen3.5); sigmoid gate: normed * sigmoid(z) (qwen4_exp, KDA)
     \\    out[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
@@ -33337,7 +33339,7 @@ pub fn gdnNormGateFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "S", seq } };
+        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(seq >= 17)) } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
         gdn_normgate_cfg = config;

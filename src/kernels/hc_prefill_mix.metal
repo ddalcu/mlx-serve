@@ -1,5 +1,5 @@
 const int idx=thread_position_in_grid.x;
-if(idx>=M*H)return;
+if(idx>=rows*H)return;
 const int row=idx/H,col=idx%H;
 T value=T(0);
 for(int h=0;h<HC;h++) {

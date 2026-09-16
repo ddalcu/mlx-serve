@@ -5020,3 +5020,11 @@ The width bound includes the chunker's coalesced tail. Unsupported shapes use
 the composed path; `MLX_SERVE_HC_PREFILL=0` and `MLX_SERVE_GDN_PREFILL_FUSED=0`
 restore it. Guards compare HC against compiled write/mix and GDN against
 `computeGdnGate`, covering cold history, batch 2, tail widths and decline gates.
+
+The first cut carried the chunk width as a Metal template arg (`S` on the
+prework and norm-gate kernels, `M` on the HC mix). MLX compiles one pipeline per
+template set, so every NOVEL prompt length paid three JIT compiles: 700-token
+prefill 957 ms on a repeated length, 1060 ms on a new one (M4 Max), which is a
+net loss below ~1k tokens and invisible to llmprobe (a rung repeats one length).
+The width now rides in as a 0-dim int input (`seq` / `rows`, exposed as a plain
+scalar like `eps`) and only the sigmoid-table switch (`TAB`) is a template.
