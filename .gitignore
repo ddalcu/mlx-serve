@@ -87,3 +87,6 @@ containers/agent-shell-mlxserve/rootfs.tar.gz.sha256
 /missionlog.md
 /.mc.json
 tests/soak_log.csv
+
+# bf16 expert-io SSD microbench output
+ssd-fill-bench/

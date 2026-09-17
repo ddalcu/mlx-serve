@@ -1,7 +1,14 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
+const expert_stream = @import("expert_stream.zig");
+const expert_bf16_kernels = @import("expert_bf16_kernels.zig");
+
 test {
+    _ = expert_stream;
+    _ = expert_bf16_kernels;
+    _ = @import("expert_io.zig");
+    _ = @import("expert_quant.zig");
     _ = @import("log.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
@@ -85,6 +92,7 @@ test {
     _ = @import("gen.zig");
     _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
+    _ = @import("kld.zig");
     _ = @import("cli.zig");
     _ = @import("launch.zig");
     _ = @import("lan.zig");

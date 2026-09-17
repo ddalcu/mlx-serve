@@ -5137,3 +5137,21 @@ Fix: `verifyRows2d` slices the first `1+m` rows before the reshape in both graph
 short block is `error.MtpVerifyBlockShape`, never an MLX raise), and the finish filters
 only the `1+m` rows it reads. Guard: `batched corrections read only 1+m rows of a
 group-padded verify block`.
+
+## bf16 expert streaming: the resident-budget ledger, the async managed-buffer release, the down-kernel tail (2026-09-17)
+
+**Budget semantics.** `--ssd-budget-gb N` is a TOTAL resident target in GiB: the expert cache is what is LEFT after base residency (trunk, router, shared expert, MTP when enabled), the selected-expert slab and the whole-layer prefill union reserve. Phase 1 had only `--expert-cache-gb` (decimal GB of expert cache). `expert_stream.budgetLedger` is the ledger: a 60 GiB target on this box is 48.6 GB of experts (103 slots/layer), 19% below `--expert-cache-gb 60`, because the trunk, the 5.03 GB union workspace and the bounce buffers come out of the same 60. The PLE n-gram table is never in the ledger (it is a disk gather, and billing it would false-fill the budget); MTP is resident when enabled and refused at the door under streaming. Guard: `expert stream ssd budget ledger derives the cache and refuses by name`; the live refusal paths were exercised on port 11299.
+
+**Async release of an imported buffer.** `expert_io.importSlab` hands a page-aligned host mapping to `mlx_array_new_data_managed_payload`; Metal aliases it (pointer identity holds at every offset probed, active memory counts it once). The trap: `mlx_array_free` on an operand that took part in an evaluated graph returns BEFORE the payload deleter runs, so a `munmap` (or an allocator free) right after it is a use-after-free that `std.testing.allocator` reports as "write after free" in ReleaseFast and ReleaseSafe and NOT in Debug. `SlabOperand.destroy` synchronizes and clears the MLX cache until the deleter has fired, and past a bound it LEAKS the mapping (`slab_release_timeouts`) rather than unmapping memory MLX still holds. Rule: a lifetime callback is the only proof of release; a returned free call is not.
+
+**The down kernel at R=1.** `downReduce` (ascending-k, f32 accumulate) reached 65% of the DRAM roof at R=1 against the `gather_mm` composite's 72%, and 92% at R=4 where it beats the composite. Staging the activation row in threadgroup memory was measured at 12.5 KiB (g=10), 6.25 KiB (g=5, the best, +3.3%), 2.5 KiB and 1.25 KiB: the 12.5 KiB variant is within 0.7% of unstaged, so the ~10 KiB occupancy guidance did not bind; below 5 slot groups the loss is thread count (`32×g` threads per threadgroup). The remaining gap is the in-dispatch k-reduction tail (16 of 160 threads after a barrier), removable only by a second dispatch, which costs about what the tail costs at one row. So the crossover is a predicate, `downKernelPreferred(rows) = rows >= 2`, pinned by a test, and the split stays on the backlog until measured with the same interleaved harness.
+
+## A test line on stdout hung `zig build test` and CI (2026-09-18)
+
+**Defect.** CI's "Run Zig tests" step on the expert-streaming PR ran for over an hour where `main` takes 15 minutes, and on the development box `zig build test` had "wedged" for a day while `zig build test-build && ./zig-out/tests/test` passed every time.
+
+**Cause.** A test helper in `src/expert_io.zig` (`benchPrint`) wrote with `write(1, …)`, and one always-on test printed a line through it. Under `zig build test` the test binary runs with `--listen=-`: stdout is the build runner's message stream. The runner read the line as a message header, computed a bogus body length and blocked on it, while the test process sat idle in `test_runner.mainServer` waiting for the next request. Run standalone, stdout is a terminal and nothing is wrong.
+
+**Fix.** The helper writes to fd 2. `zig build test --summary all` completes in about 3 minutes on the PR head and 193 s on `main`.
+
+**Guard.** The rule in `CLAUDE.md` ("A test never writes to stdout"); the tell is a `zig build test` that never returns while the test binary passes on its own, and `sample <test pid>` showing `mainServer` in `readSliceAll`.

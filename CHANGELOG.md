@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **The original bf16 Qwen3.8 Flash Next serves from a 128 GB Mac by streaming experts from SSD.** Point `--model` at the HF checkpoint and set `--ssd-budget-gb <GiB>` (the total resident target), `--expert-cache-gb`, or the per-model `ssd_budget_gb` in Model Settings; the app shows an `SSD` badge and an SSD budget row for such a checkpoint. Speculative decoding is refused by name on a streamed model.
+- **A load the server refuses by name no longer restarts it from the tray**; the selection reverts to the model still being served and the refusal shows as an error card.
+
 ## v26.9.4 — Correctness Fixes, Chinese Translation, Benchmarks
 
 ### Highlights

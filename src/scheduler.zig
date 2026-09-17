@@ -73,6 +73,7 @@ const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
+const expert_stream_mod = @import("expert_stream.zig");
 const DflashModel = dflash_mod.DflashModel;
 const VisionEncoder = vision_mod.VisionEncoder;
 const Weights = model_mod.Weights;
@@ -165,6 +166,9 @@ pub const LoadParams = struct {
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
+    expert_cache_bytes: u64 = 0,
+    ssd_budget_bytes: u64 = 0,
+    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
     /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride
@@ -1164,6 +1168,9 @@ pub const LoadRequest = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
+    expert_cache_bytes: u64 = 0,
+    ssd_budget_bytes: u64 = 0,
+    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// Zero disables (hybrid models bypass the hot prefix cache, as before).
     /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
@@ -1287,6 +1294,9 @@ pub const Scheduler = struct {
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
+    expert_cache_bytes: u64,
+    ssd_budget_bytes: u64,
+    expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale
@@ -1490,6 +1500,9 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+            .expert_cache_bytes = params.expert_cache_bytes,
+            .ssd_budget_bytes = params.ssd_budget_bytes,
+            .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
             .mtp_enabled = params.mtp_enabled,
@@ -1887,6 +1900,33 @@ pub const Scheduler = struct {
         // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
         // other load should block on our filesystem.
         const media_peak = self.mediaPeakFor(entry);
+        const settings_budget = resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming()).bytes;
+        const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
+            owned.config.supportsExpertStreaming(),
+            owned.config.expertStreamingRequired(),
+            self.expert_cache_bytes,
+            settings_budget,
+        )) blk: {
+            const geometry = streamingGeometryOf(owned.config);
+            const layout = expert_stream_mod.quant.layoutOfDir(self.allocator, self.io, owned.config.model_type, entry.path, geometry.layers) orelse
+                return error.ExpertStreamingUnsupportedLayout;
+            const split = try model_mod.streamingResidentSplit(self.io, self.allocator, entry.path, layout);
+            switch (expert_stream_mod.mtpUnderStreaming(self.mtp_enabled, owned.config.mtp_override)) {
+                .refuse => return error.ExpertStreamingMtpUnsupported,
+                .drop_settings => owned.config.mtp_override = false,
+                .off => {},
+            }
+            const mtp_resident = false;
+            const per_expert = try expert_stream_mod.expertBytesFor(self.allocator, entry.path, geometry, layout);
+            const resolved = try resolveExpertCache(self.expert_cache_bytes, settings_budget, owned.config, split, mtp_resident, per_expert);
+            const plan = try expert_stream_mod.cachePlanBytes(
+                resolved.cache_bytes,
+                geometry.layers,
+                geometry.experts,
+                per_expert,
+            );
+            break :blk expertStreamingGateBytes(split.trunk +| split.mtp, plan.cache_bytes, plan.prefill_peak_bytes, plan.bounce_bytes);
+        } else null;
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -1919,7 +1959,7 @@ pub const Scheduler = struct {
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
+            const estimated: u64 = streaming_gate_bytes orelse gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -1978,6 +2018,9 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .expert_cache_bytes = self.expert_cache_bytes,
+            .ssd_budget_bytes = self.ssd_budget_bytes,
+            .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP + embedded-llama.cpp
@@ -2521,6 +2564,23 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
+    if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
+        log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
+}
+
+pub const SsdBudgetChoice = struct {
+    bytes: u64,
+    from_setting: bool,
+    setting_ignored: bool,
+};
+
+/// The launch flag wins over the per-model setting; a non-streaming model ignores the
+/// setting (warned once). `--expert-cache-gb` is decided earlier, in `resolveExpertCache`.
+pub fn resolveSsdBudget(flag_bytes: u64, setting_gb: u32, streaming: bool) SsdBudgetChoice {
+    if (!streaming) return .{ .bytes = 0, .from_setting = false, .setting_ignored = setting_gb > 0 };
+    if (flag_bytes > 0) return .{ .bytes = flag_bytes, .from_setting = false, .setting_ignored = false };
+    return .{ .bytes = @as(u64, setting_gb) << 30, .from_setting = setting_gb > 0, .setting_ignored = false };
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -2605,6 +2665,49 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     }
 
     return .{ .config = config, .tok = tok, .chat_config = cc };
+}
+
+pub fn streamingGeometryOf(config: *const model_mod.ModelConfig) expert_stream_mod.Geometry {
+    return .{
+        .layers = @intCast(config.num_hidden_layers),
+        .experts = @intCast(config.num_experts),
+        .hidden = config.hidden_size,
+        .intermediate = config.moe_intermediate_size,
+    };
+}
+
+pub const ExpertCacheResolution = struct {
+    cache_bytes: u64,
+    ledger: ?expert_stream_mod.BudgetLedger,
+    overridden: bool,
+};
+
+/// PURE: the expert-cache byte budget for this load. `--expert-cache-gb` wins outright;
+/// otherwise `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
+/// after the resident trunk, the MTP head (only when it stays resident), the whole-layer
+/// prefill union, the selected-expert slab and the fill bounce buffers.
+pub fn resolveExpertCache(
+    explicit_bytes: u64,
+    budget_bytes: u64,
+    config: *const model_mod.ModelConfig,
+    split: model_mod.ResidentSplit,
+    mtp_resident: bool,
+    per_expert: u64,
+) !ExpertCacheResolution {
+    const overridden = expert_stream_mod.budgetOverriddenByExplicitCache(explicit_bytes, budget_bytes);
+    if (explicit_bytes > 0 or budget_bytes == 0)
+        return .{ .cache_bytes = explicit_bytes, .ledger = null, .overridden = overridden };
+    const ledger = try expert_stream_mod.budgetLedger(
+        budget_bytes,
+        split.trunk,
+        if (mtp_resident) split.mtp else 0,
+        @intCast(config.num_hidden_layers),
+        @intCast(config.num_experts),
+        @intCast(config.num_experts_per_tok),
+        per_expert,
+        expert_stream_mod.BOUNCE_BYTES,
+    );
+    return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger, .overridden = false };
 }
 
 /// Frees the three CPU-state pointers. Does NOT free `s.gguf` — the
@@ -2936,6 +3039,10 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
     return base + base / 10;
 }
 
+pub fn expertStreamingGateBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64) u64 {
+    return resident_bytes +| cache_bytes +| fill_peak_bytes +| bounce_bytes;
+}
+
 /// What a media load COMMITS to the residency budget once ready. Same estimator
 /// the gate reserved against, so reserve and commit can only differ by the
 /// gate's headroom: committing the dir sum instead parked H3 in the budget at
@@ -3181,6 +3288,117 @@ test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to it
     try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
 }
 
+test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is explicit" {
+    const t = testing;
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 48;
+    cfg.num_experts = 512;
+    cfg.num_experts_per_tok = 10;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 640;
+    const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 5_200_000_000 };
+    const GiB: u64 = 1 << 30;
+    const fused: u64 = 9_830_400;
+
+    const from_budget = try resolveExpertCache(0, 60 * GiB, &cfg, split, false, fused);
+    try t.expect(from_budget.ledger != null);
+    try t.expectEqual(@as(u16, 103), from_budget.ledger.?.slots_per_layer);
+    try t.expectEqual(from_budget.ledger.?.cache_bytes, from_budget.cache_bytes);
+    try t.expect(!from_budget.overridden);
+
+    const with_mtp = try resolveExpertCache(0, 60 * GiB, &cfg, split, true, fused);
+    try t.expectEqual(@as(u16, 92), with_mtp.ledger.?.slots_per_layer);
+
+    const explicit = try resolveExpertCache(60_000_000_000, 60 * GiB, &cfg, split, false, fused);
+    try t.expectEqual(@as(u64, 60_000_000_000), explicit.cache_bytes);
+    try t.expect(explicit.ledger == null);
+    try t.expect(explicit.overridden);
+
+    const no_budget = try resolveExpertCache(60_000_000_000, 0, &cfg, split, false, fused);
+    try t.expectEqual(@as(u64, 60_000_000_000), no_budget.cache_bytes);
+    try t.expect(!no_budget.overridden);
+
+    try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(0, 14 * GiB, &cfg, split, false, fused));
+}
+
+test "the ssd budget falls back to the per-model setting, and a non-streaming model ignores it" {
+    const t = testing;
+    const GiB: u64 = 1 << 30;
+
+    const flag_wins = resolveSsdBudget(60 * GiB, 40, true);
+    try t.expectEqual(60 * GiB, flag_wins.bytes);
+    try t.expect(!flag_wins.from_setting);
+    try t.expect(!flag_wins.setting_ignored);
+
+    const from_setting = resolveSsdBudget(0, 60, true);
+    try t.expectEqual(60 * GiB, from_setting.bytes);
+    try t.expect(from_setting.from_setting);
+    try t.expect(!from_setting.setting_ignored);
+
+    const neither = resolveSsdBudget(0, 0, true);
+    try t.expectEqual(@as(u64, 0), neither.bytes);
+    try t.expect(!neither.from_setting);
+
+    const not_streaming = resolveSsdBudget(0, 60, false);
+    try t.expectEqual(@as(u64, 0), not_streaming.bytes);
+    try t.expect(not_streaming.setting_ignored);
+    try t.expect(!resolveSsdBudget(0, 0, false).setting_ignored);
+
+    var cfg = model_mod.ModelConfig{};
+    cfg.num_hidden_layers = 48;
+    cfg.num_experts = 512;
+    cfg.num_experts_per_tok = 10;
+    cfg.hidden_size = 2560;
+    cfg.moe_intermediate_size = 640;
+    const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 5_200_000_000 };
+    const via_setting = try resolveExpertCache(0, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
+    try t.expectEqual(@as(u16, 103), via_setting.ledger.?.slots_per_layer);
+    const cache_flag = try resolveExpertCache(60_000_000_000, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
+    try t.expectEqual(@as(u64, 60_000_000_000), cache_flag.cache_bytes);
+    try t.expect(cache_flag.overridden);
+}
+
+test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the per-model setting warns" {
+    const t = testing;
+    const GiB: u64 = 1 << 30;
+    var moe = model_mod.ModelConfig{
+        .model_type = "qwen3_5_moe",
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+    };
+    applyModelSettings(&moe, .{ .ssd_budget_gb = 60 });
+    try t.expectEqual(@as(u32, 60), moe.ssd_budget_gb_override);
+    try t.expect(!moe.supportsExpertStreaming());
+
+    const from_setting = resolveSsdBudget(0, moe.ssd_budget_gb_override, moe.supportsExpertStreaming());
+    try t.expectEqual(@as(u64, 0), from_setting.bytes);
+    try t.expect(from_setting.setting_ignored);
+    const from_flag = resolveSsdBudget(60 * GiB, 0, moe.supportsExpertStreaming());
+    try t.expectEqual(@as(u64, 0), from_flag.bytes);
+    try t.expect(!from_flag.setting_ignored);
+
+    try t.expect(!expert_stream_mod.expertStreamingEngaged(
+        moe.supportsExpertStreaming(),
+        moe.expertStreamingRequired(),
+        60_000_000_000,
+        from_flag.bytes,
+    ));
+    try t.expect(!moe.expert_streaming);
+
+    var q4 = moe;
+    q4.model_type = "qwen4_exp";
+    try t.expectEqual(60 * GiB, resolveSsdBudget(60 * GiB, 0, q4.supportsExpertStreaming()).bytes);
+    try t.expect(expert_stream_mod.expertStreamingEngaged(
+        q4.supportsExpertStreaming(),
+        q4.expertStreamingRequired(),
+        0,
+        resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming()).bytes,
+    ));
+}
+
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Three separate rounds of this bug shipped: prefix-cache, then MTP +
     // llama, then the drafter/ssd group — each time a launch flag reached
@@ -3191,14 +3409,15 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // Needles are ++-split so this test's own source can't satisfy the scan.
     const src = @embedFile("scheduler.zig");
     inline for (.{
-        "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
-        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
-        "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "llama_cache_entries",       "llama_kv_type_k",       "llama_kv_type_v",
-        "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
-        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
-        "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
-        "prefix_cache_mem_resolver",
+        "kv_quant_config",           "prefix_cache_capacity",     "prefix_cache_mem_bytes",
+        "prefix_cache_disk_bytes",   "ssm_checkpoint_stride",     "ssm_checkpoint_max",
+        "mtp_enabled",               "mtp_head_kv_quant",         "mtp_depth",
+        "llama_cache_entries",       "llama_kv_type_k",           "llama_kv_type_v",
+        "ds4_mtp",                   "ds4_dspark",                "ds4_ssd_streaming",
+        "no_drafter",                "draft_block_size",          "draft_block_size_explicit",
+        "ane_prefill",               "ane_chunk_resolver",        "ane_headroom_resolver",
+        "prefix_cache_mem_resolver", "expert_cache_bytes",        "expert_cache_fit_resolver",
+        "ssd_budget_bytes",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3210,6 +3429,11 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
     // The stale TODO that stood in for the wiring must be gone.
     const old = "Phase E will wire the load-model API" ++ " to set this.";
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
+}
+
+test "bf16 streaming registry gate uses resident plan not checkpoint disk size" {
+    try testing.expectEqual(@as(u64, 81), expertStreamingGateBytes(10, 60, 5, 6));
+    try testing.expect(expertStreamingGateBytes(15_000_000_000, 60_000_000_000, 5_033_164_800, 536_870_912) < 360_000_000_000);
 }
 
 test "every HotPrefixCache.initWithMem load site reads the CLAMPED budget, never the raw launch flag" {
@@ -3492,6 +3716,76 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         return;
     }
 
+    var streaming_resident_bytes: ?u64 = null;
+    var expert_source_assigned = false;
+    errdefer if (expert_source_assigned) {
+        sch.allocator.free(params.config.expert_source_dir.?);
+        params.config.expert_source_dir = null;
+    };
+    const streaming_budget = resolveSsdBudget(params.ssd_budget_bytes, params.config.ssd_budget_gb_override, params.config.supportsExpertStreaming());
+    if (expert_stream_mod.expertStreamingEngaged(
+        params.config.supportsExpertStreaming(),
+        params.config.expertStreamingRequired(),
+        params.expert_cache_bytes,
+        streaming_budget.bytes,
+    )) {
+        const budget = streaming_budget;
+        if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
+        const geometry = streamingGeometryOf(params.config);
+        const layout = expert_stream_mod.quant.layoutOfDir(sch.allocator, sch.io, params.config.model_type, params.model_dir, geometry.layers) orelse
+            return error.ExpertStreamingUnsupportedLayout;
+        params.config.expert_layout = layout;
+        const split = try model_mod.streamingResidentSplit(sch.io, sch.allocator, params.model_dir, layout);
+        switch (expert_stream_mod.mtpUnderStreaming(params.mtp_enabled, params.config.mtp_override)) {
+            .refuse => {
+                log.err("[expert-stream] {s}; drop --mtp\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+                return error.ExpertStreamingMtpUnsupported;
+            },
+            .drop_settings => {
+                log.info("[expert-stream] model-settings mtp=true ignored: {s}\n", .{expert_stream_mod.MTP_UNSUPPORTED});
+                params.config.mtp_override = false;
+            },
+            .off => {},
+        }
+        const mtp_resident = false;
+        if (budget.from_setting)
+            log.info("[expert-stream] ssd budget {d} GiB from model-settings.json\n", .{budget.bytes >> 30});
+        const per_expert = try expert_stream_mod.expertBytesFor(sch.allocator, params.model_dir, geometry, layout);
+        const resolved = try resolveExpertCache(params.expert_cache_bytes, budget.bytes, params.config, split, mtp_resident, per_expert);
+        if (resolved.overridden)
+            log.info("[expert-stream] --expert-cache-gb overrides --ssd-budget-gb: cache {d:.2} GB\n", .{
+                @as(f64, @floatFromInt(resolved.cache_bytes)) / 1e9,
+            });
+        const plan = try expert_stream_mod.cachePlanBytes(
+            resolved.cache_bytes,
+            geometry.layers,
+            geometry.experts,
+            per_expert,
+        );
+        if (resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
+            led.budget_bytes >> 30,
+            @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.mtp_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.workspace_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.selected_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.bounce_bytes)) / 1e9,
+            @as(f64, @floatFromInt(led.cache_bytes)) / 1e9,
+            plan.slots_per_layer,
+        });
+        params.config.expert_streaming = true;
+        if (params.config.expert_source_dir == null) {
+            params.config.expert_source_dir = try sch.allocator.dupe(u8, params.model_dir);
+            expert_source_assigned = true;
+        }
+        params.config.expert_cache_bytes = plan.cache_bytes;
+        params.config.expert_ssd_budget_bytes = if (resolved.ledger != null) budget.bytes else 0;
+        params.config.expert_workspace_bytes = plan.workspace_bytes;
+        params.config.expert_bounce_bytes = plan.bounce_bytes;
+        params.config.expert_fill_peak_bytes = plan.prefill_peak_bytes;
+        streaming_resident_bytes = split.trunk +| split.mtp;
+        if (params.expert_cache_fit_resolver) |fit| try fit(params.config, streaming_resident_bytes.?);
+    }
+
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
     // so it terminates the whole process. Refuse the load up front instead, with
@@ -3499,7 +3793,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
-        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const weights_bytes = streaming_resident_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
@@ -3529,7 +3823,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Weights — first mlx call. Binds the stream on this thread.
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
-    weights_ptr.* = if (params.load_vision)
+    weights_ptr.* = if (params.config.expert_streaming)
+        try model_mod.loadWeightsStreaming(sch.io, sch.allocator, params.model_dir, params.config.expert_layout)
+    else if (params.load_vision)
         try model_mod.loadWeightsWithVision(sch.io, sch.allocator, params.model_dir)
     else
         try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
@@ -3732,7 +4028,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.
     var vision_ptr: ?*VisionEncoder = null;
-    if (params.load_vision) {
+    if (params.load_vision and !params.config.expert_streaming) {
         const v = try sch.allocator.create(VisionEncoder);
         if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
             v.* = encoder;
@@ -4184,7 +4480,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ins), else fall back to a rough multiple of layers × hidden. The
     // value drives LRU eviction's "will the new model fit?" gate in Phase
     // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
+    const bytes_resident: u64 = if (params.config.expert_streaming)
+        expertStreamingGateBytes(
+            streaming_resident_bytes.?,
+            params.config.expert_cache_bytes,
+            params.config.expert_fill_peak_bytes,
+            params.config.expert_bounce_bytes,
+        )
+    else if (entry.bytes_on_disk) |b|
         b
     else
         @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
@@ -9794,4 +10097,36 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
     const text_only = [_]u32{ 7, 8, image_id, 9 };
     try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
     try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
+}
+
+test "the ssd budget leaves a positive expert cache on the real quantized pack" {
+    const t = std.testing;
+    const path = "/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit";
+    var probe = std.Io.Dir.openDirAbsolute(t.io, path, .{}) catch return error.SkipZigTest;
+    probe.close(t.io);
+    var config = model_mod.parseConfig(t.io, t.allocator, path) catch return error.SkipZigTest;
+    defer config.deinit(t.allocator);
+    const geometry = streamingGeometryOf(&config);
+    const layout = expert_stream_mod.quant.layoutOfDir(t.allocator, t.io, config.model_type, path, geometry.layers) orelse
+        return error.ExpertStreamingUnsupportedLayout;
+    try t.expectEqual(expert_stream_mod.quant.Layout.quantized_split, layout);
+    const per_expert = try expert_stream_mod.expertBytesFor(t.allocator, path, geometry, layout);
+    const split = try model_mod.streamingResidentSplit(t.io, t.allocator, path, layout);
+    const resolved = try resolveExpertCache(0, 50 << 30, &config, split, false, per_expert);
+    const ledger = resolved.ledger orelse return error.MissingLedger;
+    try t.expect(ledger.slots_per_layer > 1);
+    try t.expect(ledger.cache_bytes > 0);
+    std.debug.print(
+        "[quant ledger] per_expert={d} trunk={d:.2} GiB mtp={d:.2} GiB workspace={d:.2} GiB selected={d:.2} GiB bounce={d:.2} GiB cache={d:.2} GiB slots/layer={d}\n",
+        .{
+            per_expert,
+            @as(f64, @floatFromInt(ledger.trunk_bytes)) / (1 << 30),
+            @as(f64, @floatFromInt(split.mtp)) / (1 << 30),
+            @as(f64, @floatFromInt(ledger.workspace_bytes)) / (1 << 30),
+            @as(f64, @floatFromInt(ledger.selected_bytes)) / (1 << 30),
+            @as(f64, @floatFromInt(ledger.bounce_bytes)) / (1 << 30),
+            @as(f64, @floatFromInt(ledger.cache_bytes)) / (1 << 30),
+            ledger.slots_per_layer,
+        },
+    );
 }

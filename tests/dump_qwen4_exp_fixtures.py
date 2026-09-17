@@ -202,6 +202,7 @@ def build(out, vision=False):
     sd["mtp.pre_fc_norm_embedding.weight"] = (torch.randn(H) * 0.2).to(torch.bfloat16)
     sd["mtp.pre_fc_norm_hidden.weight"] = (torch.randn(H * TINY["hc_count"]) * 0.2).to(torch.bfloat16)
     save_torch(sd, str(out / "model.safetensors"), metadata={"format": "pt"})
+    (out / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: "model.safetensors" for k in sd}}, indent=2))
     text_cfg = dict(TINY)
     text_cfg["model_type"] = "qwen4_exp_text"
     text_cfg["layer_types"] = ["full_attention" if (i + 1) % 4 == 0 else "linear_attention"

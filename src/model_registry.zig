@@ -159,6 +159,7 @@ pub const LoadedModel = struct {
     /// arch-derived capabilities — e.g. "bert" → embeddings — while the
     /// entry is still an `.unloaded` stub.
     arch_hint: []const u8,
+    streaming_index_complete: bool = false,
 
     // ── Mlx-allocating state. Non-null iff state == .ready (or transitioning
     //    out of .ready via eviction). Owned by this entry; freed in deinit.
@@ -765,7 +766,7 @@ pub const ModelRegistry = struct {
         if (discovery) |d| {
             errdefer self.deinitInternal();
             for (d.models) |m| {
-                _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
+                _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             }
         }
 
@@ -804,6 +805,10 @@ pub const ModelRegistry = struct {
     /// `registerStub` variant carrying the discovery-peeked `model_type` so
     /// the stub can advertise arch-derived capabilities before loading.
     pub fn registerStubWithArch(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64, arch_hint: []const u8) !*LoadedModel {
+        return self.registerStubWithMeta(id, path, bytes_on_disk, arch_hint, false);
+    }
+
+    pub fn registerStubWithMeta(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64, arch_hint: []const u8, streaming_index_complete: bool) !*LoadedModel {
         if (self.entries.get(id) != null) return error.DuplicateId;
 
         const stub = try self.allocator.create(LoadedModel);
@@ -821,6 +826,7 @@ pub const ModelRegistry = struct {
             .path = path_owned,
             .bytes_on_disk = bytes_on_disk,
             .arch_hint = arch_owned,
+            .streaming_index_complete = streaming_index_complete,
             .config = null,
             .weights = null,
             .transformer = null,
@@ -877,12 +883,14 @@ pub const ModelRegistry = struct {
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
+        const streaming_index_complete = model_mod.isExpertStreamingArch(probe.model_type) and
+            model_discovery.qwen4StreamingIndexComplete(io, self.allocator, trimmed) != null;
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         // Re-check under the lock — another conn thread may have raced us.
         if (self.entries.get(base)) |existing| return existing.id;
-        const stub = try self.registerStubWithArch(base, trimmed, probe.bytes_on_disk, probe.model_type);
+        const stub = try self.registerStubWithMeta(base, trimmed, probe.bytes_on_disk, probe.model_type, streaming_index_complete);
         return stub.id;
     }
 
@@ -942,7 +950,7 @@ pub const ModelRegistry = struct {
         for (found.models) |m| {
             if (self.entries.get(m.id) != null) continue;
             if (self.peekByPathLocked(m.path) != null) continue;
-            _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
+            _ = try self.registerStubWithMeta(m.id, m.path, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             added += 1;
         }
         return added;
@@ -1316,10 +1324,17 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "ExpertCacheDoesNotFit")) return error.ExpertCacheDoesNotFit;
+            if (std.mem.eql(u8, n, "ExpertStreamingRequired")) return error.ExpertStreamingRequired;
+            if (std.mem.eql(u8, n, "SsdBudgetBelowResident")) return error.SsdBudgetBelowResident;
+            if (std.mem.eql(u8, n, "SsdBudgetExceedsWiredLimit")) return error.SsdBudgetExceedsWiredLimit;
+            if (std.mem.eql(u8, n, "ExpertStreamingMtpUnsupported")) return error.ExpertStreamingMtpUnsupported;
+            if (std.mem.eql(u8, n, "ExpertStreamingUnsupportedLayout")) return error.ExpertStreamingUnsupportedLayout;
+            if (std.mem.eql(u8, n, "ExpertSlabImportCopied")) return error.ExpertSlabImportCopied;
         }
         return error.LoadFailed;
     }
@@ -1331,6 +1346,13 @@ pub const ModelRegistry = struct {
         // unactionable. Both spellings of "out of memory" have to survive.
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("InsufficientMemory"));
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
+        try std.testing.expectEqual(error.ExpertCacheDoesNotFit, loadErrorFromName("ExpertCacheDoesNotFit"));
+        try std.testing.expectEqual(error.ExpertStreamingRequired, loadErrorFromName("ExpertStreamingRequired"));
+        try std.testing.expectEqual(error.SsdBudgetBelowResident, loadErrorFromName("SsdBudgetBelowResident"));
+        try std.testing.expectEqual(error.SsdBudgetExceedsWiredLimit, loadErrorFromName("SsdBudgetExceedsWiredLimit"));
+        try std.testing.expectEqual(error.ExpertStreamingMtpUnsupported, loadErrorFromName("ExpertStreamingMtpUnsupported"));
+        try std.testing.expectEqual(error.ExpertStreamingUnsupportedLayout, loadErrorFromName("ExpertStreamingUnsupportedLayout"));
+        try std.testing.expectEqual(error.ExpertSlabImportCopied, loadErrorFromName("ExpertSlabImportCopied"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
@@ -1469,6 +1491,13 @@ test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
     // Plain registerStub keeps an empty hint (no arch known).
     const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
     try testing.expectEqualStrings("", plain.arch_hint);
+}
+
+test "ModelRegistry: streaming discovery verdict is cached on the stub" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStubWithMeta("q4", "/models/q4", 360, "qwen4_exp", true);
+    try testing.expect(stub.streaming_index_complete);
 }
 
 test "ModelRegistry: registerByPath reuses an existing id without touching the filesystem" {

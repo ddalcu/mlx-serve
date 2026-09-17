@@ -108,6 +108,8 @@ pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
 pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
 pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
 pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+pub extern "c" fn mlx_array_new_data_managed(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
+pub extern "c" fn mlx_array_new_data_managed_payload(data: ?*anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) mlx_array;
 pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
 
@@ -254,6 +256,7 @@ pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: us
 
 pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_scatter_single(res: *mlx_array, a: mlx_array, indices: mlx_array, updates: mlx_array, axis: c_int, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;

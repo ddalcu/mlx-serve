@@ -10,6 +10,7 @@ const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
+const expert_stream_mod = @import("expert_stream.zig");
 const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
@@ -26,6 +27,7 @@ const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
+const model_settings = @import("model_settings.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
@@ -589,6 +591,11 @@ pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages
     if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
     return !is_moe or force or native_measured;
+}
+
+fn defaultEnableMtpForStreaming(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool, expert_streaming: bool) bool {
+    if (expert_streaming) return mtp_loaded and force;
+    return defaultEnableMtp(mtp_loaded, is_moe, force, dsv4_stages, native_measured);
 }
 
 /// Does this model's MTP head carry the measured native-MoE exemption above?
@@ -1849,7 +1856,11 @@ pub fn serve(
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (server_config.default_force_mtp) {
+    if (config.expert_streaming and server_config.default_force_mtp) {
+        log.info("MTP: enabled for expert streaming by --mtp; replay measured 1.27x expert bytes per committed token\n", .{});
+    } else if (config.expert_streaming) {
+        log.info("MTP: disabled by default for expert streaming\n", .{});
+    } else if (server_config.default_force_mtp) {
         log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     if (transformer_mod.Transformer.mtp_head_kv_quant_flag) {
@@ -2406,14 +2417,6 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
-        error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
-            return;
-        },
-        error.InsufficientMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
-            return;
-        },
         error.LoadFailed => {
             try sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
             return;
@@ -2424,10 +2427,14 @@ fn handleConnection(
         },
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
-        // config.json, etc.) bubble out of `preloadCpuState`. Surface a
-        // 500 with the error name so the client gets a clean failure
-        // instead of a hung connection.
+        // config.json, etc.) bubble out of `preloadCpuState`. A refusal the
+        // registry preserves by name answers 503 under that name; anything
+        // else is a 500 with the error name, never a hung connection.
         else => {
+            if (loadRefusalFor(err)) |refusal| {
+                try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, refusal.message, 503);
+                return;
+            }
             log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -3162,6 +3169,34 @@ pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
     return @as(u64, n) << 30;
 }
 
+pub fn parseSsdBudgetGb(raw: []const u8) error{InvalidSsdBudgetGb}!u64 {
+    const gb = std.fmt.parseInt(u64, raw, 10) catch return error.InvalidSsdBudgetGb;
+    if (gb == 0 or gb > 512) return error.InvalidSsdBudgetGb;
+    return std.math.mul(u64, gb, 1 << 30) catch return error.InvalidSsdBudgetGb;
+}
+
+/// PURE: the residency limit the SSD budget is admitted against — `iogpu.wired_limit_mb`
+/// when the owner declared one, else Metal's recommended working set.
+pub fn ssdBudgetCeiling(wired_limit: u64, working_set: u64) u64 {
+    return if (wired_limit > 0) wired_limit else working_set;
+}
+
+pub fn ssdBudgetAdmits(budget_bytes: u64, kv_bytes: u64, limit: u64) bool {
+    return budget_bytes +| kv_bytes <= limit;
+}
+
+/// PURE: the `iogpu.wired_limit_mb` value that would admit this plan — quoted by the refusal.
+pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
+    const MB: u64 = 1024 * 1024;
+    return (budget_bytes +| kv_bytes +| (MB - 1)) / MB;
+}
+
+pub fn parseExpertCacheGb(raw: []const u8) error{InvalidExpertCacheGb}!u64 {
+    const gb = std.fmt.parseInt(u64, raw, 10) catch return error.InvalidExpertCacheGb;
+    if (gb == 0 or gb > 360) return error.InvalidExpertCacheGb;
+    return std.math.mul(u64, gb, 1_000_000_000) catch return error.InvalidExpertCacheGb;
+}
+
 /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
@@ -3316,6 +3351,80 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     ) -| ane_bytes;
 }
 
+pub fn expertStreamingLoadFits(ceiling: u64, active_mem: u64, resident_bytes: u64, cache_bytes: u64, bounce_bytes: u64, fill_peak_bytes: u64, serving_bytes: u64) bool {
+    const needed = active_mem +| resident_bytes +| cache_bytes +| bounce_bytes +| fill_peak_bytes +| serving_bytes;
+    return needed <= ceiling;
+}
+
+fn expertStreamingPlannedSeq(config: *const model_mod.ModelConfig) u64 {
+    const manual = manualContext(config);
+    return if (manual > 0) manual else @min(config.contextCap(), 65_536);
+}
+
+/// The KV a streamed load plans to hold: the second term of the
+/// budget-vs-wired-limit admission.
+fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
+    return kvBytesPerTokenAtBits(config.kvBytesPerToken(), defaultKvBits(config)) *| expertStreamingPlannedSeq(config);
+}
+
+fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
+    const seq: u64 = expertStreamingPlannedSeq(config);
+    const explicit = explicitPrefillChunk();
+    const chunk: u64 = if (explicit > 0) explicit else if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192;
+    return prefillNeededAtChunk(config, @max(seq, chunk), 2048, defaultKvBits(config), chunk, .{}) -| config.expert_fill_peak_bytes;
+}
+
+pub fn expertCacheFitForLoad(config: *const model_mod.ModelConfig, resident_bytes: u64) !void {
+    if (!config.expert_streaming) return;
+    if (config.expert_ssd_budget_bytes > 0) {
+        const kv_bytes = expertStreamingPlannedKvBytes(config);
+        const limit = ssdBudgetCeiling(wiredLimitBytes(), staticGpuMemoryCeiling());
+        if (!ssdBudgetAdmits(config.expert_ssd_budget_bytes, kv_bytes, limit)) {
+            log.err("--ssd-budget-gb {d} plus {d:.2} GB of planned KV exceeds the {d:.2} GB residency limit; raise iogpu.wired_limit_mb to {d} or lower the budget\n", .{
+                config.expert_ssd_budget_bytes >> 30,
+                @as(f64, @floatFromInt(kv_bytes)) / 1e9,
+                @as(f64, @floatFromInt(limit)) / 1e9,
+                wiredLimitMbForBudget(config.expert_ssd_budget_bytes, kv_bytes),
+            });
+            return error.SsdBudgetExceedsWiredLimit;
+        }
+    }
+    var active_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    if (!expertStreamingLoadFits(
+        ceiling,
+        active_mem,
+        resident_bytes,
+        config.expert_cache_bytes,
+        config.expert_bounce_bytes,
+        config.expert_fill_peak_bytes,
+        expertStreamingServingBytes(config),
+    )) return error.ExpertCacheDoesNotFit;
+}
+
+pub fn streamingStubMarker(architecture: []const u8, geometry_ok: bool, index_complete: bool) bool {
+    return model_mod.isExpertStreamingArch(architecture) and geometry_ok and index_complete;
+}
+
+/// A dense qwen4_exp checkpoint has no resident arm at all; a quantized pack
+/// streams only when a budget asks it to.
+pub fn streamingRequiredMarker(architecture: []const u8, quant_bits: u32, geometry_ok: bool, index_complete: bool) bool {
+    return streamingStubMarker(architecture, geometry_ok, index_complete) and quant_bits == 0;
+}
+
+pub fn rowSsdBudgetGb(effective_bytes: u64, setting_gb: u32) u32 {
+    if (effective_bytes > 0) return @intCast(effective_bytes >> 30);
+    return setting_gb;
+}
+
+pub fn streamingRowPart(buf: []u8, candidate: bool, required: bool, ssd_budget_gb: u32) []const u8 {
+    if (!candidate) return "";
+    const head = if (required) ",\"streaming\":true,\"streaming_required\":true" else ",\"streaming\":true";
+    if (ssd_budget_gb == 0) return head;
+    return std.fmt.bufPrint(buf, "{s},\"ssd_budget_gb\":{d}", .{ head, ssd_budget_gb }) catch head;
+}
+
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
 /// length whose KV cache + per-token working set fits under the GPU
 /// working-set ceiling, after subtracting what's already resident
@@ -3428,7 +3537,8 @@ pub fn prefillTransientReserveAtKv(
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
         .{ .qsa_ring_bytes = config.qsaRingBytes() },
-    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+    ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -3933,6 +4043,219 @@ test "clampedPrefixCacheMem: the budget never exceeds what the weights leave und
     try t.expectEqual(96 * GB - 80 * GB, clampedPrefixCacheMem(0, 96 * GB, 70 * GB, 6 * GB, 4 * GB));
     // No headroom at all: never 0 — initWithMem reads 0 as "no byte cap".
     try t.expectEqual(@as(u64, 1), clampedPrefixCacheMem(40 * GB, 64 * GB, 70 * GB, 6 * GB, 4 * GB));
+}
+
+test "bf16 expert cache admission bills cache workspace bounce and resident trunk" {
+    const gb: u64 = 1_000_000_000;
+    const fill_peak: u64 = 2 * 5_033_164_800 + 127 * 9_830_400 + 536_870_912;
+    const serving: u64 = 9 * gb;
+    const needed = 10 * gb + 16 * gb + 60 * gb + 536_870_912 + fill_peak + serving;
+    try std.testing.expect(expertStreamingLoadFits(needed, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
+    try std.testing.expect(!expertStreamingLoadFits(needed - 1, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
+}
+
+test "bf16 expert load admission includes 65k KV and QSA serving terms" {
+    const fused_guard = qsaScoreFusedOffGuard();
+    defer fused_guard.deinit();
+    const saved_share = transformer_mod.qsa_history_share_override;
+    defer transformer_mod.qsa_history_share_override = saved_share;
+    transformer_mod.qsa_history_share_override = true;
+    var config = qwen4RequestTestConfig();
+    config.expert_streaming = true;
+    config.expert_fill_peak_bytes = 11_852_000_000;
+    const saved_ctx = server_config.max_context_size;
+    defer server_config.max_context_size = saved_ctx;
+    server_config.max_context_size = 65_536;
+    const saved_kv = configured_kv_quant;
+    defer configured_kv_quant = saved_kv;
+    configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const serving = expertStreamingServingBytes(&config);
+    try std.testing.expect(serving >= kvBytesPerTokenAtBits(config.kvBytesPerToken(), 8) * 65_536);
+    const fixed: u64 = 10_000_000_000 + 16_000_000_000 + 60_000_000_000 + 536_870_912 + config.expert_fill_peak_bytes;
+    try std.testing.expect(expertStreamingLoadFits(fixed + serving, 10_000_000_000, 16_000_000_000, 60_000_000_000, 536_870_912, config.expert_fill_peak_bytes, serving));
+    try std.testing.expect(!expertStreamingLoadFits(fixed + serving - 1, 10_000_000_000, 16_000_000_000, 60_000_000_000, 536_870_912, config.expert_fill_peak_bytes, serving));
+}
+
+test "bf16 streaming marker is a property of the checkpoint, not of the launch flags" {
+    try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
+    try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
+    try std.testing.expect(!streamingStubMarker("qwen4_exp", false, true));
+    try std.testing.expect(!streamingStubMarker("qwen4_exp", true, false));
+    try std.testing.expect(!streamingStubMarker("qwen3_5_moe", true, true));
+}
+
+test "a quantized pack is streaming capable and only the dense one is streaming required" {
+    try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
+    try std.testing.expect(streamingRequiredMarker("qwen4_exp", 0, true, true));
+    try std.testing.expect(!streamingRequiredMarker("qwen4_exp", 4, true, true));
+    try std.testing.expect(!streamingRequiredMarker("qwen4_exp", 8, true, true));
+    try std.testing.expect(!streamingRequiredMarker("qwen3_5_moe", 0, true, true));
+}
+
+test "the streaming markers read the ONE arch gate: no other arch carries them" {
+    const t = std.testing;
+    var buf: [96]u8 = undefined;
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "hy_v3", "llama", "gguf", "bert", "" }) |arch| {
+        try t.expect(!streamingStubMarker(arch, true, true));
+        try t.expect(!streamingRequiredMarker(arch, 0, true, true));
+        try t.expectEqualStrings("", streamingRowPart(&buf, streamingStubMarker(arch, true, true), false, 60));
+    }
+    try t.expect(streamingStubMarker("qwen4_exp", true, true));
+    try t.expectEqualStrings(",\"streaming\":true,\"ssd_budget_gb\":60", streamingRowPart(&buf, streamingStubMarker("qwen4_exp", true, true), false, 60));
+}
+
+test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "{{ messages }}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const path = path_buf[0..path_len];
+    const geometry = "\"hidden_size\":2560,\"num_hidden_layers\":48,\"num_experts\":512,\"num_experts_per_tok\":10,\"moe_intermediate_size\":640,\"max_position_embeddings\":262144";
+    const quantized = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"qwen4_exp\",\"quantization\":{{\"bits\":4,\"group_size\":64}},\"vision_config\":{{\"hidden_size\":1152}},{s}}}", .{geometry});
+    defer t.allocator.free(quantized);
+    const dense = try std.fmt.allocPrint(t.allocator, "{{\"model_type\":\"qwen4_exp\",\"vision_config\":{{\"hidden_size\":1152}},{s}}}", .{geometry});
+    defer t.allocator.free(dense);
+
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "stub",
+        .path = path,
+        .bytes_on_disk = 0,
+        .arch_hint = "qwen4_exp",
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+        .streaming_index_complete = true,
+    };
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = quantized });
+    const quant_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(quant_row);
+    try t.expect(std.mem.indexOf(u8, quant_row, "\"streaming\":true") != null);
+    try t.expect(std.mem.indexOf(u8, quant_row, "\"streaming_required\":true") == null);
+    try t.expect(std.mem.indexOf(u8, quant_row, "\"vision\"") != null);
+    try t.expect(std.mem.indexOf(u8, quant_row, "\"image\"") != null);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = dense });
+    const dense_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(dense_row);
+    try t.expect(std.mem.indexOf(u8, dense_row, "\"streaming_required\":true") != null);
+    try t.expect(std.mem.indexOf(u8, dense_row, "\"vision\"") == null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, dense_row, "\"image\""));
+}
+
+test "a quantized pack loaded resident advertises no streaming, the same pack streamed does" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+
+    var cfg = model_mod.ModelConfig{
+        .model_type = "qwen4_exp",
+        .quant_bits = 4,
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+        .max_position_embeddings = 262144,
+    };
+    var chat_cfg = chat_mod.ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = t.allocator,
+    };
+    var entry = model_registry_mod.LoadedModel{
+        .allocator = t.allocator,
+        .id = "resident",
+        .path = path_buf[0..path_len],
+        .bytes_on_disk = 0,
+        .arch_hint = "qwen4_exp",
+        .config = &cfg,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_cfg,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .ready,
+        .error_name = null,
+    };
+    const resident_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(resident_row);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, resident_row, "\"streaming\":true"));
+
+    cfg.expert_streaming = true;
+    const streamed_row = try renderModelEntry(t.allocator, io, &entry);
+    defer t.allocator.free(streamed_row);
+    try t.expect(std.mem.indexOf(u8, streamed_row, "\"streaming\":true") != null);
+    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, streamed_row, "\"streaming_required\":true"));
+}
+
+test "a streaming row carries the marker and its ssd budget at top level" {
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("", streamingRowPart(&buf, false, false, 0));
+    try std.testing.expectEqualStrings("", streamingRowPart(&buf, false, false, 60));
+    try std.testing.expectEqualStrings(",\"streaming\":true", streamingRowPart(&buf, true, false, 0));
+    try std.testing.expectEqualStrings(",\"streaming\":true,\"ssd_budget_gb\":60", streamingRowPart(&buf, true, false, 60));
+    try std.testing.expectEqualStrings(",\"streaming\":true,\"ssd_budget_gb\":4294967295", streamingRowPart(&buf, true, false, std.math.maxInt(u32)));
+    try std.testing.expectEqualStrings(",\"streaming\":true,\"streaming_required\":true", streamingRowPart(&buf, true, true, 0));
+    try std.testing.expectEqualStrings(",\"streaming\":true,\"streaming_required\":true,\"ssd_budget_gb\":60", streamingRowPart(&buf, true, true, 60));
+}
+
+test "a loaded streamed row reports its effective budget, an unloaded one the setting" {
+    try std.testing.expectEqual(@as(u32, 60), rowSsdBudgetGb(60 << 30, 0));
+    try std.testing.expectEqual(@as(u32, 48), rowSsdBudgetGb(0, 48));
+    try std.testing.expectEqual(@as(u32, 60), rowSsdBudgetGb(60 << 30, 48));
+    try std.testing.expectEqual(@as(u32, 0), rowSsdBudgetGb(0, 0));
+}
+
+test "ssd budget parses GiB and admits against the wired limit" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    try t.expectEqual(100 * GiB, try parseSsdBudgetGb("100"));
+    try t.expectError(error.InvalidSsdBudgetGb, parseSsdBudgetGb("0"));
+    try t.expectError(error.InvalidSsdBudgetGb, parseSsdBudgetGb("513"));
+    try t.expectError(error.InvalidSsdBudgetGb, parseSsdBudgetGb("100.5"));
+    // The sysctl is the limit when it is set; otherwise Metal's recommended working set.
+    try t.expectEqual(120 * GiB, ssdBudgetCeiling(120 * GiB, 96 * GiB));
+    try t.expectEqual(96 * GiB, ssdBudgetCeiling(0, 96 * GiB));
+    try t.expect(ssdBudgetAdmits(80 * GiB, 8 * GiB, 96 * GiB));
+    try t.expect(!ssdBudgetAdmits(100 * GiB, 8 * GiB, 96 * GiB));
+    try t.expectEqual(@as(u64, 110_592), wiredLimitMbForBudget(100 * GiB, 8 * GiB));
+    try t.expectEqual(@as(u64, 1), wiredLimitMbForBudget(1, 0));
+}
+
+test "expert cache GB parser is decimal bounded and named" {
+    try std.testing.expectEqual(@as(u64, 60_000_000_000), try parseExpertCacheGb("60"));
+    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("0"));
+    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("361"));
+    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("60.5"));
 }
 
 /// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk with a QSA
@@ -5555,7 +5878,8 @@ pub fn prefillNeededAtChunk(
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
-        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
+        qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
 /// Headroom a rung must clear beyond its own bill when the long-context gate is what widened
@@ -6355,8 +6679,16 @@ fn renderModelEntry(
             try allocator.dupe(u8, "null");
         defer allocator.free(embed_limit_str);
 
+        var streaming_buf: [96]u8 = undefined;
+        const streaming_part = streamingRowPart(
+            &streaming_buf,
+            config.expert_streaming or config.expertStreamingRequired(),
+            config.expertStreamingRequired(),
+            rowSsdBudgetGb(config.expert_ssd_budget_bytes, config.ssd_budget_gb_override),
+        );
+
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s}{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6368,6 +6700,7 @@ fn renderModelEntry(
             // defaults when absent (issue #188).
             ctx_str,
             ctx_str,
+            streaming_part,
             if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
             mods.items,
@@ -6419,6 +6752,27 @@ fn renderModelEntry(
     // faulting in weights: dims, context window, MoE-ness, and capabilities.
     // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
     const sm = model_discovery.readStubMeta(io, allocator, entry.path);
+    const streaming_geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and
+        sm.num_experts > 0 and sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
+    const streaming_precheck = model_mod.isExpertStreamingArch(entry.arch_hint) and streaming_geometry;
+    const streaming_candidate = streamingStubMarker(
+        entry.arch_hint,
+        streaming_geometry,
+        streaming_precheck and entry.streaming_index_complete,
+    );
+    const streaming_required = streamingRequiredMarker(
+        entry.arch_hint,
+        sm.quant_bits,
+        streaming_geometry,
+        streaming_precheck and entry.streaming_index_complete,
+    );
+    var streaming_buf: [96]u8 = undefined;
+    const streaming_part = streamingRowPart(&streaming_buf, streaming_candidate, streaming_required, if (streaming_candidate) blk: {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var settings = model_settings.load(allocator, io, model_settings.defaultPath(&path_buf));
+        defer settings.deinit();
+        break :blk settings.lookup(entry.path).ssd_budget_gb orelse 0;
+    } else 0);
 
     // Capabilities. Encoder-only models advertise "embeddings"; chat models get
     // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
@@ -6471,14 +6825,16 @@ fn renderModelEntry(
             try add(allocator, &b, &n, "streaming");
             try add(allocator, &b, &n, "json_schema");
         }
-        if (sm.has_vision) try add(allocator, &b, &n, "vision");
+        if (sm.has_vision and !streaming_required) try add(allocator, &b, &n, "vision");
         if (stub_has_embedding) try add(allocator, &b, &n, "embeddings");
         try b.append(allocator, ']');
         break :blk try b.toOwnedSlice(allocator);
     };
     defer allocator.free(caps_part);
 
-    const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
+    const mods_part: []const u8 = if (streaming_required)
+        ",\"input_modalities\":[\"text\"]"
+    else if (sm.found and sm.has_vision and sm.has_video)
         ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
     else if (sm.found and sm.has_vision)
         ",\"input_modalities\":[\"text\",\"image\"]"
@@ -6528,8 +6884,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, streaming_part, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -6726,19 +7082,15 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
-        error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
-            return;
-        },
-        error.InsufficientMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
-            return;
-        },
         error.LoadFailed => {
             try sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
             return;
         },
         else => {
+            if (loadRefusalFor(err)) |refusal| {
+                try sendErrorResponse(allocator, stream, "503 Service Unavailable", refusal.type, refusal.message, 503);
+                return;
+            }
             log.warn("  -> 500 ({s}) on /v1/load-model\n", .{@errorName(err)});
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
@@ -8488,10 +8840,14 @@ fn handleChatCompletions(
     // subject to the n-gram spec gate below — the trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), config.expert_streaming);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -8889,10 +9245,14 @@ fn handleCompletions(
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), config.expert_streaming);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
@@ -12490,6 +12850,50 @@ pub const insufficient_free_memory_message =
     "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
     "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
 
+test "every load refusal the registry preserves answers under its own name" {
+    const t = std.testing;
+    const names = [_][]const u8{
+        "InsufficientMemory",
+        "OutOfMemory",
+        "ExpertCacheDoesNotFit",
+        "ExpertStreamingRequired",
+        "SsdBudgetBelowResident",
+        "SsdBudgetExceedsWiredLimit",
+        "ExpertStreamingMtpUnsupported",
+        "ExpertStreamingUnsupportedLayout",
+        "ExpertSlabImportCopied",
+    };
+    for (names) |name| {
+        const refusal = loadRefusalFor(model_registry_mod.ModelRegistry.loadErrorFromName(name)) orelse {
+            std.debug.print("no named refusal for {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        try t.expect(refusal.type.len > 0);
+        try t.expect(refusal.message.len > 0);
+    }
+    try t.expectEqualStrings("expert_streaming_unsupported_layout", loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?.type);
+    try t.expectEqualStrings("expert_slab_import_copied", loadRefusalFor(error.ExpertSlabImportCopied).?.type);
+    try t.expect(loadRefusalFor(error.LoadFailed) == null);
+    try t.expect(loadRefusalFor(error.UnknownModelId) == null);
+}
+
+pub const LoadRefusal = struct { type: []const u8, message: []const u8 };
+
+pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
+    return switch (err) {
+        error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
+        error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
+        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested bf16 expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --expert-cache-gb or free memory." },
+        error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
+        error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This dense qwen4_exp checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n> (or --expert-cache-gb <n>)." },
+        error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This qwen4_exp checkpoint has no expert layout this build can stream: the fused bf16 banks or the nine quantized banks are missing or incomplete. Re-download the pack, or serve a pack this build supports." },
+        error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
+        error.SsdBudgetBelowResident => .{ .type = "ssd_budget_below_resident", .message = "--ssd-budget-gb leaves no room for an expert cache after the resident trunk, the prefill union and the fill buffers. Raise the budget." },
+        error.SsdBudgetExceedsWiredLimit => .{ .type = "ssd_budget_exceeds_wired_limit", .message = "--ssd-budget-gb plus the planned KV cache exceeds the machine's residency limit. Raise iogpu.wired_limit_mb (the server log names the value) or lower the budget." },
+        else => null,
+    };
+}
+
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
 /// every on-demand load failure — the inference thread's error name was
 /// dropped at the thread boundary. The registry keeps it; echo it.
@@ -15288,10 +15692,14 @@ fn handleAnthropicMessages(
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), config.expert_streaming);
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -17179,10 +17587,14 @@ fn handleResponsesInner(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false)) |why| {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm), config.expert_streaming);
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
@@ -22456,6 +22868,8 @@ test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     try t.expect(defaultEnableMtp(true, true, false, false, true));
     // The claim is about the HEAD, so it still needs one loaded.
     try t.expect(!defaultEnableMtp(false, true, false, false, true));
+    try t.expect(!defaultEnableMtpForStreaming(true, false, false, false, true, true));
+    try t.expect(defaultEnableMtpForStreaming(true, true, true, false, false, true));
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
@@ -22503,12 +22917,11 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const src = @embedFile("server.zig");
     const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
     try testing.expect(std.mem.indexOf(u8, src, stale) == null);
-    // Both dispatch arms must use the constant — a second literal is the drift.
-    var n: usize = 0;
-    var i: usize = 0;
-    const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
-    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expectEqual(@as(usize, 2), n);
+    // One mapping serves both load switches; a second literal is the drift.
+    try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.NotEnoughMemory).?.type);
+    try testing.expectEqualStrings(not_enough_memory_message, loadRefusalFor(error.NotEnoughMemory).?.message);
+    try testing.expectEqualStrings("out_of_memory", loadRefusalFor(error.InsufficientMemory).?.type);
+    try testing.expectEqualStrings(insufficient_free_memory_message, loadRefusalFor(error.InsufficientMemory).?.message);
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {

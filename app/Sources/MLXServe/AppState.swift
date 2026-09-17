@@ -39,6 +39,10 @@ class AppState: ObservableObject {
             // something the user went shopping for. `drafterOptOut` is what
             // makes an explicit off stick.
             syncDrafterPairing()
+            if revertingSelection {
+                revertingSelection = false
+                return
+            }
             switch Self.modelSwitchAction(forStatus: server.status, path: selectedModelPath) {
             case .hotSwitch(let id):
                 // The decision `syncDrafterPairing()` just made, not a
@@ -66,11 +70,27 @@ class AppState: ObservableObject {
                 // the new flag), so only the LATEST switch's task clears it.
                 modelSwitchGeneration += 1
                 let generation = modelSwitchGeneration
+                let previousPath = oldValue
+                let attemptedPath = selectedModelPath
+                hotSwitchRefused = false
                 loadingModelPath = selectedModelPath
                 pendingModelLoadTask = Task { @MainActor in
                     defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
                     do {
                         _ = try await mgr.loadModel(id: id, drafterPath: drafterPath, setDefault: true)
+                    } catch let APIError.loadRefused(type, detail) {
+                        // A named refusal fails identically at boot, so the
+                        // restart below would only leave a dead server; the
+                        // next chat request surfaces it as an error card.
+                        print("[AppState] hot-switch refused (\(type)): \(detail) — server left running")
+                        let outcome = Self.hotSwitchOutcome(refusedType: type, previous: previousPath, attempted: attemptedPath)
+                        if self.modelSwitchGeneration == generation {
+                            self.hotSwitchRefused = !outcome.ready
+                            if outcome.selection != self.selectedModelPath, !outcome.selection.isEmpty {
+                                self.revertingSelection = true
+                                self.selectedModelPath = outcome.selection
+                            }
+                        }
                     } catch {
                         // Register-by-path failed (unsupported arch, partial
                         // download) or the load 503'd (memory) — a full
@@ -122,6 +142,16 @@ class AppState: ObservableObject {
         case .stopped, .error: return .leaveStopped
         }
     }
+
+    struct HotSwitchOutcome: Equatable {
+        var selection: String
+        var ready: Bool
+    }
+
+    nonisolated static func hotSwitchOutcome(refusedType: String?, previous: String, attempted: String) -> HotSwitchOutcome {
+        guard refusedType != nil else { return HotSwitchOutcome(selection: attempted, ready: true) }
+        return HotSwitchOutcome(selection: previous, ready: false)
+    }
     /// Set only while a hot-switch triggered by `selectedModelPath`'s `didSet`
     /// is in flight — see `useModelAndAwaitReady`.
     private var pendingModelLoadTask: Task<Void, Never>?
@@ -137,6 +167,8 @@ class AppState: ObservableObject {
     /// Bumped per hot-switch; each switch task captures its value so only the
     /// LATEST switch's completion clears `loadingModelPath` (see the didSet).
     private var modelSwitchGeneration = 0
+    private var hotSwitchRefused = false
+    private var revertingSelection = false
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
     /// Sidebar selection (multi-select). Bind the sidebar List to this set so
@@ -816,6 +848,7 @@ class AppState: ObservableObject {
     @discardableResult
     func useModelAndAwaitReady(atPath path: String) async -> Bool {
         let statusBefore = server.status
+        hotSwitchRefused = false
         selectedModelPath = path
         switch Self.useModelStartAction(forStatusBefore: statusBefore) {
         case .startExplicitly:
@@ -825,6 +858,7 @@ class AppState: ObservableObject {
             // hot-switch left status at `.running` the whole time).
             await pendingModelLoadTask?.value
         }
+        if hotSwitchRefused { return false }
         do {
             try await server.waitUntilRunning(timeout: 240)
             return true

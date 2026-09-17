@@ -2,6 +2,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
+const expert_quant = @import("expert_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
@@ -119,6 +120,8 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
+pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -160,6 +163,18 @@ pub const ModelConfig = struct {
     quant_bits: u32 = 0,
     quant_group_size: u32 = 64,
     quant_mode: QuantMode = .affine,
+    expert_streaming: bool = false,
+    expert_layout: expert_quant.Layout = .bf16_fused,
+    expert_source_dir: ?[]u8 = null,
+    /// `MLX_SERVE_NGRAM_BF16_DIR`: serve the PLE n-gram table from the ORIGINAL bf16
+    /// shards in this HF checkpoint dir instead of the pack's quantized `ngram_table.bin`
+    /// (a two-arm lever: it isolates the table's quantization cost under `kld compare`).
+    ngram_bf16_dir: ?[]u8 = null,
+    expert_cache_bytes: u64 = 0,
+    expert_ssd_budget_bytes: u64 = 0,
+    expert_workspace_bytes: u64 = 0,
+    expert_bounce_bytes: u64 = 0,
+    expert_fill_peak_bytes: u64 = 0,
 
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
     query_pre_attn_scalar: u32 = 256,
@@ -442,6 +457,8 @@ pub const ModelConfig = struct {
     mtp_override: ?bool = null,
     /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+/// Per-model `ssd_budget_gb` (GiB, the `--ssd-budget-gb` unit) from model-settings.json; 0 = none.
+    ssd_budget_gb_override: u32 = 0,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -927,6 +944,19 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
 
+    /// Streaming is a CAPABILITY of the checkpoint's routed-expert banks, not of
+    /// its precision: both the dense HF layout and an MLX pack's per-projection
+    /// banks stream. The disk-side half of the answer is the discovery layout probe.
+    pub fn supportsExpertStreaming(self: *const ModelConfig) bool {
+        return isExpertStreamingArch(self.model_type) and self.num_hidden_layers > 0 and self.num_experts > 0 and
+            self.num_experts_per_tok > 0 and self.hidden_size > 0 and self.moe_intermediate_size > 0;
+    }
+
+    /// Only the dense checkpoint cannot be served resident at all.
+    pub fn expertStreamingRequired(self: *const ModelConfig) bool {
+        return self.supportsExpertStreaming() and self.quant_bits == 0;
+    }
+
     /// The long-context blast-radius predicate: every long-context mechanism (KV
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
@@ -1003,6 +1033,16 @@ pub const ModelConfig = struct {
     }
 
     /// Additive + dedup-guarded, like every terminator merge here.
+    pub const NgramTableSource = enum { quantized, bf16_override, bf16_streamed };
+
+    /// The override outranks the layout; only the HF bf16 checkpoint carries the table
+    /// as bf16 shards — a streamed quantized pack still reads its own `ngram_table.bin`.
+    pub fn ngramTableSource(self: *const ModelConfig) NgramTableSource {
+        if (self.ngram_bf16_dir != null) return .bf16_override;
+        if (self.expert_streaming and self.expert_layout == .bf16_fused) return .bf16_streamed;
+        return .quantized;
+    }
+
     pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
         for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
     }
@@ -1272,13 +1312,18 @@ pub const ModelConfig = struct {
         });
     }
 
-    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
-    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`; `expert_source_dir` of a streamed checkpoint; `ngram_bf16_dir`
+    /// from the env override); everything else is plain data or a borrowed slice.
+    /// Every `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
     /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.expert_source_dir) |p| allocator.free(p);
+        self.expert_source_dir = null;
+        if (self.ngram_bf16_dir) |p| allocator.free(p);
+        self.ngram_bf16_dir = null;
     }
 };
 
@@ -1320,6 +1365,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+        if (std.c.getenv("MLX_SERVE_NGRAM_BF16_DIR")) |raw| {
+            const dir = std.mem.span(raw);
+            if (dir.len > 0) config.ngram_bf16_dir = try allocator.dupe(u8, dir);
+        }
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -3591,10 +3640,86 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
     }
 }
 
+pub fn streamingDropsWeightKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "language_model.mtp.");
+}
+
+pub fn qwen4StreamingWeightKey(layout: expert_quant.Layout, buf: []u8, key: []const u8) ?[]const u8 {
+    if (expert_quant.isRoutedExpertKey(layout, key)) return null;
+    if (layout == .quantized_split) return key;
+    const trunk_prefix = "model.language_model.";
+    if (std.mem.indexOf(u8, key, ".ple.ple_embedding.ngram_embedding.shard_") != null) return null;
+    if (std.mem.startsWith(u8, key, trunk_prefix)) {
+        return std.fmt.bufPrint(buf, "language_model.model.{s}", .{key[trunk_prefix.len..]}) catch null;
+    }
+    if (std.mem.startsWith(u8, key, "mtp.")) {
+        return std.fmt.bufPrint(buf, "language_model.mtp.{s}", .{key[4..]}) catch null;
+    }
+    if (std.mem.eql(u8, key, "lm_head.weight")) return "language_model.lm_head.weight";
+    return key;
+}
+
+pub const ResidentSplit = struct { trunk: u64, mtp: u64 };
+
+pub fn streamingResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !ResidentSplit {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = model_discovery.indexShardSet(io, dir) orelse return error.InvalidSafetensorsIndex;
+    defer model_discovery.freeShardSet(&referenced);
+    var total: u64 = 0;
+    var mtp: u64 = 0;
+    var found: usize = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors") or !referenced.contains(entry.name)) continue;
+        const file = try dir.openFile(io, entry.name, .{});
+        defer file.close(io);
+        var read_buffer: [8192]u8 = undefined;
+        var reader = file.reader(io, &read_buffer);
+        const header_len = try reader.interface.takeInt(u64, .little);
+        if (header_len == 0 or header_len > 128 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+        const header = try allocator.alloc(u8, @intCast(header_len));
+        defer allocator.free(header);
+        try reader.interface.readSliceAll(header);
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{}) catch return error.InvalidSafetensorsHeader;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var tensor_iterator = parsed.value.object.iterator();
+        while (tensor_iterator.next()) |tensor| {
+            if (std.mem.eql(u8, tensor.key_ptr.*, "__metadata__")) continue;
+            var key_buf: [512]u8 = undefined;
+            const canonical = qwen4StreamingWeightKey(layout, &key_buf, tensor.key_ptr.*) orelse continue;
+            if (!shouldKeepWeightKey(canonical, false)) continue;
+            if (tensor.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            const offsets = tensor.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+            if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
+            const start = offsets.array.items[0].integer;
+            const end = offsets.array.items[1].integer;
+            if (start < 0 or end < start) return error.InvalidSafetensorsHeader;
+            const size: u64 = @intCast(end - start);
+            if (std.mem.startsWith(u8, canonical, "language_model.mtp.")) {
+                mtp = std.math.add(u64, mtp, size) catch return error.InvalidSafetensorsHeader;
+            } else {
+                total = std.math.add(u64, total, size) catch return error.InvalidSafetensorsHeader;
+            }
+            found += 1;
+        }
+    }
+    if (found == 0) return error.NoWeightFiles;
+    return .{ .trunk = total, .mtp = mtp };
+}
+
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     return loadWeightsOpt(io, allocator, model_dir, false);
+}
+
+pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, layout: expert_quant.Layout) !Weights {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, false, layout);
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3634,6 +3759,10 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
 fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null);
+}
+
+fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?expert_quant.Layout) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -3665,7 +3794,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
+        try loadSafetensorsFileMode(allocator, &weights, path, s, load_vision, streaming);
         file_count += 1;
     }
 
@@ -3753,6 +3882,102 @@ pub fn loadSafetensorsFile(
     s: mlx.mlx_stream,
     load_vision: bool,
 ) !void {
+    return loadSafetensorsFileMode(allocator, weights, path, s, load_vision, null);
+}
+
+fn qwen4NormFold(key: []const u8) bool {
+    const suffixes = [_][]const u8{
+        "hc_norm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
+        "q_layernorm.weight",
+        "k_layernorm.weight",
+        "ple.norm_key.weight",
+        "ple.norm_query.weight",
+        "ple.norm_conv.weight",
+        "pre_fc_norm_embedding.weight",
+        "pre_fc_norm_hidden.weight",
+    };
+    for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
+    return false;
+}
+
+fn qwen4FoldNorm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const one_f32 = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one_f32);
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_astype(&one, one_f32, mlx.mlx_array_dtype(value), s));
+    var result = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&result, value, one, s));
+    return result;
+}
+
+fn qwen4ConvShape(shape: []const c_int) !void {
+    if (shape.len != 3 or shape[1] != 1) return error.InvalidQwen4ConvShape;
+}
+
+fn qwen4TransposeConv(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    try qwen4ConvShape(mlx.getShape(value));
+    const axes = [_]c_int{ 0, 2, 1 };
+    var view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_transpose_axes(&view, value, &axes, 3, s));
+    var result = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&result, view, false, s));
+    return result;
+}
+
+test "qwen4 convolution transform rejects a non-unit channel axis" {
+    try std.testing.expectError(error.InvalidQwen4ConvShape, qwen4ConvShape(&.{ 4, 2, 8 }));
+    try qwen4ConvShape(&.{ 4, 1, 8 });
+}
+
+test "streaming config owns and releases its expert source path" {
+    var config = ModelConfig{};
+    config.expert_source_dir = try std.testing.allocator.dupe(u8, "/tmp/qwen-stream-source");
+    config.deinit(std.testing.allocator);
+    try std.testing.expect(config.expert_source_dir == null);
+}
+
+fn qwen4SplitGateUp(value: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
+    const shape = mlx.getShape(value);
+    if (shape.len != 3 or shape[1] == 0 or @mod(shape[1], 2) != 0) return error.BadPackedGateUpShape;
+    const half = @divExact(shape[1], 2);
+    const strides = [_]c_int{ 1, 1, 1 };
+    var result = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer {
+        for (result) |arr| _ = mlx.mlx_array_free(arr);
+    }
+    for (0..2) |i| {
+        const start = [_]c_int{ 0, @intCast(i * @as(usize, @intCast(half))), 0 };
+        const stop = [_]c_int{ shape[0], @intCast((i + 1) * @as(usize, @intCast(half))), shape[2] };
+        var view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_slice(&view, value, &start, 3, &stop, 3, &strides, 3, s));
+        try mlx.check(mlx.mlx_contiguous(&result[i], view, false, s));
+    }
+    return result;
+}
+
+fn putLoadedWeight(allocator: std.mem.Allocator, weights: *Weights, key: []const u8, value: mlx.mlx_array) !void {
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try weights.map.put(owned_key, value);
+}
+
+fn loadSafetensorsFileMode(
+    allocator: std.mem.Allocator,
+    weights: *Weights,
+    path: [*:0]const u8,
+    s: mlx.mlx_stream,
+    load_vision: bool,
+    streaming: ?expert_quant.Layout,
+) !void {
+    // Only the dense HF layout needs the converter's work at load time: the
+    // fused bank split, the delta norms and the conv transpose. An MLX pack
+    // ships every resident tensor in its serving layout already.
+    const fused_streaming = streaming != null and streaming.? == .bf16_fused;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -3774,9 +3999,17 @@ pub fn loadSafetensorsFile(
             break;
         }
 
-        const key_str = std.mem.span(key.?);
+        const key_str_raw = std.mem.span(key.?);
+        var key_buf: [512]u8 = undefined;
+        const key_str = if (streaming) |layout|
+            qwen4StreamingWeightKey(layout, &key_buf, key_str_raw) orelse {
+                _ = mlx.mlx_array_free(value);
+                continue;
+            }
+        else
+            key_str_raw;
 
-        if (!shouldKeepWeightKey(key_str, load_vision)) {
+        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and streamingDropsWeightKey(key_str))) {
             _ = mlx.mlx_array_free(value);
             continue;
         }
@@ -3785,18 +4018,57 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
+        errdefer if (final_value.ctx != null) {
+            _ = mlx.mlx_array_free(final_value);
+        };
         if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(cast);
             try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
             _ = mlx.mlx_array_free(value);
             final_value = cast;
             if (ndim == 1) narrowed_1d += 1;
         }
 
-        const owned_key = try allocator.dupe(u8, key_str);
-        try weights.map.put(owned_key, final_value);
+        if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.gate_up_proj")) {
+            var pair = try qwen4SplitGateUp(final_value, s);
+            errdefer {
+                if (pair[0].ctx != null) _ = mlx.mlx_array_free(pair[0]);
+                if (pair[1].ctx != null) _ = mlx.mlx_array_free(pair[1]);
+            }
+            _ = mlx.mlx_array_free(final_value);
+            final_value = .{ .ctx = null };
+            var gate_key_buf: [512]u8 = undefined;
+            var up_key_buf: [512]u8 = undefined;
+            const prefix_len = key_str.len - "experts.gate_up_proj".len;
+            const gate_key = std.fmt.bufPrint(&gate_key_buf, "{s}switch_mlp.gate_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+            const up_key = std.fmt.bufPrint(&up_key_buf, "{s}switch_mlp.up_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+            try putLoadedWeight(allocator, weights, gate_key, pair[0]);
+            pair[0] = .{ .ctx = null };
+            try putLoadedWeight(allocator, weights, up_key, pair[1]);
+            pair[1] = .{ .ctx = null };
+            continue;
+        }
+        if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.down_proj")) {
+            var down_key_buf: [512]u8 = undefined;
+            const prefix_len = key_str.len - "experts.down_proj".len;
+            const down_key = std.fmt.bufPrint(&down_key_buf, "{s}switch_mlp.down_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+            try putLoadedWeight(allocator, weights, down_key, final_value);
+            continue;
+        }
+        if (fused_streaming and qwen4NormFold(key_str)) {
+            const folded = try qwen4FoldNorm(final_value, s);
+            _ = mlx.mlx_array_free(final_value);
+            final_value = folded;
+        }
+        if (fused_streaming and std.mem.endsWith(u8, key_str, "conv1d.weight") and mlx.mlx_array_ndim(final_value) == 3) {
+            const transposed = try qwen4TransposeConv(final_value, s);
+            _ = mlx.mlx_array_free(final_value);
+            final_value = transposed;
+        }
+        try putLoadedWeight(allocator, weights, key_str, final_value);
     }
 }
 
@@ -6797,6 +7069,199 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expect(!c.qwen_vision and !c.has_vision);
 }
 
+test "parseConfigFromJson accepts dense qwen4 as an expert streaming architecture" {
+    const json =
+        \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
+    ;
+    const config = try parseConfigFromJson(std.testing.allocator, json);
+    try std.testing.expectEqual(@as(u32, 0), config.quant_bits);
+    try std.testing.expect(config.supportsExpertStreaming());
+}
+
+test "expert streaming is a capability of every qwen4 pack and required only by the dense one" {
+    const t = std.testing;
+    const dense =
+        \\{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
+    ;
+    const quantized =
+        \\{"model_type":"qwen4_exp","quantization":{"group_size":64,"bits":4,"mode":"affine"},"text_config":{"model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"full_attention_interval":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"ple_layer_ids":[2],"ngram_size":3,"heads_per_ngram":8,"ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"indexer_n_heads":4,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}
+    ;
+    var dense_config = try parseConfigFromJson(t.allocator, dense);
+    defer dense_config.deinit(t.allocator);
+    try t.expect(dense_config.supportsExpertStreaming() and dense_config.expertStreamingRequired());
+    var quant_config = try parseConfigFromJson(t.allocator, quantized);
+    defer quant_config.deinit(t.allocator);
+    try t.expectEqual(@as(u32, 4), quant_config.quant_bits);
+    try t.expect(quant_config.supportsExpertStreaming() and !quant_config.expertStreamingRequired());
+    var other = ModelConfig{ .model_type = "qwen3_5_moe", .num_hidden_layers = 48, .num_experts = 512, .num_experts_per_tok = 10, .hidden_size = 2560, .moe_intermediate_size = 640 };
+    try t.expect(!other.supportsExpertStreaming() and !other.expertStreamingRequired());
+}
+
+test "qwen4 streaming loader canonicalizes resident keys and excludes disk tensors" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("language_model.model.layers.7.mlp.gate.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.gate.weight").?);
+    try std.testing.expectEqualStrings("language_model.mtp.fc_hidden.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "mtp.fc_hidden.weight").?);
+    try std.testing.expectEqualStrings("language_model.lm_head.weight", qwen4StreamingWeightKey(.bf16_fused, &buf, "lm_head.weight").?);
+    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.gate_up_proj") == null);
+    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.7.mlp.experts.down_proj") == null);
+    try std.testing.expect(qwen4StreamingWeightKey(.bf16_fused, &buf, "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_12.weight") == null);
+}
+
+test "the quantized streaming loader drops the nine routed banks and keeps everything else" {
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "weight", "scales", "biases" }) |part| {
+        for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+            var key_buf: [192]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "language_model.model.layers.7.mlp.switch_mlp.{s}_proj.{s}", .{ proj, part });
+            try std.testing.expect(qwen4StreamingWeightKey(.quantized_split, &buf, key) == null);
+        }
+    }
+    try std.testing.expectEqualStrings(
+        "language_model.model.layers.7.mlp.shared_expert.gate_proj.scales",
+        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.shared_expert.gate_proj.scales").?,
+    );
+    try std.testing.expectEqualStrings(
+        "language_model.model.layers.7.mlp.gate.weight",
+        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.model.layers.7.mlp.gate.weight").?,
+    );
+    try std.testing.expectEqualStrings(
+        "language_model.lm_head.weight",
+        qwen4StreamingWeightKey(.quantized_split, &buf, "language_model.lm_head.weight").?,
+    );
+}
+
+test "qwen4 streaming loader materializes only transformed resident tensors" {
+    const t = std.testing;
+    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
+    const io = t.io;
+    const allocator = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = path_buf[0..path_len];
+    const header = "{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":{\"dtype\":\"BF16\",\"shape\":[1,2,1],\"data_offsets\":[0,4]},\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":{\"dtype\":\"BF16\",\"shape\":[1,2,1],\"data_offsets\":[4,8]},\"model.language_model.layers.0.mlp.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[8,10]},\"model.language_model.layers.0.self_attn.q_norm.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[10,12]},\"model.language_model.layers.0.linear_attn.conv1d.weight\":{\"dtype\":\"BF16\",\"shape\":[1,1,2],\"data_offsets\":[12,16]},\"mtp.layers.0.mlp.experts.gate_up_proj\":{\"dtype\":\"BF16\",\"shape\":[1,2,1],\"data_offsets\":[16,20]},\"mtp.layers.0.mlp.experts.down_proj\":{\"dtype\":\"BF16\",\"shape\":[1,1,1],\"data_offsets\":[20,22]}}";
+    const padded_header_len = std.mem.alignForward(usize, header.len, 8);
+    const file_bytes = try allocator.alloc(u8, 8 + padded_header_len + 22);
+    defer allocator.free(file_bytes);
+    std.mem.writeInt(u64, file_bytes[0..8], padded_header_len, .little);
+    @memset(file_bytes[8 .. 8 + padded_header_len], ' ');
+    @memcpy(file_bytes[8 .. 8 + header.len], header);
+    const tensor_data = [_]u16{ 0x3f80, 0x4000, 0x3f80, 0x4000, 0x3f80, 0, 0x3f80, 0x4000, 0x3f80, 0x4000, 0x3f80 };
+    @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+
+    var weights = try loadWeightsStreaming(io, allocator, model_dir, .bf16_fused);
+    defer weights.deinit();
+    try t.expect(weights.get("model.language_model.layers.0.mlp.experts.gate_up_proj") == null);
+    try t.expect(weights.get("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight") == null);
+    try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
+    const norm = weights.get("language_model.model.layers.0.self_attn.q_norm.weight").?;
+    try t.expectEqualSlices(c_int, &.{1}, mlx.getShape(norm));
+    try t.expectEqualSlices(c_int, &.{ 1, 2, 1 }, mlx.getShape(weights.get("language_model.model.layers.0.linear_attn.conv1d.weight").?));
+    try t.expect(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight") == null);
+    try t.expect(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.up_proj.weight") == null);
+    try t.expect(weights.get("language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight") == null);
+}
+
+test "a streamed load that fails mid-transform frees the tensor it was holding" {
+    const t = std.testing;
+    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
+    const io = t.io;
+    const allocator = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const payload: usize = 2048 * 2 * 2048 * 2;
+    const header = "{\"model.language_model.layers.0.linear_attn.conv1d.weight\":{\"dtype\":\"BF16\",\"shape\":[2048,2,2048],\"data_offsets\":[0,16777216]}}";
+    const padded_header_len = std.mem.alignForward(usize, header.len, 8);
+    const file_bytes = try allocator.alloc(u8, 8 + padded_header_len + payload);
+    defer allocator.free(file_bytes);
+    std.mem.writeInt(u64, file_bytes[0..8], padded_header_len, .little);
+    @memset(file_bytes[8 .. 8 + padded_header_len], ' ');
+    @memcpy(file_bytes[8 .. 8 + header.len], header);
+    @memset(file_bytes[8 + padded_header_len ..], 0x3c);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+
+    const model_dir = path_buf[0..path_len];
+    const FdProbe = struct {
+        fn count(iox: std.Io) usize {
+            var dir = std.Io.Dir.openDirAbsolute(iox, "/dev/fd", .{ .iterate = true }) catch return 0;
+            defer dir.close(iox);
+            var n: usize = 0;
+            var walker = dir.iterate();
+            while (walker.next(iox) catch null) |_| n += 1;
+            return n;
+        }
+    };
+    try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+    const before = FdProbe.count(io);
+    for (0..8) |_| {
+        try t.expectError(error.InvalidQwen4ConvShape, loadWeightsStreaming(io, allocator, model_dir, .bf16_fused));
+    }
+    const after = FdProbe.count(io);
+    try t.expect(after <= before + 1);
+}
+
+test "the streamed load drops the MTP head the ledger bills at zero" {
+    const t = std.testing;
+    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
+    const io = t.io;
+    const allocator = t.allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const header = "{\"model.language_model.layers.0.mlp.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]},\"mtp.fc_hidden.weight\":{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[2,4]},\"mtp.layers.0.mlp.experts.down_proj\":{\"dtype\":\"BF16\",\"shape\":[1,1,1],\"data_offsets\":[4,6]}}";
+    const padded_header_len = std.mem.alignForward(usize, header.len, 8);
+    const file_bytes = try allocator.alloc(u8, 8 + padded_header_len + 6);
+    defer allocator.free(file_bytes);
+    std.mem.writeInt(u64, file_bytes[0..8], padded_header_len, .little);
+    @memset(file_bytes[8 .. 8 + padded_header_len], ' ');
+    @memcpy(file_bytes[8 .. 8 + header.len], header);
+    const tensor_data = [_]u16{ 0x3f80, 0x4000, 0x3f80 };
+    @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+
+    var weights = try loadWeightsStreaming(io, allocator, path_buf[0..path_len], .bf16_fused);
+    defer weights.deinit();
+    try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
+    var it = weights.map.iterator();
+    while (it.next()) |entry| {
+        try t.expect(!std.mem.startsWith(u8, entry.key_ptr.*, "language_model.mtp."));
+    }
+}
+
+test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const header = "{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":{\"dtype\":\"BF16\",\"shape\":[1,2,2],\"data_offsets\":[0,8]},\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":{\"dtype\":\"BF16\",\"shape\":[1,2],\"data_offsets\":[8,12]},\"model.visual.x\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[12,14]},\"model.language_model.layers.0.mlp.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[1,3],\"data_offsets\":[14,20]},\"mtp.layers.0.mlp.experts.down_proj\":{\"dtype\":\"BF16\",\"shape\":[1,3,2],\"data_offsets\":[20,32]}}";
+    const bytes = try t.allocator.alloc(u8, 8 + header.len + 32);
+    defer t.allocator.free(bytes);
+    std.mem.writeInt(u64, bytes[0..8], header.len, .little);
+    @memcpy(bytes[8 .. 8 + header.len], header);
+    @memset(bytes[8 + header.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "s.safetensors", .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"s.safetensors\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"s.safetensors\",\"model.visual.x\":\"s.safetensors\",\"model.language_model.layers.0.mlp.gate.weight\":\"s.safetensors\",\"mtp.layers.0.mlp.experts.down_proj\":\"s.safetensors\"}}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const split = try streamingResidentSplit(io, t.allocator, path_buf[0..path_len], .bf16_fused);
+    try t.expectEqual(@as(u64, 6), split.trunk);
+    try t.expectEqual(@as(u64, 12), split.mtp);
+}
+
+test "real qwen streaming resident estimate is trunk plus MTP only" {
+    const path = "/Users/beam/llm/models/Qwen/Qwen3.8-Flash-Next";
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    dir.close(std.testing.io);
+    const split = try streamingResidentSplit(std.testing.io, std.testing.allocator, path, .bf16_fused);
+    const bytes = split.trunk +| split.mtp;
+    try std.testing.expect(bytes > 14_000_000_000 and bytes < 16_000_000_000);
+}
+
 test "parseConfigFromJson: qwen4_exp with vision_config reads the Qwen3-VL tower, M-RoPE and vision token ids" {
     const json =
         \\{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp",
@@ -7296,4 +7761,48 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.tie_word_embeddings);
     try testing.expect(!config.norm_has_offset);
     try testing.expect(!config.has_pre_ff_norm);
+}
+
+test "isExpertStreamingArch is the ONE arch gate and only qwen4_exp passes it" {
+    const t = std.testing;
+    try t.expect(isExpertStreamingArch("qwen4_exp"));
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "hy_v3", "laguna", "llama", "deepseek_v4", "gguf", "" }) |mt| {
+        try t.expect(!isExpertStreamingArch(mt));
+        var c = ModelConfig{
+            .model_type = mt,
+            .num_hidden_layers = 48,
+            .num_experts = 512,
+            .num_experts_per_tok = 10,
+            .hidden_size = 2560,
+            .moe_intermediate_size = 640,
+        };
+        try t.expect(!c.supportsExpertStreaming());
+        try t.expect(!c.expertStreamingRequired());
+        c.quant_bits = 0;
+        try t.expect(!c.expertStreamingRequired());
+    }
+    var q4 = ModelConfig{
+        .model_type = "qwen4_exp",
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+    };
+    try t.expect(q4.supportsExpertStreaming() and q4.expertStreamingRequired());
+}
+
+test "the n-gram table source: the bf16 override outranks streaming, streaming outranks the pack table" {
+    var c = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model" };
+    try std.testing.expectEqual(ModelConfig.NgramTableSource.quantized, c.ngramTableSource());
+    c.expert_streaming = true;
+    try std.testing.expectEqual(ModelConfig.NgramTableSource.bf16_streamed, c.ngramTableSource());
+    c.expert_layout = .quantized_split;
+    try std.testing.expectEqual(ModelConfig.NgramTableSource.quantized, c.ngramTableSource());
+    c.expert_layout = .bf16_fused;
+    var dir = [_]u8{ '/', 'x' };
+    c.ngram_bf16_dir = dir[0..];
+    try std.testing.expectEqual(ModelConfig.NgramTableSource.bf16_override, c.ngramTableSource());
+    c.expert_streaming = false;
+    try std.testing.expectEqual(ModelConfig.NgramTableSource.bf16_override, c.ngramTableSource());
 }

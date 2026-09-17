@@ -36,6 +36,24 @@ final class AppStateUseModelTests: XCTestCase {
                        .hotSwitch(id: path))
     }
 
+    func testRefusedHotSwitchKeepsTheServedModelSelectedAndIsNotReady() {
+        let previous = "/models/mlx-community/gemma-4-e4b-it-4bit"
+        let attempted = "/models/qwen/Qwen3.8-Flash-Next-bf16"
+        let refused = AppState.hotSwitchOutcome(refusedType: "expert_streaming_required",
+                                                previous: previous,
+                                                attempted: attempted)
+        XCTAssertEqual(refused.selection, previous)
+        XCTAssertFalse(refused.ready)
+    }
+
+    func testAcceptedHotSwitchSelectsTheNewModelAndIsReady() {
+        let previous = "/models/mlx-community/gemma-4-e4b-it-4bit"
+        let attempted = "/models/qwen/Qwen3.8-Flash-Next-bf16"
+        let ok = AppState.hotSwitchOutcome(refusedType: nil, previous: previous, attempted: attempted)
+        XCTAssertEqual(ok.selection, attempted)
+        XCTAssertTrue(ok.ready)
+    }
+
     /// Mid-boot the process is still loading the OLD pick — restart with the
     /// new one. Stopped/error stays untouched: explicit starts
     /// (`useModelAndAwaitReady`, the launch gate) own that.

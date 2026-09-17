@@ -18,6 +18,8 @@ const log = @import("log.zig");
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
 const mtp = @import("mtp.zig");
+const expert_stream = @import("expert_stream.zig");
+const expert_quant = @import("expert_quant.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -295,6 +297,96 @@ pub fn freeShardSet(set: *std.StringHashMapUnmanaged(void)) void {
     set.deinit(std.heap.page_allocator);
 }
 
+/// The routed-expert layout this index declares, or null when it declares
+/// neither. A dense (fused) index must also name every PLE shard; the quantized
+/// pack keeps its PLE table in `ngram_table.bin` and has none.
+pub fn streamingIndexLayout(allocator: std.mem.Allocator, model_type: []const u8, raw: []const u8, layers: u16, ple_shards: u16) ?expert_quant.Layout {
+    const layout = expert_quant.layoutFromIndexJson(allocator, model_type, raw, layers) orelse return null;
+    if (layout == .quantized_split) return layout;
+    if (!fusedPleShardsComplete(allocator, raw, ple_shards)) return null;
+    return layout;
+}
+
+fn fusedPleShardsComplete(allocator: std.mem.Allocator, raw: []const u8, ple_shards: u16) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const weight_map_value = parsed.value.object.get("weight_map") orelse return false;
+    if (weight_map_value != .object) return false;
+    const weight_map = weight_map_value.object;
+    const seen = allocator.alloc(bool, ple_shards) catch return false;
+    defer allocator.free(seen);
+    @memset(seen, false);
+    const prefix = "model.language_model.layers.";
+    const middle = ".ple.ple_embedding.ngram_embedding.shard_";
+    const suffix = ".weight";
+    var ple_layer: ?u16 = null;
+    var found: usize = 0;
+    var it = weight_map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, key, prefix) or !std.mem.endsWith(u8, key, suffix)) continue;
+        const body = key[prefix.len .. key.len - suffix.len];
+        const split = std.mem.indexOf(u8, body, middle) orelse continue;
+        const layer = std.fmt.parseInt(u16, body[0..split], 10) catch return false;
+        const shard = std.fmt.parseInt(u16, body[split + middle.len ..], 10) catch return false;
+        if (shard >= ple_shards or seen[shard] or entry.value_ptr.* != .string) return false;
+        if (ple_layer) |known| {
+            if (known != layer) return false;
+        } else ple_layer = layer;
+        seen[shard] = true;
+        found += 1;
+    }
+    return found == ple_shards;
+}
+
+pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?expert_quant.Layout {
+    const meta = readStubMeta(io, allocator, model_dir);
+    if (!expert_quant.isExpertStreamingArch(meta.modelType())) return null;
+    if (!meta.found or meta.num_hidden_layers == 0 or meta.num_experts == 0 or
+        meta.hidden_size == 0 or meta.moe_intermediate_size == 0) return null;
+    if (meta.num_hidden_layers > std.math.maxInt(u16) or meta.num_experts > std.math.maxInt(u16)) return null;
+    const geometry = expert_quant.Geometry{
+        .layers = @intCast(meta.num_hidden_layers),
+        .experts = @intCast(meta.num_experts),
+        .hidden = meta.hidden_size,
+        .intermediate = meta.moe_intermediate_size,
+    };
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return null;
+    defer dir.close(io);
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(64 * 1024 * 1024)) catch return null;
+    defer allocator.free(raw);
+    const layout = streamingIndexLayout(allocator, meta.modelType(), raw, geometry.layers, 128) orelse return null;
+    var shards = indexShardSet(io, dir) orelse return null;
+    defer freeShardSet(&shards);
+    var keys = shards.keyIterator();
+    while (keys.next()) |name| {
+        const stat = dir.statFile(io, name.*, .{}) catch return null;
+        if (stat.kind != .file) return null;
+    }
+    switch (layout) {
+        .bf16_fused => {
+            var experts = expert_stream.ExpertStore.open(allocator, model_dir, .{
+                .layers = geometry.layers,
+                .experts = geometry.experts,
+                .hidden = geometry.hidden,
+                .intermediate = geometry.intermediate,
+            }) catch return null;
+            experts.deinit();
+            var table = expert_stream.Bf16NgramStore.open(allocator, model_dir) catch return null;
+            defer table.deinit();
+            if (table.dim != 160 or table.rows != 320_001_536) return null;
+        },
+        .quantized_split => {
+            const stat = dir.statFile(io, "ngram_table.bin", .{}) catch return null;
+            if (stat.kind != .file) return null;
+            var experts = expert_quant.QuantStore.open(allocator, model_dir, geometry) catch return null;
+            experts.deinit();
+        },
+    }
+    return layout;
+}
+
 /// Read at most `buf.len` bytes of `dir/name` into `buf`; null when it can't be
 /// opened or read. Short by design — the callers want a header, not a file, and
 /// the file may be gigabytes.
@@ -538,6 +630,7 @@ pub const DiscoveredModel = struct {
     /// can advertise arch-derived capabilities before a cold load. Empty
     /// when unknown.
     model_type: []const u8 = "",
+    streaming_index_complete: bool = false,
 };
 
 pub const DiscoveryResult = struct {
@@ -920,11 +1013,14 @@ fn tryAddModel(
         try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ trimTrailingSlash(model_dir), id_prefix, name })
     else
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), name });
+    const streaming_index_complete = expert_quant.isExpertStreamingArch(model_type) and
+        qwen4StreamingIndexComplete(io, allocator, path) != null;
     try found.append(allocator, .{
         .id = id,
         .path = path,
         .bytes_on_disk = if (bytes_ok) bytes else null,
         .model_type = model_type,
+        .streaming_index_complete = streaming_index_complete,
     });
     return true;
 }
@@ -1053,6 +1149,9 @@ pub const StubMeta = struct {
     is_moe: bool = false,
     /// The dir ships an MTP head (sidecar or in-checkpoint) the server can load.
     has_mtp: bool = false,
+    num_experts: u32 = 0,
+    num_experts_per_tok: u32 = 0,
+    moe_intermediate_size: u32 = 0,
     has_vision: bool = false,
     /// Qwen3-VL-family video input: a `video_token_id` alongside `has_vision`
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
@@ -1067,6 +1166,12 @@ pub const StubMeta = struct {
     /// fallback for metadata-less checkpoints lives at the server's stub-cap
     /// site via `model.poolingFromDirName` (one shared rule, no copy here).
     has_embedding: bool = false,
+    model_type_buf: [64]u8 = @splat(0),
+    model_type_len: u8 = 0,
+
+    pub fn modelType(self: *const StubMeta) []const u8 {
+        return self.model_type_buf[0..self.model_type_len];
+    }
 };
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
@@ -1121,10 +1226,17 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     meta.is_moe = cfgU32(root, text_cfg, "num_experts") > 0 or
         cfgU32(root, text_cfg, "num_local_experts") > 0 or
         cfgU32(root, text_cfg, "n_routed_experts") > 0;
+    meta.num_experts = cfgU32(root, text_cfg, "num_experts");
+    meta.num_experts_per_tok = cfgU32(root, text_cfg, "num_experts_per_tok");
+    meta.moe_intermediate_size = cfgU32(root, text_cfg, "moe_intermediate_size");
     const mt: []const u8 = if (root.get("model_type")) |v|
         (if (v == .string) v.string else "")
     else
         "";
+    if (mt.len <= meta.model_type_buf.len) {
+        @memcpy(meta.model_type_buf[0..mt.len], mt);
+        meta.model_type_len = @intCast(mt.len);
+    }
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
@@ -1255,6 +1367,163 @@ test "discoverModels finds flat and org/repo model dirs" {
     try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
     try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
     try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
+}
+
+fn writeStreamingQuantFixture(io: std.Io, dir: std.Io.Dir, model_type: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const experts: u64 = 2;
+    const hidden: u64 = 64;
+    const intermediate: u64 = 32;
+    const Spec = struct { key: []const u8, dtype: []const u8, d1: u64, d2: u64, elem: u64 };
+    const specs = [_]Spec{
+        .{ .key = "gate_proj.weight", .dtype = "U32", .d1 = intermediate, .d2 = 8, .elem = 4 },
+        .{ .key = "gate_proj.scales", .dtype = "BF16", .d1 = intermediate, .d2 = 2, .elem = 2 },
+        .{ .key = "gate_proj.biases", .dtype = "BF16", .d1 = intermediate, .d2 = 2, .elem = 2 },
+        .{ .key = "up_proj.weight", .dtype = "U32", .d1 = intermediate, .d2 = 8, .elem = 4 },
+        .{ .key = "up_proj.scales", .dtype = "BF16", .d1 = intermediate, .d2 = 2, .elem = 2 },
+        .{ .key = "up_proj.biases", .dtype = "BF16", .d1 = intermediate, .d2 = 2, .elem = 2 },
+        .{ .key = "down_proj.weight", .dtype = "U32", .d1 = hidden, .d2 = 4, .elem = 4 },
+        .{ .key = "down_proj.scales", .dtype = "BF16", .d1 = hidden, .d2 = 1, .elem = 2 },
+        .{ .key = "down_proj.biases", .dtype = "BF16", .d1 = hidden, .d2 = 1, .elem = 2 },
+    };
+
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(allocator);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(allocator);
+    try header.append(allocator, '{');
+    try index.appendSlice(allocator, "{\"weight_map\":{");
+    var at: u64 = 0;
+    for (specs, 0..) |spec, i| {
+        const bytes = experts * spec.d1 * spec.d2 * spec.elem;
+        const row = try std.fmt.allocPrint(
+            allocator,
+            "{s}\"language_model.model.layers.0.mlp.switch_mlp.{s}\":{{\"dtype\":\"{s}\",\"shape\":[{d},{d},{d}],\"data_offsets\":[{d},{d}]}}",
+            .{ if (i == 0) "" else ",", spec.key, spec.dtype, experts, spec.d1, spec.d2, at, at + bytes },
+        );
+        defer allocator.free(row);
+        try header.appendSlice(allocator, row);
+        const mapping = try std.fmt.allocPrint(
+            allocator,
+            "{s}\"language_model.model.layers.0.mlp.switch_mlp.{s}\":\"model.safetensors\"",
+            .{ if (i == 0) "" else ",", spec.key },
+        );
+        defer allocator.free(mapping);
+        try index.appendSlice(allocator, mapping);
+        at += bytes;
+    }
+    try header.append(allocator, '}');
+    try index.appendSlice(allocator, "}}");
+
+    const file_bytes = try allocator.alloc(u8, 8 + header.items.len + @as(usize, @intCast(at)));
+    defer allocator.free(file_bytes);
+    std.mem.writeInt(u64, file_bytes[0..8], header.items.len, .little);
+    @memcpy(file_bytes[8 .. 8 + header.items.len], header.items);
+    @memset(file_bytes[8 + header.items.len ..], 0);
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+    try dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = "0" });
+    const config = try std.fmt.allocPrint(
+        allocator,
+        "{{\"model_type\":\"{s}\",\"hidden_size\":{d},\"num_hidden_layers\":1,\"num_experts\":{d},\"num_experts_per_tok\":2,\"moe_intermediate_size\":{d}}}",
+        .{ model_type, hidden, experts, intermediate },
+    );
+    defer allocator.free(config);
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+}
+
+test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candidate under another model_type" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var root = std.testing.tmpDir(.{ .iterate = true });
+    defer root.cleanup();
+    try root.dir.createDirPath(io, "q4");
+    try root.dir.createDirPath(io, "moe");
+    var q4_dir = try root.dir.openDir(io, "q4", .{ .iterate = true });
+    defer q4_dir.close(io);
+    var moe_dir = try root.dir.openDir(io, "moe", .{ .iterate = true });
+    defer moe_dir.close(io);
+    try writeStreamingQuantFixture(io, q4_dir, "qwen4_exp");
+    try writeStreamingQuantFixture(io, moe_dir, "qwen3_5_moe");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try root.dir.realPath(io, &root_buf);
+    const root_path = root_buf[0..root_len];
+    var q4_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const q4_len = try q4_dir.realPath(io, &q4_buf);
+    const q4_path = q4_buf[0..q4_len];
+    var moe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const moe_len = try moe_dir.realPath(io, &moe_buf);
+    const moe_path = moe_buf[0..moe_len];
+
+    try std.testing.expectEqual(
+        expert_quant.Layout.quantized_split,
+        expert_quant.layoutOfDir(allocator, io, "qwen4_exp", q4_path, 1).?,
+    );
+    try std.testing.expect(expert_quant.layoutOfDir(allocator, io, "qwen3_5_moe", moe_path, 1) == null);
+
+    try std.testing.expectEqual(
+        expert_quant.Layout.quantized_split,
+        qwen4StreamingIndexComplete(io, allocator, q4_path).?,
+    );
+    try std.testing.expect(qwen4StreamingIndexComplete(io, allocator, moe_path) == null);
+
+    var result = try discoverModels(io, allocator, root_path);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.models.len);
+    for (result.models) |m| {
+        if (std.mem.eql(u8, m.model_type, "qwen4_exp")) {
+            try std.testing.expect(m.streaming_index_complete);
+        } else {
+            try std.testing.expectEqualStrings("qwen3_5_moe", m.model_type);
+            try std.testing.expect(!m.streaming_index_complete);
+        }
+    }
+}
+
+test "qwen4 streaming index completeness requires every target bank and PLE shard" {
+    const complete = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"a\",\"model.language_model.layers.0.mlp.experts.down_proj\":\"b\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"c\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight\":\"d\"}}";
+    const missing = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"a\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"c\"}}";
+    try std.testing.expectEqual(expert_quant.Layout.bf16_fused, streamingIndexLayout(std.testing.allocator, "qwen4_exp", complete, 1, 2).?);
+    try std.testing.expect(streamingIndexLayout(std.testing.allocator, "qwen4_exp", missing, 1, 2) == null);
+}
+
+test "a quantized index is a streaming candidate without any PLE shard" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "{\"weight_map\":{");
+    var first = true;
+    for ([_][]const u8{ "gate", "up", "down" }) |proj| {
+        for ([_][]const u8{ "weight", "scales", "biases" }) |part| {
+            if (!first) try buf.append(std.testing.allocator, ',');
+            first = false;
+            const row = try std.fmt.allocPrint(std.testing.allocator, "\"language_model.model.layers.0.mlp.switch_mlp.{s}_proj.{s}\":\"a\"", .{ proj, part });
+            defer std.testing.allocator.free(row);
+            try buf.appendSlice(std.testing.allocator, row);
+        }
+    }
+    try buf.appendSlice(std.testing.allocator, "}}");
+    try std.testing.expectEqual(expert_quant.Layout.quantized_split, streamingIndexLayout(std.testing.allocator, "qwen4_exp", buf.items, 1, 128).?);
+    try std.testing.expect(streamingIndexLayout(std.testing.allocator, "qwen4_exp", buf.items, 2, 128) == null);
+}
+
+test "the real quantized pack is a complete streaming discovery candidate" {
+    const path = "/Users/beam/llm/models/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit";
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    dir.close(std.testing.io);
+    try std.testing.expectEqual(expert_quant.Layout.quantized_split, qwen4StreamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
+    const meta = readStubMeta(std.testing.io, std.testing.allocator, path);
+    try std.testing.expect(meta.found and meta.quant_bits == 4 and meta.num_experts == 512);
+}
+
+test "real qwen checkpoint is a complete streaming discovery candidate" {
+    const path = "/Users/beam/llm/models/Qwen/Qwen3.8-Flash-Next";
+    var dir = std.Io.Dir.openDirAbsolute(std.testing.io, path, .{}) catch return error.SkipZigTest;
+    dir.close(std.testing.io);
+    try std.testing.expectEqual(expert_quant.Layout.bf16_fused, qwen4StreamingIndexComplete(std.testing.io, std.testing.allocator, path).?);
+    const meta = readStubMeta(std.testing.io, std.testing.allocator, path);
+    try std.testing.expect(meta.found and meta.quant_bits == 0 and meta.hidden_size == 2560 and meta.num_hidden_layers == 48);
+    try std.testing.expect(meta.num_experts == 512 and meta.num_experts_per_tok == 10 and meta.moe_intermediate_size == 640);
 }
 
 test "discoverModelsMany merges roots in order and de-dups by id" {

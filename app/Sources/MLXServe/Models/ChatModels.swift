@@ -476,6 +476,11 @@ struct ModelInfo {
     var mtpAvailable: Bool? = nil
     /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
     var kvQuant: String = ""
+    /// Top-level `streaming`: a dense qwen4_exp checkpoint served by streaming its
+    /// experts from SSD (`ssdBudgetGB` = the effective budget when loaded, the
+    /// per-model setting when not). Top level, never `meta.*` (#188).
+    var streaming: Bool = false
+    var ssdBudgetGB: Int? = nil
     /// Plan 05 Phase G — multi-model fields. All optional so older
     /// servers (single-model) still decode without these.
     /// Whether this entry currently holds resident weights.
@@ -572,6 +577,9 @@ struct ModelInfo {
         if drafterLoaded { return "+Drafter" }
         return nil
     }
+
+    /// The badge beside the spec-decode one: a streamed checkpoint reads its experts off disk.
+    var storageBadge: String? { streaming ? "SSD" : nil }
 
     /// Whether this entry can answer a chat request at all. A generator
     /// advertises only its OUTPUT modality ("image" / "video" / "audio") and an

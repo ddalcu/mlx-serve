@@ -105,5 +105,16 @@ check "[4] malformed file: load -> 200 (got $CODE), globals apply (ctx $(row "$M
     "$([ "$CODE" = "200" ] && [ "$(row "$MODEL_A" ctx)" = "16384" ] && echo 1 || echo 0)"
 check "[4] malformed file logged" "$(grep -q "\[model-settings\] .*malformed" "$LOG" && echo 1 || echo 0)"
 
+# [5] ssd_budget_gb on a model that does not stream experts: ignored, warned once, load still 200
+cat >"$SETTINGS" <<JSON
+{ "$MODEL_A/": { "ssd_budget_gb": 60 } }
+JSON
+post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
+CODE="$(post load-model "{\"model\":\"$MODEL_A\"}")"
+check "[5] ssd_budget_gb on a non-streaming model: load -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+check "[5] the setting is logged" "$(grep -q "\[model-settings\] .*ssd_budget_gb=60" "$LOG" && echo 1 || echo 0)"
+check "[5] one line says it is ignored" \
+    "$([ "$(grep -c "ssd_budget_gb ignored" "$LOG")" = "1" ] && echo 1 || echo 0)"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ]

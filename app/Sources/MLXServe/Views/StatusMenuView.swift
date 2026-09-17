@@ -728,6 +728,18 @@ struct StatusMenuView: View {
                           ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
                           : "Assistant drafter loaded — faster decode via speculative decoding")
             }
+            if let badge = info.storageBadge {
+                Text(L10n.text(badge))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.orange.opacity(0.15))
+                    .clipShape(Capsule())
+                    .help(info.ssdBudgetGB.map {
+                        "Experts streamed from SSD — \($0) GiB resident budget"
+                    } ?? "Experts streamed from SSD")
+            }
             Spacer()
             if info.bytesResident > 0 {
                 Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))

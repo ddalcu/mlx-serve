@@ -9,6 +9,7 @@
 //! [R, dim/gs]) written by `tests/convert_qwen38_flash_next.py`.
 
 const std = @import("std");
+const expert_stream = @import("expert_stream.zig");
 const log = @import("log.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -151,6 +152,7 @@ fn warmEnabled() bool {
 /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
 pub var live_warm_bytes = std.atomic.Value(u64).init(0);
 pub var live_warm_total = std.atomic.Value(u64).init(0);
+const empty_ngram_map: [0]u8 align(std.heap.page_size_min) = .{};
 
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
 pub const WARM_LOG_BYTES: u64 = 8 << 30;
@@ -195,6 +197,7 @@ pub const NgramTable = struct {
     warm_thread: ?std.Thread = null,
     warm_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     warm_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    bf16: ?expert_stream.Bf16NgramStore = null,
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -216,6 +219,25 @@ pub const NgramTable = struct {
         t.fd = fd;
         if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
         return t;
+    }
+
+    pub fn openBf16(allocator: std.mem.Allocator, model_dir: []const u8) !NgramTable {
+        const store = try expert_stream.Bf16NgramStore.open(allocator, model_dir);
+        var table = NgramTable{
+            .map = empty_ngram_map[0..],
+            .rows = store.rows,
+            .dim = store.dim,
+            .bits = 16,
+            .group_size = 0,
+            .w_off = 0,
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = 0,
+            .scols = 0,
+            .bf16 = store,
+        };
+        if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
+        return table;
     }
 
     /// Widths `mx.quantize` packs and `dequantRow` unpacks.
@@ -331,6 +353,13 @@ pub const NgramTable = struct {
     }
 
     pub fn close(self: *NgramTable) void {
+        if (self.bf16) |*store| {
+            if (self.pool) |pool| pool.destroy();
+            self.pool = null;
+            store.deinit();
+            self.bf16 = null;
+            return;
+        }
         if (self.warm_thread) |th| {
             self.warm_stop.store(true, .release);
             th.join();
@@ -352,6 +381,7 @@ pub const NgramTable = struct {
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
+        if (self.bf16 != null) return;
         if (self.fd < 0 or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
@@ -420,7 +450,19 @@ pub const NgramTable = struct {
     /// Gather + concatenate the `n_heads` rows of each token: `out` is
     /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the context position this
     /// gather runs at and picks the wide arm; the output is byte-identical either way.
-    pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
+    pub fn gatherChecked(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) !void {
+        if (self.bf16) |*store| {
+            if (self.pool) |pool| {
+                var start: usize = 0;
+                while (start < row_ids.len) : (start += PrefetchPool.MAX_ROWS) {
+                    const end = @min(start + PrefetchPool.MAX_ROWS, row_ids.len);
+                    if (!pool.run(self, row_ids[start..end])) return error.NgramReadFailed;
+                    for (start..end) |i| try store.decodeRowBytes(pool.bufs[i - start][0 .. store.dim * 2], out[i * store.dim ..][0..store.dim]);
+                }
+                return;
+            }
+            return store.gather(row_ids, out) catch return error.NgramReadFailed;
+        }
         const need: usize = self.wcols * 4 + self.scols * 4;
         // Prefill-width gathers ride the pool only past `PREFILL_PREFETCH_MIN_KV`: a resident
         // table loses 2-7% to the wake rounds, an evicted one (weights pushed the 32 GB
@@ -449,6 +491,11 @@ pub const NgramTable = struct {
 
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
+        if (self.bf16) |*store| {
+            if (region != 0) return false;
+            store.readRowBytes(@intCast(r), buf[0 .. store.dim * 2]) catch return false;
+            return true;
+        }
         const wl: usize = self.wcols * 4;
         const sl: usize = self.scols * 2;
         const off: usize, const dst: []u8 = switch (region) {
@@ -544,9 +591,10 @@ const PrefetchPool = struct {
             const table = self.table.?;
             const rows = self.rows;
             self.mu.unlock(io);
+            const regions: usize = if (table.bf16 != null) 1 else 3;
             var i = idx;
-            while (i < rows.len * 3) : (i += N) {
-                if (!table.preadSite(@intCast(rows[i / 3]), i % 3, &self.bufs[i / 3])) _ = self.failed.fetchAdd(1, .acq_rel);
+            while (i < rows.len * regions) : (i += N) {
+                if (!table.preadSite(@intCast(rows[i / regions]), i % regions, &self.bufs[i / regions])) _ = self.failed.fetchAdd(1, .acq_rel);
             }
             _ = self.pending.fetchSub(1, .acq_rel);
         }
@@ -852,14 +900,14 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     ple_prefill_min_kv_override = 65_536;
     defer ple_prefill_min_kv_override = null;
     const before = pool.runs.load(.monotonic);
-    t.gather(ids, ref, 8192);
+    try t.gatherChecked(ids, ref, 8192);
     try testing.expectEqual(before, pool.runs.load(.monotonic));
     try testing.expect(said(0, 1));
     try testing.expect(!said(0, 0));
     try testing.expect(!said(1, 1) and !said(1, 0));
 
     // Past the threshold the same gather rides the pool.
-    t.gather(ids, got, 131_072);
+    try t.gatherChecked(ids, got, 131_072);
     try testing.expectEqual(before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expect(said(1, 1));
     try testing.expect(!said(1, 0));
@@ -869,11 +917,11 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     ple_prefill_prefetch_override = false;
     defer ple_prefill_prefetch_override = null;
     const forced_off = pool.runs.load(.monotonic);
-    t.gather(ids, got, 1_000_000);
+    try t.gatherChecked(ids, got, 1_000_000);
     try testing.expectEqual(forced_off, pool.runs.load(.monotonic));
     try testing.expectEqualSlices(f32, ref, got);
     ple_prefill_prefetch_override = true;
-    t.gather(ids, got, 0);
+    try t.gatherChecked(ids, got, 0);
     try testing.expectEqual(forced_off + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expectEqualSlices(f32, ref, got);
 
@@ -881,7 +929,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const warm = ids[0..128];
     const w_out = try testing.allocator.alloc(f32, warm.len * t.dim);
     defer testing.allocator.free(w_out);
-    t.gather(warm, w_out, 0); // forced on: the warmup forward runs at kv 0
+    try t.gatherChecked(warm, w_out, 0); // forced on: the warmup forward runs at kv 0
     try testing.expect(said(1, 0));
     try testing.expectEqualSlices(f32, got[0 .. warm.len * t.dim], w_out);
 
@@ -893,12 +941,49 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     defer testing.allocator.free(d_got);
     ple_prefill_prefetch_override = false;
     const dec_before = pool.runs.load(.monotonic);
-    t.gather(dec, d_ref, 1_000_000);
+    try t.gatherChecked(dec, d_ref, 1_000_000);
     try testing.expectEqual(dec_before + 1, pool.runs.load(.monotonic)); // still pooled
     ple_prefill_prefetch_override = true;
-    t.gather(dec, d_got, 0);
+    try t.gatherChecked(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
+}
+
+test "qwen4 bf16 ngram table opens checkpoint shards" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const key0 = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight";
+    const key1 = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight";
+    const header = try std.fmt.allocPrint(t.allocator, "{{\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}},\"{s}\":{{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[8,16]}}}}", .{ key0, key1 });
+    defer t.allocator.free(header);
+    const file_bytes = try t.allocator.alloc(u8, 8 + header.len + 16);
+    defer t.allocator.free(file_bytes);
+    std.mem.writeInt(u64, file_bytes[0..8], header.len, .little);
+    @memcpy(file_bytes[8 .. 8 + header.len], header);
+    const values = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100 };
+    @memcpy(file_bytes[8 + header.len ..], std.mem.sliceAsBytes(&values));
+    try tmp.dir.writeFile(io, .{ .sub_path = "table.safetensors", .data = file_bytes });
+    const index = try std.fmt.allocPrint(t.allocator, "{{\"weight_map\":{{\"{s}\":\"table.safetensors\",\"{s}\":\"table.safetensors\"}}}}", .{ key0, key1 });
+    defer t.allocator.free(index);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openBf16(t.allocator, path_buf[0..path_len]);
+    defer table.close();
+    try t.expectEqual(@as(u32, 16), table.bits);
+    try t.expect(table.pool != null);
+    const runs_before = table.pool.?.runs.load(.monotonic);
+    var out: [4]f32 = undefined;
+    try table.gatherChecked(&.{ 1, 2 }, &out, 0);
+    try t.expectEqual(runs_before + 1, table.pool.?.runs.load(.monotonic));
+    try t.expectEqualSlices(f32, &.{ 3.0, 4.0, 5.0, 6.0 }, &out);
+    table.pool.?.destroy();
+    table.pool = null;
+    _ = std.c.close(table.bf16.?.files[0].fd);
+    table.bf16.?.files[0].fd = -1;
+    try t.expectError(error.NgramReadFailed, table.gatherChecked(&.{0}, out[0..2], 0));
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {

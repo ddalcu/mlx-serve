@@ -13,9 +13,11 @@ pub const Override = struct {
     kv_quant: ?kv_quant.KVQuantConfig = null,
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
+    ssd_budget_gb: ?u32 = null,
 
     pub fn isEmpty(o: Override) bool {
-        return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null;
+        return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
+            o.mtp_acceptance == null and o.ssd_budget_gb == null;
     }
 };
 
@@ -70,6 +72,12 @@ fn fromValue(v: std.json.Value) Override {
         .string => |name| o.mtp_acceptance = mtp_acceptance.fromName(name),
         else => {},
     };
+    if (obj.get("ssd_budget_gb")) |g| switch (g) {
+        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) {
+            o.ssd_budget_gb = @intCast(i);
+        },
+        else => {},
+    };
     return o;
 }
 
@@ -101,12 +109,13 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} ssd_budget_gb={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
+        o.ssd_budget_gb orelse 0,
     });
     return o;
 }
@@ -148,4 +157,16 @@ test "model_settings: bad values ignored, bad JSON = empty" {
     var empty = load(std.testing.allocator, std.testing.io, "/nonexistent/model-settings.json");
     defer empty.deinit();
     try std.testing.expect(empty.lookup("/m/a").isEmpty());
+}
+
+test "model_settings: ssd_budget_gb rides the same file as the other keys" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"ssd_budget_gb": 60}, "/m/b": {"ssd_budget_gb": 0}, "/m/c": {"ssd_budget_gb": "60"}, "/m/d": {"ctx_size": 4096}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?u32, 60), s.lookup("/m/a").ssd_budget_gb);
+    try std.testing.expect(s.lookup("/m/b").isEmpty());
+    try std.testing.expect(s.lookup("/m/c").isEmpty());
+    try std.testing.expectEqual(@as(?u32, null), s.lookup("/m/d").ssd_budget_gb);
+    try std.testing.expect(!s.lookup("/m/a").isEmpty());
 }

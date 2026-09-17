@@ -40,14 +40,16 @@ struct ModelOverride: Equatable {
     var kvQuant: KvQuantChoice?
     var mtp: Bool?
     var mtpAcceptance: MtpAcceptanceChoice?
+    var ssdBudgetGB: Int?
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
-         mtpAcceptance: MtpAcceptanceChoice? = nil) {
+         mtpAcceptance: MtpAcceptanceChoice? = nil, ssdBudgetGB: Int? = nil) {
         self.ctxSize = ctxSize
         self.kvQuant = kvQuant
         self.mtp = mtp
         self.mtpAcceptance = mtpAcceptance
+        self.ssdBudgetGB = ssdBudgetGB
     }
 
     init(json: [String: Any]) {
@@ -65,12 +67,17 @@ struct ModelOverride: Equatable {
         if let a = rest.removeValue(forKey: "mtp_acceptance") {
             if let s = a as? String { mtpAcceptance = MtpAcceptanceChoice(rawValue: s) }
         }
+        if let g = rest.removeValue(forKey: "ssd_budget_gb") {
+            if let n = g as? Int, n > 0 { ssdBudgetGB = n }
+        }
         extra = rest
     }
 
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
-    var hasSettings: Bool { ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil }
+    var hasSettings: Bool {
+        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || ssdBudgetGB != nil
+    }
 
     var json: [String: Any] {
         var out = extra
@@ -78,11 +85,13 @@ struct ModelOverride: Equatable {
         if let kvQuant { out["kv_quant"] = kvQuant.rawValue }
         if let mtp { out["mtp"] = mtp }
         if let mtpAcceptance { out["mtp_acceptance"] = mtpAcceptance.rawValue }
+        if let ssdBudgetGB { out["ssd_budget_gb"] = ssdBudgetGB }
         return out
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance
+            && a.ssdBudgetGB == b.ssdBudgetGB
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
 }

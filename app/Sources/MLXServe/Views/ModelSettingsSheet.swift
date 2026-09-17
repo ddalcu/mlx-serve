@@ -24,6 +24,10 @@ enum ModelSettingsApply {
         let show = available ?? true
         return (show, show && mtp != false)
     }
+
+    /// The SSD budget row exists only for a row the server marks `streaming`; every other
+    /// model ignores the setting, so offering it would be a knob that does nothing.
+    static func ssdBudgetRow(streaming: Bool) -> Bool { streaming }
 }
 
 struct ModelSettingsSheet: View {
@@ -62,10 +66,13 @@ struct ModelSettingsSheet: View {
         return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp)
     }
 
+    private var showSsdBudget: Bool { ModelSettingsApply.ssdBudgetRow(streaming: live?.streaming ?? false) }
+
     private var formHeight: CGFloat {
         var n = isGguf ? 1 : 2
         if rows.mtp { n += 1 }
         if rows.acceptance { n += 1 }
+        if showSsdBudget { n += 1 }
         if live?.loaded == true { n += 1 }
         return CGFloat(44 * n + 50)
     }
@@ -123,6 +130,16 @@ struct ModelSettingsSheet: View {
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                 }
                 }
+                if showSsdBudget {
+                Picker("SSD budget", selection: Binding(
+                    get: { override.ssdBudgetGB ?? -1 },
+                    set: { override.ssdBudgetGB = $0 < 0 ? nil : $0 })) {
+                    Text("None").tag(-1)
+                    ForEach(SsdBudgetAdvice.livePresets, id: \.self) { n in
+                        Text(SsdBudgetAdvice.label(n, recommended: SsdBudgetAdvice.liveRecommendedGiB)).tag(n)
+                    }
+                }
+                }
                 if let live, live.loaded {
                     LabeledContent("Live") {
                         Text(isGguf ? "\(ContextSizeDisplay.formatTokens(live.contextLength)) context"
@@ -151,7 +168,12 @@ struct ModelSettingsSheet: View {
             .padding(16)
         }
         .frame(width: 440)
-        .onAppear { override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride() }
+        .onAppear {
+            override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride()
+            if showSsdBudget && override.ssdBudgetGB == nil {
+                override.ssdBudgetGB = SsdBudgetAdvice.liveRecommendedGiB
+            }
+        }
     }
 
     private func save() async {

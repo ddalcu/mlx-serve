@@ -22,6 +22,7 @@ const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
+const kld_mod = @import("kld.zig");
 const launch_mod = @import("launch.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
@@ -47,6 +48,8 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
+var expert_cache_bytes: u64 = 0;
+var ssd_budget_bytes: u64 = 0;
 // Auto-load the ds4 MTP draft head (beside the model) for speculative decode.
 // Default on; `--no-ds4-mtp` disables it, and it's forced off under
 // `--ssd-streaming` (ds4 refuses the combination). Read by the same ds4 paths.
@@ -97,6 +100,10 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
+        \\  kld capture|compare Write a teacher fixture (full-vocab logits at
+        \\                      every greedy position), or teacher-force one
+        \\                      through a model and report KLD / top-1 / NLL.
+        \\                      `mlx-serve kld --help` for options
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -323,6 +330,14 @@ fn printUsage(io: std.Io) void {
         \\                        model in RAM (skips full residency + warmup).
         \\                        Use when the model is larger than available
         \\                        memory. Ignored by the MLX + llama.cpp engines.
+        \\  --expert-cache-gb <n>
+        \\                      Enable bf16 qwen4_exp expert streaming with a
+        \\                        decimal-GB cache (default operating point: 60).
+        \\  --ssd-budget-gb <n> Enable bf16 qwen4_exp expert streaming with a
+        \\                        TOTAL resident target of <n> GiB; the expert
+        \\                        cache is what is left after the trunk, the
+        \\                        prefill union and the fill buffers.
+        \\                        --expert-cache-gb wins when both are given.
         \\  --no-ds4-mtp        ds4 only: don't auto-load the MTP draft head
         \\                        (speculative decode). On by default when the
         \\                        model dir ships one; auto-off under
@@ -479,8 +494,11 @@ pub fn main(init: std.process.Init) !void {
             }
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "kld")) {
+            try kld_mod.cmdKld(allocator, io, args[2..]);
+            return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -933,6 +951,18 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, args[i], "--ssd-streaming")) {
             ds4_ssd_streaming = true;
+        } else if (std.mem.eql(u8, args[i], "--expert-cache-gb") and i + 1 < args.len) {
+            i += 1;
+            expert_cache_bytes = server_mod.parseExpertCacheGb(args[i]) catch {
+                log.err("--expert-cache-gb: expected an integer in 1..360; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
+            i += 1;
+            ssd_budget_bytes = server_mod.parseSsdBudgetGb(args[i]) catch {
+                log.err("--ssd-budget-gb: expected an integer in 1..512; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
             ds4_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
@@ -1425,6 +1455,9 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+            .expert_cache_bytes = expert_cache_bytes,
+            .ssd_budget_bytes = ssd_budget_bytes,
+            .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
@@ -1840,6 +1873,9 @@ fn runGenServe(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        .expert_cache_bytes = expert_cache_bytes,
+        .ssd_budget_bytes = ssd_budget_bytes,
+        .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         .tokenize_cache_entries = 0,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
@@ -1966,6 +2002,9 @@ fn runHeadlessServe(
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+        .expert_cache_bytes = expert_cache_bytes,
+        .ssd_budget_bytes = ssd_budget_bytes,
+        .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
@@ -2190,6 +2229,9 @@ fn runDs4Serve(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        .expert_cache_bytes = expert_cache_bytes,
+        .ssd_budget_bytes = ssd_budget_bytes,
+        .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         // Iteration 2: tokenize cache for ds4 too.
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
@@ -2460,6 +2502,9 @@ fn runLlamaServe(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        .expert_cache_bytes = expert_cache_bytes,
+        .ssd_budget_bytes = ssd_budget_bytes,
+        .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         // Iteration 2 + 3-5: thread the tokenize cache + multi-session
         // LRU through the llama-specific LoadParams. doLoadLlamaOnInferenceThread
         // reads both fields.

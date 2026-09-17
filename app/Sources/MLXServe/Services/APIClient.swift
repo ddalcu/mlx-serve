@@ -23,9 +23,21 @@ enum SSEEvent {
 /// truncated server output (typically a JSON error from mlx-serve, e.g. "Prompt too long").
 enum APIError: LocalizedError {
     case badStatus(code: Int, detail: String)
+    case loadRefused(type: String, detail: String)
+
+    static func fromLoadFailure(code: Int, body: Data) -> APIError {
+        let detail = errorDetail(fromBody: body)
+        if !LoadFailureVerdict.shouldRestartAfterLoadFailure(body: body),
+           let type = LoadFailureVerdict.errorType(fromBody: body) {
+            return .loadRefused(type: type, detail: detail)
+        }
+        return .badStatus(code: code, detail: detail)
+    }
 
     var errorDescription: String? {
         switch self {
+        case .loadRefused(_, let detail):
+            return detail
         case .badStatus(let code, let detail):
             // Friendly message for the most common failure: combined system prompt + tools blew past the
             // model's context window. Tool-heavy MCP servers can do this on their own.
@@ -202,6 +214,8 @@ class APIClient {
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
             mtpAvailable: meta["mtp_available"] as? Bool,
             kvQuant: meta["kv_quant"] as? String ?? "",
+            streaming: first["streaming"] as? Bool ?? false,
+            ssdBudgetGB: first["ssd_budget_gb"] as? Int,
             loaded: topLoaded,
             state: topState,
             bytesResident: topBytesResident,
@@ -247,9 +261,7 @@ class APIClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
-            throw APIError.badStatus(code: code, detail: String(snippet))
+            throw APIError.fromLoadFailure(code: (response as? HTTPURLResponse)?.statusCode ?? -1, body: data)
         }
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let modelObj = json["model"] as? [String: Any] else {

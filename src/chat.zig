@@ -568,7 +568,7 @@ pub fn decodeViaLlama(
 }
 
 /// Render the Jinja chat template with the given messages.
-fn renderChatTemplate(
+pub fn renderChatTemplate(
     allocator: std.mem.Allocator,
     messages: []const Message,
     chat_config: *const ChatConfig,
