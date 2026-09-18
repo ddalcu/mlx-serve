@@ -147,8 +147,8 @@ swift package resolve
 bash "$PROJECT_ROOT/scripts/patch-swatex-font-lookup.sh" "$SCRIPT_DIR/.build/checkouts/SwaTex"
 # No test step here, and never add one: this script is also the FAST_DEV
 # iteration loop (build, look, adjust — about two seconds when nothing
-# changed), and the Swift suite costs 24s parallel / 55s serial. Run
-# `swift test --parallel` yourself before landing.
+# changed), and the Swift suite costs ~30s. Run `bash app/test.sh`
+# yourself before landing.
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
 SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
@@ -342,7 +342,8 @@ STAGE_FRAMEWORKS=1
 if [ "$FAST_DEV" = "1" ] \
    && [ -f "$CONTENTS/Frameworks/libmlxc.dylib" ] \
    && [ -f "$CONTENTS/Frameworks/mlx.metallib" ] \
-   && [ ! "$MLX_STAGE_LIB/libmlxc.dylib" -nt "$CONTENTS/Frameworks/libmlxc.dylib" ]; then
+   && [ ! "$MLX_STAGE_LIB/libmlxc.dylib" -nt "$CONTENTS/Frameworks/libmlxc.dylib" ] \
+   && [ ! "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" -nt "$CONTENTS/Frameworks/libllama.dylib" ]; then
     STAGE_FRAMEWORKS=0
     echo "→ Reusing bundled frameworks (FAST_DEV)"
 fi

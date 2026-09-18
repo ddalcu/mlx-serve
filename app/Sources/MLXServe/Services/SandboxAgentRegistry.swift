@@ -47,7 +47,7 @@ extension SandboxAgentSpec {
         id: "pi",
         displayName: "pi",
         binaryName: "pi",
-        installScript: "npm i -g @earendil-works/pi-coding-agent@0.80.10",
+        installScript: "npm i -g @earendil-works/pi-coding-agent@latest",
         configFiles: { model, serverPort, budget, apiKey, _ in
             let base = "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)"
             let key = apiKey ?? "mlx-serve"

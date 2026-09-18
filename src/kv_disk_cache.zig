@@ -42,8 +42,7 @@
 //! [0, cp_pos) AND the SSM state at cp_pos (`restoreIntoHybrid`) — mirroring
 //! the RAM tier's rewind-both semantics.
 //!
-//! Scope: schemes off/affine (TurboQuant's rotation state doesn't survive a
-//! restore into a fresh cache), B==1 slot caches. All mlx work runs on the
+//! Scope: B==1 slot caches. All mlx work runs on the
 //! inference thread; safetensors loads use a private CPU stream
 //! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
@@ -116,6 +115,7 @@ const DarwinStatfs = extern struct {
     tail: [4096]u8,
 };
 extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
+extern fn msv_volume_free_for_use(path: [*:0]const u8) u64;
 
 pub const VolumeSpace = struct { free: u64, total: u64 };
 
@@ -131,10 +131,11 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     const bsize: u64 = st.f_bsize;
     if (bsize < 512 or bsize > (1 << 20) or !std.math.isPowerOfTwo(bsize)) return null;
     if (st.f_blocks == 0 or st.f_bavail > st.f_blocks) return null;
-    return .{
-        .free = bsize *| st.f_bavail,
-        .total = bsize *| st.f_blocks,
-    };
+    const total = bsize *| st.f_blocks;
+    // statfs excludes purgeable space the OS releases on demand; ask what a write really gets.
+    const granted = msv_volume_free_for_use(buf[0..path.len :0].ptr);
+    const free = if (granted > 0 and granted <= total) granted else bsize *| st.f_bavail;
+    return .{ .free = free, .total = total };
 }
 
 /// How a `DiskTier` asks what the volume has left. Injectable: with the live probe hard-wired
@@ -1138,6 +1139,13 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
+        // Every production caller swallows our error (the disk tier is best-effort end to
+        // end), and three writers inside can raise: persistSsmCheckpoints, writeChunkFile,
+        // appendSsmOnly. Drop the latch THIS call raised at the one funnel they all pass
+        // through — otherwise the next decode tick's checkErrorDecode charges it to an
+        // unrelated request. `writeSpecSidecar` swallows internally, so it keeps its own pair.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
@@ -1155,10 +1163,6 @@ pub const DiskTier = struct {
         const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
         const kv_target: u32 = @intCast(kv_target_u);
-        switch (config.scheme) {
-            .off, .affine => {},
-            else => return .skipped, // TurboQuant rotation state doesn't survive restore
-        }
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
         // persistable snapshot.
@@ -1289,7 +1293,8 @@ pub const DiskTier = struct {
         const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
         var written_bytes: u64 = 0;
         var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
-            chunk_sizes.deinit(self.allocator);
+            // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
+            // would double-free (the fault-injection test segfaulted on exactly this).
             return err;
         };
         errdefer ssm_res.deinit(self.allocator);
@@ -1313,6 +1318,7 @@ pub const DiskTier = struct {
             // Cap so tight nothing new landed — nothing to commit (a
             // checkpoint-only write still counts as progress).
             chunk_sizes.deinit(self.allocator);
+            ssm_res.deinit(self.allocator);
             return if (chunk_complete) .persisted else .partial;
         }
 
@@ -1321,11 +1327,7 @@ pub const DiskTier = struct {
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
-        const qsa_res = self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, prefix_rows, s) catch |err| {
-            ssm_res.deinit(self.allocator);
-            chunk_sizes.deinit(self.allocator);
-            return err;
-        };
+        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
@@ -1570,6 +1572,11 @@ pub const DiskTier = struct {
     /// can hold a stale draft tail past it) and keyed `d{layer}.*` /
     /// `m{layer}.*` with the trunk chunks' kind suffixes.
     fn writeSpecSidecar(self: *DiskTier, dir_abs: []const u8, dflash: ?SpecCommit, mtp: ?SpecCommit, s: mlx.mlx_stream) !SpecSidecarResult {
+        // Best-effort by contract: the callers log the failure and keep going. The
+        // latch a raise plants is process-wide, so a write we already reported must
+        // drop what it set — or the next decode tick fails an unrelated request.
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors\x00", .{dir_abs});
         defer self.allocator.free(path);
         if (dflash == null and mtp == null) {
@@ -1612,8 +1619,10 @@ pub const DiskTier = struct {
                 const sh = mlx.getShape(a.aux_state);
                 break :blk if (sh.len >= 2) sh[1] else 0;
             };
-            const rows_ok = hist == @as(c_int, @intCast(limit)) and
-                (a.aux_state.ctx != null or a.qsa_pooled.ctx != null);
+            // `qsa_rows` reports the checkpoint position even when the raw ring is
+            // gone, so a pooled-only head has no `h.aux` to write: the loader refuses
+            // a head half without it, and an empty array raises inside mlx.
+            const rows_ok = hist == @as(c_int, @intCast(limit)) and a.aux_state.ctx != null;
             if (rows_ok) {
                 try self.insertSpecArray(map, prefix, "h.aux", a.aux_state);
                 if (a.qsa_pooled.ctx != null) try self.insertSpecArray(map, prefix, "h.pooled", a.qsa_pooled);
@@ -4976,7 +4985,7 @@ test "DiskTier: SSM checkpoints persist incrementally under the flush byte cap" 
     try testing.expectEqual(@as(f32, 700.0), ssmArrVal(dst[0].ssm_state, 0, s));
 }
 
-test "DiskTier: short caches and TurboQuant schemes are never persisted" {
+test "DiskTier: short caches are never persisted" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5418,6 +5427,165 @@ test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less s
     defer kv_only.snap.deinit();
     try testing.expectEqual(@as(usize, 600), kv_only.snap.step);
     try testing.expect(kv_only.head_aux == null);
+}
+
+test "DiskTier: a head snap with no raw-history tensor drops the head half and arms no MLX latch" {
+    // Bar: a pooled-only head (qsa_rows > 0, empty `aux_state`) writes no `h.aux` and leaves the latch clear.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 600;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+    try testing.expect(head_snap.aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 600), head_snap.qsa_rows);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+    try testing.expect(!mlx.errorPending());
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+    try testing.expect(!mlx.errorPending());
+
+    // A pooled bank without its raw history is not restorable: KV half only, head declined.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    try testing.expect(loaded.head_aux == null);
+}
+
+test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a foreign one" {
+    // Bar: the appendCommit funnel's errdefer removes only the error THIS call raised.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-funnel", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+
+    // Arm a LATCHING fault at the N-th checked op after this line; the commit
+    // must reach it (fired) and its errdefer must clear the latched message.
+    mlx.armLatchingFaultForTest(3);
+    try testing.expectError(error.MlxError, tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s));
+    const fired_own = mlx.latchingFaultFiredForTest();
+    const pending_own = mlx.errorPending();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired_own);
+    try testing.expect(!pending_own);
+
+    // A foreign latch predates the call and must survive it untouched.
+    mlx.latchErrorForTest("foreign pre-existing error");
+    mlx.armLatchingFaultForTest(3);
+    _ = tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s) catch {};
+    const fired_foreign = mlx.latchingFaultFiredForTest();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired_foreign);
+    var msg: [512]u8 = undefined;
+    try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
+}
+
+test "DiskTier: a raise anywhere in appendCommit frees its owned results exactly once" {
+    // Bar: the fault sweep reaches the QSA history write; a double free aborts under the testing allocator.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-exits", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+
+    var k: u64 = 1;
+    while (true) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        mlx.fault.disarm();
+        if (!mlx.fault.didFire()) {
+            _ = try r;
+            break;
+        }
+        try testing.expectError(error.MlxError, r);
+        tier.invalidateAll();
+    }
+    try testing.expect(k > 1);
 }
 
 test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
@@ -5966,6 +6134,17 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
     try testing.expect(vs.total > 0);
     try testing.expect(vs.free <= vs.total);
     try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
+}
+
+test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail" {
+    // Purgeable space is not in f_bavail; the tier used to refuse a volume with 117 GB usable.
+    var st: DarwinStatfs = undefined;
+    try testing.expect(statfs("/", &st) == 0);
+    const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
+    const granted = msv_volume_free_for_use("/");
+    try testing.expect(granted > 0);
+    try testing.expect(vs.free >= @as(u64, st.f_bsize) * st.f_bavail);
+    if (granted <= vs.total) try testing.expectEqual(granted, vs.free);
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
@@ -7062,3 +7241,45 @@ test "DiskTier: entryWholeOnDisk stats what the index NAMES (a truncated chunk f
     try testing.expect(!tier.entryWholeOnDisk(id));
     try testing.expect(!tier.entryWholeOnDisk(id + 999));
 }
+
+test "DiskTier: a fresh tier over the same root ranks by the HIGHEST restorable checkpoint" {
+    // A restart must restore the highest checkpoint at or below the match, not
+    // the first one the manifest lists.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    const N = 8;
+    var tokens: [N * 128]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-coldrank", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, N * 128, 8, 0.0, .float32);
+        var srcs: [N][3]SSMCacheEntry = undefined;
+        for (&srcs, 0..) |*src, i| src.* = buildHybridEntries(s, @floatFromInt((i + 1) * 1000), @floatFromInt((i + 1) * 2000));
+        defer for (&srcs) |*src| freeHybridEntries(src);
+        var cps: [N]transformer_mod.SSMCheckpoint = undefined;
+        for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 128, s);
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        try testing.expectEqual(@as(usize, N), tier.entries.items[0].ssm_positions.len);
+        const warm = tier.bestHybridMatch(&tokens, false, cache.config, tokens.len).?;
+        try testing.expectEqual(@as(u32, N * 128), warm.cp);
+    }
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-coldrank", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(usize, N), tier2.entries.items[0].ssm_positions.len);
+    const cold = tier2.bestHybridMatch(&tokens, false, kv_quant.KVQuantConfig.dense, tokens.len).?;
+    try testing.expectEqual(@as(u32, N * 128), cold.cp);
+    try testing.expectEqual(@as(u32, N * 128), cold.usable);
+}
+

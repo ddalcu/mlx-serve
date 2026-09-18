@@ -54,10 +54,7 @@ pub fn dumpRestoreIfEnabled(
     dumpRestore(dir, n, cache, ssm, s, meta) catch |err| {
         log.warn("  [hot-cache] restore dump failed: {s}\n", .{@errorName(err)});
     };
-    if (!had_error and mlx.errorPending()) {
-        var buf: [512]u8 = undefined;
-        _ = mlx.takeError(&buf);
-    }
+    mlx.dropLatchedErrorUnless(had_error);
     return n;
 }
 

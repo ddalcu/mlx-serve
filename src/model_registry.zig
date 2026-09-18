@@ -229,6 +229,11 @@ pub const LoadedModel = struct {
     /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
     /// of the MLX path. Mutually exclusive with the safetensors fields.
     ds4_engine: ?*arch_ds4.Ds4Engine = null,
+    /// The ONE ds4 session per model (a 131k-context session is ~13 GB of
+    /// buffers, so one per request starved the box under concurrency). Created
+    /// on first prefill, driven by one slot at a time (`session_busy`), freed
+    /// with the engine.
+    ds4_session: ?*arch_ds4.Ds4Session = null,
 
     /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
     /// when non-null the MLX fields stay null and request handlers route through
@@ -248,7 +253,7 @@ pub const LoadedModel = struct {
     mesh_engine: ?*gen_mod.MeshEngine = null,
     restore_engine: ?*gen_mod.RestoreEngine = null,
     /// Model-wide serialization gate for media generation — mirrors
-    /// `llama_session_busy`. A gen runs to completion on the inference thread
+    /// `session_busy`. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
     gen_busy: bool = false,
@@ -262,7 +267,7 @@ pub const LoadedModel = struct {
     /// dispatches each incoming prompt to the entry whose resident KV
     /// shares the longest prefix.
     ///
-    /// `llama_session_busy` remains a model-wide gate — `max_concurrent=1`
+    /// `session_busy` remains a model-wide gate — `max_concurrent=1`
     /// today means only one llama request runs at a time anyway, and
     /// adding per-entry concurrency would require an inference-thread
     /// refactor we intentionally don't ship tonight.
@@ -274,7 +279,10 @@ pub const LoadedModel = struct {
     /// `LoadParams.llama_cache_entries` at load time. 0 falls back to 1
     /// for safety — every llama prefill needs at least one session.
     llama_cache_max_entries: u32 = 1,
-    llama_session_busy: bool = false,
+    /// Model-wide claim on the persistent engine session (llama pool or
+    /// `ds4_session`): one request drives it at a time, taken in
+    /// `Scheduler.submit`, released in `complete`.
+    session_busy: bool = false,
     /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
     /// cache. 0 = libllama default (F16). Non-zero values are pulled from
     /// `LoadParams.llama_kv_type_{k,v}` at load time and read by
@@ -369,7 +377,11 @@ pub const LoadedModel = struct {
     pub fn deinit(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.deinit(self.allocator);
-        self.llama_session_busy = false;
+        self.session_busy = false;
+        if (self.ds4_session) |session| {
+            session.free();
+            self.ds4_session = null;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
@@ -535,7 +547,11 @@ pub const LoadedModel = struct {
     pub fn unloadResident(self: *LoadedModel) void {
         for (self.llama_sessions.items) |entry| entry.session.free();
         self.llama_sessions.clearRetainingCapacity();
-        self.llama_session_busy = false;
+        self.session_busy = false;
+        if (self.ds4_session) |session| {
+            session.free();
+            self.ds4_session = null;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
@@ -682,6 +698,9 @@ pub const ModelRegistry = struct {
     /// specifies the literal "mlx-serve"). Borrowed from the corresponding
     /// entry's `id`; valid for the registry's lifetime.
     default_id: []const u8,
+    /// The default came from a headless load, not `--model` or an explicit
+    /// `setDefault`, so it follows the latest chat-capable load.
+    default_promoted: bool = false,
 
     /// Cap on `.ready` entries. ensureLoaded evicts before exceeding.
     max_resident_models: u32,
@@ -887,6 +906,7 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
+        self.default_promoted = false;
     }
 
     /// Look up an entry by its on-disk path (trailing slashes ignored).
@@ -1106,6 +1126,22 @@ pub const ModelRegistry = struct {
         self.lru_clock += 1;
         lm.last_used_ns = self.lru_clock;
         lm.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
+        self.releaseRefLocked(lm);
+    }
+
+    /// Release a borrow taken for a STATUS read, leaving both recency stamps
+    /// alone. A poll is not use: the app's tray polls `/props` every 3s, so
+    /// stamping here pins every resident model against `--idle-evict-secs`
+    /// forever and the sweep never fires. The refcount protocol is unchanged,
+    /// so the pointer is still protected for as long as the caller holds it.
+    pub fn releaseStatus(self: *ModelRegistry, lm: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.releaseRefLocked(lm);
+    }
+
+    /// Shared tail of `release` and `releaseStatus`. Caller holds `mutex`.
+    fn releaseRefLocked(self: *ModelRegistry, lm: *LoadedModel) void {
         const prev = lm.refcount.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         // Broadcast so an evictor waiting for refcount == 0 wakes.
@@ -1185,12 +1221,16 @@ pub const ModelRegistry = struct {
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
         // user loads a chat model via /v1/load-model — the live gen-first→
-        // chat-later hole (2026-07-05). The FIRST chat-capable model to finish
-        // loading becomes the default; media engines and embedding encoders
-        // never qualify, and an existing default is never stolen.
-        if (self.default_id.len == 0 and chatCapable(entry)) {
+        // chat-later hole (2026-07-05). The LATEST chat-capable load is the
+        // default, so a model-less request never swaps back to an older model;
+        // media engines and embedding encoders never qualify, and an explicit
+        // default (`--model`, `setDefault`) is never stolen.
+        if ((self.default_id.len == 0 or self.default_promoted) and chatCapable(entry) and
+            !std.mem.eql(u8, self.default_id, entry.id))
+        {
             self.default_id = entry.id;
-            log.info("[registry] default model -> {s} (first chat-capable load on a headless server)\n", .{entry.id});
+            self.default_promoted = true;
+            log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
         self.state_cond.broadcast(self.io);
     }
@@ -1602,6 +1642,41 @@ test "ModelRegistry: pickIdleEvictable never picks an entry with a live request"
         try testing.expect(after > stale);
         try testing.expect(reg.pickIdleEvictable(stale + 900_000, 900_000) == null);
         try testing.expect(reg.pickIdleEvictable(after + 900_000, 900_000).? == a);
+    }
+}
+
+test "ModelRegistry: releaseStatus leaves the idle clock alone" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, 900);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 1024);
+
+    // Backdate past the window so the entry is due, then borrow it the way a
+    // status poll does. Absolute, not read off the stamp under test: a
+    // baseline taken from `last_used_ms` makes every assertion below vacuous.
+    const stale: i64 = 1_000;
+    const now: i64 = stale + 1_000_000;
+    a.last_used_ms.store(stale, .release);
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+
+    reg.releaseStatus(a);
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        // The refcount still came back, so the entry is releasable...
+        try testing.expectEqual(@as(u32, 0), a.refcount.load(.acquire));
+        // ...and the poll did not count as use, so it is still due.
+        try testing.expectEqual(stale, a.last_used_ms.load(.acquire));
+        try testing.expect(reg.pickIdleEvictable(now, 900_000).? == a);
+    }
+
+    // The contrast that makes the above mean something: a real release DOES
+    // restamp, and that is what pins the entry.
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    reg.release(a);
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        try testing.expect(a.last_used_ms.load(.acquire) > stale);
     }
 }
 
@@ -2038,11 +2113,18 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     try testing.expectEqual(chat, via_alias);
     reg.release(via_alias);
 
-    // A LATER chat load never steals an existing default.
+    // A promoted default follows the latest chat load...
     const chat2 = try reg.registerStub("qwen", "/m/qwen", 64);
     var chat2_cfg = model_mod.ModelConfig{};
     chat2_cfg.model_type = "qwen3";
     chat2.config = &chat2_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(chat2, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("qwen", reg.default_id);
+
+    // ...but an explicit default is never stolen.
+    try reg.setDefault("gemma");
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
     reg.mutex.unlock(reg.io);

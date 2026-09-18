@@ -6,10 +6,12 @@ const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
+const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
@@ -218,6 +220,12 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
+        \\                        Use 0.2 for the Qwen3.8 matched comparison.
+        \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
+        \\                        Alias: --mtp-cascade. Use 0.95 for the
+        \\                        Qwen3.8 matched comparison. Exclusive with
+        \\                        --mtp-typical; exact is the default.
         \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
         \\                        context tokens (default: 0 = no ceiling).
         \\                        A verify row is BYTES, so on a long-context
@@ -236,10 +244,8 @@ fn printUsage(io: std.Io) void {
         \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
-        \\                        turbo2, turbo4          — Hadamard-rotated
-        \\                          affine at 2/4 bits; lower distortion at
-        \\                          comparable storage. Per-request override
-        \\                          via the `kv_quant` body field.
+        \\                          Per-request override via the `kv_quant`
+        \\                          body field.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -307,8 +313,9 @@ fn printUsage(io: std.Io) void {
         \\                        MLX engine and ignore this flag. For
         \\                        GGUF: `auto` (default) reads the file's
         \\                        `general.architecture` metadata and routes
-        \\                        deepseek4 + ds4-MLA quants to the embedded
-        \\                        ds4 engine, everything else to llama.cpp.
+        \\                        ds4-converted quants (DeepSeek V4/V4.1, Qwen3.8
+        \\                        Flash Next, GLM 5.x) to the embedded ds4
+        \\                        engine, everything else to llama.cpp.
         \\                        Override when auto-detection is wrong
         \\                        (e.g. an unusual ds4 quant whose metadata
         \\                        layout differs).
@@ -522,6 +529,8 @@ pub fn main(init: std.process.Init) !void {
     var force_mtp = false;
     var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
+    var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
+    var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -529,8 +538,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
-    // Off by default — only `.affine` cache scheme is supported by the
-    // v1 fused path; TurboQuant + dense schemes ignore it.
+    // Off by default — only the `.affine` cache scheme has a fused path.
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
@@ -743,6 +751,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
+            i += 1;
+            mtp_typical_raw = args[i];
+        } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
+            i += 1;
+            mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
@@ -902,12 +916,8 @@ pub fn main(init: std.process.Init) !void {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
             } else if (std.mem.eql(u8, args[i], "8")) {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
-            } else if (std.mem.eql(u8, args[i], "turbo2")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(2);
-            } else if (std.mem.eql(u8, args[i], "turbo4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(4);
             } else {
-                log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
@@ -957,6 +967,10 @@ pub fn main(init: std.process.Init) !void {
     ane_mod.media_offload = ane_media;
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
+    generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
+        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
@@ -1161,7 +1175,6 @@ pub fn main(init: std.process.Init) !void {
     switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
-        .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
 
@@ -1447,6 +1460,7 @@ pub fn main(init: std.process.Init) !void {
             try model_mod.loadWeights(io, allocator, model_dir);
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
+        try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
@@ -1460,7 +1474,7 @@ pub fn main(init: std.process.Init) !void {
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
         if (kv_quant_config.scheme != .off) {
-            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config, config.kvCacheKeyHeadDim());
+            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
         }
         try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
 
@@ -1488,6 +1502,7 @@ pub fn main(init: std.process.Init) !void {
         // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
+        if (enable_mtp) mtp_graft.ensure(allocator, io, model_dir, config);
         if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
@@ -1599,7 +1614,8 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 ///
 /// Priority: explicit `--engine` override wins. Otherwise we read the file's
 /// GGUF metadata (cheap, header-only) and route on `general.architecture`:
-/// `deepseek4` + the antirez-style MLA key → ds4; everything else → llama.cpp.
+/// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
+/// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
 /// Issue #15 — the previous basename heuristic mis-routed two real-world
 /// files; see `src/gguf_meta.zig` for the rule.
 ///
@@ -1675,6 +1691,7 @@ fn runDs4Offline(
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,
         .dspark = ds4_dspark,
+        .embedded_mtp = ds4_mtp and !ds4_ssd_streaming and ds4_arch.ggufDeclaresEmbeddedMtp(io, allocator, gguf_path),
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;

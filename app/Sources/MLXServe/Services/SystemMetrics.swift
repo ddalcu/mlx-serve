@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import IOKit
+import IOKit.ps
 
 /// Host telemetry read straight from the kernel — no subprocesses.
 enum SystemMetrics {
@@ -46,6 +47,76 @@ enum SystemMetrics {
 
         let used = (UInt64(stats.active_count) + UInt64(stats.wire_count) + UInt64(stats.compressor_page_count)) * UInt64(pageSize)
         return UInt32(used * 100 / totalMem)
+    }
+
+    // MARK: - Hardware identity (benchmark rows)
+
+    /// Coarse machine identity for a benchmark submission.
+    ///
+    /// Kernel reads only, no subprocess: `sysctl(8)` isn't reachable from
+    /// inside the App Sandbox container and spawning is a host escape from the
+    /// Agent Sandbox, so this calls the same interfaces the tool would.
+    static func benchmarkHardware() -> BenchmarkHardware {
+        BenchmarkHardware(
+            chip: chipBrandString(),
+            gpuCores: gpuCoreCount(),
+            ramGB: physicalMemoryGB(),
+            osVersion: osVersionString(),
+            onBattery: isOnBattery()
+        )
+    }
+
+    /// `machdep.cpu.brand_string` — "Apple M4", "Apple M4 Max".
+    static func chipBrandString() -> String {
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else { return "" }
+        return String(cString: buffer)
+    }
+
+    /// GPU core count from the AGXAccelerator IORegistry entry.
+    ///
+    /// The within-tier differentiator the chip string can't express: a 32-core
+    /// and a 40-core M4 Max both report "Apple M4 Max".
+    static func gpuCoreCount() -> Int {
+        var iter: io_iterator_t = 0
+        guard let matching = IOServiceMatching("AGXAccelerator") else { return 0 }
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS else { return 0 }
+        defer { IOObjectRelease(iter) }
+
+        let entry = IOIteratorNext(iter)
+        guard entry != 0 else { return 0 }
+        defer { IOObjectRelease(entry) }
+
+        var propsRef: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(entry, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = propsRef?.takeRetainedValue() as? [String: Any] else { return 0 }
+        return (props["gpu-core-count"] as? Int) ?? 0
+    }
+
+    static func physicalMemoryGB() -> Int {
+        var totalMem: UInt64 = 0
+        var len = MemoryLayout<UInt64>.size
+        guard sysctlbyname("hw.memsize", &totalMem, &len, nil, 0) == 0, totalMem > 0 else { return 0 }
+        return Int(totalMem / (1024 * 1024 * 1024))
+    }
+
+    static func osVersionString() -> String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return v.patchVersion > 0
+            ? "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+            : "\(v.majorVersion).\(v.minorVersion)"
+    }
+
+    /// A laptop on battery throttles and is a materially different machine, so
+    /// the row records which one was measured.
+    static func isOnBattery() -> Bool {
+        guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(blob)?.takeRetainedValue() as String? else {
+            return false
+        }
+        return type == kIOPSBatteryPowerValue
     }
 
     // MARK: - Memory (was: /usr/bin/vm_stat)

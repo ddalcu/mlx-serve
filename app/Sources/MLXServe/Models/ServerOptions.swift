@@ -162,8 +162,7 @@ struct ServerOptions: Codable, Equatable {
     /// regardless. Pure-attention dense models pick up ~1.6× at 4-way.
     var maxConcurrent: Int = 1
     /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
-    /// affine quant; `turbo2` / `turbo4` add a per-layer Hadamard rotation for
-    /// heavy-tailed activations.
+    /// affine quant.
     var kvQuant: KVQuant = .off
     /// Hot prefix cache entry count. >0 enables cross-request KV reuse for
     /// shared system prompts. 0 disables. The launcher RAM-clamps the emitted
@@ -356,8 +355,6 @@ struct ServerOptions: Codable, Equatable {
         case off
         case int4 = "4"
         case int8 = "8"
-        case turbo2
-        case turbo4
         var id: String { rawValue }
         /// CLI flag value (`--kv-quant <x>`); same string the server parses.
         var cliValue: String { rawValue }
@@ -366,8 +363,6 @@ struct ServerOptions: Codable, Equatable {
             case .off:    return "Off (dense bf16)"
             case .int4:   return "4-bit (≈4× smaller KV)"
             case .int8:   return "8-bit (≈2× smaller KV)"
-            case .turbo2: return "TurboQuant 2-bit"
-            case .turbo4: return "TurboQuant 4-bit"
             }
         }
     }
@@ -1124,7 +1119,7 @@ extension ServerOptions {
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",
-            explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM. TurboQuant variants add a per-layer Hadamard rotation for heavy-tailed activations.",
+            explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM.",
             needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",

@@ -1,43 +1,122 @@
 # Changelog
 
-## v26.9.3 — dev unreleased
+## v26.9.5 — Bonsai - unreleased
 
 ### Highlights
-- **Long prompts need 2.5 GB less memory on Flash Next and the other conv-cached models.** Each linear-attention layer kept a 3-row view of its whole prefill chunk input alive until its next forward, so a 4096-token chunk pinned about 3 GB on Qwen3.8 Flash Next (by the same arithmetic, 7.5 GB on the 27B at chunk 8192). The tail is now an owned copy evaluated with the layer loop's cadence; output is byte-identical and prefill speed is unchanged. Found by Nikolai V. (#366). The prefill admission bill follows the fix, so a long prompt that used to be refused or narrowed at the memory ceiling now gets its full chunk width.
-- **Flash Next admission stops charging for a buffer that no longer grows.** The sparse-attention indexer's raw keys have been a fixed 32-row ring since #381, but they were still billed as 3 KB per token of context; at 512k tokens that was 1.6 GB of phantom that shrank the advertised context and refused prompts that fit. The ring is billed once per session now.
-- **`--mtp-head-kv-quant` lets Flash Next's speculative head keep its KV at the model's `--kv-quant` precision** (about 1 KB per token of context with MTP on, 1 GB at 1M). Off by default: the head stays dense bf16 as before. Acceptance measured within noise of dense from 4k to 128k with the flag on; the head's KV is now counted in admission either way, and a cached conversation whose speculative snapshot was saved at the other precision is re-saved on its next turn.
-- **`--wired-margin-gib <n>`** sets how far under a raised `iogpu.wired_limit_mb` the planner may reach (default 8, the previous fixed value). A 96 GB Mac running the limit at 90 or 96 GB can take 6 and gain 2 GB of admissible context.
-- **`--ssm-checkpoint-max` now defaults to 16** (was 32): it halves the checkpoint bytes a cached session holds (about 57 MB each on Flash Next), and at 256k tokens still leaves a checkpoint every 16k tokens for a diverging turn to resume from.
-- **A model can hand its memory back when nobody is using it.** `--idle-evict-secs N` unloads a model that has served nothing for N seconds, and the next request reloads it; in the app it is Settings ▸ Server ▸ "Unload idle models", off by default. The flag previously had no effect, and a status poll to `/props` no longer cold-loads a model just to answer it.
-- **Reloading a model no longer leaks the tokenizer, config and chat template it replaces.** A server that loaded and unloaded the same model repeatedly grew by the size of its CPU-side state on every cycle.
-- **Spark-X2.5 (XHToken, 1.7B and 4B) is served natively.** `mlx-serve pull spark` fetches the 4B MLX pack; thinking, tool calls and 1M-token context all ride the model's own template.
-- **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
-- **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
-- **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
-- **Image, video and music generation can borrow the Neural Engine.** Turn on `--ane-image`, `--ane-video` or `--ane-audio` (Settings ▸ Neural Engine) and Krea, MiniMax-H3 or ACE-Step split each denoise step between the GPU and the Neural Engine; the split is solved per Mac and model at the first request. Off by default, and the server declines by name when the Mac cannot hold it.
-- The Neural Engine compile cache is capped by the free space on the internal disk, so a full disk no longer ships a silently half-built offload.
-- **Chat with Apple's built-in on-device model.** Pick Apple Intelligence in the model picker and the conversation is answered by macOS itself: nothing to download and no server running. Tools work, but the model's window is a fixed 4k that macOS does not let anyone raise, so keep the tool list short. No thinking mode: the framework does not have one. The row appears only when Apple Intelligence is turned on in System Settings.
+- **Prism Bonsai 2 runs.** `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (Hadamard-rotated 2-bit Qwen3.8-27B, text + vision) loads and serves like any Qwen 27B.
 - **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window, then drag the divider across the result to compare it with the picture you started from.
 
 ### Changes
+- Qwen3.8 family: a thinking request that names no `reasoning_effort` renders as low and now gets low's 2048-token budget on chat and messages; an explicit effort or `--reasoning-budget` still wins.
+- `mlx-serve launch pi` sends the picked thinking level as `reasoning_effort` (was `enable_thinking` only, which dropped low/medium).
 
+## v26.9.4 — Correctness Fixes, Chinese Translation, Benchmarks
+
+### Highlights
+
+- **Benchmark your Mac from the menu bar.** Run a standardized context-and-coding benchmark against the loaded model using the server's own timings. Results stay local, with optional anonymous sharing to the community benchmarks at mlxserve.com/benchmarks.
+
+- **Qwen3.8 Flash Next now handles 32 concurrent streams.** Fixed a crash that occurred when running more than 10 streams. On an M4 Max, 32 streams can now decode at **185 tok/s aggregate**.
+
+- **`top_p: 0` is now greedy.** It behaves like `top_k: 1`, selecting only the highest-probability token.
+
+- **Invalid images now return useful errors.** Unreadable images, bad base64, and unsupported image payloads now return a clear **400 error** instead of silently disappearing from the prompt.
+
+- **More reliable structured output.** Invalid `json_schema` requests are rejected properly, empty stop sequences no longer terminate responses immediately, and JSON output now starts and ends cleanly at the root value.
+
+- **Better Ollama and embeddings compatibility.** Ollama's model-load handshake now works correctly, and empty embedding requests return a proper 400 instead of a server error.
+
+- **`/props` now reports active serving settings.** Inspect the effective KV quantization, MTP, drafter, PLD, attention quantization, prefill chunking, and other settings used by the loaded model.
+
+- **Model-less requests now use the latest loaded model.** Requests without a `model` no longer accidentally reload an older model and evict the one currently loaded.
+
+- **Prompt-cache hits now produce identical greedy output.** Fixed a hybrid-model issue where warm and cold requests could produce different tokens due to different kernel tiling.
+
+- **Concurrent speculative decoding is more reliable.** Fixed `generation failed` errors when sampled requests with different draft lengths shared a Qwen 3.5/3.8 verification pass.
+
+---
+
+## v26.9.3 — Flash Next on 64 GB, speculation for everyone, Neural Engine media
+
+### Highlights
+
+- **Qwen 3.8 Flash Next fits on a 64 GB Mac.** New 3.3-bit pack `ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw`, 52 GB resident, 85.6% top-1 agreement with bf16 (70 GB pack: 89.1%). Its 3-bit layers use the fused MoE kernels, and a faster expert down-projection lifts every MoE model: 52 to 56.5 tok/s on an M4 Max (4-8 bit pack 54.3 to 56.3).
+- **Flash Next speculative decoding no longer dips between 16k and 32k of context.** The verify-width sparse gather now waits for 32k tokens on unquantized KV, where it starts paying for itself.
+- **Flash Next is faster on long conversations.** Sparse-attention block selection is 3x faster at long contexts, and M5 Macs prefill on the new neural accelerators (+12% at 160k). Output unchanged. (@beamivalice)
+- **More context in the same RAM.** Hybrid models need 2.5 GB less for long prompts (27B: 7.5 GB), a phantom 1.6 GB charge at 512k is gone, cached conversations hold half the checkpoint data, and the planner drops a 1.6 GB score sheet. (#366 @nikolai-vysotskyi, #397 @beamivalice.) `--wired-margin-gib 6` frees another 2 GB on 96 GB Macs with a raised `iogpu.wired_limit_mb`.
+- **Concurrent speculative decoding.** Flash Next drafts and verifies concurrent chats together: +19 to 30% per user at four chats, +27% at two (#412, #420, #421, @beamivalice). Dense Qwen 3.5/3.8 verify concurrent drafts in one pass (27B, M4 Max: two users 56 to 72 tok/s, four 52 to 84), MoE Qwen batches chats like dense, and the spec kernels compile at load. Settings > Concurrent requests and `/props` say whether a model batches; the log names why a request runs alone.
+- **Image, video and music generation on the Neural Engine.** `--ane-image`, `--ane-video`, `--ane-audio` (Settings > Neural Engine) split each Krea, MiniMax-H3 or ACE-Step step between GPU and ANE: 1.3x Krea, 1.33x ACE-Step, 1.22x per H3 step on an M4 Max, more on smaller GPUs. Off by default; refused by name when the Mac cannot hold it.
+- **Apple Intelligence in the model picker.** macOS answers on-device: no download, no server. Tools work; 4k window, no thinking. Shown only when Apple Intelligence is on.
+- **Structured output thinks first.** A JSON schema no longer turns thinking off, on every format we serve; a tag inside a JSON string stays data. (#407 @perretv)
+- **Idle models unload.** `--idle-evict-secs N` (Settings > Server > Unload idle models, off by default). (#398 @latent-variable)
+- **K2-Horizon 7B runs natively.** `mlx-serve pull k2`. Thinking at all three efforts, JSON schema, tool calls, 512k window. Terminators declared only in `generation_config.json` now stop generation.
+- **Spark-X2.5 1.7B/4B run natively.** `mlx-serve pull spark`. Thinking, tools, 1M context.
+- **Greedy sampling is greedy again.** `top_k: 1` and `top_p` near 0 cut by rank, so a bf16 tie no longer samples among tied tokens. With `top_k` set the sampler no longer ranks the whole vocabulary; the nucleus accumulates in f32.
+- **Speculation survives temperature.** Flash Next draws sampled drafts from the 32 candidates it already scores exactly: at two chats the speculated share goes from 19% to 98%. Greedy unchanged.
+- **`--kv-quant turbo2` / `turbo4` are gone.** A third slower than affine on long prompts and no fused path ever read them; `4` and `8` are the schemes.
+- **Concurrent sampled chats share one verify pass on Flash Next.** One filtered block of verify probabilities and one GPU submission per round instead of one each, so a later request in the group no longer waits on the earlier ones. (#434)
+- **Sampling with both `top_k` and `top_p` set makes one pass** over the vocabulary instead of two. Byte-identical.
+- **Speculative decoding can no longer emit a reserved token.** At temperature 0 the MTP, drafter and DFlash verifies skipped the reserved-token mask every other path applies.
+- **Sampled speculation can trade exactness for speed.** Typical or TokenV3 acceptance per model (Model Settings > MTP acceptance, or `--mtp-typical 0.2` / `--mtp-tokenv3 0.95`): 7 to 27% faster decode at temperature 1 on an M5 Max, 1K to 1M. Off by default. (#427)
+- **Flash Next prefills in 8192-token steps when memory allows.** +8% at 16K to 128K, +13% at 350K on an M5 Max, ~3 GB more peak. (#423)
+- **FLUX.2 klein base takes `guidance_scale` and `negative_prompt`.** Distilled klein packs unaffected. (#298)
+- **OpenCode 2 dashboard.** `mlx-serve launch opencode2` installs a plugin showing tok/s, memory, model and prefill progress. Needs `--metrics`. (#387, #396, @beamivalice)
+- **Long pastes fold** at 15 lines, and the transcript no longer renders blank after switching chats. (#414 @lojza3d)
+
+### Changes
+
+- Qwen3.8 Flash Next processes prompts faster by fusing hyper-connection and GatedDeltaNet prefill operations.
+
+- Restarting the server now reuses the whole of a long conversation from the SSD cache again. A text prompt that happened to contain the id the model uses for images made the disk cache treat the conversation as if it began there, so a 73k-token chat resumed from 16k and spent 34 seconds re-reading itself instead of 1.6.
+
+- New app icon. The tray footer is four tiles like the media row, and the power glyph is a red Quit.
 - The launcher offers a plain Shell beside the coding agents, on this Mac and in the sandbox.
-- Terminals open on click. The sandbox and host terminals no longer ask which folder to work in first; they use the working folder from Settings.
+- A plain Shell terminal opens on click in the working folder from Settings; the coding agents (pi, opencode, Claude Code, …) ask which folder to work in.
+- `--mtp-head-kv-quant` lets Flash Next's speculative head store its cache at the model's `--kv-quant` precision, about 1 GB saved at 1M tokens with no measurable loss in acceptance. Off by default.
+- A reply cut for repeating itself ends with `finish_reason: "stop"` and `finish_details: {"type": "repetition_loop"}`, not a token-limit look-alike. (#327)
+- Stopping a turn mid-thought or after a tool result leaves a footer (time, Regenerate, delete); the trash under an agent reply removes the whole turn. (#426)
+- Voice recordings and audio attachments are saved beside the chat as 16 kHz WAV. (#430)
+- Flash Next with MTP and the SSD cache no longer answers a random 500 `generation failed` on a later request: a failed draft-state write to disk left its error latched for the next decode tick, and a head with no raw history was written at all. A raise past the checkpoints no longer frees the flush record twice. (#435, #436 @Sinojen)
+- Restarting the server reuses a whole long conversation from the SSD cache again; a prompt containing the image placeholder id used to truncate the restore (73k chat resumed from 16k).
+- New app icon; tray footer is four tiles; the power glyph is a red Quit.
+- The launcher offers a plain Shell beside the coding agents, local and sandboxed. Shell opens in the Settings working folder; agents ask which folder.
+- `--mtp-head-kv-quant` stores Flash Next's speculative-head cache at `--kv-quant` precision: ~1 GB saved at 1M tokens, no measurable acceptance loss. Off by default.
+- `--ssm-checkpoint-max` defaults to 16 (was 32).
+- The speculative cost table is not saved across restarts unless `MLX_SERVE_ROUND_COST_PERSIST=1`.
+- The Neural Engine compile cache is capped by free disk, so a full disk no longer ships a half-built offload.
+- Embedded engines: llama.cpp v0.4.0 (b10809), ds4 September 14 head. ds4's own GGUFs (DeepSeek V4.1 Flash, GLM 5.3 Flash, Qwen3.8 Flash Next) route to ds4.
+- GGUFs with their own MTP head speculate on greedy and sampled requests (`--mtp` default on, `--no-ds4-mtp` opts out): 35 to 47 tok/s on the Flash Next Q2 pack, M4 Max.
 
 ### Fixes
 
-- Tool arguments whose array or object items repeat a key with the same value are coerced to the declared type again instead of reaching the client as a string (#402).
-- Schema-constrained answers can no longer stall on whitespace: the JSON grammar caps free whitespace per run, so a request that used to end as `length` with empty content now produces the JSON.
-- OpenCode 2 launches again. It was started with a `--model` flag its CLI does not have, and it resolves models in a shared background service that never saw our config, so every session ended the moment it opened.
-- An MLX error while writing the KV cache now fails only the request that hit it, instead of crashing the server when that cache is next reset or freed.
+- A file of near-identical lines (tile maps, bitmaps) is no longer cut as a repetition loop; the guards now need a much longer run before cutting. A real loop still ends within a minute.
+- Claude Code's hook output arrives as a second system message; Qwen's template refused it and fell back to a generic format. It is folded into the system prompt.
+- A reasoning budget ends the thought instead of hiding it: at the budget the think block is closed and the model answers, as vLLM and SGLang do. `reasoning_effort` maps to a budget on Qwen 3.8 again; `reasoning_budget_tokens`, Anthropic `thinking.budget_tokens` and `--reasoning-budget` are enforced while decoding.
+- `reasoning_effort` budgets follow pi's ladder: minimal 1024, low 2048, medium 8192, high/xhigh uncapped.
+- pi and opencode compact correctly on small windows; their 200k-sized reserves are now scaled to the window.
+- Launching an agent below its context floor warns (Claude Code 64k, opencode 32k, pi 16k) instead of failing quietly.
+- Agent launchers give half the window as output budget, not a quarter; thinking shares it and a 6144-token budget came back empty.
+- A row of identical short tokens (a map row of `1`s, a zeroed array) is no longer cut as a loop; a short cycle must run 128 tokens first.
+- ds4 GGUF models keep one session per model, not per request: four 128k requests no longer take 60 GB extra, and repeated prompts reuse their prefix.
+- Embeddings on a GGUF model return a named 400 instead of crashing.
+- Flash Next agent sessions sharing a long system prompt no longer re-read the whole conversation every turn. (#390 @d-b)
+- Split embedding batches returned wrong vectors after the first chunk. (#403 @josk0)
+- An MLX error while writing the KV cache fails that request instead of crashing later. (#405 @josk0)
+- The app can reach a server bound to a specific LAN address. (#389 @t2tx)
+- Reloading a model no longer leaks its tokenizer, config and chat template.
+- Status polls (`/props`, `/api/tags`, `/api/show`) no longer load a model or reset the idle-evict clock.
+- Tool arguments whose items repeat a key with the same value coerce to the declared type again. (#402)
+- Schema-constrained answers no longer stall on whitespace and end as an empty `length` reply.
+- OpenCode 2 launches again; it was passed a `--model` flag it does not have.
+- The M5 sparse-attention kernels self-check against the stock path at load and fall back on mismatch.
+- The SSD cache and ANE compile cache measure free disk as Finder does; `df` hid on-demand space, so 117 GB read as 36 and nothing was written.
+- GGUF models on the embedded engines report `reasoning_tokens`.
+- A model re-uploaded with fewer shards than its index lists loads again (Gemma 3 12B). Regressed in 26.8.11.
 
 ## v26.9.2 — Per-model settings, chat providers, faster Flash Next
 
 ### Highlights
 
-- **Flash Next decodes faster at long context: picking the sparse-attention blocks no longer walks the whole row on one GPU threadgroup.** The exact top-k block select now splits each row across 16 threadgroups and merges their candidates, identical ids, 0.72 → 0.26 ms per layer at 860k tokens of context, paid on every decode tick and every speculative draft step. `MLX_SERVE_QSA_SELECT_SPLIT=0` restores the single-threadgroup kernel.
-- **Flash Next sparse-attention prefill runs on the M5 neural accelerators.** The block-gathered attention now uses a NAX cooperative-tensor kernel on M5-class GPUs with macOS 26.3+, contributed by Nikolai V., with a two-term bf16 softmax that matches the stock kernel's precision; long-prompt prefill is about 12% faster at 160k tokens. `MLX_SERVE_QSA_NAX=0` restores the previous gather.
-- **Flash Next prefill scores its sparse-attention blocks in one kernel.** The indexer's score sheet is now produced by a single NAX kernel that reads the bf16 key bank directly, bit-identical to the old four-op chain, and the 1.5 KB-per-token f32 score bank it kept resident (1.6 GB at 1M tokens, rebuilt on every cache restore) is gone. The block-scoring chain runs about 2x faster per prefill chunk, a saving that grows with context length. `MLX_SERVE_QSA_SCORE_FUSED=0` restores the old chain.
 - **Every model can have its own settings.** Right-click a model in My Models > Model Settings to give it its own context size, KV cache precision and speculative-decoding default. They apply every time that model loads, and a model that is already running picks them up on the spot. Headless: `~/.mlx-serve/model-settings.json`.
 - **Chat with other servers from the same picker.** Settings > Providers takes any OpenAI-compatible chat server (a cloud API, another Mac, a local runtime) with its key, and its models appear in the model picker as `<model>@<name>`. Chat only for now; provider models are never shared over the LAN. Headless: `~/.mlx-serve/providers.json`.
 - **Qwen 3.8 Flash Next is faster across the board.** Speculative decoding costs less per step, reaches full speed on the first request instead of the fifteenth, and picks its draft from a small shortlist instead of reading the whole vocabulary. Long prompts process faster too. On an M4 Max the headline goes 83 to 93 tokens per second, with +50% at short prompts and +30% at 64k and 128k. Generated text is unchanged.
@@ -46,8 +125,6 @@
 - **Structured (JSON schema) output at full speed.** Constrained decoding used to crawl at about one token per second on Flash Next; it now runs at the model's normal speed. (#380)
 - **The chat reads the way you want.** Pick Narrow, Medium or Wide from Settings or F1 to F3. Your own messages get the same hover actions as replies, photos lay out in a grid, the reasoning block collapses out of the way and shows how long the model thought, tables no longer squeeze their headers, and numbered lists, quotes and inline code render properly. (#339, thanks @lojza3d)
 - **My Models shows how much disk space is left.** (#328, thanks @justinluque)
-- **Several people can use speculative decoding at once.** On dense Qwen 3.5/3.8 models, concurrent users' draft checks now run in one pass (two users: 64 tok/s combined instead of 48; three: 73), and with four or more the server switches them to plain batching, which is faster there. On Flash Next a second MTP user no longer waits for the first to finish. Concurrent output is unchanged: at a fixed draft depth it is byte-identical on Flash Next and within kernel rounding on the batched path.
-- **Concurrent users on Qwen 3.5 and 3.8 MoE models share one decode pass** instead of taking turns, the same batching dense models and Flash Next already had. You can now see whether your model batches: Settings > Concurrent requests says so, `/props` carries a `batching` object, `/v1/models` rows carry `batched_decode`, and the log names the reason whenever a request has to decode on its own (speculative decoding, JSON schema, logprobs). Running two servers on one Mac for two users was never needed; the log line at boot now says so at every `--max-concurrent` value.
 
 ### Fixes
 

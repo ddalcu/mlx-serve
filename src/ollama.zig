@@ -36,6 +36,9 @@ pub const Translated = struct {
     wants_stream: bool,
     /// generate-only: `raw:true` routes to /v1/completions instead of chat.
     raw: bool = false,
+    /// generate-only: an empty prompt is Ollama's load/unload handshake, not a
+    /// generation — the caller answers it without a forward.
+    load_only: bool = false,
 
     pub fn deinit(self: *Translated, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
@@ -89,6 +92,12 @@ pub fn translateGenerateRequest(allocator: std.mem.Allocator, ollama_body: []con
 
     const prompt: []const u8 = if (root.get("prompt")) |p| (if (p == .string) p.string else return error.InvalidRequest) else "";
     const raw = if (root.get("raw")) |r| (r == .bool and r.bool) else false;
+    if (prompt.len == 0) return .{
+        .body = allocator.dupe(u8, "") catch return error.OutOfMemory,
+        .model = allocator.dupe(u8, modelNameOf(root)) catch return error.OutOfMemory,
+        .wants_stream = false,
+        .load_only = true,
+    };
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -1215,6 +1224,21 @@ test "ollama: generate request maps to chat unless raw" {
     defer parsed2.deinit();
     try testing.expectEqualStrings("P", parsed2.value.object.get("prompt").?.string);
     try testing.expect(parsed2.value.object.get("messages") == null);
+}
+
+test "ollama: generate with no prompt is the load handshake" {
+    const allocator = testing.allocator;
+    var tr = try translateGenerateRequest(allocator,
+        \\{"model":"m","keep_alive":0}
+    );
+    defer tr.deinit(allocator);
+    try testing.expect(tr.load_only);
+    try testing.expectEqualStrings("m", tr.model);
+    var tr2 = try translateGenerateRequest(allocator,
+        \\{"model":"m","prompt":"P"}
+    );
+    defer tr2.deinit(allocator);
+    try testing.expect(!tr2.load_only);
 }
 
 test "ollama: embed request translation normalizes input" {

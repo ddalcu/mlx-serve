@@ -64,7 +64,7 @@ final class AgentBrevityTests: XCTestCase {
     func testAHandWrittenPromptIsNeverRewritten() {
         // Only the AI-write path adds anything. Typing your own prompt — or
         // editing a generated one — is left exactly as typed.
-        var a = Agent(name: "Mine", brief: "", systemPrompt: "You are terse.")
+        let a = Agent(name: "Mine", brief: "", systemPrompt: "You are terse.")
         a.verbosityFieldDoesNotExist()
         let prefix = AgentResolution.resolve(agent: a, defaults: AppDefaultsSnapshot()).systemPromptPrefix
         XCTAssertEqual(prefix, "You are terse.\n\n", "no clause bolted on at resolution time")

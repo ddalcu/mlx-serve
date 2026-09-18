@@ -1,3 +1,5 @@
+[English](faq.md) · [简体中文](zh-CN/faq.md)
+
 # FAQ
 
 ## Is mlx-serve faster than LM Studio?

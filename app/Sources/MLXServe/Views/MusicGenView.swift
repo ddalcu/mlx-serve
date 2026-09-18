@@ -168,7 +168,7 @@ struct MusicGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -196,7 +196,7 @@ struct MusicGenView: View {
     private var lyricsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text(model.requiresLyrics ? "Lyrics" : "Lyrics (optional)")
+                Text(L10n.text(model.requiresLyrics ? "Lyrics" : "Lyrics (optional)"))
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 rewriteButton(.lyrics, text: lyrics)
@@ -210,9 +210,11 @@ struct MusicGenView: View {
             // `is_instrumental` equivalent, and every text arm tried so far
             // still produced wordless vocal texture. ACE-Step's marker is its
             // own documented convention and does work, so it is not hedged.
-            Toggle(model.family == .minimaxMusic3
+            Toggle(L10n.text(
+                   model.family == .minimaxMusic3
                    ? "Instrumental (no vocals) — experimental"
-                   : "Instrumental (no vocals)", isOn: $instrumental)
+                   : "Instrumental (no vocals)"
+), isOn: $instrumental)
                 .font(.caption)
                 .help(model.family == .minimaxMusic3
                       ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
@@ -228,11 +230,13 @@ struct MusicGenView: View {
             // Say the words are being ignored rather than deleting them: a
             // sticky checkbox silently discarding a typed verse is the failure
             // mode the server's named 400 exists to prevent.
-            Text(instrumental
+            Text(L10n.text(
+                 instrumental
                  ? "Not used while Instrumental is on. Your lyrics are kept if you turn it off."
                  : (model.requiresLyrics
                     ? "This model sings your lyrics. Section tags go on their own lines: \(MusicOptions.sectionTagHint)"
-                    : "Leave empty, or tick Instrumental, for a track with no vocals. Section tags: \(MusicOptions.sectionTagHint)"))
+                    : "Leave empty, or tick Instrumental, for a track with no vocals. Section tags: \(MusicOptions.sectionTagHint)")
+))
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }
@@ -251,15 +255,17 @@ struct MusicGenView: View {
                 // label, so the reason is readable before the mode is even
                 // selected — the whole point of #269.
                 ForEach(MusicTask.allCases, id: \.self) { t in
-                    Text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready)).tag(t)
+                    Text(L10n.text(CoverWeightsFetch.modeLabel(t, decision: t == .cover ? coverWeights : .ready))).tag(t)
                 }
             }
             .labelsHidden().pickerStyle(.segmented)
-            Text(task == .cover
+            Text(L10n.text(
+                 task == .cover
                  ? "Re-sings an existing track in the style you describe: melody and structure stay, the caption and lyrics decide the rest."
                  : (task == .complete
                     ? "Builds an arrangement around a vocal stem (or any part): pick the instruments to add, or leave them all off to let the model decide."
-                    : "A new track from the style prompt and lyrics."))
+                    : "A new track from the style prompt and lyrics.")
+))
                 .font(.caption2).foregroundStyle(.secondary)
             coverWeightsNotice
         }
@@ -327,7 +333,7 @@ struct MusicGenView: View {
     private var sourceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(task == .cover ? "Source track" : "Source stem").font(.subheadline.weight(.semibold))
+                Text(L10n.text(task == .cover ? "Source track" : "Source stem")).font(.subheadline.weight(.semibold))
                 Spacer()
             }
             if let url = srcAudioURL {
@@ -386,7 +392,7 @@ struct MusicGenView: View {
                 Text("Add").font(.caption)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), alignment: .leading)], alignment: .leading, spacing: 4) {
                     ForEach(MusicTask.trackClasses, id: \.self) { name in
-                        Toggle(name.replacingOccurrences(of: "_", with: " "),
+                        Toggle(L10n.text(name.replacingOccurrences(of: "_", with: " ")),
                                isOn: Binding(get: { trackClasses.contains(name) },
                                              set: { on in
                                                  if on { if !trackClasses.contains(name) { trackClasses.append(name) } }
@@ -583,7 +589,7 @@ struct MusicGenView: View {
     /// intrinsic-width and was centring itself inside the column.
     private func advancedCell<C: View>(_ label: String, @ViewBuilder control: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             control()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -678,7 +684,7 @@ struct MusicGenView: View {
                             Menu {
                                 Button("Auto") { bpm = nil }
                                 ForEach(MusicOptions.bpms, id: \.bpm) { opt in
-                                    Button(opt.label) { bpm = opt.bpm }
+                                    Button(L10n.text(opt.label)) { bpm = opt.bpm }
                                 }
                             } label: { Image(systemName: "chevron.down") }
                             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
@@ -699,7 +705,7 @@ struct MusicGenView: View {
                     advancedCell("Vocal language") {
                         Picker("", selection: $vocalLanguage) {
                             ForEach(MusicOptions.languages, id: \.code) { opt in
-                                Text(opt.label).tag(opt.code)
+                                Text(L10n.text(opt.label)).tag(opt.code)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
@@ -708,7 +714,7 @@ struct MusicGenView: View {
                         Picker("", selection: $timesignature) {
                             Text("Auto").tag("")
                             ForEach(MusicOptions.timeSignatures, id: \.value) { opt in
-                                Text(opt.label).tag(opt.value)
+                                Text(L10n.text(opt.label)).tag(opt.value)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).frame(width: menuWidth, alignment: .leading)
@@ -927,18 +933,18 @@ struct MusicGenView: View {
             if !library.savedStyles.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedStyles) { p in
-                        Button(p.title) { prompt = p.body }
+                        Button(L10n.text(p.title)) { prompt = p.body }
                     }
                 }
                 Menu("Delete saved…") {
                     ForEach(library.savedStyles) { p in
-                        Button(p.title, role: .destructive) { library.deleteStyle(title: p.title) }
+                        Button(L10n.text(p.title), role: .destructive) { library.deleteStyle(title: p.title) }
                     }
                 }
             }
             Section("Examples") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
-                    Button(p.title) { prompt = p.body }
+                    Button(L10n.text(p.title)) { prompt = p.body }
                 }
             }
         }
@@ -959,18 +965,18 @@ struct MusicGenView: View {
             if !library.savedLyrics.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedLyrics) { p in
-                        Button(p.title) { lyrics = p.body }
+                        Button(L10n.text(p.title)) { lyrics = p.body }
                     }
                 }
                 Menu("Delete saved…") {
                     ForEach(library.savedLyrics) { p in
-                        Button(p.title, role: .destructive) { library.deleteLyrics(title: p.title) }
+                        Button(L10n.text(p.title), role: .destructive) { library.deleteLyrics(title: p.title) }
                     }
                 }
             }
             Section("Templates") {
                 ForEach(MusicPrompt.builtinLyrics) { p in
-                    Button(p.title) { lyrics = p.body }
+                    Button(L10n.text(p.title)) { lyrics = p.body }
                 }
             }
         }
@@ -1036,7 +1042,7 @@ struct PromptRewriteSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(title).font(.headline)
+                Text(L10n.text(title)).font(.headline)
                 Spacer()
                 if isWriting { ProgressView().controlSize(.small) }
             }

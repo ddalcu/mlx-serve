@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+@preconcurrency import AVFAudio
 import Speech
 
 /// Speech-to-text for voice mode. Drives a hands-free turn: emits partial

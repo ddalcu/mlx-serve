@@ -16,6 +16,7 @@
 // straight through.
 
 const std = @import("std");
+const gguf_meta = @import("../gguf_meta.zig");
 const ffi = @import("../ds4_ffi.zig");
 const metal_sources = @import("ds4_metal_sources");
 const log = @import("../log.zig");
@@ -77,6 +78,13 @@ const kernel_entries = [_]KernelEntry{
     .{ .env_var = "DS4_METAL_NORM_SOURCE", .file_name = "norm.metal", .source = metal_sources.norm },
     .{ .env_var = "DS4_METAL_BIN_SOURCE", .file_name = "bin.metal", .source = metal_sources.bin },
     .{ .env_var = "DS4_METAL_SET_ROWS_SOURCE", .file_name = "set_rows.metal", .source = metal_sources.set_rows },
+    .{ .env_var = "DS4_METAL_DEEPSEEK4_VISION_SOURCE", .file_name = "deepseek4_vision.metal", .source = metal_sources.deepseek4_vision },
+    .{ .env_var = "DS4_METAL_DSV41_SOURCE", .file_name = "dsv41.metal", .source = metal_sources.dsv41 },
+    .{ .env_var = "DS4_METAL_GLM53_BF16_SOURCE", .file_name = "glm53_bf16.metal", .source = metal_sources.glm53_bf16 },
+    .{ .env_var = "DS4_METAL_GLM53_KDA_SOURCE", .file_name = "glm53_kda.metal", .source = metal_sources.glm53_kda },
+    .{ .env_var = "DS4_METAL_GLM53_VISION_SOURCE", .file_name = "glm53_vision.metal", .source = metal_sources.glm53_vision },
+    .{ .env_var = "DS4_METAL_QWEN4_SOURCE", .file_name = "qwen4.metal", .source = metal_sources.qwen4 },
+    .{ .env_var = "DS4_METAL_QWEN4_VISION_SOURCE", .file_name = "qwen4_vision.metal", .source = metal_sources.qwen4_vision },
 };
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -216,6 +224,10 @@ pub const OpenOptions = struct {
     /// target-only decode). Ignored for legacy-MTP support GGUFs. Confidence
     /// pruning stays at the engine default (0.9).
     dspark: bool = false,
+    /// Arm the checkpoint's OWN MTP head (upstream `--mtp`, Qwen3.8 Flash Next /
+    /// GLM 5.x). Honoured only when the GGUF header declares one; ds4 refuses
+    /// the open otherwise.
+    embedded_mtp: bool = false,
     /// SSD weight-streaming (issue #39): skip full model residency + warmup and
     /// stream expert weights from disk, with an in-RAM cache. Lets DeepSeek-V4-Flash
     /// run on machines whose RAM can't hold the full model. 0 cache fields = ds4 auto.
@@ -230,6 +242,14 @@ pub const OpenOptions = struct {
 /// GGUF is going in too — ds4 hard-errors open() on `--dspark` with no
 /// `--mtp FILE`, and a missing OPTIONAL accelerator must degrade to a serial
 /// boot, never a boot failure. Pure; unit-tested.
+/// Whether the GGUF header declares an in-checkpoint MTP head; the callers
+/// AND it with the `--mtp` request before `OpenOptions.embedded_mtp`.
+pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    var info = gguf_meta.readFromFile(io, allocator, path) catch return false;
+    defer info.deinit(allocator);
+    return info.embedded_mtp;
+}
+
 pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
     return requested and has_support_gguf;
 }
@@ -239,6 +259,9 @@ pub const Ds4Engine = struct {
     handle: *ffi.Engine,
     model_path_owned: [:0]u8,
     mtp_path_owned: ?[:0]u8,
+    /// The in-checkpoint head is armed: speculation also serves SAMPLED
+    /// requests (`ds4_session_eval_speculative`).
+    embedded_mtp: bool,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
         try ensureMetalKernels(allocator);
@@ -259,7 +282,11 @@ pub const Ds4Engine = struct {
             log.info("[ds4] DSpark runtime armed (support GGUF: {s})\n", .{opts.mtp_path.?});
         }
 
+        const embedded_mtp = opts.embedded_mtp;
+        if (embedded_mtp) log.info("[ds4] embedded MTP head armed\n", .{});
+
         var options = ffi.EngineOptions{
+            .glm_mtp = embedded_mtp,
             .model_path = path_z.ptr,
             .mtp_path = if (mtp_z) |s| s.ptr else null,
             .backend = opts.backend,
@@ -295,6 +322,7 @@ pub const Ds4Engine = struct {
             .handle = raw.?,
             .model_path_owned = path_z,
             .mtp_path_owned = mtp_z,
+            .embedded_mtp = embedded_mtp,
         };
         return wrapper;
     }
@@ -541,6 +569,47 @@ pub const Ds4Session = struct {
         );
         if (n < 0) {
             log.err("[ds4] eval_speculative rc={d} err={s}\n", .{ n, std.mem.sliceTo(&err_buf, 0) });
+            return Error.SessionSpecFailed;
+        }
+        const n_usize: usize = @intCast(n);
+        for (c_out_buf[0..n_usize], 0..) |v, i| out_tokens[i] = @intCast(v);
+        return @intCast(n);
+    }
+
+    /// Sampled twin of `evalSpeculative` (the engine samples the drafts under
+    /// the request's temperature and verifies them). Same output contract.
+    pub fn evalSpeculativeSampled(
+        self: *Ds4Session,
+        first_token: i32,
+        max_tokens: i32,
+        eos_token: i32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        rng: *u64,
+        out_tokens: []i32,
+    ) Error!i32 {
+        var c_out_buf = self.allocator.alloc(c_int, out_tokens.len) catch return Error.OutOfMemory;
+        defer self.allocator.free(c_out_buf);
+        var err_buf: [256]u8 = undefined;
+        const n = ffi.ds4_session_eval_speculative(
+            self.handle,
+            @intCast(first_token),
+            @intCast(max_tokens),
+            @intCast(eos_token),
+            temperature,
+            @intCast(top_k),
+            top_p,
+            min_p,
+            rng,
+            c_out_buf.ptr,
+            @intCast(c_out_buf.len),
+            &err_buf,
+            err_buf.len,
+        );
+        if (n < 0) {
+            log.err("[ds4] eval_speculative (sampled) rc={d} err={s}\n", .{ n, std.mem.sliceTo(&err_buf, 0) });
             return Error.SessionSpecFailed;
         }
         const n_usize: usize = @intCast(n);

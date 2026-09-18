@@ -391,12 +391,12 @@ final class AttachmentStoreTests: XCTestCase {
                        "truncateMessages must not delete: regenerate re-uses these very paths")
     }
 
-    /// The two places a file may be removed, and nowhere else.
+    /// The three places a file may be removed, and nowhere else.
     func testOnlySessionAndMessageDeletionRemoveFiles() throws {
         let src = try source("Sources/MLXServe/AppState.swift")
         let callers = src.components(separatedBy: "AttachmentStore.remove(")
-        XCTAssertEqual(callers.count - 1, 2,
-                       "expected exactly two removal sites: deleteSessions and deleteMessage")
+        XCTAssertEqual(callers.count - 1, 3,
+                       "expected exactly three removal sites: deleteSessions, deleteMessage and deleteTurn")
         XCTAssertTrue(src.contains("removablePaths(orphanedBy:"))
         XCTAssertTrue(src.contains("removablePaths(deleting:"))
     }

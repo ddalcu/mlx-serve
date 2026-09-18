@@ -15,6 +15,22 @@ enum KvQuantChoice: String, CaseIterable {
     }
 }
 
+/// MTP draft-acceptance vocabulary of the server's `mtp_acceptance` field.
+/// Typical and TokenV3 accept more drafts but change the output distribution.
+enum MtpAcceptanceChoice: String, CaseIterable {
+    case exact
+    case typical
+    case tokenv3
+
+    var label: String {
+        switch self {
+        case .exact: "Exact (Default)"
+        case .typical: "Typical (faster, lossy)"
+        case .tokenv3: "TokenV3 (fastest, lossy)"
+        }
+    }
+}
+
 /// One model's entry in `~/.mlx-serve/model-settings.json` — the file the
 /// SERVER reads (`src/model_settings.zig`) at every load of that model, so the
 /// keys are its keys. nil = the process default. Unknown keys are kept in
@@ -23,12 +39,15 @@ struct ModelOverride: Equatable {
     var ctxSize: Int?
     var kvQuant: KvQuantChoice?
     var mtp: Bool?
+    var mtpAcceptance: MtpAcceptanceChoice?
     var extra: [String: Any] = [:]
 
-    init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil) {
+    init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
+         mtpAcceptance: MtpAcceptanceChoice? = nil) {
         self.ctxSize = ctxSize
         self.kvQuant = kvQuant
         self.mtp = mtp
+        self.mtpAcceptance = mtpAcceptance
     }
 
     init(json: [String: Any]) {
@@ -43,23 +62,27 @@ struct ModelOverride: Equatable {
         if let m = rest.removeValue(forKey: "mtp") {
             if let b = m as? Bool { mtp = b }
         }
+        if let a = rest.removeValue(forKey: "mtp_acceptance") {
+            if let s = a as? String { mtpAcceptance = MtpAcceptanceChoice(rawValue: s) }
+        }
         extra = rest
     }
 
-    var isEmpty: Bool { ctxSize == nil && kvQuant == nil && mtp == nil && extra.isEmpty }
-    /// True when any of the three fields the sheet edits is set.
-    var hasSettings: Bool { ctxSize != nil || kvQuant != nil || mtp != nil }
+    var isEmpty: Bool { !hasSettings && extra.isEmpty }
+    /// True when any field the sheet edits is set.
+    var hasSettings: Bool { ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil }
 
     var json: [String: Any] {
         var out = extra
         if let ctxSize { out["ctx_size"] = ctxSize }
         if let kvQuant { out["kv_quant"] = kvQuant.rawValue }
         if let mtp { out["mtp"] = mtp }
+        if let mtpAcceptance { out["mtp_acceptance"] = mtpAcceptance.rawValue }
         return out
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
-        a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp
+        a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
 }

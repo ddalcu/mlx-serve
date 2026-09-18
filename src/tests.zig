@@ -16,6 +16,9 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
+    _ = @import("rht.zig");
+    _ = @import("qmv2.zig");
+    _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
     _ = @import("json_grammar.zig");

@@ -109,7 +109,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 MODEL_TYPE=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('model_type','unknown'))" 2>/dev/null || echo "unknown")
-NUM_EXPERTS=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print(d.get('num_local_experts', d.get('num_experts', 0)))" 2>/dev/null || echo "0")
+NUM_EXPERTS=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); d=d.get('text_config', d); print(d.get('num_local_experts', d.get('num_experts', 0)))" 2>/dev/null || echo "0")
 HAS_VISION=$(python3 -c "import json; d=json.load(open('$CONFIG_FILE')); print('yes' if d.get('vision_config') or d.get('vision_tower') else 'no')" 2>/dev/null || echo "no")
 
 echo "Model type:  $MODEL_TYPE"
@@ -364,7 +364,7 @@ if [ "$NUM_EXPERTS" -gt 0 ] 2>/dev/null; then
     echo ""
     echo -e "${DIM}4a: MoE with thinking enabled${NC}"
     RESP=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
-      -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 7 * 8? Think step by step."}],"max_tokens":300,"temperature":0,"stream":false,"enable_thinking":true}')
+      -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 7 * 8? Think step by step."}],"max_tokens":1500,"temperature":0,"stream":false,"enable_thinking":true}')
     CONTENT=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"].get("content",""))' 2>/dev/null || echo "")
     assert_not_empty "MoE thinking returns content" "$CONTENT"
     assert_server_alive "MoE thinking"

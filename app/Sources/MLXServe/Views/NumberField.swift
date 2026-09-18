@@ -23,7 +23,7 @@ struct NumberField: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
             .font(.caption.monospacedDigit())
             .frame(width: width)
@@ -67,7 +67,7 @@ struct OptionalNumberField: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
             .font(.caption.monospacedDigit())
             .frame(width: width)

@@ -200,6 +200,7 @@ class APIClient {
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
+            mtpAvailable: meta["mtp_available"] as? Bool,
             kvQuant: meta["kv_quant"] as? String ?? "",
             loaded: topLoaded,
             state: topState,
@@ -405,6 +406,20 @@ class APIClient {
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
     }
 
+    /// The whole `/props` document. Settings are per MODEL and the bare
+    /// route answers for the default one, so a benchmark names the model it
+    /// measures (with two chat models resident a row would otherwise record
+    /// the other's KV quant); nil is the bare route, for discovering that
+    /// default. Parsing lives in `BenchmarkSettings.flatten`; this hands
+    /// back raw JSON.
+    func fetchPropsRaw(port: UInt16, model: String? = nil) async throws -> [String: Any] {
+        var components = URLComponents(url: serverURL(port: port, path: "/props"), resolvingAgainstBaseURL: false)
+        components?.queryItems = model.map { [URLQueryItem(name: "model", value: $0)] }
+        let url = components?.url ?? serverURL(port: port, path: "/props")
+        let (data, _) = try await session.data(from: url)
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
     /// Live throughput feed. 503s when the server was launched without
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
@@ -413,6 +428,108 @@ class APIClient {
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)
+    }
+
+    // MARK: - Benchmarking
+
+    /// The server's own measurement of one completion.
+    ///
+    /// A client cannot honestly time our stream: the SSE cadence is not the
+    /// decode cadence (and with `tools` present the server buffers everything
+    /// and flushes at the end, which is how the console once reported 937
+    /// tok/s on a 2B). The `timings` block is measured around the forward
+    /// passes, so it is the only defensible source for a published number.
+    struct CompletionTimings {
+        var promptTokens: Int
+        var cachedTokens: Int
+        var prefillMs: Double
+        var prefillTps: Double
+        var completionTokens: Int
+        var decodeMs: Double
+        var decodeTps: Double
+        var tokenizeMs: Double
+        var finishReason: String
+        /// The answer text, only when the caller asked for it.
+        var content: String
+
+        /// Server-side time to first token.
+        var ttftMs: Double { tokenizeMs + prefillMs }
+
+        // NOTE: deliberately no `reusedCache` here. `cachedTokens > 0` looks
+        // like the obvious test and is wrong — the chat-template header always
+        // matches, so it is never zero and every run gets thrown away. The
+        // judgement is benchmark methodology, not HTTP:
+        // `BenchmarkPrompt.prefillWasReused`.
+    }
+
+    /// One non-streaming benchmark request. Sampling is pinned (temp 0, top_p 1,
+    /// thinking off) so the workload is identical on every machine.
+    func benchmarkCompletion(
+        port: UInt16,
+        model: String,
+        prompt: String,
+        maxTokens: Int,
+        returnsContent: Bool = false,
+        timeout: TimeInterval = 900
+    ) async throws -> CompletionTimings {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // A cold load on a large checkpoint is minutes, and a 128-token decode
+        // on a 235B is not fast either.
+        request.timeoutInterval = timeout
+
+        let body: [String: Any] = [
+            "model": model,
+            "messages": [["role": "user", "content": prompt]],
+            "max_tokens": maxTokens,
+            "temperature": 0,
+            "top_p": 1,
+            "stream": false,
+            // Thinking would spend the token budget before any answer starts,
+            // making the decode figure depend on the model's mood.
+            "enable_thinking": false,
+        ]
+        // withoutEscapingSlashes: a LAN model id must not ship as `\/`.
+        request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            throw APIError.badStatus(code: code, detail: String(snippet))
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw URLError(.cannotParseResponse)
+        }
+        // No `timings` means the server measured nothing for us — publishing a
+        // client-side stopwatch instead would be the 937-tok/s bug.
+        guard let timings = json["timings"] as? [String: Any] else {
+            throw APIError.badStatus(code: 200, detail: "response carried no timings block")
+        }
+
+        func number(_ key: String) -> Double {
+            (timings[key] as? NSNumber)?.doubleValue ?? 0
+        }
+        let choice = (json["choices"] as? [[String: Any]])?.first
+        let finish = choice?["finish_reason"] as? String ?? ""
+        let content = returnsContent
+            ? ((choice?["message"] as? [String: Any])?["content"] as? String ?? "")
+            : ""
+
+        return CompletionTimings(
+            promptTokens: Int(number("prompt_n")),
+            cachedTokens: Int(number("cached_n")),
+            prefillMs: number("prompt_ms"),
+            prefillTps: number("prompt_per_second"),
+            completionTokens: Int(number("predicted_n")),
+            decodeMs: number("predicted_ms"),
+            decodeTps: number("predicted_per_second"),
+            tokenizeMs: number("tokenize_ms"),
+            finishReason: finish,
+            content: content
+        )
     }
 
     // MARK: - Agent Tool Calling
@@ -424,21 +541,19 @@ class APIClient {
         let rawArguments: String
     }
 
-    /// Read a cut's CAUSE out of one streamed choice. `finish_reason: "length"`
-    /// is the only OpenAI value for both a max_tokens cap and the server's
-    /// degenerate-tail loop cut, so the cause comes from the sibling
-    /// `finish_details` object the server emits beside it. An older server (or
-    /// any other OpenAI-compatible backend) sends no such field and reads as
-    /// `.maxTokens`, which is exactly the behaviour this replaced.
+    /// Read a cut's cause out of one streamed choice. Explicit repetition-loop
+    /// details take precedence over finish_reason: current servers use "stop"
+    /// for loop cuts, while older servers used "length". Without a recognized
+    /// loop cause, only "length" indicates a max_tokens cut.
     ///
     /// Static and dictionary-shaped so it is testable without a live stream.
     static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
-        guard let choice, let fr = choice["finish_reason"] as? String, fr == "length" else { return nil }
+        guard let choice else { return nil }
         if let details = choice["finish_details"] as? [String: Any],
            let type = details["type"] as? String, type == "repetition_loop" {
             return .repetitionLoop
         }
-        return .maxTokens
+        return choice["finish_reason"] as? String == "length" ? .maxTokens : nil
     }
 
     /// Per-request overrides that come from the user's saved ServerOptions.
@@ -669,17 +784,26 @@ class APIClient {
             return
         }
 
+        try await Self.consumeChatLines(bytes.lines, streamStart: streamStart, continuation: continuation)
+    }
+
+    static func consumeChatLines<Lines: AsyncSequence>(
+        _ lines: Lines,
+        streamStart: Date = Date(),
+        continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
+    ) async throws where Lines.Element == String {
         var firstTokenTime: Date?
         // Accumulate tool call deltas across chunks, keyed by index
         var pendingToolCalls: [String: (id: String, name: String, args: String)] = [:]
         var hasToolCalls = false
         var emittedToolCalls = false
+        var loopCut = false
         // Accumulated assistant content — used as last-resort source for tool-call
         // recovery when the server streams <tool_call> blocks as plain content
         // (e.g. some Qwen MoE outputs an older binary failed to parse).
         var contentAccumulator = ""
 
-        for try await line in bytes.lines {
+        for try await line in lines {
             guard line.hasPrefix("data: ") else { continue }
             let payload = String(line.dropFirst(6))
             if payload == "[DONE]" {
@@ -727,10 +851,14 @@ class APIClient {
                 )))
             }
 
-            guard let choices = chunk["choices"] as? [[String: Any]],
-                  let delta = choices.first?["delta"] as? [String: Any] else {
-                continue
+            guard let choices = chunk["choices"] as? [[String: Any]] else { continue }
+            // Explicit loop details identify an intentional cut even with
+            // finish_reason "stop"; bare "length" identifies a max_tokens cap.
+            if let cause = Self.truncationCause(fromChoice: choices.first) {
+                loopCut = loopCut || TruncationNotice.endsTurn(cause: cause)
+                continuation.yield(.truncated(cause))
             }
+            let delta = choices.first?["delta"] as? [String: Any] ?? [:]
             if firstTokenTime == nil {
                 firstTokenTime = Date()
             }
@@ -774,18 +902,13 @@ class APIClient {
                 }
             }
 
-            // Check finish_reason. "length" is both the max_tokens cap and the
-            // server's own loop cut; `finish_details` is what tells them apart.
-            if let cause = Self.truncationCause(fromChoice: choices.first) {
-                continuation.yield(.truncated(cause))
-            }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
             // server stall-timeout cut it mid-args). Deliver the salvaged calls so
             // the agent loop's truncation branch (maxTokensHit && !calls.isEmpty)
             // fires the chunk-and-retry nudge — before this, the server hid the
             // cut behind finish_reason "tool_calls" and the model got blamed for
             // "omitting" content it actually generated.
-            if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
+            if !loopCut, let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     Self.appendToolLog("EMIT: name=\(tc.name) rawArgs=\(tc.args.prefix(500))")
@@ -801,7 +924,7 @@ class APIClient {
         }
 
         // Fallback: emit tool calls if stream ended without finish_reason
-        if hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
+        if !loopCut && hasToolCalls && !pendingToolCalls.isEmpty && !emittedToolCalls {
             Self.appendToolLog("FALLBACK_EMIT: no finish_reason, pending=\(pendingToolCalls.count)")
             var calls: [ToolCall] = []
             for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
@@ -819,7 +942,7 @@ class APIClient {
         // Last-resort: server emitted no tool_calls deltas at all but the
         // assistant content contains <tool_call>...</tool_call> blocks (older
         // server binary / unrecognized format). Recover them from content.
-        if !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
+        if !loopCut && !emittedToolCalls && contentAccumulator.contains("<tool_call>") {
             let recovered = Self.extractToolCallsFromContent(contentAccumulator)
             if !recovered.isEmpty {
                 Self.appendToolLog("CONTENT_SCAN_RECOVER: count=\(recovered.count)")

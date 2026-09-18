@@ -274,6 +274,10 @@ final class DownloadManagerTransferTests: XCTestCase {
         ]
     }
 
+    /// Built once per process: the tests only need SOME incompressible bytes,
+    /// and regenerating 40 MB per test is most of this class's wall time.
+    private static let noise = makeNoise(bytes: 40 << 20)
+
     /// Anything that isn't a committed file — a stranded `.partial`, an orphan
     /// chunk sidecar.
     private static func strays(in dir: String) -> [String] {
@@ -282,13 +286,18 @@ final class DownloadManagerTransferTests: XCTestCase {
     }
 
     private static func pseudoRandom(bytes count: Int) -> Data {
+        precondition(count <= noise.count)
+        return noise.prefix(count)
+    }
+
+    private static func makeNoise(bytes count: Int) -> Data {
         var out = Data(count: count)
         var seed: UInt64 = 0xD1B54A32D192ED03
         out.withUnsafeMutableBytes { raw in
-            let p = raw.bindMemory(to: UInt8.self)
-            for i in 0..<count {
+            let p = raw.bindMemory(to: UInt64.self)
+            for i in 0..<(count / 8) {
                 seed = seed &* 6364136223846793005 &+ 1442695040888963407
-                p[i] = UInt8((seed >> 33) & 0xFF)
+                p[i] = seed ^ (seed >> 29)
             }
         }
         return out

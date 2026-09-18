@@ -6,14 +6,16 @@
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
+const mtp_acceptance = @import("mtp_acceptance.zig");
 
 pub const Override = struct {
     ctx_size: ?u32 = null,
     kv_quant: ?kv_quant.KVQuantConfig = null,
     mtp: ?bool = null,
+    mtp_acceptance: ?mtp_acceptance.Mode = null,
 
     pub fn isEmpty(o: Override) bool {
-        return o.ctx_size == null and o.kv_quant == null and o.mtp == null;
+        return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null;
     }
 };
 
@@ -64,6 +66,10 @@ fn fromValue(v: std.json.Value) Override {
         .bool => |b| o.mtp = b,
         else => {},
     };
+    if (obj.get("mtp_acceptance")) |a| switch (a) {
+        .string => |name| o.mtp_acceptance = mtp_acceptance.fromName(name),
+        else => {},
+    };
     return o;
 }
 
@@ -95,11 +101,12 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
+        if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
     });
     return o;
 }
@@ -118,6 +125,17 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(u8, 4), b.kv_quant.?.bits);
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
     try std.testing.expect(s.lookup("/m/c").isEmpty());
+}
+
+test "model_settings: mtp_acceptance names a mode at its default threshold" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"mtp_acceptance": "typical"}, "/m/b": {"mtp_acceptance": "tokenv3"}, "/m/c": {"mtp_acceptance": "exact"}, "/m/d": {"mtp_acceptance": "fast"}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(f32, 0.2), s.lookup("/m/a").mtp_acceptance.?.typical.delta);
+    try std.testing.expectEqual(@as(f32, 0.95), s.lookup("/m/b").mtp_acceptance.?.tokenv3);
+    try std.testing.expect(s.lookup("/m/c").mtp_acceptance.? == .exact);
+    try std.testing.expect(s.lookup("/m/d").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {

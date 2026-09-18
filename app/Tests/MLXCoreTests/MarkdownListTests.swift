@@ -94,4 +94,100 @@ final class MarkdownListTests: XCTestCase {
     func testAnEmptyItemDoesNotCrashOrVanish() {
         XCTAssertTrue(rendered("1. ").contains("1."))
     }
+
+    // MARK: - Nesting
+
+    /// The hanging indent of the run containing `needle`, which is what tells
+    /// an item's depth (and an item from prose) apart.
+    private func headIndent(_ needle: String, in source: String) -> CGFloat {
+        let attributed = MarkdownText.attributedString(for: source)
+        guard let range = attributed.string.range(of: needle) else { return -1 }
+        let location = attributed.string.distance(from: attributed.string.startIndex,
+                                                  to: range.lowerBound)
+        let style = attributed.attribute(.paragraphStyle, at: location,
+                                         effectiveRange: nil) as? NSParagraphStyle
+        return style?.headIndent ?? 0
+    }
+
+    /// An indented item is a level of its own. The marker was read at the
+    /// start of the line only, so a nested item fell through to a paragraph
+    /// and every outline a model wrote arrived flat.
+    func testANestedItemSitsDeeperThanItsParent() {
+        let source = "- top\n  - nested\n- second"
+        XCTAssertTrue(rendered(source).contains("• nested"), rendered(source))
+        XCTAssertGreaterThan(headIndent("nested", in: source), headIndent("top", in: source))
+        XCTAssertEqual(headIndent("second", in: source), headIndent("top", in: source),
+                       "coming back out returns to the parent's depth")
+    }
+
+    /// Depth counts the STEPS the list takes, not spaces: models write two or
+    /// four for the same one level, and both must read as one.
+    func testFourSpaceNestingIsOneLevelLikeTwoSpaceNesting() {
+        let two = "- top\n  - nested"
+        let four = "- top\n    - nested"
+        XCTAssertEqual(headIndent("nested", in: two), headIndent("nested", in: four))
+    }
+
+    func testThirdLevelGoesDeeperStill() {
+        let source = "- one\n  - two\n    - three"
+        XCTAssertGreaterThan(headIndent("three", in: source), headIndent("two", in: source))
+    }
+
+    /// A directory tree written as a list is deeper than the column is wide:
+    /// unbounded, twelve levels is 198pt of indent before the text starts, and
+    /// the items end up in a sliver at the right edge.
+    func testAnOutlineDeeperThanTheColumnStopsIndenting() {
+        let source = (0..<9).map { String(repeating: " ", count: $0 * 2) + "- item\($0)" }
+            .joined(separator: "\n")
+        let capped = headIndent("item5", in: source)
+        XCTAssertEqual(headIndent("item8", in: source), capped, "past the cap the indent holds")
+        XCTAssertGreaterThan(capped, headIndent("item4", in: source), "levels below it still step")
+    }
+
+    /// A line under an item, indented to its text, is part of that item: it
+    /// used to end the list and start a paragraph back at the margin.
+    func testAnIndentedLineContinuesTheItemAboveIt() {
+        let source = "- first\n  continued\n- second"
+        let out = rendered(source)
+        XCTAssertTrue(out.contains("continued"), out)
+        XCTAssertFalse(out.contains("• continued"), "it is the item's own text, not a new item")
+        XCTAssertGreaterThan(headIndent("continued", in: source), 0,
+                             "it stays inside the item, at the item's indent")
+    }
+
+    /// A hard newline would start a paragraph, and a paragraph takes the
+    /// first-line indent (the margin) plus a paragraph's air above it — the
+    /// item's own second line would look like prose that left the list.
+    func testTheContinuationIsASoftBreakNotANewParagraph() {
+        let out = rendered("- first\n  continued\n- second")
+        XCTAssertTrue(out.contains("continued"), out)
+        XCTAssertFalse(out.contains("first\ncontinued"), "that break starts a paragraph")
+    }
+
+    /// Ordinary prose after a list, at the margin, still ends the list.
+    func testAnUnindentedLineEndsTheList() {
+        let source = "- first\nplain prose"
+        XCTAssertEqual(headIndent("plain prose", in: source), 0)
+    }
+
+    // MARK: - Task lists
+
+    /// `- [ ]` is a list marker with a box, not a bullet followed by two
+    /// brackets: models write plans and checklists this way.
+    func testATaskListRendersBoxes() {
+        let out = rendered("- [ ] open\n- [x] done")
+        XCTAssertTrue(out.contains("\u{25A1} open"), out)
+        XCTAssertTrue(out.contains("\u{2611} done"), out)
+        XCTAssertFalse(out.contains("["), out)
+    }
+
+    func testAnUppercaseXIsAlsoTicked() {
+        XCTAssertTrue(rendered("- [X] done").contains("\u{2611} done"))
+    }
+
+    /// Brackets that are not a checkbox stay text.
+    func testBracketsInAnItemAreNotABox() {
+        let out = rendered("- [link] to something")
+        XCTAssertTrue(out.contains("• [link] to something"), out)
+    }
 }

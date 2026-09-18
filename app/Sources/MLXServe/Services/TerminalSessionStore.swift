@@ -24,6 +24,8 @@ final class TerminalSessionStore: ObservableObject {
 
     @Published private(set) var sessions = TerminalSessionList()
     private var runtimes: [UUID: Runtime] = [:]
+    /// An exited session's terminal, kept so its output stays readable until the row closes.
+    private var endedHandles: [UUID: EmbeddedTerminalView.Handle] = [:]
     /// The host CLI behind a `.host` row, for retries.
     private var hostSpecs: [UUID: LauncherCLI] = [:]
     private let server: ServerManager
@@ -71,7 +73,7 @@ final class TerminalSessionStore: ObservableObject {
         for id in runtimes.keys where sessions.session(id)?.themeId == nil { applyTheme(to: id) }
     }
 
-    func handle(for id: UUID) -> EmbeddedTerminalView.Handle? { runtimes[id]?.handle }
+    func handle(for id: UUID) -> EmbeddedTerminalView.Handle? { runtimes[id]?.handle ?? endedHandles[id] }
 
     /// Add a row and start the session into it. A preflight failure is a
     /// `.failed` row with the message (and the fix, rendered by the pane).
@@ -115,9 +117,11 @@ final class TerminalSessionStore: ObservableObject {
                 sessions.markFailed(id, message: "the server isn't running — load a model first; \(cli.displayName) talks to it")
                 return
             }
+            let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
+            warnIfSmallContext(agentId: cli.id, context: budget.context)
             let cmd = CLILauncher.launchCommand(
                 cli, baseURL: server.baseURL, servedModelId: server.chatModelId ?? "mlx-serve",
-                budget: AgentBudget.forServerContext(server.chatModelInfo?.contextLength),
+                budget: budget,
                 entries: AgentModelEntry.chatEntries(from: server.allModels),
                 workingDirectory: workspace)
             install(handle: makeHandle(id: id, executable: cmd.executable, args: cmd.args), cli: nil, for: id)
@@ -208,6 +212,7 @@ final class TerminalSessionStore: ObservableObject {
         // or a replaced one's, is caught here).
         guard runtimes[id] === runtime else { return }
         runtimes.removeValue(forKey: id)
+        endedHandles[id] = runtime.handle
         if let cli = runtime.cli { sandbox.endCliSession(cli) }
         sessions.markExited(id, exitCode: code)
     }
@@ -223,6 +228,7 @@ final class TerminalSessionStore: ObservableObject {
     /// caller's job (`sessions.closeNeedsConfirmation`).
     func close(_ id: UUID) {
         endRuntime(id)
+        endedHandles.removeValue(forKey: id)
         hostSpecs.removeValue(forKey: id)
         sessions.close(id)
     }

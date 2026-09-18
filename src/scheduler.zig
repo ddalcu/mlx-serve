@@ -39,6 +39,7 @@ const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
@@ -388,11 +389,15 @@ pub const NextResult = union(enum) {
 };
 
 fn firstMediaPlaceholder(
+    has_media: bool,
     tokens: []const u32,
     image_token_id: u32,
     audio_token_id: u32,
     video_token_id: u32,
 ) ?usize {
+    // The placeholder ids are ordinary vocabulary entries, so a text-only
+    // prompt can contain one; a boundary exists only where media rows do.
+    if (!has_media) return null;
     for (tokens, 0..) |token, i| {
         if ((image_token_id > 0 and token == image_token_id) or
             (audio_token_id > 0 and token == audio_token_id) or
@@ -447,9 +452,9 @@ pub const Slot = struct {
     /// Generator (constructed on inference thread post-prefill).
     legacy_gen: ?Generator,
 
-    /// Ds4 session for this slot. Created in `runPrefillDs4` when the slot's
-    /// model is `.ds4_engine`-backed; freed in `Slot.deinit`. Mutually
-    /// exclusive with `legacy_gen` (the MLX `Generator` path).
+    /// ds4 session for this slot, BORROWED from `model.ds4_session` (one
+    /// persistent session per model, claimed via `session_busy`) — never
+    /// freed here. Mutually exclusive with `legacy_gen` (the MLX path).
     ds4_session: ?*arch_ds4.Ds4Session = null,
     /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
     /// by pointer so we keep it on the slot.
@@ -465,10 +470,10 @@ pub const Slot = struct {
     /// dequantized embedding table; freed in `Slot.deinit`. Mutually
     /// exclusive with `legacy_gen` (the autoregressive MLX path).
     diffusion: ?*diffusion_mod.Runner = null,
-    /// True when this slot claimed `model.llama_session_busy` in `submit`. The
+    /// True when this slot claimed `model.session_busy` in `submit`. The
     /// single persistent context serves one request at a time; the claim is
     /// released in `complete()`. Tracked per-slot so only the holder releases.
-    llama_holds_session: bool = false,
+    holds_session: bool = false,
     /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
     llama_rng: u64 = 0,
 
@@ -522,11 +527,9 @@ pub const Slot = struct {
     finished: bool,
     error_code: ?[]const u8,
     finish_reason: []const u8,
-    /// Set ONLY by the degenerate-tail guard. `finish_reason` stays "length"
-    /// (see `loopStopReason`) — this is the sibling signal that says WHICH
-    /// kind of "length" it was, so a client can tell a server-cut loop from a
-    /// genuine max_tokens truncation without log archaeology. Static string,
-    /// never freed.
+    /// Set ONLY by the degenerate-tail guard. The wire reason is "stop" so a
+    /// client does not mistake the guard for output/context exhaustion; this
+    /// sibling signal preserves the specific cause. Static string, never freed.
     finish_details: ?[]const u8,
     /// Index into the emitted tokens where the degenerate span begins;
     /// everything from here on is the loop. Non-streaming responses are cut
@@ -598,13 +601,11 @@ pub const Slot = struct {
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
         const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
 
-        // Per-slot KVCache, honoring the process-level kv-quant setting.
-        // TurboQuant schemes need `head_dim` at construction time for the
-        // per-layer rotation matrices; other schemes ignore it. For embedded
-        // slots the engine owns its own cache — we initialize a zero-layer
-        // shell so `Slot.deinit` is symmetric with the MLX path.
+        // Per-slot KVCache, honoring the process-level kv-quant setting. For
+        // embedded slots the engine owns its own cache — we initialize a
+        // zero-layer shell so `Slot.deinit` is symmetric with the MLX path.
         const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
-        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.kvCacheKeyHeadDim());
+        var cache = try KVCache.initWithConfig(allocator, slot_kv_layers, kv_quant_config);
         errdefer cache.deinit();
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
@@ -645,6 +646,7 @@ pub const Slot = struct {
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
         const media_start = firstMediaPlaceholder(
+            params.vision_embeddings != null,
             full_prompt_owned,
             config.image_token_id,
             config.audio_token_id,
@@ -758,10 +760,10 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        if (self.ds4_session) |session| {
-            session.free();
-            self.ds4_session = null;
-        }
+        // ds4_session / llama_session are borrowed from the model (persistent
+        // across requests) — never freed here. The claim on them is released
+        // in Scheduler.complete; the sessions die with the model.
+        self.ds4_session = null;
         // llama_session is borrowed from model.llama_session (persistent across
         // requests) — do NOT free it here. The claim on it is released in
         // Scheduler.complete; the session itself is freed with the model.
@@ -1430,7 +1432,7 @@ pub const Scheduler = struct {
     submit_cond: std.Io.Condition,
     /// Signaled when a persistent engine session (llama) is released in
     /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
-    /// `queue_mu` together with `LoadedModel.llama_session_busy`.
+    /// `queue_mu` together with `LoadedModel.session_busy`.
     session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
@@ -1698,27 +1700,27 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        // Persistent-session engines (llama) reuse one KV context across
+        // Persistent-session engines (llama, ds4) reuse one KV context across
         // requests, so only one request may drive it at a time. Block here until
         // the model's session is free, then claim it (released in `complete`).
-        // ds4 keeps a per-slot session, so it isn't gated. This serializes
-        // concurrent llama requests (v1 scope) without spinning the inference
-        // thread, and lets the next request reuse the previous one's prompt KV.
-        if (params.model.llama_engine != null) {
-            while (params.model.llama_session_busy and !self.shutdown.load(.acquire)) {
+        // This serializes concurrent embedded-engine requests without spinning
+        // the inference thread, and lets the next request reuse the previous
+        // one's prompt KV.
+        if (params.model.llama_engine != null or params.model.ds4_engine != null) {
+            while (params.model.session_busy and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
             }
             if (self.shutdown.load(.acquire)) return error.Shutdown;
-            params.model.llama_session_busy = true;
-            slot.llama_holds_session = true;
+            params.model.session_busy = true;
+            slot.holds_session = true;
         }
 
         self.pending.append(self.allocator, slot) catch |err| {
             // Release the session claim before bubbling the error — the caller
             // never gets the slot, so `complete` won't run for it.
-            if (slot.llama_holds_session) {
-                params.model.llama_session_busy = false;
-                slot.llama_holds_session = false;
+            if (slot.holds_session) {
+                params.model.session_busy = false;
+                slot.holds_session = false;
                 self.session_cond.broadcast(self.io);
             }
             return err;
@@ -1769,9 +1771,9 @@ pub const Scheduler = struct {
         // the next queued llama request can claim it AND reuse the KV prefix the
         // session now holds. Done before enqueueing cleanup so a waiting
         // submitter can proceed immediately.
-        if (slot.llama_holds_session) {
-            slot.model.llama_session_busy = false;
-            slot.llama_holds_session = false;
+        if (slot.holds_session) {
+            slot.model.session_busy = false;
+            slot.holds_session = false;
             self.session_cond.broadcast(self.io);
         }
 
@@ -2046,6 +2048,12 @@ pub const Scheduler = struct {
     /// under registry.mutex.
     pub fn release(self: *Scheduler, lm: *LoadedModel) void {
         self.registry.release(lm);
+    }
+
+    /// `release` for a status read — same refcount protocol, no recency
+    /// stamp. See `ModelRegistry.releaseStatus`.
+    pub fn releaseStatus(self: *Scheduler, lm: *LoadedModel) void {
+        self.registry.releaseStatus(lm);
     }
 
     /// Duped stored failure name for the id `ensureLoaded` just refused with
@@ -2357,7 +2365,7 @@ pub fn batchKvLenOfWith(cache: *const KVCache, cfg: ?*const model_mod.ModelConfi
     if (!c.longCtxGated()) return @intCast(cache.step);
     const raw: u32 = @intCast(cache.kvLenForBatching());
     const gather_on = transformer_mod.qsaBatchedGatherOn(seq_len, any_mrope);
-    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len));
+    const min_kv: u32 = @intCast(transformer_mod.qsaBatchedGatherFloor(seq_len, cache.config.scheme == .affine));
     return c.batchedEffectiveKvLen(raw, gather_on, min_kv);
 }
 
@@ -2513,6 +2521,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
+    config.mtp_acceptance_override = o.mtp_acceptance;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -2730,8 +2739,10 @@ const DS4_MTP_MAX_TOKENS: usize = 17;
 /// size only when `--dspark` armed the runtime — so a `has_mtp` conjunct
 /// (false for DSpark by design) would leave DSpark unreachable, the
 /// dispatch-hole class. Pure + unit-tested; mirrors ds4's own CLI gate.
-fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32) bool {
-    return draft_tokens > 1 and temperature <= 0.0;
+/// A support-GGUF draft (legacy MTP head, DSpark) verifies by argmax, so it
+/// serves greedy requests only; the in-checkpoint head has a sampled arm.
+fn ds4MtpShouldEngage(draft_tokens: c_int, temperature: f32, embedded: bool) bool {
+    return draft_tokens > 1 and (temperature <= 0.0 or embedded);
 }
 
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
@@ -2754,6 +2765,8 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
         .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
         .mtp_margin = DS4_MTP_MARGIN,
         .dspark = params.ds4_dspark,
+        .embedded_mtp = params.ds4_mtp and !params.ds4_ssd_streaming and
+            arch_ds4.ggufDeclaresEmbeddedMtp(sch.io, sch.allocator, params.ds4_path),
     });
     errdefer engine.close();
     // draft_tokens is the spec-readiness signal for BOTH support kinds
@@ -3524,6 +3537,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
+    try model_mod.narrowHadamardPackTables(params.config, weights_ptr, mlx.gpuStream());
 
     // Transformer — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Transformer);
@@ -3543,7 +3557,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
     const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
     if (kv_quant_config.scheme != .off) {
-        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config, params.config.kvCacheKeyHeadDim());
+        try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
     try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
@@ -3900,6 +3914,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
+    if (mtp_enabled) mtp_graft.ensure(sch.allocator, sch.io, params.model_dir, params.config);
     if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
@@ -3917,7 +3932,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     // carries it, so this is paid once per (chip, model,
                     // quant, OS build) like the ladder itself.
                     log.info("MTP head ready (depth={d}, profile={s}).\n", .{
-                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
+                        generate_mod.Generator.resolveMtpDepthCapForProfile(params.config.mtpDepth(params.mtp_depth), mtp_cost_profile),
                         @tagName(mtp_cost_profile),
                     });
                 } else |bind_err| {
@@ -3989,6 +4004,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 1 << 20,
                 cfg.has_sliding_window,
                 cfg.isMoe(),
+                cfg.longCtxGated(),
                 pinned,
             ));
             xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
@@ -4007,6 +4023,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+        if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
+            const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
+            xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+                log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
+            };
+        }
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -4035,8 +4057,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
-    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-    xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(params.mtp_depth);
+    const mtp_depth_cfg = params.config.mtpDepth(params.mtp_depth);
+    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(mtp_depth_cfg, mtp_cost_profile);
+    xfm_ptr.mtp_depth_free = generate_mod.Generator.mtpDepthCapFree(mtp_depth_cfg);
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
     // must not disagree about the same sidecar.
@@ -5137,23 +5160,21 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
 /// has collapsed into a short repeating cycle, returns the finish reason to
 /// cut the request with; null while generation is healthy.
 ///
-/// The reason is "length", NOT "stop": the SERVER is truncating the generation
-/// (the model didn't finish — we cut a runaway loop), and "length" is the one
-/// reason server.toolCallFinishReason preserves through tool-call parsing, so
-/// a call salvaged from the cut buffer reaches the client as a TRUNCATION and
-/// its recovery fires. Live 2026-07-14 (plang/php.html): "stop" became
-/// "tool_calls", presenting a server-cut fragment as a model-completed write.
+/// The reason is "stop", not "length": this guard fired far below the requested
+/// output cap, and clients such as pi treat "length" as context-overflow recovery
+/// and compact unnecessarily. The server separately suppresses tool-call parsing
+/// for this cause, so a cut fragment cannot be promoted to a completed call.
 pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
     const d = loopStopDecision(generated_ids) orelse return null;
     return d.finish_reason;
 }
 
 /// What a loop cut tells the rest of the server. `finish_reason` is the wire
-/// value (always "length" — see above); `finish_details` is the sibling
+/// value (always "stop" — see above); `finish_details` is the sibling
 /// signal that names the CAUSE, and `trim_start` is where the client's copy
 /// of the answer should end.
 pub const LoopStop = struct {
-    finish_reason: []const u8 = "length",
+    finish_reason: []const u8 = "stop",
     /// The `finish_details.type` value. One string for all three tiers: a
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
@@ -5328,12 +5349,10 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
-/// ds4 prefill: create a session sized to the configured ctx and sync it to
-/// the full prompt. ds4 internally reuses the common prefix between its live
-/// session cache and the new prompt, so the mlx-serve hot prefix cache stays
-/// out of the picture. `slot.prompt_tokens` reports the full prompt length;
-/// `cached_tokens` is left at 0 (ds4 doesn't expose its per-session reuse
-/// count back through the FFI).
+/// ds4 prefill: sync the model's ONE persistent session to the full prompt.
+/// ds4 keeps the common prefix against the session's live KV (the previous
+/// request's prompt + reply) and rebuilds only the tail, so the mlx-serve hot
+/// prefix cache stays out of the picture. `cached_tokens` is that prefix.
 fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !void {
     _ = sch;
     // Convert the slot's u32 prompt to ds4's i32 view. Sized once per
@@ -5349,14 +5368,22 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     // ds4's default. Larger ctx → larger KV scratch up front.
     const req_ctx: u32 = if (slot.model.config) |c| c.max_position_embeddings else 0;
     const ctx_size: i32 = @intCast(arch_ds4.clampSessionCtx(req_ctx));
-    var sess = try engine.createSession(ctx_size);
-    errdefer sess.free();
+    const sess = slot.model.ds4_session orelse blk: {
+        const created = try engine.createSession(ctx_size);
+        slot.model.ds4_session = created;
+        break :blk created;
+    };
 
-    try sess.sync(i32_prompt);
+    const cached = sess.commonPrefix(i32_prompt) catch 0;
+    sess.sync(i32_prompt) catch |err| {
+        // Leave nothing half-built behind for the next request.
+        sess.invalidate();
+        return err;
+    };
 
     slot.ds4_session = sess;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
-    slot.cached_tokens = 0;
+    slot.cached_tokens = @intCast(@max(cached, 0));
     slot.state = .decoding;
 }
 
@@ -5500,12 +5527,17 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     // verifies several more, advancing ds4's KV internally (no separate eval).
     // It emits `[sampled, accepted…]`, so this tick may push several tokens.
     // Mirrors ds4's own CLI loop; engages only under greedy sampling.
-    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature)) {
+    if (ds4MtpShouldEngage(engine.mtpDraftTokens(), slot.sampling.temperature, engine.embedded_mtp)) {
         var spec_buf: [DS4_MTP_MAX_TOKENS]i32 = undefined;
         const done: i64 = @intCast(slot.completion_tokens);
         const cap: i64 = @intCast(slot.max_tokens);
         const remaining: i32 = @intCast(@max(@as(i64, 1), cap - done));
-        const n = session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..]) catch {
+        const spec = if (slot.sampling.temperature <= 0.0)
+            session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
+        else
+            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+        const n = spec catch {
+            session.invalidate();
             slot.markError("ds4_spec_failed");
             return;
         };
@@ -5534,7 +5566,10 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
 
     // Advance ds4's KV by feeding the freshly-sampled token. After this
     // the session is in the state expected by the NEXT decode tick.
-    try session.eval(next_id);
+    session.eval(next_id) catch |err| {
+        session.invalidate();
+        return err;
+    };
 
     if (slot.completion_tokens >= slot.max_tokens) {
         finishSlot(sch, slot, "length");
@@ -5550,14 +5585,17 @@ test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {
     // (ds4_engine_mtp_draft_tokens) — a has_mtp conjunct here would leave
     // DSpark (has_mtp=false by design) permanently unreachable, the
     // engagement-blind dispatch-hole class.
-    try std.testing.expect(ds4MtpShouldEngage(4, 0.0));
-    try std.testing.expect(ds4MtpShouldEngage(2, -1.0));
+    try std.testing.expect(ds4MtpShouldEngage(4, 0.0, false));
+    try std.testing.expect(ds4MtpShouldEngage(2, -1.0, false));
     // DSpark block size (e.g. 16) engages the same way.
-    try std.testing.expect(ds4MtpShouldEngage(16, 0.0));
+    try std.testing.expect(ds4MtpShouldEngage(16, 0.0, false));
     // No ready draft (0), or 1 draft token, or sampling → regular decode.
-    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0));
-    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7));
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(1, 0.0, false));
+    try std.testing.expect(!ds4MtpShouldEngage(4, 0.7, false));
+    // The in-checkpoint head (Qwen3.8 Flash Next, GLM 5.x) drafts under sampling too.
+    try std.testing.expect(ds4MtpShouldEngage(2, 0.7, true));
+    try std.testing.expect(!ds4MtpShouldEngage(0, 0.7, true));
 }
 
 /// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
@@ -6238,6 +6276,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.model.config.?.isMoe(),
             ),
             .mtp_enabled = use_mtp,
+            .mtp_acceptance = slot.model.config.?.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
@@ -6751,7 +6790,42 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }
-    return false;
+    return thinkBoundTick(sch, slot, gen);
+}
+
+/// A thinking budget at its limit: commit the early-stop line and the closer
+/// through the model this tick, and decode the answer regular from here on
+/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    tb.observe(gen.generated_ids.items);
+    if (!tb.due()) return false;
+    tb.fired = true;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tb.forced.len + 1)) {
+        log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
+        return false;
+    }
+    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    defer slot.allocator.free(r.emitted);
+    for (r.emitted) |t| {
+        slot.pushToken(t);
+        slot.completion_tokens += 1;
+        if (t != 0) slot.was_pad_only = false;
+    }
+    std.debug.assert(slot.completion_tokens == gen.completion_tokens);
+    if (r.stopped) {
+        finishSlot(sch, slot, gen.finish_reason);
+        return true;
+    }
+    gen.spec_disabled_runtime = true;
+    gen.spec_disable_reason = .think_bound;
+    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    return true;
+}
+
+fn thinkBoundFired(gen: *const Generator) bool {
+    const tb = gen.sampling.think_bound orelse return false;
+    return tb.fired;
 }
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
@@ -6802,7 +6876,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode: SpecTickMode = if (Planner.enabled() and slot.planner_force_plain) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
@@ -6964,11 +7038,11 @@ test "a finish over a latched MLX failure ends the request as an ERROR, never a 
 
 test "firstMediaPlaceholder finds every dynamic media kind and ignores disabled ids" {
     const tokens = [_]u32{ 0, 11, 22, 33, 44 };
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 22, 0, 0));
-    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(&tokens, 0, 33, 0));
-    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(&tokens, 0, 0, 44));
-    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(&tokens, 44, 33, 22));
-    try testing.expect(firstMediaPlaceholder(&tokens, 0, 0, 0) == null);
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 22, 0, 0));
+    try testing.expectEqual(@as(?usize, 3), firstMediaPlaceholder(true, &tokens, 0, 33, 0));
+    try testing.expectEqual(@as(?usize, 4), firstMediaPlaceholder(true, &tokens, 0, 0, 44));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &tokens, 44, 33, 22));
+    try testing.expect(firstMediaPlaceholder(true, &tokens, 0, 0, 0) == null);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
@@ -7727,10 +7801,19 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
         n_chain = i + 1;
     }
 
+    const chain_lap = generate_mod.Generator.SubLap.start(generate_mod.Generator.mtpTraceOn(), live[0].io);
     generate_mod.Generator.mtpChainBuildBatched(gens[0..n], chains[0..n], 0, depth) catch |e| {
         for (live[0..n]) |slot| slot.markError(@errorName(e));
         return;
     };
+    // Dispatched before the verify build so the chain's GPU time covers the build.
+    generate_mod.Generator.mtpChainDispatchBatched(chains[0..n]) catch |e| {
+        for (live[0..n]) |slot| slot.markError(@errorName(e));
+        return;
+    };
+    if (chain_lap.read()) |chain_ns| {
+        for (gens[0..n]) |gen| gen.mtpTraceSub(.chain, chain_ns);
+    }
 
     const taken = n;
     n = 0;
@@ -8993,16 +9076,11 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
-test "loopStopReason: a degenerate tail cut reports length, a healthy tail is not cut" {
-    // The reason MUST be "length": the SERVER is truncating the generation
-    // (the model didn't finish — we cut a runaway repetition loop), and
-    // "length" is the one reason server.toolCallFinishReason preserves through
-    // tool-call parsing, so a call salvaged from the cut buffer reaches the
-    // client as a TRUNCATION and its recovery fires. Live 2026-07-14
-    // (plang/php.html): the cut reported "stop" → "tool_calls", presenting a
-    // server-cut fragment as a model-completed write call — pi validated
-    // garbage while the actual cause stayed invisible (the cut also never
-    // logged). Reverting the reason to "stop" turns this red.
+test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {
+    // A loop guard is an intentional server stop, not exhaustion of the
+    // requested output budget. Reporting "length" makes clients such as pi
+    // run context-overflow recovery and compact a mostly-empty context. Tool
+    // calls from this truncated buffer are suppressed separately at emission.
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
 
@@ -9011,14 +9089,14 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
     try testing.expect(loopStopReason(ids.items) == null);
 
     // Collapse into a short cycle (the php.html shape: "server-side scripting
-    // language, " ≈ a 6-token cycle) past the guard's rep threshold.
-    for (0..generate_mod.degenerate_loop_reps + 1) |_| {
+    // language, " ≈ a 6-token cycle) past the guard's span threshold.
+    for (0..generate_mod.degenerate_loop_min_span / 6 + 1) |_| {
         for ([_]u32{ 101, 202, 303, 404, 505, 606 }) |t| {
             try ids.append(testing.allocator, t);
         }
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 }
 
 test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
@@ -9032,33 +9110,28 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     defer ids.deinit(testing.allocator);
     for (0..30) |i| try ids.append(testing.allocator, @as(u32, @intCast(i * 3 + 11)));
 
-    // 58-token cycle, 9 reps: below the tier-2 threshold — NOT cut.
+    // 58-token cycle, one rep short of the tier's span bar: NOT cut.
     var cycle: [58]u32 = undefined;
     for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(1000 + i));
-    for (0..9) |_| try ids.appendSlice(testing.allocator, &cycle);
+    for (0..generate_mod.degenerate_loop_long_min_span / cycle.len) |_| try ids.appendSlice(testing.allocator, &cycle);
     try testing.expect(loopStopReason(ids.items) == null);
 
-    // Tenth repetition crosses it — cut, and as a truncation ("length").
+    // The next repetition crosses it — cut as an intentional stop.
     try ids.appendSlice(testing.allocator, &cycle);
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 }
 
-test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it" {
-    // The reason must not move to "stop" or a new value — clients key on
-    // "length" for truncation recovery, and "tool_calls" on a server-cut
-    // fragment is the 2026-07-14 php.html failure. The cause is a SIBLING
-    // field, so pi keeps rendering "maximum output token limit" while a
-    // client that reads finish_details can tell the two apart.
+test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(testing.allocator);
     try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
-    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
 
     const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", stop.finish_reason);
+    try testing.expectEqualStrings("stop", stop.finish_reason);
     try testing.expectEqualStrings("repetition_loop", stop.finish_details);
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
     // Trimmed to the honest prefix plus one copy of the cycle.
@@ -9071,12 +9144,12 @@ test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it"
     try testing.expect(loopStopDecision(ids.items[answer_start..]) == null);
 
     // A new loop wholly inside the constrained answer retains the existing
-    // length/repetition result, with an absolute trim point for response code.
-    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+    // stop/repetition result, with an absolute trim point for response code.
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
     }
     const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", answer_loop.finish_reason);
+    try testing.expectEqualStrings("stop", answer_loop.finish_reason);
     try testing.expect(answer_loop.trim_start + answer_start >= answer_start);
 
     // Healthy output decides nothing at all — no reason, and nothing to trim.
@@ -9112,11 +9185,11 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         &[_]u32{ 40, 41, 42, 43, 44, 45, 50, 46 },
     };
     var i: usize = 0;
-    while (ids.items.len < generate_mod.near_repeat_window + 32) : (i += 1) {
+    while (ids.items.len < generate_mod.near_repeat_min_span + 32) : (i += 1) {
         try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
-    try testing.expectEqualStrings("length", reason);
+    try testing.expectEqualStrings("stop", reason);
 
     // A long answer that keeps introducing new material is untouched, however
     // repetitive its scaffolding.
@@ -9491,6 +9564,7 @@ test "retained position: a padded row can never take the full-accept arm" {
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
     var xfm: Transformer = undefined;
+    xfm.rht = null;
     var model: model_registry_mod.LoadedModel = undefined;
     model.transformer = null;
     var gen: Generator = undefined;
@@ -9560,13 +9634,12 @@ test "group cost geometry rejects partial rounds and keeps complete cache format
     var b = a;
     b.group_size = 128;
     try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
-    b = a;
-    b.scheme = .turboquant_4;
-    try testing.expect(cacheCostFormat(a) != cacheCostFormat(b));
+    try testing.expect(cacheCostFormat(a) != cacheCostFormat(transformer_mod.KVQuantConfig.affine(4)));
 }
 
 test "scheduler prices each shared execution once and preserves row sampling geometry" {
     var xfm: Transformer = undefined;
+    xfm.rht = null;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
@@ -9602,6 +9675,7 @@ test "scheduler prices each shared execution once and preserves row sampling geo
 
 test "planner pools recurring head histories without mixing the cold first history" {
     var xfm: Transformer = undefined;
+    xfm.rht = null;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
@@ -9659,6 +9733,7 @@ test "planner pools recurring head histories without mixing the cold first histo
 
 test "mean cost pooling retains differences between histories and both worst-case bounds" {
     var xfm: Transformer = undefined;
+    xfm.rht = null;
     xfm.round_cost = .{ .layout = .long };
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
@@ -9718,4 +9793,14 @@ test "transition pricing skips the first realized round after prime or width cha
     try testing.expect(!plannerPriceTransition(1, 1, false));
     try testing.expect(plannerPriceTransition(1, 2, false));
     try testing.expect(!plannerPriceTransition(2, 0, true));
+}
+
+test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {
+    // The ids are ordinary vocabulary entries, so a text-only prompt can carry
+    // one (live: a pasted source file held 248056 at index 18338 of a 73k
+    // prompt). A media boundary exists only where media rows do.
+    const image_id: u32 = 248056;
+    const text_only = [_]u32{ 7, 8, image_id, 9 };
+    try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
+    try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
 }

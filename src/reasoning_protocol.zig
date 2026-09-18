@@ -971,7 +971,7 @@ test "choice mask at cursor 0: opener candidates and JSON starts, nothing else" 
     try testing.expect(mask[Vocab.opener]); // "<think" starts the opener
     try testing.expect(mask[Vocab.lt]); // "<" is an opener prefix
     try testing.expect(mask[Vocab.json_ob]); // direct answer is JSON-legal
-    try testing.expect(mask[Vocab.json_ws]); // JSON leading whitespace
+    try testing.expect(!mask[Vocab.json_ws]); // JSON admits no free whitespace
     try testing.expect(!mask[Vocab.close_gt]); // ">" cannot START the opener
     try testing.expect(!mask[Vocab.span_gt_reason]); // ">x" is a completion, reachable only from cursor 6
     try testing.expect(!mask[Vocab.close_full]); // the CLOSE spelling never rides the choice mask
@@ -1706,7 +1706,6 @@ test "channel routing and masks agree at every token split, including repeated r
 
 test "channel formats allow direct answers through their content headers" {
     try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "<|channel>\n{}", "", "{}");
-    try expectRoutedAtEverySplit(.gemma, "<|turn>model\n", "  {}", "", "{}");
     try expectRoutedAtEverySplit(.inkling, "<|message_model|>", "<|content_text|>{}", "", "{}");
     try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>final<|message|>{}", "", "{}");
     try expectRoutedAtEverySplit(.harmony, "<|start|>assistant", "<|channel|>commentary<|message|>{}", "", "{}");

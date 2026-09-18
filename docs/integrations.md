@@ -1,3 +1,5 @@
+[English](integrations.md) · [简体中文](zh-CN/integrations.md)
+
 # Integrations
 
 mlx-serve speaks the standard APIs (OpenAI, Anthropic, Ollama, OpenAI Responses), so most coding agents and editors connect with a base URL and a model id. This page covers the zero-config launchers first, then manual setup per tool.

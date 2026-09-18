@@ -67,7 +67,7 @@ final class AgentIntegrationTests: XCTestCase {
         // Print the EXACT JSON for debugging
         if let pretty = try? JSONSerialization.jsonObject(with: jsonData),
            let prettyData = try? JSONSerialization.data(withJSONObject: pretty, options: .prettyPrinted),
-           let prettyStr = String(data: prettyData, encoding: .utf8) {
+           String(data: prettyData, encoding: .utf8) != nil {
             print("\n=== REQUEST JSON (\(jsonData.count) bytes) ===")
             // Print just the messages, not the full tools
             if let dict = pretty as? [String: Any], let msgs = dict["messages"] as? [[String: Any]] {

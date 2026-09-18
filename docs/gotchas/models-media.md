@@ -2004,7 +2004,7 @@ Two things learned on the way:
 - **No env var for an obvious win.** The first cut shipped a `MLX_SERVE_CONV3D_CHUNK=0` kill switch out of habit. It bought one A/B (the 67 GB number above) and one bug: `maxInt(u32)` handed to a `c_int` is `-1`, and the "off" arm ran a window of −1 frames and killed the server with an MLX shape error. Chunking is exact and free, so nobody ever wants the other arm; the switch is gone. Levers are for paths with two arms worth comparing (lossy or tradeoff perf), not for fixes.
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
-H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+H3's VAE convs match the same gate too, and "chunked by reference semantics" turned out not to be enough (#424, 26.8.11 through 26.9.2): the encoder slices a reference video into 17-frame clips and 256-px tiles but built ONE lazy graph over all of them, evaluated once after the last tile. A 480x640 124-frame reference is 8 clips x 6 tiles = 48 encoder passes, and MLX's eval keeps ~10 command buffers in flight, each holding its convs' tap copies and Winograd working sets until completion, so the transient stacked past the wired limit. The tell is `kIOGPUCommandBufferCallbackErrorInvalidResource` (residency, not a malloc failure) right after `prompt -> N tokens`, with images and audio still fine. Fix: `encodeMoments` evaluates its output, one barrier per tile pass, nothing else changes; the tiled parity case is unchanged at cos 0.999998. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
 
 ## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
 
@@ -2047,3 +2047,72 @@ HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
 Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
 tool-response turn, 2.8k-token needle past the 512 window) and the HF
 reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).
+
+## K2-Horizon (`k2_horizon`) port (2026-09-14)
+
+IFM's dense sizes are a Llama trunk (stock weight names, GQA, full-head RoPE
+at theta 1e7, untied head) with ONE arch difference: `K2HorizonRMSNorm`
+normalizes `layernorm_num_groups` (4) channel groups on their own rms before
+the full-width weight. `groupedRmsNorm` does reshape → weight-less rms_norm →
+reshape → multiply, gated inside `rmsNorm` on `norm_groups > 1` and the
+residual width (a per-head q/k norm is already one group per head). The
+first live load answered 17*23 correctly through the generic fallback prompt,
+so the forward was right before the template was.
+
+Three things were not the arch:
+
+- The 51 KB template hit two jinja.cpp gaps: `{% if spec is sameas true %}`
+  (a test with a BARE argument; the parser only knew `is x(arg)`) and
+  `sameas` itself (`not_implemented`). Both fixed in `lib/jinja_cpp`,
+  `libjinja.a` rebuilt. The failure was the usual silent generic fallback.
+- Every marker is a special token spelled `<ifm|…>`: three think openers
+  (`<ifm|think>`, `<ifm|think_fast>`, `<ifm|think_faster>`, picked by
+  `reasoning_effort` high/medium/low, the template raising on any other
+  word) and the GLM tool tags. Threading a fourth think spelling through the
+  ~200 literal sites was the wrong shape; the tokenizer decodes them to the
+  canonical bytes instead (`installMarkerAliases`, decode-only), so parsing,
+  streaming gates and the split all see `<think>` and `<arg_key>`. Only the
+  rendered prompt keeps the pack's spelling, which is why thinking-off's
+  closer is chosen from the rendered tail (`k2ThinkOpenerAt`). The template
+  also raises when an assistant history turn carries no thinking field, so
+  the K2 family always gets a `reasoning_content` (empty when the client sent
+  none).
+- `<|ifm|im_end|>` is declared ONLY in `generation_config.json`'s
+  `eos_token_id` list; config.json names `<|ifm|endoftext|>`. We never read
+  that list, and the model wrote `<|ifm|im_end|>` and kept going. Merged
+  additively at load for every model (`mergeEosTokens`).
+
+Bar: HF `tokenizers` byte-identical ids on numbers, code, CJK, contractions
+and the markers; greedy answers with thinking on/off, effort low, tool calls
+(plain and streamed with thinking), tool-result history, JSON schema and the
+Anthropic surface on the 6-bit pack.
+
+Two more came out of the first llmprobe run (all cells failing were ours):
+
+- Thinking default. The template opens a think marker on EVERY assistant
+  turn and the pack declares no `generation_config` default, so
+  `defaultEnableThinking` answered false and the prompt closed the block.
+  llmprobe's probe saw a non-thinker and budgeted 8..192 tokens, while its
+  `reasoning_effort: medium` opted thinking back on — every cell ended
+  `[length]` with empty content. `k2_horizon` now defaults ON like
+  `bailing_hybrid`; thinking-off is still the committed closer.
+- JSON schema + thinking. The protocol resolves its closer from the DECODED
+  prompt tail, which the alias turns into `<think>`; `</think>` has no atomic
+  id here and its byte matcher fired on a literal `</think>` the model wrote
+  INSIDE its reasoning (it was quoting the schema), so the grammar engaged
+  mid-thought and the model idled on whitespace. `Tokenizer.markerCloserFor`
+  pairs each opener id with its closer; `resolveReasoningProtocol` reads the
+  prompt's last opener token and sets the closer TEXT to the pack's own
+  spelling, so the marker lookup finds the atomic id and no byte spelling is a
+  boundary. Guards: `tests/test_json_schema_protocol_routing.py` on the pack.
+- A GLM call to a parameterless tool (`<tool_call>list_files</tool_call>`)
+  has no `<arg_key>`, the one signal the GLM route keyed on; it fell to the
+  Hermes path and vanished, so every agentic cell read "never used a tool".
+  A bare-identifier body routes to the GLM parser (corpus entry `[k2]`).
+
+- `top_p` near 0 and `top_k: 1` still sampled: both filters masked by VALUE
+  (`logit >= cutoff`), so every token tied with the cutoff survived, and bf16
+  logits tie at the top constantly (three tokens at -1.421875 on the
+  band-name prompt). `applyTopK` now keeps the k argpartition indices and
+  `applyTopP` decides the nucleus in argsort space and scatters the mask back
+  (`generate.zig`); non-tied rows mask identically. Every model, not K2.

@@ -29,4 +29,21 @@ final class ServerControlButtonPresentationTests: XCTestCase {
         XCTAssertEqual(presentation.systemImageName, "play.fill")
         XCTAssertEqual(presentation.tint, .accent)
     }
+
+    /// A headless start must not claim to be loading a model.
+    func testAHeadlessStartDoesNotClaimToBeLoadingAModel() {
+        let starting = ServerControlButtonPresentation(status: .starting, loadsModel: false)
+        XCTAssertEqual(starting.title, "Starting Server...")
+        let stopped = ServerControlButtonPresentation(status: .stopped, loadsModel: false)
+        XCTAssertTrue(stopped.help.contains("no model resident"))
+        XCTAssertTrue(ServerControlButtonPresentation(status: .stopped).help.contains("load the selected model"))
+    }
+
+    /// A hot-load in flight reads as loading even though the server is running.
+    func testALoadingModelOutranksRunning() {
+        let loading = ServerControlButtonPresentation(status: .running, isLoadingModel: true)
+        XCTAssertEqual(loading.title, "Loading Model...")
+        XCTAssertTrue(loading.showsProgress)
+        XCTAssertEqual(ServerControlButtonPresentation(status: .running).title, "Stop Server")
+    }
 }

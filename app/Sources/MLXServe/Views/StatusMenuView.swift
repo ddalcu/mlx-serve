@@ -160,8 +160,9 @@ struct StatusMenuView: View {
     let openModel3DGen: () -> Void
     let openSettings: () -> Void
     let openServerLog: () -> Void
-    let openTasks: () -> Void
+    var openModelSettings: () -> Void = {}
     var openAgents: () -> Void = {}
+    var openBenchmarks: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -214,7 +215,7 @@ struct StatusMenuView: View {
         HStack(spacing: 8) {
             Text("MLX Core")
                 .font(.headline)
-            Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+            Text(L10n.text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
                 .font(.caption)
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 6)
@@ -255,13 +256,22 @@ struct StatusMenuView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    modelPicker
+                    HStack(spacing: 6) {
+                        modelPicker
+                        Button { openModelSettings() } label: {
+                            Image(systemName: "slider.horizontal.3")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(appState.selectedModelPath.isEmpty || server.lanChatModelId != nil || appState.useAppleModel)
+                        .help("Model Settings for the selected model (context, KV cache, MTP)")
+                    }
                     serverControls
                     serverFooterRow
 
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
-                        Text(server.lastError)
+                        Text(L10n.text(server.lastError))
                             .font(.caption2)
                             .foregroundStyle(.red)
                             .lineLimit(4)
@@ -295,42 +305,42 @@ struct StatusMenuView: View {
             if !mlxServe.isEmpty {
                 Section("MLX-Serve Models") {
                     ForEach(mlxServe) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !lmStudio.isEmpty {
-                Section(LocalModelSource.lmStudio.sectionTitle) {
+                Section(L10n.text(LocalModelSource.lmStudio.sectionTitle)) {
                     ForEach(lmStudio) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !mtplx.isEmpty {
-                Section(LocalModelSource.mtplx.sectionTitle) {
+                Section(L10n.text(LocalModelSource.mtplx.sectionTitle)) {
                     ForEach(mtplx) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !osaurus.isEmpty {
-                Section(LocalModelSource.osaurus.sectionTitle) {
+                Section(L10n.text(LocalModelSource.osaurus.sectionTitle)) {
                     ForEach(osaurus) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !huggingFace.isEmpty {
                 Section("Hugging Face Cache") {
                     ForEach(huggingFace) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
             if !custom.isEmpty {
                 Section("Custom Folder") {
                     ForEach(custom) { model in
-                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                 }
             }
@@ -341,22 +351,22 @@ struct StatusMenuView: View {
             let network = lanChat.filter { $0.provider == nil }
             let providers = lanChat.filter { $0.provider != nil }
             if !network.isEmpty {
-                Section(ModelPalette.networkSection) {
+                Section(L10n.text(ModelPalette.networkSection)) {
                     ForEach(network, id: \.name) { m in
-                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
                     }
                 }
             }
             if !providers.isEmpty {
-                Section(ModelPalette.providersSection) {
+                Section(L10n.text(ModelPalette.providersSection)) {
                     ForEach(providers, id: \.name) { m in
-                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
                     }
                 }
             }
             if case .available = AppleFoundationChat.availability {
-                Section(ModelPalette.onDeviceSection) {
-                    Text(AppleFoundationChat.displayName).tag(ChatModelSelection.appleTag)
+                Section(L10n.text(ModelPalette.onDeviceSection)) {
+                    Text(L10n.text(AppleFoundationChat.displayName)).tag(ChatModelSelection.appleTag)
                 }
             }
         }
@@ -366,7 +376,13 @@ struct StatusMenuView: View {
 
     /// The one state-driven action, plus the log window.
     private var serverControls: some View {
-        let control = ServerControlButtonPresentation(status: server.status)
+        // A hot-load stays `.running`, so the button reads `loadingModelPath` as the chat pill does.
+        let control = ServerControlButtonPresentation(
+            status: server.status,
+            loadsModel: StartupModelChoice.trayStartLoadsModel(
+                loadModelAtStart: appState.loadModelAtStart,
+                selectedModelPath: appState.selectedModelPath),
+            isLoadingModel: appState.loadingModelPath != nil)
         return HStack(spacing: 6) {
             serverPrimaryButton(control)
 
@@ -384,7 +400,11 @@ struct StatusMenuView: View {
     @ViewBuilder
     private func serverPrimaryButton(_ control: ServerControlButtonPresentation) -> some View {
         let button = Button {
-            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
+            if server.status == .running || server.status == .starting {
+                server.stop()
+            } else {
+                appState.startServer(loadingSelection: appState.loadModelAtStart)
+            }
         } label: {
             HStack(spacing: 8) {
                 if control.showsProgress {
@@ -393,12 +413,11 @@ struct StatusMenuView: View {
                 } else if let systemImageName = control.systemImageName {
                     Image(systemName: systemImageName)
                 }
-                Text(control.title)
+                Text(L10n.text(control.title))
             }
             .frame(maxWidth: .infinity)
         }
         .tint(control.tint.color)
-        .disabled(appState.selectedModelPath.isEmpty)
         .controlSize(.regular)
         .help(control.help)
 
@@ -411,16 +430,17 @@ struct StatusMenuView: View {
 
     private var serverFooterRow: some View {
         HStack {
-            Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
+            Toggle("Start server with the app", isOn: $appState.autoStartServer)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
+                .help("Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server.")
             Spacer()
             // Which embedded engine the selected model routes to (MLX
             // safetensors, llama.cpp GGUF, or ds4 GGUF).
             if let engine = appState.localModels
                 .first(where: { $0.path == appState.selectedModelPath })?.engine
             {
-                Text(engine.displayName)
+                Text(L10n.text(engine.displayName))
                     .help("Engine the selected model runs on")
             }
         }
@@ -440,7 +460,7 @@ struct StatusMenuView: View {
         let loadedModels = server.residentModels
         return VStack(alignment: .leading, spacing: TrayMetrics.rowSpacing) {
             TraySectionHeader(title: "In Memory",
-                              detail: loadedModels.count > 1 ? "\(loadedModels.count) models" : nil)
+                              detail: loadedModels.count > 1 ? L10n.format("%lld models", loadedModels.count) : nil)
             TrayCard {
                 if loadedModels.isEmpty {
                     Text("None loaded — models load on demand")
@@ -478,14 +498,14 @@ struct StatusMenuView: View {
     @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
-            statRow("Decode", "\(ThroughputSnapshot.formatTPS(server.decodeTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgDecodeTPS)) avg tok/s")
-            statRow("Prefill", "\(ThroughputSnapshot.formatTPS(server.prefillTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgPrefillTPS)) avg tok/s")
+            statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.decodeTPSNow), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
+            statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.prefillTPSNow), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
         }
     }
 
     @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
         HStack {
-            Text(label).foregroundStyle(.secondary)
+            Text(L10n.text(label)).foregroundStyle(.secondary)
             Spacer()
             Text(value).monospacedDigit()
         }
@@ -566,7 +586,7 @@ struct StatusMenuView: View {
 
     // MARK: - Footer
 
-    /// Chat, Tasks, Claude Code & Quit — the panel's exits, on their own bar so
+    /// Chat, Benchmark, Claude Code & Quit — the panel's exits, on their own bar so
     /// they read as chrome rather than as one more section. Same tiles as the
     /// Media Generation row: one shape for everything you can open from here.
     private var footer: some View {
@@ -576,8 +596,10 @@ struct StatusMenuView: View {
                 TrayTile(icon: "bubble.left.and.bubble.right", title: "Chat",
                          help: "Open the chat window") { openChat() }
 
-                TrayTile(icon: "clock.badge.checkmark", title: "Tasks",
-                         help: "Scheduled Tasks") { openTasks() }
+                // Tasks moved to the chat sidebar; the benchmark loads its own
+                // model, so the tile needs no running server.
+                TrayTile(icon: "speedometer", title: "Benchmark",
+                         help: "Benchmark this Mac and compare with the community") { openBenchmarks() }
 
                 // The App Store build can't detect or launch other apps'
                 // CLIs, so its Code button shows copy-paste terminal
@@ -695,7 +717,7 @@ struct StatusMenuView: View {
             }
             // Speculative-decoding speedup badge (MTP / drafter).
             if let badge = info.specDecodeBadge {
-                Text(badge)
+                Text(L10n.text(badge))
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.green)
                     .padding(.horizontal, 5)
@@ -857,14 +879,25 @@ struct ServerControlButtonPresentation: Equatable {
     /// than a full-width slab that dominates the state the app lives in.
     let isProminent: Bool
 
-    init(status: ServerStatus) {
-        switch status {
-        case .starting:
+    /// `loadsModel`: whether THIS start loads a model. `isLoadingModel` outranks
+    /// `.running`: the server is up but cannot answer yet; a click still stops it.
+    init(status: ServerStatus, loadsModel: Bool = true, isLoadingModel: Bool = false) {
+        if isLoadingModel, status == .running {
             title = "Loading Model..."
             systemImageName = nil
             showsProgress = true
             tint = .loading
-            help = "Loading model. Click to stop."
+            help = "Loading model. Click to stop the server."
+            isProminent = true
+            return
+        }
+        switch status {
+        case .starting:
+            title = loadsModel ? "Loading Model..." : "Starting Server..."
+            systemImageName = nil
+            showsProgress = true
+            tint = .loading
+            help = loadsModel ? "Loading model. Click to stop." : "Starting the server. Click to stop."
             isProminent = true
         case .running:
             title = "Stop Server"
@@ -878,7 +911,9 @@ struct ServerControlButtonPresentation: Equatable {
             systemImageName = "play.fill"
             showsProgress = false
             tint = .accent
-            help = "Start the selected model."
+            help = loadsModel
+                ? "Start the server and load the selected model."
+                : "Start the server with no model resident — it loads one on demand at your first message. Settings ▸ Server ▸ \"Preload the model when the server starts\" changes this."
             isProminent = true
         }
     }
@@ -979,7 +1014,7 @@ struct EndpointsSection: View {
                             .font(.system(size: 9, weight: .bold, design: .monospaced))
                             .foregroundStyle(.green)
                             .frame(width: 30, alignment: .leading)
-                        Text(baseURL + "/")
+                        Text(L10n.text(baseURL + "/"))
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.blue)
                             .lineLimit(1)
@@ -1008,11 +1043,11 @@ struct EndpointsSection: View {
     private func copyRow(method: String, display: String,
                          copyKey: String, copyString: String) -> some View {
         HStack(spacing: 4) {
-            Text(method)
+            Text(L10n.text(method))
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
                 .foregroundStyle(method == "GET" ? .green : .blue)
                 .frame(width: 30, alignment: .leading)
-            Text(display)
+            Text(L10n.text(display))
                 .font(.system(size: 10, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -1064,6 +1099,7 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
     let budget = AgentBudget.forServerContext(serverContextLength)
+    warnIfSmallContext(agentId: "claude", context: budget.context)
     let scriptContent = """
     #!/bin/zsh -l
     \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
@@ -1114,7 +1150,7 @@ struct ServerLogWindowView: View {
     private var toolbar: some View {
         HStack(spacing: 10) {
             StatusDot(status: server.status)
-            Text(statusLabel)
+            Text(L10n.text(statusLabel))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             Text("·")
@@ -1140,7 +1176,7 @@ struct ServerLogWindowView: View {
             Button {
                 copyLog()
             } label: {
-                Label(copied ? "Copied" : "Copy",
+                Label(L10n.text(copied ? "Copied" : "Copy"),
                       systemImage: copied ? "checkmark" : "doc.on.doc")
             }
             .controlSize(.small)

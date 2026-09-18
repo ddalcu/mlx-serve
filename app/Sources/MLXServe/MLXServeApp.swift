@@ -35,6 +35,7 @@ struct MLXCoreApp: App {
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
+    @ObservedObject private var browser = BrowserManager.shared
     @Environment(\.openWindow) private var openWindow
 
     private func menuBarIcon(for status: ServerStatus) -> NSImage {
@@ -89,8 +90,14 @@ struct MLXCoreApp: App {
                 openModel3DGen: { appState.showCreate(.model3d) },
                 openSettings: { appState.showSettings() },
                 openServerLog: { openAndFocus("serverLog") },
-                openTasks: { appState.showTasks() },
+                openModelSettings: {
+                    let path = appState.selectedModelPath
+                    appState.modelSettingsRequest = ModelSettingsRequest(
+                        path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
+                    openAndFocus("modelSettings")
+                },
                 openAgents: { openAndFocus("agents") },
+                openBenchmarks: { openAndFocus("benchmarks") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -114,6 +121,11 @@ struct MLXCoreApp: App {
                 // the launcher panel can't reach SwiftUI's openWindow itself.
                 .onChange(of: appState.pendingChatOpenTick) { _, _ in
                     openAndFocus("chat")
+                }
+                // A tool handler has no SwiftUI environment: browse{show} bumps
+                // this on the manager and the scene opens the window.
+                .onChange(of: browser.showRequestTick) { _, _ in
+                    openAndFocus("browser")
                 }
 
         }
@@ -194,6 +206,30 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 560)
 
+        // Benchmarks: run a pinned suite against the loaded model, keep the
+        // history locally, and compare against what other people measured.
+        // Its own window rather than a tray popover because a run takes
+        // minutes and a popover dismisses the moment you click away.
+        Window("Benchmarks", id: "benchmarks") {
+            BenchmarkView()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .appAppearance()
+        }
+        .defaultSize(width: 1040, height: 680)
+
+        // Per-model settings for the tray's selected model. A window, not a
+        // sheet: the MenuBarExtra popover cannot host one.
+        Window("Model Settings", id: "modelSettings") {
+            if let request = appState.modelSettingsRequest {
+                ModelSettingsSheet(request: request)
+                    .environmentObject(appState)
+                    .environmentObject(appState.server)
+                    .appAppearance()
+            }
+        }
+        .windowResizability(.contentSize)
+
         // A sandbox terminal moved out of the chat window ("Move Tab to New
         // Window", 2026-09-02). One window per session id; the session itself
         // stays in `appState.terminals` — the window only hosts its view, so
@@ -248,6 +284,12 @@ struct MLXCoreApp: App {
 
                 Button("Browser") { openAndFocus("browser") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
+
+                // The tray button is disabled until the server is running;
+                // this stays reachable so the History and Community panes can
+                // be opened without a live server.
+                Button("Benchmarks…") { openAndFocus("benchmarks") }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
 
                 Button("Settings…") { appState.showSettings() }
                     .keyboardShortcut(",", modifiers: [.command])

@@ -17,6 +17,12 @@ enum LaTeXFonts {
     /// name is a half-finished copy, not a hit.
     static let probeFont = "Fonts/KaTeX_Main-Regular.ttf"
 
+    /// Where that font can sit inside the bundle. Classic SwiftPM writes a flat
+    /// bundle (`Fonts/`); Xcode 26+'s Swift Build backend writes a real macOS
+    /// bundle (`Contents/Resources/Fonts/`). The SwaTex-side lookup reads both
+    /// through the Bundle API, so this probe must accept both too.
+    static let probePaths = [probeFont, "Contents/Resources/" + probeFont]
+
     /// Contents/Resources for a real .app; the bundle URL covers the
     /// `swift build` layout, where the resource bundle sits beside the binary;
     /// its parent covers `swift test`, where the reading bundle is the
@@ -31,7 +37,7 @@ enum LaTeXFonts {
     ) -> URL? {
         for base in candidates {
             let bundle = base.appendingPathComponent(bundleName)
-            if fileExists(bundle.appendingPathComponent(probeFont)) { return bundle }
+            for probe in probePaths where fileExists(bundle.appendingPathComponent(probe)) { return bundle }
         }
         return nil
     }

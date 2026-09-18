@@ -23,4 +23,11 @@ final class EmbeddedTerminalLayoutTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(frame.width, 0)
         XCTAssertGreaterThanOrEqual(frame.height, 0)
     }
+
+    func testExitCodeIsDecodedFromTheRawWaitStatus() {
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 256), 1)
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 0), 0)
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 15), 128 + 15, "killed by SIGTERM")
+        XCTAssertNil(EmbeddedTerminalView.exitCode(waitStatus: nil))
+    }
 }

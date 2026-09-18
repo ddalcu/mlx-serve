@@ -132,6 +132,8 @@ class AppState: ObservableObject {
     /// in flight. A RESTART is not tracked here — that one moves the server
     /// status, which the Start control already reports.
     @Published var loadingModelPath: String?
+    /// The model the "Model Settings" window edits (tray button); nil = closed.
+    @Published var modelSettingsRequest: ModelSettingsRequest?
     /// Bumped per hot-switch; each switch task captures its value so only the
     /// LATEST switch's completion clears `loadingModelPath` (see the didSet).
     private var modelSwitchGeneration = 0
@@ -232,6 +234,28 @@ class AppState: ObservableObject {
     lazy var restoreGen = RestoreService()
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
+    }
+    /// Whether launch loads a model with the server (`StartupModelChoice.launch`).
+    /// Default OFF, with no migration: auto-start alone must not read a checkpoint.
+    @Published var loadModelAtStart: Bool {
+        didSet { UserDefaults.standard.set(loadModelAtStart, forKey: "loadModelAtStart") }
+    }
+    /// Which model `loadModelAtStart` loads; its own key, never a sentinel in a path field.
+    @Published var startupModelMode: StartupModelChoice.Mode {
+        didSet {
+            UserDefaults.standard.set(startupModelMode.rawValue, forKey: "startupModelMode")
+            // An empty pin matches no dropdown row and would render blank.
+            guard startupModelMode == .pinned, startupModelPinnedPath.isEmpty else { return }
+            startupModelPinnedPath = StartupModelChoice.seedPin(
+                lastUsed: StartupModelChoice.lastUsed(),
+                installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+            )
+        }
+    }
+    /// The `.pinned` startup model, empty until one is pinned. Not `selectedModelPath`,
+    /// whose `didSet` would swap the running server's model mid-conversation.
+    @Published var startupModelPinnedPath: String {
+        didSet { UserDefaults.standard.set(startupModelPinnedPath, forKey: "startupModelPinnedPath") }
     }
     /// All server-launch flags + per-request defaults, mirrored to UserDefaults.
     /// Auto-saves on every mutation. Prefer this over the legacy single-key
@@ -373,15 +397,18 @@ class AppState: ObservableObject {
         pendingChatOpenTick += 1
     }
 
-    /// Start a sandbox terminal (pi / hermes, or a plain shell for nil) in the
-    /// default working folder, hot-mounted into the guest. The folder is the
-    /// Settings one — a terminal opens on click, it does not interrogate.
+    /// Start a sandbox terminal (pi / hermes, or a plain shell for nil),
+    /// hot-mounted into the guest. A coding agent asks which folder it works
+    /// in; a plain shell opens on click in the Settings folder.
     /// The ONE door for every "… in Sandbox" entry (tray, chip, sidebar).
     func startTerminal(agentId: String?) {
         let agent = SandboxAgentRegistry.all.first { $0.id == agentId }
+        // Every caller is a MENU item. A modal panel run inside the menu's own
+        // click handler races the menu's dismissal and sometimes never shows,
+        // so the picker opens one run-loop turn later, once the menu is gone.
         DispatchQueue.main.async { [self] in
-            showTerminal(terminals.start(agent: agent,
-                                         workspace: ChatSession.defaultWorkingDirectory))
+            guard let workspace = terminalWorkspace(askingFor: agent?.displayName) else { return }
+            showTerminal(terminals.start(agent: agent, workspace: workspace))
         }
     }
 
@@ -390,9 +417,25 @@ class AppState: ObservableObject {
     /// Terminal.app is no longer involved.
     func startTerminal(hostCLI cli: LauncherCLI) {
         DispatchQueue.main.async { [self] in
-            showTerminal(terminals.startHost(cli: cli,
-                                             workspace: ChatSession.defaultWorkingDirectory))
+            guard let workspace = terminalWorkspace(askingFor: cli == .shell ? nil : cli.displayName) else { return }
+            showTerminal(terminals.startHost(cli: cli, workspace: workspace))
         }
+    }
+
+    /// The folder a new terminal opens in: the Settings default for a plain
+    /// shell (nil name), a picker for a coding agent. nil = the user cancelled.
+    private func terminalWorkspace(askingFor name: String?) -> String? {
+        guard let name else { return ChatSession.defaultWorkingDirectory }
+        let panel = OpenPanel.make()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = URL(fileURLWithPath: ChatSession.defaultWorkingDirectory)
+        panel.message = "Choose the folder \(name) works in"
+        panel.prompt = "Open Terminal"
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return nil }
+        return url.path
     }
 
     /// Close a terminal row (terminating a live session) and leave its pane.
@@ -507,13 +550,15 @@ class AppState: ObservableObject {
     init() {
         // Defaults to ON when the key is absent — `UserDefaults.bool` would
         // read a never-set key as false, which is why a fresh install used to
-        // download a model and then sit there with the server stopped. The
-        // launch gate below is `autoStartServer && !selectedModelPath.isEmpty`,
-        // so this stays a no-op until a model exists; the first download's
-        // completion hook is what actually starts it. No migration: existing
-        // users who never touched the toggle get it turned on, which is the
-        // intent.
+        // download a model and then sit there with the server stopped. Safe with
+        // no model on disk: the launch gate below starts headless unless told to
+        // load. No migration: existing users who never touched the toggle get
+        // it turned on, which is the intent.
         self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
+        self.loadModelAtStart = UserDefaults.standard.bool(forKey: "loadModelAtStart")
+        self.startupModelMode = UserDefaults.standard.string(forKey: "startupModelMode")
+            .flatMap(StartupModelChoice.Mode.init(rawValue:)) ?? .default
+        self.startupModelPinnedPath = UserDefaults.standard.string(forKey: "startupModelPinnedPath") ?? ""
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated
@@ -611,15 +656,29 @@ class AppState: ObservableObject {
             }
         }
 
-        // Auto-start server if enabled and a model is available
-        if autoStartServer, !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        // Auto-start is headless unless "Preload the model when the server starts" resolves an installed
+        // model (`refreshModels()` above fills the library the gate checks).
+        let launchPlan = StartupModelChoice.launch(
+            autoStart: autoStartServer,
+            loadModelAtStart: loadModelAtStart,
+            mode: startupModelMode,
+            pinnedPath: startupModelPinnedPath,
+            lastUsed: StartupModelChoice.lastUsed(),
+            installedPaths: localModels.filter(\.isChatPickable).map(\.path)
+        )
+        switch launchPlan {
+        case .doNothing:
+            break
+        case .headless:
+            server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        case .load(let path):
+            server.start(modelPath: path, options: serverOptions)
         }
         // LAN sharing/discovery lives in the server process — with either
-        // enabled the server should be up (headless when nothing was
-        // auto-started) so this Mac shares and sees network models.
+        // enabled the server should be up so this Mac shares and sees network
+        // models, loading only what the launch plan chose (empty = headless).
         if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {
-            ensureServerForLan()
+            ensureServerForLan(modelPath: StartupModelChoice.lanStartPath(plan: launchPlan))
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
@@ -647,15 +706,35 @@ class AppState: ObservableObject {
         ensureServerForLan()
     }
 
-    /// Start the server for LAN duty if it isn't running: with the selected
-    /// local model when there is one (it keeps serving chat AND the LAN),
-    /// else headless over the models root.
-    func ensureServerForLan() {
+    /// Start the server for LAN duty if it isn't running: with `modelPath`
+    /// (default: the selected local model, which keeps serving chat AND the
+    /// LAN), else headless over the models root. Launch passes its plan's choice.
+    func ensureServerForLan(modelPath: String? = nil) {
         guard server.status != .running, server.status != .starting else { return }
-        if !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, options: serverOptions)
+        let path = modelPath ?? selectedModelPath
+        if !path.isEmpty {
+            server.start(modelPath: path, options: serverOptions)
         } else {
             server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        }
+    }
+
+    /// Every Start button: headless, then a hot-load of the selection the pill spins
+    /// on. Unlike `--model`, the loaded model is not the registry's default, so an
+    /// eject sticks. Nothing selected = headless (the model may be a LAN peer's).
+    func startServer(loadingSelection: Bool) {
+        guard server.status != .running, server.status != .starting else { return }
+        server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
+        guard loadingSelection, !selectedModelPath.isEmpty else { return }
+        let path = selectedModelPath
+        let mgr = server
+        modelSwitchGeneration += 1
+        let generation = modelSwitchGeneration
+        loadingModelPath = path
+        pendingModelLoadTask = Task { @MainActor in
+            defer { if self.modelSwitchGeneration == generation { self.loadingModelPath = nil } }
+            try? await mgr.waitUntilRunning(timeout: 240)
+            await mgr.ensureDefaultChatModel(selectedModelPath: path)
         }
     }
 
@@ -1126,6 +1205,22 @@ class AppState: ObservableObject {
         // `truncateMessages` deliberately does not do this - regenerate and
         // edit-and-resend truncate and then rebuild the turn from the very same
         // `ChatImage` values, paths included.
+        for path in AttachmentStore.removablePaths(orphanedBy: dropped, in: chatSessions) {
+            AttachmentStore.remove(path)
+        }
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
+    /// Drop the model's turn that ends at `messageId`: that message and
+    /// everything above it back to the nearest boundary (`ChatTurn`), so a
+    /// tool call never outlives its results and the reader's question stays.
+    func deleteTurn(in sessionId: UUID, endingAt messageId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let range = ChatTurn.deletionRange(endingAt: messageId, in: chatSessions[sIdx].messages)
+        else { return }
+        let dropped = Array(chatSessions[sIdx].messages[range])
+        chatSessions[sIdx].messages.removeSubrange(range)
         for path in AttachmentStore.removablePaths(orphanedBy: dropped, in: chatSessions) {
             AttachmentStore.remove(path)
         }

@@ -77,14 +77,14 @@ fi
 
 pass=0; fail=0
 check() { # name, got, expected-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "PASS $1"; pass=$((pass+1))
     else
         echo "FAIL $1"; echo "  wanted substring: $3"; echo "  got: $(echo "$2" | head -c 400)"; fail=$((fail+1))
     fi
 }
 check_absent() { # name, got, forbidden-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "FAIL $1 (forbidden '$3' present)"; echo "  got: $(echo "$2" | head -c 400)"; fail=$((fail+1))
     else
         echo "PASS $1"; pass=$((pass+1))

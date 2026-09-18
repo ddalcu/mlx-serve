@@ -82,7 +82,7 @@ enum CLISetupInstructions {
                 \(AgentConfigs.opencode2CliJSON(existing: "{}", baseURL: baseURL))
                 EOF
                 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true))'
+                export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true))'
                 if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
                 opencode2 --standalone
                 """),
@@ -203,7 +203,7 @@ struct CLISetupInstructionsView: View {
             // this popover's width.
             Picker("", selection: $selectedId) {
                 ForEach(tabs) { tab in
-                    Text(tab.title).tag(tab.id)
+                    Text(L10n.text(tab.title)).tag(tab.id)
                 }
             }
             .pickerStyle(.menu)
@@ -222,7 +222,7 @@ struct CLISetupInstructionsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
 
                 HStack {
-                    Text(tab.installHint)
+                    Text(L10n.text(tab.installHint))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -233,7 +233,7 @@ struct CLISetupInstructionsView: View {
                         copied = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
                     } label: {
-                        Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        Label(L10n.text(copied ? "Copied" : "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
                     }
                 }
             }
