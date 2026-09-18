@@ -553,6 +553,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Parity fixtures for deep ViTs/DiTs: dump fp32 on CPU** (MPS fp16 decorrelates); transformers ≥5 zeroes custom rotary buffers — dump scripts assert non-zero; an oracle that IMPROVES when you remove a transform had it silently disabled.
 - **TTS**: `TimeDelayNetBlock` = conv + IMPLICIT ReLU; embedding lookups reshape to the TABLE's width (`getShape`); voice clone = ECAPA embedding as one codec-prefix position, `ref_text` ignored.
 - **A pinned library's op TRANSIENT is invisible to every residency bill** (#321, #424): MLX ≥ 0.32.2 splits a temporal-pad-0 N=1 3D conv into per-tap 2D convs under a whole-GPU Winograd budget; LTX VAE decode OOM'd, the H3 ref-video encoder died `Invalid Resource`. `conv3dDepthChunked` windows decoder convs (exact); H3 `encodeMoments` EVALS per tile pass (semantic chunking without an eval is one lazy graph). Diff conv DISPATCH per mlx bump.
+- **A `prism_hadamard_qwen35` pack (Bonsai 2) is qwen3_5 bytes in a Hadamard-ROTATED basis**: `qmatmul` rotates every quantized linear's input (`signs`, then blockwise WHT), `rawEmbedding` inverts it; signs are per activation WIDTH (`hadamard_signs`), the block comes from config `modules`. Loading it as plain `qwen3_5` gives fluent garbage, not an error; discovery has its own allowlist.
 
 ### Licensing & third-party code
 

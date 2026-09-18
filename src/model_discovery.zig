@@ -39,6 +39,7 @@ const supported_model_types = [_][]const u8{
     "qwen3",            "qwen3_5",
     "qwen3_5_text",     "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_moe",
+    "prism_hadamard_qwen35", // Bonsai 2: qwen3_5 in a Hadamard-rotated basis (see model.zig)
     "qwen3_moe_text",   "qwen3_next",
     "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",            "mistral",
@@ -1589,6 +1590,7 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.chat, modelKindFromType("gguf"));
     try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
     try testing.expect(isSupportedModelType("diffusion_gemma"));
+    try testing.expect(isSupportedModelType("prism_hadamard_qwen35")); // Bonsai 2 (rotated qwen3_5)
     // Media modalities.
     try testing.expectEqual(ModelKind.image, modelKindFromType("flux2-klein-4b"));
     try testing.expectEqual(ModelKind.image, modelKindFromType("krea2_turbo"));

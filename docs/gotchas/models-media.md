@@ -1890,3 +1890,43 @@ Two more came out of the first llmprobe run (all cells failing were ours):
   band-name prompt). `applyTopK` now keeps the k argpartition indices and
   `applyTopP` decides the nucleus in argsort space and scatters the mask back
   (`generate.zig`); non-tied rows mask identically. Every model, not K2.
+
+## Bonsai 2 (`prism_hadamard_qwen35`) port (2026-09-17)
+
+Prism's Bonsai 2 27B MLX pack is a qwen3_5 checkpoint whose every quantized
+projection is stored in a blockwise Hadamard-ROTATED basis: affine 2-bit/g128
+bytes exactly like any mlx-community pack, `model_type` set to
+`prism_hadamard_qwen35`, plus one `<module>.signs` ±1 vector per packed module
+and a `modules` manifest in config.json (block 1024 everywhere). The bytes load
+fine as `qwen3_5`; the output is fluent garbage (`.Criteria流的 Manzostro…` on
+"capital of France"), never an error, because the activation transform is
+missing. Prism's own demo refuses to serve the pack through mlx_lm/mlx_vlm
+server for the same reason.
+
+The runtime contract (Prism's `runtime/runtime.py` is the reference):
+
+- forward, on the input of EVERY quantized linear incl. lm_head:
+  `y = qmm(WHT_block(x ⊙ signs))`, normalized Sylvester Walsh-Hadamard over
+  blocks of `block` on the last dim (MLX's `hadamard_transform` default
+  `1/sqrt(n)` scale IS the reference's), in float32, then back to x's dtype;
+- inverse, on gathered embedding rows: `e = signs ⊙ WHT_block(dequant(row))`
+  (the normalized WHT is its own inverse, same kernel both ways);
+- `in_proj_a/b`, norms, conv1d, A_log, dt_bias and the FP16 vision tower are
+  plain: rule is "quantized ⇒ folded", so the hook keys on `sc.ctx != null`.
+
+The signs are per INPUT WIDTH, not per module: all 402 tensors in the 27B
+pack are identical within each of the three widths (5120 ×274, 6144 ×64,
+17408 ×64) and equal `hadamard.json`'s vectors, which is also how Prism's
+GGUF runtime indexes them. So `Transformer` carries a small width-keyed table
+built from the `*.signs` keys at init (refusing the pack if two same-width
+vectors ever differ) and `qmatmul` — the single funnel above `qmatmulBits`,
+`verifyQmm` and `prefillDqGemm` — applies the transform by `lastDim(x)`.
+`model_discovery.zig` has its OWN allowlist separate from the config parser:
+without the entry there the pack loads via `--model` but is skipped by
+discovery, invisible to the registry and to by-id requests.
+
+Validation on an M5 Max: greedy output byte-identical to PrismML's llama.cpp
+fork (PQ2_0) on three prompts including a 400-token answer; a 3,571-token
+needle prompt retrieved exactly; medium/xhigh thinking correct. Decode
+42.6 tok/s plain (the pack ships no MTP or DSpark drafter), vs 30.6 on the
+fork. The transform's float32 round trip is the obvious next optimisation.

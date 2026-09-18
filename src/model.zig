@@ -161,6 +161,15 @@ pub const ModelConfig = struct {
     quant_group_size: u32 = 64,
     quant_mode: QuantMode = .affine,
 
+    // Prism Hadamard packs (Bonsai 2, model_type "prism_hadamard_qwen35"):
+    // every quantized projection is stored in a blockwise Walsh-Hadamard
+    // rotated basis, so the runtime must apply the matching transform to
+    // the activation feeding each quantized matmul (signs, then a
+    // normalized WHT over blocks of this width on the last dim) and the
+    // inverse to gathered embedding rows. 0 = ordinary checkpoint. The sign
+    // vectors themselves are tensors in the safetensors ("<module>.signs").
+    hadamard_block: u32 = 0,
+
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
     query_pre_attn_scalar: u32 = 256,
 
@@ -2395,9 +2404,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
-        std.mem.eql(u8, model_type, "qwen3_5_text"))
+        std.mem.eql(u8, model_type, "qwen3_5_text") or
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
     {
         config.model_type = "qwen3_5_moe";
+        if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) {
+            try parsePrismHadamardFields(&config, root);
+        }
         config.weight_prefix = "language_model.model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3540,6 +3553,50 @@ pub const Weights = struct {
         return @intCast(self.map.count());
     }
 };
+
+/// Prism Hadamard pack (Bonsai 2): read the transform block width from the
+/// pack's `modules` manifest. Every packed module must declare the same
+/// block, and it must be one of the widths MLX's hadamard_transform serves
+/// exactly (the pack format only ever emits 512..4096). Anything else is a
+/// pack this build has not validated against, so refuse rather than guess:
+/// loading a rotated checkpoint without the matching transform produces
+/// fluent-looking garbage, not an error.
+fn parsePrismHadamardFields(config: *ModelConfig, root: std.json.ObjectMap) !void {
+    if (root.get("base_model_type")) |b| {
+        if (b != .string or !std.mem.eql(u8, b.string, "qwen3_5")) {
+            log.err("prism_hadamard_qwen35: unsupported base_model_type (want qwen3_5)\n", .{});
+            return error.UnsupportedHadamardPack;
+        }
+    }
+    const mods = root.get("modules") orelse {
+        log.err("prism_hadamard_qwen35: config.json has no `modules` manifest\n", .{});
+        return error.UnsupportedHadamardPack;
+    };
+    if (mods != .array or mods.array.items.len == 0) return error.UnsupportedHadamardPack;
+    var block: u32 = 0;
+    for (mods.array.items) |m| {
+        if (m != .object) return error.UnsupportedHadamardPack;
+        const b = m.object.get("block") orelse return error.UnsupportedHadamardPack;
+        if (b != .integer or b.integer <= 0) return error.UnsupportedHadamardPack;
+        const bw: u32 = @intCast(b.integer);
+        if (block == 0) block = bw;
+        if (bw != block) {
+            log.err("prism_hadamard_qwen35: mixed Hadamard block sizes ({d} vs {d}) are not supported\n", .{ block, bw });
+            return error.UnsupportedHadamardPack;
+        }
+        if (m.object.get("dtype")) |d| {
+            if (d != .string or !std.mem.eql(u8, d.string, "float16")) return error.UnsupportedHadamardPack;
+        }
+    }
+    switch (block) {
+        512, 1024, 2048, 4096 => {},
+        else => {
+            log.err("prism_hadamard_qwen35: unvalidated Hadamard block size {d}\n", .{block});
+            return error.UnsupportedHadamardPack;
+        },
+    }
+    config.hadamard_block = block;
+}
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
 /// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
@@ -5937,6 +5994,90 @@ test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
     try testing.expect(config.attn_output_gate);
     try testing.expect(config.isMoe());
     try testing.expectEqual(@as(u32, 256), config.num_experts);
+}
+
+test "parseConfigFromJson prism_hadamard_qwen35 (Bonsai 2) sets hadamard_block from the modules manifest" {
+    // Prism's Bonsai 2 MLX pack: qwen3_5 weights in a Hadamard-rotated basis.
+    // The arch arm is qwen3_5's; the ONLY new config state is the transform
+    // block, read from the pack's `modules` manifest (every entry block 1024).
+    const json =
+        \\{
+        \\  "schema_version": 2,
+        \\  "model_type": "prism_hadamard_qwen35",
+        \\  "base_model_type": "qwen3_5",
+        \\  "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+        \\  "modules": [
+        \\    {"path": "lm_head", "block": 1024, "embedding": false, "dtype": "float16"},
+        \\    {"path": "model.embed_tokens", "block": 1024, "embedding": true, "dtype": "float16"},
+        \\    {"path": "model.layers.0.mlp.up_proj", "block": 1024, "embedding": false, "dtype": "float16"}
+        \\  ],
+        \\  "text_config": {
+        \\    "model_type": "qwen3_5_text",
+        \\    "hidden_size": 5120,
+        \\    "head_dim": 256,
+        \\    "num_hidden_layers": 64,
+        \\    "num_attention_heads": 24,
+        \\    "num_key_value_heads": 4,
+        \\    "attn_output_gate": true,
+        \\    "tie_word_embeddings": false
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqual(@as(u32, 1024), config.hadamard_block);
+    try testing.expectEqual(@as(u32, 2), config.quant_bits);
+    try testing.expectEqual(@as(u32, 128), config.quant_group_size);
+}
+
+test "parseConfigFromJson ordinary qwen3_5 leaves hadamard_block at 0" {
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "quantization": {"bits": 2, "group_size": 128},
+        \\  "text_config": {"hidden_size": 5120, "head_dim": 256, "num_hidden_layers": 64,
+        \\                  "num_attention_heads": 24, "num_key_value_heads": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 0), config.hadamard_block);
+}
+
+test "parseConfigFromJson prism_hadamard_qwen35 refuses mixed, unvalidated, or missing blocks" {
+    // Loading a rotated pack with the wrong transform yields fluent garbage,
+    // never an error, so every manifest shape this build has not validated
+    // against must fail at config time.
+    const mixed =
+        \\{"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5",
+        \\ "modules": [{"path": "a", "block": 1024, "embedding": false, "dtype": "float16"},
+        \\             {"path": "b", "block": 512, "embedding": false, "dtype": "float16"}],
+        \\ "text_config": {"hidden_size": 5120, "head_dim": 256, "num_hidden_layers": 64,
+        \\                 "num_attention_heads": 24, "num_key_value_heads": 4}}
+    ;
+    try testing.expectError(error.UnsupportedHadamardPack, parseConfigFromJson(testing.allocator, mixed));
+
+    const odd =
+        \\{"model_type": "prism_hadamard_qwen35",
+        \\ "modules": [{"path": "a", "block": 768, "embedding": false, "dtype": "float16"}],
+        \\ "text_config": {"hidden_size": 5120, "head_dim": 256, "num_hidden_layers": 64,
+        \\                 "num_attention_heads": 24, "num_key_value_heads": 4}}
+    ;
+    try testing.expectError(error.UnsupportedHadamardPack, parseConfigFromJson(testing.allocator, odd));
+
+    const missing =
+        \\{"model_type": "prism_hadamard_qwen35",
+        \\ "text_config": {"hidden_size": 5120, "head_dim": 256, "num_hidden_layers": 64,
+        \\                 "num_attention_heads": 24, "num_key_value_heads": 4}}
+    ;
+    try testing.expectError(error.UnsupportedHadamardPack, parseConfigFromJson(testing.allocator, missing));
+
+    const wrong_base =
+        \\{"model_type": "prism_hadamard_qwen35", "base_model_type": "gemma4",
+        \\ "modules": [{"path": "a", "block": 1024, "embedding": false, "dtype": "float16"}],
+        \\ "text_config": {"hidden_size": 5120, "head_dim": 256, "num_hidden_layers": 64,
+        \\                 "num_attention_heads": 24, "num_key_value_heads": 4}}
+    ;
+    try testing.expectError(error.UnsupportedHadamardPack, parseConfigFromJson(testing.allocator, wrong_base));
 }
 
 test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {

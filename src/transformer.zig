@@ -14470,6 +14470,9 @@ fn groupedRmsNorm(x: mlx.mlx_array, w: mlx.mlx_array, groups: u32, eps: f32, one
     return result;
 }
 
+const HADAMARD_MAX_WIDTHS = 8;
+const HadamardSigns = struct { width: u32 = 0, arr: mlx.mlx_array = .{} };
+
 pub const Transformer = struct {
     config: ModelConfig,
     cache: KVCache,
@@ -14604,6 +14607,16 @@ pub const Transformer = struct {
     // MuseGlimmer: bf16 output_multiplier scalar applied to logits BEFORE the
     // tanh softcap (reference: T * tanh(logits * mult / T)). Null elsewhere.
     output_mult: ?mlx.mlx_array = null,
+
+    // Prism Hadamard pack (Bonsai 2). `hadamard_block` mirrors
+    // config.hadamard_block (0 = off). The pack stores one ±1 sign vector per
+    // packed module, but they are identical for every module of a given input
+    // width (Prism's own GGUF runtime indexes them by width), so the table is
+    // keyed by activation width: `hadamardForward` looks up lastDim(x).
+    // Owned; float32 so the transform runs at the reference's precision.
+    hadamard_block: u32 = 0,
+    hadamard_signs: [HADAMARD_MAX_WIDTHS]HadamardSigns = @splat(.{}),
+    hadamard_n: u8 = 0,
 
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
@@ -15362,6 +15375,64 @@ pub const Transformer = struct {
             break :blk true;
         };
 
+        // Prism Hadamard pack: collect the ±1 sign vectors, one per distinct
+        // activation width. Every "<module>.signs" tensor of a given width is
+        // the same vector (verified at load below: a mismatch is a pack this
+        // build does not understand, so refuse rather than serve garbage).
+        var hadamard_signs: [HADAMARD_MAX_WIDTHS]HadamardSigns = @splat(.{});
+        var hadamard_n: u8 = 0;
+        if (config.hadamard_block != 0) {
+            var it = weights.map.iterator();
+            var seen: u32 = 0;
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (!std.mem.endsWith(u8, key, ".signs")) continue;
+                seen += 1;
+                const arr = entry.value_ptr.*;
+                const sh = mlx.getShape(arr);
+                if (sh.len != 1 or sh[0] <= 0) {
+                    log.err("hadamard: sign tensor {s} is not a vector\n", .{key});
+                    return error.UnsupportedHadamardPack;
+                }
+                const width: u32 = @intCast(sh[0]);
+                if (width % config.hadamard_block != 0) {
+                    log.err("hadamard: sign width {d} ({s}) not a multiple of block {d}\n", .{ width, key, config.hadamard_block });
+                    return error.UnsupportedHadamardPack;
+                }
+                var found: ?usize = null;
+                for (hadamard_signs[0..hadamard_n], 0..) |e, i| {
+                    if (e.width == width) found = i;
+                }
+                if (found) |i| {
+                    // Same width seen before: it must be the identical vector.
+                    var eq = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(eq);
+                    var cast = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(cast);
+                    try mlx.check(mlx.mlx_astype(&cast, arr, .float32, s));
+                    try mlx.check(mlx.mlx_array_equal(&eq, hadamard_signs[i].arr, cast, false, s));
+                    var same: bool = false;
+                    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+                    if (!same) {
+                        log.err("hadamard: {s} differs from the other width-{d} sign vectors; per-module signs are not supported\n", .{ key, width });
+                        return error.UnsupportedHadamardPack;
+                    }
+                    continue;
+                }
+                if (hadamard_n == HADAMARD_MAX_WIDTHS) return error.UnsupportedHadamardPack;
+                var f32s = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&f32s, arr, .float32, s));
+                hadamard_signs[hadamard_n] = .{ .width = width, .arr = f32s };
+                hadamard_n += 1;
+            }
+            if (hadamard_n == 0) {
+                log.err("hadamard: prism_hadamard pack carries no *.signs tensors\n", .{});
+                return error.UnsupportedHadamardPack;
+            }
+            log.info("[hadamard] prism pack: block {d}, {d} sign tensors, {d} distinct widths\n", .{ config.hadamard_block, seen, hadamard_n });
+            for (hadamard_signs[0..hadamard_n]) |e| log.info("[hadamard]   width {d}\n", .{e.width});
+        }
+
         return .{
             .config = config,
             .cache = cache,
@@ -15379,6 +15450,9 @@ pub const Transformer = struct {
             .lm_head_w = lm_head_w,
             .lm_head_s = lm_head_s,
             .lm_head_b = lm_head_b,
+            .hadamard_block = config.hadamard_block,
+            .hadamard_signs = hadamard_signs,
+            .hadamard_n = hadamard_n,
             .dense0_w = dense0_w,
             .dense0_s = dense0_s,
             .dense0_b = dense0_b,
@@ -16115,6 +16189,8 @@ pub const Transformer = struct {
 
     pub fn deinit(self: *Transformer) void {
         self.releaseJoinedVerifyLogits();
+        for (self.hadamard_signs[0..self.hadamard_n]) |e| _ = mlx.mlx_array_free(e.arr);
+        self.hadamard_n = 0;
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -16255,12 +16331,91 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        // Prism Hadamard pack: every QUANTIZED projection is folded, so its
+        // input must be rotated first. Dense (bf16, null scales) weights —
+        // the vision tower, any unquantized matrix — are stored plain.
+        if (self.hadamard_block != 0 and sc.ctx != null) {
+            const hx = try self.hadamardForward(x);
+            defer _ = mlx.mlx_array_free(hx);
+            const hqp = self.quantParamsHinted(w, sc, lastDim(hx));
+            return qmatmulBits(hx, w, sc, bi, hqp.bits, hqp.group_size, hqp.mode, self.s);
+        }
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
         // first touch — x's inner dim pins (bits, group_size) exactly.
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
+    }
+
+    fn hadamardSignsFor(self: *const Transformer, width: u32) ?mlx.mlx_array {
+        for (self.hadamard_signs[0..self.hadamard_n]) |e| {
+            if (e.width == width) return e.arr;
+        }
+        return null;
+    }
+
+    /// Blockwise normalized Walsh-Hadamard transform on the last dim, in
+    /// float32 like Prism's reference runtime (`fwht` in runtime.py):
+    ///   forward:  WHT_block(x ⊙ signs)         (before every folded qmatmul)
+    ///   inverse:  WHT_block(x) ⊙ signs         (on gathered embedding rows)
+    /// The normalized WHT is its own inverse, so both directions use the same
+    /// kernel with MLX's default 1/sqrt(block) scale. Returns a new array in
+    /// x's dtype; caller frees.
+    fn hadamardApply(self: *const Transformer, x: mlx.mlx_array, inverse: bool) !mlx.mlx_array {
+        const shape = mlx.getShape(x);
+        if (shape.len == 0 or shape.len > 8) return error.InvalidHadamardInput;
+        const width: u32 = @intCast(shape[shape.len - 1]);
+        if (width % self.hadamard_block != 0) return error.InvalidHadamardInput;
+        const signs = self.hadamardSignsFor(width) orelse {
+            log.err("hadamard: no sign vector for activation width {d}\n", .{width});
+            return error.MissingHadamardSigns;
+        };
+        const dtype = mlx.mlx_array_dtype(x);
+        var out_shape: [8]c_int = undefined;
+        for (shape, 0..) |d, i| out_shape[i] = d;
+
+        // pre = float32(x) ⊙ signs (forward) | float32(x) (inverse)
+        var pre = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pre);
+        if (inverse) {
+            try mlx.check(mlx.mlx_astype(&pre, x, .float32, self.s));
+        } else {
+            var xf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xf);
+            try mlx.check(mlx.mlx_astype(&xf, x, .float32, self.s));
+            try mlx.check(mlx.mlx_multiply(&pre, xf, signs, self.s));
+        }
+
+        const flat = [_]c_int{ -1, @intCast(self.hadamard_block) };
+        var xr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xr);
+        try mlx.check(mlx.mlx_reshape(&xr, pre, &flat, 2, self.s));
+
+        var ht = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ht);
+        try mlx.check(mlx.mlx_hadamard_transform(&ht, xr, mlx.mlx_optional_float.none(), self.s));
+
+        var back = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(back);
+        try mlx.check(mlx.mlx_reshape(&back, ht, &out_shape, shape.len, self.s));
+
+        // post = back ⊙ signs (inverse) | back (forward)
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        if (inverse) {
+            var post = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(post);
+            try mlx.check(mlx.mlx_multiply(&post, back, signs, self.s));
+            try mlx.check(mlx.mlx_astype(&out, post, dtype, self.s));
+        } else {
+            try mlx.check(mlx.mlx_astype(&out, back, dtype, self.s));
+        }
+        return out;
+    }
+
+    inline fn hadamardForward(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        return self.hadamardApply(x, false);
     }
 
     /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
@@ -16968,6 +17123,14 @@ pub const Transformer = struct {
                 .{ .value = .bfloat16, .has_value = true },
                 self.s,
             ));
+            // Prism Hadamard pack: the embedding table is stored rotated too
+            // (its module is the one `inverse` entry in the manifest), so the
+            // gathered rows come back through WHT then ⊙ signs.
+            if (self.hadamard_block != 0) {
+                const rot = try self.hadamardApply(emb, true);
+                _ = mlx.mlx_array_free(emb);
+                emb = rot;
+            }
         }
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
