@@ -420,6 +420,14 @@ pub fn parseInput(
         else => {},
     }
 
+    // Templates we serve require the system turn first; fold any system past
+    // index 0 into the leading one — the same unconditional fold /v1/messages
+    // applies — so the native template renders a multi-system Responses input.
+    if (try chat_mod.foldSystemMessages(allocator, &pi.messages)) |joined| {
+        errdefer allocator.free(joined);
+        try pi.owned_strings.append(allocator, joined);
+    }
+
     return pi;
 }
 
@@ -936,6 +944,25 @@ test "parseInput replaces stored system when fresh instructions are provided" {
     try testing.expectEqualStrings("user", pi.messages.items[1].role);
     try testing.expectEqualStrings("assistant", pi.messages.items[2].role);
     try testing.expectEqualStrings("user", pi.messages.items[3].role);
+    for (pi.messages.items[1..]) |m| {
+        try testing.expect(!std.mem.eql(u8, m.role, "system"));
+    }
+}
+
+test "parseInput folds a non-leading system into the leading one" {
+    const allocator = testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"role":"system","content":"mid"},{"role":"user","content":"hi"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(allocator, parsed.value, "You are S.", null, null, .{});
+    defer pi.deinit();
+    // Qwen's own template raises on a system that is not first, so a second
+    // system must fold into the leading one instead of reaching the render.
+    try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+    try testing.expectEqualStrings("system", pi.messages.items[0].role);
+    try testing.expectEqualStrings("You are S.\n\nmid", pi.messages.items[0].content);
+    try testing.expectEqualStrings("user", pi.messages.items[1].role);
     for (pi.messages.items[1..]) |m| {
         try testing.expect(!std.mem.eql(u8, m.role, "system"));
     }
