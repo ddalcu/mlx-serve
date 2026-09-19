@@ -351,6 +351,13 @@ final class LocalizationTests: XCTestCase {
     /// it missed `sectionLabel` in another — this walks the helpers out of the
     /// sources instead of a hand-written list.
     ///
+    /// An *interpolated* literal is checked the same way, and can never pass:
+    /// the helper looks its parameter up in the table, so a caller that builds
+    /// the sentence first (`fileChip(detail: "PDF · \(count) chars")`) hands the
+    /// lookup a finished string no key can match. The format has to run at the
+    /// producer (`L10n.format`) and the helper render the resolved text — that
+    /// is the defect this arm of the test exists to catch.
+    ///
     /// `latinLabels` are values that are deliberately rendered in Latin — HTTP
     /// verbs and sampling symbols — where the lookup falls through to the
     /// literal by design.
@@ -364,8 +371,7 @@ final class LocalizationTests: XCTestCase {
         for helper in Self.lookupHelpers(in: files) {
             for file in calls {
                 for arguments in file.index[helper.name] ?? [] {
-                    guard let literal = Self.literalArgument(arguments, label: helper.label),
-                          !literal.contains("\\(") else { continue }
+                    guard let literal = Self.literalArgument(arguments, label: helper.label) else { continue }
                     sites += 1
                     if latinLabels.contains(literal) || keys.contains(literal) { continue }
                     missing.append("\(file.name): \"\(literal)\" reaching \(helper.name)")

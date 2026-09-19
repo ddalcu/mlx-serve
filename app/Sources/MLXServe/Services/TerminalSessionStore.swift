@@ -114,7 +114,7 @@ final class TerminalSessionStore: ObservableObject {
             // Same wording as the sandbox preflight, so the row offers the
             // same Start Server fix.
             guard !cli.requiresServer || server.status == .running else {
-                sessions.markFailed(id, message: "the server isn't running — load a model first; \(cli.displayName) talks to it")
+                sessions.markFailed(id, message: L10n.format("the server isn't running — load a model first; %@ talks to it", cli.displayName))
                 return
             }
             let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)

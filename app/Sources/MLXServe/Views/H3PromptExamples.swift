@@ -327,13 +327,13 @@ N/A
             return "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above."
         case .h3Base:
             if let first = baseSections.first, !prompt.contains(first) {
-                return "MiniMax-H3 was trained on labelled prompts. Start with “\(first)”, then overall_soundscape: and non_diegetic_music:. Try Examples or Prompt tips above."
+                return L10n.format("MiniMax-H3 was trained on labelled prompts. Start with “%@”, then overall_soundscape: and non_diegetic_music:. Try Examples or Prompt tips above.", first)
             }
             guard words < 25 else { return nil }
             return "MiniMax-H3 was trained on detailed shot descriptions — style, action, camera movement and sound. Try Examples above."
         case .h3Reference:
             if let first = referenceSections.first, !prompt.contains(first) {
-                return "MiniMax-H3 REF2VA was trained on six labelled sections starting with “\(first)”. retention_analysis: is what states each reference's role. Try Examples or Prompt tips above."
+                return L10n.format("MiniMax-H3 REF2VA was trained on six labelled sections starting with “%@”. retention_analysis: is what states each reference's role. Try Examples or Prompt tips above.", first)
             }
             if !prompt.contains("retention_analysis:") {
                 return "Add retention_analysis: — it is the only place the model is told what to do with each reference."

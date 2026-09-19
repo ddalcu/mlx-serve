@@ -732,7 +732,8 @@ struct BenchmarkView: View {
             return
         }
         if case .contextTooSmall(let have, let need) = LadderPreflight.decide(contextLength: resident.contextLength, ladder: ladder) {
-            runError = "This model is serving \(ContextSizeDisplay.formatTokens(have)) of context; the ladder needs \(ContextSizeDisplay.formatTokens(need)). Raise it in Settings ▸ Context."
+            runError = L10n.format("This model is serving %@ of context; the ladder needs %@. Raise it in Settings ▸ Context.",
+                                   ContextSizeDisplay.formatTokens(have), ContextSizeDisplay.formatTokens(need))
             return
         }
         let model = resident.name

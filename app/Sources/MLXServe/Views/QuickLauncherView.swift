@@ -146,7 +146,7 @@ struct QuickLauncherTrayRow: View {
         TrayFeatureRow(
             icon: "bolt.fill",
             title: "Quick Launcher",
-            subtitle: "\(QuickLauncherHotKey.display) — ask from anywhere",
+            subtitle: L10n.format("%@ — ask from anywhere", QuickLauncherHotKey.display),
             isOn: appState.quickLauncherEnabled
         ) {
             Toggle("", isOn: $appState.quickLauncherEnabled)

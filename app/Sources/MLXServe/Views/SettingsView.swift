@@ -3061,7 +3061,7 @@ private struct UpdatesSectionContent: View {
         }
 
         SettingsRow(
-            title: "Installed version — v\(updates.currentVersion)",
+            title: L10n.format("Installed version — v%@", updates.currentVersion),
             explainer: statusText
         ) {
             Button {
@@ -3094,7 +3094,7 @@ private struct UpdatesSectionContent: View {
 
         if let update = updates.available {
             SettingsRow(
-                title: "MLX Core v\(update.version) is available",
+                title: L10n.format("MLX Core v%@ is available", update.version),
                 explainer: "Downloads MLXCore.dmg from the release, replaces the app, and relaunches."
             ) {
                 switch updates.phase {

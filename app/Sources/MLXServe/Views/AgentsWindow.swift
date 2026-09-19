@@ -241,7 +241,10 @@ struct AgentDetailPane: View {
                                 appState.startChat(withAgent: draft.id)
                             },
                             onDuplicate: { duplicate(draft) },
-                            onDelete: { model.alert = .init(title: "Delete “\(draft.name)”?",
+                            // The format runs at the producer: the title is
+                            // rendered verbatim in the alert, so building the
+                            // sentence first would leave the key unreachable.
+                            onDelete: { model.alert = .init(title: L10n.format("Delete “%@”?", draft.name),
                                                             kind: .confirmDelete(draft)) },
                             onNotify: { model.message($0, $0) })
             } else {
@@ -1315,7 +1318,7 @@ private struct AgentVoiceMenu: View {
                 }
                 Menu("Your voices") {
                     if !globalClipPath.isEmpty {
-                        choice(globalClipLabel.isEmpty ? "Settings clip" : "\(globalClipLabel) (Settings)",
+                        choice(globalClipLabel.isEmpty ? "Settings clip" : L10n.format("%@ (Settings)", globalClipLabel),
                                isOn: voice == .clone(globalClipPath)) { voice = .clone(globalClipPath) }
                             .disabled(!cloneAvailable)
                     }

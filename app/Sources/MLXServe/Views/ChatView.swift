@@ -166,16 +166,19 @@ private struct AttachmentPreviewRow: View {
                 ForEach(Array(images.enumerated()), id: \.offset) { idx, pending in
                     imageChip(idx: idx, img: pending.image)
                 }
+                // Each `detail` is localized by its producer, not by `fileChip`:
+                // a format key has to be completed BEFORE the catalog lookup, or
+                // the lookup keys on the finished sentence and can never match.
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
-                    fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
+                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.text.count),
                              icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
                 }
                 ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
-                    fileChip(idx: idx, name: vid.name, detail: "Video · \(vid.frameCount) frames",
+                    fileChip(idx: idx, name: vid.name, detail: L10n.format("Video · %lld frames", vid.frameCount),
                              icon: "video.fill", tint: .orange) { videos.remove(at: idx) }
                 }
                 ForEach(Array(audio.enumerated()), id: \.offset) { idx, clip in
-                    fileChip(idx: idx, name: clip.name, detail: String(format: "Audio · %.1fs", clip.durationSeconds),
+                    fileChip(idx: idx, name: clip.name, detail: L10n.format("Audio · %.1fs", clip.durationSeconds),
                              icon: "waveform", tint: .purple) { audio.remove(at: idx) }
                 }
             }
@@ -222,7 +225,9 @@ private struct AttachmentPreviewRow: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(L10n.text(detail))
+                    // Verbatim: every caller hands in text its producer already
+                    // localized, so a lookup here would re-key the sentence.
+                    Text(detail)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -4642,10 +4647,14 @@ struct MessageBubble: View {
             }
 
             if let tps = message.tokensPerSecond, tps > 0 {
-                StatPill(text: "\(Int(tps)) tok/sec",
+                // The format moves to the producer: `StatPill` renders its
+                // strings verbatim, so a lookup of an already-built `"42 tok/sec"`
+                // could never match a `%lld` key. Same shape as `ComposerTip`.
+                let speed = L10n.format("%lld tok/sec", Int(tps))
+                StatPill(text: speed,
                          expanded: message.completionTokens.map {
-                             "\(Int(tps)) tok/sec (\($0) tokens)"
-                         } ?? "\(Int(tps)) tok/sec")
+                             L10n.format("%lld tok/sec (%lld tokens)", Int(tps), $0)
+                         } ?? speed)
             }
 
             Spacer(minLength: 0)
@@ -4779,7 +4788,10 @@ private struct StatPill: View {
     }
 
     private func label(_ string: String) -> some View {
-        Text(L10n.text(string))
+        // Verbatim: both callers hand in finished text — timestamps already
+        // formatted by Foundation, and the tok/sec sentence localized by the
+        // producer — so a catalog lookup here would re-key the result.
+        Text(string)
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)

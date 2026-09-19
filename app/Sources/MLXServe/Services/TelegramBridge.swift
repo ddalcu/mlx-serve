@@ -223,7 +223,7 @@ final class TelegramBridge: ObservableObject {
             // re-enters reconcile() as a no-op (token/enabled unchanged).
             appState.serverOptions.telegram.allowedChatIds.append(chatId)
             await send(token: token, chatId: chatId,
-                       text: "✅ Locked to this chat. I'll relay your messages to the local model on \(hostName()). Send /new anytime to start a fresh conversation.")
+                       text: L10n.format("✅ Locked to this chat. I'll relay your messages to the local model on %@. Send /new anytime to start a fresh conversation.", hostName()))
             // Fall through and answer this first message (unless it's a command).
         case .allowed:
             break

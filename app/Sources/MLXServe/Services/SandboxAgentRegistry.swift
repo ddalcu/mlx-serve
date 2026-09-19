@@ -203,7 +203,7 @@ enum SandboxCliPreflight {
             out.append("guest networking is off — ssh, first-run installs, and reaching the model all need it (Settings → Agent Sandbox → Network)")
         }
         if !serverRunning {
-            out.append("the server isn't running — load a model first; the sandboxed agent talks to it")
+            out.append(L10n.format("the server isn't running — load a model first; %@ talks to it", L10n.text("the sandboxed agent")))
         } else if !serverBindReachableFromGuest(host: serverHost) {
             out.append("the server is bound to \(serverHost.trimmingCharacters(in: .whitespacesAndNewlines)) — the guest can only reach it when the server listens on 0.0.0.0 (Settings → Server → Host)")
         }

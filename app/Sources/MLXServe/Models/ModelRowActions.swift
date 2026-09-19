@@ -63,7 +63,9 @@ enum ModelRowActions {
         }
         switch model.source {
         case .mlxServe:
-            return "Delete \(model.name)? This will remove all downloaded files."
+            // Producer-side format: the row renders this verbatim, so the key
+            // has to be completed here rather than looked up afterwards.
+            return L10n.format("Delete %@? This will remove all downloaded files.", model.name)
         case .huggingFace:
             // The one tree where deleting damages models we are NOT deleting:
             // snapshots hard-link shared blobs. Allowed — it is the user's disk
