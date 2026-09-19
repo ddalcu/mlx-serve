@@ -56,6 +56,7 @@ const supported_model_types = [_][]const u8{
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
+    "minicpmv4_6", // MiniCPM-V 4.6 (SigLIP2 tower + qwen3_5 trunk; served on the qwen3_5_moe arch)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
