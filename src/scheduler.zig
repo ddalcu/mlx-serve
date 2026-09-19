@@ -4733,11 +4733,18 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
             defer _ = mlx.mlx_vector_array_free(vec);
             emb = mlx.mlx_array_new();
             if (parts.items.len == 1) {
+                // mlx_array_set copies the array into emb's own wrapper, so
+                // the source handle still owes its free — swapped for a fresh
+                // empty to keep the parts cleanup balanced.
                 _ = mlx.mlx_array_set(&emb, parts.items[0]);
+                _ = mlx.mlx_array_free(parts.items[0]);
                 parts.items[0] = mlx.mlx_array_new();
             } else {
-                _ = mlx.mlx_array_free(emb);
+                // emb is a LIVE handle here: the concatenate assigns into it,
+                // so a free before the call is the wrapper-reuse UAF
+                // (docs/gotchas/engine-mlx.md).
                 if (mlx.check(mlx.mlx_concatenate_axis(&emb, vec, 1, vision_enc.s))) |_| {} else |err| {
+                    _ = mlx.mlx_array_free(emb);
                     failParts(sch, req, emb_parts.items, @errorName(err));
                     return;
                 }
