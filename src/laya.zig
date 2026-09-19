@@ -101,17 +101,6 @@ fn readJsonFile(io: std.Io, a: std.mem.Allocator, dir: []const u8, rel: []const 
     return std.json.parseFromSlice(std.json.Value, a, text, .{ .allocate = .alloc_always });
 }
 
-/// True when `dir` is a Laya checkpoint (the two configs it always ships).
-pub fn isLayaDir(io: std.Io, a: std.mem.Allocator, dir: []const u8) bool {
-    for ([_][]const u8{ "rl_agent_config.json", "encoder/config.json" }) |rel| {
-        const path = std.fmt.allocPrint(a, "{s}/{s}", .{ dir, rel }) catch return false;
-        defer a.free(path);
-        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-        f.close(io);
-    }
-    return true;
-}
-
 pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *const tokenizer_mod.Tokenizer) !Config {
     var enc = try readJsonFile(io, a, dir, "encoder/config.json");
     defer enc.deinit();
@@ -600,9 +589,28 @@ fn layerNorm(x: A, w: A, b: ?A, eps: f32, s: S) !A {
     return out;
 }
 
+/// 0-d constant in `like`'s dtype. `mlx_array_new_float` is a float32 0-d
+/// ARRAY, and MLX promotes fp16 operands against it to float32 (Python
+/// scalars keep the operand dtype) — one such constant in the MLP turned the
+/// whole residual stream fp32 (measured: encoder 5.4 ms -> 3.9 ms).
+fn scalarLike(like: A, v: f32) A {
+    const no_shape = [_]c_int{};
+    switch (mlx.mlx_array_dtype(like)) {
+        .float16 => {
+            const h: f16 = @floatCast(v);
+            return mlx.mlx_array_new_data(&h, &no_shape, 0, .float16);
+        },
+        .bfloat16 => {
+            const b: u16 = @truncate(@as(u32, @bitCast(v)) >> 16);
+            return mlx.mlx_array_new_data(&b, &no_shape, 0, .bfloat16);
+        },
+        else => return mlx.mlx_array_new_float(v),
+    }
+}
+
 /// Exact (erf) GELU — `mlx.nn.gelu`.
 fn gelu(x: A, s: S) !A {
-    const inv_sqrt2 = mlx.mlx_array_new_float(1.0 / @sqrt(2.0));
+    const inv_sqrt2 = scalarLike(x, 1.0 / @sqrt(2.0));
     defer free(inv_sqrt2);
     var scaled = mlx.mlx_array_new();
     defer free(scaled);
@@ -610,7 +618,7 @@ fn gelu(x: A, s: S) !A {
     var e = mlx.mlx_array_new();
     defer free(e);
     try mlx.check(mlx.mlx_erf(&e, scaled, s));
-    const one = mlx.mlx_array_new_float(1.0);
+    const one = scalarLike(x, 1.0);
     defer free(one);
     var onep = mlx.mlx_array_new();
     defer free(onep);
@@ -618,7 +626,7 @@ fn gelu(x: A, s: S) !A {
     var prod = mlx.mlx_array_new();
     defer free(prod);
     try mlx.check(mlx.mlx_multiply(&prod, x, onep, s));
-    const half = mlx.mlx_array_new_float(0.5);
+    const half = scalarLike(x, 0.5);
     defer free(half);
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_multiply(&out, prod, half, s));
@@ -626,7 +634,7 @@ fn gelu(x: A, s: S) !A {
 }
 
 fn relu(x: A, s: S) !A {
-    const zero = mlx.mlx_array_new_float(0.0);
+    const zero = scalarLike(x, 0.0);
     defer free(zero);
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_maximum(&out, x, zero, s));
@@ -745,6 +753,12 @@ pub const Model = struct {
     act_l2: Linear,
     /// Pre-transposed weights not owned by `weights`.
     owned: std.ArrayList(A),
+    /// `forwardBody` wrapped by `mlx_compile`: traced once per input shape,
+    /// then replayed with fused elementwise kernels (the reference wraps its
+    /// model in `mx.compile` the same way). Null: lazy graph (compile off or
+    /// failed).
+    compiled: ?mlx.mlx_closure = null,
+    compile_failed: bool = false,
 
     fn getW(self: *Model, comptime fmt: []const u8, args: anytype) !A {
         var buf: [160]u8 = undefined;
@@ -867,6 +881,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.compiled) |c| _ = mlx.mlx_closure_free(c);
         self.freeOwned();
         self.weights.deinit();
         self.cfg.deinit();
@@ -894,42 +909,82 @@ pub const Model = struct {
         }
     };
 
-    /// Encoder only: `[n, T, D]` fp16 (final norm applied). Caller frees.
-    pub fn encode(self: *Model, batch: Batch, pad_t: usize) !A {
-        const a = self.allocator;
+    /// Sequence length padding granularity: bounds the number of distinct
+    /// shapes the compiled forward has to trace (one trace per `[n, t, k]`).
+    pub const PAD_T: usize = 16;
+
+    /// The five device inputs of `DecisionModel.__call__` (`input_ids`,
+    /// `attention_mask`, `marker_pos`, `marker_mask`, `qtype`).
+    pub const Inputs = struct {
+        ids: A, // [n, t] int32
+        valid: A, // [n, t] bool
+        marker_pos: A, // [n, k] int32 (padded slots 0)
+        marker_mask: A, // [n, k] bool
+        qtype: A, // [n] int32
+
+        pub fn fromBatch(a: std.mem.Allocator, batch: Batch, pad_id: u32) !Inputs {
+            const n = batch.ids.len;
+            var t: usize = 0;
+            var k: usize = 2;
+            for (batch.ids, batch.markers) |row, m| {
+                t = @max(t, row.len);
+                k = @max(k, m.len);
+            }
+            t = (t + PAD_T - 1) / PAD_T * PAD_T;
+            const ids = try a.alloc(i32, n * t);
+            defer a.free(ids);
+            const valid = try a.alloc(bool, n * t);
+            defer a.free(valid);
+            const mpos = try a.alloc(i32, n * k);
+            defer a.free(mpos);
+            const mmask = try a.alloc(bool, n * k);
+            defer a.free(mmask);
+            const qt = try a.alloc(i32, n);
+            defer a.free(qt);
+            for (0..n) |i| {
+                for (0..t) |j| {
+                    const in_row = j < batch.ids[i].len;
+                    ids[i * t + j] = if (in_row) @intCast(batch.ids[i][j]) else @intCast(pad_id);
+                    valid[i * t + j] = in_row;
+                }
+                for (0..k) |j| {
+                    const in_row = j < batch.markers[i].len;
+                    mpos[i * k + j] = if (in_row) @intCast(batch.markers[i][j]) else 0;
+                    mmask[i * k + j] = in_row;
+                }
+                qt[i] = @intFromEnum(batch.qtype[i]);
+            }
+            const N: c_int = @intCast(n);
+            const T: c_int = @intCast(t);
+            const K: c_int = @intCast(k);
+            return .{
+                .ids = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ N, T }, 2, .int32),
+                .valid = mlx.mlx_array_new_data(valid.ptr, &[_]c_int{ N, T }, 2, .bool_),
+                .marker_pos = mlx.mlx_array_new_data(mpos.ptr, &[_]c_int{ N, K }, 2, .int32),
+                .marker_mask = mlx.mlx_array_new_data(mmask.ptr, &[_]c_int{ N, K }, 2, .bool_),
+                .qtype = mlx.mlx_array_new_data(qt.ptr, &[_]c_int{N}, 1, .int32),
+            };
+        }
+
+        pub fn deinit(self: *Inputs) void {
+            for ([_]A{ self.ids, self.valid, self.marker_pos, self.marker_mask, self.qtype }) |x| free(x);
+        }
+    };
+
+    /// Encoder only: `[n, T, D]` fp16 (final norm applied) from `ids` `[n, T]`
+    /// int32 and `valid` `[n, T]` bool. Caller frees.
+    pub fn encode(self: *Model, ids_arr: A, valid: A) !A {
         const s = self.stream;
-        const n = batch.ids.len;
-        const t = pad_t;
         const D: c_int = @intCast(self.cfg.hidden_size);
         const H: c_int = @intCast(self.cfg.num_heads);
         const Dh: c_int = @intCast(self.cfg.head_dim);
-        const N: c_int = @intCast(n);
-        const T: c_int = @intCast(t);
+        const shape = mlx.mlx_array_shape(ids_arr);
+        const N = shape[0];
+        const T = shape[1];
 
-        // Host-side inputs: ids [n,t], valid [n,t], local mask [n,1,t,t].
-        const ids = try a.alloc(i32, n * t);
-        defer a.free(ids);
-        const valid = try a.alloc(bool, n * t);
-        defer a.free(valid);
-        for (0..n) |i| for (0..t) |j| {
-            const in_row = j < batch.ids[i].len;
-            ids[i * t + j] = if (in_row) @intCast(batch.ids[i][j]) else @intCast(self.cfg.pad_id);
-            valid[i * t + j] = in_row;
-        };
-        const local = try a.alloc(bool, n * t * t);
-        defer a.free(local);
-        const half: usize = self.cfg.local_attention / 2;
-        for (0..n) |i| for (0..t) |qi| for (0..t) |kj| {
-            const dist = if (qi > kj) qi - kj else kj - qi;
-            // Padded queries see every valid key (no all-masked softmax rows).
-            const q_ok = dist <= half or !valid[i * t + qi];
-            local[(i * t + qi) * t + kj] = q_ok and valid[i * t + kj];
-        };
-        const ids_arr = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ N, T }, 2, .int32);
-        defer free(ids_arr);
-        const full_mask = mlx.mlx_array_new_data(valid.ptr, &[_]c_int{ N, 1, 1, T }, 4, .bool_);
+        const full_mask = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
         defer free(full_mask);
-        const local_mask = mlx.mlx_array_new_data(local.ptr, &[_]c_int{ N, 1, T, T }, 4, .bool_);
+        const local_mask = try localMask(valid, N, T, @intCast(self.cfg.local_attention / 2), s);
         defer free(local_mask);
 
         const emb = try take(self.tok_embeddings, ids_arr, 0, s);
@@ -990,33 +1045,22 @@ pub const Model = struct {
         return out;
     }
 
-    /// Decision head over encoder output `enc` (`[n, T, D]`): type embedding,
-    /// head layers with the padding key mask. Caller frees.
-    pub fn headForward(self: *Model, enc: A, batch: Batch, pad_t: usize) !A {
-        const a = self.allocator;
+    /// Decision head over encoder output `enc` (`[n, T, D]`): type embedding
+    /// (`qt_arr` `[n]` int32), head layers with the padding key mask (`valid`
+    /// `[n, T]` bool). Caller frees.
+    pub fn headForward(self: *Model, enc: A, valid: A, qt_arr: A) !A {
         const s = self.stream;
-        const n = batch.ids.len;
-        const t = pad_t;
-        const N: c_int = @intCast(n);
-        const T: c_int = @intCast(t);
+        const shape = mlx.mlx_array_shape(enc);
+        const N = shape[0];
+        const T = shape[1];
         const D: c_int = @intCast(self.cfg.hidden_size);
         const heads: c_int = @intCast(@max(1, self.cfg.hidden_size / 64));
         if (@rem(D, heads) != 0) return error.InvalidLayaConfig;
         const dh = @divExact(D, heads);
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dh)));
 
-        const valid = try a.alloc(bool, n * t);
-        defer a.free(valid);
-        const qt = try a.alloc(i32, n);
-        defer a.free(qt);
-        for (0..n) |i| {
-            qt[i] = @intFromEnum(batch.qtype[i]);
-            for (0..t) |j| valid[i * t + j] = j < batch.ids[i].len;
-        }
-        const mask = mlx.mlx_array_new_data(valid.ptr, &[_]c_int{ N, 1, 1, T }, 4, .bool_);
+        const mask = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
         defer free(mask);
-        const qt_arr = mlx.mlx_array_new_data(qt.ptr, &[_]c_int{N}, 1, .int32);
-        defer free(qt_arr);
 
         const te = try take(self.type_emb, qt_arr, 0, s);
         defer free(te);
@@ -1057,44 +1101,160 @@ pub const Model = struct {
         return x;
     }
 
-    /// Full forward for one padded batch (`DecisionModel.__call__`).
+    /// Full forward for one batch (`DecisionModel.__call__`): pads, runs the
+    /// compiled graph (lazy graph when compile is off), one eval.
     pub fn forward(self: *Model, batch: Batch) !Output {
         const a = self.allocator;
-        const s = self.stream;
-        const n = batch.ids.len;
-        if (n == 0) return error.EmptyBatch;
-        var t: usize = 0;
-        var k_pad: usize = 2;
-        for (batch.ids, batch.markers) |row, m| {
-            t = @max(t, row.len);
-            k_pad = @max(k_pad, m.len);
+        if (batch.ids.len == 0) return error.EmptyBatch;
+        var in = try Inputs.fromBatch(a, batch, self.cfg.pad_id);
+        defer in.deinit();
+        const n: usize = @intCast(mlx.mlx_array_shape(in.ids)[0]);
+        const t: usize = @intCast(mlx.mlx_array_shape(in.ids)[1]);
+        const k_pad: usize = @intCast(mlx.mlx_array_shape(in.marker_pos)[1]);
+
+        const t_start = std.Io.Timestamp.now(trace_io, .boot);
+        const outs = if (self.ensureCompiled()) |cls| self.applyCompiled(cls, in) catch |e| blk: {
+            log.warn("[laya] compiled forward failed ({s}); lazy graph from now on\n", .{@errorName(e)});
+            self.compile_failed = true;
+            break :blk try self.forwardBody(in);
+        } else try self.forwardBody(in);
+        const masked = outs[0];
+        defer free(masked);
+        const act32 = outs[1];
+        defer free(act32);
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        try mlx.check(mlx.mlx_vector_array_append_value(ev, masked));
+        try mlx.check(mlx.mlx_vector_array_append_value(ev, act32));
+        const build_ms = msSince(t_start);
+        const t_built = std.Io.Timestamp.now(trace_io, .boot);
+        try mlx.check(mlx.mlx_eval(ev));
+        log.debug("[laya] forward n={d} t={d}: graph {d:.2} ms, eval {d:.2} ms\n", .{ n, t, build_ms, msSince(t_built) });
+
+        const logits = try a.alloc(f32, n * k_pad);
+        errdefer a.free(logits);
+        const raw = mlx.mlx_array_data_float32(masked) orelse return error.MlxError;
+        @memcpy(logits, raw[0 .. n * k_pad]);
+        const n_act: usize = self.cfg.n_actions;
+        const act_raw = mlx.mlx_array_data_float32(act32) orelse return error.MlxError;
+        const act = try a.alloc(f32, n * n_act);
+        errdefer a.free(act);
+        for (0..n) |i| {
+            const row = act_raw[i * n_act .. (i + 1) * n_act];
+            const pr = try a.alloc(f64, n_act);
+            defer a.free(pr);
+            softmaxInto(row, 1.0, pr);
+            for (pr, 0..) |v, jj| act[i * n_act + jj] = @floatCast(v);
         }
+        return .{ .logits = logits, .k_pad = k_pad, .act = act, .n_actions = n_act };
+    }
+
+    fn compileEnabled() bool {
+        const raw = std.c.getenv("MLX_SERVE_LAYA_COMPILE") orelse return true;
+        return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    }
+
+    /// The compiled forward, built on first use. Null: lazy graph
+    /// (`MLX_SERVE_LAYA_COMPILE=0`, or compile failed once).
+    fn ensureCompiled(self: *Model) ?mlx.mlx_closure {
+        if (self.compiled) |c| return c;
+        if (self.compile_failed or !compileEnabled()) return null;
+        const raw = mlx.mlx_closure_new_func_payload(&forwardClosure, @ptrCast(self), null);
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw, false);
+        _ = mlx.mlx_closure_free(raw);
+        if (rc != 0 or compiled.ctx == null) {
+            self.compile_failed = true;
+            log.warn("[laya] mlx_compile failed; lazy graph\n", .{});
+            return null;
+        }
+        self.compiled = compiled;
+        log.info("[laya] compiled forward engaged (one trace per input shape)\n", .{});
+        return compiled;
+    }
+
+    fn forwardClosure(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Model = @ptrCast(@alignCast(payload.?));
+        if (mlx.mlx_vector_array_size(input) != 5) return -1;
+        var arrs: [5]A = @splat(.{ .ctx = null });
+        defer for (&arrs) |*x| {
+            if (x.ctx != null) free(x.*);
+        };
+        for (0..5) |i| {
+            arrs[i] = mlx.mlx_array_new();
+            if (mlx.mlx_vector_array_get(&arrs[i], input, i) != 0) return -1;
+        }
+        const out = self.forwardBody(.{ .ids = arrs[0], .valid = arrs[1], .marker_pos = arrs[2], .marker_mask = arrs[3], .qtype = arrs[4] }) catch return -1;
+        res.* = mlx.mlx_vector_array_new_data(&out, 2);
+        for (out) |o| free(o);
+        return 0;
+    }
+
+    fn applyCompiled(self: *Model, cls: mlx.mlx_closure, in: Inputs) ![2]A {
+        _ = self;
+        const in_arr = [_]A{ in.ids, in.valid, in.marker_pos, in.marker_mask, in.qtype };
+        const in_vec = mlx.mlx_vector_array_new_data(&in_arr, in_arr.len);
+        defer _ = mlx.mlx_vector_array_free(in_vec);
+        var out_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(out_vec);
+        try mlx.check(mlx.mlx_closure_apply(&out_vec, cls, in_vec));
+        if (mlx.mlx_vector_array_size(out_vec) != 2) return error.MlxError;
+        var out: [2]A = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+        errdefer for (out) |o| free(o);
+        try mlx.check(mlx.mlx_vector_array_get(&out[0], out_vec, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&out[1], out_vec, 1));
+        return out;
+    }
+
+    /// The op sequence of `DecisionModel.__call__` on device inputs, stock
+    /// ops only (this is what `mlx_compile` traces). Returns the masked
+    /// scorer logits `[n, k]` f32 and the raw action logits `[n, n_actions]`
+    /// f32; caller frees both.
+    pub fn forwardBody(self: *Model, in: Inputs) ![2]A {
+        const s = self.stream;
+        const shape = mlx.mlx_array_shape(in.ids);
+        const N_ = shape[0];
+        const T_ = shape[1];
+        const K_ = mlx.mlx_array_shape(in.marker_pos)[1];
         const D: c_int = @intCast(self.cfg.hidden_size);
 
-        const enc = try self.encode(batch, t);
+        const enc = try self.encode(in.ids, in.valid);
         defer free(enc);
-        const h = try self.headForward(enc, batch, t);
+        const h = try self.headForward(enc, in.valid, in.qtype);
         defer free(h);
-        const h_flat = try reshape(h, &[_]c_int{ @intCast(n * t), D }, s);
+        const h_flat = try reshape(h, &[_]c_int{ N_ * T_, D }, s);
         defer free(h_flat);
 
-        // Marker rows (`h[b, max(marker_pos, 0)]`, padded slots gather row 0
+        // Marker rows (`h[b, max(marker_pos, 0)]`; padded slots gather row 0
         // of their sequence and are masked below) and the CLS rows.
-        const midx = try a.alloc(i32, n * k_pad);
-        defer a.free(midx);
-        const cidx = try a.alloc(i32, n);
-        defer a.free(cidx);
-        for (0..n) |i| {
-            cidx[i] = @intCast(i * t);
-            for (0..k_pad) |j| {
-                const pos: usize = if (j < batch.markers[i].len) batch.markers[i][j] else 0;
-                midx[i * k_pad + j] = @intCast(i * t + pos);
-            }
-        }
-        const midx_arr = mlx.mlx_array_new_data(midx.ptr, &[_]c_int{@intCast(n * k_pad)}, 1, .int32);
+        var row0 = mlx.mlx_array_new();
+        defer free(row0);
+        try mlx.check(mlx.mlx_arange(&row0, 0, @floatFromInt(N_ * T_), @floatFromInt(T_), .int32, s));
+        const cidx_arr = row0;
+        const row0c = try reshape(row0, &[_]c_int{ N_, 1 }, s);
+        defer free(row0c);
+        const zero = mlx.mlx_array_new_int(0);
+        defer free(zero);
+        var mp0 = mlx.mlx_array_new();
+        defer free(mp0);
+        try mlx.check(mlx.mlx_maximum(&mp0, in.marker_pos, zero, s));
+        var midx2 = mlx.mlx_array_new();
+        defer free(midx2);
+        try mlx.check(mlx.mlx_add(&midx2, mp0, row0c, s));
+        const midx_arr = try reshape(midx2, &[_]c_int{N_ * K_}, s);
         defer free(midx_arr);
-        const cidx_arr = mlx.mlx_array_new_data(cidx.ptr, &[_]c_int{@intCast(n)}, 1, .int32);
-        defer free(cidx_arr);
+        // k = max(marker count, 2) as f32 [n, 1]
+        var ksum = mlx.mlx_array_new();
+        defer free(ksum);
+        try mlx.check(mlx.mlx_sum_axis(&ksum, in.marker_mask, -1, true, s));
+        const two = mlx.mlx_array_new_int(2);
+        defer free(two);
+        var k2 = mlx.mlx_array_new();
+        defer free(k2);
+        try mlx.check(mlx.mlx_maximum(&k2, ksum, two, s));
+        const k_arr = try astype(k2, .float32, s);
+        defer free(k_arr);
+        const mmask_arr = in.marker_mask;
 
         const markers = try take(h_flat, midx_arr, 0, s);
         defer free(markers);
@@ -1111,48 +1271,67 @@ pub const Model = struct {
         const cls = try take(h_flat, cidx_arr, 0, s);
         defer free(cls);
 
-        const ev = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(ev);
-        try mlx.check(mlx.mlx_vector_array_append_value(ev, logits_arr));
-        try mlx.check(mlx.mlx_vector_array_append_value(ev, cls));
-        try mlx.check(mlx.mlx_eval(ev));
-
-        const logits = try a.alloc(f32, n * k_pad);
-        errdefer a.free(logits);
-        const raw = mlx.mlx_array_data_float32(logits_arr) orelse return error.MlxError;
-        for (0..n) |i| for (0..k_pad) |j| {
-            logits[i * k_pad + j] = if (j < batch.markers[i].len) raw[i * k_pad + j] else -1e4;
-        };
-
-        // Confidence features from the (uncalibrated) softmax, then the action
-        // head in fp16 on `[cls | features]` like the reference.
-        const feats = try a.alloc(f32, n * 4);
-        defer a.free(feats);
-        for (0..n) |i| {
-            const row = logits[i * k_pad .. (i + 1) * k_pad];
-            const p = try a.alloc(f64, k_pad);
-            defer a.free(p);
-            softmaxInto(row, 1.0, p);
-            const k: f64 = @floatFromInt(@max(batch.markers[i].len, 2));
-            var ent: f64 = 0;
-            for (p) |v| ent -= v * @log(@max(v, 1e-9));
-            ent /= @log(k);
-            var top1: f64 = -1;
-            var top2: f64 = -1;
-            for (p) |v| {
-                if (v > top1) {
-                    top2 = top1;
-                    top1 = v;
-                } else if (v > top2) top2 = v;
-            }
-            feats[i * 4 + 0] = @floatCast(top1);
-            feats[i * 4 + 1] = @floatCast(top1 - top2);
-            feats[i * 4 + 2] = @floatCast(ent);
-            feats[i * 4 + 3] = @floatCast(k / 255.0);
-        }
-        const feats_arr = mlx.mlx_array_new_data(feats.ptr, &[_]c_int{ @intCast(n), 4 }, 2, .float32);
-        defer free(feats_arr);
-        const feats16 = try astype(feats_arr, .float16, s);
+        // Masked logits, confidence features and the action head all stay in
+        // the graph (one eval), matching the reference op sequence.
+        const lg = try reshape(logits_arr, &[_]c_int{ N_, K_ }, s);
+        defer free(lg);
+        const neg = mlx.mlx_array_new_float(-1e4);
+        defer free(neg);
+        var masked = mlx.mlx_array_new();
+        defer free(masked);
+        try mlx.check(mlx.mlx_where(&masked, mmask_arr, lg, neg, s));
+        var p = mlx.mlx_array_new();
+        defer free(p);
+        try mlx.check(mlx.mlx_softmax_axis(&p, masked, -1, false, s));
+        // entropy = -sum(p * log(max(p, 1e-9))) / log(k)
+        const floor = mlx.mlx_array_new_float(1e-9);
+        defer free(floor);
+        var pf = mlx.mlx_array_new();
+        defer free(pf);
+        try mlx.check(mlx.mlx_maximum(&pf, p, floor, s));
+        var lp = mlx.mlx_array_new();
+        defer free(lp);
+        try mlx.check(mlx.mlx_log(&lp, pf, s));
+        var plp = mlx.mlx_array_new();
+        defer free(plp);
+        try mlx.check(mlx.mlx_multiply(&plp, p, lp, s));
+        var ent_sum = mlx.mlx_array_new();
+        defer free(ent_sum);
+        try mlx.check(mlx.mlx_sum_axis(&ent_sum, plp, -1, true, s));
+        var neg_ent = mlx.mlx_array_new();
+        defer free(neg_ent);
+        try mlx.check(mlx.mlx_negative(&neg_ent, ent_sum, s));
+        var logk = mlx.mlx_array_new();
+        defer free(logk);
+        try mlx.check(mlx.mlx_log(&logk, k_arr, s));
+        var ent = mlx.mlx_array_new();
+        defer free(ent);
+        try mlx.check(mlx.mlx_divide(&ent, neg_ent, logk, s));
+        // top-2 via sort
+        var sorted = mlx.mlx_array_new();
+        defer free(sorted);
+        try mlx.check(mlx.mlx_sort_axis(&sorted, p, -1, s));
+        var top0 = mlx.mlx_array_new();
+        defer free(top0);
+        try mlx.check(mlx.mlx_slice(&top0, sorted, &[_]c_int{ 0, K_ - 2 }, 2, &[_]c_int{ N_, K_ - 1 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var top1 = mlx.mlx_array_new();
+        defer free(top1);
+        try mlx.check(mlx.mlx_slice(&top1, sorted, &[_]c_int{ 0, K_ - 1 }, 2, &[_]c_int{ N_, K_ }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var margin = mlx.mlx_array_new();
+        defer free(margin);
+        try mlx.check(mlx.mlx_subtract(&margin, top1, top0, s));
+        const inv255 = mlx.mlx_array_new_float(1.0 / 255.0);
+        defer free(inv255);
+        var k255 = mlx.mlx_array_new();
+        defer free(k255);
+        try mlx.check(mlx.mlx_multiply(&k255, k_arr, inv255, s));
+        const feat_parts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(feat_parts);
+        for ([_]A{ top1, margin, ent, k255 }) |f| try mlx.check(mlx.mlx_vector_array_append_value(feat_parts, f));
+        var feats = mlx.mlx_array_new();
+        defer free(feats);
+        try mlx.check(mlx.mlx_concatenate_axis(&feats, feat_parts, -1, s));
+        const feats16 = try astype(feats, .float16, s);
         defer free(feats16);
         const pair = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(pair);
@@ -1168,22 +1347,58 @@ pub const Model = struct {
         const a2 = try linear(ag, self.act_l2.w_t, self.act_l2.b, s);
         defer free(a2);
         const act32 = try astype(a2, .float32, s);
-        defer free(act32);
-        try mlx.check(mlx.mlx_array_eval(act32));
-        const n_act: usize = self.cfg.n_actions;
-        const act_raw = mlx.mlx_array_data_float32(act32) orelse return error.MlxError;
-        const act = try a.alloc(f32, n * n_act);
-        errdefer a.free(act);
-        for (0..n) |i| {
-            const row = act_raw[i * n_act .. (i + 1) * n_act];
-            const p = try a.alloc(f64, n_act);
-            defer a.free(p);
-            softmaxInto(row, 1.0, p);
-            for (p, 0..) |v, j| act[i * n_act + j] = @floatCast(v);
-        }
-        return .{ .logits = logits, .k_pad = k_pad, .act = act, .n_actions = n_act };
+        errdefer free(act32);
+        var masked_out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&masked_out, masked));
+        return .{ masked_out, act32 };
     }
 };
+
+/// `attention_masks` sliding mask: `[n, 1, T, T]` bool, key within `half`
+/// positions of the query and valid; padded queries see every valid key (no
+/// all-masked softmax rows).
+fn localMask(valid: A, N: c_int, T: c_int, half: c_int, s: S) !A {
+    var pos = mlx.mlx_array_new();
+    defer free(pos);
+    try mlx.check(mlx.mlx_arange(&pos, 0, @floatFromInt(T), 1, .int32, s));
+    const pi = try reshape(pos, &[_]c_int{ T, 1 }, s);
+    defer free(pi);
+    const pj = try reshape(pos, &[_]c_int{ 1, T }, s);
+    defer free(pj);
+    var diff = mlx.mlx_array_new();
+    defer free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, pi, pj, s));
+    var dist = mlx.mlx_array_new();
+    defer free(dist);
+    try mlx.check(mlx.mlx_abs(&dist, diff, s));
+    const h = mlx.mlx_array_new_int(half);
+    defer free(h);
+    var near = mlx.mlx_array_new();
+    defer free(near);
+    try mlx.check(mlx.mlx_less_equal(&near, dist, h, s));
+    const near4 = try reshape(near, &[_]c_int{ 1, 1, T, T }, s);
+    defer free(near4);
+    const vq = try reshape(valid, &[_]c_int{ N, 1, T, 1 }, s);
+    defer free(vq);
+    var pad_q = mlx.mlx_array_new();
+    defer free(pad_q);
+    try mlx.check(mlx.mlx_logical_not(&pad_q, vq, s));
+    var q_ok = mlx.mlx_array_new();
+    defer free(q_ok);
+    try mlx.check(mlx.mlx_logical_or(&q_ok, near4, pad_q, s));
+    const vk = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
+    defer free(vk);
+    var out = mlx.mlx_array_new();
+    errdefer free(out);
+    try mlx.check(mlx.mlx_logical_and(&out, q_ok, vk, s));
+    return out;
+}
+
+const trace_io = std.Io.Threaded.global_single_threaded.io();
+
+fn msSince(t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.untilNow(trace_io, .boot).nanoseconds)) / 1e6;
+}
 
 /// `softmax(z / scale)` in f64 into `out` (same length as `z`).
 fn softmaxInto(z: []const f32, scale: f64, out: []f64) void {
@@ -1259,6 +1474,7 @@ pub const Engine = struct {
         }
         const qids = try a.alloc([]const u8, nq);
         defer a.free(qids);
+        const t_prep = std.Io.Timestamp.now(trace_io, .boot);
         var it = qobj.iterator();
         var qi: usize = 0;
         while (it.next()) |kv| : (qi += 1) {
@@ -1270,6 +1486,7 @@ pub const Engine = struct {
             if (seqs[qi].markers.len != qs[qi].optionCount()) return error.TooManyOptions;
         }
 
+        log.debug("[laya] prepare {d} question(s): {d:.2} ms\n", .{ nq, msSince(t_prep) });
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
         try out.appendSlice(a, "{\"model\":");
@@ -1586,7 +1803,9 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
     defer a.free(markers);
     const batch = Model.Batch{ .ids = &.{ids}, .markers = &.{markers}, .qtype = &.{.choice} };
 
-    const enc = try model.encode(batch, ids.len);
+    var in = try Model.Inputs.fromBatch(a, batch, model.cfg.pad_id);
+    defer in.deinit();
+    const enc = try model.encode(in.ids, in.valid);
     defer free(enc);
     const enc32 = try astype(enc, .float32, s);
     defer free(enc32);
@@ -1603,7 +1822,7 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
     std.debug.print("\n[laya] encoder max|diff| {d:.4} (max|ref| {d:.2})\n", .{ max_abs, max_ref });
     try testing.expect(max_abs < 0.05 * max_ref);
 
-    const h = try model.headForward(enc, batch, ids.len);
+    const h = try model.headForward(enc, in.valid, in.qtype);
     defer free(h);
     const h32 = try astype(h, .float32, s);
     defer free(h32);
@@ -1694,4 +1913,73 @@ fn numF64(v: std.json.Value) f64 {
         .float => |f| f,
         else => std.math.nan(f64),
     };
+}
+
+test "laya: forward latency breakdown (LAYA_BENCH=1)" {
+    // Not a correctness test: prints the median of 30 for the 3-question en
+    // batch, compiled and lazy, plus encoder-only — the numbers REPORT.md quotes.
+    if (std.c.getenv("LAYA_BENCH") == null) return error.SkipZigTest;
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var model = try Model.load(testIo(), a, dir, s);
+    defer model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    var ids_l: std.ArrayList([]const u32) = .empty;
+    defer {
+        for (ids_l.items) |x| a.free(x);
+        ids_l.deinit(a);
+    }
+    var mk_l: std.ArrayList([]const u32) = .empty;
+    defer {
+        for (mk_l.items) |x| a.free(x);
+        mk_l.deinit(a);
+    }
+    var qt_l: std.ArrayList(QType) = .empty;
+    defer qt_l.deinit(a);
+    for (fx.cases()) |cv| {
+        const c = cv.object;
+        if (!std.mem.eql(u8, c.get("lang").?.string, "en")) continue;
+        try ids_l.append(a, try jsonU32Slice(a, c.get("ids").?));
+        try mk_l.append(a, try jsonU32Slice(a, c.get("markers").?));
+        try qt_l.append(a, @enumFromInt(c.get("qtype").?.integer));
+    }
+    const batch = Model.Batch{ .ids = ids_l.items, .markers = mk_l.items, .qtype = qt_l.items };
+
+    // LAYA_BENCH_GAP_MS: idle gap between requests (an HTTP client's pacing)
+    // — the GPU/CPU clocks ramp down between calls.
+    const gap_ms: u64 = if (std.c.getenv("LAYA_BENCH_GAP_MS")) |g| try std.fmt.parseInt(u64, std.mem.sliceTo(g, 0), 10) else 0;
+    const gap_ts = std.c.timespec{ .sec = 0, .nsec = @intCast(gap_ms * 1_000_000) };
+    var times: [30]f64 = undefined;
+    for ([_]bool{ true, false }) |compiled| {
+        model.compile_failed = !compiled;
+        for (0..5) |_| {
+            var o = try model.forward(batch);
+            o.deinit(a);
+        }
+        for (&times) |*t| {
+            if (gap_ms > 0) _ = std.c.nanosleep(&gap_ts, null);
+            const t0 = std.Io.Timestamp.now(trace_io, .boot);
+            var o = try model.forward(batch);
+            o.deinit(a);
+            t.* = msSince(t0);
+        }
+        std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+        std.debug.print("\n[laya-bench] forward n={d} compiled={} gap={d}ms: median {d:.2} ms p10 {d:.2} p90 {d:.2}\n", .{ batch.ids.len, compiled, gap_ms, times[15], times[3], times[27] });
+    }
+    // Encoder only (lazy graph): 22 layers.
+    var in = try Model.Inputs.fromBatch(a, batch, model.cfg.pad_id);
+    defer in.deinit();
+    for (0..5 + 30) |i| {
+        const t0 = std.Io.Timestamp.now(trace_io, .boot);
+        const enc = try model.encode(in.ids, in.valid);
+        defer free(enc);
+        try mlx.check(mlx.mlx_array_eval(enc));
+        if (i >= 5) times[i - 5] = msSince(t0);
+    }
+    std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+    std.debug.print("[laya-bench] encoder only: median {d:.2} ms p10 {d:.2} p90 {d:.2}\n", .{ times[15], times[3], times[27] });
 }
