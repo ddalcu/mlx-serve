@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -1630,6 +1631,7 @@ extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*us
 /// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
 /// Python's platform.mac_ver()[0]).
 pub fn macosProductVersion(buf: []u8) ?[]const u8 {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
     var len: usize = buf.len;
     if (sysctlbyname("kern.osproductversion", buf.ptr, &len, null, 0) != 0) return null;
     var n = @min(len, buf.len);

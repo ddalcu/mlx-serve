@@ -204,9 +204,10 @@ pub const NgramTable = struct {
         const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         errdefer _ = std.c.close(fd);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
-        const size: usize = @intCast(st.size);
+        // File size via lseek-to-end: 0.17 has no portable fstat wrapper on
+        // Linux (std.c.Stat is void there) and this loader has no `std.Io`.
+        const size: usize = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+        if (size == 0) return error.StatFailed;
         const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
         if (size < 8) return error.NgramTableTruncated;

@@ -1,0 +1,21 @@
+diff --git a/mlx/c/half.h b/mlx/c/half.h
+index 958d555..afe8449 100644
+--- a/mlx/c/half.h
++++ b/mlx/c/half.h
+@@ -13,6 +13,16 @@ extern "C" {
+ typedef __fp16 float16_t;
+ #endif
+ 
++#if defined(__x86_64__) && !defined(HAS_FLOAT16)
++/* Linux x86_64: no baseline _Float16/__bf16 in mlx-c's half.h. The f16/bf16
++   buffers are 2-byte-per-element bit containers, so the accessors can hand
++   out uint16_t aliases; consumers reinterpret the storage. */
++#define HAS_FLOAT16
++typedef uint16_t float16_t;
++#define HAS_BFLOAT16
++typedef uint16_t bfloat16_t;
++#endif
++
+ #if defined(__ARM_FEATURE_BF16) || defined(__aarch64__)
+ #define HAS_BFLOAT16
+ #include <arm_bf16.h>

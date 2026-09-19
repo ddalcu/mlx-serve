@@ -27,6 +27,7 @@
 //! (1/16 .. x16) down-conv wrap.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = @import("log.zig");
 const mlx = @import("mlx.zig");
 const status = @import("status.zig");
@@ -121,9 +122,11 @@ pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
     return rows;
 }
 
-/// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
-/// consume this must treat 0 as "unknown", never as "tiny machine").
+/// Total physical RAM (`hw.memsize` on Darwin, `/proc/meminfo` on Linux);
+/// 0 when the read fails (gates that consume this must treat 0 as "unknown",
+/// never as "tiny machine").
 pub fn totalMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return status.getTotalMemBytes();
     var mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
@@ -156,6 +159,9 @@ pub fn chipBrand() []const u8 {
 }
 
 fn chipBrandString(buf: []u8) []const u8 {
+    // machdep.cpu.brand_string is an Apple-Silicon sysctl; the ANE offload is
+    // macOS-only, so non-Darwin gets the empty brand (defaults downstream).
+    if (comptime !builtin.os.tag.isDarwin()) return "";
     var len: usize = buf.len;
     if (std.c.sysctlbyname("machdep.cpu.brand_string", buf.ptr, &len, null, 0) != 0) return "";
     if (len > 0 and buf[len - 1] == 0) len -= 1;

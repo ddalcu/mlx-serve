@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("kv_quant.zig");
@@ -23,10 +24,10 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
+const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
-const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
+const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
 const webp = @import("webp");
@@ -3187,6 +3188,9 @@ var wired_limit_read: bool = false;
 /// let the ceiling move under a live request. 0 when the OID is absent.
 pub fn wiredLimitBytes() u64 {
     if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
+    // iogpu.wired_limit_mb is an Apple GPU sysctl; Linux has no wired-limit
+    // concept, so the query reads as absent (0), same as a non-Apple-Silicon Mac.
+    if (comptime !builtin.os.tag.isDarwin()) return 0;
     if (wired_limit_read) return wired_limit_bytes_cached;
     var v: u32 = 0;
     var len: usize = @sizeOf(u32);
@@ -6036,11 +6040,17 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
 
 extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
-/// Get the Metal max buffer allocation limit (~75% of system unified memory).
+/// Get the max buffer allocation limit (~75% of system unified memory).
+/// `hw.memsize` on Darwin; on Linux there is no unified-memory sysctl, so the
+/// same 75%-of-physical-RAM heuristic runs against /proc/meminfo.
 fn getMetalBufferLimit() u64 {
     var mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    if (comptime builtin.os.tag.isDarwin()) {
+        var len: usize = @sizeOf(u64);
+        _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    } else {
+        mem = metrics.getTotalMemBytes();
+    }
     if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
     return mem * 75 / 100;
 }

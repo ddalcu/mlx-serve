@@ -18,9 +18,8 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = @import("arch/ds4.zig");
-const llama_arch = @import("arch/llama.zig");
-const ds4_ffi = @import("ds4_ffi.zig");
+const ds4_arch = if (build_options.macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
@@ -36,6 +35,18 @@ pub const VERSION: []const u8 = build_options.version;
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
+
+// The embedded llama.cpp engine only links on macOS builds (macos_engines);
+// elsewhere the stub engine replaces it, so the libllama symbols above are
+// not referenced and `--version` reports these placeholders instead.
+fn ggmlEngineVersion() []const u8 {
+    if (comptime !build_options.macos_engines) return "unavailable (no embedded llama.cpp)";
+    return std.mem.span(ggml_version());
+}
+fn ggmlEngineCommit() []const u8 {
+    if (comptime !build_options.macos_engines) return "";
+    return std.mem.span(ggml_commit());
+}
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
@@ -567,8 +578,8 @@ pub fn main(init: std.process.Init) !void {
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
                 .nax = transformer_mod.naxStatus(),
-                .ggml = std.mem.span(ggml_version()),
-                .ggml_commit = std.mem.span(ggml_commit()),
+                .ggml = ggmlEngineVersion(),
+                .ggml_commit = ggmlEngineCommit(),
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
                 .ds4_commit = build_options.ds4_commit,
@@ -854,8 +865,7 @@ pub fn main(init: std.process.Init) !void {
             // compression, some quality impact). Auto-enables flash-attn
             // in the shim because llama's plain SDPA needs F16/F32 KV.
             i += 1;
-            const arch_llama = @import("arch/llama.zig");
-            if (arch_llama.LlamaKvQuant.fromString(args[i])) |q| {
+            if (llama_arch.LlamaKvQuant.fromString(args[i])) |q| {
                 server_mod.llama_kv_quant = q;
             } else {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
