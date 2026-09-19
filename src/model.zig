@@ -563,6 +563,29 @@ pub const ModelConfig = struct {
     lv_pixels_tolerance: f32 = 2.0,
     lv_thumbnail_token_id: u32 = 0,
     lv_row_col_base_id: u32 = 0, // id of `<|img_row_1_col_1|>`; the block is row-major
+    // MiniCPM-V 4.6 vision (src/minicpm_vision.zig): a stock SigLIP2 tower with
+    // an attention-pooling 2x2 downsample (`vit_merger`) inserted at
+    // `cp_insert_layer` and a final 2x2-merge projector (`merger`). The
+    // processor slices an image into <=`cp_max_slice_nums` ~`cp_scale_resolution`px
+    // views; each view is one encoder call and one prompt block.
+    minicpm_vision: bool = false,
+    cp_insert_layer: u32 = 6,
+    cp_16x: bool = true, // downsample_mode "16x" arms the vit_merger; "4x" skips it
+    cp_max_slice_nums: u32 = 9,
+    cp_scale_resolution: u32 = 448,
+    cp_use_image_id: bool = true,
+    cp_token_divisor: u32 = 16, // patches per output token (2x2 vit_merger x 2x2 merger)
+    cp_ln_eps: f32 = 1e-6,
+    cp_vit_intermediate: u32 = 0, // vit_merger linear_1 width (vision_intermediate x window^2)
+    // Prompt block markers, resolved from the tokenizer at load (0 = absent).
+    cp_im_start_id: u32 = 0,
+    cp_im_end_id: u32 = 0,
+    cp_slice_start_id: u32 = 0,
+    cp_slice_end_id: u32 = 0,
+    cp_image_id_start_id: u32 = 0,
+    cp_image_id_end_id: u32 = 0,
+    cp_newline_id: u32 = 0,
+    cp_digit_ids: [10]u32 = @splat(0),
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -1291,6 +1314,36 @@ pub const ModelConfig = struct {
         }
         log.info("LFM2-VL image tokens: <image>={d} start={d} end={d} thumbnail={d} row_col_base={d}\n", .{
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
+        });
+    }
+
+    /// MiniCPM-V 4.6's prompt block is built from single-token markers that
+    /// only exist in the tokenizer — `<image>`/`</image>` wrap the source
+    /// view, `<slice>`/`</slice>` wrap each tiled view, `<image_id>`N`</image_id>`
+    /// labels the image, and `\n` separates slice rows. Resolved by string at
+    /// load (same rule as the user-turn marker); a missing marker leaves id 0,
+    /// which the segment builder reads as "skip this piece".
+    pub fn populateMinicpmImageTokens(self: *ModelConfig, allocator: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.minicpm_vision) return;
+        if (tok.special_tokens.get("<image>")) |id| self.cp_im_start_id = id;
+        if (tok.special_tokens.get("</image>")) |id| self.cp_im_end_id = id;
+        if (tok.special_tokens.get("<slice>")) |id| self.cp_slice_start_id = id;
+        if (tok.special_tokens.get("</slice>")) |id| self.cp_slice_end_id = id;
+        if (tok.special_tokens.get("<image_id>")) |id| self.cp_image_id_start_id = id;
+        if (tok.special_tokens.get("</image_id>")) |id| self.cp_image_id_end_id = id;
+        // The slice-row separator and the label digits are plain BPE text;
+        // each must encode to ONE token to be useful here.
+        for ([_][]const u8{ "\n", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" }, 0..) |text, i| {
+            const ids = tok.encode(allocator, text) catch continue;
+            defer allocator.free(ids);
+            if (ids.len != 1) continue;
+            switch (i) {
+                0 => self.cp_newline_id = ids[0],
+                else => self.cp_digit_ids[i - 1] = ids[0],
+            }
+        }
+        log.info("MiniCPM-V image tokens: fill={d} <image>={d} </image>={d} <slice>={d} </slice>={d} <image_id>={d} newline={d}\n", .{
+            self.image_token_id, self.cp_im_start_id, self.cp_im_end_id, self.cp_slice_start_id, self.cp_slice_end_id, self.cp_image_id_start_id, self.cp_newline_id,
         });
     }
 
@@ -2510,6 +2563,69 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
         }
         try validateQwen4Config(&config);
+    } else if (std.mem.eql(u8, model_type, "minicpmv4_6")) {
+        // MiniCPM-V 4.6 (openbmb): SigLIP2-400M tower + Qwen3.5-0.8B trunk.
+        // The trunk IS qwen3_5 (hybrid GDN/full attention via `layer_types`,
+        // qk-norm, attn output gate) — collapse onto qwen3_5_moe so every
+        // trunk path (batched GDN decode, rope, weight probing) fires
+        // identically; the vision wrapper keys on `minicpm_vision` instead of
+        // the model_type. Vision fields live at the ROOT (text_config is the
+        // trunk), so they are read from `root` below.
+        config.model_type = "qwen3_5_moe";
+        config.weight_prefix = "language_model.model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.attn_output_gate = true;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        config.minicpm_vision = true;
+        if (root.get("insert_layer_id")) |v| {
+            if (v == .integer) config.cp_insert_layer = @intCast(v.integer);
+        }
+        if (root.get("downsample_mode")) |v| {
+            if (v == .string) config.cp_16x = !std.mem.eql(u8, v.string, "4x");
+        }
+        if (root.get("slice_config")) |sc_val| {
+            if (sc_val == .object) {
+                if (sc_val.object.get("max_slice_nums")) |v| {
+                    if (v == .integer) config.cp_max_slice_nums = @intCast(v.integer);
+                }
+                if (sc_val.object.get("scale_resolution")) |v| {
+                    if (v == .integer) config.cp_scale_resolution = @intCast(v.integer);
+                }
+            }
+        }
+        if (root.get("use_image_id")) |v| {
+            if (v == .bool) config.cp_use_image_id = v.bool;
+        }
+        if (config.vision_intermediate_size > 0) {
+            // mlx-vlm defaults the vit_merger window to 2x2 (the checkpoint's
+            // shapes pin it: linear_1 is [17216, 4608] = intermediate*4 x hidden*4).
+            config.cp_vit_intermediate = config.vision_intermediate_size * 4;
+        }
+        config.cp_token_divisor = if (config.cp_16x) 16 else 4;
+        // The reference strips <|endoftext|> (248044) from the eos list when
+        // <|im_end|> (248046) is declared: sampling can hit the raw EOS first
+        // and end the turn before any token is emitted.
+        if (config.isEosToken(248046) and config.isEosToken(248044)) {
+            var kept: [8]u32 = undefined;
+            var n: usize = 0;
+            for (config.eos_token_ids[0..config.num_eos_tokens]) |id| {
+                if (id != 248044) {
+                    kept[n] = id;
+                    n += 1;
+                }
+            }
+            @memcpy(config.eos_token_ids[0..n], kept[0..n]);
+            config.num_eos_tokens = @intCast(n);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -7381,4 +7497,85 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.tie_word_embeddings);
     try testing.expect(!config.norm_has_offset);
     try testing.expect(!config.has_pre_ff_norm);
+}
+
+test "ModelConfig parses minicpmv4_6: qwen3_5 trunk collapse + SigLIP2 wrapper" {
+    // Trimmed but faithful copy of mlx-community/MiniCPM-V-4.6-4bit config.json.
+    // The trunk fields live under text_config (model_type qwen3_5_text) and
+    // collapse onto qwen3_5_moe; the vision wrapper fields sit at the ROOT.
+    const json =
+        \\{
+        \\  "architectures": ["MiniCPMV4_6ForConditionalGeneration"],
+        \\  "model_type": "minicpmv4_6",
+        \\  "image_size": 1120,
+        \\  "image_token_id": 248056,
+        \\  "video_token_id": 248057,
+        \\  "insert_layer_id": 6,
+        \\  "eos_token_id": [248044, 248046],
+        \\  "text_config": {
+        \\    "model_type": "qwen3_5_text",
+        \\    "attn_output_gate": true,
+        \\    "full_attention_interval": 4,
+        \\    "head_dim": 256,
+        \\    "hidden_size": 1024,
+        \\    "intermediate_size": 3584,
+        \\    "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        \\    "linear_conv_kernel_dim": 4,
+        \\    "linear_key_head_dim": 128,
+        \\    "linear_num_key_heads": 16,
+        \\    "linear_num_value_heads": 16,
+        \\    "linear_value_head_dim": 128,
+        \\    "max_position_embeddings": 262144,
+        \\    "num_attention_heads": 8,
+        \\    "num_hidden_layers": 4,
+        \\    "num_key_value_heads": 2,
+        \\    "partial_rotary_factor": 0.25,
+        \\    "rms_norm_eps": 1e-06,
+        \\    "rope_parameters": {"partial_rotary_factor": 0.25, "rope_theta": 10000000.0, "rope_type": "default"},
+        \\    "vocab_size": 248094,
+        \\    "tie_word_embeddings": true
+        \\  },
+        \\  "vision_config": {
+        \\    "hidden_act": "gelu_pytorch_tanh",
+        \\    "hidden_size": 1152,
+        \\    "image_size": 980,
+        \\    "intermediate_size": 4304,
+        \\    "layer_norm_eps": 1e-06,
+        \\    "model_type": "minicpmv4_6_vision",
+        \\    "num_attention_heads": 16,
+        \\    "num_channels": 3,
+        \\    "num_hidden_layers": 27,
+        \\    "patch_size": 14
+        \\  },
+        \\  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // Trunk collapse: the qwen3_5 path fires (batched GDN decode, qk-norm,
+    // weight probing under language_model.model) with the checkpoint's OWN
+    // hybrid layer types.
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 4), config.full_attention_interval);
+    try testing.expect(config.attn_output_gate);
+    try testing.expect(config.tie_word_embeddings);
+    // The vision wrapper rides minicpm_vision, NOT qwen_vision (no M-RoPE, no
+    // vision_start/end, no QwenVision tower).
+    try testing.expect(config.minicpm_vision);
+    try testing.expect(!config.qwen_vision);
+    try testing.expectEqual(@as(u32, 248056), config.image_token_id);
+    try testing.expectEqual(@as(u32, 6), config.cp_insert_layer);
+    try testing.expect(config.cp_16x);
+    try testing.expectEqual(@as(u32, 16), config.cp_token_divisor);
+    try testing.expectEqual(@as(u32, 1152), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 27), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 4304), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 17216), config.cp_vit_intermediate);
+    try testing.expectApproxEqAbs(@as(f32, 1e-6), config.cp_ln_eps, 1e-9);
+    // The reference strips <|endoftext|> (248044) once <|im_end|> (248046) is
+    // declared: stopping on the raw EOS can end a turn before any token.
+    try testing.expect(config.isEosToken(248046));
+    try testing.expect(!config.isEosToken(248044));
 }

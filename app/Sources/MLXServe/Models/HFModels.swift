@@ -34,6 +34,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "spark",      // XHToken Spark-X2.5 — repos tag "spark2_5" and/or "sparkx2_5"
     "k2-horizon", // IFM K2-Horizon — repos tag "k2-horizon" and/or "k2_horizon"
     "k2_horizon",
+    "minicpm",   // MiniCPM-V 4.6 — repos tag "minicpm-v" / "minicpmv4_6" (SigLIP2 + Qwen3.5 trunk)
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -58,6 +59,7 @@ let supportedModelTypes: Set<String> = [
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
+    "minicpmv4_6", // MiniCPM-V 4.6 (SigLIP2 tower + qwen3_5 trunk; served on the qwen3_5_moe arch)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
