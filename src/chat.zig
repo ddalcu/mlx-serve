@@ -68,6 +68,9 @@ pub const VisionPreproc = struct {
     max_slice_nums: u32 = 0,
     scale_resolution: u32 = 0,
     token_divisor: u32 = 16,
+    /// minicpm video: frame cap before encoding; a longer clip is
+    /// linspace-sampled down (`_select_frames`).
+    max_num_frames: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -83,11 +86,30 @@ pub const AudioData = struct {
 /// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
 /// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
 /// are the shared per-frame patch grid every frame in the video was resized to.
+/// One view of a MiniCPM-V video unit. A sampled frame is processed exactly
+/// like an image (source view + slice grid, grids vary per frame), so the
+/// uniform Qwen grid fields say nothing; `units` is the flat per-view table.
+/// Views appear in encode order: per unit, the source view (`tile_index` 0)
+/// then its slices row-major — the same order the prompt block mirrors.
+pub const VideoUnitView = struct {
+    /// Float32-element offset of this view's pixel_values inside
+    /// `VideoData.pixels` (all views share that one buffer).
+    offset: u32,
+    grid_h: u32,
+    grid_w: u32,
+    tile_rows: u16 = 0,
+    tile_cols: u16 = 0,
+    tile_index: u16 = 0,
+};
+
 pub const VideoData = struct {
     pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// MiniCPM-V per-view table into `pixels`. Null for the Qwen uniform-grid
+    /// layout, where `grid_t x grid_h x grid_w` describes every patch.
+    units: ?[]const VideoUnitView = null,
 };
 
 /// OpenAI spells the system turn `developer` for reasoning models (pi does

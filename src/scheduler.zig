@@ -1038,6 +1038,9 @@ pub const VisionVideoPixels = struct {
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// MiniCPM-V per-view table (frames encoded as images, variable grids);
+    /// empty for the Qwen uniform-grid layout.
+    units: []const chat_mod.VideoUnitView = &.{},
 };
 
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
@@ -4698,15 +4701,58 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
 
     var n_video: usize = 0;
     for (req.videos) |vid| {
-        const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
-        const feat: usize = (vid.pixels.len / 4) / n;
-        const shape = [_]c_int{ @intCast(n), @intCast(feat) };
-        const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
-        defer _ = mlx.mlx_array_free(pixel_arr);
-        const emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
+        var emb: mlx.mlx_array = undefined;
+        if (vid.units.len > 0) {
+            // MiniCPM-V: every view is its own tower call (grids vary per
+            // frame); the views' outputs concatenate in table order, which is
+            // the order the video segment's video-token fills appear in.
+            var parts = std.ArrayList(mlx.mlx_array).empty;
+            defer {
+                for (parts.items) |e| _ = mlx.mlx_array_free(e);
+                parts.deinit(req.allocator);
+            }
+            var total_patches: usize = 0;
+            for (vid.units) |u| total_patches += @as(usize, u.grid_h) * u.grid_w;
+            const feat: usize = (vid.pixels.len / 4) / total_patches;
+            for (vid.units) |u| {
+                const n: usize = @as(usize, u.grid_h) * u.grid_w;
+                const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+                const view_arr = mlx.mlx_array_new_data(vid.pixels.ptr + @as(usize, u.offset) * 4, &shape, 2, .float32);
+                defer _ = mlx.mlx_array_free(view_arr);
+                const part = vision_enc.forwardPatches(view_arr, u.grid_h, u.grid_w) catch |err| {
+                    failParts(sch, req, emb_parts.items, @errorName(err));
+                    return;
+                };
+                parts.append(req.allocator, part) catch {
+                    _ = mlx.mlx_array_free(part);
+                    failParts(sch, req, emb_parts.items, "OutOfMemory");
+                    return;
+                };
+            }
+            const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            emb = mlx.mlx_array_new();
+            if (parts.items.len == 1) {
+                _ = mlx.mlx_array_set(&emb, parts.items[0]);
+                parts.items[0] = mlx.mlx_array_new();
+            } else {
+                _ = mlx.mlx_array_free(emb);
+                if (mlx.check(mlx.mlx_concatenate_axis(&emb, vec, 1, vision_enc.s))) |_| {} else |err| {
+                    failParts(sch, req, emb_parts.items, @errorName(err));
+                    return;
+                }
+            }
+        } else {
+            const n: usize = @as(usize, vid.grid_t) * vid.grid_h * vid.grid_w;
+            const feat: usize = (vid.pixels.len / 4) / n;
+            const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+            const pixel_arr = mlx.mlx_array_new_data(vid.pixels.ptr, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            emb = vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w) catch |err| {
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+        }
         const es = mlx.getShape(emb);
         n_video += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
