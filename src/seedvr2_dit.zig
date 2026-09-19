@@ -613,7 +613,7 @@ fn applyRope(x: mlx.mlx_array, r: *const Rope, s: S) !mlx.mlx_array {
 // ════════════════════════════════════════════════════════════════════════
 
 /// Two on-disk key layouts carry the same NaDiT weights. This project's own
-/// converter (`dit.safetensors`, `justintime47/SeedVR2-3B-MLX-Serve`) nests
+/// converter (`dit.safetensors`, `jlweights/SeedVR2-3B-MLX-Serve`) nests
 /// the txt/vid split as its own path segment (`attn.proj_qkv.txt.weight`,
 /// `ada.txt.attn_gate`, `rope.rope.freqs`, `vid_out_ada.out_shift`); the
 /// mlx-community 8-bit mirror (`transformer.safetensors`) flattens the split

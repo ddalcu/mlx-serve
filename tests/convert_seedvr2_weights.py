@@ -21,13 +21,14 @@ WHY A CONVERTER AT ALL, when two of the three inputs are already safetensors:
   * `pos_emb.pt` is a PICKLE. It is the only text conditioning SeedVR2 has —
     there is no text encoder at runtime — and it cannot be loaded without torch.
     Baking it into the pack is what makes the pack self-contained.
-  * The engine looks up fixed filenames. Shipping `dit.safetensors` rather than
-    `seedvr2_ema_3b_fp16.safetensors` means the loader does not have to guess
-    among the six differently-named mirrors of the same weights.
   * `dit.safetensors` doubles as the pack's COMPLETENESS MARKER
-    (`model_discovery.requiredMediaMarker`). It is the largest file and lands
+    (`model_discovery.requiredMediaMarkers`). It is the largest file and lands
     last, so a half-finished download is invisible to discovery rather than
     registering as a model and dying in the text loader.
+
+The filename itself no longer buys anything: discovery accepts the mirrors'
+`transformer.safetensors` too, and `seedvr2_dit.KeyScheme` reads the key layout
+out of the checkpoint rather than inferring it from which file it came from.
 
 Nothing is requantized here. The bytes are copied through in whatever dtype the
 source carries; a quantized mirror is a separate step.

@@ -2047,9 +2047,9 @@ test "SeedVR2 discovers as complete under EITHER its own or the mlx-community mi
     defer tmp.cleanup();
 
     // Our own converter's marker.
-    try tmp.dir.createDirPath(io, "justintime47/seedvr2-3b");
-    try tmp.dir.writeFile(io, .{ .sub_path = "justintime47/seedvr2-3b/config.json", .data = "{\"model_type\":\"seedvr2\"}" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "justintime47/seedvr2-3b/dit.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "jlweights/seedvr2-3b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "jlweights/seedvr2-3b/config.json", .data = "{\"model_type\":\"seedvr2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "jlweights/seedvr2-3b/dit.safetensors", .data = "0123" });
     // The mlx-community 8-bit mirror ships `transformer.safetensors`
     // instead — same NaDiT, no `dit.safetensors` at all.
     try tmp.dir.createDirPath(io, "mlx-community/seedvr2-3b-int8");
@@ -2074,7 +2074,7 @@ test "SeedVR2 discovers as complete under EITHER its own or the mlx-community mi
     }.lt);
 
     try testing.expectEqual(@as(usize, 2), ids.items.len);
-    try testing.expectEqualStrings("justintime47/seedvr2-3b", ids.items[0]);
+    try testing.expectEqualStrings("jlweights/seedvr2-3b", ids.items[0]);
     try testing.expectEqualStrings("mlx-community/seedvr2-3b-int8", ids.items[1]);
 }
 

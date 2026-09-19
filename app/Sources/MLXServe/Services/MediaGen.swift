@@ -1311,7 +1311,7 @@ struct RestoreModelPreset: Identifiable, Hashable {
     static let seedvr2_3b = RestoreModelPreset(
         id: "seedvr2-3b",
         name: "SeedVR2 3B (fp16)",
-        repo: "justintime47/SeedVR2-3B-MLX-Serve",
+        repo: "jlweights/SeedVR2-3B-MLX-Serve",
         // 7.3 GB weights (bf16 compute, the server default) + a fixed 6 GB
         // activation headroom the server bills for windowed attention + the
         // VAE decoder's first upsampled feature map (`SEEDVR2_ACTIVATION_BYTES`
