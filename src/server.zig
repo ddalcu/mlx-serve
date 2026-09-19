@@ -13572,6 +13572,7 @@ fn processVisionImages(
                 .grid_t = vid.grid_t,
                 .grid_h = vid.grid_h,
                 .grid_w = vid.grid_w,
+                .units = vid.units orelse &.{},
             });
         }
         var aud_list = std.ArrayList([]const u8).empty;
@@ -13865,6 +13866,62 @@ fn lfm2ImageSegment(
     return try seg.toOwnedSlice(allocator);
 }
 
+/// The video twin of `minicpmImageSegment`: per video, an
+/// `<image_id>`N`</image_id>` label (a SEPARATE counter from images), then
+/// each frame's `<image>`/`<slice>` blocks with `video_token_id` fills —
+/// same markers, same view order, different fill token.
+fn minicpmVideoSegment(
+    allocator: std.mem.Allocator,
+    media_msg: ?*const chat_mod.Message,
+    config: *const model_mod.ModelConfig,
+) !?[]u32 {
+    if (!config.minicpm_vision or config.video_token_id == 0) return null;
+    const msg = media_msg orelse return null;
+    const videos: []const chat_mod.VideoData = msg.videos orelse &.{};
+    if (videos.len == 0) return null;
+
+    var seg = std.ArrayList(u32).empty;
+    errdefer seg.deinit(allocator);
+    const divisor: u32 = if (config.cp_token_divisor > 0) config.cp_token_divisor else 16;
+    var video_idx: usize = 0;
+    for (videos) |vid| {
+        const views = vid.units orelse continue;
+        if (views.len == 0) continue;
+        if (config.cp_use_image_id and config.cp_image_id_start_id > 0 and config.cp_image_id_end_id > 0) {
+            try seg.append(allocator, config.cp_image_id_start_id);
+            var buf: [8]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{video_idx}) catch unreachable;
+            for (text) |ch| {
+                const digit = ch - '0';
+                if (digit < config.cp_digit_ids.len and config.cp_digit_ids[digit] > 0) {
+                    try seg.append(allocator, config.cp_digit_ids[digit]);
+                }
+            }
+            try seg.append(allocator, config.cp_image_id_end_id);
+        }
+        video_idx += 1;
+        for (views) |view| {
+            const pads = view.grid_h * view.grid_w / divisor;
+            if (view.tile_rows == 0 or view.tile_index == 0) {
+                if (config.cp_im_start_id > 0) try seg.append(allocator, config.cp_im_start_id);
+                try seg.appendNTimes(allocator, config.video_token_id, pads);
+                if (config.cp_im_end_id > 0) try seg.append(allocator, config.cp_im_end_id);
+            } else {
+                const offset = view.tile_index - 1;
+                const row = offset / view.tile_cols;
+                if (row > 0 and offset % view.tile_cols == 0 and config.cp_newline_id > 0) {
+                    try seg.append(allocator, config.cp_newline_id);
+                }
+                if (config.cp_slice_start_id > 0) try seg.append(allocator, config.cp_slice_start_id);
+                try seg.appendNTimes(allocator, config.video_token_id, pads);
+                if (config.cp_slice_end_id > 0) try seg.append(allocator, config.cp_slice_end_id);
+            }
+        }
+    }
+    if (seg.items.len == 0) return null;
+    return try seg.toOwnedSlice(allocator);
+}
+
 /// MiniCPM-V 4.6's image block. Per image: an `<image_id>`N`</image_id>` label,
 /// then `<image>` + the SOURCE view's pad run + `</image>`, then the slice
 /// grid as `<slice>`-wrapped pad runs with `\n` between rows. The block order
@@ -13951,6 +14008,8 @@ fn insertMultimodalTokens(
     defer if (lfm2_seg) |ls| allocator.free(ls);
     const minicpm_seg: ?[]u32 = if (want_image) try minicpmImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
     defer if (minicpm_seg) |ms| allocator.free(ms);
+    const minicpm_vid_seg: ?[]u32 = if (want_video) try minicpmVideoSegment(allocator, if (active_media) |media| media.message else null, config) else null;
+    defer if (minicpm_vid_seg) |ms| allocator.free(ms);
 
     var seg = std.ArrayList(u32).empty;
     defer seg.deinit(allocator);
@@ -13966,9 +14025,13 @@ fn insertMultimodalTokens(
         }
     }
     if (want_video) {
-        if (boi > 0) try seg.append(allocator, boi);
-        try seg.appendNTimes(allocator, video_token_id, n_video);
-        if (eoi > 0) try seg.append(allocator, eoi);
+        if (minicpm_vid_seg) |ms| {
+            try seg.appendSlice(allocator, ms);
+        } else {
+            if (boi > 0) try seg.append(allocator, boi);
+            try seg.appendNTimes(allocator, video_token_id, n_video);
+            if (eoi > 0) try seg.append(allocator, eoi);
+        }
     }
     if (want_audio) {
         if (boa > 0) try seg.append(allocator, boa);
@@ -14023,6 +14086,7 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
             .max_slice_nums = config.cp_max_slice_nums,
             .scale_resolution = config.cp_scale_resolution,
             .token_divisor = config.cp_token_divisor,
+            .max_num_frames = config.cp_max_num_frames,
         };
     }
     if (config.lfm2_vision) {
@@ -14193,7 +14257,13 @@ fn MediaBag(comptime T: type) type {
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             for (self.lists.items) |*l| {
-                for (l.items) |item| allocator.free(mediaBuffer(item));
+                for (l.items) |item| {
+                    allocator.free(mediaBuffer(item));
+                    // MiniCPM-V videos carry a per-view table beside the buffer.
+                    if (comptime @hasField(T, "units")) {
+                        if (item.units) |u| allocator.free(u);
+                    }
+                }
                 l.deinit(allocator);
             }
             self.lists.deinit(allocator);
@@ -14481,7 +14551,7 @@ fn appendMinicpmSlices(
     std.base64.standard.Decoder.decode(raw, b64) catch return;
     const src = decodeRgbOwned(allocator, raw) orelse return;
     defer src.deinit(allocator);
-    _ = minicpmViewsForImage(allocator, src, vp, list);
+    _ = minicpmViewsForImageAs(allocator, src, vp, chat_mod.ImageData, list);
 }
 
 /// `MiniCPMVImageProcessor.slice_image` for one DECODED image: append the
@@ -14490,11 +14560,14 @@ fn appendMinicpmSlices(
 /// reuse this unchanged: a frame IS processed as an image. Returns false on
 /// any failure, having dropped every entry it appended (a partial slice set
 /// would be spliced against a token layout that assumes all of them).
-fn minicpmViewsForImage(
+/// `T` is the entry shape: `chat_mod.ImageData` for a request's media list,
+/// the local `MinicpmStagedView` for video's function-owned staging.
+fn minicpmViewsForImageAs(
     allocator: std.mem.Allocator,
     src: DecodedRgb,
     vp: chat_mod.VisionPreproc,
-    list: *std.ArrayList(chat_mod.ImageData),
+    comptime T: type,
+    list: *std.ArrayList(T),
 ) bool {
     const res = if (vp.scale_resolution > 0) vp.scale_resolution else 448;
     const max_slices = if (vp.max_slice_nums > 0) vp.max_slice_nums else 9;
@@ -14506,11 +14579,19 @@ fn minicpmViewsForImage(
     if (lfm2Canvas(allocator, src, source.h, source.w, vp)) |chw| {
         defer allocator.free(chw);
         if (lfm2Region(allocator, chw, source.h, source.w, vp, 0, 0, source.h, source.w)) |entry| {
-            var img = entry;
+            var img: T = .{
+                .pixels = entry.pixels,
+                .width = entry.width,
+                .height = entry.height,
+                .grid_h = entry.grid_h,
+                .grid_w = entry.grid_w,
+                .tile_rows = 0,
+                .tile_cols = 0,
+                .tile_index = 0,
+            };
             if (grid) |g| {
                 img.tile_rows = @intCast(g[1]);
                 img.tile_cols = @intCast(g[0]);
-                img.tile_index = 0;
             }
             list.append(allocator, img) catch {
                 allocator.free(img.pixels);
@@ -14530,7 +14611,7 @@ fn minicpmViewsForImage(
         defer allocator.free(chw);
         outer: for (0..g[1]) |row| {
             for (0..g[0]) |col| {
-                var img = lfm2Region(
+                const region = lfm2Region(
                     allocator,
                     chw,
                     refined.h,
@@ -14544,9 +14625,17 @@ fn minicpmViewsForImage(
                     ok = false;
                     break :outer;
                 };
-                img.tile_rows = @intCast(g[1]);
-                img.tile_cols = @intCast(g[0]);
-                img.tile_index = @intCast(1 + row * g[0] + col);
+                var img: T = .{
+                    .pixels = region.pixels,
+                    .width = region.width,
+                    .height = region.height,
+                    .grid_h = region.grid_h,
+                    .grid_w = region.grid_w,
+                    .tile_rows = @intCast(g[1]),
+                    .tile_cols = @intCast(g[0]),
+                    .tile_index = @intCast(1 + row * g[0] + col),
+                };
+                if (@hasField(T, "grid_t")) img.grid_t = 0;
                 list.append(allocator, img) catch {
                     allocator.free(img.pixels);
                     ok = false;
@@ -14708,16 +14797,92 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 /// must be identical across frames), then grouped into `vp.tps`-sized temporal-
 /// patch groups — the last group pads by repeating its final frame, matching
 /// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
-/// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
-/// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
-/// this codebase, so frame extraction is the client's job — into ONE
-/// `chat_mod.VideoData`. All frames share ONE smart-resize target, computed
-/// from the FIRST frame and applied to every frame (a video's whole patch grid
-/// must be identical across frames), then grouped into `vp.tps`-sized temporal-
-/// patch groups — the last group pads by repeating its final frame, matching
-/// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
+/// Function-owned staging for video frame views. Same shape as
+/// `chat_mod.ImageData` (the view builder is generic over the entry type) but
+/// a DISTINCT type: a handler may not hold a `chat_mod` media list of its own
+/// (the RequestMedia scan), and this list never outlives the decode.
+const MinicpmStagedView = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    grid_h: u32,
+    grid_w: u32,
+    tile_rows: u16 = 0,
+    tile_cols: u16 = 0,
+    tile_index: u16 = 0,
+};
+
+/// MiniCPM-V video: `_select_frames` (linspace, numpy round = half-even)
+/// caps the clip at `max_num_frames`, then EVERY selected frame is processed
+/// exactly like an image (`stack_frames` stays 1 in this pack's config) —
+/// decoded, sliced, and flattened into one shared pixel buffer with a
+/// per-view table. Fills use `video_token_id`; `minicpmVideoSegment` walks
+/// the same view order.
+fn decodeMinicpmVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
+    const max_frames: usize = if (vp.max_num_frames > 0) vp.max_num_frames else 128;
+    var selected = std.ArrayList([]const u8).empty;
+    defer selected.deinit(allocator);
+    if (frame_urls.len <= max_frames) {
+        selected.appendSlice(allocator, frame_urls) catch return null;
+    } else {
+        const span: f64 = @floatFromInt(frame_urls.len - 1);
+        const steps: f64 = @floatFromInt(max_frames - 1);
+        for (0..max_frames) |i| {
+            const idx = qwen_vision.roundHalfEven(@as(f64, @floatFromInt(i)) * span / steps);
+            selected.append(allocator, frame_urls[@intFromFloat(idx)]) catch return null;
+        }
+    }
+
+    var views = std.ArrayList(MinicpmStagedView).empty;
+    defer {
+        for (views.items) |v| allocator.free(v.pixels);
+        views.deinit(allocator);
+    }
+    for (selected.items) |url| {
+        const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
+        const b64 = url[sep + 8 ..];
+        const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+        const raw = allocator.alloc(u8, decoded_size) catch return null;
+        defer allocator.free(raw);
+        std.base64.standard.Decoder.decode(raw, b64) catch return null;
+        const src = decodeRgbOwned(allocator, raw) orelse return null;
+        defer src.deinit(allocator);
+        if (!minicpmViewsForImageAs(allocator, src, vp, MinicpmStagedView, &views)) return null;
+    }
+    if (views.items.len == 0) return null;
+
+    // Concat every view's patches into ONE buffer (MediaBag frees `pixels`
+    // alone) and record each view's float32 offset.
+    var total: usize = 0;
+    for (views.items) |v| total += v.pixels.len / 4;
+    const pv_bytes = allocator.alloc(u8, total * 4) catch return null;
+    const pv_f32: [*]f32 = @ptrCast(@alignCast(pv_bytes.ptr));
+    const unit_views = allocator.alloc(chat_mod.VideoUnitView, views.items.len) catch {
+        allocator.free(pv_bytes);
+        return null;
+    };
+    var off: usize = 0;
+    for (views.items, 0..) |v, i| {
+        const n = v.pixels.len / 4;
+        @memcpy(pv_f32[off .. off + n], @as([*]const f32, @ptrCast(@alignCast(v.pixels.ptr)))[0..n]);
+        unit_views[i] = .{
+            .offset = @intCast(off),
+            .grid_h = v.grid_h,
+            .grid_w = v.grid_w,
+            .tile_rows = v.tile_rows,
+            .tile_cols = v.tile_cols,
+            .tile_index = v.tile_index,
+        };
+        off += n;
+    }
+    log.info("  Decoded {d} frame(s) → minicpm video, {d} view(s), {d} patches\n", .{ selected.items.len, views.items.len, total });
+    return .{ .pixels = pv_bytes, .grid_t = 0, .grid_h = 0, .grid_w = 0, .units = unit_views };
+}
+
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
-    if (vp.mode != .qwen or frame_urls.len == 0) return null;
+    if (frame_urls.len == 0) return null;
+    if (vp.mode == .minicpm) return decodeMinicpmVideo(allocator, frame_urls, vp);
+    if (vp.mode != .qwen) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
 
@@ -24519,4 +24684,59 @@ test "minicpmImageSegment wraps an unsliced image without labels when markers ar
     defer testing.allocator.free(seg);
     const want = [_]u32{ 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056 };
     try testing.expectEqualSlices(u32, &want, seg);
+}
+
+test "minicpmVideoSegment labels videos separately and fills with the video token" {
+    // Two videos: the first unsliced (one 16x16 view), the second a single
+    // frame with a 2x1 slice grid (source 32x32 + two 40x28 slices). Labels
+    // count VIDEOS, and every fill uses video_token_id.
+    var config = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    config.minicpm_vision = true;
+    config.image_token_id = 248056;
+    config.video_token_id = 248057;
+    config.cp_im_start_id = 101;
+    config.cp_im_end_id = 102;
+    config.cp_slice_start_id = 103;
+    config.cp_slice_end_id = 104;
+    config.cp_image_id_start_id = 105;
+    config.cp_image_id_end_id = 106;
+    config.cp_digit_ids[0] = 110;
+    config.cp_digit_ids[1] = 111;
+    config.cp_token_divisor = 16;
+
+    const views0 = [_]chat_mod.VideoUnitView{
+        .{ .offset = 0, .grid_h = 16, .grid_w = 16 },
+    };
+    const views1 = [_]chat_mod.VideoUnitView{
+        .{ .offset = 0, .grid_h = 32, .grid_w = 32, .tile_rows = 1, .tile_cols = 2, .tile_index = 0 },
+        .{ .offset = 1024, .grid_h = 40, .grid_w = 28, .tile_rows = 1, .tile_cols = 2, .tile_index = 1 },
+        .{ .offset = 3264, .grid_h = 40, .grid_w = 28, .tile_rows = 1, .tile_cols = 2, .tile_index = 2 },
+    };
+    const vids = [_]chat_mod.VideoData{
+        .{ .pixels = "", .grid_t = 0, .grid_h = 0, .grid_w = 0, .units = &views0 },
+        .{ .pixels = "", .grid_t = 0, .grid_h = 0, .grid_w = 0, .units = &views1 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .videos = &vids }};
+    const seg = (try minicpmVideoSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+
+    var want = std.ArrayList(u32).empty;
+    defer want.deinit(testing.allocator);
+    // Video 0: <image_id>0</image_id><image>16 fills</image>.
+    try want.appendSlice(testing.allocator, &.{ 105, 110, 106, 101 });
+    try want.appendNTimes(testing.allocator, 248057, 16);
+    try want.append(testing.allocator, 102);
+    // Video 1: <image_id>1</image_id><image>64 fills</image>
+    // <slice>70 fills</slice><slice>70 fills</slice>.
+    try want.appendSlice(testing.allocator, &.{ 105, 111, 106, 101 });
+    try want.appendNTimes(testing.allocator, 248057, 64);
+    try want.append(testing.allocator, 102);
+    for (0..2) |_| {
+        try want.append(testing.allocator, 103);
+        try want.appendNTimes(testing.allocator, 248057, 70);
+        try want.append(testing.allocator, 104);
+    }
+    try testing.expectEqualSlices(u32, want.items, seg);
+    // No image_token fill may leak into a video block.
+    for (seg) |id| try testing.expect(id != 248056);
 }

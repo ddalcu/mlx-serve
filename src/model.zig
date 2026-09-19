@@ -575,6 +575,7 @@ pub const ModelConfig = struct {
     cp_scale_resolution: u32 = 448,
     cp_use_image_id: bool = true,
     cp_token_divisor: u32 = 16, // patches per output token (2x2 vit_merger x 2x2 merger)
+    cp_max_num_frames: u32 = 128, // video frame cap; longer clips are linspace-sampled
     cp_ln_eps: f32 = 1e-6,
     cp_vit_intermediate: u32 = 0, // vit_merger linear_1 width (vision_intermediate x window^2)
     // Prompt block markers, resolved from the tokenizer at load (0 = absent).
