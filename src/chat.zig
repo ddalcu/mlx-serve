@@ -28,8 +28,10 @@ pub const ImageData = struct {
     /// a `tile_rows` x `tile_cols` grid plus a thumbnail, and EACH piece is its
     /// own entry here — separate patch grid, separate encoder call. `tile_index`
     /// runs row-major over the tiles, and `tile_index == rows*cols` is the
-    /// thumbnail. All three stay 0 for an untiled image, which is every other
-    /// tower we serve.
+    /// thumbnail. MiniCPM-V slicing reuses the same three fields with its own
+    /// order: `tile_index == 0` is the source view, `1..rows*cols` are the
+    /// slices row-major (its prompt block puts the source FIRST). All three
+    /// stay 0 for an untiled image, which is every other tower we serve.
     tile_rows: u16 = 0,
     tile_cols: u16 = 0,
     tile_index: u16 = 0,
@@ -41,7 +43,7 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, minicpm } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -59,6 +61,13 @@ pub const VisionPreproc = struct {
     max_tiles: u32 = 0,
     use_thumbnail: bool = false,
     pixels_tolerance: f32 = 0,
+    /// minicpm: an image past the ~`scale_resolution`² budget splits into a
+    /// grid of up to `max_slice_nums` views (plus the source view). Each view
+    /// is one encoder call; `token_divisor` patches make one output token
+    /// (16x = 2x2 vit_merger x 2x2 merger).
+    max_slice_nums: u32 = 0,
+    scale_resolution: u32 = 0,
+    token_divisor: u32 = 16,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.

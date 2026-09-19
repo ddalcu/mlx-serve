@@ -15,6 +15,7 @@ const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const minicpm_vision = @import("minicpm_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -13864,6 +13865,61 @@ fn lfm2ImageSegment(
     return try seg.toOwnedSlice(allocator);
 }
 
+/// MiniCPM-V 4.6's image block. Per image: an `<image_id>`N`</image_id>` label,
+/// then `<image>` + the SOURCE view's pad run + `</image>`, then the slice
+/// grid as `<slice>`-wrapped pad runs with `\n` between rows. The block order
+/// must match the encoder's piece order (source first, slices row-major) —
+/// the splice scatters embedding rows into pad slots positionally. A marker
+/// the tokenizer lacks (id 0) is omitted rather than fatal.
+fn minicpmImageSegment(
+    allocator: std.mem.Allocator,
+    media_msg: ?*const chat_mod.Message,
+    config: *const model_mod.ModelConfig,
+) !?[]u32 {
+    if (!config.minicpm_vision or config.image_token_id == 0) return null;
+    const msg = media_msg orelse return null;
+    const images: []const chat_mod.ImageData = msg.images orelse &.{};
+    if (images.len == 0) return null;
+
+    var seg = std.ArrayList(u32).empty;
+    errdefer seg.deinit(allocator);
+    const divisor: u32 = if (config.cp_token_divisor > 0) config.cp_token_divisor else 16;
+    var image_idx: usize = 0;
+    for (images) |img| {
+        const pads = img.grid_h * img.grid_w / divisor;
+        if (img.tile_rows == 0 or img.tile_index == 0) {
+            // Open a new image: the label, then the source view.
+            if (config.cp_use_image_id and config.cp_image_id_start_id > 0 and config.cp_image_id_end_id > 0) {
+                try seg.append(allocator, config.cp_image_id_start_id);
+                var buf: [8]u8 = undefined;
+                const text = std.fmt.bufPrint(&buf, "{d}", .{image_idx}) catch unreachable;
+                for (text) |ch| {
+                    const digit = ch - '0';
+                    if (digit < config.cp_digit_ids.len and config.cp_digit_ids[digit] > 0) {
+                        try seg.append(allocator, config.cp_digit_ids[digit]);
+                    }
+                }
+                try seg.append(allocator, config.cp_image_id_end_id);
+            }
+            if (config.cp_im_start_id > 0) try seg.append(allocator, config.cp_im_start_id);
+            try seg.appendNTimes(allocator, config.image_token_id, pads);
+            if (config.cp_im_end_id > 0) try seg.append(allocator, config.cp_im_end_id);
+            image_idx += 1;
+        } else {
+            // A slice: newline before the first slice of every row but the first.
+            const offset = img.tile_index - 1;
+            const row = offset / img.tile_cols;
+            if (row > 0 and offset % img.tile_cols == 0 and config.cp_newline_id > 0) {
+                try seg.append(allocator, config.cp_newline_id);
+            }
+            if (config.cp_slice_start_id > 0) try seg.append(allocator, config.cp_slice_start_id);
+            try seg.appendNTimes(allocator, config.image_token_id, pads);
+            if (config.cp_slice_end_id > 0) try seg.append(allocator, config.cp_slice_end_id);
+        }
+    }
+    return try seg.toOwnedSlice(allocator);
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -13893,11 +13949,15 @@ fn insertMultimodalTokens(
 
     const lfm2_seg: ?[]u32 = if (want_image) try lfm2ImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
     defer if (lfm2_seg) |ls| allocator.free(ls);
+    const minicpm_seg: ?[]u32 = if (want_image) try minicpmImageSegment(allocator, if (active_media) |media| media.message else null, config) else null;
+    defer if (minicpm_seg) |ms| allocator.free(ms);
 
     var seg = std.ArrayList(u32).empty;
     defer seg.deinit(allocator);
     if (want_image) {
-        if (lfm2_seg) |ls| {
+        if (minicpm_seg) |ms| {
+            try seg.appendSlice(allocator, ms);
+        } else if (lfm2_seg) |ls| {
             try seg.appendSlice(allocator, ls);
         } else {
             if (boi > 0) try seg.append(allocator, boi);
@@ -13951,6 +14011,20 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.minicpm_vision) {
+        // MiniCPM-V 4.6: the tower does both merges internally, so the
+        // preprocessor only slices (source view + up to 9 slice views) and
+        // patchifies — no pre-merge, plain row-major grid.
+        return .{
+            .mode = .minicpm,
+            .patch = config.vision_patch_size,
+            .tps = 1,
+            .merge = 1,
+            .max_slice_nums = config.cp_max_slice_nums,
+            .scale_resolution = config.cp_scale_resolution,
+            .token_divisor = config.cp_token_divisor,
+        };
+    }
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -14193,12 +14267,13 @@ const RequestMedia = struct {
 };
 
 /// Decode one `image_url` into as many entries as the model's processor makes
-/// of it — one per tower call. Only LFM2-VL ever yields more than one: past its
-/// single-tile token budget it splits the source into a tile grid plus a
-/// thumbnail, and each piece is encoded separately. Every other arch appends
-/// exactly one entry. Returns false when nothing could be decoded (a remote
-/// URL, bad base64, an unreadable payload) so the caller can refuse by name
-/// instead of answering a prompt the image silently fell out of.
+/// of it — one per tower call. LFM2-VL and MiniCPM-V 4.6 yield several: past
+/// their single-view budget they split the source into pieces, each encoded
+/// separately (LFM2 tiles + thumbnail; MiniCPM a source view + a slice grid).
+/// Every other arch appends exactly one entry. Returns false when nothing
+/// could be decoded (a remote URL, bad base64, an unreadable payload) so the
+/// caller can refuse by name instead of answering a prompt the image silently
+/// fell out of.
 pub fn appendImageUrlContent(
     allocator: std.mem.Allocator,
     list: *std.ArrayList(chat_mod.ImageData),
@@ -14210,6 +14285,12 @@ pub fn appendImageUrlContent(
         !std.mem.startsWith(u8, url, "data:image/x-mlx-pixels"))
     {
         appendLfm2Tiles(allocator, list, url, vp);
+        return list.items.len > before;
+    }
+    if (vp.mode == .minicpm and std.mem.startsWith(u8, url, "data:image/") and
+        !std.mem.startsWith(u8, url, "data:image/x-mlx-pixels"))
+    {
+        appendMinicpmSlices(allocator, list, url, vp);
         return list.items.len > before;
     }
     if (parseImageUrlContent(allocator, url, vp)) |img| {
@@ -14379,6 +14460,113 @@ fn lfm2Region(
     return .{ .pixels = bytes, .width = region_w, .height = region_h, .grid_h = gh, .grid_w = gw };
 }
 
+/// `MiniCPMVImageProcessor.slice_image`: the source view is the whole image
+/// resized into ~`scale_resolution`² (no upscale), and a SLICED image also
+/// gets a `cols`x`rows` refine canvas whose cells resize to ~448px (upscale
+/// allowed) — the canvas is resampled ONCE and read cell by cell. Entries
+/// append SOURCE FIRST (`tile_index` 0), then slices row-major: the reference's
+/// `get_sliced_images` order, which the prompt block must mirror. An image
+/// inside the budget is one entry, `tile_rows` 0.
+fn appendMinicpmSlices(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(chat_mod.ImageData),
+    url: []const u8,
+    vp: chat_mod.VisionPreproc,
+) void {
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return;
+    const b64 = url[sep + 8 ..];
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return;
+    const raw = allocator.alloc(u8, decoded_size) catch return;
+    defer allocator.free(raw);
+    std.base64.standard.Decoder.decode(raw, b64) catch return;
+    const src = decodeRgbOwned(allocator, raw) orelse return;
+    defer src.deinit(allocator);
+    _ = minicpmViewsForImage(allocator, src, vp, list);
+}
+
+/// `MiniCPMVImageProcessor.slice_image` for one DECODED image: append the
+/// source view, then the slice views row-major (tile_index 0, then 1..) —
+/// the order the encoder walks and the prompt block mirrors. Video frames
+/// reuse this unchanged: a frame IS processed as an image. Returns false on
+/// any failure, having dropped every entry it appended (a partial slice set
+/// would be spliced against a token layout that assumes all of them).
+fn minicpmViewsForImage(
+    allocator: std.mem.Allocator,
+    src: DecodedRgb,
+    vp: chat_mod.VisionPreproc,
+    list: *std.ArrayList(chat_mod.ImageData),
+) bool {
+    const res = if (vp.scale_resolution > 0) vp.scale_resolution else 448;
+    const max_slices = if (vp.max_slice_nums > 0) vp.max_slice_nums else 9;
+    const grid = minicpm_vision.slicedGrid(src.w, src.h, max_slices, res);
+    const source = minicpm_vision.findBestResize(src.w, src.h, res, vp.patch, grid == null);
+    const before = list.items.len;
+
+    var ok = true;
+    if (lfm2Canvas(allocator, src, source.h, source.w, vp)) |chw| {
+        defer allocator.free(chw);
+        if (lfm2Region(allocator, chw, source.h, source.w, vp, 0, 0, source.h, source.w)) |entry| {
+            var img = entry;
+            if (grid) |g| {
+                img.tile_rows = @intCast(g[1]);
+                img.tile_cols = @intCast(g[0]);
+                img.tile_index = 0;
+            }
+            list.append(allocator, img) catch {
+                allocator.free(img.pixels);
+                ok = false;
+            };
+        } else ok = false;
+    } else ok = false;
+
+    if (ok) if (grid) |g| blk: {
+        const refined = minicpm_vision.refineSize(src.w, src.h, g[0], g[1], res, vp.patch);
+        const cell_w = refined.w / g[0];
+        const cell_h = refined.h / g[1];
+        const chw = lfm2Canvas(allocator, src, refined.h, refined.w, vp) orelse {
+            ok = false;
+            break :blk;
+        };
+        defer allocator.free(chw);
+        outer: for (0..g[1]) |row| {
+            for (0..g[0]) |col| {
+                var img = lfm2Region(
+                    allocator,
+                    chw,
+                    refined.h,
+                    refined.w,
+                    vp,
+                    @intCast(row * cell_h),
+                    @intCast(col * cell_w),
+                    cell_h,
+                    cell_w,
+                ) orelse {
+                    ok = false;
+                    break :outer;
+                };
+                img.tile_rows = @intCast(g[1]);
+                img.tile_cols = @intCast(g[0]);
+                img.tile_index = @intCast(1 + row * g[0] + col);
+                list.append(allocator, img) catch {
+                    allocator.free(img.pixels);
+                    ok = false;
+                    break :outer;
+                };
+            }
+        }
+    };
+    if (!ok) {
+        for (list.items[before..]) |prior| allocator.free(prior.pixels);
+        list.shrinkRetainingCapacity(before);
+        return false;
+    }
+    const slices: usize = if (grid) |g| @as(usize, g[0]) * g[1] else 0;
+    log.info("  Decoded {d}x{d} frame → minicpm {d} source view + {d} slice(s), source resized {d}x{d}\n", .{
+        src.w, src.h, 1, slices, source.w, source.h,
+    });
+    return true;
+}
+
 /// A decoded source image as packed RGB8, owned by `allocator`. One owner and
 /// one free path — stb and libwebp buffers are copied out and released here, so
 /// callers that need the pixels for more than one pass (LFM2-VL's tiles) do not
@@ -14512,6 +14700,14 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     return .{ .pixels = out_buf, .width = target, .height = target };
 }
 
+/// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
+/// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
+/// this codebase, so frame extraction is the client's job — into ONE
+/// `chat_mod.VideoData`. All frames share ONE smart-resize target, computed
+/// from the FIRST frame and applied to every frame (a video's whole patch grid
+/// must be identical across frames), then grouped into `vp.tps`-sized temporal-
+/// patch groups — the last group pads by repeating its final frame, matching
+/// HF's video processor. Qwen-only: the only family declaring `video_token_id`.
 /// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
 /// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
 /// this codebase, so frame extraction is the client's job — into ONE
@@ -24247,4 +24443,80 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("<think> <think:opensource>") == null);
     try std.testing.expect(templateThinkOpener("<think:{{ suffix }}>") == null);
     try std.testing.expect(templateThinkOpener("assistant") == null);
+}
+
+test "minicpmImageSegment lays out label + source view + slice rows" {
+    // A 1024x1024 request decodes to 1 source view (32x32 grid -> 64 tokens at
+    // 16x) + a 2x3 slice grid (40x28 grid -> 70 tokens each). The block MUST
+    // walk pieces in the encoder's order (source first, slices row-major,
+    // newline between rows) so the splice scatters rows positionally.
+    var config = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    config.minicpm_vision = true;
+    config.image_token_id = 248056;
+    config.cp_im_start_id = 101;
+    config.cp_im_end_id = 102;
+    config.cp_slice_start_id = 103;
+    config.cp_slice_end_id = 104;
+    config.cp_image_id_start_id = 105;
+    config.cp_image_id_end_id = 106;
+    config.cp_newline_id = 107;
+    config.cp_digit_ids[0] = 110;
+    config.cp_token_divisor = 16;
+
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 448, .height = 448, .grid_h = 32, .grid_w = 32, .tile_rows = 3, .tile_cols = 2, .tile_index = 0 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 1 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 2 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 3 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 4 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 5 },
+        .{ .pixels = "", .width = 560, .height = 392, .grid_h = 40, .grid_w = 28, .tile_rows = 3, .tile_cols = 2, .tile_index = 6 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    const seg = (try minicpmImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+
+    // <image_id>0</image_id><image>64x</image>
+    // <slice>70x</slice><slice>70x</slice>\n<slice>70x</slice><slice>70x</slice>\n<slice>70x</slice><slice>70x</slice>
+    var want = std.ArrayList(u32).empty;
+    defer want.deinit(testing.allocator);
+    try want.appendSlice(testing.allocator, &.{ 105, 110, 106, 101 });
+    try want.appendNTimes(testing.allocator, 248056, 64);
+    try want.appendSlice(testing.allocator, &.{102});
+    for (0..3) |row| {
+        for (0..2) |col| {
+            if (row > 0 and col == 0) try want.append(testing.allocator, 107);
+            try want.append(testing.allocator, 103);
+            try want.appendNTimes(testing.allocator, 248056, 70);
+            try want.append(testing.allocator, 104);
+        }
+    }
+    try testing.expectEqualSlices(u32, want.items, seg);
+    // Fill count equals the encoder output the entries produce.
+    var fills: usize = 0;
+    for (seg) |id| {
+        if (id == 248056) fills += 1;
+    }
+    try testing.expectEqual(@as(usize, 64 + 6 * 70), fills);
+
+    // Not minicpm ⇒ null, so every other arch keeps its own segment builder.
+    config.minicpm_vision = false;
+    try testing.expect((try minicpmImageSegment(testing.allocator, &msgs[0], &config)) == null);
+}
+
+test "minicpmImageSegment wraps an unsliced image without labels when markers are missing" {
+    var config = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    config.minicpm_vision = true;
+    config.image_token_id = 248056;
+    config.cp_use_image_id = true;
+    // All marker ids 0 (tokenizer lacked them): the block degrades to a bare
+    // pad run rather than emitting zeros into the prompt.
+    const imgs = [_]chat_mod.ImageData{
+        .{ .pixels = "", .width = 224, .height = 224, .grid_h = 16, .grid_w = 16 },
+    };
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "hi", .images = &imgs }};
+    const seg = (try minicpmImageSegment(testing.allocator, &msgs[0], &config)) orelse return error.NoSegment;
+    defer testing.allocator.free(seg);
+    const want = [_]u32{ 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056, 248056 };
+    try testing.expectEqualSlices(u32, &want, seg);
 }
