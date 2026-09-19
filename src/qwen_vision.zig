@@ -16,6 +16,44 @@ const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const log = @import("log.zig");
 
+pub const MAX_DEEPSTACK = 4;
+
+/// One DeepStack patch merger: an optional per-DEPTH projector that turns the
+/// ViT block output (pre-merger, [N, hidden]) into an extra [N, out_hidden]
+/// additive feature stream for the LLM's first decoder layers. Identical
+/// topology to the main merger, but the LayerNorm runs AFTER the merge-reshape
+/// (hidden·merge² wide) — mlx_vlm's `use_postshuffle_norm=True`.
+pub const DeepStackMerger = struct {
+    norm_w: mlx.mlx_array,
+    norm_b: mlx.mlx_array,
+    fc1_w: mlx.mlx_array,
+    fc1_b: mlx.mlx_array,
+    fc2_w: mlx.mlx_array,
+    fc2_b: mlx.mlx_array,
+    depth: u32, // ViT block index this merger taps
+};
+
+/// The two output streams of the Qwen3-VL vision tower: the main merged
+/// embedding ([1, N_merged, out_hidden]) plus, for DeepStack checkpoints, one
+/// [N_merged, out_hidden] stream per tapped depth. Owns its arrays — free
+/// with `deinit` (returns values, NOT pointers: mlx C arrays are malloc'd
+/// handles and remain valid after the struct leaves the stack).
+pub const VisionTowerOutput = struct {
+    merged: mlx.mlx_array,
+    deepstack: [MAX_DEEPSTACK]mlx.mlx_array = @splat(.{ .ctx = null }),
+    deepstack_count: usize = 0,
+
+    pub fn deinit(self: *VisionTowerOutput) void {
+        if (self.merged.ctx != null) _ = mlx.mlx_array_free(self.merged);
+        self.merged = .{ .ctx = null };
+        for (self.deepstack[0..self.deepstack_count]) |d| {
+            if (d.ctx != null) _ = mlx.mlx_array_free(d);
+        }
+        @memset(self.deepstack[0..self.deepstack_count], .{ .ctx = null });
+        self.deepstack_count = 0;
+    }
+};
+
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
 /// processor metadata overrides these when present.
 pub const FACTOR: u32 = 32; // patch_size(16) * merge_size(2)
@@ -496,6 +534,7 @@ pub const QwenVision = struct {
     merger_fc1_b: mlx.mlx_array,
     merger_fc2_w: mlx.mlx_array,
     merger_fc2_b: mlx.mlx_array,
+    deepstack: []DeepStackMerger, // empty when the checkpoint ships none
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
@@ -569,6 +608,40 @@ pub const QwenVision = struct {
             };
         }
 
+        // DeepStack mergers are OPTIONAL: only the Qwen3-VL-Embedding family
+        // ships them so far, and a generic qwen3_vl chat checkpoint (WeMM,
+        // instruct models) has none. Presence is keyed on the config's
+        // deepstack_visual_indexes — an empty list loads nothing and the
+        // forward keeps its single-output shape.
+        var deepstack: []DeepStackMerger = &.{};
+        if (config.qv_deepstack_count > 0) {
+            if (config.qv_deepstack_count > MAX_DEEPSTACK) return error.MissingVisionWeights;
+            deepstack = try allocator.alloc(DeepStackMerger, config.qv_deepstack_count);
+            errdefer allocator.free(deepstack);
+            for (deepstack, 0..) |*ds, i| {
+                ds.depth = config.qv_deepstack_indexes[i];
+                // Key shape: <prefix>deepstack_merger_list.<i>.<suffix>.
+                // The suffix carries its own leading dot (same contract as
+                // fmtKey), so the format string must NOT add one — a doubled
+                // dot here made every DeepStack weight lookup miss.
+                const dsKey = struct {
+                    fn f(b: *[256]u8, p: []const u8, idx: usize, suffix: []const u8) []const u8 {
+                        return std.fmt.bufPrint(b, "{s}deepstack_merger_list.{d}{s}", .{ p, idx, suffix }) catch unreachable;
+                    }
+                }.f;
+                ds.norm_w = getWeightLocal(weights, &kbuf, dsKey(&kbuf, prefix, i, ".norm.weight")) orelse {
+                    log.warn("MISSING QWEN VISION DEEPSTACK WEIGHT: {s}deepstack_merger_list.{d}.norm.weight\n", .{ prefix, i });
+                    return error.MissingVisionWeights;
+                };
+                ds.norm_b = try must(weights, &buf, dsKey(&buf, prefix, i, ".norm.bias"));
+                ds.fc1_w = try must(weights, &buf, dsKey(&buf, prefix, i, ".linear_fc1.weight"));
+                ds.fc1_b = try must(weights, &buf, dsKey(&buf, prefix, i, ".linear_fc1.bias"));
+                ds.fc2_w = try must(weights, &buf, dsKey(&buf, prefix, i, ".linear_fc2.weight"));
+                ds.fc2_b = try must(weights, &buf, dsKey(&buf, prefix, i, ".linear_fc2.bias"));
+            }
+            log.info("[vision] qwen deepstack: {d} mergers at depths {any}\n", .{ config.qv_deepstack_count, config.qv_deepstack_indexes[0..config.qv_deepstack_count] });
+        }
+
         return QwenVision{
             .s = s,
             .allocator = allocator,
@@ -589,11 +662,21 @@ pub const QwenVision = struct {
             .merger_fc1_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc1.bias")),
             .merger_fc2_w = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.weight")),
             .merger_fc2_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "merger.linear_fc2.bias")),
+            .deepstack = deepstack,
         };
     }
 
     pub fn deinit(self: *QwenVision) void {
         _ = mlx.mlx_array_free(self.patch_w);
+        for (self.deepstack) |*ds| {
+            _ = mlx.mlx_array_free(ds.norm_w);
+            _ = mlx.mlx_array_free(ds.norm_b);
+            _ = mlx.mlx_array_free(ds.fc1_w);
+            _ = mlx.mlx_array_free(ds.fc1_b);
+            _ = mlx.mlx_array_free(ds.fc2_w);
+            _ = mlx.mlx_array_free(ds.fc2_b);
+        }
+        if (self.deepstack.len > 0) self.allocator.free(self.deepstack);
         self.allocator.free(self.blocks);
     }
 
@@ -1008,6 +1091,27 @@ pub const QwenVision = struct {
 
     /// Encode one image. `patches` = pixel_values [N, C*tps*ps*ps] (merge order).
     pub fn forward(self: *QwenVision, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        var ds = try self.forwardWithDeepstack(patches, grid_h, grid_w);
+        // forwardWithDeepstack owns `merged`; deinit would free it before the
+        // return. Move it out first (transfer ownership), then discard the
+        // DeepStack streams.
+        const merged = ds.merged;
+        ds.merged = .{ .ctx = null };
+        ds.deinit();
+        return merged;
+    }
+
+    /// Full forward for DeepStack checkpoints: runs the ViT, applies the main
+    /// merger (returned as `merged` [1, N_merged, out_hidden]), and — when the
+    /// checkpoint ships DeepStack mergers — taps the block outputs at
+    /// `deepstack[i].depth` into their own postshuffle-norm mergers
+    /// (`deepstack_out[i]` [N_merged, out_hidden]). Callers that don't consume
+    /// the extra stream call plain `forward`, which is this minus the capture.
+    /// mlx_vlm reference (vision.py VisionModel.__call__): the block outputs
+    /// are captured BEFORE the main merger runs; the main merger norm stays
+    /// pre-reshape (hidden-wide), each deepstack merger's norm is post-reshape
+    /// (hidden·merge² wide) — the two do NOT share a code path.
+    pub fn forwardWithDeepstack(self: *QwenVision, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !VisionTowerOutput {
         const n: c_int = @intCast(grid_h * grid_w);
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&x, patches, .bfloat16, self.s));
@@ -1030,6 +1134,12 @@ pub const QwenVision = struct {
         const rope = try self.buildVisionRope(grid_h, grid_w);
         defer _ = mlx.mlx_array_free(rope.cos);
         defer _ = mlx.mlx_array_free(rope.sin);
+
+        var ds_out: [MAX_DEEPSTACK]mlx.mlx_array = @splat(.{ .ctx = null });
+        var ds_filled: usize = 0;
+        errdefer for (ds_out[0..ds_filled]) |d| {
+            if (d.ctx != null) _ = mlx.mlx_array_free(d);
+        };
 
         var dt = mlx.DtypeTrace.begin("qwen3vl-vision", x, if (self.blocks.len > 0) self.blocks[0].qkv_w else null);
         for (self.blocks, 0..) |blk, block_idx| {
@@ -1060,10 +1170,29 @@ pub const QwenVision = struct {
                 x = h;
             }
             dt.layer(x, block_idx);
+
+            // DeepStack capture: the block output at a tapped depth goes
+            // straight into its own merger (mlx_vlm vision.py:412-427).
+            if (ds_out.len > ds_filled and self.deepstack.len > ds_filled and self.deepstack[ds_filled].depth == block_idx) {
+                ds_out[ds_filled] = try self.deepstackMergerForward(&self.deepstack[ds_filled], x, n);
+                ds_filled += 1;
+            }
         }
         dt.end(x);
 
-        // Merger: LayerNorm(hidden) → reshape [N/merge², hidden·merge²] → fc2(gelu(fc1)).
+        // Main merger: LayerNorm(hidden) → reshape [N/merge², hidden·merge²] → fc2(gelu(fc1)).
+        // NOTE: no errdefer needed — `ds_out` holds only un-freed handles which
+        // the struct-by-value return takes over; on the merged error path the
+        // caller never receives them (they leak only if mlx itself threw, which
+        // aborts the stream anyway). free via VisionTowerOutput.deinit.
+        const merged = try self.mainMergerForward(x, n);
+        return .{ .merged = merged, .deepstack = ds_out, .deepstack_count = ds_filled };
+    }
+
+    /// Main merger: pre-reshape LayerNorm over `hidden` dims (reference
+    /// `use_postshuffle_norm=False`). Consumes `x`. Returns
+    /// [1, N_merged, out_hidden].
+    fn mainMergerForward(self: *QwenVision, x: mlx.mlx_array, n: c_int) !mlx.mlx_array {
         const normed = try self.layerNorm6(x, self.merger_norm_w, self.merger_norm_b);
         _ = mlx.mlx_array_free(x);
         defer _ = mlx.mlx_array_free(normed);
@@ -1084,6 +1213,30 @@ pub const QwenVision = struct {
         const oshape = [_]c_int{ 1, n_merged, @intCast(self.out_hidden) };
         try mlx.check(mlx.mlx_reshape(&out, m2, &oshape, 3, self.s));
         return out;
+    }
+
+    /// DeepStack merger: post-reshape LayerNorm over `hidden·merge²` dims
+    /// (reference `use_postshuffle_norm=True` — the NORM PARAMS ARE WIDER than
+    /// the block output), then fc2(gelu(fc1)). Keeps `x` (the block output
+    /// feeds both the next block and this merger). Returns [N_merged, out_hidden].
+    fn deepstackMergerForward(self: *QwenVision, ds: *const DeepStackMerger, x: mlx.mlx_array, n: c_int) !mlx.mlx_array {
+        const merge2: c_int = @intCast(self.merge * self.merge);
+        const n_merged = @divExact(n, merge2);
+        const wide: c_int = @intCast(self.hidden * self.merge * self.merge);
+        var grouped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(grouped);
+        const gshape = [_]c_int{ n_merged, wide };
+        try mlx.check(mlx.mlx_reshape(&grouped, x, &gshape, 2, self.s));
+
+        // LayerNorm over the LAST dim with eps 1e-6, reusing the tower's
+        // exact-eps helper (weight/bias are [hidden·merge²]).
+        const normed = try self.layerNorm6(grouped, ds.norm_w, ds.norm_b);
+        defer _ = mlx.mlx_array_free(normed);
+        const m1 = try self.denseLinear(normed, ds.fc1_w, ds.fc1_b);
+        defer _ = mlx.mlx_array_free(m1);
+        const ma = try self.geluExact(m1);
+        defer _ = mlx.mlx_array_free(ma);
+        return self.denseLinear(ma, ds.fc2_w, ds.fc2_b);
     }
 
     /// Encode one VIDEO. `patches` is the concatenation of `grid_t` temporal-
@@ -1647,6 +1800,7 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
         .merge = 1,
         .num_grid_per_side = 2,
         .out_hidden = 4,
+        .deepstack = &.{},
         .patch_w = mkArr(&patch_w_shape, 0.1),
         .patch_b = mkArr(&hidden, 0.0),
         .pos_embed = mkArr(&pos_shape, 0.2),
