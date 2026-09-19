@@ -2247,6 +2247,7 @@ private struct InterfaceSectionContent: View {
     @EnvironmentObject var appState: AppState
     @AppStorage(InterfacePrefKey.appearanceMode) private var appearanceModeRaw = AppAppearanceMode.system.rawValue
     @AppStorage(InterfacePrefKey.accentColor) private var accentColorRaw = AppAccentColor.system.rawValue
+    @AppStorage(InterfacePrefKey.language) private var languageRaw = AppLanguage.system.rawValue
     @AppStorage(InterfacePrefKey.textSize) private var textSizeRaw = ChatTextSize.medium.rawValue
     @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
@@ -2254,6 +2255,32 @@ private struct InterfaceSectionContent: View {
     @AppStorage(InterfacePrefKey.terminalBackground) private var terminalBackgroundHex = ""
 
     var body: some View {
+        SettingsRow(title: "Language",
+                    explainer: "The app's own language. System follows macOS — including the per-app language in System Settings ▸ General ▸ Language & Region.") {
+            Picker("", selection: Binding(
+                get: { languageRaw },
+                // Swapped BEFORE the write, because the preference change is
+                // what re-renders the subtree and every `L10n` lookup runs
+                // inside that render: applying the bundle afterwards leaves the
+                // strings it just built in the old language.
+                set: { newValue in
+                    AppLanguage.select(AppLanguage(rawValue: newValue) ?? .system)
+                    languageRaw = newValue
+                }
+            )) {
+                ForEach(AppLanguage.allCases) { language in
+                    // A language names itself, so "English" and "简体中文" are
+                    // NOT looked up: they read the same in every UI language.
+                    if language == .system {
+                        Text(L10n.text(language.label)).tag(language.rawValue)
+                    } else {
+                        Text(verbatim: language.label).tag(language.rawValue)
+                    }
+                }
+            }
+            .labelsHidden()
+            .frame(width: 160)
+        }
         SettingsRow(title: "Appearance", explainer: "Follow the system setting, or force light/dark for this app only.") {
             Picker("", selection: $appearanceModeRaw) {
                 ForEach(AppAppearanceMode.allCases) { mode in

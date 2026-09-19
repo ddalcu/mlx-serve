@@ -2,7 +2,7 @@ import XCTest
 @testable import MLXCore
 
 /// Guards for Settings ▸ Interface wiring — the two places a display pref can
-/// silently stop applying: a window scene that forgets `.appAppearance()`,
+/// silently stop applying: a window scene that forgets `.appChrome()`,
 /// and the transcript, whose metrics read UserDefaults with no SwiftUI
 /// dependency of their own.
 final class AppearanceSettingsTests: XCTestCase {
@@ -14,17 +14,17 @@ final class AppearanceSettingsTests: XCTestCase {
         return try String(contentsOf: root.appendingPathComponent(relative), encoding: .utf8)
     }
 
-    /// `.appAppearance()` is applied per scene BY HAND, so a new `Window` can
+    /// `.appChrome()` is applied per scene BY HAND, so a new `Window` can
     /// forget it and ship a window that ignores Settings ▸ Interface — the
     /// same class as the window-injection rules.
-    func testEveryWindowSceneAppliesTheAppAppearance() throws {
+    func testEveryWindowSceneAppliesTheAppChrome() throws {
         let text = try source("Sources/MLXServe/MLXServeApp.swift")
         let scenes = text.components(separatedBy: "Window(\"").dropFirst()
         XCTAssertGreaterThanOrEqual(scenes.count, 4, "expected the app's window scenes to be found")
         for scene in scenes {
             let name = scene.prefix(while: { $0 != "\"" })
-            XCTAssertTrue(scene.contains(".appAppearance()"),
-                          "the \(name) window scene does not apply .appAppearance()")
+            XCTAssertTrue(scene.contains(".appChrome()"),
+                          "the \(name) window scene does not apply .appChrome()")
         }
     }
 

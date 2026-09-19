@@ -324,7 +324,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
 
     func show() {
         let panel = ensurePanel()
-        // The SwiftUI content forces its scheme via `.appAppearance()`, but
+        // The SwiftUI content forces its scheme via `.appChrome()`, but
         // the panel's own chrome — the NSVisualEffectView material — follows
         // the WINDOW's appearance, and forced-dark content over a
         // system-light vibrancy reads as a broken half-theme. Re-read per
@@ -453,7 +453,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         let hosting = NSHostingView(rootView: AnyView(
             QuickLauncherView(controller: self, engine: appState.chatEngine)
                 .environmentObject(appState)
-                .appAppearance()
+                .appChrome()
         ))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(hosting)

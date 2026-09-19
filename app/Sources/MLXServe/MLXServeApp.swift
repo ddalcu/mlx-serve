@@ -33,6 +33,22 @@ struct MLXCoreApp: App {
     /// The View ▸ Interface menu writes the same keys the Settings rows do.
     @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+    /// The command menus below are `LocalizedStringKey` literals, so SwiftUI
+    /// resolves them through `Bundle.main` when this body builds them — but
+    /// nothing here reads `LanguageLookupRevision` (the commands never call
+    /// `L10n`), so they have no invalidation of their own. This preference is
+    /// their refresh: `AppLanguage.select` swaps the bundle and then writes
+    /// the key, which invalidates this body and rebuilds Agent/Tools/… against
+    /// the new `.lproj`. Without it a live switch left the menus in the old
+    /// language until relaunch (when `init()` applies the bundle again).
+    @AppStorage(InterfacePrefKey.language) private var languageRaw = AppLanguage.system.rawValue
+    /// The menu bar and every `CommandMenu` are built before the first
+    /// window's `.appChrome()` runs, so the launch-time language is applied
+    /// here as well as per scene (both are cheap and idempotent).
+    init() {
+        BundleLanguageOverride.apply(AppLanguage.current)
+    }
+
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
     @ObservedObject private var browser = BrowserManager.shared
@@ -80,6 +96,12 @@ struct MLXCoreApp: App {
     }
 
     var body: some Scene {
+        // Read, not used: this is what ties the command menus built below to
+        // `languageRaw`, so a live switch re-evaluates this body (and rebuilds
+        // the menus) instead of waiting for the next launch. The window copy
+        // rides `LanguageLookupRevision`; the literal commands cannot.
+        let _ = languageRaw
+
         MenuBarExtra {
             StatusMenuView(
                 openChat: { appState.showChat() },
@@ -103,6 +125,10 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
                 .environmentObject(appState.voice)
+                // The tray popover is a surface like any other window: without
+                // this it would keep the system language while every window
+                // followed the setting.
+                .appChrome()
         } label: {
             // Observe the voice controller so the tray icon picks up the accent
             // tint the instant a hands-free session starts or stops.
@@ -181,7 +207,7 @@ struct MLXCoreApp: App {
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
                 }
-                .appAppearance()
+                .appChrome()
         }
         // Roomier than the old 900x650: this window is three things now
         // (transcript, model browser, media generators) and the two it gained
@@ -190,7 +216,7 @@ struct MLXCoreApp: App {
 
         Window("Browser", id: "browser") {
             BrowserView()
-                .appAppearance()
+                .appChrome()
         }
         .defaultSize(width: 1024, height: 768)
 
@@ -201,7 +227,7 @@ struct MLXCoreApp: App {
         Window("Server Log", id: "serverLog") {
             ServerLogWindowView()
                 .environmentObject(appState.server)
-                .appAppearance()
+                .appChrome()
         }
         .defaultSize(width: 900, height: 560)
 
@@ -213,7 +239,7 @@ struct MLXCoreApp: App {
             BenchmarkView()
                 .environmentObject(appState)
                 .environmentObject(appState.server)
-                .appAppearance()
+                .appChrome()
         }
         .defaultSize(width: 1040, height: 680)
 
@@ -224,7 +250,7 @@ struct MLXCoreApp: App {
                 ModelSettingsSheet(request: request)
                     .environmentObject(appState)
                     .environmentObject(appState.server)
-                    .appAppearance()
+                    .appChrome()
             }
         }
         .windowResizability(.contentSize)
@@ -241,7 +267,7 @@ struct MLXCoreApp: App {
                     .environmentObject(appState.server)
                     .environmentObject(appState.terminals)
                     .frame(minWidth: 560, minHeight: 360)
-                    .appAppearance()
+                    .appChrome()
             }
         }
         .defaultSize(width: 900, height: 600)
@@ -255,7 +281,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.agents)
                 .environmentObject(appState.server)
                 .frame(minWidth: 760, minHeight: 520)
-                .appAppearance()
+                .appChrome()
         }
         .defaultSize(width: 900, height: 640)
 

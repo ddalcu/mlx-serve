@@ -11,6 +11,8 @@ import AppKit
 enum InterfacePrefKey {
     static let appearanceMode = "appearanceMode"
     static let accentColor = "accentColorName"
+    /// UI language override; the raw values are `AppLanguage`'s.
+    static let language = "appLanguage"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
     static let chatColumn = "chatColumnWidth"
@@ -161,19 +163,42 @@ enum AppAccentColor: String, CaseIterable, Identifiable {
 /// HAND per scene, so a new scene CAN forget it; the scan in
 /// `AppearanceSettingsTests` is what catches that, the same reasoning as the
 /// window-injection rules in app/CLAUDE.md.
-struct AppAppearance: ViewModifier {
+///
+/// It carries the UI language as well as the appearance because a language is
+/// the same kind of setting — one choice, honored by every window — and both
+/// have to be applied at the same place: the `\.locale` environment here at
+/// the root (SwiftUI literals), and (through `BundleLanguageOverride`) the
+/// bundle lookup that `L10n` and AppKit read.
+///
+/// The language deliberately does NOT key a view's identity. An earlier cut
+/// ended in `.id(languageRaw)` to force `L10n` bodies to re-run; that also
+/// destroyed every descendant's `@State` (a half-typed composer draft, each
+/// scroll position). The invalidation now rides `LanguageLookupRevision`,
+/// which `L10n.text` reads inside the body, so observation re-runs exactly
+/// the views that built copy and leaves their state alone.
+struct AppChrome: ViewModifier {
     @AppStorage(InterfacePrefKey.appearanceMode) private var modeRaw = AppAppearanceMode.system.rawValue
     @AppStorage(InterfacePrefKey.accentColor) private var accentRaw = AppAccentColor.system.rawValue
+    @AppStorage(InterfacePrefKey.language) private var languageRaw = AppLanguage.system.rawValue
 
     func body(content: Content) -> some View {
         let mode = AppAppearanceMode(rawValue: modeRaw) ?? .system
         let accent = AppAccentColor(rawValue: accentRaw) ?? .system
+        let language = AppLanguage(rawValue: languageRaw) ?? .system
         content
             .preferredColorScheme(mode.colorScheme)
             .tint(accent.color)
+            // Re-resolving a literal is what an environment change is for; a
+            // view that merely re-renders with the same `Locale` value keeps
+            // the language it already resolved.
+            .environment(\.locale, language.locale ?? .autoupdatingCurrent)
+            // The swap itself (and the `L10n` invalidation) is ordered BEFORE
+            // the preference write that re-renders the views; see
+            // `AppLanguage.select`.
+            .onAppear { BundleLanguageOverride.apply(language) }
     }
 }
 
 extension View {
-    func appAppearance() -> some View { modifier(AppAppearance()) }
+    func appChrome() -> some View { modifier(AppChrome()) }
 }
