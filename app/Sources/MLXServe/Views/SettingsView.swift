@@ -375,6 +375,7 @@ private struct ResetDefaultsFooter: View {
                 ) {
                     Button("Reset", role: .destructive) {
                         appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                        CrashRecoveryMode.resetIfApplicable(selection)
                     }
                     .keyboardShortcut(.defaultAction)
                     Button("Cancel", role: .cancel) { }
@@ -1421,6 +1422,40 @@ private struct ServerSectionContent: View {
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
+        }
+        CrashRecoveryRow()
+    }
+}
+
+/// Crash recovery mode picker — app-level setting, not a server launch flag.
+private struct CrashRecoveryRow: View {
+    @State private var mode: CrashRecoveryMode = ServerManager.loadCrashRecoveryMode()
+
+    var body: some View {
+        SettingsRow(
+            title: "On crash",
+            explainer: "What to do when the server exits unexpectedly. Auto-restart retries up to \(CrashRecovery.maxRetries) times with backoff; memory failures always show the alert.",
+            isDirty: false
+        ) {
+            Picker("", selection: $mode) {
+                ForEach(CrashRecoveryMode.allCases) { m in
+                    Text(m.label).tag(m)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 200)
+            .onChange(of: mode) { _, newValue in
+                // Only persist when the effective value actually changed.
+                // This prevents the programmatic reset (onReceive below)
+                // from writing the default back after resetIfApplicable
+                // removed the key.
+                if ServerManager.loadCrashRecoveryMode() != newValue {
+                    UserDefaults.standard.set(newValue.rawValue, forKey: CrashRecoveryMode.defaultsKey)
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: CrashRecoveryMode.didResetNotification)) { _ in
+            mode = .defaultMode
         }
     }
 }

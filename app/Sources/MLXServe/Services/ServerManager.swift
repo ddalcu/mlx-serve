@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import UserNotifications
 
 @MainActor
 class ServerManager: ObservableObject {
@@ -68,6 +69,8 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
+    private var restartTask: Task<Void, Never>?
+    private var crashCounter = CrashRecovery.CounterState()
     let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
@@ -117,6 +120,14 @@ class ServerManager: ObservableObject {
 
     func start(modelPath: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
+
+        // Cancel any pending auto-restart — the user is taking over.
+        restartTask?.cancel()
+        restartTask = nil
+
+        // A manual start resets the crash counter so the next crash gets its
+        // full retry budget.
+        crashCounter.reset()
 
         let resolvedModel = Self.launchModelPath(modelPath)
         currentModelPath = resolvedModel
@@ -169,13 +180,11 @@ class ServerManager: ObservableObject {
     /// chat + image + audio + video under one memory budget.
     func startHeadless(modelsDir: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
+        restartTask?.cancel()
+        restartTask = nil
+        crashCounter.reset()
         currentModelPath = ""
-        // `modelsDir` is the caller's primary root; the rest of the library's
-        // folders ride along so a headless boot discovers everything the picker
-        // shows, not just one folder (`launchModelDirs` de-dups).
-        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
-        if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
-        let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
+        let args = Self.headlessArgs(modelsDir: modelsDir, options: options)
         launch(args: args, options: options)
     }
 
@@ -270,6 +279,8 @@ class ServerManager: ObservableObject {
     private var quitObserver: NSObjectProtocol?
 
     func stop() {
+        restartTask?.cancel()
+        restartTask = nil
         pollSource?.cancel()
         pollSource = nil
         healthTask?.cancel()
@@ -359,9 +370,13 @@ class ServerManager: ObservableObject {
     /// memory branches of `summarizeCrash`; drives the "here's what's using
     /// memory" advice in the crash alert. Pure + testable.
     nonisolated static func isMemoryFailure(_ log: String) -> Bool {
-        if log.contains("Insufficient memory to load model") { return true }
-        return log.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
-            || (log.contains("[METAL]") && log.localizedCaseInsensitiveContains("Insufficient Memory"))
+        let lines = log.split(whereSeparator: \.isNewline).map(String.init)
+            .filter { !isRequestPreviewLine($0) }
+        return lines.contains { $0.contains("Insufficient memory to load model") }
+            || lines.contains {
+                $0.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+                    || ($0.contains("[METAL]") && $0.localizedCaseInsensitiveContains("Insufficient Memory"))
+            }
     }
 
     private func handleTermination(exitCode: Int32) {
@@ -373,26 +388,112 @@ class ServerManager: ObservableObject {
         healthTimer = nil
         process = nil
 
-        // Read straight from the locked buffer — the throttled `serverLog`
-        // can be up to one flush-interval (~100 ms) behind, which on a fast
-        // crash means we'd present the alert before the fatal stderr line
-        // made it to @Published.
         let errSnippet = currentServerLogSnapshot()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shortErr = Self.summarizeCrash(errSnippet, exitCode: exitCode)
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
-        if case .running = status {
+        let wasRunning: Bool
+        if case .running = status { wasRunning = true }
+        else { wasRunning = false }
+
+        // Startup failures always show the modal — the config is likely wrong.
+        guard wasRunning else {
+            if case .starting = status {
+                status = .error("Failed to start")
+                lastError = shortErr
+                presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
+            } else {
+                status = .stopped
+            }
+            return
+        }
+
+        // Manage the crash counter with a sliding window.
+        crashCounter.recordCrash()
+
+        let mode = Self.loadCrashRecoveryMode()
+        let memFail = Self.isMemoryFailure(fullLog)
+        let shouldRestart = CrashRecovery.shouldAutoRestart(
+            mode: mode, wasRunning: true, exitCode: exitCode,
+            isMemoryFailure: memFail,
+            crashCount: crashCounter.count, maxRetries: CrashRecovery.maxRetries
+        )
+
+        guard shouldRestart else {
             status = .error("Exited unexpectedly")
             lastError = shortErr
             presentCrashAlert(title: "mlx-serve exited unexpectedly", log: fullLog, exitCode: exitCode)
-        } else if case .starting = status {
-            status = .error("Failed to start")
-            lastError = shortErr
-            presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
-        } else {
-            status = .stopped
+            return
         }
+
+        // Auto-restart path.
+        let delay = CrashRecovery.backoffDelay(attempt: crashCounter.count)
+        let attempt = crashCounter.count
+        status = .error("Restarting in \(Int(delay))s (\(attempt)/\(CrashRecovery.maxRetries))")
+        lastError = shortErr
+
+        if mode == .autoRestart {
+            sendCrashNotification(attempt: attempt, delay: delay)
+        }
+
+        restartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled else { return }
+            guard let opts = self.lastLaunchedOptions else {
+                self.status = .error("Cannot restart — no saved launch options")
+                return
+            }
+            // A manual start during the backoff cancels restartTask and
+            // launches its own process.  If that happened, bail out.
+            guard case .error = self.status else { return }
+
+            // Call launch() directly — NOT start()/startHeadless(), which
+            // reset the crash counter.  The counter must accumulate across
+            // auto-restart cycles so it eventually reaches maxRetries.
+            var args: [String]
+            if self.currentModelPath.isEmpty {
+                args = Self.headlessArgs(modelsDir: "", options: opts)
+            } else {
+                args = ["--model", self.currentModelPath]
+                args += opts.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: self.currentModelPath))
+            }
+            self.launch(args: args, options: opts)
+            self.scheduleStabilityReset()
+        }
+    }
+
+    /// After stable uptime, reset the crash counter so a one-off crash
+    /// hours later gets its full retry budget.
+    private func scheduleStabilityReset() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(CrashRecovery.stableThreshold))
+            guard let self else { return }
+            if case .running = self.status {
+                self.crashCounter.reset()
+            }
+        }
+    }
+
+    private func sendCrashNotification(attempt: Int, delay: TimeInterval) {
+        // UNUserNotificationCenter crashes with no bundle identifier
+        // (e.g. under `swift test`). Same guard as TaskNotifier.
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "mlx-serve crashed"
+        content.body = "Restarting automatically (\(attempt)/\(CrashRecovery.maxRetries)) in \(Int(delay))s…"
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: "crash-restart-\(attempt)",
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+
+    nonisolated static func loadCrashRecoveryMode() -> CrashRecoveryMode {
+        guard let raw = UserDefaults.standard.string(forKey: CrashRecoveryMode.defaultsKey),
+              let mode = CrashRecoveryMode(rawValue: raw) else {
+            return .defaultMode
+        }
+        return mode
     }
 
     // MARK: - Server log (throttled)
@@ -534,7 +635,7 @@ class ServerManager: ObservableObject {
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       json["status"] as? String == "ok" else { return }
                 DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
+                    guard let self, self.process != nil else { return }
                     if self.status != .running {
                         self.transitionToRunning()
                     }
@@ -770,6 +871,14 @@ class ServerManager: ObservableObject {
     /// path fell through to the MLX directory loader and died `NotDir` (#158).
     nonisolated static func launchModelPath(_ selected: String) -> String {
         (selected as NSString).standardizingPath
+    }
+
+    /// Build the argv for a headless launch.  Shared by `startHeadless()`
+    /// and the auto-restart path so the two cannot diverge.
+    private static func headlessArgs(modelsDir: String, options: ServerOptions) -> [String] {
+        var dirs = ModelRoots().scanRoots(toolRoots: ToolModelRoots.detected())
+        if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
+        return options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
     }
 
     /// Every `--model-dir` a launch should carry: all configured library
