@@ -411,6 +411,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
     addMlxLib(b, mod);
+    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
+    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
 
     // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
     mod.linkSystemLibrary("webp", .{});
@@ -449,6 +453,17 @@ fn verifyMlxStageLinux(b: *std.Build) void {
         );
         std.process.exit(1);
     }
+    // The server embeds files from the opencode2 submodule
+    // (lib/opencode2_plugin.zig @embedFile). A missing checkout surfaces as a
+    // cryptic FileNotFound mid-compile, so check it at configure time.
+    buildRootHandle(b).access(b.graph.io, "lib/opencode2-mlx-serve/LICENSE", .{}) catch {
+        std.debug.print(
+            "\n[mlx-serve] lib/opencode2-mlx-serve is not checked out. Run:\n" ++
+                "  git submodule update --init lib/opencode2-mlx-serve\n\n",
+            .{},
+        );
+        std.process.exit(1);
+    };
 }
 
 /// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),
