@@ -19,6 +19,7 @@
 | **K2-Horizon** | `k2_horizon` | IFM K2-Horizon dense (0.9B / 3.7B / 7B / 32B, [7B oQ6e](https://huggingface.co/mlx-community/K2-Horizon-7B-oQ6e)) | IFM tags, thinking default on | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
 | **LFM2 / LFM2.5** | `lfm2`, `lfm2_vl` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4), LFM2.5-VL 3B / 1.6B | ChatML, Pythonic tool calls | SigLIP2, big images tiled |
+| **MiniCPM-V 4.6** | `minicpmv4_6` | openbmb MiniCPM-V 4.6 (SigLIP2-400M + Qwen3.5-0.8B trunk; e.g. [`mlx-community/MiniCPM-V-4.6-4bit`](https://huggingface.co/mlx-community/MiniCPM-V-4.6-4bit)) | ChatML, Hermes-style tool calls | SigLIP2, sliced into a source view + up to 9 slices (16x token compression); video = frames as sliced views |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
 | **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, mxbai, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |

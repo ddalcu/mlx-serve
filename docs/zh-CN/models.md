@@ -19,6 +19,7 @@
 | **K2-Horizon** | `k2_horizon` | IFM K2-Horizon dense（0.9B / 3.7B / 7B / 32B，[7B oQ6e](https://huggingface.co/mlx-community/K2-Horizon-7B-oQ6e)） | IFM 标签，思考默认开启 | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
 | **LFM2 / LFM2.5** | `lfm2`, `lfm2_vl` | LFM2.5-2.6B（8-bit、bf16、nvfp4、mxfp4），LFM2.5-VL 3B / 1.6B | ChatML，Python 风格工具调用 | SigLIP2，大图切片 |
+| **MiniCPM-V 4.6** | `minicpmv4_6` | openbmb MiniCPM-V 4.6（SigLIP2-400M + Qwen3.5-0.8B 主干；例如 [`mlx-community/MiniCPM-V-4.6-4bit`](https://huggingface.co/mlx-community/MiniCPM-V-4.6-4bit)） | ChatML，Hermes 风格工具调用 | SigLIP2，切为源视图 + 最多 9 个切片（16x token 压缩）；视频按帧处理为切片视图 |
 | **Llama** | `llama` | Llama 3、Llama 3.1、Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral 轮次 | -- |
 | **嵌入** | `bert`, `gemma3_text`, `qwen3` | bge、mxbai、EmbeddingGemma、Qwen3-Embedding（池化方式从检查点读取） | n/a | -- |

@@ -8,6 +8,7 @@
 - **Bonsai 2 runs in its own numerics.** f16 activations over the pack's f16 scales and an f32 GatedDeltaNet state, as Prism's reference runtime does: 60x closer to an f32 reference of the pack than the old bf16 path (KL 2.9e-6 vs 1.7e-4), same speed.
 
 ### Changes
+- **MiniCPM-V 4.6 runs natively** (SigLIP2-400M tower + Qwen3.5-0.8B trunk, e.g. `mlx-community/MiniCPM-V-4.6-4bit`): images are sliced into a source view plus up to 9 slices, served on the qwen3_5 arch with batched decode.
 - Qwen3.8 family: a thinking request that names no `reasoning_effort` renders as low and now gets low's 2048-token budget on chat, messages and responses; an explicit effort or `--reasoning-budget` still wins.
 - `/v1/responses` enforces the reasoning budget (effort word or `reasoning_budget_tokens`) like chat; a capped thought used to run until `max_output_tokens`.
 - Logprobs are computed in f32: f16-logit models returned `-inf`/NaN (invalid JSON) and bf16 ones were rounded.
