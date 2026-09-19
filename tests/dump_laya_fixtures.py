@@ -4,10 +4,11 @@ Run from the laya example dir that has laya_mlx installed:
   cd /Users/sbusso/Code/dev/laya && USE_TF=0 uv run mlx-serve-laya/mlx-serve/tests/dump_laya_fixtures.py
 
 Writes tests/fixtures/laya/:
-  cases.json        3 states x 3 questions: token ids, markers, qtype, expected answers
+  cases.json        6 states x 3 questions: token ids, markers, qtype, expected answers
   encoder_en_q0.npy float32 [T, 768] final-norm encoder output for case en/department
   head_en_q0.npy    float32 [T, 768] decision-head output (after type_emb + head layers)
   logits_en_q0.npy  float32 [K] raw scorer logits; act_en_q0.npy float32 [2]
+  tokenizer_cases.json  HF `tokenizers` ids + decode for out-of-vocab scripts (byte fallback)
 """
 import json, os, sys
 import numpy as np
@@ -30,6 +31,26 @@ STATES = {
     "en": {"body": "I was charged twice for March. Please refund the duplicate."},
     "fr": {"body": "J'ai été facturé deux fois en mars. Merci de rembourser le doublon."},
     "hi": {"body": "मुझसे मार्च के लिए दो बार शुल्क लिया गया। कृपया डुप्लिकेट वापस करें।"},
+    # Characters with no vocab entry (CJK ext-B, Buginese, Cuneiform, a 2024
+    # emoji): the tokenizer's byte fallback (<0xNN> tokens) is on the path.
+    "cjk_extb": {"subject": "𠀋 invoice", "body": "Name field shows 𪚥 instead of my name. Fix it, not urgent."},
+    "mixed_scripts": {"body": "Réservation ᨀᨕ 👨\u200d👩\u200d👧 double booked 🫩 — refund or I cancel! 東京→Paris"},
+    "cuneiform": {"body": "𒀀𒁀 renders as boxes in the PDF export, blocking our release."},
+}
+
+# HF `tokenizers` reference for the byte-fallback unit test in src/tokenizer.zig.
+TOKENIZER_TEXTS = {
+    "emoji": "I love it 😀🎉🚀",
+    "emoji_2024": "new face 🫩 and 🪾",
+    "cjk_extb": "古文字 𠀋 𪚥 test",
+    "khmer": "ភាសាខ្មែរ is Khmer",
+    "buginese": "Buginese ᨀᨕ script",
+    "cuneiform": "𒀀𒁀𒂀 clay",
+    "zwj": "family 👨\u200d👩\u200d👧\u200d👦 flag 🏳️\u200d🌈",
+    "mixed": "Réservation #42: 東京 → Paris 🗼 (ok?) ᨀᨕ 𠀋",
+    "combining": "e\u0301 a\u0308 z\u0335",
+    "control": "tab\there\x01x",
+    "private_use": "pua \ue000\uf8ff end",
 }
 
 agent = laya_mlx.load("aac6fef/laya-multilingual-mlx")
@@ -45,6 +66,17 @@ for lang, state in STATES.items():
     print(lang, json.dumps(result["answers"], ensure_ascii=False))
 json.dump({"model_dir": str(agent.model_dir), "questions": QUESTIONS, "states": STATES, "cases": cases},
           open(os.path.join(OUT, "cases.json"), "w"), ensure_ascii=False, indent=1)
+
+from tokenizers import Tokenizer
+hf_tok = Tokenizer.from_file(os.path.join(str(agent.model_dir), "tokenizer", "tokenizer.json"))
+tok_cases = []
+for name, text in TOKENIZER_TEXTS.items():
+    enc = hf_tok.encode(text, add_special_tokens=False)
+    tok_cases.append({"name": name, "text": text, "ids": enc.ids,
+                      "byte_tokens": sum(1 for t in enc.tokens if t.startswith("<0x")),
+                      "decoded": hf_tok.decode(enc.ids, skip_special_tokens=False)})
+    print("tok", name, len(enc.ids), "byte tokens", tok_cases[-1]["byte_tokens"])
+json.dump(tok_cases, open(os.path.join(OUT, "tokenizer_cases.json"), "w"), ensure_ascii=False, indent=1)
 
 # Intermediate tensors for case 0 (en / department), batch of one.
 items, _ = agent.prepare(STATES["en"], QUESTIONS)

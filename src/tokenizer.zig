@@ -90,6 +90,16 @@ pub const Tokenizer = struct {
     /// (kept with the following piece) before BPE (`split: true`).
     metaspace_prepend: bool = false,
     metaspace_split: bool = false,
+    /// HF BPE `byte_fallback`: a character with no vocab entry becomes its
+    /// UTF-8 bytes as `<0xNN>` tokens (all must exist, else `unk_token`);
+    /// consecutive unks fuse when `fuse_unk`. Gemma / mmBERT class.
+    byte_fallback: bool = false,
+    fuse_unk: bool = false,
+    unk_id: ?u32 = null,
+    /// tokenizer.json decoder carries `ByteFallback`: runs of `<0xNN>`
+    /// tokens decode as the bytes they spell (U+FFFD per byte when the run
+    /// is not valid UTF-8).
+    byte_fallback_decode: bool = false,
     /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
@@ -427,11 +437,22 @@ pub const Tokenizer = struct {
         var result: std.ArrayList(u8) = .empty;
         defer result.deinit(allocator);
 
+        // `ByteFallback` decoder: a run of `<0xNN>` tokens is one byte string,
+        // appended verbatim when it is valid UTF-8, else U+FFFD per byte.
+        var pending: std.ArrayList(u8) = .empty;
+        defer pending.deinit(allocator);
         for (ids) |id| {
-            if (self.id_to_token.get(id)) |token| {
-                try result.appendSlice(allocator, token);
+            const token = self.id_to_token.get(id) orelse continue;
+            if (self.byte_fallback_decode) {
+                if (byteTokenValue(token)) |b| {
+                    try pending.append(allocator, b);
+                    continue;
+                }
+                try flushByteRun(allocator, &result, &pending);
             }
+            try result.appendSlice(allocator, token);
         }
+        try flushByteRun(allocator, &result, &pending);
 
         // Replace ▁ (0xE2 0x96 0x81) with space
         var output = try allocator.alloc(u8, result.items.len);
@@ -742,6 +763,8 @@ pub const Tokenizer = struct {
             const sym = input[n.start..n.end];
             if (self.vocab.get(sym)) |id| {
                 try ids.append(allocator, id);
+            } else if (self.byte_fallback) {
+                try self.appendByteFallback(allocator, &ids, sym);
             } else {
                 // Unknown token — try to encode individual bytes
                 for (sym) |byte| {
@@ -756,6 +779,30 @@ pub const Tokenizer = struct {
         }
 
         return ids.toOwnedSlice(allocator);
+    }
+
+    /// `BPE::merge_word` with `byte_fallback`: `sym` (one character HF found
+    /// no vocab entry for) becomes one `<0xNN>` id per byte when every byte
+    /// token exists, else the unk id — fused with a directly preceding unk
+    /// when `fuse_unk`.
+    fn appendByteFallback(self: *const Tokenizer, allocator: std.mem.Allocator, ids: *std.ArrayList(u32), sym: []const u8) !void {
+        var byte_ids: [4]u32 = undefined;
+        var all = sym.len <= byte_ids.len;
+        if (all) for (sym, 0..) |byte, i| {
+            var name: [6]u8 = undefined;
+            const key = std.fmt.bufPrint(&name, "<0x{X:0>2}>", .{byte}) catch unreachable;
+            byte_ids[i] = self.vocab.get(key) orelse {
+                all = false;
+                break;
+            };
+        };
+        if (all) {
+            try ids.appendSlice(allocator, byte_ids[0..sym.len]);
+            return;
+        }
+        const unk = self.unk_id orelse return;
+        if (self.fuse_unk and ids.items.len > 0 and ids.items[ids.items.len - 1] == unk) return;
+        try ids.append(allocator, unk);
     }
 };
 
@@ -1415,6 +1462,10 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
         .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else false,
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
+        .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
+        .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
+        .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
+        .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -1534,6 +1585,36 @@ const MetaspaceOpts = struct { prepend: bool = false, split: bool = false };
 /// `Metaspace` pre-tokenizer options from tokenizer.json (top-level or inside
 /// a `Sequence`). Absent → both false, which is the pre-existing behaviour
 /// (Gemma 4's `Split " " MergedWithPrevious` never reaches here).
+/// `<0xNN>` -> NN, null for any other token.
+fn byteTokenValue(token: []const u8) ?u8 {
+    if (token.len != 6 or !std.mem.startsWith(u8, token, "<0x") or token[5] != '>') return null;
+    return std.fmt.parseInt(u8, token[3..5], 16) catch null;
+}
+
+fn flushByteRun(allocator: std.mem.Allocator, out: *std.ArrayList(u8), pending: *std.ArrayList(u8)) !void {
+    if (pending.items.len == 0) return;
+    if (std.unicode.utf8ValidateSlice(pending.items)) {
+        try out.appendSlice(allocator, pending.items);
+    } else {
+        for (pending.items) |_| try out.appendSlice(allocator, "\xef\xbf\xbd");
+    }
+    pending.clearRetainingCapacity();
+}
+
+/// True when the tokenizer.json `decoder` is `ByteFallback` or a `Sequence`
+/// containing one.
+fn decoderHasByteFallback(dec: std.json.Value) bool {
+    if (dec != .object) return false;
+    const t = dec.object.get("type") orelse return false;
+    if (t == .string and std.mem.eql(u8, t.string, "ByteFallback")) return true;
+    if (t == .string and std.mem.eql(u8, t.string, "Sequence")) {
+        const subs = dec.object.get("decoders") orelse return false;
+        if (subs != .array) return false;
+        for (subs.array.items) |sub| if (decoderHasByteFallback(sub)) return true;
+    }
+    return false;
+}
+
 fn metaspaceFromPreTokenizer(pt: std.json.Value) MetaspaceOpts {
     if (pt != .object) return .{};
     const t = pt.object.get("type") orelse return .{};
@@ -2365,6 +2446,152 @@ test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
     const ids = try tok.bpeMerge(allocator, "az");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
+}
+
+test "byte_fallback: an unknown character becomes its UTF-8 bytes as <0xNN> tokens; missing byte token -> fused unk" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("a", 1);
+    try vocab.put("<unk>", 3);
+    try vocab.put("<0xF0>", 10);
+    try vocab.put("<0xA0>", 11);
+    try vocab.put("<0x80>", 12);
+    try vocab.put("<0x8B>", 13);
+    try vocab.put("<0xE1>", 14);
+    try vocab.put("<0xA8>", 15);
+    // 'z' is NOT in vocab and neither is <0x7A>: unk.
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+    tok.byte_fallback = true;
+    tok.fuse_unk = true;
+    tok.unk_id = 3;
+
+    // U+2000B (CJK ext-B) = F0 A0 80 8B.
+    const cjk = try tok.bpeMerge(allocator, "a\xf0\xa0\x80\x8ba");
+    defer allocator.free(cjk);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 10, 11, 12, 13, 1 }, cjk);
+
+    // U+1A00 = E1 A8 80 -> bytes; 'z' twice -> ONE fused unk, then a lone unk.
+    const mixed = try tok.bpeMerge(allocator, "zz\xe1\xa8\x80z");
+    defer allocator.free(mixed);
+    try testing.expectEqualSlices(u32, &[_]u32{ 3, 14, 15, 12, 3 }, mixed);
+
+    // Without fuse_unk every unknown char is its own unk.
+    tok.fuse_unk = false;
+    const unfused = try tok.bpeMerge(allocator, "zz");
+    defer allocator.free(unfused);
+    try testing.expectEqualSlices(u32, &[_]u32{ 3, 3 }, unfused);
+}
+
+test "ByteFallback decoder: <0xNN> runs decode as bytes, invalid runs as U+FFFD per byte, other tokens verbatim" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(1, "\xe2\x96\x81a");
+    try id_to_token.put(10, "<0xF0>");
+    try id_to_token.put(11, "<0xA0>");
+    try id_to_token.put(12, "<0x80>");
+    try id_to_token.put(13, "<0x8B>");
+    try id_to_token.put(20, "<0x00>");
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    // Decoder flag off: the token strings leak through (legacy behaviour).
+    const raw = try tok.decode(allocator, &[_]u32{ 1, 10, 11, 12, 13 }, false);
+    defer allocator.free(raw);
+    try testing.expectEqualStrings(" a<0xF0><0xA0><0x80><0x8B>", raw);
+
+    tok.byte_fallback_decode = true;
+    const ok = try tok.decode(allocator, &[_]u32{ 1, 10, 11, 12, 13, 1 }, false);
+    defer allocator.free(ok);
+    try testing.expectEqualStrings(" a\xf0\xa0\x80\x8b a", ok);
+
+    // Truncated sequence F0 A0 + NUL byte: invalid as a whole -> three U+FFFD.
+    const bad = try tok.decode(allocator, &[_]u32{ 10, 11, 20, 1 }, false);
+    defer allocator.free(bad);
+    try testing.expectEqualStrings("\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbd a", bad);
+
+    try testing.expectEqual(@as(?u8, 0xF0), byteTokenValue("<0xF0>"));
+    try testing.expectEqual(@as(?u8, null), byteTokenValue("<0xF>"));
+    try testing.expectEqual(@as(?u8, null), byteTokenValue("<0xGG>"));
+    try testing.expectEqual(@as(?u8, null), byteTokenValue("\xe2\x96\x81a"));
+}
+
+test "decoderHasByteFallback: Sequence containing ByteFallback, bare ByteFallback, others" {
+    const allocator = testing.allocator;
+    const seq = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"Sequence","decoders":[{"type":"Replace","pattern":{"String":"▁"},"content":" "},{"type":"ByteFallback"},{"type":"Fuse"}]}
+    , .{});
+    defer seq.deinit();
+    try testing.expect(decoderHasByteFallback(seq.value));
+    const bare = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"ByteFallback\"}", .{});
+    defer bare.deinit();
+    try testing.expect(decoderHasByteFallback(bare.value));
+    const bl = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"ByteLevel\"}", .{});
+    defer bl.deinit();
+    try testing.expect(!decoderHasByteFallback(bl.value));
+}
+
+test "byte_fallback: real Laya tokenizer matches HF `tokenizers` on out-of-vocab scripts (LAYA_TEST_MODEL)" {
+    // tests/fixtures/laya/tokenizer_cases.json is dumped by
+    // tests/dump_laya_fixtures.py from the Python `tokenizers` library.
+    const model = std.c.getenv("LAYA_TEST_MODEL") orelse return error.SkipZigTest;
+    const fx = std.c.getenv("LAYA_FIXTURES") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{std.mem.span(model)});
+    defer allocator.free(tok_dir);
+    var tok = try loadTokenizer(io, allocator, tok_dir);
+    defer tok.deinit();
+    try testing.expect(tok.byte_fallback);
+    try testing.expect(tok.byte_fallback_decode);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_cases.json", .{std.mem.span(fx)});
+    defer allocator.free(path);
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const text = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    defer allocator.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+
+    var byte_cases: usize = 0;
+    for (parsed.value.array.items) |c| {
+        const name = c.object.get("name").?.string;
+        const input = c.object.get("text").?.string;
+        const want = c.object.get("ids").?.array.items;
+        const ids = try tok.encode(allocator, input);
+        defer allocator.free(ids);
+        var same = ids.len == want.len;
+        if (same) for (ids, want) |g, w| {
+            if (g != @as(u32, @intCast(w.integer))) same = false;
+        };
+        if (!same) {
+            std.debug.print("\n[byte-fallback] {s}: got {any}\n                want {any}\n", .{ name, ids, want });
+            return error.TokenizationMismatch;
+        }
+        if (c.object.get("byte_tokens").?.integer > 0) byte_cases += 1;
+        const decoded = try tok.decode(allocator, ids, false);
+        defer allocator.free(decoded);
+        try testing.expectEqualStrings(c.object.get("decoded").?.string, decoded);
+    }
+    try testing.expect(byte_cases >= 3);
+    std.debug.print("\n[byte-fallback] {d} cases match HF tokenizers ({d} exercise byte tokens)\n", .{ parsed.value.array.items.len, byte_cases });
 }
 
 test "parseMergePair handles both array and space-joined-string formats" {
