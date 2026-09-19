@@ -66,5 +66,10 @@ final class RestoreGeometryTests: XCTestCase {
         let crop = RestoreGeometry.centeredCrop(width: 905, height: 960)
         XCTAssertEqual(crop, RestoreGeometry.CropRect(x: 4, y: 0, width: 896, height: 960))
         XCTAssertNil(RestoreGeometry.centeredCrop(width: 896, height: 960))
+        // Below 16 there is no crop that snaps DOWN onto the grid, so there is
+        // no rect to offer — never one bigger than the picture at a negative
+        // origin, which is what snapping up would produce.
+        XCTAssertNil(RestoreGeometry.centeredCrop(width: 10, height: 10))
+        XCTAssertNil(RestoreGeometry.centeredCrop(width: 900, height: 10))
     }
 }

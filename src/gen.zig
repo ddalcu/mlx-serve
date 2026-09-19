@@ -4121,6 +4121,11 @@ pub fn handleUpscaleVideo(allocator: std.mem.Allocator, conn: *Conn, body: []con
     // every frame and runs out of memory long before a still of the same size.
     if (restoreMemoryRefusal(&rbuf, nf, fw, fh, metrics.getAvailableMemBytes())) |msg|
         return sendError(conn, 400, msg);
+    // Restoration answers ONE JSON body like every other video route, and the
+    // memory gate above goes quiet when free RAM cannot be measured — so the
+    // transport cap is billed here too, before any denoise step.
+    if (videoRgbTransportReason(nf, fw, fh)) |reason|
+        return sendError(conn, 400, reason);
     const lat = seedvr2_shape.latentShape(.{}, nf, fh, fw) orelse
         return sendError(conn, 400, "unsupported clip geometry");
 
@@ -5066,8 +5071,12 @@ test "a restore too big for free memory is refused, not silently ruined" {
     try testing.expect(restoreMemoryRefusal(&buf, 17, 512, 512, 2 * gb) != null);
 
     // Unknown free memory (the sysctl failed) must not refuse everything —
-    // a gate that cannot measure has nothing to say.
+    // a gate that cannot measure has nothing to say. The transport cap is what
+    // still bounds a restored clip there: 17 frames of 4000x4000 is 816 MB of
+    // raw RGB in one JSON body, past the 768 MB a response carries.
     try testing.expect(restoreMemoryRefusal(&buf, 1, 2048, 2048, 0) == null);
+    try testing.expect(videoRgbTransportReason(17, 4000, 4000) != null);
+    try testing.expect(videoRgbTransportReason(17, 512, 512) == null);
 }
 
 test "seedvr2's residency bill follows the LOAD dtype, not the file sizes" {

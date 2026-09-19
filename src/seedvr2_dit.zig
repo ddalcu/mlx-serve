@@ -1341,7 +1341,10 @@ fn attention(
     const inv = mlx.mlx_array_new_float(1.0 / @as(f32, @floatFromInt(plan.windows.len)));
     defer _ = mlx.mlx_array_free(inv);
     const txt_mean = try mulA(txt_acc, inv, s);
+    // Reset AT the free: the errdefer above is still live over the fallible
+    // ops below, and would otherwise free this handle a second time.
     _ = mlx.mlx_array_free(txt_acc);
+    txt_acc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(txt_mean);
 
     const total_v: c_int = mlx.getShape(vid_out)[0];
@@ -1349,10 +1352,9 @@ fn attention(
     defer _ = mlx.mlx_array_free(vflat);
     const tflat = try reshape(txt_mean, &[_]c_int{ txt_len, heads * hd }, s);
     defer _ = mlx.mlx_array_free(tflat);
-    return .{
-        .vid = try linT(vflat, &vs.out_wt, vs.out_b, s),
-        .txt = try linT(tflat, &ts.out_wt, ts.out_b, s),
-    };
+    const vid_proj = try linT(vflat, &vs.out_wt, vs.out_b, s);
+    errdefer _ = mlx.mlx_array_free(vid_proj);
+    return .{ .vid = vid_proj, .txt = try linT(tflat, &ts.out_wt, ts.out_b, s) };
 }
 
 fn runBlock(

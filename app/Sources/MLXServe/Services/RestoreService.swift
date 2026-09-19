@@ -23,6 +23,10 @@ enum RestoreGeometry {
     /// when it's already there. Centered so a portrait crop takes evenly off
     /// both sides rather than favoring one edge.
     static func centeredCrop(width: Int, height: Int) -> CropRect? {
+        // `snap` floors at 16, so a source below that would snap UP and yield a
+        // rect larger than the picture at a negative origin. There is no crop
+        // that puts it on the grid — the server's geometry 400 is the answer.
+        guard width >= 16, height >= 16 else { return nil }
         let w = snap(width), h = snap(height)
         guard w != width || h != height else { return nil }
         return CropRect(x: (width - w) / 2, y: (height - h) / 2, width: w, height: h)
