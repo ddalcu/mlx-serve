@@ -431,13 +431,37 @@
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
-      <li><a href="../#explore" class="hide-mobile">Deep dives</a></li>
-      <li><a href="../#performance" class="hide-mobile">Performance</a></li>
-      <li><a href="../#features" class="hide-mobile">Features</a></li>
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Overview <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu">
+          <li><a href="../#explore">Deep dives</a></li>
+          <li><a href="../#performance">Performance</a></li>
+          <li><a href="../#features">Features</a></li>
+          <li><a href="../#faq">FAQ</a></li>
+        </ul>
+      </li>
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Features <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu nav-submenu-wide">
+          <li><a href="../onboarding/">Getting started</a></li>
+          <li><a href="../image-generation/">Image generation</a></li>
+          <li><a href="../video-generation/">Video generation</a></li>
+          <li><a href="../music-generation/">Music generation</a></li>
+          <li><a href="../3d-generation/">3D generation</a></li>
+          <li><a href="../voice-cloning/">Voice cloning</a></li>
+          <li><a href="../claude-code-local/">Claude Code, local</a></li>
+          <li><a href="../local-ai-assistant/">AI assistant</a></li>
+          <li><a href="../agent-sandbox/">Agent sandbox</a></li>
+          <li><a href="../speculative-decoding/">Speculative decoding</a></li>
+          <li><a href="../tool-calling/">Tool calling</a></li>
+          <li><a href="../lm-studio-alternative/">vs LM Studio</a></li>
+          <li><a href="../ollama-alternative/">vs Ollama</a></li>
+        </ul>
+      </li>
       <li><a href="../api/" class="hide-mobile">API</a></li>
       <li><a href="../cli/" class="hide-mobile">CLI</a></li>
       <li><a href="./" class="hide-mobile nav-current">Tier list</a></li>
-      <li><a href="../#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="../benchmarks/" class="hide-mobile">Benchmarks</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl nav-dl-desktop">Download</a></li>
       <li><a href="https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518" class="nav-appstore" target="_blank" rel="noopener"><img src="../assets/appstore.svg" alt="Download on the App Store" width="120" height="40"></a></li>
@@ -661,8 +685,8 @@
     { id: "gemma-4-12b",      name: "Gemma 4 12B",       params: "12B",          sizeGb: 7.0, minRam: 16,  tags: ["vision"], downloads: 0, paramsB: 12,  activeB: 12 },
     { id: "gemma-4-26b-a4b",  name: "Gemma 4 26B-A4B",   params: "26B (4B act)", sizeGb: 15,  minRam: 24,  tags: ["moe", "vision", "fast"], downloads: 0, paramsB: 25.2, activeB: 3.8 },
     { id: "gemma-4-31b",      name: "Gemma 4 31B",       params: "31B",          sizeGb: 17.4, minRam: 32, tags: ["vision"], downloads: 0, paramsB: 30.7, activeB: 30.7 },
-    { id: "qwen3.6-27b",      name: "Qwen3.6 27B",       params: "27B",          sizeGb: 15.5, minRam: 24, tags: [], downloads: 0, paramsB: 27.8, activeB: 27.8 },
     { id: "qwen3.8-27b",      name: "Qwen3.8 27B",       params: "27B",          sizeGb: 18.2, minRam: 24, tags: ["vision"], downloads: 0, paramsB: 27.8, activeB: 27.8 },
+    { id: "qwen3.8-flash-next", name: "Qwen3.8 Flash Next", params: "125B (6B act)", sizeGb: 70, minRam: 96, tags: ["moe", "vision"], downloads: 0, paramsB: 125, activeB: 6 },
     { id: "muse-glimmer-30b", name: "Muse-Glimmer 30B",  params: "30B",          sizeGb: 21.4, minRam: 32, tags: ["vision"], downloads: 0, paramsB: 30, activeB: 30 },
     { id: "qwen3.6-35b-a3b",  name: "Qwen3.6 35B-A3B",   params: "35B (3B act)", sizeGb: 20,  minRam: 32,  tags: ["moe", "fast"], downloads: 0, paramsB: 36, activeB: 3 },
     { id: "llama-3.3-70b",    name: "Llama 3.3 70B",     params: "70B",          sizeGb: 40,  minRam: 64,  tags: [], downloads: 0, paramsB: 70,  activeB: 70 },
@@ -694,7 +718,7 @@
   // phi, gemma2, …) are deliberately absent — see MODERN_FLOOR too.
   const LISTED_ARCHS = new Set(["gemma4", "gemma4_text", "diffusion_gemma",
     "gemma3", "gemma3_text", "qwen3", "qwen3_5", "qwen3_5_moe",
-    "qwen3_5_moe_text", "qwen3_next", "qwen3_moe", "qwen3_vl", "qwen3_vl_moe",
+    "qwen3_5_moe_text", "qwen3_next", "qwen3_moe", "qwen3_vl", "qwen3_vl_moe", "qwen4_exp",
     "nemotron_h", "lfm2", "lfm2_vl", "hy_v3", "llama", "mistral",
     "muse_glimmer", "muse_glimmer_text", "bailing_hybrid",
     "gpt_oss", "deepseek_v4", "glm_moe_dsa", "glm4_moe_lite", "glm4_moe",
@@ -808,7 +832,7 @@
       const sizeGb = Math.max(0.1, Math.round(g.params * 0.5625 / 1e9 * 10) / 10);
       const activeM = g.base.match(/(?:^|-)a(\d+(\.\d+)?)b(?:-|$)/i);
       const arch = g.arch || "";
-      const moe = !!activeM || arch.endsWith("_moe") || arch === "hy_v3" || arch === "glm_moe_dsa";
+      const moe = !!activeM || arch.endsWith("_moe") || arch === "hy_v3" || arch === "glm_moe_dsa" || arch === "qwen4_exp";
       const tags = [];
       if (g.vision) tags.push("vision");
       if (moe) tags.push("moe");
@@ -827,9 +851,13 @@
     // on the board; the unranked table is filterable so length is cheap
     return out.slice(0, 60);
   }
+  // Releases replaced by a newer one from the same lab. HF keeps ranking them
+  // on accumulated downloads long after nobody should pick them.
+  const SUPERSEDED = new Set(["qwen3.6-27b"]);
   function mergeWithSeed(groups, seeds) {
     const have = new Set(groups.map((g) => g.id));
-    return groups.concat(seeds.filter((s) => !have.has(s.id)));
+    return groups.concat(seeds.filter((s) => !have.has(s.id)))
+      .filter((m) => !SUPERSEDED.has(m.id));
   }
 
   // ── unranked-table helpers ─────────────────────────────────────────────
@@ -907,8 +935,13 @@
   // Cutoffs on the AA index. Sized against the current snapshot so no tier is
   // empty and S stays scarce (a tier list where everything is S ranks nothing).
   const INTEL_TIERS = [["S", 45], ["A", 35], ["B", 25], ["C", 15]];
+  // Editorial placements on the intelligence board: models we run and rate
+  // ourselves that the AA snapshot has not scored (or scores on a later,
+  // rebased scale). Never consulted in votes mode.
+  const TIER_PINS = { "qwen3.8-27b": "A", "qwen3.8-flash-next": "A" };
   function tierForModel(model, tally, mode) {
     if ((mode || TIER_MODE) === "votes") return tierFor(tally.up, tally.down);
+    if (TIER_PINS[model.id]) return TIER_PINS[model.id];
     // Rank on the PUBLISHED score only: an estimate is a guess from parameter
     // count, and guesses do not belong on a ranking board. Unscored models
     // wait in the table below, where they can still be voted on.
@@ -1080,7 +1113,7 @@
   };
   // A trained multi-token-prediction head ships INSIDE a checkpoint — it is
   // not a runtime flag you can turn on for any model.
-  const MTP_FAMILIES = [/^qwen3\.[56]/, /^ling-/, /^deepseek-v4/, /^glm-5/];
+  const MTP_FAMILIES = [/^qwen3\.[568]/, /^ling-/, /^deepseek-v4/, /^glm-5/];
   function specSupported(mode, model) {
     if (mode !== "mtp") return true;
     return MTP_FAMILIES.some((re) => re.test(model.id || ""));
@@ -1142,7 +1175,7 @@
   const AA_INDEX = {
     "kimi-k3": 57, "glm-5.2": 51, "deepseek-v4-flash": 50, "minimax-m3": 44,
     "mimo-v2.5-pro": 42, "inkling": 41, "nemotron-3-ultra-550b-a55b": 38,
-    "qwen3.6-27b": 37, "qwen3.6-35b-a3b": 32, "g9v3-39a5b": 31,
+    "qwen3.6-35b-a3b": 32, "g9v3-39a5b": 31,
     "mistral-medium-3.5": 30, "gemma-4-31b": 29, "gemma-4-26b-a4b": 26,
     "qwen3.5-35b-a3b": 24, "gpt-oss-120b": 24, "command-a": 23,
     "gemma-4-12b": 22, "qwen3.5-9b": 21, "apriel-v1.6-15b-thinker": 21,
@@ -1798,7 +1831,7 @@
       if (c) setActiveModels(mergeWithSeed(c.models, SEED_MODELS));
     }
     // the playground opens on a model we have actually benchmarked
-    const preferred = ["qwen3.6-27b", "gemma-4-26b-a4b", "qwen3.6-35b-a3b"];
+    const preferred = ["qwen3.8-27b", "gemma-4-26b-a4b", "qwen3.6-35b-a3b"];
     rig.modelId = (preferred.find((id) => activeModels.some((m) => m.id === id)) ||
       (activeModels[0] && activeModels[0].id));
     renderRig();

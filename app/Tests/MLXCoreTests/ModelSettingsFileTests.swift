@@ -29,6 +29,17 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertNil(back.override(for: "/m/b"))
     }
 
+    func testMtpAcceptanceRoundTripsByName() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(mtp: true, mtpAcceptance: .typical), for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"mtp_acceptance\" : \"typical\""), text)
+        XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.mtpAcceptance, .typical)
+        XCTAssertEqual(ModelOverride(json: ["mtp_acceptance": "fast"]).mtpAcceptance, nil)
+    }
+
     func testAnEmptyOverrideRemovesTheEntry() throws {
         let path = tempPath()
         var file = ModelSettingsFile()

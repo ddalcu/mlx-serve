@@ -307,9 +307,9 @@ test "buildMask: only valid first bytes are allowed for object schema" {
     try testing.expect(mask[0]); // `{` is the start of the object
     try testing.expect(!mask[1]); // `[` not allowed
     try testing.expect(!mask[2]); // `"hello"` not allowed (string, but root is object)
-    try testing.expect(mask[3]); // whitespace allowed before value
+    try testing.expect(!mask[3]); // no whitespace before value
     try testing.expect(!mask[4]); // EOS not allowed; grammar is incomplete
-    try testing.expectEqual(@as(u32, 2), count);
+    try testing.expectEqual(@as(u32, 1), count);
 }
 
 test "buildMask: EOS is allowed when grammar is complete" {
@@ -330,7 +330,7 @@ test "buildMask: EOS is allowed when grammar is complete" {
 
     const vocab: [3]?[]const u8 = .{
         try a.dupe(u8, "x"),
-        try a.dupe(u8, " "), // whitespace ok after value
+        try a.dupe(u8, " "),
         null, // EOS
     };
     var tb = try TokenBytes.init(arena, &vocab, 2);
@@ -340,7 +340,7 @@ test "buildMask: EOS is allowed when grammar is complete" {
     _ = try buildMask(&g, &tb, &mask);
 
     try testing.expect(!mask[0]); // garbage byte rejected
-    try testing.expect(mask[1]); // trailing whitespace allowed
+    try testing.expect(!mask[1]); // no trailing whitespace
     try testing.expect(mask[2]); // EOS allowed because root is accepted
 }
 
@@ -478,7 +478,7 @@ test "buildMask: the fast path agrees with the full walk at every byte of a docu
     const brute = try testing.allocator.alloc(bool, vocab.len);
     defer testing.allocator.free(brute);
 
-    const doc = "{\"name\": \"a\\\"b \\u00e9\", \"age\": -12, \"tags\": [\"x\", \"日本\"], \"color\": \"blue\"} ";
+    const doc = "{\"name\":\"a\\\"b \\u00e9\",\"age\":-12,\"tags\":[\"x\",\"日本\"],\"color\":\"blue\"}";
     for (doc, 0..) |byte, i| {
         _ = try buildMask(&g, &tb, fast);
         try bruteMask(&g, &tb, brute);
@@ -508,11 +508,11 @@ test "buildMask: a step walks only tokens that can start in the current state" {
     const mask = try testing.allocator.alloc(bool, vocab.len);
     defer testing.allocator.free(mask);
 
-    // Structural state: only `{` and whitespace can start a token.
+    // Structural state: only `{` can start a token.
     var r = try buildMask(&g, &tb, mask);
     try testing.expect(r.probed < 64);
     // String body: the quote-free majority is admitted without a walk.
-    for ("{\"name\": \"he") |b| try testing.expect(try g.acceptByte(b));
+    for ("{\"name\":\"he") |b| try testing.expect(try g.acceptByte(b));
     r = try buildMask(&g, &tb, mask);
     try testing.expect(r.probed <= tb.string_other.len);
     try testing.expect(r.allowed > tb.string_plain.len);

@@ -1,0 +1,64 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "results": {
+      ".read": true,
+
+      "$row": {
+        ".write": "!data.exists() && newData.exists()",
+
+        ".validate": "newData.hasChildren(['schemaVersion','sessionId','suiteId','armId','modelId','prefillTps','decodeTps','runs','hardware','date'])",
+
+        "schemaVersion": { ".validate": "newData.isNumber() && newData.val() >= 1" },
+        "id":            { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "sessionId":     { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "installId":     { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "suiteId":       { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "armId":         { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "armLabel":      { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "modelId":       { ".validate": "newData.isString() && newData.val().length <= 200" },
+        "quant":         { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "engineVersion": { ".validate": "newData.isString() && newData.val().length <= 40" },
+        "isLossy":       { ".validate": "newData.isBoolean()" },
+        "date":          { ".validate": "newData.isString() && newData.val().length <= 40" },
+
+        "prefillTps":       { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 200000" },
+        "decodeTps":        { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000" },
+        "ttftMs":           { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 3600000" },
+        "promptTokens":     { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000000" },
+        "completionTokens": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000000" },
+        "runs":             { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1000" },
+        "spreadPercent":    { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100000" },
+
+        "targetTokens":     { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10000000" },
+        "ceilingDecodeTps": { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000" },
+        "contextUsed":      { ".validate": "newData.isBoolean()" },
+        "note":             { ".validate": "newData.isString() && newData.val().length <= 120" },
+        "driftDecodeTps":   { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 10000" },
+        "driftPercent":     { ".validate": "newData.isNumber() && newData.val() >= -1000 && newData.val() <= 1000" },
+
+        "settings": {
+          "$key": { ".validate": "newData.isString() && newData.val().length <= 60" }
+        },
+
+        "flags": {
+          "$flag": { ".validate": "newData.isString() && newData.val().length <= 40" }
+        },
+
+        "hardware": {
+          ".validate": "newData.hasChildren(['chip','ramGB'])",
+          "chip":      { ".validate": "newData.isString() && newData.val().length <= 60" },
+          "gpuCores":  { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1024" },
+          "ramGB":     { ".validate": "newData.isNumber() && newData.val() > 0 && newData.val() <= 8192" },
+          "osVersion": { ".validate": "newData.isString() && newData.val().length <= 40" },
+          "onBattery": { ".validate": "newData.isBoolean()" },
+          "$other":    { ".validate": false }
+        },
+
+        "$other": { ".validate": false }
+      }
+    }
+  }
+}

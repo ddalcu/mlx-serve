@@ -17,7 +17,10 @@ Layout / renames:
         directory loader never mlx-loads it; the engine gathers rows from the
         mmap on the host).
 
-Widths: routed experts `--bits` (default 4, gs 64); n-gram table
+Widths: routed experts `--bits` (default 4, gs 64), or a per-role mix
+`--gate-up-bits`/`--down-bits` for trunk layers below `--tail-layers`, with the
+last `--tail-layers` layers and the MTP head's experts staying at `--bits`
+(a uniform low-bit tail is the turn-level agent-loop trap); n-gram table
 `--ngram-bits` (default 4, gs 32 because the row width is 160; 3/5/6 need
 mlx-serve >= 26.9.1, older readers unpack them as noise, #305); every other
 2-D projection `--nonexpert-bits` (default 8, 4 = the -all pack) gs 64; embed_tokens 4-bit gs 64; 2-D weights with fewer
@@ -33,11 +36,17 @@ reads [C, K, 1].
   python3 tests/convert_qwen38_flash_next.py --dst ~/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit \
       --stage ~/claude-tmp/qwen38-flash-next/stage
   python3 tests/convert_qwen38_flash_next.py --add-vision --dst <pack> --stage <dir>   # or --src <hf dir>
+
+`--imatrix <safetensors>` (tests/qwen38_flash_next_imatrix_collect.py) switches every
+weight that has an entry to the imatrix-weighted (s, b) search (`dsv4_imatrix.
+weighted_affine_quant`, per expert for the routed banks, `--jobs` processes);
+weights without an entry (embed_tokens, lm_head, the MTP head) stay on mx.quantize.
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -50,6 +59,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert_dsv4_weights import (bf16_to_f32, f32_to_bf16_u16,  # noqa: E402
                                   mlx_affine_quant, write_safetensors_raw)
+from dsv4_imatrix import weighted_affine_quant  # noqa: E402
 
 REPO = "Qwen/Qwen3.8-Flash-Next"
 README = """\
@@ -73,9 +83,8 @@ tags:
 # Qwen3.8-Flash-Next for mlx-serve (4-bit experts, 8-bit rest)
 
 mlx-serve pack of [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
-the Qwen4 preview architecture (`model_type: qwen4_exp`). Runs on a 128 GB Mac
-with about 75 GB resident. Includes the MTP head and the vision tower (image
-and video input).
+the Qwen4 preview architecture (`model_type: qwen4_exp`). About {resident_gb:.0f} GB
+resident{tier_note}. Includes the MTP head and the vision tower (image and video input).
 
 ```bash
 mlx-serve --model ddalcu/{repo_name} --serve
@@ -124,13 +133,13 @@ the page cache already is an LRU over exactly this access pattern.
 
 | tensors | width |
 |---|---|
-| routed experts (512 x 48 layers, the 121B) | 4-bit, group 64 |
+| routed experts (512 x 48 layers, the 121B) | {expert_widths} |
 | attention, GDN, hyper-connections, indexer, shared experts | {nonexpert_bits}-bit, group 64 |
 | lm_head | 8-bit, group 64 |
 | embed_tokens | 4-bit, group 64 |
 | n-gram table | 4-bit, group 32 (row width 160) |
 | routers, inject gates, norms, convs, SSM state | bf16 |
-| MTP head | same policy as the trunk |
+| MTP head | {mtp_widths} |
 
 Every `(1 + w)` RMSNorm has the `+1` folded into the stored weight; depthwise
 convs are transposed to MLX's `[C, K, 1]`; `experts.gate_up_proj` is split into
@@ -139,7 +148,7 @@ convs are transposed to MLX's `[C, K, 1]`; `experts.gate_up_proj` is split into
 
 ## Serving notes
 
-- **Memory.** ~75 GB resident plus KV cache. mlx-serve sizes the context to
+- **Memory.** ~{resident_gb:.0f} GB resident plus KV cache. mlx-serve sizes the context to
   what fits; `--kv-quant 8` halves the cache.
 - **MTP.** The checkpoint's own 1-layer speculative head is loaded from the
   pack and works (`--mtp` or per-request `"enable_mtp": true`), but as of this
@@ -191,6 +200,33 @@ def needs_norm_fold(name):
     return name.endswith(NORM_FOLD_SUFFIXES)
 
 
+def expert_width(name, role, args, n_layers):
+    """(bits, group_size) for a routed-expert weight: the `--alloc` table when given,
+    else the per-role mix below the tail; `--bits` gs64 on the tail layers and on the
+    MTP head (its own `mtp.layers.0`)."""
+    m = re.search(r"\.layers\.(\d+)\.", name)
+    if ".mtp." in name or m is None or int(m.group(1)) >= n_layers - args.tail_layers:
+        return args.bits, 64
+    if args.alloc is not None:
+        a = args.alloc[f"layers.{m.group(1)}.{role}"]
+        return a["bits"], a["group_size"]
+    return (args.down_bits if role == "down" else args.gate_up_bits), args.expert_gs
+
+
+def expert_widths_note(args, n_layers):
+    t = n_layers - args.tail_layers
+    if args.alloc is not None:
+        from collections import Counter
+        mix = Counter(f"{a['bits']}-bit g{a['group_size']}" for a in args.alloc.values())
+        return (f"per-layer, imatrix-measured allocation on layers 0-{t-1} ({', '.join(f'{k} x{v}' for k, v in sorted(mix.items()))} "
+                f"of {len(args.alloc)} gate-up/down groups); {args.bits}-bit group 64 on layers {t}-{n_layers-1} and the MTP head; imatrix-calibrated")
+    if args.gate_up_bits == args.bits and args.down_bits == args.bits:
+        return f"{args.bits}-bit, group 64"
+    return (f"gate/up {args.gate_up_bits}-bit, down {args.down_bits}-bit (group {args.expert_gs}) on layers 0-{t-1}; "
+            f"{args.bits}-bit group 64 on layers {t}-{n_layers-1} and the MTP head"
+            + (", imatrix-calibrated" if args.imatrix else ""))
+
+
 def width_for(name, shape, nonexpert_bits=8):
     """(bits, group_size) or None for bf16 pass-through."""
     if len(shape) != 2 or shape[0] < 32 or shape[1] % 64 != 0:
@@ -228,6 +264,23 @@ def quant(arr_u16, bits, gs):
     return ((wq[0], lead + (wq[1][-1],), wq[2]),
             (sc[0], lead + (sc[1][-1],), sc[2]),
             (bi[0], lead + (bi[1][-1],), bi[2]))
+
+
+def _wq_slab(task):
+    arr_u16, bits, gs, ch = task
+    return weighted_affine_quant(bf16_to_f32(arr_u16), bits, gs, ch)
+
+
+def quant_weighted(arr_u16, bits, gs, ch, pool=None):
+    """Imatrix-weighted twin of quant(): `ch` is [in] for a 2-D weight, [E * in] for a
+    3-D expert bank (expert e's channels at [e*in, (e+1)*in)); banks fan out per expert."""
+    if arr_u16.ndim == 2:
+        return weighted_affine_quant(bf16_to_f32(arr_u16), bits, gs, ch)
+    E, out_dim, in_dim = arr_u16.shape
+    assert ch.shape == (E * in_dim,), (ch.shape, arr_u16.shape)
+    tasks = [(arr_u16[e], bits, gs, ch[e * in_dim:(e + 1) * in_dim]) for e in range(E)]
+    per = list(pool.map(_wq_slab, tasks, chunksize=8)) if pool else [_wq_slab(t) for t in tasks]
+    return tuple((per[0][i][0], (E,) + tuple(per[0][i][1]), b"".join(t[i][2] for t in per)) for i in range(3))
 
 
 class NgramTable:
@@ -374,12 +427,24 @@ def main():
     ap.add_argument("--dst", required=True)
     ap.add_argument("--stage", default=None, help="download staging dir (Hub mode)")
     ap.add_argument("--src", default=None, help="local HF checkpoint dir instead of the Hub")
-    ap.add_argument("--bits", type=int, default=4)
+    ap.add_argument("--bits", type=int, default=4, help="routed experts (tail layers + MTP head when a mix is set)")
+    ap.add_argument("--gate-up-bits", type=int, default=None, help="expert gate/up width below the tail (default --bits)")
+    ap.add_argument("--down-bits", type=int, default=None, help="expert down width below the tail (default --bits)")
+    ap.add_argument("--tail-layers", type=int, default=0, help="last N layers keep --bits experts")
+    ap.add_argument("--expert-gs", type=int, default=64, help="group size for the mixed expert widths below the tail")
+    ap.add_argument("--imatrix", default=None, help="activation statistics (safetensors) for weighted quantization")
+    ap.add_argument("--alloc", default=None, help="per-layer expert widths from qwen38_flash_next_iq_allocate.py")
+    ap.add_argument("--ngram-link", default=None, help="hard-link this ngram_table.bin instead of re-quantizing the table")
+    ap.add_argument("--jobs", type=int, default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--ngram-bits", type=int, default=4)
     ap.add_argument("--nonexpert-bits", type=int, default=8, help="width for every non-expert 2-D projection (4 = the -all pack)")
     ap.add_argument("--ahead", type=int, default=2)
     ap.add_argument("--add-vision", action="store_true", help="append the bf16 vision tower to the pack at --dst (no re-stream)")
     args = ap.parse_args()
+    args.gate_up_bits = args.gate_up_bits or args.bits
+    args.down_bits = args.down_bits or args.bits
+    if args.alloc:
+        args.alloc = json.loads(Path(os.path.expanduser(args.alloc)).read_text())
     if args.add_vision:
         return add_vision(args)
 
@@ -414,6 +479,8 @@ def main():
     n_ngram_shards = len(ngram_names)
 
     state_path = dst / ".convert_state.json"
+    hf_cfg = json.loads((stage / "config.json").read_text())
+    n_layers = hf_cfg.get("text_config", hf_cfg)["num_hidden_layers"]
     state = json.loads(state_path.read_text()) if state_path.exists() else \
         {"done": [], "out_idx": 0, "out_map": {}, "total": 0, "ngram_rows": None}
     todo = [f for f in files if f not in state["done"]]
@@ -444,8 +511,21 @@ def main():
         out[nk] = triple
         out_bytes += len(triple[2])
 
-    def emit_q(nk, arr, bits, gs):
-        wq, sc, bi = quant(arr, bits, gs)
+    imatrix, pool, stats = None, None, {"weighted": 0, "plain": 0}
+    if args.imatrix:
+        from concurrent.futures import ProcessPoolExecutor
+        from safetensors.numpy import load_file
+        imatrix = load_file(os.path.expanduser(args.imatrix))
+        pool = ProcessPoolExecutor(max_workers=args.jobs)
+
+    def emit_q(nk, arr, bits, gs, src_name=None):
+        ch = imatrix.get(src_name) if imatrix is not None and src_name else None
+        if ch is not None:
+            wq, sc, bi = quant_weighted(arr, bits, gs, ch, pool)
+            stats["weighted"] += 1
+        else:
+            wq, sc, bi = quant(arr, bits, gs)
+            stats["plain"] += 1
         base = nk[:-len(".weight")] if nk.endswith(".weight") else nk
         emit(base + ".weight", wq)
         emit(base + ".scales", sc)
@@ -460,6 +540,8 @@ def main():
             if name.startswith("model.visual."):
                 continue
             if NGRAM_MARK in name:
+                if args.ngram_link:
+                    continue
                 shard_idx = int(name.rsplit("_", 1)[1].split(".")[0])
                 arr = read_raw(path, data_off, meta)
                 if ngram is None:
@@ -473,15 +555,17 @@ def main():
             if nk.endswith(".mlp.experts.gate_up_proj"):
                 half = arr.shape[1] // 2
                 base = nk[:-len("experts.gate_up_proj")] + "switch_mlp."
-                emit_q(base + "gate_proj.weight", np.ascontiguousarray(arr[:, :half]), args.bits, 64)
-                emit_q(base + "up_proj.weight", np.ascontiguousarray(arr[:, half:]), args.bits, 64)
+                eb, gs = expert_width(nk, "gate_up", args, n_layers)
+                emit_q(base + "gate_proj.weight", np.ascontiguousarray(arr[:, :half]), eb, gs, name)
+                emit_q(base + "up_proj.weight", np.ascontiguousarray(arr[:, half:]), eb, gs, name)
                 continue
             if nk.endswith(".mlp.experts.down_proj"):
-                emit_q(nk[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight", arr, args.bits, 64)
+                emit_q(nk[:-len("experts.down_proj")] + "switch_mlp.down_proj.weight", arr,
+                       *expert_width(nk, "down", args, n_layers), name)
                 continue
             w = width_for(nk, arr.shape, args.nonexpert_bits) if meta["dtype"] == "BF16" else None
             if w:
-                emit_q(nk, arr, *w)
+                emit_q(nk, arr, *w, src_name=name)
                 continue
             if nk.endswith("conv1d.weight") and arr.ndim == 3:
                 arr = np.ascontiguousarray(np.swapaxes(arr, 1, 2))
@@ -497,19 +581,29 @@ def main():
         state["done"].append(fname)
         state_path.write_text(json.dumps(state))
         print(f"[{i+1}/{len(todo)}] {fname} done in {time.time()-ts:.0f}s, "
-              f"elapsed {(time.time()-t0)/60:.1f} min, out {state['total']/1e9:.1f} GB", flush=True)
+              f"elapsed {(time.time()-t0)/60:.1f} min, out {state['total']/1e9:.1f} GB"
+              f"{', weighted %d / plain %d' % (stats['weighted'], stats['plain']) if imatrix is not None else ''}", flush=True)
 
     (dst / "model.safetensors.index.json").write_text(json.dumps(
         {"metadata": {"total_size": state["total"]}, "weight_map": state["out_map"]}, indent=2))
+    if args.ngram_link and not (dst / "ngram_table.bin").exists():
+        os.link(os.path.expanduser(args.ngram_link), dst / "ngram_table.bin")
     cfg = json.loads((stage / "config.json").read_text())
     cfg.pop("vision_config", None)
     cfg["language_model_only"] = True
     cfg["quantization"] = {"group_size": 64, "bits": args.bits, "mode": "affine"}
     cfg["quantization_config"] = cfg["quantization"]
     cfg["ngram_table"] = {"file": "ngram_table.bin", "bits": args.ngram_bits, "group_size": 32}
+    if imatrix is not None:
+        cfg["quantization"]["calibration"] = "imatrix-weighted affine (iQ-MLX)"
+        pool.shutdown()
     (dst / "config.json").write_text(json.dumps(cfg, indent=2))
     (dst / "README.md").write_text(README.format(
-        repo_name=dst.name, ngram_gb=os.path.getsize(dst / "ngram_table.bin") / 1e9, nonexpert_bits=args.nonexpert_bits))
+        repo_name=dst.name, ngram_gb=os.path.getsize(dst / "ngram_table.bin") / 1e9, nonexpert_bits=args.nonexpert_bits,
+        resident_gb=state["total"] / 1e9, expert_widths=expert_widths_note(args, n_layers),
+        mtp_widths=f"experts {args.bits}-bit group 64, projections {args.nonexpert_bits}-bit group 64",
+        tier_note=(" (a 64 GB Mac with the wired limit raised, 64k context)" if state["total"] < 56e9
+                   else " (128 GB Macs)")))
     state_path.unlink()
     print(f"done: {state['total']/1e9:.1f} GB trunk + ngram_table.bin "
           f"{os.path.getsize(dst / 'ngram_table.bin')/1e9:.1f} GB in {(time.time()-t0)/60:.0f} min")

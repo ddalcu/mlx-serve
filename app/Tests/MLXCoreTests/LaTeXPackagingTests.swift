@@ -53,7 +53,9 @@ final class LaTeXPackagingTests: XCTestCase {
             guard let patch = script.range(of: "patch-swatex-font-lookup.sh") else {
                 return XCTFail("\(path) must patch SwaTexRender's font lookup")
             }
-            guard let build = script.range(of: "swift build") else {
+            // A command line, not a comment; `swift test` compiles the app too.
+            guard let build = script.range(of: #"(?m)^\s*swift (build|test)\b"#,
+                                           options: .regularExpression) else {
                 return XCTFail("\(path) does not build the app")
             }
             XCTAssertTrue(

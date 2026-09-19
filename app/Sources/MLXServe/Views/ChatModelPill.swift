@@ -41,6 +41,7 @@ struct ChatModelPill: View {
     /// how one picker starts naming a model the other doesn't.
     private var pill: ChatModelPillState {
         ChatModelSelection.pillState(lanChatModelId: server.lanChatModelId,
+                                     apple: appState.useAppleModel,
                                      residentName: server.chatModelInfo?.name,
                                      loadingPath: appState.loadingModelPath,
                                      selectedPath: appState.selectedModelPath,
@@ -51,6 +52,9 @@ struct ChatModelPill: View {
     /// "running with nothing loaded" is not ready to answer, and a green dot
     /// there is a lie the first message exposes.
     private var statusColor: Color {
+        // The on-device model answers with the server down — the dot reports
+        // whether the chat can answer, not whether a process is up.
+        if appState.useAppleModel { return .green }
         guard server.status == .running else { return .secondary.opacity(0.5) }
         if server.lanChatModelId != nil { return .green }
         return server.chatModelInfo == nil ? .orange : .green
@@ -59,7 +63,8 @@ struct ChatModelPill: View {
     private var selection: Binding<String> {
         Binding(
             get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
-                                          lanChatModelId: server.lanChatModelId) },
+                                          lanChatModelId: server.lanChatModelId,
+                                          apple: appState.useAppleModel) },
             // What a pick MEANS is `AppState.applyChatModelPick` — one method,
             // shared with the tray and the ⌘L palette.
             set: { picked in appState.applyChatModelPick(picked) }
@@ -194,15 +199,17 @@ struct ChatModelPill: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help(pill.isLoading
-              ? "Loading \(ModelDisplayName.pretty(pill.name))…"
-              : "Chat model. Click to switch — models on this Mac and any shared by other Macs on your network.")
+              ? L10n.format("Loading %@…", ModelDisplayName.pretty(pill.name))
+              : L10n.text("Chat model. Click to switch — models on this Mac and any shared by other Macs on your network."))
     }
 
     @ViewBuilder
     private var menuContent: some View {
         let pickable = pickableModels
         if pickable.isEmpty && lanChatModels.isEmpty {
-            Text("No chat models downloaded")
+            if !AppleFoundationChat.availability.isAvailable {
+                Text("No chat models downloaded")
+            }
         } else {
             // Same duplicate-name suffixing as the tray: a menu keys its
             // checkmark by row TITLE, so two same-named rows both tick.
@@ -210,7 +217,7 @@ struct ChatModelPill: View {
             ForEach(LocalModelSource.allCases, id: \.self) { source in
                 let models = pickable.filter { $0.source == source }
                 if !models.isEmpty {
-                    Section(source.sectionTitle) {
+                    Section(L10n.text(source.sectionTitle)) {
                         ForEach(models) { model in
                             row(title: rowLabel(model, dupNames: dupNames),
                                 tag: model.path)
@@ -221,18 +228,23 @@ struct ChatModelPill: View {
             let network = lanChatModels.filter { $0.provider == nil }
             let providers = lanChatModels.filter { $0.provider != nil }
             if !network.isEmpty {
-                Section(ModelPalette.networkSection) {
+                Section(L10n.text(ModelPalette.networkSection)) {
                     ForEach(network, id: \.name) { m in
                         row(title: m.lanDisplayName, tag: "lan:" + m.name)
                     }
                 }
             }
             if !providers.isEmpty {
-                Section(ModelPalette.providersSection) {
+                Section(L10n.text(ModelPalette.providersSection)) {
                     ForEach(providers, id: \.name) { m in
                         row(title: m.lanDisplayName, tag: "lan:" + m.name)
                     }
                 }
+            }
+        }
+        if AppleFoundationChat.availability.isAvailable {
+            Section(L10n.text(ModelPalette.onDeviceSection)) {
+                row(title: AppleFoundationChat.displayName, tag: ChatModelSelection.appleTag)
             }
         }
         Divider()
@@ -250,9 +262,9 @@ struct ChatModelPill: View {
             selection.wrappedValue = tag
         } label: {
             if selection.wrappedValue == tag {
-                Label(title, systemImage: "checkmark")
+                Label(L10n.text(title), systemImage: "checkmark")
             } else {
-                Text(title)
+                Text(L10n.text(title))
             }
         }
     }

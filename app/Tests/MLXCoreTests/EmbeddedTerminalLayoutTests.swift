@@ -23,4 +23,20 @@ final class EmbeddedTerminalLayoutTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(frame.width, 0)
         XCTAssertGreaterThanOrEqual(frame.height, 0)
     }
+
+    /// SwiftTerm keeps 500 lines by default, which one agent turn's diff
+    /// or test output scrolls past.
+    @MainActor
+    func testATerminalSessionKeepsTwentyThousandLinesOfScrollback() {
+        let handle = EmbeddedTerminalView.Handle(executable: "/bin/cat", args: [], onExit: { _ in })
+        defer { handle.terminate() }
+        XCTAssertEqual(handle.scrollbackLines, 20_000)
+    }
+
+    func testExitCodeIsDecodedFromTheRawWaitStatus() {
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 256), 1)
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 0), 0)
+        XCTAssertEqual(EmbeddedTerminalView.exitCode(waitStatus: 15), 128 + 15, "killed by SIGTERM")
+        XCTAssertNil(EmbeddedTerminalView.exitCode(waitStatus: nil))
+    }
 }

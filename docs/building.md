@@ -1,3 +1,5 @@
+[English](building.md) · [简体中文](zh-CN/building.md)
+
 # Building from source
 
 You only need this if you're hacking on mlx-serve. To just use it, grab [the app](https://github.com/ddalcu/mlx-serve/releases/latest) or `brew install mlx-serve`.

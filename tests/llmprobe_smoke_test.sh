@@ -17,7 +17,7 @@
 #                                           default is OFF)
 #        drafter   --drafter <assistant>   (Gemma 4 dense only)
 #      Plus, on the ONE fastest model, a KV-quant crash check at its default
-#      spec config: --kv-quant 4 and --kv-quant turbo4.
+#      spec config: --kv-quant 4.
 #   3. Scrapes each server log for `[spec-stats] mode=` — throughput alone cannot
 #      prove a spec path engaged (the regular-decode fallback is output-identical;
 #      that is how a hardcoded use_drafter=false survived a month).

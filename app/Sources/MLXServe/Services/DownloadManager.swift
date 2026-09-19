@@ -1651,6 +1651,7 @@ class DownloadManager: ObservableObject {
             contextLength: meta.contextLength,
             numExperts: meta.numExperts,
             activeExperts: meta.activeExperts,
+            hasMtpHead: dirHasMtpHead(atDir: resolved),
             defect: defect
         )]
     }
@@ -1722,6 +1723,23 @@ class DownloadManager: ObservableObject {
             bytes += safetensorsBytes(in: sub, names: names)
         }
         return bytes >= minimumWeightBytes ? nil : .missingWeights
+    }
+
+    /// The dir ships an MTP head the server can run: a sidecar file, in-checkpoint
+    /// head tensors named in the shard index, or qwen4's own `fc_hidden` layer.
+    /// Mirror of the server's `mtp.dirAdvertisesMtp` (single-file checkpoints
+    /// without an index are not probed here).
+    nonisolated static func dirHasMtpHead(atDir dir: String) -> Bool {
+        let fm = FileManager.default
+        for rel in ["mtp/weights.safetensors", "mtp.safetensors", "model-mtp.safetensors", "optiq/mtp.safetensors"] {
+            let p = (dir as NSString).appendingPathComponent(rel)
+            if let size = (try? fm.attributesOfItem(atPath: p))?[.size] as? UInt64, size > 0 { return true }
+        }
+        guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("model.safetensors.index.json")),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        return ["\"mtp.fc.weight\"", "\"language_model.mtp.fc.weight\"", "\"mtp.eh_proj.weight\"",
+                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\""]
+            .contains { text.contains($0) }
     }
 
     /// Metadata read from a model's `config.json` — the authoritative source for

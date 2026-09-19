@@ -51,6 +51,13 @@ struct EmbeddedTerminalView: NSViewRepresentable {
 
     /// Owns the terminal view and the process it spawned, for as long as the
     /// session lives — independent of any window.
+    /// SwiftTerm hands over the raw `waitpid` status on macOS (exit 1 arrives as 256).
+    static func exitCode(waitStatus: Int32?) -> Int32? {
+        guard let s = waitStatus else { return nil }
+        let signal = s & 0x7f
+        return signal == 0 ? (s >> 8) & 0xff : 128 + signal
+    }
+
     final class Handle {
         let terminalView: LocalProcessTerminalView
         private let delegate: ProcessDelegate
@@ -63,6 +70,9 @@ struct EmbeddedTerminalView: NSViewRepresentable {
             terminalView = LocalProcessTerminalView(frame: .zero)
             delegate = ProcessDelegate(onExit: onExit)
             terminalView.processDelegate = delegate
+            // SwiftTerm's default is 500 lines; one agent turn's diff or test
+            // output scrolls past that.
+            terminalView.getTerminal().changeScrollback(20_000)
             // Default environment (TERM=xterm-256color etc.) — ssh needs nothing
             // from the host env; every path it uses arrives via argv.
             terminalView.startProcess(executable: executable, args: args)
@@ -70,6 +80,8 @@ struct EmbeddedTerminalView: NSViewRepresentable {
 
         /// SIGTERM to the spawned process, which drops the PTY and fires onExit.
         func terminate() { terminalView.terminate() }
+
+        var scrollbackLines: Int { terminalView.getTerminal().options.scrollback }
 
         /// Paint a theme (the 16 ANSI slots + text) on `background`. Live:
         /// SwiftTerm recomputes its palette and redraws.
@@ -165,7 +177,8 @@ struct EmbeddedTerminalView: NSViewRepresentable {
             guard !exited else { return }
             exited = true
             let cb = onExit
-            DispatchQueue.main.async { cb(exitCode) }
+            let code = EmbeddedTerminalView.exitCode(waitStatus: exitCode)
+            DispatchQueue.main.async { cb(code) }
         }
     }
 }

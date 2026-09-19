@@ -62,7 +62,7 @@ struct TrayStatusChip: View {
             Circle()
                 .fill(model.tone.color)
                 .frame(width: 6, height: 6)
-            Text(model.label)
+            Text(L10n.text(model.label))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
         }
@@ -78,7 +78,10 @@ struct TrayStatusChip: View {
 
 /// An all-caps section label. Same treatment as the welcome screen's
 /// "BEST MODELS FOR YOUR MAC", so a user moving between the two surfaces sees
-/// one design, not two.
+/// one design, not two. The caps are a render-time treatment: the catalog is
+/// keyed on the source literal, so the lookup must happen BEFORE uppercasing.
+/// `detail` arrives already localized (its callers run `L10n.format` on it) —
+/// a runtime-formatted string is never a table key.
 struct TraySectionHeader: View {
     let title: String
     /// Optional trailing text (a count, a size) — never a control; controls that
@@ -87,7 +90,7 @@ struct TraySectionHeader: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(title.uppercased())
+            Text(L10n.text(title).uppercased())
                 .font(.caption2.weight(.semibold))
                 .tracking(0.6)
             Spacer(minLength: 0)
@@ -159,10 +162,10 @@ struct TrayFeatureRow<Trailing: View>: View {
                 .foregroundStyle(isOn ? tint : Color.secondary)
                 .frame(width: 17)
             VStack(alignment: .leading, spacing: 1) {
-                Text(title)
+                Text(L10n.text(title))
                     .font(.subheadline.weight(.medium))
                 if let subtitle {
-                    Text(subtitle)
+                    Text(L10n.text(subtitle))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -194,7 +197,7 @@ struct TrayDisclosureHeader<Accessory: View>: View {
                         .font(.caption2.weight(.semibold))
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 9)
-                    Text(title)
+                    Text(L10n.text(title))
                         .font(.subheadline.weight(.medium))
                     Spacer(minLength: 0)
                 }
@@ -226,7 +229,7 @@ struct TrayAccessoryButton: View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Image(systemName: icon)
-                Text(title)
+                Text(L10n.text(title))
             }
             .font(.caption)
         }
@@ -244,37 +247,63 @@ struct TrayTile: View {
     let icon: String
     let title: String
     let help: String
+    /// The icon's colour. Red marks a tile that ENDS something (Quit).
+    var tint: Color = .accentColor
+    var isEnabled: Bool = true
     let action: () -> Void
 
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(Color.accentColor)
-                Text(title)
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.primary.opacity(hovering ? 0.10 : 0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
-            )
-            .contentShape(Rectangle())
+            TrayTileFace(icon: icon, title: title, tint: tint,
+                         hovering: hovering, isEnabled: isEnabled)
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
         // Enter/exit only — no continuous redraw, so the popover's hit-testing
         // stays alive (see the VoiceTrayPanel dot comment).
         .onHover { hovering = $0 }
         .help(help)
+    }
+}
+
+/// The tile's FACE, without the button. A tray control that is a Menu rather
+/// than a Button (the Code launcher) wears the same face — two hand-drawn
+/// copies is how one of them stops matching the row it sits in.
+struct TrayTileFace: View {
+    static let height: CGFloat = 48
+
+    let icon: String
+    let title: String
+    var tint: Color = .accentColor
+    var hovering: Bool = false
+    var isEnabled: Bool = true
+
+    var body: some View {
+        VStack(spacing: 4) {
+            // Glyphs differ in height (speedometer is taller than the chat
+            // bubbles); a fixed box keeps every tile's title on one baseline.
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(isEnabled ? tint : Color.secondary)
+                .frame(height: 18)
+            Text(L10n.text(title))
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(isEnabled ? .primary : .secondary)
+                .lineLimit(1)
+        }
+        // A fixed height, not padding: the Code control is a Menu, which sizes
+        // its label differently, and the row read as one short tile.
+        .frame(maxWidth: .infinity, minHeight: TrayTileFace.height)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(hovering && isEnabled ? 0.10 : 0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
     }
 }

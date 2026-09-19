@@ -98,10 +98,10 @@ final class ProcessRegistryTests: XCTestCase {
         let p = reg.start(command: "sleep 300 & echo $! > \(pidFile); wait",
                           workingDirectory: nil, sessionId: nil)
         await waitUntil(5) {
-            guard let s = try? String(contentsOfFile: pidFile) else { return false }
+            guard let s = try? String(contentsOfFile: pidFile, encoding: .utf8) else { return false }
             return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
-        let childPid = Int32((try? String(contentsOfFile: pidFile))?
+        let childPid = Int32((try? String(contentsOfFile: pidFile, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
         XCTAssertGreaterThan(childPid, 0, "failed to capture the child pid")
         XCTAssertEqual(Darwin.kill(childPid, 0), 0, "child should be alive before kill")

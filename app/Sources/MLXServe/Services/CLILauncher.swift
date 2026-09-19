@@ -29,6 +29,12 @@ final class CLILauncher: ObservableObject {
     /// (same CLIs, same order) by `CLISetupInstructionsTests`.
     nonisolated static var candidateIds: [String] { candidates.map(\.id) }
 
+    /// What the "On this Mac" section shows: the detected CLIs plus the plain
+    /// shell, which has nothing to detect.
+    nonisolated static func offered(detected: [LauncherCLI]) -> [LauncherCLI] {
+        detected + [.shell]
+    }
+
     init() {
         Task { await refresh() }
     }
@@ -42,7 +48,7 @@ final class CLILauncher: ObservableObject {
             return
         }
         let found = await Self.detectInstalled()
-        self.available = found
+        self.available = Self.offered(detected: found)
         self.hasScanned = true
     }
 
@@ -139,6 +145,19 @@ final class CLILauncher: ObservableObject {
     }
 }
 
+/// Small-window alert before an agent launches: the agent takes the whole
+/// screen, so a line in its terminal is never seen.
+func warnIfSmallContext(agentId: String, context: Int) {
+    guard let text = AgentBudget.contextWarning(agentId: agentId, context: context) else { return }
+    MainActor.assumeIsolated {
+        let alert = NSAlert()
+        alert.messageText = "Small context window"
+        alert.informativeText = text
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+}
+
 /// One row in the launcher dropdown. `resolvedPath` is filled in after detection.
 struct LauncherCLI: Identifiable, Equatable {
     let id: String
@@ -157,6 +176,9 @@ struct LauncherCLI: Identifiable, Equatable {
     /// desktop app bundles (codex inside ChatGPT.app/Codex.app). `~` is not
     /// expanded here; entries may start with `$HOME`, expanded at probe time.
     var fallbackPaths: [String] = []
+    /// A row that talks to mlx-serve refuses to start while the server is
+    /// down; the plain shell does not.
+    var requiresServer: Bool = true
     /// Shell body that sets env vars and execs the CLI. Does NOT include the
     /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
     /// it into its inline config; pi/Claude Code ignore it — pi's list is
@@ -208,6 +230,10 @@ extension LauncherCLI {
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
+            let settingsPath = (dir as NSString).appendingPathComponent("settings.json")
+            let existing = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "{}"
+            try? AgentConfigs.piSettingsJSON(existing: existing, context: budget.context)
+                .write(toFile: settingsPath, atomically: true, encoding: .utf8)
             // Global context file — pi injects it into every session's system
             // prompt (same builder the sandbox registry materializes in-guest).
             try? AgentConfigs.piAgentsMD(budget: budget)
@@ -405,11 +431,30 @@ extension LauncherCLI {
                 list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
             }
             return """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true))'
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list, pinModel: true, compaction: true))'
             export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
             \(cdLine)
             if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
             opencode2 --standalone
+            """
+        }
+    )
+
+    /// A plain login shell in the terminal pane. No config, no server: the
+    /// script only cds and hands the row an INTERACTIVE zsh — without the
+    /// exec the script would end and the row would close on open.
+    static let shell = LauncherCLI(
+        id: "shell",
+        displayName: "Shell",
+        binaryName: "zsh",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: nil,
+        requiresServer: false,
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(cdLine)
+            exec /bin/zsh -i
             """
         }
     )
@@ -443,13 +488,15 @@ struct CLILauncherButton: View {
     let openHostCLI: (LauncherCLI) -> Void
 
     @StateObject private var detector = CLILauncher()
+    @State private var hovering = false
 
     var body: some View {
         Group {
-            if !detector.hasScanned {
-                // Still scanning — reserve the space with a placeholder so the
-                // footer doesn't reflow when scan finishes a moment later.
-                Color.clear.frame(width: 0, height: 0)
+            if !isEnabled || !detector.hasScanned {
+                // A disabled Menu with a plain button style draws no label, so
+                // the tile vanished with the server; show the gray face instead.
+                TrayTileFace(icon: "terminal", title: "Code", isEnabled: false)
+                    .help(isEnabled ? "Scanning for coding agents…" : "Start the server to launch a coding agent")
             } else {
                 Menu {
                     CLILauncherMenuItems(detector: detector, baseURL: baseURL,
@@ -459,20 +506,20 @@ struct CLILauncherButton: View {
                                          openSandboxAgent: openSandboxAgent,
                                          openHostCLI: openHostCLI)
                 } label: {
-                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
-                        Image(systemName: "terminal")
-                        Text("Code")
-                    }
-                    .frame(maxWidth: .infinity)
+                    // The tray tile's own face (`TrayTileFace`), so the Code
+                    // menu matches its Chat / Tasks / Quit siblings and the
+                    // Media Generation row above them.
+                    TrayTileFace(icon: "terminal", title: "Code",
+                                 hovering: hovering, isEnabled: isEnabled)
                 }
-                // Standard bordered-button chrome so the menu is visually
-                // identical to its sibling Chat/Tasks buttons — the previous
-                // hand-rolled stroke + material background rendered as an
-                // odd-one-out outlined pill in the tray footer.
+                // `.button` (not `.borderlessButton`, which throws the custom
+                // label away and draws a plain menu title) + a plain button so
+                // the tile face IS the control.
                 .menuStyle(.button)
-                .buttonStyle(.bordered)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
-                .disabled(!isEnabled)
+                .frame(maxWidth: .infinity)
+                .onHover { hovering = $0 }
                 .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
         }
@@ -501,7 +548,7 @@ struct CLILauncherMenuItems: View {
                     Button {
                         openHostCLI(cli)
                     } label: {
-                        Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                        Label(L10n.text(cli.displayName), systemImage: cli.iconSystemName ?? "terminal")
                     }
                 }
             }

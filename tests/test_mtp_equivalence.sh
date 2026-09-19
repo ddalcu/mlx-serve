@@ -370,10 +370,12 @@ curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: applicati
 FIXED_STATS=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1)
 FIXED_EXT=$(echo "$FIXED_STATS" | grep -o 'ext_rounds=[0-9]*' | cut -d= -f2)
 FIXED_DEPTH=$(echo "$FIXED_STATS" | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
-if [ "${FIXED_EXT:-1}" = "0" ] && [ "${FIXED_DEPTH:-0}" = "3" ]; then
-    echo "PASS [MLX_SERVE_MTP_ADAPTIVE=0 reverts to fixed depth 3, no extension]"; PASS=$((PASS+1))
+# The cap the server resolved (3 by default; a Hadamard pack pins 2).
+CAP_DEPTH=$(grep -o 'MTP head ready (depth=[0-9]*' "$LOG" | tail -1 | grep -o '[0-9]*$')
+if [ "${FIXED_EXT:-1}" = "0" ] && [ "${FIXED_DEPTH:-0}" = "${CAP_DEPTH:-3}" ]; then
+    echo "PASS [MLX_SERVE_MTP_ADAPTIVE=0 reverts to fixed depth ${CAP_DEPTH:-3}, no extension]"; PASS=$((PASS+1))
 else
-    echo "FAIL [adaptive kill switch]: depth=${FIXED_DEPTH:-none} ext_rounds=${FIXED_EXT:-none} (want depth=3 ext_rounds=0)"
+    echo "FAIL [adaptive kill switch]: depth=${FIXED_DEPTH:-none} ext_rounds=${FIXED_EXT:-none} (want depth=${CAP_DEPTH:-3} ext_rounds=0)"
     FAIL=$((FAIL+1))
 fi
 stop_server

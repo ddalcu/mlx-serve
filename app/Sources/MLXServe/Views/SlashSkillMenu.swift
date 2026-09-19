@@ -15,7 +15,7 @@ struct SlashSkillMenu: View {
                     HStack(spacing: 8) {
                         Text("/\(skill.name)")
                             .font(.callout.weight(.medium))
-                        Text(skill.description)
+                        Text(L10n.text(skill.description))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

@@ -51,6 +51,11 @@ enum ChatMetrics {
     /// Extra air under a reply: the turn boundary is answer -> next question.
     static var assistantTurnBottomPadding: CGFloat { compactMode ? 4 : 10 }
 
+    /// Above a folded turn's show-more. Compact keeps it tight; at normal
+    /// density the control needs air or it reads as one more line of the
+    /// message it belongs to.
+    static var foldToggleTopPadding: CGFloat { compactMode ? 2 : 5 }
+
     /// Single-line height of the composer's input pill — also the frame of
     /// every round control beside it (attach / mic / send), so a
     /// bottom-aligned HStack lines their centers up with the resting pill
@@ -81,6 +86,11 @@ enum ChatMetrics {
     /// Baked into the render cache: `MarkdownText`'s key carries the density.
     static var proseLineHeightMultiple: CGFloat { compactMode ? 1.15 : 1.4 }
     static let codeLineHeightMultiple: CGFloat = 1.2
+
+    /// One step of list nesting: enough to read as a level beside the marker's
+    /// own hanging indent, not so much that a three-deep outline runs out of
+    /// column.
+    static let listIndentStep: CGFloat = 18
 
     /// The user's bubble is plain SwiftUI `Text`, where leading is extra points
     /// rather than a multiple. Tighter than the reply on purpose. Never below

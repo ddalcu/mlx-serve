@@ -42,4 +42,20 @@ final class ServerManagerStopTests: XCTestCase {
         XCTAssertNil(server.chatModelInfo,
                      "a stopped server has nothing resident to answer chat, so the pill must not fall back to the old model")
     }
+
+    /// A stop during a start ends the wait for `.running` instead of running out the timeout.
+    func testStopDuringStartEndsTheWaitForRunning() async {
+        let server = ServerManager()
+        server.status = .starting
+        let waited = Task { @MainActor () -> TimeInterval in
+            let began = Date()
+            _ = try? await server.waitUntilRunning(timeout: 5)
+            return Date().timeIntervalSince(began)
+        }
+        await Task.yield()
+        server.stop()
+
+        let elapsed = await waited.value
+        XCTAssertLessThan(elapsed, 2, "a waiter that outlives a stopped start holds the model pill's spinner for the whole timeout")
+    }
 }

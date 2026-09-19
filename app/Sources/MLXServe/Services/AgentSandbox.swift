@@ -609,7 +609,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// before the delete — removing a rootfs out from under a still-stopping
     /// VM risks a partial delete that a later boot mistakes for a valid
     /// cache. Guest detach is synchronous (same shape as `teardown`).
-    func resetAllData(completion: (@Sendable () -> Void)? = nil) {
+    func resetAllData(completion: (@MainActor @Sendable () -> Void)? = nil) {
         let g = detachGuest()
         bootLock.lock()
         terminalCwd = "/workspace"
@@ -1235,8 +1235,8 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             }
             forwarder = fwd
         }
-        if let sp = bootSshPort {
-            // Own forwarder for ssh: same class, fixed mapping localhost:sp →
+        if bootSshPort != nil {
+            // Own forwarder for ssh: same class, fixed mapping localhost:<port> →
             // guest :22, immune to the guest's own listener churn (dropbear
             // binds 0.0.0.0:22, which the general forwarder would ALSO mirror
             // to localhost:22 — the dedicated instance is the stable address).

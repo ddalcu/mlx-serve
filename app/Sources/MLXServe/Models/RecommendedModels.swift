@@ -300,6 +300,31 @@ extension RecommendedModelPick {
         activeParamsB: 27.0
     )
 
+    /// prism-ml's Bonsai 2: Qwen3.8-27B requantized to ternary 2-bit behind
+    /// Hadamard rotations (`prism_hadamard_qwen35`), 8.6 GB, so the 27B fits
+    /// a 16 GB Mac. The repo ships no MTP head; the server grafts the 27B
+    /// pack's head at load (`mtp_graft.zig`), so it runs by default.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry), placed below the 4-bit
+    /// 27B: a 2-bit squeeze of the same model never beats it. `speed` is the
+    /// 71 tok/s measured with the grafted head at depth 2 on an M4 Max
+    /// (26.9.5 dev, code prompts), not a bench.sh cell.
+    static let bonsai2_27b = RecommendedModelPick(
+        id: "bonsai2-27b",
+        name: "Bonsai 2 27B",
+        tagline: "The 27B, sized for 16 GB",
+        blurb: "Qwen 3.8 27B squeezed down to about 2 bits per weight by prism-ml, so one of the strongest models here fits a Mac with 16 GB of memory. It gives up some accuracy against the full-size 27B and replies slower on a small Mac, but it is far smarter than anything else that fits in 16 GB. It reads images too, and uses the same built-in speed trick as the 27B.",
+        repoId: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        sizeGB: 8.6,
+        family: .qwen,
+        intelligence: 55,
+        intelligenceIsEstimated: true,
+        speed: 36,
+        speedIsWithMtp: true,
+        contextTokens: 262_144,
+        activeParamsB: 27.0
+    )
+
     /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
     /// on a very large Mac — now on our OWN native `deepseek_v4` MLX arch
     /// rather than the embedded ds4 GGUF engine, so the curated pick is our
@@ -390,7 +415,7 @@ extension RecommendedModelPick {
     /// Qwen picks, ascending by size — the Recommended pane's other family
     /// section.
     static let qwenCatalog: [RecommendedModelPick] = [
-        .qwen35_9b, .qwen38_27b, .qwen36_35bA3b,
+        .qwen35_9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's

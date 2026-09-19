@@ -6,10 +6,12 @@ const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
+const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
+const mtp_graft = @import("mtp_graft.zig");
 const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
@@ -26,6 +28,7 @@ const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
+const ane_mod = @import("ane.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -57,6 +60,9 @@ var ds4_dspark: bool = false;
 // lossy int8/fp16). File-level like ds4_dspark so the headless serve path
 // reads the same flag (the runHeadlessServe flag-eater class).
 var ane_prefill: bool = false;
+// `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
+// offload, published as ONE value (`ane.media_offload`) after the parse.
+var ane_media: ane_mod.MediaOffload = .{};
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
 
@@ -169,11 +175,22 @@ fn printUsage(io: std.Io) void {
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
         \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\  --ane-image         Run a share of each image DiT block's MLP on the
+        \\  --ane-video           Neural Engine beside the GPU (Krea / MiniMax-H3 /
+        \\  --ane-audio           ACE-Step; int8/fp16, lossy; off by default). The
+        \\                        share is calibrated once per Mac and model on
+        \\                        the first request (~1 s) and reused; the server
+        \\                        declines by name where the copy does not fit.
+        \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
+        \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
+        \\                        --kv-quant (default OFF: the head keeps
+        \\                        dense bf16 KV).
         \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
         \\                        default: the stages cost ~11 GB resident; the
         \\                        memory fit-gate still applies at load). For a
@@ -203,6 +220,12 @@ fn printUsage(io: std.Io) void {
         \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
+        \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
+        \\                        Use 0.2 for the Qwen3.8 matched comparison.
+        \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
+        \\                        Alias: --mtp-cascade. Use 0.95 for the
+        \\                        Qwen3.8 matched comparison. Exclusive with
+        \\                        --mtp-typical; exact is the default.
         \\  --max-mtp-ctx <n>   Keep MTP speculative decoding OFF past <n>
         \\                        context tokens (default: 0 = no ceiling).
         \\                        A verify row is BYTES, so on a long-context
@@ -221,10 +244,8 @@ fn printUsage(io: std.Io) void {
         \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
-        \\                        turbo2, turbo4          — Hadamard-rotated
-        \\                          affine at 2/4 bits; lower distortion at
-        \\                          comparable storage. Per-request override
-        \\                          via the `kv_quant` body field.
+        \\                          Per-request override via the `kv_quant`
+        \\                          body field.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -268,10 +289,13 @@ fn printUsage(io: std.Io) void {
         \\                        weights; see --prefill-chunk.
         \\  --ssm-checkpoint-max <n>
         \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 32). The first stride-aligned position
+        \\                        (default: 16). The first stride-aligned position
         \\                        is always kept; beyond the cap the oldest are
         \\                        dropped. 0 = unlimited, bounded only by the
         \\                        prefix cache's byte budget.
+        \\  --wired-margin-gib <n>
+        \\                      How far under iogpu.wired_limit_mb a plan may
+        \\                        reach (default: 8, integers 2..32).
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -289,8 +313,9 @@ fn printUsage(io: std.Io) void {
         \\                        MLX engine and ignore this flag. For
         \\                        GGUF: `auto` (default) reads the file's
         \\                        `general.architecture` metadata and routes
-        \\                        deepseek4 + ds4-MLA quants to the embedded
-        \\                        ds4 engine, everything else to llama.cpp.
+        \\                        ds4-converted quants (DeepSeek V4/V4.1, Qwen3.8
+        \\                        Flash Next, GLM 5.x) to the embedded ds4
+        \\                        engine, everything else to llama.cpp.
         \\                        Override when auto-detection is wrong
         \\                        (e.g. an unusual ds4 quant whose metadata
         \\                        layout differs).
@@ -502,7 +527,10 @@ pub fn main(init: std.process.Init) !void {
     // ships a sidecar is otherwise unreachable from clients that never send
     // `enable_mtp:true` (llmprobe, Claude Code, curl).
     var force_mtp = false;
+    var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
+    var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
+    var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -510,8 +538,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
-    // Off by default — only `.affine` cache scheme is supported by the
-    // v1 fused path; TurboQuant + dense schemes ignore it.
+    // Off by default — only the `.affine` cache scheme has a fused path.
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
@@ -687,12 +714,28 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
+            mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
             // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
             // the row share.
             ane_prefill = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-image")) {
+            ane_media.image = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-video")) {
+            ane_media.video = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-audio")) {
+            ane_media.audio = true;
+        } else if (std.mem.eql(u8, args[i], "--ane-split") and i + 1 < args.len) {
+            i += 1;
+            const v = std.fmt.parseFloat(f32, args[i]) catch 0;
+            if (!(v > 0) or v > 1) {
+                log.err("--ane-split must be in (0, 1], got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            ane_media.share = v;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -708,6 +751,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
+            i += 1;
+            mtp_typical_raw = args[i];
+        } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
+            i += 1;
+            mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
@@ -791,7 +840,13 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
-            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 32;
+            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
+            i += 1;
+            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+                log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
             // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
             // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`
@@ -847,10 +902,9 @@ pub fn main(init: std.process.Init) !void {
                 max_resident_mem_explicit = true;
             }
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
-            // Plan 05 Phase D: idle-tick eviction window. When set, the
-            // inference loop's idle path evicts .ready entries (refcount==0)
-            // whose last_used_ns is older than this. Default off — eviction
-            // is on-demand only.
+            // Idle eviction window. When set, `server.idleEvictLoop` unloads
+            // .ready entries (refcount==0) whose last_used_ms is older than
+            // this. Default off — eviction is on-demand only.
             i += 1;
             const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
             idle_evict_secs = if (n > 0) n else null;
@@ -862,12 +916,8 @@ pub fn main(init: std.process.Init) !void {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
             } else if (std.mem.eql(u8, args[i], "8")) {
                 kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
-            } else if (std.mem.eql(u8, args[i], "turbo2")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(2);
-            } else if (std.mem.eql(u8, args[i], "turbo4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(4);
             } else {
-                log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
@@ -910,6 +960,17 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+
+    // One value for the three media seams (they run under gen.zig with no
+    // server config in reach); the env stays the benching override.
+    if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
+    ane_mod.media_offload = ane_media;
+
+    transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
+    generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
+        log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
@@ -1114,7 +1175,6 @@ pub fn main(init: std.process.Init) !void {
     switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
-        .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
 
@@ -1166,7 +1226,14 @@ pub fn main(init: std.process.Init) !void {
     // error-return path, so pairing it with an errdefer that has the same body
     // frees the resource twice on error (double-free / SIGSEGV). The runtime
     // `owned_by_registry` guard makes the single defer correct on every exit.
-    defer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    // `create` hands back UNINITIALIZED memory and the defer below READS a
+    // field, so the struct gets a valid value before that defer can ever run:
+    // a `parseConfig` failure would otherwise free a garbage pointer.
+    config_storage.* = std.mem.zeroes(model_mod.ModelConfig);
+    defer if (!config_owned_by_registry) {
+        config_storage.deinit(allocator);
+        allocator.destroy(config_storage);
+    };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
@@ -1345,6 +1412,7 @@ pub fn main(init: std.process.Init) !void {
             .drafter_dir = drafter_dir orelse "",
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
+            .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = mtp_depth,
             .ane_prefill = ane_prefill,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
@@ -1386,12 +1454,10 @@ pub fn main(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         log.info("Loading weights...\n", .{});
-        var weights = if (load_vision)
-            try model_mod.loadWeightsWithVision(io, allocator, model_dir)
-        else
-            try model_mod.loadWeights(io, allocator, model_dir);
+        var weights = try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
+        try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
@@ -1405,8 +1471,9 @@ pub fn main(init: std.process.Init) !void {
         // through Slot caches via the scheduler; here we swap the
         // Transformer's own legacy cache to match.
         if (kv_quant_config.scheme != .off) {
-            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config, config.kvCacheKeyHeadDim());
+            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
         }
+        try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
@@ -1432,6 +1499,7 @@ pub fn main(init: std.process.Init) !void {
         // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
+        if (enable_mtp) mtp_graft.ensure(allocator, io, model_dir, config);
         if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
@@ -1543,7 +1611,8 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 ///
 /// Priority: explicit `--engine` override wins. Otherwise we read the file's
 /// GGUF metadata (cheap, header-only) and route on `general.architecture`:
-/// `deepseek4` + the antirez-style MLA key → ds4; everything else → llama.cpp.
+/// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
+/// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
 /// Issue #15 — the previous basename heuristic mis-routed two real-world
 /// files; see `src/gguf_meta.zig` for the rule.
 ///
@@ -1619,6 +1688,7 @@ fn runDs4Offline(
         .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
         .mtp_margin = 3.0,
         .dspark = ds4_dspark,
+        .embedded_mtp = ds4_mtp and !ds4_ssd_streaming and ds4_arch.ggufDeclaresEmbeddedMtp(io, allocator, gguf_path),
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1884,6 +1954,7 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .kv_quant_config = kv_quant_config,
+        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which

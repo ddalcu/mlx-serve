@@ -717,6 +717,38 @@ final class HFModelQuantGateTests: XCTestCase {
                       "gpt_oss tags should be treated as supported architecture")
         XCTAssertNil(m.incompatibleReason)
     }
+
+    /// HF tags a repo with its config.json model_type, so a served model_type
+    /// passes search with no family prefix to remember (Prism Bonsai 2's tags
+    /// carry no "qwen").
+    func testATagThatIsAServedModelTypeIsSupportedArchitecture() {
+        let m = mlx(id: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+                    tags: ["mlx", "safetensors", "prism_hadamard_qwen35", "ternary", "2-bit",
+                           "bonsai", "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture)
+        XCTAssertNil(m.incompatibleReason)
+        for type in supportedModelTypes {
+            XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
+                          "a repo tagged with served model_type \"\(type)\" reads as unsupported")
+        }
+    }
+}
+
+// MARK: - Mixed-width repos
+
+/// A "mixed-4-8bit" pack is mostly 4-bit with some 8-bit tensors, so its id
+/// names no single width. Pricing it at the larger one read Flash Next's 75 GB
+/// of weights as 142 GB; with no width the estimate falls to the file tree.
+final class HFMixedWidthTests: XCTestCase {
+    func testAWidthRangeBadgesAsTheRangeAndPricesNothing() {
+        let id = "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+        XCTAssertEqual(HFModel.quantizationLabel(forId: id), "4/8-bit")
+        XCTAssertNil(HFModel.packedBitWidth(forId: id))
+        XCTAssertNil(HFModel.estimateWeightBytes(
+            parameters: ["BF16": 455_671_664, "U32": 132_739_891_200], id: id))
+        XCTAssertEqual(HFModel.quantizationLabel(forId: "org/m-mixed_3_6bit"), "3/6-bit")
+        XCTAssertEqual(HFModel.quantizationLabel(forId: "org/m-4bit"), "4-bit")
+    }
 }
 
 // MARK: - HFModel.quantization label parsing

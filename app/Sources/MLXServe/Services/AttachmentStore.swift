@@ -225,12 +225,16 @@ enum AttachmentStore {
     static func removablePaths(orphanedBy removed: [ChatMessage],
                                in sessions: [ChatSession],
                                root: String = AttachmentStore.root) -> [String] {
-        let gone = Set(removed.flatMap { $0.images ?? [] }.compactMap(\.path))
-        return orphans(gone, surviving: paths(in: sessions), root: root)
+        return orphans(paths(in: removed), surviving: paths(in: sessions), root: root)
     }
 
     private static func paths(in sessions: [ChatSession]) -> Set<String> {
-        Set(sessions.flatMap(\.messages).flatMap { $0.images ?? [] }.compactMap(\.path))
+        paths(in: sessions.flatMap(\.messages))
+    }
+
+    /// Every file a message owns: its pictures and its audio clips.
+    private static func paths(in messages: [ChatMessage]) -> Set<String> {
+        Set(messages.flatMap { ($0.images ?? []).compactMap(\.path) + ($0.audio ?? []).compactMap(\.path) })
     }
 
     private static func orphans(_ gone: Set<String>,

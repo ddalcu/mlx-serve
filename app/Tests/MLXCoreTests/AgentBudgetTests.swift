@@ -60,16 +60,17 @@ final class AgentBudgetTests: XCTestCase {
     // args, the model misread the validation error as "I forgot content",
     // and the session looped for hours; at 11% context usage pi never
     // compacted the poisoned history away. The output budget must SCALE with
-    // the advertised context (context/4), capped at 65536 so a degenerate
-    // runaway generation stays bounded, floored at 1024.
+    // the advertised context (context/2: thinking shares the cap, and a 24k
+    // window's quarter was spent entirely on one xhigh thought), capped at
+    // 65536 so a degenerate runaway generation stays bounded, floored at 1024.
     func testOutputBudgetScalesWithContext() {
         XCTAssertEqual(AgentBudget.forServerContext(262144).output, 65536)
-        XCTAssertEqual(AgentBudget.forServerContext(131072).output, 32768)
+        XCTAssertEqual(AgentBudget.forServerContext(131072).output, 65536)
         XCTAssertEqual(AgentBudget.forServerContext(524288).output, 65536,
                        "runaway cap holds at huge contexts")
-        XCTAssertEqual(AgentBudget.forServerContext(65536).output, 16384,
-                       "mid contexts unchanged")
-        XCTAssertEqual(AgentBudget.forServerContext(32768).output, 8192)
+        XCTAssertEqual(AgentBudget.forServerContext(65536).output, 32768)
+        XCTAssertEqual(AgentBudget.forServerContext(24576).output, 12288)
+        XCTAssertEqual(AgentBudget.forServerContext(32768).output, 16384)
         XCTAssertEqual(AgentBudget.forServerContext(2048).output, 1024, "floor")
     }
 
@@ -157,7 +158,48 @@ final class AgentBudgetTests: XCTestCase {
         // opencode's schema: models.<id>.limit.{context,output}
         let limit = try XCTUnwrap(model["limit"] as? [String: Any])
         XCTAssertEqual(limit["context"] as? Int, b.context)
-        XCTAssertEqual(limit["output"] as? Int, b.output)
+        // opencode never sends max_tokens: limit.output is its compaction reserve.
+        XCTAssertEqual(limit["output"] as? Int, AgentBudget.compactionReserve(b.context))
+        XCTAssertNil(obj["compaction"], "opencode 1 gets no compaction block")
+    }
+
+    // pi keeps 20000 recent tokens and opencode2 reserves a 20000 buffer by
+    // default, both sized for 200k windows: a 24k window compacted before its
+    // first reply (opencode2) or never (pi, while max_tokens shrank to 1).
+    func testCompactionReserveIsAQuarterCappedAtTheAgentsDefaults() {
+        XCTAssertEqual(AgentBudget.compactionReserve(24576), 6144)
+        XCTAssertEqual(AgentBudget.compactionReserve(8192), 2048)
+        XCTAssertEqual(AgentBudget.compactionReserve(2048), 1024)
+        XCTAssertEqual(AgentBudget.compactionReserve(262144), 20000)
+    }
+
+    func testPiSettingsMergeScalesCompactionAndKeepsTheRest() throws {
+        let existing = #"{"theme":"dark","compaction":{"enabled":false,"reserveTokens":1}}"#
+        let json = AgentConfigs.piSettingsJSON(existing: existing, context: 24576)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["theme"] as? String, "dark")
+        let c = try XCTUnwrap(obj["compaction"] as? [String: Any])
+        XCTAssertEqual(c["enabled"] as? Bool, false, "the user's own flag survives")
+        XCTAssertEqual(c["reserveTokens"] as? Int, 10240)
+        XCTAssertEqual(c["keepRecentTokens"] as? Int, 6144)
+
+        let big = AgentConfigs.piSettingsJSON(existing: "", context: 262144)
+        let bo = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(big.utf8)) as? [String: Any])
+        let bc = try XCTUnwrap(bo["compaction"] as? [String: Any])
+        XCTAssertEqual(bc["reserveTokens"] as? Int, 16384, "big windows keep pi's defaults")
+        XCTAssertEqual(bc["keepRecentTokens"] as? Int, 20000)
+    }
+
+    func testOpencode2ConfigCarriesAScaledCompactionBlock() throws {
+        let b = AgentBudget.forServerContext(24576)
+        let json = AgentConfigs.opencodeJSON(
+            baseURL: "http://localhost:11234", defaultModel: "m",
+            entries: [AgentModelEntry(id: "m", budget: b, vision: false)], pinModel: true, compaction: true)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let c = try XCTUnwrap(obj["compaction"] as? [String: Any])
+        XCTAssertEqual(c["buffer"] as? Int, 6144)
+        XCTAssertEqual((c["keep"] as? [String: Any])?["tokens"] as? Int, 6144)
+        XCTAssertFalse(json.contains("'"))
     }
 
     func testClaudeCodeExportsCapOutputTokens() {

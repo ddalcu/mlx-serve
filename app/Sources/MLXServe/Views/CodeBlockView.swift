@@ -234,7 +234,7 @@ struct CodeBlockView: View {
 
     private var header: some View {
         HStack(spacing: 6) {
-            Text(label)
+            Text(L10n.text(label))
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
             Spacer()
@@ -252,7 +252,7 @@ struct CodeBlockView: View {
                 HStack(spacing: 4) {
                     Image(systemName: copied ? "checkmark" : "doc.on.doc")
                         .font(.system(size: 10, weight: .medium))
-                    Text(copied ? "Copied" : "Copy")
+                    Text(L10n.text(copied ? "Copied" : "Copy"))
                         .font(.system(size: 10, weight: .medium))
                 }
                 .foregroundStyle(copied ? Color.green : Color.secondary)

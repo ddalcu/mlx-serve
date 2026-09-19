@@ -38,6 +38,7 @@ int msv_ane_available(void);
  * a compile session's program budget (~free / program-bytes). 0 on probe
  * failure (no information). */
 uint64_t msv_ane_internal_free_disk(void);
+uint64_t msv_volume_free_for_use(const char *path);
 
 /* Shared I/O planes (A9): within ONE unit evals are strictly serial (one
  * in-flight kick/wait), so every program of a shape class binds the SAME

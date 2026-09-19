@@ -300,7 +300,7 @@ struct MediaDropWell: View {
             Image(systemName: systemImage)
                 .font(.title2)
                 .foregroundStyle(.secondary)
-            Button(title, action: action)
+            Button(L10n.text(title), action: action)
                 .buttonStyle(.link)
                 .font(.caption)
             Text("or drag one here")

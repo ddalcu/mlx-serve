@@ -36,7 +36,7 @@ final class ModelRootsTests: XCTestCase {
     /// `ownedRoots`, so the custom folder must NOT appear there.
     func testReadRootsCoverEveryServedFolderButOwnedRootsStayNarrow() {
         let dest = tempDir("dest"), custom = tempDir("custom"), lms = tempDir("lms")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = custom
         let read = roots.readRoots(toolRoots: ToolModelRoots(lmStudio: lms))
@@ -61,7 +61,7 @@ final class ModelRootsTests: XCTestCase {
 
     func testChoosingADefaultFolderMovesTheDownloadDestination() {
         let dir = tempDir("dest")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dir
         XCTAssertEqual(roots.downloadRoot, dir)
         // It survives a relaunch.
@@ -76,7 +76,7 @@ final class ModelRootsTests: XCTestCase {
     /// and creating it would write GBs into a mountpoint stub. The configured
     /// value is KEPT so Settings can still show it and the user can see why.
     func testAMissingDefaultFolderFallsBackButIsNotForgotten() {
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = "/Volumes/Gone/models"
         XCTAssertEqual(roots.downloadRoot, NSString(string: "~/.mlx-serve/models").expandingTildeInPath)
         XCTAssertEqual(roots.configuredDownloadRoot, "/Volumes/Gone/models")
@@ -91,7 +91,7 @@ final class ModelRootsTests: XCTestCase {
     func testScanRootsLeadWithTheDownloadDestination() {
         let dest = tempDir("dest")
         let custom = tempDir("custom")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = custom
         let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: nil))
@@ -118,7 +118,7 @@ final class ModelRootsTests: XCTestCase {
         defer { if !preexisting { try? FileManager.default.removeItem(atPath: builtIn) } }
 
         let dest = tempDir("dest")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: nil))
         XCTAssertEqual(all.first, dest)
@@ -132,7 +132,7 @@ final class ModelRootsTests: XCTestCase {
     /// LM Studio / custom folders, which are other tools' trees the app must
     /// not delete into.
     func testOwnedRootsKeepTheBuiltInFolderAfterTheDestinationMoves() {
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         XCTAssertEqual(roots.ownedRoots, [ModelRoots.builtInRoot])
 
         let dest = tempDir("dest")
@@ -145,7 +145,7 @@ final class ModelRootsTests: XCTestCase {
     /// `--model-dir`, and the server logs a warning per unopenable one.
     func testScanRootsAreDedupedAndExist() {
         let dest = tempDir("dest")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         roots.customRoot = dest + "/"          // same folder, trailing slash
         let all = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: dest))  // and again as LM Studio
@@ -160,7 +160,7 @@ final class ModelRootsTests: XCTestCase {
     /// The server's cap is 8 folders and it EXITS on the ninth, so the client
     /// must never build a list that long.
     func testScanRootsStayInsideTheServersOwnCap() {
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = tempDir("dest")
         roots.customRoot = tempDir("custom")
         XCTAssertLessThanOrEqual(roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: tempDir("lms"))).count, ModelRoots.serverRootLimit)
@@ -320,7 +320,7 @@ final class ModelRootsTests: XCTestCase {
     /// defaults by a Developer ID build (same user, same defaults domain, an
     /// App Store install later) must not move the destination there.
     func testAStoredFolderIsIgnoredWhereTheFeatureIsOff() {
-        var roots = ModelRoots(defaults: defaults, allowCustomFolders: true)
+        let roots = ModelRoots(defaults: defaults, allowCustomFolders: true)
         let dir = tempDir("dest")
         roots.configuredDownloadRoot = dir
         XCTAssertEqual(roots.downloadRoot, dir)

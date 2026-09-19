@@ -675,9 +675,11 @@ private final class TransportRecorder: @unchecked Sendable {
         return failAll
     }
 
-    func transport(_ texts: [String], _ model: String) async throws -> [[Double]] {
-        if record(texts) { throw URLError(.cannotConnectToHost) }
-        // Distinct per-text vectors so order round-trips visibly.
-        return texts.map { [Double($0.count), 1.0] }
+    var transport: @Sendable ([String], String) async throws -> [[Double]] {
+        { [self] texts, _ in
+            if record(texts) { throw URLError(.cannotConnectToHost) }
+            // Distinct per-text vectors so order round-trips visibly.
+            return texts.map { [Double($0.count), 1.0] }
+        }
     }
 }

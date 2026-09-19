@@ -85,14 +85,14 @@ struct VoiceTrayPanel: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                Text(VoicePreflight.shortMessage(for: issue))
+                Text(L10n.text(VoicePreflight.shortMessage(for: issue)))
                     .font(.caption.weight(.semibold))
             }
-            Text(VoicePreflight.detail(for: issue))
+            Text(L10n.text(VoicePreflight.detail(for: issue)))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button(VoicePreflight.actionLabel(for: issue)) {
+            Button(L10n.text(VoicePreflight.actionLabel(for: issue))) {
                 if let url = URL(string: VoicePreflight.settingsURLString(for: issue)) {
                     NSWorkspace.shared.open(url)
                 }
@@ -119,7 +119,7 @@ struct VoiceTrayPanel: View {
             Circle()
                 .fill(dotColor)
                 .frame(width: 8, height: 8)
-            Text(statusText)
+            Text(L10n.text(statusText))
                 .font(.caption.weight(.medium))
                 .foregroundStyle(isError ? .red : .secondary)
             if !voice.partialTranscript.isEmpty {
@@ -213,11 +213,11 @@ struct VoiceTrayPanel: View {
                 Text("Allow this tool call?")
                     .font(.caption.weight(.semibold))
             }
-            Text(req.toolName)
+            Text(L10n.text(req.toolName))
                 .font(.caption2.monospaced())
                 .foregroundStyle(.secondary)
             if !req.rawArguments.isEmpty {
-                Text(req.rawArguments)
+                Text(L10n.text(req.rawArguments))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
@@ -249,7 +249,7 @@ struct VoiceTrayPanel: View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Image(systemName: system).font(.system(size: 11, weight: .medium))
-                Text(label).font(.caption2.weight(.medium))
+                Text(L10n.text(label)).font(.caption2.weight(.medium))
             }
             .foregroundStyle(tint ?? .secondary)
         }

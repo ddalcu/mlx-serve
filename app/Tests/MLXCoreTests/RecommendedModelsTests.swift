@@ -134,7 +134,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// 35B-A3B is the fastest thing here, Flash-Next sits above the 27B.
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
-        XCTAssertEqual(mtp, ["qwen38-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
+        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -173,7 +173,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// point of carrying the flag.
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
-        XCTAssertEqual(estimated, ["qwen38-27b", "qwen38-flash-next"])
+        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -347,6 +347,20 @@ final class RecommendedModelsTests: XCTestCase {
         let repoIds = RecommendedModelPick.qwenCatalog.map(\.repoId)
         XCTAssertTrue(repoIds.contains("ddalcu/Qwen3.8-27B-MLX-Serve-4bit"))
         XCTAssertFalse(repoIds.contains("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve"))
+    }
+
+    /// Bonsai 2 is the Qwen 3.8 27B squeezed to 2 bits so it fits a 16 GB Mac.
+    /// Listed only: the 16 GB starter pick stays Gemma 4 E4B.
+    func testBonsaiIsTheQwen27BThatFitsA16GBMac() {
+        let b = RecommendedModelPick.bonsai2_27b
+        XCTAssertEqual(b.repoId, "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit")
+        XCTAssertTrue(RecommendedModelPick.qwenCatalog.contains(b))
+        XCTAssertTrue(b.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertFalse(RecommendedModelPick.qwen38_27b.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertLessThan(b.intelligence, RecommendedModelPick.qwen38_27b.intelligence, "a 2-bit squeeze is never smarter")
+        XCTAssertEqual(b.contextTokens, 262_144)
+        XCTAssertEqual(b.quantLabel, "2-bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 16 * GiB).id, "gemma-4-e4b")
     }
 
     func testGemma4EverydayPicksArePresent() {

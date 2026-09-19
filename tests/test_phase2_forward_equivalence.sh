@@ -36,7 +36,7 @@ set -uo pipefail
 
 PORT="${PORT:-19099}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
-QWEN="${QWEN_MLX_MODEL:-/Volumes/Sandisk_1TB/Models/mlx-community/Qwen3.5-4B-MLX-4bit}"
+QWEN="${QWEN_MLX_MODEL:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit}"
 GEMMA="${GEMMA4_MLX_MODEL:-/Users/david/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 REBASELINE="${PHASE2_REBASELINE:-0}"
 BASE="http://127.0.0.1:$PORT"

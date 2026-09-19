@@ -119,7 +119,7 @@ private struct TaskRow: View {
 private struct AutonomyBadge: View {
     let autonomy: TaskAutonomy
     var body: some View {
-        Text(autonomy.shortLabel)
+        Text(L10n.text(autonomy.shortLabel))
             .font(.caption2.weight(.semibold))
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(autonomy.tint.opacity(0.18), in: Capsule())
@@ -165,7 +165,7 @@ private struct TaskDetailView: View {
                     Button {
                         scheduler.runNow(task)
                     } label: {
-                        Label(isRunning ? "Running…" : "Run now", systemImage: "play.fill")
+                        Label(L10n.text(isRunning ? "Running…" : "Run now"), systemImage: "play.fill")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(isRunning)
@@ -282,7 +282,7 @@ private struct RunRow: View {
                 Image(systemName: run.status.iconName)
                     .foregroundStyle(run.status.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(run.summary ?? run.status.label)
+                    Text(L10n.text(run.summary ?? run.status.label))
                         .font(.callout)
                         .lineLimit(2)
                     Text("\(run.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(run.triggerReason)")
@@ -326,7 +326,7 @@ private struct ApprovalCard: View {
                 .font(.subheadline.weight(.semibold))
             Text(pending.reason).font(.caption).foregroundStyle(.secondary)
             if !pending.arguments.isEmpty {
-                Text(pending.arguments.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n"))
+                Text(L10n.text(pending.arguments.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n")))
                     .font(.caption.monospaced())
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)

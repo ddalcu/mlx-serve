@@ -40,21 +40,21 @@ struct FileToolSandboxGate: Sendable {
     /// Read at execution time — the setting changes between calls. Injectable
     /// (same seam as `ShellHandler.sandboxEnabled`) so gate tests never depend
     /// on the build flavor (MAS forces the sandbox on).
-    var sandboxEnabled: () -> Bool = { AgentSandbox.shared.isEnabled }
+    var sandboxEnabled: @Sendable () -> Bool = { AgentSandbox.shared.isEnabled }
     /// The live pinned guest's shared root + CLI-session label. (nil, nil)
     /// when no live pinned guest exists — then shell would remount silently,
     /// so file tools must not block either.
-    var pinnedWorkspace: () -> (root: String?, label: String?) = { AgentSandbox.shared.pinnedWorkspace }
+    var pinnedWorkspace: @Sendable () -> (root: String?, label: String?) = { AgentSandbox.shared.pinnedWorkspace }
     /// Test seam: force a rejection so each file tool's gate wiring stays
     /// provable now that production never blocks on the pin (hot-mount shares
     /// any folder). Nil in production.
-    var forcedRejection: ((String?) -> String?)? = nil
+    var forcedRejection: (@Sendable (String?) -> String?)? = nil
     /// Every file tool hits this chokepoint, so it's where a host-side file op
     /// ensures its folder is hot-mounted into a LIVE guest — otherwise a session
     /// that only ever writes/reads files (never `shell`) never appears in the
     /// VM at /projects/<slug>. Fire-and-forget; injectable so tests don't touch
     /// the shared guest.
-    var ensureMounted: (String?) -> Void = { AgentSandbox.shared.ensureProjectMountedAsync(workingDirectory: $0) }
+    var ensureMounted: @Sendable (String?) -> Void = { AgentSandbox.shared.ensureProjectMountedAsync(workingDirectory: $0) }
 
     func check(workingDirectory: String?) throws {
         if let forced = forcedRejection, let reason = forced(workingDirectory) {
@@ -111,7 +111,7 @@ struct ShellHandler: ToolHandler {
     /// because the MAS build forces the sandbox on (`AgentSandbox.resolveEnabled`)
     /// — without the seam, host-behavior tests in the MAS test binary would
     /// route into a guest that xctest can never boot.
-    var sandboxEnabled: () -> Bool = { AgentSandbox.shared.isEnabled }
+    var sandboxEnabled: @Sendable () -> Bool = { AgentSandbox.shared.isEnabled }
 
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let command = parameters["command"] else {
@@ -829,11 +829,19 @@ struct BrowseHandler: ToolHandler {
             switch action {
             case "navigate":
                 guard let url = parameters["url"] else { throw ToolError.missingParameter("url") }
-                return try await browser.navigate(to: url)
+                return try await browser.navigate(to: url, workingDirectory: workingDirectory)
+            case "show":
+                await browser.requestShow()
+                guard let raw = parameters["url"] else { return "Browser window shown." }
+                guard let url = BrowserManager.resolveURL(raw, workingDirectory: workingDirectory) else {
+                    throw ToolError.executionFailed("Invalid URL: \(raw)")
+                }
+                let nav = try await browser.load(url)
+                return "\(nav)\nTitle: \(await browser.pageTitle)\nBrowser window shown to the user."
             case "readText":
                 // Navigate to URL first if provided, then read text
                 if let url = parameters["url"] {
-                    _ = try await browser.navigate(to: url)
+                    _ = try await browser.navigate(to: url, workingDirectory: workingDirectory)
                 }
                 return try await browser.readText()
             case "readHTML":

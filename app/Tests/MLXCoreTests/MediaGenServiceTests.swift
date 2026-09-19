@@ -708,7 +708,7 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(decoded?.audioPCM)
     }
 
-    func testRefPayloadsBuildFromREALFilesOnDisk() throws {
+    func testRefPayloadsBuildFromREALFilesOnDisk() async throws {
         // Every other ref2va test constructs `VideoRefPayloads` by hand, so the
         // half a user actually exercises — picked file on disk → decode →
         // base64 on the wire — was covered nowhere. That half is the one with
@@ -744,7 +744,8 @@ final class MediaGenServiceTests: XCTestCase {
         req.refVideoPaths = [clip.path]
         req.refAudioPaths = [clip.path]      // audio is extracted from any AV-readable file
 
-        let refs = try XCTUnwrap(VideoGenService.refPayloads(for: req), "a readable picked file must not fail the build")
+        let built = await VideoGenService.refPayloads(for: req)
+        let refs = try XCTUnwrap(built, "a readable picked file must not fail the build")
 
         // Image rides through UNCHANGED — the server resizes, so re-encoding here
         // would only throw away what the "max" sizing mode exists to keep.
@@ -772,23 +773,26 @@ final class MediaGenServiceTests: XCTestCase {
         // Same picked files against an FL2VA preset resolve to NOTHING — the
         // capability gate, proven on real input rather than on a struct.
         var fl = req; fl.model = .minimaxH3
-        let none = try XCTUnwrap(VideoGenService.refPayloads(for: fl))
+        let flBuilt = await VideoGenService.refPayloads(for: fl)
+        let none = try XCTUnwrap(flBuilt)
         XCTAssertTrue(none.images.isEmpty && none.videos.isEmpty && none.audios.isEmpty)
     }
 
-    func testRefPayloadsFailRatherThanSilentlyDroppingAnUnreadableFile() throws {
+    func testRefPayloadsFailRatherThanSilentlyDroppingAnUnreadableFile() async throws {
         // "Generated, but quietly without your reference" is the worst outcome:
         // it looks like the feature not working rather than the file not being
         // readable, and it costs a full generation to find out.
         var req = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
                                   numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
         req.refImagePaths = ["/nonexistent/\(UUID().uuidString).png"]
-        XCTAssertNil(VideoGenService.refPayloads(for: req))
+        let missing = await VideoGenService.refPayloads(for: req)
+        XCTAssertNil(missing)
 
         var bad = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
                                   numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
         bad.refVideoPaths = ["/nonexistent/\(UUID().uuidString).mp4"]
-        XCTAssertNil(VideoGenService.refPayloads(for: bad))
+        let unreadable = await VideoGenService.refPayloads(for: bad)
+        XCTAssertNil(unreadable)
     }
 
     func testWriteMP4WithAudioProducesAnAudioTrack() async throws {
@@ -1240,6 +1244,38 @@ final class MediaGenServiceTests: XCTestCase {
         let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
         XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/ok.safetensors"])
         XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
+    }
+
+    func testImageRequestJsonOmitsGuidanceFieldsAtDefaults() {
+        let req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertNil(json["guidance_scale"])
+        XCTAssertNil(json["negative_prompt"])
+    }
+
+    func testImageRequestJsonIncludesGuidanceScaleAndTrimmedNegativePrompt() {
+        var req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        req.guidanceScale = 3.5
+        req.negativePrompt = "  blurry, low quality  "
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["guidance_scale"] as? Double, 3.5)
+        XCTAssertEqual(json["negative_prompt"] as? String, "blurry, low quality")
+    }
+
+    func testImageRequestJsonOmitsBlankNegativePromptEvenWithGuidanceSet() {
+        var req = ImageGenRequest(model: .flux2Klein9BBase_Q4, prompt: "x", width: 1024, height: 1024, steps: 30)
+        req.guidanceScale = 3.5
+        req.negativePrompt = "   "
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["guidance_scale"] as? Double, 3.5)
+        XCTAssertNil(json["negative_prompt"])
+    }
+
+    func testOnlyTheBaseKleinPresetDeclaresGuidanceSupport() {
+        XCTAssertTrue(ImageModelPreset.flux2Klein9BBase_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.flux2Klein4B_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.flux2Klein9B_Q4.supportsGuidance)
+        XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsGuidance)
     }
 
     func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {
