@@ -59,7 +59,7 @@ else
     -DMLX_BUILD_TESTS=OFF \
     -DMLX_BUILD_BENCHMARKS=OFF \
     -DMLX_BUILD_EXAMPLES=OFF
-  cmake --build "$WORK/mlx-build" --target mlx --parallel "$(nproc)"
+  cmake --build "$WORK/mlx-build" --parallel "$(nproc)"
   cmake --install "$WORK/mlx-build" --prefix "$WORK/mlx-prefix" >/dev/null
 fi
 
