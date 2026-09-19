@@ -50,6 +50,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `minimax_h3*.zig` | MiniMax-H3 text-to-audio-video: joint video+audio DiT, staged residency, fast recipe, Turbo LoRA, chained windows — detail in `docs/reference.md` |
 | `tts.zig` | Qwen3-TTS incl. ECAPA-TDNN voice clone |
 | `kokoro.zig` / `kokoro_g2p.zig` | Kokoro-82M TTS + text→IPA G2P (no espeak — GPLv3) |
+| `laya.zig` | Laya typed decisions (`POST /v1/decisions`): mmBERT/ModernBERT encoder + decision head, prompt layout and output JSON mirror `laya_mlx`; `.decision` modality slot |
 | `marching_cubes.zig` / `glb.zig` / `uvwrap.zig` / `rasterize.zig` / `texinpaint.zig` | Pure-Zig mesh/GLB/xatlas/rasterizer/inpaint (zero MLX, hermetic tests) |
 | `preview.zig` / `latent_rgb.zig` / `jpeg.zig` | Opt-in per-step video previews (#208): published latent→RGB map per backend (GENERATED — `tests/dump_latent_rgb_factors.py`), temporal pick + filmstrip, bilinear resize, baseline JPEG. Zero MLX; `zig build preview-test` is the Linux-runnable graph |
 | `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
@@ -141,6 +142,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
 | `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`); ~0 net on 0731 |
 | `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on |
+| `laya` | Laya typed-decision checkpoints (no root config.json — classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, `gen.peekModelType` delegates): ModernBERT encoder (RoPE, GeGLU, global/sliding bool masks) + 2 head layers + marker scorer + act head, fp16; tokenizer.json `Metaspace` pre-tokenizer implemented in `tokenizer.zig` |
 | media types | `flux2*`/`krea*`/`mage_flow*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` has NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery.peekMageFlowIndex`, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.

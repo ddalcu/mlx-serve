@@ -92,6 +92,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "laya") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -152,6 +153,9 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // the DiT's own weight names.
         if (peekMfluxFlux2(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "flux2-klein") catch return .missing_or_unparseable };
+        // A Laya decision checkpoint ships encoder/config.json + rl_agent_config.json.
+        if (peekLayaCheckpoint(io, sub))
+            return .{ .supported = allocator.dupe(u8, "laya") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
     };
     defer file.close(io);
@@ -193,6 +197,17 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         }
     }
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+}
+
+/// True when `sub` holds a Laya typed-decision checkpoint (no root config.json;
+/// identified by the two configs every Laya export carries). Twin of
+/// gen.isLayaRepo, which delegates here.
+pub fn peekLayaCheckpoint(io: std.Io, sub: std.Io.Dir) bool {
+    for ([_][]const u8{ "rl_agent_config.json", "encoder/config.json" }) |rel| {
+        const f = sub.openFile(io, rel, .{}) catch return false;
+        f.close(io);
+    }
+    return true;
 }
 
 /// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
@@ -432,6 +447,7 @@ pub const ModelKind = enum {
     audio,
     video,
     mesh,
+    decision,
     embed,
     drafter,
     unsupported,
@@ -444,6 +460,7 @@ pub const ModelKind = enum {
             .audio => "audio",
             .video => "video",
             .mesh => "3d",
+            .decision => "decision",
             .embed => "embed",
             .drafter => "drafter",
             .unsupported => "unsupported",
@@ -458,6 +475,7 @@ pub const ModelKind = enum {
             .audio => "an audio generation model",
             .video => "a video generation model",
             .mesh => "a 3D generation model",
+            .decision => "a typed-decision model (use /v1/decisions)",
             .embed => "an embedding encoder (use /v1/embeddings)",
             .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
             .unsupported => "an architecture mlx-serve does not support",
@@ -471,6 +489,7 @@ pub const ModelKind = enum {
             .audio => "/v1/audio/speech (TTS) or /v1/audio/music-generations (music)",
             .video => "/v1/video/generations",
             .mesh => "/v1/3d/generations",
+            .decision => "/v1/decisions",
             else => null,
         };
     }
@@ -490,6 +509,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.eql(u8, model_type, "laya")) return .decision;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -844,7 +864,8 @@ fn tryAddModel(
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
-            !peekMfluxFlux2(io, allocator, sub)) return false;
+            !peekMfluxFlux2(io, allocator, sub) and
+            !peekLayaCheckpoint(io, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)

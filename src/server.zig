@@ -769,6 +769,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/completions",
+    "/v1/decisions",
     "/v1/embeddings",
     "/v1/images/edits",
     "/v1/images/generations",
@@ -1869,6 +1870,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
+    log.info("  POST /v1/decisions (Laya)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2537,6 +2539,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/decisions")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .decisions);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/music-generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -6114,6 +6120,7 @@ const ReadyCaps = struct {
     has_music_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
+    has_decision_engine: bool = false,
 };
 
 /// Chat capability for a READY entry. Template presence is NOT the gate for
@@ -6157,6 +6164,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
+    if (c.has_decision_engine) try append_cap(allocator, &caps, &n_caps, "decisions");
     try caps.append(allocator, ']');
     return caps;
 }
@@ -6173,6 +6181,7 @@ const TextGenTarget = struct {
     has_audio_engine: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
+    has_decision_engine: bool = false,
     /// A text-capable LM is resident (transformer / ds4 / llama engine) —
     /// or the entry isn't loaded yet, in which case stubs default to
     /// "assume text until the arch hint or a load says otherwise".
@@ -6217,6 +6226,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
         if (t.has_video_engine) break :blk .video;
         if (t.has_mesh_engine) break :blk .mesh;
         if (t.has_audio_engine) break :blk .audio;
+        if (t.has_decision_engine) break :blk .decision;
         break :blk media_mod.modalityFromType(t.arch_hint);
     };
     if (modality) |m| return switch (m) {
@@ -6224,6 +6234,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
         .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
+        .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
     };
     if (!t.has_text_lm) return "This model cannot serve text generation (no language model resident).";
     return null;
@@ -6241,6 +6252,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_audio_engine = lm.audio_engine != null,
         .has_video_engine = lm.video_engine != null,
         .has_mesh_engine = lm.mesh_engine != null,
+        .has_decision_engine = lm.decision_engine != null,
         .has_text_lm = lm.state != .ready or lm.transformer != null or
             lm.ds4_engine != null or lm.llama_engine != null,
     };
@@ -6314,6 +6326,7 @@ fn renderModelEntry(
             } else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
+            .has_decision_engine = entry.decision_engine != null,
         });
         defer caps.deinit(allocator);
 
@@ -6814,6 +6827,7 @@ fn genJobRun(ctx: *anyopaque) void {
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .decisions => if (job.lm.decision_engine) |e| media_mod.handleDecisions(job.allocator, job.conn, job.body, e, job.lm.id) else error.WrongModality,
     };
     result catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
@@ -6834,9 +6848,10 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .audio => lm.audio_engine != null,
         .video => lm.video_engine != null,
         .mesh => lm.mesh_engine != null,
+        .decision => lm.decision_engine != null,
     };
     if (!ok) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video/3D model and target it by id.", 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);
         return;
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };

@@ -23,6 +23,7 @@ const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
 const kokoro = @import("kokoro.zig");
+const laya = @import("laya.zig");
 const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
@@ -53,6 +54,9 @@ pub const Modality = enum {
     audio,
     video,
     mesh,
+    /// Laya typed decisions (`/v1/decisions`): an encoder, not a generator,
+    /// but it rides the media plumbing (engine slot, inference-thread job).
+    decision,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
@@ -60,6 +64,7 @@ pub const Modality = enum {
             .audio => "audio",
             .video => "video",
             .mesh => "3d",
+            .decision => "decisions",
         };
     }
 
@@ -72,6 +77,7 @@ pub const Modality = enum {
             .audio => "qwen3_tts",
             .video => "AudioVideo",
             .mesh => "hunyuan3d_2_1",
+            .decision => "laya",
         };
     }
 };
@@ -93,7 +99,7 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "laya",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -107,6 +113,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.eql(u8, model_type, "laya")) return .decision;
     return null;
 }
 
@@ -119,6 +126,7 @@ pub const GenRoute = enum {
     music,
     video,
     mesh,
+    decisions,
 
     pub fn modality(self: GenRoute) Modality {
         return switch (self) {
@@ -126,6 +134,7 @@ pub const GenRoute = enum {
             .speech, .music => .audio,
             .video => .video,
             .mesh => .mesh,
+            .decisions => .decision,
         };
     }
 };
@@ -173,7 +182,15 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the SAME predicate discovery uses — a private copy here is how `list` and
     // the loader end up disagreeing about whether a dir is a model.
     if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
+    // Laya decision checkpoints carry no root config.json either.
+    if (isLayaRepo(io, model_dir)) return allocator.dupe(u8, "laya") catch null;
     return null;
+}
+
+fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekLayaCheckpoint(io, dir);
 }
 
 /// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
@@ -807,6 +824,50 @@ pub const AudioEngine = struct {
         self.allocator.destroy(self);
     }
 };
+
+/// Decision engine: Laya typed decisions over `POST /v1/decisions`.
+pub const DecisionEngine = struct {
+    allocator: std.mem.Allocator,
+    engine: *laya.Engine,
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
+        const self = try allocator.create(DecisionEngine);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+        const s = mlx.mlx_default_gpu_stream_new();
+        self.engine = try laya.Engine.load(io, allocator, model_dir, s);
+        log.info("[decision] Laya engine ready\n", .{});
+        return self;
+    }
+
+    pub fn deinit(self: *DecisionEngine) void {
+        self.engine.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+/// `POST /v1/decisions` `{"model", "state": <string|object|array>, "questions": {id: {...}}}`
+/// -> laya's `predict` JSON. Runs on the inference thread like every gen job.
+pub fn handleDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *DecisionEngine, model_id: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        return sendError(conn, 400, "request body is not valid JSON");
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return sendError(conn, 400, "request body must be a JSON object");
+    const obj = parsed.value.object;
+    const state = obj.get("state") orelse return sendError(conn, 400, "missing 'state'");
+    const questions = obj.get("questions") orelse return sendError(conn, 400, "missing 'questions'");
+    const t0 = std.Io.Timestamp.now(conn.io, .boot);
+    const out = engine.engine.predictJson(allocator, model_id, state, questions) catch |err| {
+        if (laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
+        log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
+        return sendError(conn, 500, "decision forward failed");
+    };
+    defer allocator.free(out);
+    const nq: usize = if (questions == .object) questions.object.count() else 0;
+    log.info("[decision] {d} question(s) in {d:.1} ms\n", .{ nq, @as(f64, @floatFromInt(t0.untilNow(conn.io, .boot).nanoseconds)) / 1e6 });
+    try sendBytesJson(conn, allocator, out);
+}
 
 /// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d
 /// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
@@ -4749,7 +4810,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video, .mesh }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh, .decision }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }

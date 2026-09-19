@@ -251,6 +251,7 @@ pub const LoadedModel = struct {
     audio_engine: ?*gen_mod.AudioEngine = null,
     video_engine: ?*gen_mod.VideoEngine = null,
     mesh_engine: ?*gen_mod.MeshEngine = null,
+    decision_engine: ?*gen_mod.DecisionEngine = null,
     /// Model-wide serialization gate for media generation — mirrors
     /// `session_busy`. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
@@ -404,6 +405,10 @@ pub const LoadedModel = struct {
         if (self.mesh_engine) |e| {
             e.deinit();
             self.mesh_engine = null;
+        }
+        if (self.decision_engine) |e| {
+            e.deinit();
+            self.decision_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -570,6 +575,10 @@ pub const LoadedModel = struct {
         if (self.mesh_engine) |e| {
             e.deinit();
             self.mesh_engine = null;
+        }
+        if (self.decision_engine) |e| {
+            e.deinit();
+            self.decision_engine = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {

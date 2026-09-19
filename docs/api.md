@@ -58,6 +58,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /v1/models` — list loaded models with capabilities + engine info
 - `POST /v1/completions` — text completions
 - `POST /v1/embeddings` — text embeddings (BERT, EmbeddingGemma, and last-token pooling models like Qwen3-Embedding; pooling follows the checkpoint's sentence-transformers metadata, `dimensions` truncates and renormalizes)
+- `POST /v1/decisions` — Laya typed decisions: `{"model", "state": <string|object>, "questions": {id: {"type": "choice"|"score"|"noul", "instructions", "criteria"}}}` returns laya's `predict` schema (`answers` with `type`, `confidence`, `action.act_probability`, plus `choice`+`probabilities`, `score`+`legend`+`probabilities`, or `noul`)
 - `POST /v1/images/generations`, `POST /v1/images/edits` — image generation and instruction edits; the edits endpoint speaks the OpenAI SDK's multipart shape (`client.images.edit`), including repeated `image[]` for multi-reference
 - `POST /v1/audio/speech` — Qwen3-TTS (`ref_audio` clones a voice) or Kokoro (`voice` picks or blends one of 54), WAV out
 - `POST /v1/audio/music-generations` — text-to-music, WAV out: ACE-Step (48 kHz stereo, fast) or MiniMax Music 3 (`lyrics` required, 44.1 kHz, songs up to six minutes)
