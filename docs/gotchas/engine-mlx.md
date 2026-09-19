@@ -5159,3 +5159,26 @@ group-padded verify block`.
 - Bar: `qmv2: no worse than stock ... against f32 truth` (within 5% of
   stock's RMS and max error, bf16 + f16, both bias layouts). A tolerance vs
   stock's OUTPUT (the old test) passed the half2 kernel.
+
+## mlx-c handles: `replace` aliases the wrapper a defer still frees (2026-09-19)
+
+- `mlx_array` is a wrapper POINTER (`mlx_array_free_` = `delete ctx`, no
+  refcount), and every op binding ASSIGNS INTO THE CALLER'S WRAPPER
+  (`mlx_array_set_`: `*res.ctx = value`) — so `mlx_transpose_axes(&t, cur, ...)`
+  leaves `t.ctx` as the ONLY owner of the result. The `replace(&cur, t)` idiom
+  (free old, copy the handle) makes `cur.ctx == t.ctx`; a `defer free(t)` in the
+  same block then deletes the wrapper `cur` still points at, and the next op
+  reads a freed wrapper.
+- MiniCPM-V's `mergeWindows` hit it in live serving: SIGSEGV inside
+  `mlx_add`/`mlx_reshape` at a garbage address, ON THE INFERENCE THREAD ONLY —
+  the same forward passed as a unit test (the freed wrapper's memory was still
+  intact there; the server's heap churn reused it). Two crashes, two different
+  frames, one class.
+- Fix in `minicpm_vision.zig`: a handle moved via `replace` goes out of scope
+  UN-freed; a handle freed explicitly before function exit gets a fresh
+  `mlx_array_new()` in it (the `towerHidden` reassign-empty trick), so an armed
+  `errdefer` can never double-free; `defer`-style frees are only ever used on
+  handles read but never replaced-in.
+- Guard: the shape asserts in `minicpm vision live` check finiteness, not just
+  shape — a wrong-view reshape keeps the shape but corrupts the data, so a
+  shape-only test passes through exactly this class.
