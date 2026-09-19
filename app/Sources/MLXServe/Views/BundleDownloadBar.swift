@@ -33,9 +33,11 @@ struct BundleDownloadBar: View {
     @ViewBuilder
     private var notStartedRow: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(showsStartButton
+            Text(L10n.text(
+                 showsStartButton
                  ? "This model isn't downloaded yet."
-                 : "This model isn't downloaded yet — use Download above.")
+                 : "This model isn't downloaded yet — use Download above."
+))
                 .font(.caption).foregroundStyle(.secondary)
             if showsStartButton {
             Button {
@@ -47,7 +49,8 @@ struct BundleDownloadBar: View {
             .buttonStyle(.borderedProminent)
             }
             if bundle.components.count > 1 {
-                Text("Includes \(bundle.components.count) models (e.g. the text encoder).")
+                Text(L10n.format("Includes %lld models (e.g. the text encoder).",
+                                 Int64(bundle.components.count)))
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -65,7 +68,9 @@ struct BundleDownloadBar: View {
                 .buttonStyle(.plain)
                 .help("Cancel download")
             }
-            let label = a.count > 1 ? "Downloading model \(a.index)/\(a.count): " : "Downloading: "
+            let label = a.count > 1
+                ? L10n.format("Downloading model %lld/%lld: ", Int64(a.index), Int64(a.count))
+                : L10n.text("Downloading: ")
             Text(label + (a.state.currentFile.isEmpty ? a.state.statusText : a.state.currentFile))
                 .font(.system(size: 9)).foregroundStyle(.secondary)
                 .lineLimit(1).truncationMode(.middle)

@@ -85,8 +85,8 @@ struct ChatErrorNotice: Codable, Equatable {
                 // Pre-counts server: say what happened without inventing figures.
                 return "This request was larger than the model's context window."
             }
-            return "This request needed \(Self.grouped(neededTokens)) tokens, "
-                + "but the model's context window holds only \(Self.grouped(contextLength))."
+            return L10n.format("This request needed %@ tokens, but the model's context window holds only %@.",
+                               Self.grouped(neededTokens), Self.grouped(contextLength))
         case .generic:
             return message
         }

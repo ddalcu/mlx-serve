@@ -32,6 +32,7 @@ SLUGS=(
   speculative-decoding
   local-ai-assistant
   llm-tier-list
+  benchmarks
 )
 
 PASS=0; FAIL=0; PEND=0
@@ -171,9 +172,42 @@ else
   fail "llm-tier-list: interactive page missing ($TIER)"
 fi
 
+# ── 7b: benchmarks board contract ──────────────────────────────────────────
+# The community benchmark board reads Firebase Realtime Database over plain
+# HTTPS (no SDK — that's why RTDB was chosen over Firestore) and renders two
+# views: absolute tok/s per comparable cell, and each setting's decode ratio
+# against its own session's `defaults` arm. The ratio view is the only
+# comparison that's valid across different Macs, so it must always ship.
+BENCH="$DOCS/benchmarks/index.html"
+if [ -f "$BENCH" ]; then
+  pass
+  check "$BENCH" 'firebaseio.com'          "benchmarks: RTDB endpoint"
+  check "$BENCH" 'limitToLast'             "benchmarks: bounded fetch, never the whole database"
+  check "$BENCH" 'function isValidRow'     "benchmarks: per-row validation (open database)"
+  check "$BENCH" 'function familyKey'      "benchmarks: comparable-family grouping"
+  check "$BENCH" 'function headroomByCell' "benchmarks: speculation-headroom view"
+  check "$BENCH" 'function settingsSignature' "benchmarks: settings in the grouping key"
+  check "$BENCH" 'function aggregateFamilies' "benchmarks: per-rung cell families"
+  check "$BENCH" 'gpuCores'                "benchmarks: GPU cores in the grouping key"
+  check "$BENCH" 'id="mode-ratio"'         "benchmarks: speculation-headroom view toggle"
+  check "$BENCH" 'id="mode-prefill"'       "benchmarks: prefill view toggle"
+  check "$BENCH" 'id="f-chip"'             "benchmarks: chip filter"
+  check "$BENCH" 'id="f-ram"'              "benchmarks: memory filter"
+  check "$BENCH" 'value="lossless"'        "benchmarks: lossless filter"
+  # The grouping mirrors BenchmarkStore.familyKey in the Swift app; both sides
+  # are unit-tested so the two can't quote different numbers for one dataset.
+  if command -v node >/dev/null 2>&1; then
+    if node tests/website_benchmarks_logic.mjs; then pass; else fail "benchmarks: logic assertions (tests/website_benchmarks_logic.mjs)"; fi
+  else
+    pend "benchmarks logic assertions skipped (node not installed)"
+  fi
+else
+  fail "benchmarks: board page missing ($BENCH)"
+fi
+
 # ── 8: ONE shared header on every page ──────────────────────────────────────
-# Every page carries the same nav: an EMPTY version pill, a Tier list link, and
-# the Download CTA.
+# Every page carries the same nav: an EMPTY version pill, Tier list and
+# Benchmarks links, and the Download CTA.
 #
 # The pill is empty in the markup on purpose. It used to be hardcoded and
 # checked against the CHANGELOG's newest entry here, which meant every release
@@ -191,6 +225,28 @@ for f in "$DOCS"/index.html "$DOCS"/*/index.html; do
   check "$f" 'class="nav-appstore"'    "$page: nav App Store CTA (mobile variant)"
   check "$f" 'appstore.svg'            "$page: nav App Store badge asset ref"
   check "$f" '>Tier list<'             "$page: nav Tier list link"
+  check "$f" '>Benchmarks<'            "$page: nav Benchmarks link"
+  # The homepage sections live under ONE submenu, never as four top-level
+  # anchor links that crowd the bar on a 13" screen.
+  check "$f" 'class="nav-submenu"'     "$page: nav Overview submenu"
+  check "$f" '#faq"'                   "$page: nav FAQ link inside the submenu"
+  # Every deep-dive page is reachable from the Features submenu on every page,
+  # and a deep-dive page marks itself current inside it.
+  check "$f" 'class="nav-submenu nav-submenu-wide"' "$page: nav Features submenu"
+  for slug in onboarding image-generation video-generation music-generation 3d-generation voice-cloning \
+              claude-code-local local-ai-assistant agent-sandbox speculative-decoding tool-calling \
+              lm-studio-alternative ollama-alternative; do
+    if [ "$page" = "$slug" ]; then
+      check "$f" 'href="./" class="nav-current"' "$page: Features submenu marks this page current"
+    else
+      check "$f" "$slug/\"" "$page: Features submenu links $slug"
+    fi
+  done
+  if grep -qE '<li><a href="[^"]*#(explore|performance|features|faq)" class="hide-mobile">' "$f"; then
+    fail "$page: homepage anchor link at the top level of the nav — it belongs in the Overview submenu"
+  else
+    pass
+  fi
   if grep -qE 'nav-ver">v?[0-9]' "$f"; then
     fail "$page: version hardcoded in the nav pill — assets/version.js resolves it"
   else

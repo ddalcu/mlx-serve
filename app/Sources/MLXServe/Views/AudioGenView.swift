@@ -23,7 +23,7 @@ struct AudioGenView: View {
         VStack(spacing: 0) {
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { t in
-                    Text(t.rawValue).tag(t)
+                    Text(L10n.text(t.rawValue)).tag(t)
                 }
             }
             .pickerStyle(.segmented)
@@ -75,7 +75,7 @@ struct AudioHistoryShelf: View {
         Group {
             if !paths.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     ScrollView {
                         VStack(spacing: 2) {
                             ForEach(paths, id: \.self) { path in
@@ -247,7 +247,7 @@ struct VoiceGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -263,7 +263,7 @@ struct VoiceGenView: View {
                         .foregroundStyle(dictating ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
                 }
                 .buttonStyle(.borderless)
-                .help(dictating ? "Stop dictation" : "Dictate the text to speak")
+                .help(L10n.text(dictating ? "Stop dictation" : "Dictate the text to speak"))
             }
             TextEditor(text: $text)
                 .font(.body)
@@ -272,7 +272,7 @@ struct VoiceGenView: View {
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
             if dictating {
-                Text(dictationPartial.isEmpty ? "Listening…" : dictationPartial)
+                Text(L10n.text(dictationPartial.isEmpty ? "Listening…" : dictationPartial))
                     .font(.caption2).foregroundStyle(.secondary)
                     .lineLimit(2)
             }
@@ -350,7 +350,7 @@ struct VoiceGenView: View {
             HStack {
                 Text("Reference voice").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("~\(model.recommendedRefSeconds)s recommended")
+                Text(L10n.format("~%llds recommended", Int64(model.recommendedRefSeconds)))
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -406,7 +406,8 @@ struct VoiceGenView: View {
                         .font(.caption)
                 }
             } else {
-                Text("Pick, record or drag in ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
+                Text(L10n.format("Pick, record or drag in ~%lld seconds of the voice to clone. Without a reference, the model's default voice is used.",
+                                 Int64(model.recommendedRefSeconds)))
                     .font(.caption2).foregroundStyle(.secondary)
             }
 

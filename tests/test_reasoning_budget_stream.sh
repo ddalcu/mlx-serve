@@ -1,5 +1,7 @@
 #!/bin/bash
-# A reasoning BUDGET must SHORTEN the thought, not hide it.
+# A reasoning BUDGET must SHORTEN the thought, not hide it — and END it: at the
+# budget the server commits the early-stop line and the closer through the
+# model, so the answer (or tool call) still arrives inside max_tokens.
 #
 # With `tools` present the streaming chat path used to gate incremental
 # reasoning on `reasoning_budget < 0`: a capped request showed NOTHING for the
@@ -10,7 +12,9 @@
 # Checks, tools + an explicit tiny `reasoning_budget_tokens`:
 #   1. reasoning arrives in MORE THAN ONE delta (incremental, not one dump)
 #   2. the first reasoning delta lands well before the stream ends
-#   3. total streamed reasoning stays inside the budget
+#   3. total streamed reasoning stays inside the budget plus the forced close
+#   4. the thought is CLOSED by the server (early-stop line) and the turn
+#      finishes with content or a tool call, never `length` (stream + non-stream)
 #
 # Usage: ./tests/test_reasoning_budget_stream.sh [model_dir] [port]
 set -u
@@ -76,14 +80,81 @@ for i,l in enumerate(lines):
         if r:
             n+=1; total+=r
             if first is None: first=i
-print(f"N={n}; FIRST={first if first is not None else -1}; EVENTS={len(lines)}; CHARS={len(total)}")
+fin=""; has_answer=0
+for l in lines:
+    try: d=json.loads(l)
+    except Exception: continue
+    for c in d.get("choices",[]):
+        if c.get("finish_reason"): fin=c["finish_reason"]
+        dl=c.get("delta") or {}
+        if dl.get("content") or dl.get("tool_calls"): has_answer=1
+closed=1 if "Considering the limited time" in total else 0
+print(f"N={n}; FIRST={first if first is not None else -1}; EVENTS={len(lines)}; CHARS={len(total)}; FIN={fin}; ANSWER={has_answer}; CLOSED={closed}")
 PY
 )"
 
 check "reasoning arrives in more than one delta (not one end-of-stream dump)" "$([ "$N" -gt 1 ] && echo 1 || echo 0)"
 check "first reasoning delta lands in the first half of the stream" "$([ "$FIRST" -ge 0 ] && [ "$FIRST" -lt $((EVENTS / 2 + 1)) ] && echo 1 || echo 0)"
-# ~4 chars/token is generous; the cap is enforced in tokens.
-check "streamed reasoning stays inside the budget" "$([ "$CHARS" -le $((BUDGET * 8)) ] && echo 1 || echo 0)"
+# ~4 chars/token is generous; the cap is enforced in tokens, plus the ~30-token forced close.
+check "streamed reasoning stays inside the budget plus the forced close" "$([ "$CHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
+check "the server closed the thought (early-stop line streamed as reasoning)" "$CLOSED"
+check "the turn ends with an answer or tool call, not length (got '$FIN')" "$([ "$ANSWER" = 1 ] && [ "$FIN" != "length" ] && echo 1 || echo 0)"
+
+# Non-stream: same bound, whole body.
+curl -s -m 300 "$BASE/v1/chat/completions" -H 'content-type: application/json' -d "{
+  \"model\":\"x\",
+  \"messages\":[{\"role\":\"user\",\"content\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\"}],
+  \"max_tokens\":600, \"temperature\":0, \"enable_thinking\":true,
+  \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
+eval "$(python3 - "$OUT" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); c=d["choices"][0]; m=c["message"]
+r=m.get("reasoning_content") or ""; content=m.get("content") or ""
+print(f"NS_FIN={c.get('finish_reason')}; NS_CLOSED={1 if 'Considering the limited time' in r else 0}; NS_CONTENT={1 if content.strip() else 0}; NS_RCHARS={len(r)}")
+PY
+)"
+check "non-stream: thought closed by the server" "$NS_CLOSED"
+check "non-stream: content present and finish_reason stop (got '$NS_FIN')" "$([ "$NS_CONTENT" = 1 ] && [ "$NS_FIN" = "stop" ] && echo 1 || echo 0)"
+check "non-stream: reasoning inside the budget plus the forced close" "$([ "$NS_RCHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
+
+# /v1/responses: the same budget, enforced the same way (it used to be parsed and dropped).
+curl -s -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
+  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"max_output_tokens\":600, \"temperature\":0, \"reasoning\":{\"effort\":\"high\"},
+  \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
+eval "$(python3 - "$OUT" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); r=""; text=""
+for it in d.get("output",[]):
+    if it.get("type")=="reasoning":
+        for part in (it.get("summary") or [])+(it.get("content") or []): r+=part.get("text","")
+    if it.get("type")=="message":
+        for part in it.get("content") or []: text+=part.get("text","")
+print(f"RS_STATUS={d.get('status')}; RS_CLOSED={1 if 'Considering the limited time' in r else 0}; RS_TEXT={1 if text.strip() else 0}; RS_RCHARS={len(r)}")
+PY
+)"
+check "responses: thought closed by the server" "$RS_CLOSED"
+check "responses: message text present, status completed (got '$RS_STATUS')" "$([ "$RS_TEXT" = 1 ] && [ "$RS_STATUS" = "completed" ] && echo 1 || echo 0)"
+check "responses: reasoning inside the budget plus the forced close" "$([ "$RS_RCHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
+
+curl -sN -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
+  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"max_output_tokens\":600, \"temperature\":0, \"stream\":true, \"reasoning\":{\"effort\":\"high\"},
+  \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
+eval "$(python3 - "$OUT" <<'PY'
+import json,sys
+r=""; done=""
+for l in open(sys.argv[1]).read().splitlines():
+    if not l.startswith("data: "): continue
+    try: d=json.loads(l[6:])
+    except Exception: continue
+    if d.get("type","").startswith("response.reasoning") and d.get("type","").endswith(".delta"): r+=d.get("delta","")
+    if d.get("type")=="response.completed": done=d["response"].get("status","")
+print(f"RSS_CLOSED={1 if 'Considering the limited time' in r else 0}; RSS_STATUS={done}")
+PY
+)"
+check "responses stream: thought closed by the server" "$RSS_CLOSED"
+check "responses stream: completes (got '$RSS_STATUS')" "$([ "$RSS_STATUS" = "completed" ] && echo 1 || echo 0)"
 
 echo "[budget-stream] $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

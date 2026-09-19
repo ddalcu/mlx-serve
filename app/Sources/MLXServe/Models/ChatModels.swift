@@ -250,15 +250,34 @@ struct ChatMediaRef: Codable, Equatable, Identifiable {
 /// An audio clip attached to a message. `pcm` holds raw little-endian float32
 /// mono samples at 16 kHz — the format the Gemma 4 12B unified audio embedder
 /// frames into 640-sample tokens. Decoded client-side by `AudioPreprocessor`.
+///
+/// The samples are NOT persisted: like `ChatImage`, the history carries `id`,
+/// `name` and `path`, and a decode reads the clip back from its WAV file
+/// (`AudioClipFile`). A history from before, or a file since gone, decodes
+/// with empty `pcm` rather than throwing, for the same reason as the image.
 struct ChatAudio: Identifiable, Codable, Equatable {
     let id: UUID
     let name: String   // original filename, for the attachment chip
-    let pcm: Data       // float32-LE 16 kHz mono samples
+    /// The WAV under `~/.mlx-serve/attachments/`, when there is one.
+    var path: String?
+    var pcm: Data       // float32-LE 16 kHz mono samples; empty when the file is gone
 
-    init(name: String, pcm: Data) {
+    enum CodingKeys: String, CodingKey { case id, name, path }
+
+    init(name: String, pcm: Data, path: String? = nil) {
         self.id = UUID()
         self.name = name
         self.pcm = pcm
+        self.path = path
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        path = try c.decodeIfPresent(String.self, forKey: .path)
+        pcm = path.flatMap { FileManager.default.contents(atPath: $0) }
+            .flatMap { AudioClipFile.decode(wav: $0) } ?? Data()
     }
 
     /// Number of decoded samples (4 bytes each) and the clip's duration.
@@ -453,6 +472,8 @@ struct ModelInfo {
     /// the server loaded the native multi-token-prediction head. Drives the
     /// "+MTP" speedup badge under the model name in the tray.
     var mtpLoaded: Bool = false
+    /// `meta.mtp_available`: the checkpoint ships an MTP head. nil on older servers.
+    var mtpAvailable: Bool? = nil
     /// `meta.kv_quant`: "off" | "4" | "8" | … — the width THIS model stores at. Empty on older servers.
     var kvQuant: String = ""
     /// Plan 05 Phase G — multi-model fields. All optional so older
@@ -621,6 +642,34 @@ enum ServerEngine: String, CaseIterable {
         case .mlx:   return "MLX"
         case .llama: return "llama.cpp (GGUF)"
         case .dsv4:  return "ds4 (DSV4-Flash)"
+        }
+    }
+}
+
+/// The `/props` "batching" object: does the loaded model share one decode
+/// forward across concurrent requests, and why not when it does not.
+struct BatchingInfo: Equatable {
+    var supported: Bool
+    var reason: String
+    var maxGroup: Int
+
+    static func parse(_ json: [String: Any]) -> BatchingInfo? {
+        guard let obj = json["batching"] as? [String: Any],
+              let supported = obj["supported"] as? Bool else { return nil }
+        return BatchingInfo(
+            supported: supported,
+            reason: obj["reason"] as? String ?? "",
+            maxGroup: obj["max_group"] as? Int ?? 0
+        )
+    }
+
+    /// One line for the settings row. Reasons are the server's `BatchVerdict` tags.
+    var label: String {
+        if supported { return "Loaded model batches decode (up to \(maxGroup) requests share one forward)." }
+        switch reason {
+        case "no_model": return "No model loaded."
+        case "embedded_engine": return "Loaded model runs on an embedded GGUF engine: concurrent requests take turns."
+        default: return "Loaded model's architecture does not batch: concurrent requests take turns."
         }
     }
 }
@@ -932,6 +981,8 @@ struct LocalModel: Identifiable, Hashable {
     var numExperts: Int? = nil
     /// Active MoE experts per token (`num_experts_per_tok`).
     var activeExperts: Int? = nil
+    /// The dir ships an MTP head (`DownloadManager.dirHasMtpHead`).
+    var hasMtpHead: Bool = false
     /// The `.gguf` basename this model IS, when it's one quant of a GGUF repo.
     /// A repo folder holds many quants and each is separately loadable, so
     /// discovery emits one `LocalModel` per file and `path` points at the file.

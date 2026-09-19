@@ -135,7 +135,7 @@ struct HotKeyRecorderControl: View {
                     )
                     .frame(width: 1, height: 1)
 
-                    Button(recording ? "Press keys… (⎋ to cancel)" : display) {
+                    Button(L10n.text(recording ? "Press keys… (⎋ to cancel)" : display)) {
                         recording = true
                     }
                     .frame(minWidth: 140)

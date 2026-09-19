@@ -5,7 +5,7 @@
 // `src/arch/ds4.zig`. Keeping this layer mechanical means an upstream `ds4.h`
 // drift shows up as a Zig compile error here rather than in the bridge.
 //
-// Submodule pin: lib/ds4 @ efdadd4.
+// Submodule pin: lib/ds4 @ 9139e2a.
 
 const std = @import("std");
 
@@ -19,6 +19,8 @@ pub const ThinkMode = enum(c_int) {
     none = 0,
     high = 1,
     max = 2,
+    low = 3,
+    medium = 4,
 };
 
 pub const LogType = enum(c_int) {
@@ -72,7 +74,7 @@ pub const DistributedOptions = extern struct {
     debug: bool = false,
 };
 
-// Two-machine tensor parallelism (pin efdadd4). Never enabled by mlx-serve —
+// Two-machine tensor parallelism (pin 9139e2a). Never enabled by mlx-serve —
 // mirrored only because ds4_engine_options embeds it by value.
 pub const TpRole = enum(c_int) {
     none = 0,
@@ -107,6 +109,7 @@ pub const TpOptions = extern struct {
 pub const EngineOptions = extern struct {
     model_path: ?[*:0]const u8 = null,
     mtp_path: ?[*:0]const u8 = null,
+    vision_path: ?[*:0]const u8 = null,
     backend: Backend = .metal,
     n_threads: c_int = 0,
     context_size: c_int = 0,
@@ -130,6 +133,7 @@ pub const EngineOptions = extern struct {
     glm_mtp_timing: bool = false,
     dspark: bool = false,
     dspark_strict: bool = false,
+    dspark_exact_sampling: bool = false,
     dspark_confidence_threshold_set: bool = false,
     cuda_tensor_parallel: bool = false,
     ssd_streaming: bool = false,
@@ -137,6 +141,7 @@ pub const EngineOptions = extern struct {
     ssd_streaming_full_layers_set: bool = false,
     inspect_only: bool = false,
     placement_ctx_hint: c_int = 0,
+    placement_session_count_hint: c_int = 0,
     share_session_prefill_workspace: bool = false,
     first_token_test: bool = false,
     metal_graph_test: bool = false,
@@ -240,6 +245,21 @@ pub extern fn ds4_session_sample(
 pub extern fn ds4_session_top_logprobs(s: *Session, out: [*]TokenScore, k: c_int) c_int;
 pub extern fn ds4_session_token_logprob(s: *Session, token: c_int, out: *TokenScore) c_int;
 pub extern fn ds4_session_eval(s: *Session, token: c_int, err: ?[*]u8, errlen: usize) c_int;
+pub extern fn ds4_session_eval_speculative(
+    s: *Session,
+    first_token: c_int,
+    max_tokens: c_int,
+    eos_token: c_int,
+    temperature: f32,
+    top_k: c_int,
+    top_p: f32,
+    min_p: f32,
+    rng: *u64,
+    accepted: ?[*]c_int,
+    accepted_cap: c_int,
+    err: ?[*]u8,
+    errlen: usize,
+) c_int;
 pub extern fn ds4_session_eval_speculative_argmax(
     s: *Session,
     first_token: c_int,

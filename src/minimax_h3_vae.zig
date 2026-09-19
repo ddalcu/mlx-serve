@@ -1547,6 +1547,11 @@ pub const Encoder = struct {
         step(&h, try transpose(h, &[_]c_int{ 0, 4, 1, 2, 3 }, s));
         const out = try contig(h, s);
         _ = mlx.mlx_array_free(h);
+        // Evaluate per tile pass: mlx >= 0.32.2 runs each kD=3 conv as
+        // per-tap 2D convs whose tap copies and Winograd working sets live
+        // until the op completes, and a lazy graph over every clip x tile
+        // stacks them past the wired limit (Invalid Resource, #424).
+        try mlx.check(mlx.mlx_array_eval(out));
         return out;
     }
 

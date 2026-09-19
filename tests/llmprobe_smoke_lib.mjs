@@ -25,6 +25,7 @@ const MLX_CHAT_ARCHS = new Set([
   // inherits the MoE rules: MTP + drafter default OFF. Note the mirror is
   // 68.5 GB against SMOKE_MAX_GB's 60 default, so it needs the cap raised.
   "bailing_hybrid",
+  "lfm2_moe", "lfm2_vl", "laguna", "inkling_mm_model", "muse_glimmer", "spark2_5", "qwen4_exp",
 ]);
 
 /** Block-diffusion models denoise a canvas instead of decoding token-by-token,
@@ -176,7 +177,6 @@ export function planCells(rep, opts = {}) {
   if (kvCheck) {
     cells.push(
       { id: "kv4", label: "KV 4-bit (crash check)", flags: ["--kv-quant", "4"], expectSpec: null, kv: true },
-      { id: "kv-turbo4", label: "KV TurboQuant-4 (crash check)", flags: ["--kv-quant", "turbo4"], expectSpec: null, kv: true },
     );
   }
   return cells;

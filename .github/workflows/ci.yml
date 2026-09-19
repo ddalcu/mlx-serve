@@ -48,6 +48,7 @@ jobs:
           echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+          echo "submodules=$(git submodule status | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Cache self-built mlx + mlx-c
         uses: actions/cache@v4
@@ -65,6 +66,17 @@ jobs:
 
       - name: Fetch libllama (llama.cpp GGUF engine)
         run: bash scripts/fetch-llama.sh
+
+      # Bounded: the key is written once per toolchain/build/submodule set, so
+      # later runs restore it and never re-save a growing cache. Xcode is in the
+      # key because zig caches configure-time SDK paths.
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.mlxpin.outputs.submodules }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx-serve (Zig, ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
@@ -85,17 +97,24 @@ jobs:
       - name: Run Zig tests
         run: zig build test --summary all
 
+      # Dependencies (NIO, MCP, SwiftTerm, SwaTex) are most of a cold Swift
+      # build and only change with Package.resolved. Our own sources get fresh
+      # mtimes from checkout, so MLXCore always recompiles.
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: app/.build
+          key: swiftpm-ci-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.mlxpin.outputs.xcode }}
+
       # Do not force one Swift language mode through the dependency graph.
       # Each package's manifest owns its mode (SwaTex requires Swift 6.1).
-      - name: Build Swift app
+      # Debug build only; the release build is release.yml's.
+      - name: Build and test Swift app
         working-directory: app
         run: |
           # Catch a drifted SwaTex font-lookup patch here rather than at release
           # time (issue #233). Mirrors app/build.sh.
           swift package resolve
           bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
-          swift build -c release
-
-      - name: Run Swift tests
-        working-directory: app
-        run: swift test
+          swift build --build-tests
+          bash test.sh

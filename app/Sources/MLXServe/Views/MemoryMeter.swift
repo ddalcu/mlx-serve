@@ -33,7 +33,7 @@ struct MemoryMeter: View {
                     key(.accentColor, "GPU \(gpuLabel ?? MemoryInfo.format(gpu))")
                 }
                 if availableBytes > 0 {
-                    key(.green.opacity(0.6), "\(MemoryInfo.format(availableBytes)) free")
+                    key(.green.opacity(0.6), L10n.format("%@ free", MemoryInfo.format(availableBytes)))
                 }
                 Spacer()
                 Text("\(MemoryInfo.format(totalBytes)) total")

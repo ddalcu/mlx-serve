@@ -70,7 +70,7 @@ struct ToolApprovalSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Allow this tool call?")
                         .font(.headline)
-                    Text(headline)
+                    Text(L10n.text(headline))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -83,7 +83,7 @@ struct ToolApprovalSheet: View {
                     .foregroundStyle(.secondary)
                 if argPairs.isEmpty && !request.rawArguments.isEmpty {
                     ScrollView {
-                        Text(request.rawArguments)
+                        Text(L10n.text(request.rawArguments))
                             .font(.system(size: 11, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -101,10 +101,10 @@ struct ToolApprovalSheet: View {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(argPairs, id: \.0) { (k, v) in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(k)
+                                    Text(L10n.text(k))
                                         .font(.system(size: 11, design: .monospaced).weight(.semibold))
                                         .foregroundStyle(.secondary)
-                                    Text(v)
+                                    Text(L10n.text(v))
                                         .font(.system(size: 11, design: .monospaced))
                                         .textSelection(.enabled)
                                         .lineLimit(8)
@@ -222,7 +222,7 @@ private struct AttachmentPreviewRow: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(detail)
+                    Text(L10n.text(detail))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -253,11 +253,11 @@ private struct DocumentFolderChip: View {
                 .background(tint.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 1) {
-                Text(index.folderName)
+                Text(L10n.text(index.folderName))
                     .font(.caption.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(statusText)
+                Text(L10n.text(statusText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -1331,7 +1331,7 @@ struct ChatSidebar: View {
     private func sectionHeader<T: View>(_ title: String,
                                         @ViewBuilder trailing: () -> T) -> some View {
         HStack(spacing: 4) {
-            Text(title)
+        Text(L10n.text(title))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1423,8 +1423,9 @@ struct ChatSidebar: View {
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
-                    Text(ChatSessionTitle.display(title: session.title,
-                                                  agentName: agent?.name))
+                    let displayTitle = ChatSessionTitle.display(title: session.title,
+                                                                agentName: agent?.name)
+                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
@@ -1437,7 +1438,7 @@ struct ChatSidebar: View {
                 // one is a single line exactly like a destination row.
                 if let subject = ChatSessionTitle.subject(title: session.title,
                                                           agentName: agent?.name) {
-                    Text(subject)
+                    Text(L10n.text(subject))
                         .font(.caption2)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -1536,7 +1537,7 @@ struct ChatSidebar: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(t.displayName)
+                    Text(L10n.text(t.displayName))
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
@@ -1599,7 +1600,7 @@ struct ChatSidebar: View {
                         set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
                 }
             }
-            Button(t.isActive ? "End Session" : "Close", role: .destructive) {
+            Button(L10n.text(t.isActive ? "End Session" : "Close"), role: .destructive) {
                 requestCloseTerminal(t.id)
             }
         }
@@ -1747,7 +1748,7 @@ struct ChatSidebar: View {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
                 .frame(width: 16)
-            Text(title).font(.subheadline.weight(.medium))
+            Text(L10n.text(title)).font(.subheadline.weight(.medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
@@ -1872,6 +1873,15 @@ struct ChatDetailView: View {
     // inside the ForEach handed SwiftUI a fresh array on every layout pass and
     // the LazyVStack could spin forever.
     @State private var rows: [ChatRow] = []
+    @State private var foldStore = FoldStore()
+    /// The transcript lays out `rows[firstVisibleRow...]`; see `TranscriptWindow`.
+    @State private var firstVisibleRow = 0
+    /// Which conversation the cut belongs to. The messages observer cuts on
+    /// first appearance (it is the one with `initial: true`); the session
+    /// observer cuts on every switch, with its own copy of the rows, so
+    /// neither depends on the other having run.
+    @State private var windowSession: UUID?
+    @State private var isRevealingEarlier = false
 
 
     private var session: ChatSession? {
@@ -1952,7 +1962,8 @@ struct ChatDetailView: View {
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
             inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
-            agentLock: agentModeLock)
+            agentLock: agentModeLock,
+            apple: appState.useAppleModel)
     }
 
     /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
@@ -1977,15 +1988,15 @@ struct ChatDetailView: View {
     @ViewBuilder private var serverStartControl: some View {
         let control = ChatServerStartControl.resolve(
             status: server.status,
-            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+            // Nothing to start for the on-device model — it needs no server.
+            hasStartableModel: !appState.useAppleModel
+                && (!appState.selectedModelPath.isEmpty || server.lanChatModelId != nil)
         )
         if control != .hidden {
             Button {
-                // ONE start path, shared with the LAN toggle: it loads the
-                // selected checkpoint, or boots headless when the model
-                // answering is on another Mac. A second `server.start` call
-                // site here is how the two would drift.
-                appState.ensureServerForLan()
+                // The one button-start path; a second `server.start` call site
+                // here is how the start paths would drift.
+                appState.startServer(loadingSelection: true)
             } label: {
                 HStack(spacing: 4) {
                     if control == .starting {
@@ -1993,7 +2004,7 @@ struct ChatDetailView: View {
                     } else {
                         Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
                     }
-                    Text(control.title)
+                    Text(L10n.text(control.title))
                         .font(.caption.weight(.semibold))
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
@@ -2025,7 +2036,7 @@ struct ChatDetailView: View {
             Button {
                 pickAttachment()
             } label: {
-                Label(attachmentMenuLabel, systemImage: "photo.on.rectangle")
+                Label(L10n.text(attachmentMenuLabel), systemImage: "photo.on.rectangle")
             }
             Button {
                 pickDocumentFolder()
@@ -2090,13 +2101,19 @@ struct ChatDetailView: View {
     /// as the tool menu's "not in <agent>'s capabilities" rows.
     @ViewBuilder
     private func lockedModeMenu(_ agentName: String) -> some View {
-        Text("Set by \(agentName)")
-        Button("Edit Agent…") {
-            // ON that agent — the window otherwise opens on whoever sorts
-            // first, which is the wrong one every time you got here from a card
-            // that just named a different name.
-            guard let id = activeAgent?.id else { return }
-            appState.openAgentSettings(id, using: openWindow)
+        if agentName == AppleFoundationChat.displayName {
+            // Not an agent, and nothing to edit: the on-device model simply
+            // does not have these.
+            Text("Not available on \(AppleFoundationChat.displayName)")
+        } else {
+            Text("Set by \(agentName)")
+            Button("Edit Agent…") {
+                // ON that agent — the window otherwise opens on whoever sorts
+                // first, which is the wrong one every time you got here from a
+                // card that just named a different name.
+                guard let id = activeAgent?.id else { return }
+                appState.openAgentSettings(id, using: openWindow)
+            }
         }
     }
 
@@ -2142,7 +2159,7 @@ struct ChatDetailView: View {
     @ViewBuilder private var reasoningEffortMenu: some View {
         Picker("Reasoning", selection: $reasoningEffort) {
             ForEach(ReasoningEffort.allCases) { effort in
-                Text(effort.label).tag(effort)
+                Text(L10n.text(effort.label)).tag(effort)
             }
         }
         .pickerStyle(.inline)
@@ -2207,7 +2224,13 @@ struct ChatDetailView: View {
 
     /// What the tab's agent permits at all; everything when there's no agent.
     private var agentAllowedTools: Set<AgentToolKind> {
-        activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        let fromAgent = activeAgent.map { $0.capabilities.resolvedTools() } ?? Set(AgentToolKind.allCases)
+        // The on-device model's 4k window cannot hold the rest of the tool
+        // definitions; `AgentResolution` clamps the turn, this keeps the menu
+        // from offering what the clamp would drop.
+        return appState.useAppleModel
+            ? fromAgent.intersection(AppleFoundationChat.allowedTools)
+            : fromAgent
     }
 
     private var disabledToolSet: Set<AgentToolKind> {
@@ -2233,17 +2256,22 @@ struct ChatDetailView: View {
     /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
+        if appState.useAppleModel {
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+        }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
-            Section(group.title) {
-                ForEach(group.tools, id: \.self) { tool in
+            let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
+            if !tools.isEmpty {
+            Section(L10n.text(group.title)) {
+                ForEach(tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
                     Button {
                         setTool(tool, enabled: !isToolEnabled(tool))
                     } label: {
                         if isToolEnabled(tool) {
-                            Label(tool.displayName, systemImage: "checkmark")
+                            Label(L10n.text(tool.displayName), systemImage: "checkmark")
                         } else if allowed {
-                            Text(tool.displayName)
+                            Text(L10n.text(tool.displayName))
                         } else {
                             // The agent forbids it — say so rather than showing
                             // an off switch the user can't turn on.
@@ -2252,6 +2280,7 @@ struct ChatDetailView: View {
                     }
                     .disabled(!allowed || isExternalBridgeSession)
                 }
+            }
             }
         }
 
@@ -2262,7 +2291,7 @@ struct ChatDetailView: View {
             }
         }
         .disabled(isExternalBridgeSession)
-        Text(session?.workingDirectory ?? "No workspace set")
+        Text(L10n.text(session?.workingDirectory ?? "No workspace set"))
     }
 
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
@@ -2364,8 +2393,8 @@ struct ChatDetailView: View {
                 .font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
-                                                    serverRunning: server.status == .running) {
-                Text(subtitle)
+                                                    serverRunning: canAnswer) {
+                Text(L10n.text(subtitle))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -2403,8 +2432,14 @@ struct ChatDetailView: View {
             } else {
             // Messages
                 ScrollView {
-                    LazyVStack(spacing: ChatMetrics.transcriptSpacing) {
-                        ForEach(rows) { row in
+                    // Not lazy: a lazy stack ESTIMATES its height from the rows
+                    // it has built, and every scroll decision below aims at
+                    // that number (story: docs/gotchas/app.md).
+                    VStack(spacing: ChatMetrics.transcriptSpacing) {
+                        if firstVisibleRow > 0 {
+                            showEarlierButton
+                        }
+                        ForEach(rows[firstVisibleRow...]) { row in
                             switch row {
                             case .message(let m):
                                 MessageBubble(
@@ -2420,9 +2455,14 @@ struct ChatDetailView: View {
                                             appState.showSettings()
                                         }
                                     },
-                                    onDelete: {
-                                        appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    },
+                                    // Your message goes alone. A reply takes
+                                    // the model's turn above it with it, and
+                                    // only where the transcript can be cut.
+                                    onDelete: m.role == .user
+                                        ? { deleteKeepingPlace { appState.deleteMessage(in: sessionId, messageId: m.id) } }
+                                        : ChatTurn.footerDeletes(m, isLast: m.id == session?.messages.last?.id)
+                                            ? { deleteTurn(endingAt: m.id) }
+                                            : nil,
                                     // Both roles are editable, and they mean
                                     // different things. Editing YOUR message
                                     // is a re-ask: the turns after it answered
@@ -2467,13 +2507,26 @@ struct ChatDetailView: View {
                                     // the source is changed.
                                     onFork: ChatFork.isForkable(session?.messages ?? [], at: m.id)
                                         ? { appState.forkSession(sessionId, from: m.id) }
-                                        : nil)
+                                        : nil,
+                                    onWillResize: { applyScroll(.rowWillResize) },
+                                    onDidResize: { applyScroll(.rowDidResize) },
+                                    foldStore: foldStore)
                                 .id(m.id)
                             case .toolCall(let call, let results, let calls, let owned):
                                 ToolCallRow(call: call, results: results, calls: calls,
                                             ownedHandles: owned,
                                             sessionId: sessionId).id(call.id)
                             }
+                        }
+                        // A property of the transcript's END, not of a row: the
+                        // turn stopped on something that carries no footer.
+                        if let last = session?.messages.last,
+                           ChatTurn.needsEndFooter(session?.messages ?? [],
+                                                   turnInFlight: composerState == .generatingHere) {
+                            TurnEndFooter(
+                                endedAt: last.timestamp,
+                                onRegenerate: canRegenerate ? { regenerateLastResponse() } : nil,
+                                onDelete: { deleteTurn(endingAt: last.id) })
                         }
                         // Live media generation, under the tool-call row that
                         // started it. These block chat decode on the one GPU for
@@ -2488,12 +2541,6 @@ struct ChatDetailView: View {
                                 .id("mediaProgress")
                         }
                     }
-                    // New identity when the text size or density changes, so
-                    // every row rebuilds with the new metrics at once (see the
-                    // @AppStorage pair above). Only fires on a Settings edit —
-                    // the transcript isn't even visible then (Settings is a
-                    // mode of this window), so the scroll reset is unseen.
-                    .id("transcript-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
                     // The reading measure. The window is free to be as wide as
                     // the user wants; the prose is not (`ChatMetrics`).
                     .frame(maxWidth: contentWidth)
@@ -2510,6 +2557,9 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                // A chat opens at its newest line by LAYOUT, with the real
+                // heights in hand, not by a jump aimed at an estimate of them.
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
                 // The transcript is moved from exactly one place — `applyScroll`
                 // — and only ever by a decision `ChatScrollState` made.
                 .scrollPosition($scrollPosition)
@@ -2525,6 +2575,12 @@ struct ChatDetailView: View {
                     ChatScrollState.distanceFromBottom($0)
                 } action: { _, distance in
                     applyScroll(.geometryChanged(distanceFromBottom: distance))
+                }
+                // The two numbers a fold's correction is made of.
+                .onScrollGeometryChange(for: CGPoint.self) {
+                    CGPoint(x: $0.contentOffset.y, y: $0.contentSize.height)
+                } action: { _, g in
+                    applyScroll(.contentGeometry(offsetY: g.x, contentHeight: g.y))
                 }
                 // Who is moving it. The predecessor was an app-global NSEvent
                 // scroll-wheel monitor: it fired for every other window in the
@@ -2546,6 +2602,11 @@ struct ChatDetailView: View {
                     }
                     .animation(.easeInOut(duration: 0.18), value: scrollModel.isPinnedToBottom)
                 }
+                // A new conversation is a new scroll view, laid out from its
+                // initial anchor instead of inheriting an offset measured in
+                // the transcript it replaces. A metrics change rebuilds every
+                // row anyway (they read `ChatMetrics` at build time).
+                .id("transcript-\(sessionId)-\(interfaceTextSize)-\(interfaceCompact)-\(interfaceChatColumn)")
             // The divider belongs to the transcript — against the empty
             // state's greeting it would draw a line across mid-window.
             Divider()
@@ -2685,17 +2746,18 @@ struct ChatDetailView: View {
                         }
                     }
                 } else if videoSupported, provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
-                    // Decode inside the closure — the temp URL is only valid here.
+                    // The temp URL is only valid inside the closure and frame
+                    // extraction is async, so decode from a copy we own.
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
                         guard let url = url else { return }
-                        let name = url.lastPathComponent
-                        let frames = VideoPreprocessor.extractFrames(url: url)
+                        let copy = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+                        guard (try? FileManager.default.copyItem(at: url, to: copy)) != nil else {
+                            DispatchQueue.main.async { showVideoError(url.lastPathComponent) }
+                            return
+                        }
                         DispatchQueue.main.async {
-                            if let frames, !frames.isEmpty {
-                                pendingVideos.append(ChatVideo(name: name, frames: frames))
-                            } else {
-                                showVideoError(name)
-                            }
+                            addVideoAttachment(copy, name: url.lastPathComponent, removeAfter: true)
                         }
                     }
                 } else if let imageType = provider.registeredTypeIdentifiers.first(where: {
@@ -2872,6 +2934,11 @@ struct ChatDetailView: View {
         }
         .onChange(of: session?.messages, initial: true) { _, msgs in
             rows = ChatRowBuilder.rows(from: msgs ?? [])
+            if windowSession != sessionId {
+                cutTranscriptWindow()
+            } else {
+                firstVisibleRow = TranscriptWindow.clamp(first: firstVisibleRow, total: rows.count)
+            }
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -2885,11 +2952,25 @@ struct ChatDetailView: View {
             // unpinned at whatever offset the previous conversation's content
             // happened to leave behind.
             applyScroll(.transcriptShown)
+            // The binding outlives the scroll view too: a point a fold set in
+            // the old conversation would be what the new one attaches to,
+            // instead of its initial anchor.
+            scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
+            // Rebuilt here as well so the cut does not depend on whether the
+            // messages observer ran first (it runs only when the messages
+            // differ, which a fork's do not).
+            rows = ChatRowBuilder.rows(from: session?.messages ?? [])
+            cutTranscriptWindow()
             // A history walk belongs to ONE conversation. Stale indexes are
             // harmless (ComposerHistory reads a mismatched draft as no walk),
             // but the first ↑ in the newly-visible tab has to mean "the last
             // thing I said HERE".
             composerWalk = .idle
+            // Unfolding a long turn belongs to the visit, not to the message:
+            // nothing about it is written to disk, so carrying it across
+            // conversations would remember it until the next launch and no
+            // further, which the reader can rely on in neither direction.
+            foldStore.clear()
         }
         .onGeometryChange(for: CGFloat.self) { proxy in
             proxy.size.width
@@ -2923,7 +3004,7 @@ struct ChatDetailView: View {
                           onKeyCommand: { handleSlashKey($0) })
             .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
             .padding(.horizontal, ComposerTextMetrics.fieldHorizontalPadding)
-            .disabled(server.status != .running)
+            .disabled(!canAnswer)
             // The placeholder stands in for the first character you type, so it
             // has to sit exactly where that character lands — which is three
             // insets in, not one (`ComposerTextMetrics`). It was a literal 9
@@ -2936,7 +3017,7 @@ struct ChatDetailView: View {
             }
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
-                    Text(composerPlaceholder)
+                    Text(L10n.text(composerPlaceholder))
                         .font(.body)
                         .foregroundStyle(.secondary)
                         .padding(.leading, ComposerTextMetrics.placeholderLeading)
@@ -3015,7 +3096,7 @@ struct ChatDetailView: View {
         // Stop is always tappable for the owning chat. Otherwise: Send,
         // disabled when the server is down or when this chat has nothing to
         // send. Another chat's turn blocks nothing — the engine is multi-turn.
-        .disabled(server.status != .running
+        .disabled(!canAnswer
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingVideos.isEmpty && pendingAudio.isEmpty))
@@ -3200,11 +3281,12 @@ struct ChatDetailView: View {
 
     /// Extract frames from a video file (off the main thread — AVFoundation
     /// decode can be slow) and add it as a pending attachment.
-    private func addVideoAttachment(_ url: URL) {
-        let name = url.lastPathComponent
-        DispatchQueue.global(qos: .userInitiated).async {
-            let frames = VideoPreprocessor.extractFrames(url: url)
-            DispatchQueue.main.async {
+    private func addVideoAttachment(_ url: URL, name: String? = nil, removeAfter: Bool = false) {
+        let name = name ?? url.lastPathComponent
+        Task.detached(priority: .userInitiated) {
+            let frames = await VideoPreprocessor.extractFrames(url: url)
+            if removeAfter { try? FileManager.default.removeItem(at: url) }
+            await MainActor.run {
                 if let frames, !frames.isEmpty {
                     pendingVideos.append(ChatVideo(name: name, frames: frames))
                 } else {
@@ -3223,9 +3305,10 @@ struct ChatDetailView: View {
     }
 
     /// Convert pending audio clips to a ChatAudio array, clearing the list.
+    /// Written on SEND like the pictures (`AudioClipFile.stored`).
     private func consumePendingAudio() -> [ChatAudio]? {
         guard !pendingAudio.isEmpty else { return nil }
-        let clips = pendingAudio
+        let clips = pendingAudio.map { AudioClipFile.stored($0) }
         pendingAudio = []
         return clips
     }
@@ -3253,8 +3336,9 @@ struct ChatDetailView: View {
     private func toggleRecording() {
         if recorder.isRecording {
             if let pcm = recorder.stop(), pcm.count >= 4 {
-                let secs = Double(pcm.count / 4) / AudioRecorder.targetSampleRate
-                pendingAudio.append(ChatAudio(name: String(format: "Recording · %.0fs", secs.rounded()), pcm: pcm))
+                // The chips print the duration themselves; a name carrying it too read
+                // "Recording · 4s · 3.8s" and would land in the filename.
+                pendingAudio.append(ChatAudio(name: "Recording", pcm: pcm))
             }
             return
         }
@@ -3354,6 +3438,13 @@ struct ChatDetailView: View {
                 // they stay synchronous so the jump lands with the click.
                 performScroll(animated: animated)
             }
+        case .toOffset(let y):
+            // From a geometry callback, so out of the layout flush (#136).
+            DispatchQueue.main.async {
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) { scrollPosition.scrollTo(y: y) }
+            }
         }
     }
 
@@ -3374,6 +3465,64 @@ struct ChatDetailView: View {
             instant.disablesAnimations = true
             withTransaction(instant) {
                 scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+    }
+
+    /// Above the first laid-out row of a long conversation.
+    private var showEarlierButton: some View {
+        Button {
+            revealEarlierRows()
+        } label: {
+            Group {
+                if isRevealingEarlier {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Show earlier messages")
+                }
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .frame(height: 22)
+            .padding(.horizontal, 12)
+            .background(Color.secondary.opacity(0.15), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.bottom, 4)
+    }
+
+    /// A delete shortens the transcript at or above the control that asked for
+    /// it, so it rides the resize bracket a fold uses.
+    private func deleteKeepingPlace(_ change: @escaping () -> Void) {
+        applyScroll(.rowWillResize)
+        change()
+        DispatchQueue.main.async { DispatchQueue.main.async { applyScroll(.rowDidResize) } }
+    }
+
+    private func deleteTurn(endingAt id: UUID) {
+        deleteKeepingPlace { appState.deleteTurn(in: sessionId, endingAt: id) }
+    }
+
+    private func cutTranscriptWindow() {
+        windowSession = sessionId
+        firstVisibleRow = TranscriptWindow.firstRow(total: rows.count)
+    }
+
+    /// The rows appear ABOVE what the reader is looking at, so the transcript
+    /// holds their place through it (the same bracket a fold uses), and the
+    /// button answers the click before the layout that makes it slow starts.
+    private func revealEarlierRows() {
+        isRevealingEarlier = true
+        applyScroll(.rowWillResize)
+        DispatchQueue.main.async {
+            firstVisibleRow = 0
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    applyScroll(.rowDidResize)
+                    isRevealingEarlier = false
+                }
             }
         }
     }
@@ -3402,7 +3551,8 @@ struct ChatDetailView: View {
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.chatModelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength,
+                apple: appState.useAppleModel
             )
             return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }
@@ -3438,7 +3588,8 @@ struct ChatDetailView: View {
             liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
             contextLength: usage?.contextLength
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                      modelContextLength: server.chatModelInfo?.contextLength),
+                                                      modelContextLength: server.chatModelInfo?.contextLength,
+                                                      apple: appState.useAppleModel),
             overflow: lastOverflowNotice)
     }
 
@@ -3531,7 +3682,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -3584,7 +3735,7 @@ struct ChatDetailView: View {
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedVideos != nil || attachedAudio != nil || !pdfText.isEmpty,
-              composerState != .generatingHere, server.status == .running else { return }
+              composerState != .generatingHere, canAnswer else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
@@ -3619,11 +3770,20 @@ struct ChatDetailView: View {
             resolved, documentIndex: appState.documentIndexes[sessionId])
     }
 
+    /// Whether this chat can answer at all. Apple's on-device model needs no
+    /// server, so "the server is down" is not the same question as "nothing
+    /// can answer" — every composer gate asks THIS, or the composer locks on a
+    /// model that was ready to reply.
+    private var canAnswer: Bool {
+        ChatTurnEngine.canRunTurn(serverRunning: server.status == .running,
+                                  apple: appState.useAppleModel)
+    }
+
     /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
     /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
     /// the last user turn and resubmits it fresh.
     private var canRegenerate: Bool {
-        server.status == .running && composerState != .generatingHere
+        canAnswer && composerState != .generatingHere
             && session?.isExternalBridge != true
             && (session?.messages.contains { $0.role == .user } ?? false)
     }
@@ -3796,7 +3956,7 @@ struct GeneratingIndicator: View {
                     .foregroundStyle(memColor)
                 Text("·")
                     .foregroundStyle(.tertiary)
-                Text(whimsy)
+                Text(L10n.text(whimsy))
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
                 Text("·")
@@ -3930,11 +4090,27 @@ struct MessageBubble: View {
     /// new chat and this one is left alone. nil when there would be nothing to
     /// fork (`ChatFork.isForkable`) or on a read-only surface.
     var onFork: (() -> Void)?
+    /// Bracket a change that makes this row shorter (a fold, a thinking block
+    /// closing, an edit field replacing the bubble), so the transcript can
+    /// hold the reader's place through it. nil where there is no scroll view.
+    var onWillResize: (() -> Void)?
+    var onDidResize: (() -> Void)?
+    /// Survives a transcript rebuild; see `FoldStore`.
+    var foldStore: FoldStore?
     /// Hover over the whole row reveals the user turn's action row; the
     /// buttons themselves start invisible.
     @State private var isHovered = false
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    /// Unfolding a long turn is an act of reading, and it belongs to the row
+    /// for the same reason the accordion above does: writing it into the
+    /// transcript's own state re-evaluates every row in the conversation, and
+    /// a fold has to feel like a click, not like a page load.
+    @State private var longTurnExpanded = false
+    /// Between the click and the layout it asks for. Laying out a long `Text`
+    /// takes this thread for up to hundreds of milliseconds, so the control
+    /// answers the click before that starts.
+    @State private var isFolding = false
     @State private var isEditing = false
     @State private var editDraft = ""
     /// The edit field is the composer's field (`GrowingTextEditor`), so it
@@ -3964,12 +4140,16 @@ struct MessageBubble: View {
         if let reasoning = message.reasoningContent, !reasoning.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                    if thinkingExpanded {
+                        resize { thinkingExpanded = false }
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded = true }
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "brain")
                             .symbolEffect(.pulse, isActive: isThinkingNow)
-                        Text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds))
+                        Text(L10n.text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds)))
                         Spacer(minLength: 8)
                         Image(systemName: "chevron.right")
                             .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
@@ -3981,7 +4161,7 @@ struct MessageBubble: View {
                 .buttonStyle(.plain)
 
                 if thinkingExpanded {
-                    Text(reasoning)
+                    Text(L10n.text(reasoning))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -4055,15 +4235,27 @@ struct MessageBubble: View {
                     }
                 }
 
-                // Attached audio clips
+                // Attached audio clips. A clip whose file is gone says so, the
+                // way a picture does: it was not sent, and a silent chip would
+                // claim otherwise.
                 if let clips = message.audio, !clips.isEmpty {
                     ForEach(clips) { clip in
-                        Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.purple.opacity(0.18))
-                            .clipShape(Capsule())
+                        if clip.pcm.isEmpty {
+                            Label("\(clip.name) · file no longer on disk", systemImage: "questionmark.folder")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(.quaternary.opacity(0.4))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else {
+                            Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
+                                .font(.caption.weight(.medium))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color.purple.opacity(0.18))
+                                .clipShape(Capsule())
+                        }
                     }
                 }
 
@@ -4097,6 +4289,31 @@ struct MessageBubble: View {
                                 // two roles read at two densities.
                                 .lineSpacing(ChatMetrics.userLineSpacing)
                                 .textSelection(.enabled)
+                                .lineLimit(isFolded ? LongUserTurn.collapsedLineLimit : nil)
+                                // A folded `Text` reports the width of the
+                                // lines it shows, so a bubble that hugged it
+                                // would change width on unfold and re-lay the
+                                // whole turn out at the new one. A turn this
+                                // long is a full-width block either way.
+                                .frame(maxWidth: foldsLongTurn ? .infinity : nil, alignment: .leading)
+                                .overlay(alignment: .bottom) { foldFade }
+                            if foldsLongTurn {
+                                Group {
+                                    if isFolding {
+                                        // The spinner ignores `tint`; it draws
+                                        // white in the dark scheme.
+                                        ProgressView()
+                                            .controlSize(.mini)
+                                            .colorScheme(.dark)
+                                    } else {
+                                        Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
+                                            .buttonStyle(.plain)
+                                            .font(.caption.weight(.medium))
+                                            .foregroundStyle(.white.opacity(0.8))
+                                    }
+                                }
+                                .padding(.top, ChatMetrics.foldToggleTopPadding)
+                            }
                         }
                         if message.isStreaming {
                             GeneratingIndicator()
@@ -4138,7 +4355,7 @@ struct MessageBubble: View {
                 // under the bubble — never appended into content, which rides
                 // back to the model as history.
                 if let notice = message.truncationNotice, !message.isStreaming {
-                    Text(notice.text)
+                    Text(L10n.text(notice.text))
                         .font(.callout)
                         .italic()
                         .foregroundStyle(.secondary)
@@ -4165,13 +4382,16 @@ struct MessageBubble: View {
             .frame(maxWidth: .infinity,
                    alignment: message.role == .user ? .trailing : .leading)
         }
+        .onAppear { longTurnExpanded = foldStore?.isExpanded(message.id) ?? false }
         // Hover must cover the transparent action row too, or it vanishes as
         // the pointer approaches it.
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .contextMenu {
-            Button("Copy Message") { copyMessage() }
-            if onEdit != nil {
+            if !message.content.isEmpty {
+                Button("Copy Message") { copyMessage() }
+            }
+            if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
                 // question, editing the model's rewrites what it said.
                 Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
@@ -4186,7 +4406,8 @@ struct MessageBubble: View {
                 Button("Branch Chat From Here", action: onFork)
             }
             if onDelete != nil {
-                Button("Delete Message", role: .destructive) { onDelete?() }
+                // A reply takes the model's whole turn with it (`ChatTurn`).
+                Button(message.role == .user ? "Delete Message" : "Delete Turn", role: .destructive) { onDelete?() }
             }
         }
     }
@@ -4240,11 +4461,15 @@ struct MessageBubble: View {
 
     private func startEditing() {
         editDraft = message.content
-        isEditing = true
-        // Put the caret in the field the edit just opened — otherwise Return
-        // is typed at whatever still holds focus (the composer below), which
-        // sends a NEW message instead of the edit.
-        editFocused = true
+        // The field is capped in height where the bubble was not, so on a long
+        // turn it would otherwise open above the top of the window.
+        resize(animated: false) {
+            isEditing = true
+            // Put the caret in the field the edit just opened — otherwise
+            // Return is typed at whatever still holds focus (the composer
+            // below), which sends a NEW message instead of the edit.
+            editFocused = true
+        }
     }
 
     private func cancelEdit() {
@@ -4267,6 +4492,77 @@ struct MessageBubble: View {
     /// bubble.
     private var isBare: Bool { message.role == .assistant && !message.isAgentSummary }
 
+    // MARK: - Folding a long user turn
+
+    private var userTurnCharsPerLine: Int {
+        LongUserTurn.charsPerLine(
+            textWidth: ChatMetrics.userBubbleMaxWidth - 2 * ChatMetrics.bubblePaddingH,
+            fontSize: ChatMetrics.transcriptFontSize)
+    }
+
+    private var foldsLongTurn: Bool {
+        guard message.role == .user, !message.isStreaming else { return false }
+        return LongUserTurn.isCollapsible(message.content, charsPerLine: userTurnCharsPerLine)
+    }
+
+    private var isFolded: Bool { foldsLongTurn && !longTurnExpanded }
+
+    /// Fades the last two kept lines into the bubble instead of ending them on
+    /// an ellipsis, so a folded turn reads as continuing rather than as a
+    /// sentence that stops.
+    ///
+    /// An overlay in the bubble's own colour, not a `mask`: a mask renders what
+    /// it covers into an offscreen layer, and an unfolded turn is a layer
+    /// thousands of points tall — which is hundreds of milliseconds per fold.
+    @ViewBuilder
+    private var foldFade: some View {
+        if isFolded {
+            // Stops short of covering the last line: a line faded to nothing
+            // reads as the end of the message, one still faintly there reads as
+            // more of it below.
+            LinearGradient(colors: [bubbleBackground.opacity(0), bubbleBackground.opacity(0.85)],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: (ChatMetrics.transcriptFontSize + ChatMetrics.userLineSpacing) * 2)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private func toggleLongTurn() {
+        let expanding = !longTurnExpanded
+        foldStore?.set(message.id, expanded: expanding)
+        isFolding = true
+        // One turn later, so the indicator is drawn before the layout that
+        // makes this click slow takes the thread.
+        DispatchQueue.main.async {
+            if expanding {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    longTurnExpanded = true
+                } completion: {
+                    isFolding = false
+                }
+            } else {
+                resize({ longTurnExpanded = false }, done: { isFolding = false })
+            }
+        }
+    }
+
+    /// Brackets a change that makes this row shorter. The end is reported one
+    /// turn after the change has landed, so the geometry of its last frame is
+    /// seen inside the bracket.
+    private func resize(animated: Bool = true, _ change: @escaping () -> Void,
+                        done: (() -> Void)? = nil) {
+        onWillResize?()
+        let finish = { onDidResize?(); done?() }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.15)) { change() } completion: {
+                DispatchQueue.main.async(execute: finish)
+            }
+        } else {
+            change()
+            DispatchQueue.main.async { DispatchQueue.main.async(execute: finish) }
+        }
+    }
+
     private var bubbleBackground: Color {
         if isBare { return .clear }
         return message.role == .user ? Color.accentColor : Color(.controlBackgroundColor)
@@ -4274,10 +4570,8 @@ struct MessageBubble: View {
 
     // MARK: - Footer (timestamp · actions · stats)
 
-    private var showsFooter: Bool {
-        message.role == .assistant && !message.isStreaming
-            && !message.isAgentSummary && !message.content.isEmpty
-    }
+    /// One predicate with the transcript's end footer, which is its negation.
+    private var showsFooter: Bool { ChatTurn.hasOwnFooter(message) }
 
     /// Left-aligned strip under a reply: time, actions, speed. Always visible,
     /// unlike the user turn's row: Regenerate and Continue have no other home.
@@ -4297,8 +4591,10 @@ struct MessageBubble: View {
                                                                 count: message.revisions.count))
                     }
                     .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
-                    Text(MessageRevisions.label(index: message.activeRevision,
-                                                count: message.revisions.count))
+                    Text(
+                                                MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count)
+)
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                     footerButton("chevron.right", help: "Next version of this reply") {
@@ -4312,12 +4608,15 @@ struct MessageBubble: View {
             }
 
             HStack(spacing: 2) {
-                footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                // A generated picture has a footer and no text to copy or edit.
+                if !message.content.isEmpty {
+                    footerButton("square.on.square", help: "Copy this reply") { copyMessage() }
+                }
                 // The model's replies are editable but have no double-click
                 // route into it (that gesture belongs to selecting a word), so
                 // without this the only way in is a context menu nobody thinks
                 // to open on a paragraph.
-                if onEdit != nil, message.role == .assistant {
+                if onEdit != nil, message.role == .assistant, !message.content.isEmpty {
                     footerButton("pencil", help: "Edit this reply — then Continue to carry on from it") {
                         startEditing()
                     }
@@ -4337,7 +4636,7 @@ struct MessageBubble: View {
                                  action: onRegenerate)
                 }
                 if let onDelete {
-                    footerButton("trash", help: "Delete this message from the conversation",
+                    footerButton("trash", help: "Delete this turn from the conversation",
                                  action: onDelete)
                 }
             }
@@ -4387,6 +4686,23 @@ struct MessageBubble: View {
 
     private func footerButton(_ icon: String, help: String, flipped: Bool = false,
                               action: @escaping () -> Void) -> some View {
+        FooterIconButton(icon: icon, help: help, flipped: flipped, action: action)
+    }
+
+    private func copyMessage() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content, forType: .string)
+    }
+}
+
+/// One glyph of a footer's action row.
+private struct FooterIconButton: View {
+    let icon: String
+    let help: String
+    var flipped = false
+    let action: () -> Void
+
+    var body: some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11))
@@ -4396,12 +4712,34 @@ struct MessageBubble: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help)
+        .help(L10n.text(help))
     }
+}
 
-    private func copyMessage() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(message.content, forType: .string)
+/// The footer of a turn that ended without a reply to hang one on: cut while
+/// thinking, stopped after a tool result, an error card. Time of the last
+/// thing that happened, and the two ways out — try again, or take the turn
+/// away. It is what the transcript draws after its last row.
+private struct TurnEndFooter: View {
+    let endedAt: Date
+    var onRegenerate: (() -> Void)?
+    let onDelete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            StatPill(text: endedAt.formatted(date: .omitted, time: .shortened),
+                     expanded: endedAt.formatted(date: .numeric, time: .shortened))
+            HStack(spacing: 2) {
+                if let onRegenerate {
+                    FooterIconButton(icon: "arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                     action: onRegenerate)
+                }
+                FooterIconButton(icon: "trash", help: "Delete this turn from the conversation",
+                                 action: onDelete)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, ChatMetrics.compactMode ? 2 : 8)
     }
 }
 
@@ -4441,7 +4779,7 @@ private struct StatPill: View {
     }
 
     private func label(_ string: String) -> some View {
-        Text(string)
+        Text(L10n.text(string))
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -4491,12 +4829,14 @@ struct ChatModeToggles: Equatable {
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
                         inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
-                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+                        agentLock: AgentModeLock? = nil,
+                        /// Chat is answered by Apple's on-device model.
+                        apple: Bool = false) -> ChatModeToggles {
         let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
-        guard let lock = agentLock else { return base }
-        return ChatModeToggles(
+        guard let lock = agentLock else { return applyingApple(base, apple: apple) }
+        return applyingApple(ChatModeToggles(
             // Thinking is the one an agent may leave unset, and `AgentResolution`
             // falls back to the surface's own value there — so locking it anyway
             // would take away a control nobody is deciding for you.
@@ -4505,7 +4845,21 @@ struct ChatModeToggles: Equatable {
             mcp: lock.mcp,
             thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
             toolsLockedBy: lock.name,
-            mcpLockedBy: lock.name)
+            mcpLockedBy: lock.name), apple: apple)
+    }
+
+    /// The on-device model has no thinking mode at all, and its 4k window has
+    /// no room for MCP's tool definitions — so both read locked, with it named
+    /// as the owner. The tool LOOP still switches; the tool SET is clamped in
+    /// `AgentResolution`, which is where capabilities are decided.
+    private static func applyingApple(_ t: ChatModeToggles, apple: Bool) -> ChatModeToggles {
+        guard apple else { return t }
+        var out = t
+        out.thinking = false
+        out.thinkingLockedBy = AppleFoundationChat.displayName
+        out.mcp = false
+        out.mcpLockedBy = AppleFoundationChat.displayName
+        return out
     }
 }
 
@@ -4706,7 +5060,7 @@ private struct ToolCallRow: View {
     /// The one place a tool's name is drawn, so `server__tool` reads as a path
     /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
     @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
-        Text(ToolCallDisplay.displayName(name))
+        Text(L10n.text(ToolCallDisplay.displayName(name)))
             .font(.caption.monospaced())
             .foregroundStyle(Color.accentColor.opacity(0.7))
         if let variant {
@@ -4809,7 +5163,7 @@ private struct ToolCallRow: View {
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.leading)
                         .fixedSize(horizontal: true, vertical: false)
-                    Text(result)
+                    Text(L10n.text(result))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -5012,22 +5366,89 @@ struct MarkdownText: View {
         case paragraph(String)
         case heading(Int, String)              // level, text
         case code(String, String)              // language, content
-        case listItem(String, String)          // marker (`•`, `1.`, `2)`), text
+        case listItem(String, String, Int)     // marker (`•`, `1.`, `☐`), text, depth
+        case thematicBreak                     // `---` between sections
         case quote(String)                     // `>` lines, already merged
         case xmlBlock(String)                  // raw XML/tag content
         case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
     }
 
     /// Anchored: at most nine digits (CommonMark) then `.` or `)` and a space.
-    fileprivate static func listItem(in line: String) -> (marker: String, text: String)? {
-        if line.hasPrefix("- ") || line.hasPrefix("* ") {
-            return ("•", String(line.dropFirst(2)))
+    fileprivate static func listItem(in line: String) -> (marker: String, text: String, indent: Int)? {
+        let indent = leadingIndent(of: line)
+        let body = line.drop { $0 == " " || $0 == "\t" }
+        if body.hasPrefix("- ") || body.hasPrefix("* ") {
+            let text = String(body.dropFirst(2))
+            if let box = taskBox(in: text) { return (box.marker, box.text, indent) }
+            return ("•", text, indent)
         }
-        guard let match = line.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
+        guard let match = body.range(of: "^[0-9]{1,9}[.)] ", options: .regularExpression) else {
             return nil
         }
-        return (String(line[match]).trimmingCharacters(in: .whitespaces),
-                String(line[match.upperBound...]))
+        return (String(body[match]).trimmingCharacters(in: .whitespaces),
+                String(body[match.upperBound...]), indent)
+    }
+
+    /// Spaces before the first mark on the line; a tab counts as four.
+    fileprivate static func leadingIndent(of line: String) -> Int {
+        var n = 0
+        for c in line {
+            if c == " " { n += 1 } else if c == "\t" { n += 4 } else { break }
+        }
+        return n
+    }
+
+    /// A break INSIDE a paragraph. TextKit starts a new paragraph at every
+    /// `\n`, and a new paragraph takes the first-line indent (the margin) and a
+    /// paragraph's worth of air — so an item's own second line would leave the
+    /// list it belongs to.
+    fileprivate static let softBreak = "\u{2028}"
+
+    /// A checklist's boxes, which read at the weight of the text rather than a
+    /// bullet's: they are the item's state, not its punctuation.
+    fileprivate static let taskBoxes: Set<String> = ["\u{25A1}", "\u{2611}"]
+
+    /// `[ ]` or `[x]` right after the marker is a checkbox, not text.
+    private static func taskBox(in text: String) -> (marker: String, text: String)? {
+        guard text.count >= 4, text.hasPrefix("["), text.dropFirst(2).hasPrefix("] ") else { return nil }
+        switch text[text.index(text.startIndex, offsetBy: 1)] {
+        case " ": return ("\u{25A1}", String(text.dropFirst(4)))
+        case "x", "X": return ("\u{2611}", String(text.dropFirst(4)))
+        default: return nil
+        }
+    }
+
+    /// Three or more of one mark, alone on the line.
+    fileprivate static func isThematicBreak(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard let mark = trimmed.first, mark == "-" || mark == "*" || mark == "_" else { return false }
+        guard trimmed.allSatisfy({ $0 == mark || $0 == " " }) else { return false }
+        return trimmed.filter { $0 == mark }.count >= 3
+    }
+
+    /// A list's depth comes from the STEPS it takes, not from a count of
+    /// spaces: models write two or four for the same one level, and a list
+    /// that starts indented is still at its own top.
+    fileprivate struct ListDepth {
+        /// Past this an outline is deeper than the column can show, so further
+        /// levels share an indent rather than walking off the right edge. The
+        /// stack still tracks the real structure, so coming back out lands
+        /// where it should.
+        static let maxLevel = 5
+
+        private var stops: [Int] = []
+
+        mutating func level(forIndent indent: Int) -> Int {
+            while let last = stops.last, indent < last { stops.removeLast() }
+            if let last = stops.last {
+                if indent > last { stops.append(indent) }
+            } else {
+                stops.append(indent)
+            }
+            return min(stops.count - 1, Self.maxLevel)
+        }
+
+        mutating func reset() { stops.removeAll() }
     }
 
     /// `>` alone is a blank line inside a quote and keeps the block open.
@@ -5041,6 +5462,7 @@ struct MarkdownText: View {
         var blocks: [Block] = []
         let lines = source.components(separatedBy: "\n")
         var i = 0
+        var depth = ListDepth()
 
         while i < lines.count {
             let line = lines[i]
@@ -5145,10 +5567,40 @@ struct MarkdownText: View {
                 continue
             }
 
-            // List item
-            if let item = listItem(in: line) {
-                blocks.append(.listItem(item.marker, item.text))
+            // A rule, before the list check: `- - -` is a break, not an item.
+            if isThematicBreak(line) {
+                blocks.append(.thematicBreak)
                 i += 1
+                continue
+            }
+
+            // List item, with the lines indented under it: a second line, or a
+            // second paragraph, belongs to the item rather than to the margin.
+            if let item = listItem(in: line) {
+                // Any other block ended the list, so its depth starts again.
+                if case .some(.listItem) = blocks.last {} else { depth.reset() }
+                var text = item.text
+                i += 1
+                while i < lines.count {
+                    // One blank line may sit inside an item, before its second
+                    // paragraph; two end it.
+                    let blank = lines[i].trimmingCharacters(in: .whitespaces).isEmpty
+                    let at = blank ? i + 1 : i
+                    guard at < lines.count else { break }
+                    let next = lines[at]
+                    let trimmed = next.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty,
+                          leadingIndent(of: next) > item.indent,
+                          listItem(in: next) == nil,
+                          !isThematicBreak(next),
+                          quoteBody(in: trimmed) == nil,
+                          !trimmed.hasPrefix("```"), !trimmed.hasPrefix("#"),
+                          !trimmed.hasPrefix("|"), !trimmed.hasPrefix("<")
+                    else { break }
+                    text += (blank ? softBreak + softBreak : softBreak) + trimmed
+                    i = at + 1
+                }
+                blocks.append(.listItem(item.marker, text, depth.level(forIndent: item.indent)))
                 continue
             }
 
@@ -5278,14 +5730,19 @@ struct MarkdownText: View {
                 linkifyBareUrls(code)
                 result.append(code)
 
-            case .listItem(let marker, let text):
+            case .listItem(let marker, let text, let level):
                 let bullet = NSAttributedString(string: marker + " ", attributes: [
                     .font: NSFont.systemFont(ofSize: ChatMetrics.transcriptFontSize),
-                    .foregroundColor: NSColor.secondaryLabelColor,
+                    .foregroundColor: taskBoxes.contains(marker)
+                        ? NSColor.labelColor : NSColor.secondaryLabelColor,
                 ])
                 let p = NSMutableParagraphStyle()
-                // Hanging indent off the marker's own width.
-                p.headIndent = bullet.size().width.rounded(.up)
+                // One step per level; the hanging indent hangs off the marker's
+                // own width, so wrapped lines and the item's own second line
+                // line up under its text.
+                let step = CGFloat(level) * ChatMetrics.listIndentStep
+                p.firstLineHeadIndent = step
+                p.headIndent = step + bullet.size().width.rounded(.up)
                 p.lineHeightMultiple = ChatMetrics.proseLineHeightMultiple
                 // Tight between items, a paragraph's worth after the last.
                 p.paragraphSpacing = isItem(idx + 1) ? 4 : 8
@@ -5297,6 +5754,27 @@ struct MarkdownText: View {
                 if isItem(idx + 1) { combined.append(NSAttributedString(string: "\n")) }
                 combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
                 result.append(combined)
+
+            case .thematicBreak:
+                // A rule is a bordered block for the same reason the quote bar
+                // is one: an attributed string has no "line across here".
+                let table = NSTextTable()
+                table.numberOfColumns = 1
+                let cell = NSTextTableBlock(table: table, startingRow: 0, rowSpan: 1,
+                                            startingColumn: 0, columnSpan: 1)
+                cell.setContentWidth(100, type: .percentageValueType)
+                cell.setWidth(1, type: .absoluteValueType, for: .border, edge: .minY)
+                cell.setBorderColor(NSColor.separatorColor, for: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .minY)
+                cell.setWidth(8, type: .absoluteValueType, for: .margin, edge: .maxY)
+                let p = NSMutableParagraphStyle()
+                p.textBlocks = [cell]
+                // The cell needs something to hold; at 1pt the rule is the
+                // only thing with height.
+                result.append(NSAttributedString(string: "\u{00A0}", attributes: [
+                    .font: NSFont.systemFont(ofSize: 1),
+                    .paragraphStyle: p,
+                ]))
 
             case .table(let headers, let rows, let alignments):
                 result.append(renderTable(headers: headers, rows: rows, alignments: alignments, theme: theme))
@@ -5604,7 +6082,21 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
+        // `~~struck~~` arrives as an intent, like bold and inline code do.
+        result.enumerateAttribute(.inlinePresentationIntent, in: full, options: []) { value, range, _ in
+            guard isStruckThrough(value) else { return }
+            result.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+        }
         tintInlineCode(result, bodyFont: bodyFont)
+    }
+
+    /// The intent crosses the `AttributedString` bridge as an `NSNumber`.
+    private static func isStruckThrough(_ value: Any?) -> Bool {
+        if let intent = value as? InlinePresentationIntent { return intent.contains(.strikethrough) }
+        if let number = value as? NSNumber {
+            return InlinePresentationIntent(rawValue: number.uintValue).contains(.strikethrough)
+        }
+        return false
     }
 
     /// Inline code is found by `inlinePresentationIntent`, never by the font:
@@ -5758,6 +6250,38 @@ fileprivate struct SelectableMarkdownNSText: NSViewRepresentable {
     }
 }
 
+/// Where an inline-code span's ground is drawn: one rect per line the span
+/// occupies, each ending at that line's last visible glyph.
+///
+/// Not `enumerateEnclosingRects`, which is SELECTION geometry: a span that
+/// continues on the next line takes its first fragment all the way to the
+/// container's trailing edge, and the tint ran to the right margin.
+enum InlineCodeGround {
+    static func rects(forGlyphRange glyphs: NSRange,
+                      layoutManager: NSLayoutManager,
+                      in container: NSTextContainer) -> [NSRect] {
+        guard glyphs.length > 0, let text = layoutManager.textStorage?.string as NSString? else { return [] }
+        var rects: [NSRect] = []
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, lineGlyphs, _ in
+            let onThisLine = NSIntersectionRange(lineGlyphs, glyphs)
+            guard onThisLine.length > 0 else { return }
+            // The space a line breaks at belongs to the line, and tinting
+            // it is what reaches the margin.
+            var chars = layoutManager.characterRange(forGlyphRange: onThisLine, actualGlyphRange: nil)
+            while chars.length > 0,
+                  let last = text.substring(with: NSRange(location: chars.upperBound - 1, length: 1)).unicodeScalars.first,
+                  CharacterSet.whitespacesAndNewlines.contains(last) {
+                chars.length -= 1
+            }
+            guard chars.length > 0 else { return }
+            let visible = layoutManager.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
+            guard visible.length > 0 else { return }
+            rects.append(layoutManager.boundingRect(forGlyphRange: visible, in: container))
+        }
+        return rects
+    }
+}
+
 /// NSTextView that reports its laid-out height as its intrinsic content size,
 /// so embedding it in SwiftUI's layout system "just works" — no manual height
 /// binding required.
@@ -5807,11 +6331,9 @@ fileprivate final class IntrinsicTextView: NSTextView {
             let band = ((font?.ascender ?? 10) - (font?.descender ?? -3)) + 2
             let glyphs = layoutManager.glyphRange(forCharacterRange: range,
                                                   actualCharacterRange: nil)
-            layoutManager.enumerateEnclosingRects(
-                forGlyphRange: glyphs,
-                withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
-                in: textContainer
-            ) { rect, _ in
+            for rect in InlineCodeGround.rects(forGlyphRange: glyphs,
+                                               layoutManager: layoutManager,
+                                               in: textContainer) {
                 var box = rect.offsetBy(dx: origin.x, dy: origin.y)
                 if box.height > band {
                     box = box.insetBy(dx: 0, dy: (box.height - band) / 2)

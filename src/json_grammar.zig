@@ -165,6 +165,8 @@ const Frame = struct {
 // ── Grammar ───────────────────────────────────────────────────────────────────
 
 const MAX_STACK = 64;
+/// Consecutive free-whitespace bytes the grammar admits between tokens.
+pub const MAX_FREE_WS = 16;
 
 pub const Grammar = struct {
     gpa: std.mem.Allocator,
@@ -172,6 +174,7 @@ pub const Grammar = struct {
     stack: std.ArrayListUnmanaged(Frame),
     /// Set true once all configurations have rejected and recovery is impossible.
     dead: bool = false,
+    ws_run: u16 = 0,
 
     pub fn init(gpa: std.mem.Allocator, schema: *const Schema) std.mem.Allocator.Error!Grammar {
         var g: Grammar = .{
@@ -263,7 +266,7 @@ pub const Grammar = struct {
         while (iter < 8) : (iter += 1) {
             const r = try advanceOne(self, b);
             switch (r) {
-                .consumed => return true,
+                .consumed, .consumed_ws => return true,
                 .replay => |nb| b = nb,
                 .reject => return false,
             }
@@ -278,17 +281,19 @@ pub const Grammar = struct {
     pub const Snapshot = struct {
         stack: []Frame, // owned
         dead: bool,
+        ws_run: u16,
     };
 
     pub fn snapshot(self: *const Grammar) std.mem.Allocator.Error!Snapshot {
         const copy = try self.gpa.dupe(Frame, self.stack.items);
-        return .{ .stack = copy, .dead = self.dead };
+        return .{ .stack = copy, .dead = self.dead, .ws_run = self.ws_run };
     }
 
     pub fn restoreFrom(self: *Grammar, snap: Snapshot) std.mem.Allocator.Error!void {
         self.stack.clearRetainingCapacity();
         try self.stack.appendSlice(self.gpa, snap.stack);
         self.dead = snap.dead;
+        self.ws_run = snap.ws_run;
     }
 
     pub fn discardSnapshot(self: *const Grammar, snap: Snapshot) void {
@@ -308,23 +313,36 @@ pub const Grammar = struct {
 
 const StepResult = union(enum) {
     consumed,
+    consumed_ws,
     replay: u8,
     reject,
 };
 
 fn advanceOne(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
-    if (g.stack.items.len == 0) {
-        // Past the root; only whitespace allowed.
-        return if (isWs(byte)) .consumed else .reject;
-    }
+    const r = try advanceOneInner(g, byte);
+    if (r == .consumed) g.ws_run = 0;
+    return r;
+}
 
-    if (g.stack.items.len == 1 and g.topConst().sub == .accepted) {
-        return if (isWs(byte)) .consumed else .reject;
-    }
+/// Free whitespace is capped per run: a masked model whose real argmax is
+/// off-schema otherwise idles on whitespace until the loop guard cuts it.
+fn freeWhitespace(g: *Grammar) StepResult {
+    if (g.ws_run >= MAX_FREE_WS) return .reject;
+    g.ws_run += 1;
+    return .consumed_ws;
+}
+
+fn advanceOneInner(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
+    // Nothing outside the root value: whitespace there is a greedy near-tie
+    // the model pads with (`\r   \r   \r  {`) or idles on, and it carries no
+    // formatting the model prefers. Inside the root its own layout stays.
+    if (g.stack.items.len == 0) return .reject;
+    if (g.stack.items.len == 1 and g.topConst().sub == .accepted) return .reject;
+    const before_root = g.stack.items.len == 1 and g.topConst().sub == .expect_value;
 
     // Free whitespace handling for between-token positions.
-    if (isWs(byte) and canAcceptFreeWhitespace(g.topConst())) {
-        return .consumed;
+    if (isWs(byte) and !before_root and canAcceptFreeWhitespace(g.topConst())) {
+        return freeWhitespace(g);
     }
 
     if (g.stack.items.len > MAX_STACK) {
@@ -988,7 +1006,8 @@ test "grammar respects minItems and maxItems" {
     }
 }
 
-test "grammar accepts whitespace between tokens" {
+// The model keeps its own layout inside the root; outside it nothing is admitted.
+test "grammar admits free whitespace inside the root value only" {
     var schema = try parseSchema(testing.allocator,
         \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
     );
@@ -996,8 +1015,12 @@ test "grammar accepts whitespace between tokens" {
 
     var g = try Grammar.init(testing.allocator, &schema);
     defer g.deinit();
-    try feed(&g, "  {\n  \"x\" : 42\n}\n");
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte('\n'));
+    try feed(&g, "{\n  \"x\" : 42\n}");
     try testing.expect(g.isComplete());
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte(' '));
 }
 
 test "grammar relaxes anyOf to any-json" {
@@ -1022,7 +1045,6 @@ test "allowedBytes initial returns object opener" {
     defer g.deinit();
     const mask = try g.allowedBytes();
     try testing.expect(mask.contains('{'));
-    try testing.expect(mask.contains(' ')); // whitespace
     try testing.expect(!mask.contains('['));
     try testing.expect(!mask.contains('"'));
 }
@@ -1132,5 +1154,36 @@ test "cruise-app-style nested schema parses sample response" {
     defer g.deinit();
 
     try feed(&g, "{\"blocks\":[{\"type\":\"text\",\"content\":\"hi\"}]}");
+    try testing.expect(g.isComplete());
+}
+
+// A masked model whose real argmax is off-schema falls back to whitespace,
+// which the grammar admitted forever; the bar is that a free-whitespace run
+// ends and structure is forced.
+test "free whitespace is capped so a masked model cannot idle forever" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
+    );
+    defer schema.deinit();
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+
+    try testing.expect(try g.acceptByte('{'));
+    var i: usize = 0;
+    while (i < MAX_FREE_WS) : (i += 1) try testing.expect(try g.acceptByte('\n'));
+    try testing.expect(!try g.acceptByte('\n'));
+    const capped = try g.allowedBytes();
+    try testing.expect(!capped.contains(' '));
+    try testing.expect(capped.contains('"'));
+
+    // A snapshot carries the run; a structural byte resets it.
+    const snap = try g.snapshot();
+    defer g.discardSnapshot(snap);
+    try feed(&g, "\"x\":");
+    try testing.expect(try g.acceptByte(' '));
+    try g.restoreFrom(snap);
+    try testing.expect(!try g.acceptByte(' '));
+
+    try feed(&g, "\"x\":1}");
     try testing.expect(g.isComplete());
 }

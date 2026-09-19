@@ -71,14 +71,14 @@ curl -s -m 3 "http://127.0.0.1:$PORT/health" | grep -q '"ok"' || { echo "FAIL: n
 
 pass=0; fail=0
 check() { # name, got, expected-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "PASS: $1"; pass=$((pass+1))
     else
         echo "FAIL: $1"; echo "  got:      $2"; echo "  expected: $3"; fail=$((fail+1))
     fi
 }
 refuse() { # name, got, forbidden-substring
-    if echo "$2" | grep -qF "$3"; then
+    if grep -qF "$3" <<< "$2"; then
         echo "FAIL: $1 (leaked '$3')"; echo "  got: $2"; fail=$((fail+1))
     else
         echo "PASS: $1"; pass=$((pass+1))

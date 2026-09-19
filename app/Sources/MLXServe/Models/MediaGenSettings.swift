@@ -71,6 +71,10 @@ struct ImageGenSettings: Codable, Equatable {
     /// Conditioning rebalance (Advanced): global gain + weights text.
     var condGain: Double = 1.0
     var condWeightsText: String = ""
+    /// Classifier-free guidance (Advanced, `ImageModelPreset.supportsGuidance`
+    /// models only): 1.0 = off. The negative prompt itself is transient, like
+    /// the main prompt — not persisted.
+    var guidanceScale: Double = 1.0
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []
@@ -156,6 +160,7 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .condGain) { condGain = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .guidanceScale) { guidanceScale = v }
         if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {
             loras = v
         } else {

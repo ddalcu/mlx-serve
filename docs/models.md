@@ -1,3 +1,5 @@
+[English](models.md) · [简体中文](zh-CN/models.md)
+
 # Supported models
 
 | Architecture | `model_type` | Examples | Chat Format | Vision |

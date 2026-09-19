@@ -98,9 +98,9 @@ run_request() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -151,9 +151,9 @@ run_and_tokenize() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -295,7 +295,7 @@ echo "== real N=2 concurrency (batch != 1) =="
 # first-N-tokens bar against the serial answer.
 sleep 2
 CONC_LOG=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
 CONC_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -373,6 +373,29 @@ t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 
     fi
     echo -e "${GREEN}PASS${NC} both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
 fi
+
+# Observability: the verdict a user reads without the log. /props and
+# /v1/models both say the loaded model batches, and a slot that cannot
+# (logprobs) names its reason once beside live company.
+if ! curl -s "$BASE/props" | grep -q '"batching":{"supported":true'; then
+    echo -e "${RED}FAIL${NC} /props does not report batching.supported=true"
+    curl -s "$BASE/props" | head -c 600; echo; kill $CONC_PID 2>/dev/null || true; exit 1
+fi
+if ! curl -s "$BASE/v1/models" | grep -q '"batched_decode":true'; then
+    echo -e "${RED}FAIL${NC} /v1/models row lacks batched_decode:true"
+    kill $CONC_PID 2>/dev/null || true; exit 1
+fi
+LP_PAYLOAD=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=1; print(json.dumps(d))" "$LONG_JSON_PAYLOAD")
+echo "$LP_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > /dev/null &
+LA=$!
+echo "$LONG_JSON_PAYLOAD" | curl -s -m 180 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" > /dev/null &
+LB=$!
+wait $LA; wait $LB
+if grep -q "\[batched\] slot serial: logprobs" "$CONC_LOG"; then
+    echo -e "${GREEN}PASS${NC} a logprobs slot beside a batched one names its serial reason"
+else
+    echo -e "  ${YELLOW}NOT RUN${NC} the logprobs request never overlapped a live slot (no serial-reason line)"
+fi
 kill $CONC_PID 2>/dev/null || true
 wait $CONC_PID 2>/dev/null || true
 rm -f "$CONC_LOG" "$CONC_A" "$CONC_B"
@@ -390,7 +413,7 @@ echo "== batched-kernel x kv-quant crash guard =="
 
 sleep 2
 KVQ_LOG=$(mktemp)
-MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --kv-quant 8 > "$KVQ_LOG" 2>&1 &
+MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --kv-quant 8 > "$KVQ_LOG" 2>&1 &
 KVQ_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -437,9 +460,9 @@ rm -f "$KVQ_LOG"
 echo -e "${GREEN}PASS${NC} batched decode survives --kv-quant 8 (server alive, completion returned)"
 
 # Pad-waste cap arm (opt-in: MLX_SERVE_PADWASTE_ARM=1): one ~1k-token stream beside one ~64k
-# one. The cap was dead on every linear-layer-0 trunk (it read `cache.step`, 0 forever there).
-# The bar is the SPLIT, not bytes. Off by default: it needs a long-context checkpoint and a
-# multi-minute 64k prefill.
+# one. A group past 1024 tokens attends PER SLOT (nothing padded), so the pair batches; only
+# qwen4's QSA reads still stack, and there the cap must SPLIT the pair. Off by default: it
+# needs a long-context checkpoint and a multi-minute 64k prefill.
 if [ "${MLX_SERVE_PADWASTE_ARM:-0}" = "1" ]; then
     echo
     echo "== pad-waste cap: a 1k stream must NOT batch with a 64k one =="
@@ -487,7 +510,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(body("64k", 50000, 600)))
 pathlib.Path(sys.argv[3]).write_text(json.dumps(body("1k", 800, 400)))
 PW_PYEOF
 
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --max-concurrent 4 > "$PW_LOG" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
     PW_PID=$!
     up=0
     for i in $(seq 1 90); do
@@ -523,6 +546,16 @@ PW_PYEOF
     wait $PW_A 2>/dev/null || true
 
     PW_FAIL=0
+    if grep -q "\[batched\] per-slot attention engaged" "$PW_LOG"; then
+        if grep -q "pad-waste cap" "$PW_LOG"; then
+            echo -e "${RED}FAIL${NC} the pair attends per slot and was still capped"; PW_FAIL=1
+        else
+            echo -e "${GREEN}PASS${NC} the 1k+64k pair batched per slot (no pad, no cap)"
+        fi
+        if [ "$PW_FAIL" != "0" ]; then tail -20 "$PW_LOG"; cleanup_padwaste; exit 1; fi
+        cleanup_padwaste
+        exit 0
+    fi
     # (a) the cap must have fired on the pair, naming the waste it compared.
     if ! grep -qE "\[batched\] pad-waste cap: kept [0-9]+ of [0-9]+ slots \(waste " "$PW_LOG"; then
         echo -e "${RED}FAIL${NC} the 1k+64k pair never hit the pad-waste cap —"

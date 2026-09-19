@@ -1029,6 +1029,90 @@ value and warns `Ignoring --include since filenames have been explicitly set`
 first pass. Pass filenames POSITIONALLY.
 
 
+## The ANE seam is fp16 end to end, and H3's DiT rendered BLACK (2026-09-10)
+
+Wiring the channel-mode ANE MLP offload into H3's video DiT gave a clean
+1.24x on the denoise step and an all-zero video. The seam MATH was never
+wrong — a per-block parity probe read cos 0.99999 / rms_ratio 1.0000 against
+the plain `mlpForward` at blocks 0-2. The output was NaN from block 36 on.
+
+**Cause**: the compiled ANE program computes in fp16 from input plane to
+output plane, and H3's DiT partials do not fit. Measured at 864x480/22f: the
+fc2 partial peaks at ~1.7M and the intermediate `act = silu(gate)*up` at 52k,
+against an fp16 max of 65504. The plane saturated to INF, the residual stream
+went NaN, and the VAE decoded zeros.
+
+**The fix is a scale, and WHERE it goes is the whole point.** Dividing the
+`up` half of the ANE's weight copy by `ane.OUT_PLANE_SCALE` (256) and
+multiplying the read-back partial by it is EXACT: `up` is linear into the
+product, so `act` and the down-conv output both scale with it, while
+`silu(gate)` is untouched; per-row int8 quantization folds the factor into the
+row scale so the codes are unchanged; and a power of two is exact in fp16.
+Scaling `gate` instead would be wrong (it sits under a nonlinearity), and
+scaling fc2 alone bounds the output but not `act` — that arm was measured and
+still hit INF at block 49.
+
+**Two false starts worth keeping**: scaling fc2 by 16 (output bounded, `act`
+still overflowed); then 64 (same, and the parity probe read 0.92 because it
+was comparing the scaled partial against an unscaled reference — a probe that
+does not follow the fix reports the fix as a regression).
+
+**The class lesson**: the LM prefill seam never hit this because a normed
+decoder hidden is O(1) and its MLP output is O(100). A DiT residual stream is
+not, and neither is any other backend we might point this seam at. The scale
+is now unconditional in both seams. Krea had shipped without it and looked
+correct — it was silently losing precision at the top of the fp16 range: mean
+|diff| vs the GPU arm 5.68/255 -> 2.00 and cos 0.9962 -> 0.9993 once scaled.
+A correct-looking image is not evidence of range headroom.
+
+**Guard**: `ane.OUT_PLANE_SCALE` carries the measured peaks in its doc
+comment; the bar is perceived content plus a finite-output check, never bytes.
+
+## ACE-Step peak-normalizes, so raw RMS cannot measure the ANE arm (2026-09-10)
+
+The first ANE-vs-GPU audio comparison reported a "loudness lift" of +0.7 to
++1.1 dB RMS that changed SIGN across seeds. It was not energy the offload
+added. `generate()` ends with `peakNormalize(samples, -1 dBFS)`: one global
+max sample sets the gain for the whole 180 s track. In the GPU track that
+peak is an isolated spike (the runner-up frame sits at 0.853 of it); the ANE
+arm rounds that one sample differently, the spike shrinks, and the whole
+track is scaled up to put a different sample at -1 dBFS. Raw RMS and crest
+factor then measure the spike, not the audio.
+
+**Valid measures**: a ROBUST energy (per-frame RMS, trimmed of the top
+percentiles — +1.9%/+2.8% at 0.45/0.75 over 3 seeds, consistent in sign) and
+log-STFT cosine (≥ 0.994). Anything normalized by a single sample is out.
+
+**The class**: a metric taken AFTER a global normalization step measures the
+normalizer's anchor, not the signal. Check for one before trusting any
+whole-track scalar on a generated audio arm.
+
+## A GPU tail built after the ANE wait is serial, and a small one is launch latency (2026-09-11)
+
+The media seam moved to one fixed 256-row tile looped over every request (`ane.mediaMlp`), so a new image size, canvas or song length stops compiling and storing another 1.3-4.9 GB program set. Its first version ran the rows past the last full tile through the full GPU MLP AFTER the tile loop and trailed the whole-request tile by 3-4% on ACE-Step and H3.
+
+The tail was not costing its rows. The whole-request tile had the same shape with a sub-32-row tail, and moving that 23-row tail to go out with the GPU complement, before the first ANE wait, took ACE 30 s whole@0.60 diffusion from 1982 to 1836 ms. Three small matmuls are dispatch latency, and built after a blocking wait nothing overlaps them; built before it they land in whatever GPU slack the ANE-critical block leaves.
+
+Fix: `ane.mediaMlp` async-evals every GPU piece (complement and tail) before the loop. A partial last tile rides the ANE zero-padded when `tail > T x (1 - share)` (`ane.mediaTilePlan`), the balance point where padding the ANE costs less than the tail on the GPU. M4 Max, T = 256: ACE 180 s pads (12.4 s vs 13.6 s unpadded), H3's 116 rows stay on the GPU (7.44 s/step vs 7.64 padded), ACE 30 s ties. Against the whole-request tile: Krea -0.6%, ACE 180 s tie, H3 -1..2%/step, ACE 30 s -7% (140 ms of 2 s).
+
+Guard: the `mediaTilePlan` test; live, the `[ane] <what> offload engaged: tiled N x 256 rows (P padded), tail R on GPU` line.
+
+## A parameter that keys a compiled artifact must not be re-derived per request (2026-09-11)
+
+The media share decides which ANE program set a build compiles, and the lineage prune keeps one share per model. It was re-solved at every build from a GPU probe timed at the request's own row count, so the fixed 256-row tile still recompiled: a 50 s song solved 0.50 where a 30 s one had solved 0.60, and H3 builds on every request. A sweep showed the size was not even the main problem: at 256-4096 rows the M4 Max probe reads 11.2-13.5 TFLOPS on all three models, so the raw share sits at 0.47-0.51, and Krea and H3 straddle the 0.475 rounding line (two consecutive H3 probes at 1024 rows: 0.468, 0.477). Any re-solve can land on the other side and cost a full compile plus a prune.
+
+Fix: the probe runs at a fixed `MEDIA_PROBE_ROWS` (4096), and a model reuses the share of its most recently used compiled set (`ane.cachedShare` over `msv_ane_cache_variant`), tagged `calibrated share=X`. An explicit `--ane-split` tags plain `share=X` and is never reused, and a cache hit re-tags the entry with the current lineage, so a set built by an older binary becomes reusable. The same sweep showed last round's ACE "0.60 match" was an outlier probe (7.8 TFLOPS): the solve cannot tell ACE from Krea or H3 on M4 Max.
+
+Guard: the `shareVariant` test; live, `[ane] <what> offload share X (reused from its compiled set)` on every build after the first.
+
+## A calibration timed on the wrong dtype aims low (2026-09-11)
+
+The media share is calibrated on block 0: its ANE program over one 4096-row run, its GPU complement over the same rows, balanced. The first version fed the complement bf16 ones (the weight-scale dtype) and aimed ACE at 0.50 and H3 at 0.40, below the measured bests of 0.60 and 0.45. Sustained ANE runs (clock ramp) and running both sides at once (bandwidth and power contention) each moved the timings by under 3%. A throwaway seam probe found the gap: at 0.50 ACE's real GPU complement took ~18 ms per block against the 12.9 ms calibration predicted, so every block was GPU-bound. ACE's DiT stream is float32 and so is its complement; Krea's is float32 cast to bf16 inside each linear; only H3's is bf16.
+
+Fix: each backend's calibrator names the dtype its MLP sees (`AneCalib.dtype`), and the complement is timed on that. ACE now calibrates at 0.57 (GPU 32.9 vs 25.9 ms). H3's remaining 0.42 vs 0.45 is its bench canvas's 116-row GPU tail, a per-request cost a per-model share cannot carry.
+
+Guard: the `calibratedShare` test; live, `[ane] <what> offload share calibrated X in Ns: …`.
+
 ## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
 
 The third cause above, closed. `vae_diffusion_decoder.safetensors` is four
@@ -1694,7 +1778,7 @@ Two things learned on the way:
 - **No env var for an obvious win.** The first cut shipped a `MLX_SERVE_CONV3D_CHUNK=0` kill switch out of habit. It bought one A/B (the 67 GB number above) and one bug: `maxInt(u32)` handed to a `c_int` is `-1`, and the "off" arm ran a window of −1 frames and killed the server with an MLX shape error. Chunking is exact and free, so nobody ever wants the other arm; the switch is gone. Levers are for paths with two arms worth comparing (lossy or tradeoff perf), not for fixes.
 - **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
 
-H3's VAE convs match the same gate but its decoder is already chunked by reference semantics (17-frame clips, 256-px spatial tiles), so its per-conv transient stays inside the H3 activation bill. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
+H3's VAE convs match the same gate too, and "chunked by reference semantics" turned out not to be enough (#424, 26.8.11 through 26.9.2): the encoder slices a reference video into 17-frame clips and 256-px tiles but built ONE lazy graph over all of them, evaluated once after the last tile. A 480x640 124-frame reference is 8 clips x 6 tiles = 48 encoder passes, and MLX's eval keeps ~10 command buffers in flight, each holding its convs' tap copies and Winograd working sets until completion, so the transient stacked past the wired limit. The tell is `kIOGPUCommandBufferCallbackErrorInvalidResource` (residency, not a malloc failure) right after `prompt -> N tokens`, with images and audio still fine. Fix: `encodeMoments` evaluates its output, one barrier per tile pass, nothing else changes; the tiled parity case is unchanged at cos 0.999998. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
 
 ## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
 
@@ -1737,3 +1821,91 @@ HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
 Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
 tool-response turn, 2.8k-token needle past the 512 window) and the HF
 reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).
+
+## K2-Horizon (`k2_horizon`) port (2026-09-14)
+
+IFM's dense sizes are a Llama trunk (stock weight names, GQA, full-head RoPE
+at theta 1e7, untied head) with ONE arch difference: `K2HorizonRMSNorm`
+normalizes `layernorm_num_groups` (4) channel groups on their own rms before
+the full-width weight. `groupedRmsNorm` does reshape → weight-less rms_norm →
+reshape → multiply, gated inside `rmsNorm` on `norm_groups > 1` and the
+residual width (a per-head q/k norm is already one group per head). The
+first live load answered 17*23 correctly through the generic fallback prompt,
+so the forward was right before the template was.
+
+Three things were not the arch:
+
+- The 51 KB template hit two jinja.cpp gaps: `{% if spec is sameas true %}`
+  (a test with a BARE argument; the parser only knew `is x(arg)`) and
+  `sameas` itself (`not_implemented`). Both fixed in `lib/jinja_cpp`,
+  `libjinja.a` rebuilt. The failure was the usual silent generic fallback.
+- Every marker is a special token spelled `<ifm|…>`: three think openers
+  (`<ifm|think>`, `<ifm|think_fast>`, `<ifm|think_faster>`, picked by
+  `reasoning_effort` high/medium/low, the template raising on any other
+  word) and the GLM tool tags. Threading a fourth think spelling through the
+  ~200 literal sites was the wrong shape; the tokenizer decodes them to the
+  canonical bytes instead (`installMarkerAliases`, decode-only), so parsing,
+  streaming gates and the split all see `<think>` and `<arg_key>`. Only the
+  rendered prompt keeps the pack's spelling, which is why thinking-off's
+  closer is chosen from the rendered tail (`k2ThinkOpenerAt`). The template
+  also raises when an assistant history turn carries no thinking field, so
+  the K2 family always gets a `reasoning_content` (empty when the client sent
+  none).
+- `<|ifm|im_end|>` is declared ONLY in `generation_config.json`'s
+  `eos_token_id` list; config.json names `<|ifm|endoftext|>`. We never read
+  that list, and the model wrote `<|ifm|im_end|>` and kept going. Merged
+  additively at load for every model (`mergeEosTokens`).
+
+Bar: HF `tokenizers` byte-identical ids on numbers, code, CJK, contractions
+and the markers; greedy answers with thinking on/off, effort low, tool calls
+(plain and streamed with thinking), tool-result history, JSON schema and the
+Anthropic surface on the 6-bit pack.
+
+Two more came out of the first llmprobe run (all cells failing were ours):
+
+- Thinking default. The template opens a think marker on EVERY assistant
+  turn and the pack declares no `generation_config` default, so
+  `defaultEnableThinking` answered false and the prompt closed the block.
+  llmprobe's probe saw a non-thinker and budgeted 8..192 tokens, while its
+  `reasoning_effort: medium` opted thinking back on — every cell ended
+  `[length]` with empty content. `k2_horizon` now defaults ON like
+  `bailing_hybrid`; thinking-off is still the committed closer.
+- JSON schema + thinking. The protocol resolves its closer from the DECODED
+  prompt tail, which the alias turns into `<think>`; `</think>` has no atomic
+  id here and its byte matcher fired on a literal `</think>` the model wrote
+  INSIDE its reasoning (it was quoting the schema), so the grammar engaged
+  mid-thought and the model idled on whitespace. `Tokenizer.markerCloserFor`
+  pairs each opener id with its closer; `resolveReasoningProtocol` reads the
+  prompt's last opener token and sets the closer TEXT to the pack's own
+  spelling, so the marker lookup finds the atomic id and no byte spelling is a
+  boundary. Guards: `tests/test_json_schema_protocol_routing.py` on the pack.
+- A GLM call to a parameterless tool (`<tool_call>list_files</tool_call>`)
+  has no `<arg_key>`, the one signal the GLM route keyed on; it fell to the
+  Hermes path and vanished, so every agentic cell read "never used a tool".
+  A bare-identifier body routes to the GLM parser (corpus entry `[k2]`).
+
+- `top_p` near 0 and `top_k: 1` still sampled: both filters masked by VALUE
+  (`logit >= cutoff`), so every token tied with the cutoff survived, and bf16
+  logits tie at the top constantly (three tokens at -1.421875 on the
+  band-name prompt). `applyTopK` now keeps the k argpartition indices and
+  `applyTopP` decides the nucleus in argsort space and scatters the mask back
+  (`generate.zig`); non-tied rows mask identically. Every model, not K2.
+
+## Bonsai 2 served in bf16 (2026-09-18)
+
+- Defect: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` ships f16 scales and biases
+  and f32 norm/GDN tables, and Prism's reference runtime runs it in f16 with an
+  f32 GatedDeltaNet state. We narrowed every f16 side tensor to bf16 at load
+  (3 mantissa bits off each group scale), ran bf16 activations and kept the GDN
+  state bf16: KL 1.7e-4 vs an f32 reference of the pack, top-1 98.3%.
+- Fix: `ModelConfig.actDtype` (f16) and `ssmStateDtype` (f32) for Hadamard
+  packs; the loader keeps f16 as stored (`LoadOpts.keep_f16`), f32 tables
+  narrow to f16; every kernel on the path takes f16 (qmv2, gdn_decode, GDN
+  prework/norm-gate, QK-norm+RoPE 256, msv_attn_p256), and the grafted bf16 MTP
+  head casts at its two boundaries. KL 2.9e-6 / top-1 99.1%, the reference's
+  own fp16 distance. Same speed: fp16 GEMMs run at bf16's rate.
+- Two bf16 constants surfaced only under f16: the batched decode mask (sdpa
+  requires the mask to promote to the output dtype, so 4 concurrent MTP
+  requests 500'd) and the M-RoPE full-rotation cast.
+- Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
+  self-contained f32 reference, KL < 1e-5); red on the old engine.

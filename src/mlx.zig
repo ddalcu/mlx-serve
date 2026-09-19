@@ -79,6 +79,8 @@ pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
 
 // Stream
 pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
+pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
 pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
@@ -209,6 +211,7 @@ pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_hadamard_transform(res: *mlx_array, a: mlx_array, scale: mlx_optional_float, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
@@ -344,6 +347,7 @@ pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_me
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
@@ -358,6 +362,7 @@ pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
 // Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 
@@ -587,11 +592,38 @@ pub const fault = struct {
     }
 };
 
+/// Test-only: like `fault`, but the injected failure also LATCHES the process-wide
+/// error — the state a real mlx-c raise leaves behind, which a best-effort caller
+/// must drop before returning.
+const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+var latch_remaining: u64 = 0;
+var latch_fired = false;
+
+fn latchFaultHit() bool {
+    if (latch_remaining == 0) return false;
+    latch_remaining -= 1;
+    if (latch_remaining != 0) return false;
+    latch_fired = true;
+    return true;
+}
+
+pub fn armLatchingFaultForTest(k: u64) void {
+    latch_remaining = k;
+    latch_fired = false;
+}
+pub fn latchingFaultFiredForTest() bool {
+    return latch_fired;
+}
+
 pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
     if (comptime builtin.is_test) {
         if (fault.hit()) return error.MlxError;
+        if (latchFaultHit()) {
+            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            return error.MlxError;
+        }
     }
 }
 
@@ -803,6 +835,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     mlx_error_len = 0;
     mlx_error_latched.store(false, .release);
     return buf[0..n];
+}
+
+/// Drop a latch a best-effort op raised and its caller already reported, so an
+/// optional write or a diagnostic can never become an unrelated request's
+/// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
+/// an error that was already latched belongs to someone else and stays.
+pub fn dropLatchedErrorUnless(had_error: bool) void {
+    if (!had_error and errorPending()) {
+        var buf: [512]u8 = undefined;
+        _ = takeError(&buf);
+    }
 }
 
 /// Release-build fault injection: `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal

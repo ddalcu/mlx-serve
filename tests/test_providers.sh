@@ -59,6 +59,11 @@ PY
 start_stub() { python3 "$WORK/stub.py" "$STUB_PORT" list >/dev/null 2>&1 & STUB_PID=$!; }
 start_stub
 python3 "$WORK/stub.py" "$NOLIST_PORT" nolist >/dev/null 2>&1 & NOLIST_PID=$!
+# The server probes every provider ONCE at boot and then every 60 s: a stub that
+# binds after that first probe reads as unreachable for a minute.
+for p in $STUB_PORT $NOLIST_PORT; do
+    for i in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$p/" && break; sleep 0.1; done
+done
 
 cat > "$FAKE_HOME/.mlx-serve/providers.json" <<EOF
 [
@@ -85,7 +90,7 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-check() { TOTAL=$((TOTAL + 1)); if [ "$2" = PASS ]; then PASS=$((PASS + 1)); echo "  PASS: $1"; else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — $3"; fi; }
+check() { TOTAL=$((TOTAL + 1)); if [ "$2" = PASS ]; then PASS=$((PASS + 1)); echo "  PASS: $1"; else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — ${3:-}"; fi; }
 wait_rows() { # wait_rows <jq filter> <expected>
     for i in $(seq 1 30); do
         got=$(curl -s "$BASE/v1/models" | jq -r "$1"); [ "$got" = "$2" ] && return 0; sleep 0.5

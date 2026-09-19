@@ -21,6 +21,10 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// model is serving (they'd silently no-op), so the section always has
     /// something in it while never offering a knob that does nothing.
     case performance
+    /// The Neural Engine offloads: LM prefill plus the three media DiT seams.
+    /// Always listed — the media rows apply to generation models, which are
+    /// not the text `engine` the other gates key on.
+    case neuralEngine
     case ggufPerformance
     case ds4
     case requestDefaults
@@ -45,6 +49,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .lanSharing:        return "LAN Sharing"
         case .providers:         return "Providers"
         case .performance:       return "Performance"
+        case .neuralEngine:      return "Neural Engine"
         case .specDecode:        return "Speculative Decoding (MLX only)"
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"
@@ -78,6 +83,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .lanSharing:        return "antenna.radiowaves.left.and.right"
         case .providers:         return "cloud"
         case .performance:       return "speedometer"
+        case .neuralEngine:      return "cpu"
         case .specDecode:        return "hare"
         case .ggufPerformance:   return "shippingbox"
         case .ds4:               return "cube"

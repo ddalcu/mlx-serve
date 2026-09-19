@@ -48,6 +48,12 @@ struct ImageGenView: View {
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
     @State private var condWeightsText: String = ""
+    /// Classifier-free guidance (Advanced, `model.supportsGuidance` only):
+    /// how strongly to follow the prompt over the unconditional pathway.
+    @State private var guidanceScale: Double = 1.0
+    /// What to steer away from (Advanced, CFG only). Transient like the main
+    /// prompt — not persisted.
+    @State private var negativePrompt: String = ""
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
     @State private var loras: [LoraAdapter] = []
@@ -122,7 +128,7 @@ struct ImageGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -140,7 +146,7 @@ struct ImageGenView: View {
                     ForEach(model.promptExamples(editing: isEditing), id: \.name) { group in
                         Menu(group.name) {
                             ForEach(group.examples, id: \.title) { ex in
-                                Button(ex.title) { prompt = ex.body; persist() }
+                                Button(L10n.text(ex.title)) { prompt = ex.body; persist() }
                             }
                         }
                     }
@@ -238,7 +244,7 @@ struct ImageGenView: View {
                 MediaDropWell(title: sourceImageButtonLabel,
                               systemImage: "photo.badge.plus",
                               isTargeted: isDropTargeted) { chooseSourceImage() }
-                Text(sourceImageHint)
+                Text(L10n.text(sourceImageHint))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -352,13 +358,13 @@ struct ImageGenView: View {
                 Text("Quality").font(.subheadline.weight(.semibold))
                 Picker("", selection: $quality) {
                     ForEach(QualityPreset.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-                Text(qualityHint)
+                Text(L10n.text(qualityHint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -369,7 +375,7 @@ struct ImageGenView: View {
     /// front. CFG is deliberately absent: no image backend reads a guidance
     /// field, so quoting one would be inventing a knob.
     private var qualityHint: String {
-        "\(model.settings(quality).steps) steps"
+        L10n.format("%lld steps", Int64(model.settings(quality).steps))
     }
 
     private var resolutionSection: some View {
@@ -377,7 +383,7 @@ struct ImageGenView: View {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
                 ForEach(model.resolutionOptions(editMode: isEditing)) { r in
-                    Text(r.label).tag(r)
+                    Text(L10n.text(r.label)).tag(r)
                 }
             }
             .labelsHidden()
@@ -411,7 +417,7 @@ struct ImageGenView: View {
                 labelledSizeField("Height", text: $customHeightText)
             }
             if let hint = verdict.hint {
-                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
                     .font(.caption2)
                     // A correction is information; a refusal is the reason
                     // Generate is disabled, so only that one is coloured.
@@ -422,7 +428,7 @@ struct ImageGenView: View {
 
     private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(L10n.text(title)).font(.caption2).foregroundStyle(.secondary)
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 80)
@@ -474,11 +480,8 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            // No CFG field and no negative prompt: NO image backend reads either
-            // one (`handleImage` parses neither, and the app never sent
-            // guidance), so both were pure decoration on every model, not just
-            // the distilled ones. Steps stay overridable even where the schedule
-            // is fixed — it's the Advanced panel, and the hint says the cost.
+            // Steps stay overridable even where the schedule is fixed — it's
+            // the Advanced panel, and the hint says the cost.
             HStack {
                 numberField("Steps", value: $steps, step: 1)
                 // -1 is the random sentinel and renders as an EMPTY box, so the
@@ -491,6 +494,27 @@ struct ImageGenView: View {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+
+            // Real CFG — the undistilled base checkpoint only. Every other
+            // preset has guidance baked into its weights, so the field would
+            // be pure decoration there and stays hidden.
+            if model.supportsGuidance {
+                Divider()
+                Text("Classifier-free guidance").font(.caption.weight(.semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Guidance scale").font(.caption)
+                    Stepper(value: $guidanceScale, in: 1...20, step: 0.5) {
+                        Text(String(format: "%.1f", guidanceScale))
+                    }
+                    .onChange(of: guidanceScale) { _, _ in guard !hydrating else { return }; persist() }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Negative prompt").font(.caption)
+                    TextField("", text: $negativePrompt, prompt: Text("what to steer away from (optional)"))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
             }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
@@ -677,7 +701,7 @@ struct ImageGenView: View {
 
     private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             Stepper(value: value, step: step) {
                 Text(String(value.wrappedValue))
             }
@@ -813,6 +837,7 @@ struct ImageGenView: View {
         editMode = s.editMode
         condGain = s.condGain
         condWeightsText = s.condWeightsText
+        guidanceScale = s.guidanceScale
         loras = s.loras
         customWidthText = String(s.customWidth)
         customHeightText = String(s.customHeight)
@@ -838,6 +863,7 @@ struct ImageGenView: View {
         s.editMode = editMode
         s.condGain = condGain
         s.condWeightsText = condWeightsText
+        s.guidanceScale = guidanceScale
         s.loras = loras
         s.save()
     }
@@ -877,7 +903,9 @@ struct ImageGenView: View {
             refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
-            loras: loras
+            loras: loras,
+            guidanceScale: model.supportsGuidance ? guidanceScale : 1.0,
+            negativePrompt: model.supportsGuidance ? negativePrompt : ""
         )
         persist()  // final capture — the agent's generate_image reuses these
 

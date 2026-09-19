@@ -9,32 +9,11 @@ struct BrowserView: View {
         VStack(spacing: 0) {
             // URL bar
             HStack(spacing: 8) {
-                Button {
-                    browser.webView.goBack()
-                } label: {
-                    Image(systemName: "chevron.left")
+                navButton("chevron.left", enabled: browser.canGoBack) { browser.webView.goBack() }
+                navButton("chevron.right", enabled: browser.canGoForward) { browser.webView.goForward() }
+                navButton(browser.isLoading ? "xmark" : "arrow.clockwise", enabled: true) {
+                    if browser.isLoading { browser.webView.stopLoading() } else { browser.webView.reload() }
                 }
-                .buttonStyle(.plain)
-                .disabled(!browser.webView.canGoBack)
-
-                Button {
-                    browser.webView.goForward()
-                } label: {
-                    Image(systemName: "chevron.right")
-                }
-                .buttonStyle(.plain)
-                .disabled(!browser.webView.canGoForward)
-
-                Button {
-                    if browser.isLoading {
-                        browser.webView.stopLoading()
-                    } else {
-                        browser.webView.reload()
-                    }
-                } label: {
-                    Image(systemName: browser.isLoading ? "xmark" : "arrow.clockwise")
-                }
-                .buttonStyle(.plain)
 
                 TextField("URL", text: $urlText)
                     .textFieldStyle(.roundedBorder)
@@ -60,57 +39,30 @@ struct BrowserView: View {
         }
     }
 
+    private func navButton(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.title3)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
     private func navigateToURL() {
-        var url = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !url.hasPrefix("http://") && !url.hasPrefix("https://") {
-            url = "https://" + url
-        }
-        Task {
-            try? await browser.navigate(to: url)
-        }
+        Task { try? await browser.navigate(to: urlText) }
     }
 }
 
 struct WebViewWrapper: NSViewRepresentable {
     let browser: BrowserManager
 
-    func makeNSView(context: Context) -> WKWebView {
-        // Use the shared webView from BrowserManager (created eagerly, always available)
-        browser.webView.navigationDelegate = context.coordinator
-        return browser.webView
-    }
+    func makeNSView(context: Context) -> WKWebView { browser.webView }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {}
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(browser: browser)
-    }
-
-    class Coordinator: NSObject, WKNavigationDelegate {
-        let browser: BrowserManager
-
-        init(browser: BrowserManager) {
-            self.browser = browser
-        }
-
-        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            Task { @MainActor in
-                browser.isLoading = true
-            }
-        }
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            Task { @MainActor in
-                browser.currentURL = webView.url?.absoluteString ?? ""
-                browser.pageTitle = webView.title ?? ""
-                browser.isLoading = false
-            }
-        }
-
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            Task { @MainActor in
-                browser.isLoading = false
-            }
-        }
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: ()) {
+        BrowserManager.shared.returnToHost()
     }
 }

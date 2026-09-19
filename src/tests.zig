@@ -16,6 +16,9 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
+    _ = @import("rht.zig");
+    _ = @import("qmv2.zig");
+    _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
     _ = @import("json_grammar.zig");
@@ -29,6 +32,7 @@ test {
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
+    _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");

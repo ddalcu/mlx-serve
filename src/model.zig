@@ -5,6 +5,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
+const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -149,6 +150,10 @@ pub const ModelConfig = struct {
     num_key_value_heads: u32 = 8,
     head_dim: u32 = 256,
     rms_norm_eps: f32 = 1e-6,
+    /// K2-Horizon: every RMS norm normalizes `hidden_size / norm_groups`-wide channel groups on their own rms, then applies the full weight.
+    norm_groups: u32 = 1,
+    /// Prism Hadamard packs: every `<linear>.signs` weight reads `H_block(signs * x)` (rht.zig); 0 = none.
+    hadamard_block: u32 = 0,
 
     // RoPE
     rope_theta: f32 = 1000000.0,
@@ -447,6 +452,8 @@ pub const ModelConfig = struct {
     ctx_override: u32 = 0,
     kv_quant_override: ?kv_quant_mod.KVQuantConfig = null,
     mtp_override: ?bool = null,
+    /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
+    mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -829,16 +836,27 @@ pub const ModelConfig = struct {
         return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
     }
 
-    /// Dense bf16 bytes of QSA indexer history ONE token occupies: raw keys
-    /// `[kv, idx_hd]` plus pooled blocks `[kv/ratio, idx_hd]`, per full-attn
-    /// layer. Not kv-quantized. Zero on archs without an indexer. ONE copy; the billed
-    /// width (copies + score bank) is `server.statePerTokenBilled`.
+    /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
+    /// blocks `[kv/ratio, idx_hd]` per full-attn layer. The raw keys are a fixed
+    /// ring (`qsaRingBytes`, billed once per slot), not per token. Not
+    /// kv-quantized. Zero on archs without an indexer. ONE copy; the billed width
+    /// (copies + score bank) is `server.statePerTokenBilled`.
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
-        return n * hd * 2 + n * hd * 2 / ratio;
+        return n * hd * 2 / ratio;
+    }
+
+    /// The raw indexer keys every live slot holds: `QSA_RING_ROWS` rows per
+    /// full-attn layer, context-independent, billed once per slot.
+    pub fn qsaRingBytes(self: *const ModelConfig) u64 {
+        if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
+        const n = @as(u64, self.attnCacheLayerCount());
+        const hd = @as(u64, self.indexer_head_dim);
+        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        return n * rows * hd * 2;
     }
 
     /// f32 bytes per token of the QSA block-score operand a live slot holds
@@ -858,12 +876,32 @@ pub const ModelConfig = struct {
         if (self.linear_num_value_heads == 0) return 0;
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
         if (linear_layers == 0) return 0;
+        const state_elem: u64 = if (self.ssmStateDtype() == .float32) 4 else 2;
         const state: u64 = @as(u64, self.linear_num_value_heads) *
-            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * 2;
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * state_elem;
         const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
             @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
         const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
         return linear_layers * (state + conv * conv_dim * 2);
+    }
+
+    /// Activation dtype: f16 for a Prism Hadamard pack (its own contract: f16
+    /// activations over f16 scales), bf16 everywhere else.
+    pub fn actDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.hadamard_block > 0) .float16 else .bfloat16;
+    }
+
+    /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
+    /// reference runtime keeps it; bf16 elsewhere.
+    pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.hadamard_block > 0) .float32 else .bfloat16;
+    }
+
+    /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
+    /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
+    pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
+        if (configured == 0 and self.hadamard_block > 0) return 2;
+        return configured;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -902,15 +940,6 @@ pub const ModelConfig = struct {
     /// gate that never forgets — so the arm must be chosen, never defaulted.
     pub fn kdaUsesBoundedGate(self: *const ModelConfig) bool {
         return self.kda_vector_gate and self.kda_gate_lower_bound != 0.0;
-    }
-
-    /// The width the KV cache's KEY buffer is laid out at — `head_dim` on every
-    /// symmetric arch, nope+rope on MLA. What a scheme with a shape constraint
-    /// (TurboQuant's Hadamard rotation needs a power of two) must validate
-    /// against; `head_dim` alone says 128 for an arch that caches 192-wide keys
-    /// and the refusal then fires mid-request instead of at load.
-    pub fn kvCacheKeyHeadDim(self: *const ModelConfig) u32 {
-        return if (self.isMla()) self.mlaQkHeadDim() else self.head_dim;
     }
 
     /// The pooling op /v1/embeddings runs: the explicit signal, else masked
@@ -958,6 +987,14 @@ pub const ModelConfig = struct {
         return self.isQwen4();
     }
 
+    pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
+        if (!self.isQwen4() or !gather_on) return kv;
+        if (kv <= gather_min_kv) return kv;
+        const cap = self.indexer_budget + self.indexer_compress_ratio;
+        if (cap == 0) return kv;
+        return @min(kv, cap);
+    }
+
     /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
         return self.longCtxGated();
@@ -997,7 +1034,9 @@ pub const ModelConfig = struct {
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
-        if (self.isMoe() and !self.isQwen4()) return false; // routed experts: only qwen4_exp's per-slot state is modelled
+        // Routed experts are row-generic; a MoE trunk batches when its per-slot
+        // state is what the path merges (GDN pair, qwen4's PLE window + QSA keys).
+        if (self.isMoe() and !self.isQwen4() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
@@ -1014,6 +1053,11 @@ pub const ModelConfig = struct {
     pub fn isGemma4Layers(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "gemma4") or
             std.mem.eql(u8, self.model_type, "diffusion_gemma");
+    }
+
+    /// Additive + dedup-guarded, like every terminator merge here.
+    pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
+        for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -1149,6 +1193,9 @@ pub const ModelConfig = struct {
         // without reasoning ("17 - 9 = 8" where the thinking arm works the
         // word problem and answers "9 sheep are left").
         if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
+        // k2_horizon: the template opens a think marker on every assistant
+        // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
+        if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
 
         return false;
     }
@@ -1277,6 +1324,15 @@ pub const ModelConfig = struct {
             self.image_token_id, self.boi_token_id, self.eoi_token_id, self.lv_thumbnail_token_id, self.lv_row_col_base_id,
         });
     }
+
+    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// path. Idempotent.
+    pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
+        if (self.ngram_table_path) |p| allocator.free(p);
+        self.ngram_table_path = null;
+    }
 };
 
 /// Pick the user-turn prefix string for a model based on what its chat template
@@ -1334,6 +1390,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.gen_top_p = gd.top_p;
             config.gen_top_k = gd.top_k;
             config.gen_enable_thinking = gd.enable_thinking;
+            config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
         } else |_| {}
     } else |_| {}
     // Pooling (issue #116), priority: explicit config.json `pooling_mode`
@@ -1420,6 +1477,11 @@ pub const GenerationDefaults = struct {
     /// `default_chat_template_kwargs.enable_thinking` — the checkpoint's own
     /// thinking default. null when absent or not a bool.
     enable_thinking: ?bool = null,
+    /// `eos_token_id` (scalar or list): HF stops generation on these, and a
+    /// checkpoint may name the chat terminator ONLY here (K2-Horizon's
+    /// `<|ifm|im_end|>` rides beside config.json's `<|ifm|endoftext|>`).
+    eos_token_ids: [8]u32 = @splat(0),
+    num_eos: usize = 0,
 };
 
 /// Image-area limits parsed from a Qwen processor configuration.
@@ -1518,6 +1580,21 @@ pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
             else => {},
         }
     }
+    if (root.get("eos_token_id")) |v| {
+        switch (v) {
+            .integer => |i| if (i >= 0) {
+                gd.eos_token_ids[0] = @intCast(i);
+                gd.num_eos = 1;
+            },
+            .array => |arr| for (arr.items) |item| {
+                if (item == .integer and item.integer >= 0 and gd.num_eos < gd.eos_token_ids.len) {
+                    gd.eos_token_ids[gd.num_eos] = @intCast(item.integer);
+                    gd.num_eos += 1;
+                }
+            },
+            else => {},
+        }
+    }
     // The checkpoint's own chat-template kwargs. Only a real bool counts —
     // anything else leaves the field null and the arch default in charge.
     if (root.get("default_chat_template_kwargs")) |v| {
@@ -1585,6 +1662,19 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
 /// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
 /// vision token ids). The generic vision_config block already set
 /// `has_vision`; this reads Qwen's own keys into `qv_*`.
+/// One block for every packed module; mixed blocks are not a layout we serve.
+fn prismHadamardBlock(root: std.json.ObjectMap) !u32 {
+    const modules = (root.get("modules") orelse return error.UnsupportedHadamardLayout).array.items;
+    var block: i64 = 0;
+    for (modules) |m| {
+        const b = (m.object.get("block") orelse return error.UnsupportedHadamardLayout).integer;
+        if (b <= 0 or (block != 0 and b != block)) return error.UnsupportedHadamardLayout;
+        block = b;
+    }
+    if (block == 0) return error.UnsupportedHadamardLayout;
+    return @intCast(block);
+}
+
 fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) void {
     if (root.get("vision_config")) |vc_val| {
         if (vc_val == .object) {
@@ -2392,9 +2482,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
-        std.mem.eql(u8, model_type, "qwen3_5_text"))
+        std.mem.eql(u8, model_type, "qwen3_5_text") or
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
     {
         config.model_type = "qwen3_5_moe";
+        if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
         config.weight_prefix = "language_model.model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3474,6 +3566,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.model_type = "llama";
         } else if (std.mem.eql(u8, model_type, "mistral")) {
             config.model_type = "mistral";
+        } else if (std.mem.eql(u8, model_type, "k2_horizon")) {
+            // IFM K2-Horizon dense (0.9B/3.7B/7B/32B): a Llama trunk whose
+            // RMS norms are GROUPED (`layernorm_num_groups`). The MoVA MoE
+            // sizes (`mova_num_experts` > 0) are a different attention and
+            // are not served.
+            config.model_type = "k2_horizon";
+            if (cfg_obj.get("layernorm_num_groups")) |v| {
+                if (v == .integer and v.integer > 1) config.norm_groups = @intCast(v.integer);
+            }
         } else {
             config.model_type = "unknown";
         }
@@ -3585,6 +3686,24 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// that already loaded binds byte-identically. Scan order puts the most
 /// specific spelling first: a `model.language_model.*` checkpoint also
 /// satisfies the bare "model" probe.
+/// Prism Hadamard packs run f16 activations over f16 scales (the pack's own
+/// contract) and ship the unpacked tensors f32 (norms, conv, the dense GDN a/b
+/// rows, A_log, dt_bias): an f32 table widens the f16 residual, so those
+/// narrow to f16. Signs stay f32: the rotation runs in f32.
+pub fn narrowHadamardPackTables(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !void {
+    if (config.hadamard_block == 0) return;
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const v = kv.value_ptr.*;
+        if (mlx.mlx_array_dtype(v) != .float32) continue;
+        if (std.mem.endsWith(u8, kv.key_ptr.*, ".signs")) continue;
+        var cast = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cast, v, config.actDtype(), s));
+        _ = mlx.mlx_array_free(v);
+        kv.value_ptr.* = cast;
+    }
+}
+
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
     const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
     var known = false;
@@ -3606,7 +3725,17 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, false);
+    return loadWeightsOpt(io, allocator, model_dir, .{});
+}
+
+/// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
+/// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
+/// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+
+/// The text model's weights for `config`.
+pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3621,7 +3750,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 
     const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
     defer allocator.free(pathz);
-    try loadSafetensorsFile(allocator, &weights, pathz, s, false);
+    try loadSafetensorsFile(allocator, &weights, pathz, s, .{});
 
     if (weights.count() == 0) {
         log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
@@ -3631,13 +3760,13 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 }
 
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, true);
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
-fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_vision: bool) !Weights {
+fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDir(io, allocator, dir, model_dir, load_vision);
+    return loadWeightsFromOpenDir(io, allocator, dir, model_dir, opts);
 }
 
 /// Load every `*.safetensors` in an already-open `dir` into a Weights map.
@@ -3645,7 +3774,7 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// absolute path for `mlx_load_safetensors` and to phrase the error message.
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
-fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
+fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, opts: LoadOpts) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -3677,7 +3806,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
+        try loadSafetensorsFile(allocator, &weights, path, s, opts);
         file_count += 1;
     }
 
@@ -3763,8 +3892,9 @@ pub fn loadSafetensorsFile(
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
-    load_vision: bool,
+    opts: LoadOpts,
 ) !void {
+    const load_vision = opts.vision;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -3797,7 +3927,7 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+        if (!opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -3948,7 +4078,7 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
 
     try std.testing.expectError(
         error.NoWeightFiles,
-        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
+        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", .{}),
     );
 }
 
@@ -3972,7 +4102,30 @@ test "loadWeights reads only the shards the index names (issue #274)" {
     const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
     const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
     defer allocator.free(dir);
-    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+    defer w.deinit();
+    try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "loadWeights ignores an index that names no shard on disk (re-sharded upload, stale index)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00002.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001-of-00005.safetensors\"}}" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
@@ -4193,6 +4346,13 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
     const ling = ModelConfig{ .model_type = "bailing_hybrid" };
     try testing.expect(ling.defaultEnableThinking(false));
     try testing.expect(ling.defaultEnableThinking(true));
+    // k2_horizon: the template opens a think marker on every assistant turn
+    // and the pack declares no default; a declared off still wins.
+    const k2 = ModelConfig{ .model_type = "k2_horizon" };
+    try testing.expect(k2.defaultEnableThinking(false));
+    try testing.expect(k2.defaultEnableThinking(true));
+    const k2_off = ModelConfig{ .model_type = "k2_horizon", .gen_enable_thinking = false };
+    try testing.expect(!k2_off.defaultEnableThinking(false));
     // gpt_oss opts in with AND without tools. Unlike muse there is no
     // thinking-off prompt to commit: harmony's `Reasoning: low|medium|high`
     // sets depth, not presence, so the model opens an analysis channel on
@@ -4237,6 +4397,19 @@ test "parseGenerationDefaultsFromJson: reads default_chat_template_kwargs.enable
     try testing.expectEqual(@as(?bool, null), parseGenerationDefaultsFromJson(
         "{\"default_chat_template_kwargs\": {\"enable_thinking\": \"yes\"}}",
     ).enable_thinking);
+}
+
+test "parseGenerationDefaultsFromJson: eos_token_id list merges additively into the stop set" {
+    const gd = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 250019]}");
+    try testing.expectEqual(@as(usize, 2), gd.num_eos);
+    var config = ModelConfig{};
+    config.addEosToken(1);
+    config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expect(config.isEosToken(250019));
+    const scalar = parseGenerationDefaultsFromJson("{\"eos_token_id\": 7}");
+    try testing.expectEqual(@as(u32, 7), scalar.eos_token_ids[0]);
+    try testing.expectEqual(@as(usize, 0), parseGenerationDefaultsFromJson("{\"eos_token_id\": \"x\"}").num_eos);
 }
 
 test "ModelConfig addEosToken" {
@@ -5734,6 +5907,25 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
 }
 
+test "ModelConfig prism_hadamard_qwen35 is qwen3_5 with the module Hadamard block" {
+    const json =
+        \\{
+        \\  "model_type": "prism_hadamard_qwen35",
+        \\  "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120, "num_hidden_layers": 64},
+        \\  "modules": [{"path": "lm_head", "block": 1024}, {"path": "model.layers.0.mlp.up_proj", "block": 1024}],
+        \\  "quantization": {"bits": 2, "group_size": 128, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqual(@as(u32, 1024), config.hadamard_block);
+    const mixed =
+        \\{"model_type": "prism_hadamard_qwen35", "text_config": {"hidden_size": 5120},
+        \\ "modules": [{"path": "a", "block": 1024}, {"path": "b", "block": 512}]}
+    ;
+    try testing.expectError(error.UnsupportedHadamardLayout, parseConfigFromJson(testing.allocator, mixed));
+}
+
 test "ModelConfig text-only qwen3_5 has no qwen_vision" {
     const json =
         \\{
@@ -6085,11 +6277,6 @@ test "parseConfigFromJson bailing_hybrid (Ling 3.0) KDA/MLA/MoE fields" {
     // Attention scale is over the FULL qk head dim (192), not head_dim.
     try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
 
-    // The cache's KEY width is 192 — what a shape-constrained KV scheme must
-    // validate against (TurboQuant's Hadamard needs a power of two, and 192 is
-    // not one, so it is refused at LOAD instead of at the first MLA layer).
-    try testing.expectEqual(@as(u32, 192), config.kvCacheKeyHeadDim());
-    try testing.expect(!std.math.isPowerOfTwo(config.kvCacheKeyHeadDim()));
     // A negative bound selects fla's bounded-sigmoid arm.
     try testing.expect(config.kdaUsesBoundedGate());
 }
@@ -6187,6 +6374,27 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {
+    // Bar: routed experts are row-generic (the sorted gather path takes B*S rows),
+    // so a qwen3_5 MoE batches like the dense trunk; MoE trunks with other
+    // per-slot state (hy3, laguna, lfm2_moe, bailing) stay refused.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "text_config": {"hidden_size": 2048, "num_experts": 256, "full_attention_interval": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.isMoe());
+    try testing.expect(config.supportsBatchedGdnDecode());
+
+    var laguna = std.mem.zeroes(ModelConfig);
+    laguna.model_type = "laguna";
+    laguna.num_experts = 64;
+    laguna.full_attention_interval = 4;
+    try testing.expect(!laguna.supportsBatchedGdnDecode());
 }
 
 test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
@@ -6824,7 +7032,8 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u32, 4), c.full_attention_interval);
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
-    try testing.expectEqual(@as(u64, 12 * 128 * 2 + 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
@@ -7304,4 +7513,31 @@ test "qwen4 PLE placement: the layer loop must install exactly one PLE, at the c
     // ...while a config that DOES name a layer is unchanged.
     try testing.expect(!qwen4PleInstalledAt(&.{false}, 0));
     try testing.expect(qwen4PleInstalledAt(&.{true}, 0));
+}
+
+test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RMS norms" {
+    const json =
+        \\{
+        \\  "model_type": "k2_horizon",
+        \\  "hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 36,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+        \\  "hidden_act": "silu", "rms_norm_eps": 1e-06, "vocab_size": 250624,
+        \\  "layernorm_num_groups": 4, "query_key_norm": false, "attention_gate_func": null,
+        \\  "num_experts": 0, "sliding_window": null, "tie_word_embeddings": false,
+        \\  "max_position_embeddings": 524288, "rope_head_dim": 128,
+        \\  "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("k2_horizon", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 4), config.norm_groups);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(f32, 10000000.0), config.rope_theta);
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(!config.has_sliding_window);
+    try testing.expect(!config.tie_word_embeddings);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.has_pre_ff_norm);
 }

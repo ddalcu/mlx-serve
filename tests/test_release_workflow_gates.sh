@@ -304,6 +304,20 @@ if gh_line is not None:
     check(any("exit 1" in l for l in b_code[gh_line:gh_line + 12]),
           "a `gh` failure stops the build instead of stamping a version behind the published ones")
 
+    # A pre-release tag (v26.9.5-pre-release.1) is not a release number: the
+    # filter must skip it like release.yml does, not choke on it and stop the build.
+    m = re.search(r'--jq "(.*?)" 2>', b_code[gh_line])
+    check(m is not None, "the CalVer jq filter is readable")
+    if m:
+        import json, subprocess
+        # Undo double-quote escaping the way the shell does, then fill in YM.
+        prog = re.sub(r'\\([\\"$`])', r'\1', m.group(1)).replace("${YM}", "26.9")
+        tags = ["v26.9.5-pre-release.1", "v26.9.4", "v26.9.3", "v26.8.11"]
+        out = subprocess.run(["jq", prog], input=json.dumps([{"tagName": t} for t in tags]),
+                             capture_output=True, text=True)
+        check(out.returncode == 0 and out.stdout.strip() == "4",
+              f"the CalVer filter skips pre-release tags (got {out.stdout.strip() or out.stderr.strip()})")
+
     # ...but only a build that could BECOME a release may require `gh` at all.
     # The GitHub CLI is release tooling, not a build dependency: a contributor
     # who clones and runs app/build.sh signs ad-hoc, cuts nothing, and must not

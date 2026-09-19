@@ -37,8 +37,9 @@ paths="$(git config -f .gitmodules --get-regexp path 2>/dev/null | awk '{print $
 short() { printf '%.12s' "$1"; }
 
 for p in $paths; do
-    # The pin = the gitlink recorded in the superproject tree for this path.
-    pinned="$(git ls-tree HEAD -- "$p" 2>/dev/null | awk '{print $3}')"
+    # The pin = the gitlink in the index (a staged, not-yet-committed bump
+    # counts), which equals HEAD's when nothing is staged.
+    pinned="$(git ls-files -s -- "$p" 2>/dev/null | awk '{print $2}')"
     [ -n "$pinned" ] || continue
 
     # Not initialized yet (fresh clone) — `git submodule update --init` fetches

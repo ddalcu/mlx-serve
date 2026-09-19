@@ -1979,6 +1979,46 @@ test "flux applyCondRebalance scales tap thirds and global gain" {
     try testing.expectError(error.InvalidCondWeights, applyCondRebalance(enc, 1.0, &bad, s));
 }
 
+test "flux CFG blend is uncond + guidance_scale * (cond - uncond)" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cond_v = [_]f32{ 1, 2, 3, 4 };
+    const uncond_v = [_]f32{ 0, 0, 1, 2 };
+    const sh = [_]c_int{ 1, 1, 4 };
+    const cond = mlx.mlx_array_new_data(&cond_v, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(cond);
+    const uncond = mlx.mlx_array_new_data(&uncond_v, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(uncond);
+    const guidance_scale: f32 = 3.5;
+
+    const diff = try subA(cond, uncond, s); defer _ = mlx.mlx_array_free(diff);
+    const scale_a = mlx.mlx_array_new_float(guidance_scale); defer _ = mlx.mlx_array_free(scale_a);
+    const scaled = try mulA(diff, scale_a, s); defer _ = mlx.mlx_array_free(scaled);
+    const blended = try addA(uncond, scaled, s); defer _ = mlx.mlx_array_free(blended);
+    _ = mlx.mlx_array_eval(blended);
+    const d = mlx.mlx_array_data_float32(blended) orelse return error.NoData;
+    // manual: uncond + 3.5*(cond-uncond)
+    for (cond_v, uncond_v, 0..) |c, u, i| {
+        const expect = u + guidance_scale * (c - u);
+        try testing.expectApproxEqAbs(expect, d[i], 1e-5);
+    }
+    // guidance_scale 1.0 collapses the blend to `cond` exactly — the
+    // mathematical identity `generateFromCondWithOpts` relies on to skip
+    // the unconditional forward entirely when CFG is off.
+    const scale_one = mlx.mlx_array_new_float(1.0); defer _ = mlx.mlx_array_free(scale_one);
+    const scaled_one = try mulA(diff, scale_one, s); defer _ = mlx.mlx_array_free(scaled_one);
+    const blended_one = try addA(uncond, scaled_one, s); defer _ = mlx.mlx_array_free(blended_one);
+    _ = mlx.mlx_array_eval(blended_one);
+    const d1 = mlx.mlx_array_data_float32(blended_one) orelse return error.NoData;
+    for (cond_v, 0..) |c, i| try testing.expectApproxEqAbs(c, d1[i], 1e-5);
+}
+
+test "flux GenOpts defaults keep CFG off (distilled klein pays no extra forward)" {
+    const opts = GenOpts{};
+    try testing.expectEqual(@as(f32, 1.0), opts.guidance_scale);
+    try testing.expectEqual(@as(?mlx.mlx_array, null), opts.neg_enc);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Full text→image pipeline.
 // ════════════════════════════════════════════════════════════════════════
@@ -2080,6 +2120,14 @@ pub const GenOpts = struct {
     /// Conditioning rebalance: global gain + per-tap weights (len 3).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance (the UNDISTILLED "base" klein checkpoints —
+    /// distilled klein has guidance baked into the weights and takes neither
+    /// field: `guidance_scale` 1.0 skips the unconditional forward entirely,
+    /// byte-identical to the no-CFG path). `neg_enc` is the negative prompt's
+    /// text-encoder output, same fixed [1,FLUX_SEQ_LEN,hidden] shape as the
+    /// positive `enc` so both forwards share `img_ids`/`txt_ids`.
+    guidance_scale: f32 = 1.0,
+    neg_enc: ?mlx.mlx_array = null,
 };
 
 pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, progress: ?sse.Progress) !mlx.mlx_array {
@@ -2102,15 +2150,35 @@ pub fn encodePrompt(te: *TextEncoder, ids: []const i32, mask: []const i32, opts:
     return enc;
 }
 
+/// One DiT forward → predicted velocity [1,nlat,128], slicing off any
+/// reference-editing tokens concatenated onto `latents`. Shared by the
+/// conditional and (CFG) unconditional passes — both read the same
+/// `img_ids`/`txt_ids`/`ref_tokens`, only `enc` differs.
+fn ditVelocity(dit: *Dit, latents: mlx.mlx_array, enc: mlx.mlx_array, t: f32, img_ids: []const i32, txt_ids: []const i32, ref_tokens: mlx.mlx_array, all_ids: ?[]i32, nlat: c_int, s: S) !mlx.mlx_array {
+    if (ref_tokens.ctx != null) {
+        const input = try concat(&[_]mlx.mlx_array{ latents, ref_tokens }, 1, s);
+        defer _ = mlx.mlx_array_free(input);
+        const full = try dit.forward(input, enc, t, all_ids.?, txt_ids);
+        defer _ = mlx.mlx_array_free(full);
+        return slice3(full, 1, 0, nlat, s);
+    }
+    return dit.forward(latents, enc, t, img_ids, txt_ids);
+}
+
 pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
     const enc = try encodePrompt(te, ids, mask, opts);
     return generateFromCondWithOpts(dit, vae, enc, ids.len, seed, steps, height, width, opts, progress);
 }
 
 /// Stages 2+ (latents init → denoise loop → VAE decode) from a pre-computed
-/// prompt encoding. Takes ownership of `enc_owned`. `prompt_len` = token count
-/// of the encoded prompt (drives the text position ids).
+/// prompt encoding. Takes ownership of `enc_owned` AND `opts.neg_enc` (CFG).
+/// `prompt_len` = token count of the encoded prompt (drives the text position
+/// ids); the negative encoding shares the same fixed FLUX_SEQ_LEN padding, so
+/// it needs no position ids of its own.
 pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, prompt_len: usize, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+    defer if (opts.neg_enc) |ne| {
+        _ = mlx.mlx_array_free(ne);
+    };
     const s = dit.s;
     const a = dit.allocator;
     const lh = height / 16;
@@ -2204,19 +2272,21 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
         latents = nl;
     }
 
+    const use_cfg = opts.guidance_scale != 1.0 and opts.neg_enc != null;
     const run_steps = steps - start_step;
     for (start_step..steps) |t| {
         if (progress) |p| if (p.cancelled()) return error.Cancelled;
-        const nz = blk: {
-            if (ref_tokens.ctx != null) {
-                const input = try concat(&[_]mlx.mlx_array{ latents, ref_tokens }, 1, s);
-                defer _ = mlx.mlx_array_free(input);
-                const full = try dit.forward(input, enc, sched.ts[t], all_ids.?, txt_ids);
-                defer _ = mlx.mlx_array_free(full);
-                break :blk try slice3(full, 1, 0, @intCast(nlat), s);
-            }
-            break :blk try dit.forward(latents, enc, sched.ts[t], img_ids, txt_ids);
-        };
+        const nz_cond = try ditVelocity(dit, latents, enc, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat), s);
+        const nz = if (use_cfg) blk: {
+            defer _ = mlx.mlx_array_free(nz_cond);
+            const nz_uncond = try ditVelocity(dit, latents, opts.neg_enc.?, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat), s);
+            defer _ = mlx.mlx_array_free(nz_uncond);
+            // v = uncond + guidance_scale · (cond − uncond)
+            const diff = try subA(nz_cond, nz_uncond, s); defer _ = mlx.mlx_array_free(diff);
+            const scale_a = mlx.mlx_array_new_float(opts.guidance_scale); defer _ = mlx.mlx_array_free(scale_a);
+            const scaled = try mulA(diff, scale_a, s); defer _ = mlx.mlx_array_free(scaled);
+            break :blk try addA(nz_uncond, scaled, s);
+        } else nz_cond;
         defer _ = mlx.mlx_array_free(nz);
         const dt = sched.sig[t + 1] - sched.sig[t];
         const dta = mlx.mlx_array_new_float(dt); defer _ = mlx.mlx_array_free(dta);

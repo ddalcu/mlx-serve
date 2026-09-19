@@ -161,9 +161,18 @@ jobs:
 
       - name: Create tag (manual dispatch)
         if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The version step only picks a number with no release behind it, so a
+        # tag already on origin is a leftover from a run that failed before it
+        # released. Re-point it at this commit instead of failing the push.
         run: |
-          git tag v${{ steps.version.outputs.version }}
-          git push origin v${{ steps.version.outputs.version }}
+          TAG=v${{ steps.version.outputs.version }}
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG is already released"; exit 1
+          fi
+          git tag "$TAG"
+          git push --force origin "$TAG"
 
       - name: Fetch libllama (llama.cpp GGUF engine)
         run: bash scripts/fetch-llama.sh
@@ -197,6 +206,13 @@ jobs:
         if: github.event_name != 'pull_request'
         run: zig build test --summary all
 
+      # Same cache as ci.yml, own key: this one also holds the release products.
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: app/.build
+          key: swiftpm-release-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.mlxpin.outputs.xcode }}
+
       - name: Build Swift app
         working-directory: app
         # Package manifests own their language modes. A global Swift 5 override
@@ -215,7 +231,7 @@ jobs:
         # Same rationale as the Zig tests — ci.yml covers the PR commit.
         if: github.event_name != 'pull_request'
         working-directory: app
-        run: swift test
+        run: bash test.sh
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary

@@ -874,8 +874,8 @@ const corpus = [_]Expect{
     // The salvage must recover the tool NAME and DROP the fragment value — the
     // Hermes-truncation rule ("a half-written file is worse than a re-issued
     // write") now applied to the Gemma arm too. The cut itself reports
-    // finish_reason "length" (server truncation; scheduler.loopStopReason), so
-    // client truncation recovery fires instead of validating a fragment.
+    // finish_reason "stop" with repetition_loop details; HTTP handlers suppress
+    // tool parsing for that cause instead of exposing the salvaged fragment.
     .{
         // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html):
         // the model looped "server-side scripting language, " (a ~6-token
@@ -1089,6 +1089,42 @@ const corpus = [_]Expect{
         .name = "thinking off answers directly, nothing filed as reasoning",
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
+    },
+    // ── K2-Horizon (IFM) ────────────────────────────────────────────────
+    // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
+    // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
+    // inside a bare plural wrapper. Thinking is template-opened
+    // (`…assistant\n<ifm|think>\n`, decoded `<think>`).
+    .{
+        .family = "k2_horizon",
+        .name = "plural wrapper around newline-separated arg pairs",
+        .raw = "I'll check the weather.\n<tool_calls>\n<tool_call>get_weather\n" ++
+            "<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n" ++
+            "<arg_key>celsius</arg_key>\n<arg_value>true</arg_value>\n" ++
+            "</tool_call>\n</tool_calls>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "k2_horizon",
+        .name = "template-opened thought, then two calls in one wrapper",
+        .raw = "Two reads are needed.</think>\n<tool_calls>\n" ++
+            "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n</tool_call>\n" ++
+            "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>b.txt</arg_value>\n</tool_call>\n" ++
+            "</tool_calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = write_read_tools_schema,
+        .reasoning_contains = "Two reads",
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
     },
     .{
         .family = "glm-bare",
@@ -1717,6 +1753,16 @@ const corpus = [_]Expect{
         .tool_name = "write_file",
         .tool_arg_key = "path",
         .tool_arg_value = "a.txt",
+    },
+    .{
+        // LIVE capture 2026-09-14 (K2-Horizon 7B, llmprobe agentic): a GLM
+        // call to a PARAMETERLESS tool has no <arg_key>, the one signal the
+        // GLM route keyed on, so it fell to the Hermes path and vanished.
+        .family = "k2",
+        .name = "GLM call with a bare name and no arguments",
+        .raw = "<tool_calls>\n<tool_call>list_files\n</tool_call>\n</tool_calls>",
+        .tool_name = "list_files",
+        .tool_count = 1,
     },
 };
 
@@ -2502,5 +2548,27 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
             return error.FixpointLostArg;
         };
         try testing.expectEqualStrings(d.value, rt_val.string);
+    }
+}
+
+test "format corpus: constrained JSON marker strings are data on every protocol" {
+    const rp = @import("reasoning_protocol.zig");
+    const json = "{\"note\":\"<think>kept</think> <|channel>thought <|content_thinking|> <tool_call>literal</tool_call>\"}";
+    inline for (std.meta.tags(rp.Kind)) |kind| {
+        var proto = rp.Protocol{ .kind = kind, .initial_phase = .json_body };
+        _ = proto.setCloser(rp.BARE_THINK_CLOSER);
+        var delivery = rp.Delivery.init(&proto);
+        defer delivery.deinit(testing.allocator);
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(testing.allocator);
+        // Exercise every byte as its own transport chunk after the authoritative
+        // JSON boundary, including all fragments of marker-looking strings.
+        for (json) |byte| {
+            delivery.noteToken(1, .{ .token_index = 0, .byte_offset = 0 });
+            try delivery.feed(testing.allocator, &.{byte});
+            try testing.expectEqual(@as(usize, 0), delivery.reasoning.items.len);
+            try output.appendSlice(testing.allocator, delivery.content.items);
+        }
+        try testing.expectEqualStrings(json, output.items);
     }
 }

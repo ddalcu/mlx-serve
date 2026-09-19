@@ -17,6 +17,7 @@ const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
+const mtp = @import("mtp.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -54,6 +55,8 @@ const supported_model_types = [_][]const u8{
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
+    "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -270,8 +273,18 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
             continue;
         };
     }
-    if (set.count() == 0) {
-        set.deinit(a);
+    // An index none of whose shards exist is stale (the repo was re-sharded
+    // after this index was written); the directory is then the set.
+    var any_present = false;
+    var keys = set.keyIterator();
+    while (keys.next()) |k| {
+        _ = dir.statFile(io, k.*, .{}) catch continue;
+        any_present = true;
+        break;
+    }
+    if (!any_present) {
+        log.warn("model.safetensors.index.json names no shard in this directory; loading every *.safetensors instead\n", .{});
+        freeShardSet(&set);
         return null;
     }
     return set;
@@ -638,6 +651,7 @@ pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_pa
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!isMtpGgufBasename(entry.name)) continue;
+        if (std.mem.eql(u8, entry.name, std.fs.path.basename(model_file_path))) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file) continue;
         return std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return null;
@@ -1039,6 +1053,8 @@ pub const StubMeta = struct {
     max_position_embeddings: u32 = 0,
     quant_bits: u32 = 0,
     is_moe: bool = false,
+    /// The dir ships an MTP head (sidecar or in-checkpoint) the server can load.
+    has_mtp: bool = false,
     has_vision: bool = false,
     /// Qwen3-VL-family video input: a `video_token_id` alongside `has_vision`
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
@@ -1162,6 +1178,7 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     defer allocator.free(bytes);
 
     var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+    meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even
     // when config.json says nothing (the load path parses its mode; the stub
     // only needs existence). Issue #116.
@@ -1491,6 +1508,26 @@ test "probeModelDir accepts a GGUF dir (register-by-path / /api/pull)" {
     defer allocator.free(probe.model_type);
     try testing.expectEqualStrings("gguf", probe.model_type);
     try testing.expectEqual(@as(?u64, 8), probe.bytes_on_disk);
+}
+
+test "findDs4MtpSidecar never returns the model file itself" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-IQ2-MTP.gguf", .data = "x" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model = try std.fmt.allocPrint(allocator, "{s}/Flash-Next-IQ2-MTP.gguf", .{path_buf[0..root_len]});
+    defer allocator.free(model);
+
+    try testing.expectEqual(@as(?[]u8, null), findDs4MtpSidecar(io, allocator, model));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-MTP-Q8.gguf", .data = "x" });
+    const found = findDs4MtpSidecar(io, allocator, model) orelse return error.TestExpectedSidecar;
+    defer allocator.free(found);
+    try testing.expectEqualStrings("Flash-Next-MTP-Q8.gguf", std.fs.path.basename(found));
 }
 
 test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
@@ -1968,4 +2005,28 @@ test "probeModelDir refuses an incomplete media pack by name" {
     defer allocator.free(dir);
 
     try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, dir));
+}
+
+test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_mtp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"mtp.fc.weight":"model-00002-of-00002.safetensors"}}
+    });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+    // qwen4_exp's head is the checkpoint's own layer.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
+    });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
 }
