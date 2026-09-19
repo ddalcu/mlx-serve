@@ -37,6 +37,7 @@ test {
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("kokoro.zig");
+    _ = @import("laya.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");

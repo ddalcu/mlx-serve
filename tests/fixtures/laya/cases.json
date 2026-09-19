@@ -1,0 +1,850 @@
+{
+ "model_dir": "/Users/sbusso/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/f2b4faf51023039425946074e2cf1361d2db11d5",
+ "questions": {
+  "department": {
+   "type": "choice",
+   "instructions": "Which team should handle this?",
+   "criteria": {
+    "billing": "invoices, payments, refunds",
+    "technical": "bugs and outages",
+    "sales": "pricing"
+   }
+  },
+  "urgency": {
+   "type": "score",
+   "instructions": "How urgent is this?",
+   "criteria": [
+    "not urgent",
+    "soon",
+    "blocking"
+   ]
+  },
+  "churn_risk": {
+   "type": "noul",
+   "instructions": "Does the user threaten to cancel?"
+  }
+ },
+ "states": {
+  "en": {
+   "body": "I was charged twice for March. Please refund the duplicate."
+  },
+  "fr": {
+   "body": "J'ai été facturé deux fois en mars. Merci de rembourser le doublon."
+  },
+  "hi": {
+   "body": "मुझसे मार्च के लिए दो बार शुल्क लिया गया। कृपया डुप्लिकेट वापस करें।"
+  }
+ },
+ "cases": [
+  {
+   "lang": "en",
+   "qid": "department",
+   "state": {
+    "body": "I was charged twice for March. Please refund the duplicate."
+   },
+   "question": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "invoices, payments, refunds",
+     "technical": "bugs and outages",
+     "sales": "pricing"
+    }
+   },
+   "ids": [
+    2,
+    6241,
+    2872,
+    235292,
+    12236,
+    2970,
+    1412,
+    6589,
+    736,
+    235336,
+    1,
+    4,
+    54972,
+    235292,
+    88220,
+    235269,
+    15598,
+    235269,
+    85869,
+    4,
+    9838,
+    235292,
+    30608,
+    578,
+    142788,
+    4,
+    7108,
+    235292,
+    25063,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235285,
+    729,
+    12497,
+    11594,
+    604,
+    4482,
+    235265,
+    5651,
+    19745,
+    573,
+    38294,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    11,
+    19,
+    25
+   ],
+   "qtype": 0,
+   "expected": {
+    "type": "choice",
+    "confidence": 0.9997,
+    "action": {
+     "act_probability": 1.0
+    },
+    "choice": "billing",
+    "probabilities": {
+     "billing": 1.0,
+     "technical": 0.0,
+     "sales": 0.0
+    }
+   }
+  },
+  {
+   "lang": "en",
+   "qid": "urgency",
+   "state": {
+    "body": "I was charged twice for March. Please refund the duplicate."
+   },
+   "question": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "not urgent",
+     "soon",
+     "blocking"
+    ]
+   },
+   "ids": [
+    2,
+    7716,
+    2872,
+    235292,
+    2250,
+    34722,
+    603,
+    736,
+    235336,
+    1,
+    4,
+    2403,
+    235248,
+    235276,
+    235292,
+    780,
+    34722,
+    4,
+    2403,
+    235248,
+    235274,
+    235292,
+    4445,
+    4,
+    2403,
+    235248,
+    235284,
+    235292,
+    35578,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235285,
+    729,
+    12497,
+    11594,
+    604,
+    4482,
+    235265,
+    5651,
+    19745,
+    573,
+    38294,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    10,
+    17,
+    23
+   ],
+   "qtype": 1,
+   "expected": {
+    "type": "score",
+    "confidence": 0.6338,
+    "action": {
+     "act_probability": 1.0
+    },
+    "score": 1.8694,
+    "legend": {
+     "0": "not urgent",
+     "1": "soon",
+     "2": "blocking"
+    },
+    "probabilities": {
+     "0": 0.0094,
+     "1": 0.1117,
+     "2": 0.8788
+    }
+   }
+  },
+  {
+   "lang": "en",
+   "qid": "churn_risk",
+   "state": {
+    "body": "I was charged twice for March. Please refund the duplicate."
+   },
+   "question": {
+    "type": "noul",
+    "instructions": "Does the user threaten to cancel?"
+   },
+   "ids": [
+    2,
+    552,
+    6311,
+    2872,
+    235292,
+    11188,
+    573,
+    2425,
+    60399,
+    577,
+    12459,
+    235336,
+    1,
+    4,
+    1566,
+    235292,
+    793,
+    235269,
+    573,
+    6218,
+    1721,
+    780,
+    3385,
+    4,
+    1382,
+    235292,
+    7778,
+    235269,
+    573,
+    6218,
+    12723,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235285,
+    729,
+    12497,
+    11594,
+    604,
+    4482,
+    235265,
+    5651,
+    19745,
+    573,
+    38294,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    13,
+    23
+   ],
+   "qtype": 2,
+   "expected": {
+    "type": "noul",
+    "confidence": 0.9861,
+    "action": {
+     "act_probability": 1.0
+    },
+    "noul": 0.0139
+   }
+  },
+  {
+   "lang": "fr",
+   "qid": "department",
+   "state": {
+    "body": "J'ai été facturé deux fois en mars. Merci de rembourser le doublon."
+   },
+   "question": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "invoices, payments, refunds",
+     "technical": "bugs and outages",
+     "sales": "pricing"
+    }
+   },
+   "ids": [
+    2,
+    6241,
+    2872,
+    235292,
+    12236,
+    2970,
+    1412,
+    6589,
+    736,
+    235336,
+    1,
+    4,
+    54972,
+    235292,
+    88220,
+    235269,
+    15598,
+    235269,
+    85869,
+    4,
+    9838,
+    235292,
+    30608,
+    578,
+    142788,
+    4,
+    7108,
+    235292,
+    25063,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235338,
+    235303,
+    1515,
+    8515,
+    2252,
+    46857,
+    9080,
+    15845,
+    659,
+    16597,
+    235265,
+    51759,
+    581,
+    165422,
+    1098,
+    709,
+    178620,
+    477,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    11,
+    19,
+    25
+   ],
+   "qtype": 0,
+   "expected": {
+    "type": "choice",
+    "confidence": 1.0,
+    "action": {
+     "act_probability": 1.0
+    },
+    "choice": "billing",
+    "probabilities": {
+     "billing": 1.0,
+     "technical": 0.0,
+     "sales": 0.0
+    }
+   }
+  },
+  {
+   "lang": "fr",
+   "qid": "urgency",
+   "state": {
+    "body": "J'ai été facturé deux fois en mars. Merci de rembourser le doublon."
+   },
+   "question": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "not urgent",
+     "soon",
+     "blocking"
+    ]
+   },
+   "ids": [
+    2,
+    7716,
+    2872,
+    235292,
+    2250,
+    34722,
+    603,
+    736,
+    235336,
+    1,
+    4,
+    2403,
+    235248,
+    235276,
+    235292,
+    780,
+    34722,
+    4,
+    2403,
+    235248,
+    235274,
+    235292,
+    4445,
+    4,
+    2403,
+    235248,
+    235284,
+    235292,
+    35578,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235338,
+    235303,
+    1515,
+    8515,
+    2252,
+    46857,
+    9080,
+    15845,
+    659,
+    16597,
+    235265,
+    51759,
+    581,
+    165422,
+    1098,
+    709,
+    178620,
+    477,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    10,
+    17,
+    23
+   ],
+   "qtype": 1,
+   "expected": {
+    "type": "score",
+    "confidence": 0.5067,
+    "action": {
+     "act_probability": 1.0
+    },
+    "score": 1.7926,
+    "legend": {
+     "0": "not urgent",
+     "1": "soon",
+     "2": "blocking"
+    },
+    "probabilities": {
+     "0": 0.0145,
+     "1": 0.1783,
+     "2": 0.8071
+    }
+   }
+  },
+  {
+   "lang": "fr",
+   "qid": "churn_risk",
+   "state": {
+    "body": "J'ai été facturé deux fois en mars. Merci de rembourser le doublon."
+   },
+   "question": {
+    "type": "noul",
+    "instructions": "Does the user threaten to cancel?"
+   },
+   "ids": [
+    2,
+    552,
+    6311,
+    2872,
+    235292,
+    11188,
+    573,
+    2425,
+    60399,
+    577,
+    12459,
+    235336,
+    1,
+    4,
+    1566,
+    235292,
+    793,
+    235269,
+    573,
+    6218,
+    1721,
+    780,
+    3385,
+    4,
+    1382,
+    235292,
+    7778,
+    235269,
+    573,
+    6218,
+    12723,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    235338,
+    235303,
+    1515,
+    8515,
+    2252,
+    46857,
+    9080,
+    15845,
+    659,
+    16597,
+    235265,
+    51759,
+    581,
+    165422,
+    1098,
+    709,
+    178620,
+    477,
+    1464,
+    235270,
+    1
+   ],
+   "markers": [
+    13,
+    23
+   ],
+   "qtype": 2,
+   "expected": {
+    "type": "noul",
+    "confidence": 0.9966,
+    "action": {
+     "act_probability": 1.0
+    },
+    "noul": 0.0034
+   }
+  },
+  {
+   "lang": "hi",
+   "qid": "department",
+   "state": {
+    "body": "मुझसे मार्च के लिए दो बार शुल्क लिया गया। कृपया डुप्लिकेट वापस करें।"
+   },
+   "question": {
+    "type": "choice",
+    "instructions": "Which team should handle this?",
+    "criteria": {
+     "billing": "invoices, payments, refunds",
+     "technical": "bugs and outages",
+     "sales": "pricing"
+    }
+   },
+   "ids": [
+    2,
+    6241,
+    2872,
+    235292,
+    12236,
+    2970,
+    1412,
+    6589,
+    736,
+    235336,
+    1,
+    4,
+    54972,
+    235292,
+    88220,
+    235269,
+    15598,
+    235269,
+    85869,
+    4,
+    9838,
+    235292,
+    30608,
+    578,
+    142788,
+    4,
+    7108,
+    235292,
+    25063,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    84372,
+    238385,
+    20579,
+    149287,
+    236062,
+    6777,
+    19126,
+    51484,
+    99744,
+    144905,
+    228834,
+    158850,
+    44370,
+    235940,
+    232499,
+    27910,
+    78158,
+    57065,
+    11558,
+    43696,
+    195109,
+    235533,
+    38607,
+    235940,
+    12990,
+    1
+   ],
+   "markers": [
+    11,
+    19,
+    25
+   ],
+   "qtype": 0,
+   "expected": {
+    "type": "choice",
+    "confidence": 0.9436,
+    "action": {
+     "act_probability": 1.0
+    },
+    "choice": "billing",
+    "probabilities": {
+     "billing": 0.9891,
+     "technical": 0.0005,
+     "sales": 0.0104
+    }
+   }
+  },
+  {
+   "lang": "hi",
+   "qid": "urgency",
+   "state": {
+    "body": "मुझसे मार्च के लिए दो बार शुल्क लिया गया। कृपया डुप्लिकेट वापस करें।"
+   },
+   "question": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "not urgent",
+     "soon",
+     "blocking"
+    ]
+   },
+   "ids": [
+    2,
+    7716,
+    2872,
+    235292,
+    2250,
+    34722,
+    603,
+    736,
+    235336,
+    1,
+    4,
+    2403,
+    235248,
+    235276,
+    235292,
+    780,
+    34722,
+    4,
+    2403,
+    235248,
+    235274,
+    235292,
+    4445,
+    4,
+    2403,
+    235248,
+    235284,
+    235292,
+    35578,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    84372,
+    238385,
+    20579,
+    149287,
+    236062,
+    6777,
+    19126,
+    51484,
+    99744,
+    144905,
+    228834,
+    158850,
+    44370,
+    235940,
+    232499,
+    27910,
+    78158,
+    57065,
+    11558,
+    43696,
+    195109,
+    235533,
+    38607,
+    235940,
+    12990,
+    1
+   ],
+   "markers": [
+    10,
+    17,
+    23
+   ],
+   "qtype": 1,
+   "expected": {
+    "type": "score",
+    "confidence": 0.4782,
+    "action": {
+     "act_probability": 1.0
+    },
+    "score": 1.7728,
+    "legend": {
+     "0": "not urgent",
+     "1": "soon",
+     "2": "blocking"
+    },
+    "probabilities": {
+     "0": 0.017,
+     "1": 0.1932,
+     "2": 0.7898
+    }
+   }
+  },
+  {
+   "lang": "hi",
+   "qid": "churn_risk",
+   "state": {
+    "body": "मुझसे मार्च के लिए दो बार शुल्क लिया गया। कृपया डुप्लिकेट वापस करें।"
+   },
+   "question": {
+    "type": "noul",
+    "instructions": "Does the user threaten to cancel?"
+   },
+   "ids": [
+    2,
+    552,
+    6311,
+    2872,
+    235292,
+    11188,
+    573,
+    2425,
+    60399,
+    577,
+    12459,
+    235336,
+    1,
+    4,
+    1566,
+    235292,
+    793,
+    235269,
+    573,
+    6218,
+    1721,
+    780,
+    3385,
+    4,
+    1382,
+    235292,
+    7778,
+    235269,
+    573,
+    6218,
+    12723,
+    1,
+    19946,
+    2168,
+    1192,
+    664,
+    84372,
+    238385,
+    20579,
+    149287,
+    236062,
+    6777,
+    19126,
+    51484,
+    99744,
+    144905,
+    228834,
+    158850,
+    44370,
+    235940,
+    232499,
+    27910,
+    78158,
+    57065,
+    11558,
+    43696,
+    195109,
+    235533,
+    38607,
+    235940,
+    12990,
+    1
+   ],
+   "markers": [
+    13,
+    23
+   ],
+   "qtype": 2,
+   "expected": {
+    "type": "noul",
+    "confidence": 0.9917,
+    "action": {
+     "act_probability": 1.0
+    },
+    "noul": 0.0083
+   }
+  }
+ ]
+}

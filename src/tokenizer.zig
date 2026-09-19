@@ -84,6 +84,12 @@ pub const Tokenizer = struct {
     /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
     /// Parsed from the tokenizer.json Split regex.
     pretok_style: PretokStyle = .gpt2,
+    /// HF `Metaspace` pre-tokenizer (mmBERT / Gemma-2 class tokenizer.json):
+    /// a leading ▁ is prepended when the text does not already start with
+    /// one (`prepend_scheme` != never), and the text is split at every ▁
+    /// (kept with the following piece) before BPE (`split: true`).
+    metaspace_prepend: bool = false,
+    metaspace_split: bool = false,
     /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
@@ -377,15 +383,44 @@ pub const Tokenizer = struct {
         var normalized: std.ArrayList(u8) = .empty;
         defer normalized.deinit(allocator);
 
+        const sep = "\xe2\x96\x81";
+        if (self.metaspace_prepend and !std.mem.startsWith(u8, text, " ") and !std.mem.startsWith(u8, text, sep)) {
+            try normalized.appendSlice(allocator, sep);
+        }
         for (text) |c| {
             if (c == ' ') {
-                try normalized.appendSlice(allocator, "\xe2\x96\x81");
+                try normalized.appendSlice(allocator, sep);
             } else {
                 try normalized.append(allocator, c);
             }
         }
 
-        return self.bpeMerge(allocator, normalized.items);
+        if (!self.metaspace_split) return self.bpeMerge(allocator, normalized.items);
+
+        // Metaspace `split: true` = SplitDelimiterBehavior::MergedWithNext on
+        // ▁: every piece starts at a ▁ (a run of ▁ yields lone "▁" pieces) and
+        // BPE never merges across pieces.
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(allocator);
+        const n = normalized.items;
+        var start: usize = 0;
+        var i: usize = if (std.mem.startsWith(u8, n, sep)) sep.len else 0;
+        while (i <= n.len) {
+            const at_sep = i + sep.len <= n.len and std.mem.eql(u8, n[i .. i + sep.len], sep);
+            if (i == n.len or at_sep) {
+                if (i > start) {
+                    const piece = try self.bpeMerge(allocator, n[start..i]);
+                    defer allocator.free(piece);
+                    try ids.appendSlice(allocator, piece);
+                }
+                start = i;
+                if (i == n.len) break;
+                i += sep.len;
+            } else {
+                i += 1;
+            }
+        }
+        return ids.toOwnedSlice(allocator);
     }
 
     fn decodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32, strip_leading_space: bool) ![]u8 {
@@ -1378,6 +1413,8 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else false,
+        .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -1492,6 +1529,96 @@ fn parseMergePair(merge_val: std.json.Value) ?Tokenizer.MergePair {
 }
 
 /// Check if a pre_tokenizer JSON value contains a ByteLevel type.
+const MetaspaceOpts = struct { prepend: bool = false, split: bool = false };
+
+/// `Metaspace` pre-tokenizer options from tokenizer.json (top-level or inside
+/// a `Sequence`). Absent → both false, which is the pre-existing behaviour
+/// (Gemma 4's `Split " " MergedWithPrevious` never reaches here).
+fn metaspaceFromPreTokenizer(pt: std.json.Value) MetaspaceOpts {
+    if (pt != .object) return .{};
+    const t = pt.object.get("type") orelse return .{};
+    if (t != .string) return .{};
+    if (std.mem.eql(u8, t.string, "Sequence")) {
+        if (pt.object.get("pretokenizers")) |pts| {
+            if (pts == .array) for (pts.array.items) |sub| {
+                const o = metaspaceFromPreTokenizer(sub);
+                if (o.prepend or o.split) return o;
+            };
+        }
+        return .{};
+    }
+    if (!std.mem.eql(u8, t.string, "Metaspace")) return .{};
+    var opts = MetaspaceOpts{ .prepend = true, .split = true };
+    if (pt.object.get("prepend_scheme")) |ps| {
+        if (ps == .string and std.mem.eql(u8, ps.string, "never")) opts.prepend = false;
+    }
+    if (pt.object.get("split")) |sp| {
+        if (sp == .bool) opts.split = sp.bool;
+    }
+    return opts;
+}
+
+test "metaspaceFromPreTokenizer: Metaspace sets prepend+split, Split/ByteLevel do not" {
+    var p1 = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always","split":true}
+    , .{});
+    defer p1.deinit();
+    try testing.expectEqual(MetaspaceOpts{ .prepend = true, .split = true }, metaspaceFromPreTokenizer(p1.value));
+    var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false}
+    , .{});
+    defer p2.deinit();
+    try testing.expectEqual(MetaspaceOpts{}, metaspaceFromPreTokenizer(p2.value));
+    var p3 = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"never","split":false}
+    , .{});
+    defer p3.deinit();
+    try testing.expectEqual(MetaspaceOpts{}, metaspaceFromPreTokenizer(p3.value));
+}
+
+test "encodeSentencePiece: Metaspace prepends ▁ once and splits pieces at ▁ before BPE" {
+    const allocator = testing.allocator;
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("\xe2\x96\x81a", 1);
+    try vocab.put("\xe2\x96\x81", 2);
+    try vocab.put("\xe2\x96\x81b", 3);
+    try vocab.put("a", 4);
+    try vocab.put("b", 5);
+    try vocab.put("\xe2\x96\x81a\xe2\x96\x81b", 6);
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+    try merge_ranks.put(.{ .left = "\xe2\x96\x81", .right = "a" }, 0);
+    try merge_ranks.put(.{ .left = "\xe2\x96\x81", .right = "b" }, 1);
+    try merge_ranks.put(.{ .left = "\xe2\x96\x81a", .right = "\xe2\x96\x81b" }, 2);
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
+    defer tok.unicode_to_byte.deinit();
+
+    // Legacy path (no Metaspace): no prefix.
+    const legacy = try tok.encodeSentencePiece(allocator, "a b");
+    defer allocator.free(legacy);
+    try testing.expectEqualSlices(u32, &[_]u32{ 4, 3 }, legacy);
+
+    // Prefix without split: BPE merges straight across the ▁ boundary.
+    tok.metaspace_prepend = true;
+    const unsplit = try tok.encodeSentencePiece(allocator, "a b");
+    defer allocator.free(unsplit);
+    try testing.expectEqualSlices(u32, &[_]u32{6}, unsplit);
+
+    tok.metaspace_split = true;
+    const split = try tok.encodeSentencePiece(allocator, "a b");
+    defer allocator.free(split);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 3 }, split);
+    // A leading space already IS the prefix; a double space yields a lone ▁ (HF: 'a  b' -> ▁a ▁ ▁b).
+    const lead = try tok.encodeSentencePiece(allocator, " a  b");
+    defer allocator.free(lead);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, lead);
+}
+
 fn hasByteLevel(pt: std.json.Value) bool {
     if (pt != .object) return false;
     if (pt.object.get("type")) |t| {
