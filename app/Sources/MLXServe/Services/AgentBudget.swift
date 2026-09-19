@@ -73,7 +73,7 @@ enum AgentBudget {
     static func contextWarning(agentId: String, context: Int) -> String? {
         let floor = contextFloor(agentId: agentId)
         guard context > 0, context < floor else { return nil }
-        return "The model advertises a \(context)-token context; \(agentId) needs \(floor)+ to work well. Raise Context size in Settings > Server, or expect compaction and truncated turns."
+        return L10n.formatUngrouped("The model advertises a %lld-token context; %@ needs %lld+ to work well. Raise Context size in Settings > Server, or expect compaction and truncated turns.", context, agentId, floor)
     }
 }
 

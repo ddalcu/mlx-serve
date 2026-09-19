@@ -1491,10 +1491,10 @@ class DownloadManager: ObservableObject {
     private func presentFailureAlert(repoId: String, message: String) {
         let modelName = repoId.components(separatedBy: "/").last ?? repoId
         let alert = NSAlert()
-        alert.messageText = "Download Failed: \(modelName)"
+        alert.messageText = L10n.format("Download Failed: %@", modelName)
         alert.informativeText = message
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: L10n.text("OK"))
         // LSUIElement app — bring focus to make sure the alert is visible.
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()

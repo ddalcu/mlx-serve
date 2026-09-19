@@ -392,7 +392,7 @@ struct VideoGenView: View {
                 labelledSizeField("Height", text: $customHeightText)
             }
             if let hint = verdict.hint {
-                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
                     .font(.caption2)
                     .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
             }

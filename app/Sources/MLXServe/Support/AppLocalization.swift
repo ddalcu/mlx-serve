@@ -16,4 +16,14 @@ enum L10n {
     static func format(_ key: String, _ arguments: CVarArg...) -> String {
         String(format: text(key), locale: Locale.current, arguments: arguments)
     }
+
+    /// `format`, with numbers kept as plain digits.
+    ///
+    /// The locale-aware path groups them — 1536 px comes out "1,536 px" — while
+    /// the values these strings quote (a resolution grid, a step count) are
+    /// printed ungrouped everywhere else in the app, and a test pins the range
+    /// note at "256 … 1536". One number, one spelling.
+    static func formatUngrouped(_ key: String, _ arguments: CVarArg...) -> String {
+        String(format: text(key), arguments: arguments)
+    }
 }

@@ -417,7 +417,7 @@ struct ImageGenView: View {
                 labelledSizeField("Height", text: $customHeightText)
             }
             if let hint = verdict.hint {
-                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
                     .font(.caption2)
                     // A correction is information; a refusal is the reason
                     // Generate is disabled, so only that one is coloured.

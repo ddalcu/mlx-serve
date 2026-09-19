@@ -385,11 +385,11 @@ class ServerManager: ObservableObject {
         if case .running = status {
             status = .error("Exited unexpectedly")
             lastError = shortErr
-            presentCrashAlert(title: "mlx-serve exited unexpectedly", log: fullLog, exitCode: exitCode)
+            presentCrashAlert(title: L10n.text("mlx-serve exited unexpectedly"), log: fullLog, exitCode: exitCode)
         } else if case .starting = status {
             status = .error("Failed to start")
             lastError = shortErr
-            presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
+            presentCrashAlert(title: L10n.text("mlx-serve failed to start"), log: fullLog, exitCode: exitCode)
         } else {
             status = .stopped
         }
@@ -492,21 +492,21 @@ class ServerManager: ObservableObject {
         if Self.isMemoryFailure(log) {
             let apps = RunningAppsMemory.topApps(limit: 4)
             if apps.isEmpty {
-                info = "Not enough free memory to load the model. Quit some other apps to free memory, or turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+                info = L10n.text("Not enough free memory to load the model. Quit some other apps to free memory, or turn on Settings ▸ Skip memory preflight, or pick a smaller model.") + "\n\n"
             } else {
                 let freed = MemoryInfo.format(RunningAppsMemory.totalBytes(apps))
-                info = "Not enough free memory to load the model. Using the most right now: \(RunningAppsMemory.summaryLine(apps)) — quitting these frees about \(freed). You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+                info = L10n.format("Not enough free memory to load the model. Using the most right now: %@ — quitting these frees about %@. You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.", RunningAppsMemory.summaryLine(apps), freed) + "\n\n"
             }
         }
-        info += "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+        info += L10n.format("Exit code %lld. Full server log below — select & copy, or use the Copy Log button.", exitCode)
         alert.informativeText = info
         alert.alertStyle = .warning
 
         // Scrollable, selectable, monospaced log view as the accessory.
         alert.accessoryView = Self.makeCrashLogScrollView(log: log, width: 640, height: 280)
 
-        alert.addButton(withTitle: "Copy Log")
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: L10n.text("Copy Log"))
+        alert.addButton(withTitle: L10n.text("OK"))
 
         // LSUIElement app: surface the alert above any focused app.
         NSApp.activate(ignoringOtherApps: true)

@@ -46,21 +46,26 @@ final class TaskNotifier: NSObject, UNUserNotificationCenterDelegate {
     // MARK: - Posting
 
     func notifyCompleted(task: ScheduledTask, run: TaskRun) {
-        post(title: "✓ \(task.title)",
-             body: run.summary ?? "Task completed.",
+        post(title: L10n.format("✓ %@", task.title),
+             body: run.summary ?? L10n.text("Task completed."),
              category: Self.completedCategory, task: task, run: run)
     }
 
     func notifyFailed(task: ScheduledTask, run: TaskRun) {
-        post(title: "⚠ \(task.title) failed",
-             body: run.summary ?? "The task run failed.",
+        post(title: L10n.format("⚠ %@ failed", task.title),
+             body: run.summary ?? L10n.text("The task run failed."),
              category: Self.failedCategory, task: task, run: run)
     }
 
     func notifyNeedsApproval(task: ScheduledTask, run: TaskRun) {
-        let tool = run.pendingApproval?.toolName ?? "a tool"
-        post(title: "\(task.title) needs approval",
-             body: "Wants to run “\(tool)”. \(run.pendingApproval?.reason ?? "")",
+        let tool = run.pendingApproval?.toolName ?? L10n.text("a tool")
+        // The joining period and the reason slot live INSIDE the key: a
+        // sentence terminated outside the catalog keeps an ASCII full stop no
+        // translator can change (`想要运行“ls”. …` beside the full-width 。 the
+        // rest of the Chinese copy uses).
+        let reason = run.pendingApproval?.reason ?? ""
+        post(title: L10n.format("%@ needs approval", task.title),
+             body: L10n.format("Wants to run “%@”. %@", tool, reason),
              category: Self.approvalCategory, task: task, run: run)
     }
 

@@ -3273,8 +3273,8 @@ struct ChatDetailView: View {
 
     private func showAudioError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read audio"
-        alert.informativeText = "\(name) couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac."
+        alert.messageText = L10n.text("Couldn't read audio")
+        alert.informativeText = L10n.format("%@ couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac.", name)
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3298,8 +3298,8 @@ struct ChatDetailView: View {
 
     private func showVideoError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read video"
-        alert.informativeText = "\(name) couldn't be decoded."
+        alert.messageText = L10n.text("Couldn't read video")
+        alert.informativeText = L10n.format("%@ couldn't be decoded.", name)
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3355,8 +3355,8 @@ struct ChatDetailView: View {
 
     private func showMicPermissionError() {
         let alert = NSAlert()
-        alert.messageText = "Microphone access needed"
-        alert.informativeText = "Enable microphone access for MLX Core in System Settings → Privacy & Security → Microphone, then try again."
+        alert.messageText = L10n.text("Microphone access needed")
+        alert.informativeText = L10n.text("Enable microphone access for MLX Core in System Settings → Privacy & Security → Microphone, then try again.")
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3374,8 +3374,8 @@ struct ChatDetailView: View {
 
     private func showPDFError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read PDF"
-        alert.informativeText = "\(name) is empty, encrypted, or contains only scanned images (no extractable text)."
+        alert.messageText = L10n.text("Couldn't read PDF")
+        alert.informativeText = L10n.format("%@ is empty, encrypted, or contains only scanned images (no extractable text).", name)
         alert.alertStyle = .warning
         alert.runModal()
     }

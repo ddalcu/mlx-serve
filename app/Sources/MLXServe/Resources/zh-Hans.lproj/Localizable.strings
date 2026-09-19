@@ -1459,6 +1459,7 @@
 "Waiting for approval" = "等待批准";
 "Wake phrase" = "唤醒词";
 "Wants to run “%@”" = "想要运行“%@”";
+"Wants to run “%@”. %@" = "想要运行“%@”。%@";
 "Warn" = "警告";
 "Web" = "网页";
 "Web Search" = "网页搜索";
