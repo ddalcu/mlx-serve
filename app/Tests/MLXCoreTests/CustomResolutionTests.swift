@@ -59,6 +59,27 @@ final class CustomResolutionTests: XCTestCase {
         XCTAssertEqual(krea.snap(512), 512)
     }
 
+    /// Video is the other case: the server REFUSES an off-grid canvas rather
+    /// than rewriting it, so the pane snaps before sending and the direction is
+    /// its own to choose — and nearest is the only defensible one. 460 on a
+    /// 64-grid is 12 from 448 and 52 from 512; rounding up sent 512.
+    func testVideoGridsSnapToNearestBecauseTheServerOnlyChecks() {
+        let ltx32 = VideoModelPreset.ltx25Q4.resolutionGrid(twoStage: false)
+        XCTAssertEqual(ltx32.snap(460), 448)
+        XCTAssertEqual(ltx32.snap(470), 480)
+        XCTAssertEqual(ltx32.snap(464), 480, "a tie rounds up")
+        let ltx64 = VideoModelPreset.ltx25Q4.resolutionGrid(twoStage: true)
+        XCTAssertEqual(ltx64.snap(460), 448)
+        XCTAssertEqual(ltx64.snap(500), 512)
+        XCTAssertEqual(ltx64.snap(512), 512)
+        let h3 = VideoModelPreset.minimaxH3.resolutionGrid(twoStage: false)
+        XCTAssertEqual(h3.snap(460), 448)
+        // Nearest never leaves the range check's answer: an in-range value
+        // snaps to a grid point that is itself in range.
+        XCTAssertEqual(ltx64.snap(ltx64.minDim + 1), ltx64.minDim)
+        XCTAssertEqual(ltx64.snap(ltx64.maxDim - 1), ltx64.maxDim)
+    }
+
     // MARK: - resolve(): ok / corrected / invalid
 
     func testOnGridResolutionsPassThroughUntouched() {

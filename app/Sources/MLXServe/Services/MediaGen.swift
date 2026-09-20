@@ -36,8 +36,23 @@ struct ResolutionOption: Hashable, Identifiable {
     let width: Int
     let height: Int
     let label: String   // e.g. "1024 × 1024 (square)"
+    /// How the shape is NAMED, not computed: 704 x 448 reduces to 11:7 and
+    /// everybody calls it 14:9. Optional because only the video pane groups
+    /// and re-labels its rows; elsewhere `label` is the whole answer.
+    var ratio: String? = nil
+    /// What the row costs, in the words the label already used ("fastest",
+    /// "recommended", "2.9x slower").
+    var note: String? = nil
 
     var id: String { "\(width)x\(height)" }
+
+    /// Landscape, square or portrait. The video pane's Presets menu groups by
+    /// it, so the orientation never has to be repeated in every row's text.
+    enum Orientation { case landscape, square, portrait }
+    var orientation: Orientation {
+        if width == height { return .square }
+        return width > height ? .landscape : .portrait
+    }
 
     /// Sentinel: send NO `size`, so the server keeps the reference image's own
     /// resolution (the edit pipeline's `max_size = source size` default). An
@@ -66,17 +81,24 @@ struct ResolutionOption: Hashable, Identifiable {
 /// Documented duplication in the `isMediaModelType` / `modalityFromType`
 /// mould; `CustomResolutionTests` is what keeps the two from drifting.
 struct ResolutionGrid: Hashable {
+    /// Image backends REWRITE an off-grid size up, so the pane rounds up too
+    /// or its hint names a size the server does not generate. Video backends
+    /// REFUSE an off-grid canvas, so the pane's snap is the one that counts,
+    /// and nearest is the one a user can predict.
+    enum Rounding: Hashable { case up, nearest }
+
     /// Every dimension must be a multiple of this.
     let alignment: Int
     let minDim: Int
     let maxDim: Int
+    var rounding: Rounding = .up
 
-    /// Round onto the grid the way the server does — UP, never to nearest
-    /// (`((v + 31) / 32) * 32`). Rounding the friendly way would print a hint
-    /// naming a size the server does not generate.
     func snap(_ v: Int) -> Int {
         guard v > 0 else { return minDim }
-        return ((v + alignment - 1) / alignment) * alignment
+        switch rounding {
+        case .up:      return ((v + alignment - 1) / alignment) * alignment
+        case .nearest: return ((v + alignment / 2) / alignment) * alignment
+        }
     }
 
     /// Classify a typed size. In-range-but-off-grid is a CORRECTION (the model
@@ -645,10 +667,13 @@ struct VideoModelPreset: Identifiable, Hashable {
         // H3 has no two-stage pipeline at all, and its own fastest canvases
         // (544, 672, 960) are /32 and not /64 — applying LTX's two-stage grid
         // here would refuse the model's own shipped rows.
+        // `.nearest`: the video handlers refuse an off-grid canvas, they do
+        // not rewrite it, so this snap is the one that counts.
         case .minimaxH3:
-            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: maxDim)
+            return ResolutionGrid(alignment: 32, minDim: 256, maxDim: maxDim, rounding: .nearest)
         case .ltx:
-            return ResolutionGrid(alignment: twoStage ? 64 : 32, minDim: 256, maxDim: maxDim)
+            return ResolutionGrid(alignment: twoStage ? 64 : 32, minDim: 256, maxDim: maxDim,
+                                  rounding: .nearest)
         }
     }
 
@@ -694,16 +719,20 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// two landscape/portrait pairs keep their place in the list. Pinned by
     /// `testEveryLtxResolutionSurvivesTheTwoStagePipelines`.
     private static let ltxResolutions: [ResolutionOption] = [
-        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9) — fastest"),
-        .init(width: 448,  height: 704, label: "448 × 704 (portrait 9:14)"),
-        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2)"),
-        .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
-        .init(width: 1024, height: 576, label: "1024 × 576 (landscape 16:9)"),
-        .init(width: 576,  height: 1024, label: "576 × 1024 (portrait 9:16)"),
-        .init(width: 1600, height: 896, label: "1600 × 896 (landscape 16:9) — recommended"),
-        .init(width: 896,  height: 1600, label: "896 × 1600 (portrait 9:16)"),
-        .init(width: 1920, height: 1088, label: "1920 × 1088 (landscape 16:9) — LTX's own canvas, slowest"),
-        .init(width: 1088, height: 1920, label: "1088 × 1920 (portrait 9:16) — slowest"),
+        .init(width: 704,  height: 448, label: "704 × 448 (landscape 14:9) — fastest",
+              ratio: "14:9", note: "fastest"),
+        .init(width: 448,  height: 704, label: "448 × 704 (portrait 9:14)", ratio: "9:14"),
+        .init(width: 768,  height: 512, label: "768 × 512 (landscape 3:2)", ratio: "3:2"),
+        .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)", ratio: "2:3"),
+        .init(width: 1024, height: 576, label: "1024 × 576 (landscape 16:9)", ratio: "16:9"),
+        .init(width: 576,  height: 1024, label: "576 × 1024 (portrait 9:16)", ratio: "9:16"),
+        .init(width: 1600, height: 896, label: "1600 × 896 (landscape 16:9) — recommended",
+              ratio: "16:9", note: "recommended"),
+        .init(width: 896,  height: 1600, label: "896 × 1600 (portrait 9:16)", ratio: "9:16"),
+        .init(width: 1920, height: 1088, label: "1920 × 1088 (landscape 16:9) — LTX's own canvas, slowest",
+              ratio: "16:9", note: "LTX's own canvas, slowest"),
+        .init(width: 1088, height: 1920, label: "1088 × 1920 (portrait 9:16) — slowest",
+              ratio: "9:16", note: "slowest"),
     ]
 
     /// Ceiling on ONE generation's raw RGB volume. The server base64s the whole
@@ -720,12 +749,27 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// one response can carry. Always returns at least the first rung, so the
     /// picker can never render blank.
     func frameOptions(width: Int, height: Int, chainWindows: Int = 1) -> [Int] {
-        let perFrame = max(1, width * height * 3)
-        let budget = Self.maxFramePayloadBytes / perFrame
-        // Chained windows deliver `w*n - (w-1)` frames in ONE response (#283).
-        let w = max(1, chainWindows)
-        let fits = frameOptions.filter { $0 * w - (w - 1) <= budget }
+        let fits = frameOptions.filter {
+            framePayloadFits(width: width, height: height, numFrames: $0, chainWindows: chainWindows)
+        }
         return fits.isEmpty ? Array(frameOptions.prefix(1)) : fits
+    }
+
+    /// Frames one request DELIVERS: chained windows join end to end and ride
+    /// back in a single response (#283).
+    static func deliveredFrames(perWindow: Int, chainWindows: Int) -> Int {
+        let w = max(1, chainWindows)
+        return perWindow * w - (w - 1)
+    }
+
+    /// Does one request's raw RGB fit the transport cap? ONE formula, read by
+    /// the length ladder AND by the Generate gate: the ladder alone is a gate
+    /// that can be walked around, because raising the window count after
+    /// choosing a length shortens the ladder under a value already set.
+    func framePayloadFits(width: Int, height: Int, numFrames: Int, chainWindows: Int) -> Bool {
+        let perFrame = max(1, width * height * 3)
+        return Self.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)
+            <= Self.maxFramePayloadBytes / perFrame
     }
 
     /// Ceiling for the AUTO-picked default canvas. This is a TIME budget, not a
@@ -747,8 +791,10 @@ struct VideoModelPreset: Identifiable, Hashable {
         guard let smallest = resolutions.map({ $0.width * $0.height }).min() else { return nil }
         let halfArea = (width / 2) * (height / 2)
         guard halfArea < smallest else { return nil }
-        return "Quality and Super Quality denoise at half this size (\(width / 2) × \(height / 2)) and upscale — "
-             + "below 1600 × 896 they can look softer than the one-stage tiers, not sharper."
+        // About the RENDER, not the tiers: the pane shows this whenever the
+        // request runs two stages, which a clip forces on a one-stage tier too.
+        return "Two stages denoise at half this size (\(width / 2) × \(height / 2)) and upscale — "
+             + "below 1600 × 896 that can look softer than one stage, not sharper."
     }
 
     /// Default canvas for THIS Mac. A single static default has to be safe on
@@ -924,14 +970,22 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// energy at matched display size). It is what makes the top of the 17k+5
     /// ladder — 362 frames, 15 s in ONE generation — practical at all.
     private static let h3Resolutions: [ResolutionOption] = [
-        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — most detail, 2.9x slower"),
-        .init(width: 960,  height: 544,  label: "960 × 544 (16:9 widescreen) — fastest, best for long clips"),
-        .init(width: 768,  height: 768,  label: "768 × 768 (square) — 1.2x slower"),
-        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 1.8x slower"),
-        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 1.8x slower"),
-        .init(width: 544,  height: 960,  label: "544 × 960 (9:16 portrait) — fastest, best for long clips"),
-        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 2.9x slower"),
-        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 2.9x slower"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — most detail, 2.9x slower",
+              ratio: "16:9 widescreen", note: "most detail, 2.9x slower"),
+        .init(width: 960,  height: 544,  label: "960 × 544 (16:9 widescreen) — fastest, best for long clips",
+              ratio: "16:9 widescreen", note: "fastest, best for long clips"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square) — 1.2x slower",
+              ratio: "1:1", note: "1.2x slower"),
+        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 1.8x slower",
+              ratio: "4:3", note: "1.8x slower"),
+        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 1.8x slower",
+              ratio: "3:4", note: "1.8x slower"),
+        .init(width: 544,  height: 960,  label: "544 × 960 (9:16 portrait) — fastest, best for long clips",
+              ratio: "9:16", note: "fastest, best for long clips"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 2.9x slower",
+              ratio: "9:16", note: "2.9x slower"),
+        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 2.9x slower",
+              ratio: "21:9 cinematic", note: "2.9x slower"),
     ]
 
     /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
@@ -2051,7 +2105,7 @@ struct VideoRefPayloads {
 }
 
 /// `ref_image_size` on the wire.
-enum RefImageSizing: String, CaseIterable, Hashable {
+enum RefImageSizing: String, CaseIterable, Hashable, Codable {
     case match, max
 
     var label: String {

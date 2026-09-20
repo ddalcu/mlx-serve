@@ -300,14 +300,14 @@ N/A
     static func placeholder(for format: VideoPromptFormat) -> String {
         switch format {
         case .ltx:
-            return "Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Examples above for a starting point."
+            return "Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Templates above for a starting point."
         // Kept to a few lines: this sits INSIDE the 110pt prompt editor, so a
         // section-per-line list is clipped exactly where the last labels are.
-        // The labels are named here; the Examples menu carries the full shape.
+        // The labels are named here; the Templates menu carries the full shape.
         case .h3Base:
-            return "MiniMax-H3 expects three labelled fields — integrated_multimodal_description: (the shot, its style, action and camera movement), overall_soundscape: (ambience and physical sound), non_diegetic_music: (score only the audience hears, or N/A). Click Examples above for the exact shape."
+            return "MiniMax-H3 expects three labelled fields — integrated_multimodal_description: (the shot, its style, action and camera movement), overall_soundscape: (ambience and physical sound), non_diegetic_music: (score only the audience hears, or N/A). Click Templates above for the exact shape."
         case .h3Reference:
-            return "MiniMax-H3 REF2VA expects six labelled sections in order — subject_definitions:, summary:, retention_analysis: (what to DO with each reference), detailed_description:, overall_soundscape:, non_diegetic_music:. Refer to attachments as <Picture 1>, <Video 1>, <Audio 1>. Click Examples above."
+            return "MiniMax-H3 REF2VA expects six labelled sections in order — subject_definitions:, summary:, retention_analysis: (what to DO with each reference), detailed_description:, overall_soundscape:, non_diegetic_music:. Refer to attachments as <Picture 1>, <Video 1>, <Audio 1>. Click Templates above."
         }
     }
 
@@ -324,22 +324,33 @@ N/A
         switch format {
         case .ltx:
             guard words < 15 else { return nil }
-            return "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above."
+            return "LTX-Video performs best with detailed 4 to 8 sentence prompts. Consider starting from an example template."
         case .h3Base:
             if let first = baseSections.first, !prompt.contains(first) {
-                return "MiniMax-H3 was trained on labelled prompts. Start with “\(first)”, then overall_soundscape: and non_diegetic_music:. Try Examples or Prompt tips above."
+                return "MiniMax-H3 was trained on labelled prompts. Start with “\(first)”, then “overall_soundscape:” and “non_diegetic_music:”. Consider starting from an example template."
             }
             guard words < 25 else { return nil }
-            return "MiniMax-H3 was trained on detailed shot descriptions — style, action, camera movement and sound. Try Examples above."
+            return "MiniMax-H3 was trained on detailed shot descriptions - style, action, camera movement and sound. Consider starting from an example template."
         case .h3Reference:
             if let first = referenceSections.first, !prompt.contains(first) {
-                return "MiniMax-H3 REF2VA was trained on six labelled sections starting with “\(first)”. retention_analysis: is what states each reference's role. Try Examples or Prompt tips above."
+                return "MiniMax-H3 REF2VA was trained on six labelled sections starting with “\(first)”. “retention_analysis:” is what states each reference's role. Consider starting from an example template."
             }
             if !prompt.contains("retention_analysis:") {
-                return "Add retention_analysis: — it is the only place the model is told what to do with each reference."
+                return "Add “retention_analysis:” - it is the only place the model is told what to do with each reference."
             }
             guard words < 25 else { return nil }
-            return "MiniMax-H3 REF2VA was trained on detailed shot descriptions. Try Examples above."
+            return "MiniMax-H3 REF2VA was trained on detailed shot descriptions. Consider starting from an example template."
+        }
+    }
+
+    /// The Templates menu's section heading. Named after the format, because
+    /// the sets are not interchangeable: LTX takes prose, H3 takes a labelled
+    /// document, and the reference format takes six sections rather than three.
+    static func templatesTitle(for format: VideoPromptFormat) -> String {
+        switch format {
+        case .ltx:         return "Example templates for LTX"
+        case .h3Base:      return "Example templates for MiniMax H3"
+        case .h3Reference: return "Example templates for MiniMax H3 with references"
         }
     }
 

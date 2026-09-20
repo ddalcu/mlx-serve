@@ -204,6 +204,40 @@ final class MediaDropTests: XCTestCase {
         XCTAssertEqual(routed.audios, [u("c.wav")])
     }
 
+    /// The reported case, as the two halves that produced it. A mixed drop
+    /// hands over EVERYTHING and lets the router spend the caps; truncating to
+    /// the room first threw away the files that would have been kept.
+    func testAMixedDropDeliversEveryFileAndLetsTheRouterSpendTheRoom() {
+        let dropped: [URL?] = (1...5).map { u("p\($0).png") } + [u("v1.mp4"), u("p6.png")]
+        // Three slots left, and the first three files are already attached.
+        XCTAssertEqual(MediaDrop.deliverable(dropped, kind: nil, limit: 3).count, dropped.count,
+                       "a mixed drop is not pre-truncated")
+        let attached = (1...3).map { u("p\($0).png") }
+        let routed = H3RefDrop.route(MediaDrop.deliverable(dropped, kind: nil, limit: 3),
+                                     images: attached, videos: [], audios: [])
+        XCTAssertEqual(routed.images, attached + [u("p4.png"), u("p5.png"), u("p6.png")],
+                       "the files not already attached are the ones that land")
+        XCTAssertEqual(routed.videos, [u("v1.mp4")])
+        // A TYPED slot still spends its room here: nothing downstream knows it.
+        XCTAssertEqual(MediaDrop.deliverable(dropped, kind: .image, limit: 2).count, 2)
+    }
+
+    /// A file already attached is not attached again. It would spend one of the
+    /// twelve on nothing, and it BROKE the tile grid outright: the tiles are
+    /// labelled by position, and a list whose identity is the URL renders one
+    /// tile per unique URL — so eight drops of five files drew five tiles
+    /// carrying numbers from the wrong positions. The picker deduped already;
+    /// only the drop path did not.
+    func testAFileAlreadyAttachedIsNotAttachedTwice() {
+        let routed = H3RefDrop.route([u("a.png"), u("a.png"), u("b.mov")],
+                                     images: [u("a.png")], videos: [], audios: [])
+        XCTAssertEqual(routed.images, [u("a.png")], "no second copy of an attached image")
+        XCTAssertEqual(routed.videos, [u("b.mov")], "a different file still lands")
+        // The same file twice inside ONE drop is the same question.
+        let fresh = H3RefDrop.route([u("c.png"), u("c.png")], images: [], videos: [], audios: [])
+        XCTAssertEqual(fresh.images, [u("c.png")])
+    }
+
     /// Per-type cap and combined cap both bind, and a file no pane wants is
     /// skipped without spending either.
     func testRoutingRespectsThePerTypeCapTheCombinedCapAndSkipsUnknownFiles() {

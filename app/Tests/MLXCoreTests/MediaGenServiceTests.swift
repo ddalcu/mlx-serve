@@ -366,9 +366,14 @@ final class MediaGenServiceTests: XCTestCase {
     }
 
     func testHintAndTipsLinkAreSelectedPerBackend() {
-        // LTX keeps its own guidance verbatim, including the 15-word floor.
-        XCTAssertEqual(H3PromptExamples.hint(for: .ltx, prompt: "a cat"),
-                       "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above.")
+        // LTX's hint is a 15-word floor. The BAR, not the wording: pinning the
+        // sentence verbatim broke this test on every copy edit.
+        let short = H3PromptExamples.hint(for: .ltx, prompt: "a cat")
+        XCTAssertNotNil(short)
+        XCTAssertTrue(short!.contains("LTX"), "names the engine the advice is for")
+        let fourteen = Array(repeating: "word", count: 14).joined(separator: " ")
+        XCTAssertNotNil(H3PromptExamples.hint(for: .ltx, prompt: fourteen))
+        XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: fourteen + " more"), "fifteen words is enough")
         XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: H3PromptExamples.ltx[0].body))
         XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: ""), "an empty field shows the placeholder, not a warning")
 

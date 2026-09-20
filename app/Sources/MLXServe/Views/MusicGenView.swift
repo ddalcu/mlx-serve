@@ -157,7 +157,10 @@ struct MusicGenView: View {
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
                 }
+                // Full-width, leading-aligned frame OUTSIDE the padding — see
+                // AudioGenView.
                 .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minWidth: 340, idealWidth: 380)
 
@@ -592,10 +595,13 @@ struct MusicGenView: View {
     /// the only thing about it the pane still has to say once it is picked.
     private var keepResidentToggle: AnyView {
         AnyView(
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
+            Toggle(isOn: $keepResident) {
+                Text("Keep model loaded after generating")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
                 .font(.caption)
                 .controlSize(.small)
-                .fixedSize()
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
     }
@@ -672,27 +678,9 @@ struct MusicGenView: View {
         return String(format: "%d:%02d", s / 60, s % 60)
     }
 
-    /// One header in both states: same words, same chevron on the same side,
-    /// and the whole row is the control.
-    private var advancedHeader: some View {
-        Button {
-            withAnimation { showAdvanced.toggle() }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: showAdvanced ? "chevron.down" : "chevron.right")
-                Text("Advanced options")
-                Spacer()
-            }
-            .font(.subheadline.weight(.semibold))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-    }
-
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            advancedHeader
+            FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced { advancedBody }
         }
     }
@@ -1027,7 +1015,10 @@ struct MusicGenView: View {
                     }
                 }
             }
-            Section("Example templates") {
+            // Named after the engine, because the two sets are not
+            // interchangeable: ACE-Step reads a one-line genre description and
+            // Music 3 a structured caption.
+            Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button(p.title) { prompt = p.body }
                 }

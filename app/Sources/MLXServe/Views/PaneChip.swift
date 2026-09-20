@@ -28,6 +28,9 @@ struct PaneChip: ViewModifier {
     static let side: CGFloat = 24
 
     var square = false
+    /// An exact height, for a chip that has to line up with a bezeled field
+    /// beside it rather than hug its own text.
+    var height: CGFloat? = nil
 
     func body(content: Content) -> some View {
         if square {
@@ -35,6 +38,13 @@ struct PaneChip: ViewModifier {
                 .font(.caption)
                 .foregroundStyle(.primary)
                 .frame(width: Self.side, height: Self.side)
+                .background(chipShape)
+        } else if let height {
+            content
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 9)
+                .frame(height: height)
                 .background(chipShape)
         } else {
             content

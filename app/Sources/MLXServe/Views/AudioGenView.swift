@@ -239,7 +239,11 @@ struct VoiceGenView: View {
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
                 }
+                // Full-width, leading-aligned frame OUTSIDE the padding: a
+                // child that will not compress otherwise makes the stack
+                // oversized, and the ScrollView centres the overflow.
                 .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minWidth: 340, idealWidth: 380)
 
@@ -377,10 +381,13 @@ struct VoiceGenView: View {
     /// the only thing about it the pane still has to say once it is picked.
     private var keepResidentToggle: AnyView {
         AnyView(
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
+            Toggle(isOn: $keepResident) {
+                Text("Keep model loaded after generating")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
                 .font(.caption)
                 .controlSize(.small)
-                .fixedSize()
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
     }
@@ -492,30 +499,9 @@ struct VoiceGenView: View {
         }
     }
 
-    /// One header in both states: same words, same chevron on the same side,
-    /// and the whole row is the control — a disclosure you can only close by
-    /// finding a 12-point glyph is a disclosure that stays open.
-    private var advancedHeader: some View {
-        Button {
-            withAnimation { showAdvanced.toggle() }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: showAdvanced ? "chevron.down" : "chevron.right")
-                Text("Advanced options")
-                Spacer()
-            }
-            // A section heading like the others: a disclosure is still a
-            // section, and it sits in their column.
-            .font(.subheadline.weight(.semibold))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-    }
-
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            advancedHeader
+            FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Speed (\(String(format: "%.2fx", speed)))").font(.caption)
