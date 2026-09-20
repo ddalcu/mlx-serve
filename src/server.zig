@@ -8220,8 +8220,12 @@ fn handleChatCompletions(
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
                         appendCachedImage(allocator, stream.io, lm, media.images(img_slot), url_val.string) catch |err| {
-                            try sendGenerationError(allocator, stream, err, .openai);
-                            return;
+                            if (err == error.InvalidImage) {
+                                image_decode_failed = true;
+                            } else {
+                                try sendGenerationError(allocator, stream, err, .openai);
+                                return;
+                            }
                         };
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
                         if (!decode_this_message) continue;
@@ -14613,7 +14617,7 @@ const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL 
 fn appendCachedImage(allocator: std.mem.Allocator, io: std.Io, lm: *LoadedModel, list: *std.ArrayList(chat_mod.ImageData), url: []const u8) !void {
     const vp = visionPreprocFromConfig(lm.config.?);
     if (vp.mode != .qwen) {
-        appendImageUrlContent(allocator, list, url, vp);
+        if (!appendImageUrlContent(allocator, list, url, vp)) return error.InvalidImage;
         return;
     }
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -15478,8 +15482,12 @@ fn handleAnthropicMessages(
                             if (data_url) |du| {
                                 defer allocator.free(du);
                                 appendCachedImage(allocator, stream.io, lm, media.images(img_slot), du) catch |err| {
-                                    try sendGenerationError(allocator, stream, err, .anthropic);
-                                    return;
+                                    if (err == error.InvalidImage) {
+                                        image_decode_failed = true;
+                                    } else {
+                                        try sendGenerationError(allocator, stream, err, .anthropic);
+                                        return;
+                                    }
                                 };
                             }
                         }
