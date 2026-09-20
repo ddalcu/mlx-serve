@@ -418,20 +418,29 @@ struct VoiceGenView: View {
 
             if let url = refAudioURL {
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
-                        Text(url.lastPathComponent)
-                            .font(.caption).lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        if clipPlayer.playingPath == url.path {
-                            Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
-                                .buttonStyle(.borderless).help("Stop preview")
-                        } else {
-                            Button { playReference(url) } label: { Image(systemName: "play.circle") }
-                                .buttonStyle(.borderless).help("Preview reference")
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
+                            Text(url.lastPathComponent)
+                                .font(.caption).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if clipPlayer.playingPath == url.path {
+                                Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
+                                    .buttonStyle(.borderless).help("Stop preview")
+                            } else {
+                                Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                                    .buttonStyle(.borderless).help("Preview reference")
+                            }
+                            Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                         }
-                        Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
-                            .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
+                        // In the well with the clip it describes, not under it.
+                        Text("Transcript of reference (optional)").font(.caption)
+                            .padding(.top, 6)
+                        TextField("", text: $refText,
+                                  prompt: Text("Optional — the reference audio alone clones the voice"))
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
                     }
                 }
             } else if recorder.isRecording {
@@ -470,17 +479,7 @@ struct VoiceGenView: View {
                         action: startRecording))
             }
 
-            if refAudioURL != nil {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Transcript of reference (optional)").font(.caption)
-                    TextField("", text: $refText,
-                              prompt: Text("Optional — the reference audio alone clones the voice"))
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-                }
-                // Its own step under the clip, not a caption of the well.
-                .padding(.top, 6)
-            } else {
+            if refAudioURL == nil {
                 // The well already says how to add a clip and how long it wants
                 // one; what is left to say is what happens without it.
                 Text("Without a reference, the model's default voice is used.")
