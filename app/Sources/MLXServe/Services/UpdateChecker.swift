@@ -198,8 +198,8 @@ final class UpdateChecker: ObservableObject {
         // Never under the xctest host — unit tests must not touch the network.
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         maybeAutoCheck()
-        let t = Timer(timeInterval: 6 * 3600, repeats: true) { _ in
-            Task { @MainActor [weak self] in self?.maybeAutoCheck() }
+        let t = Timer(timeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.maybeAutoCheck() }
         }
         t.tolerance = 600
         RunLoop.main.add(t, forMode: .common)

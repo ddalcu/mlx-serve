@@ -868,6 +868,12 @@ fn exePath(buf: []u8) ?[:0]const u8 {
             if (std.c._NSGetExecutablePath(buf.ptr, &n) != 0) return null;
             return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
         },
+        .linux => {
+            const got = std.c.readlink("/proc/self/exe", buf.ptr, buf.len - 1);
+            if (got <= 0 or got >= buf.len - 1) return null;
+            buf[@intCast(got)] = 0;
+            return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
+        },
         else => return null,
     }
 }
@@ -883,19 +889,20 @@ fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
 }
 
 fn mlxDylibPath(buf: []u8) ?[]const u8 {
+    const lib_name = if (builtin.os.tag.isDarwin()) "libmlx.dylib" else "libmlx.so";
     if (builtin.os.tag.isDarwin()) {
         const n = std.c._dyld_image_count();
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const name = std.mem.span(std.c._dyld_get_image_name(i));
-            if (std.mem.endsWith(u8, name, "libmlx.dylib")) return name;
+            if (std.mem.endsWith(u8, name, lib_name)) return name;
         }
     }
     var exe_buf: [4096]u8 = undefined;
     const exe = exePath(&exe_buf) orelse return null;
     const dir = std.fs.path.dirname(exe) orelse return null;
-    for ([_][]const u8{ "../../lib/mlx/lib/libmlx.dylib", "../../../lib/mlx/lib/libmlx.dylib" }) |rel| {
-        const p = std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, rel }) catch continue;
+    for ([_][]const u8{ "../../lib/mlx/lib/", "../../../lib/mlx/lib/" }) |rel| {
+        const p = std.fmt.bufPrint(buf, "{s}/{s}{s}", .{ dir, rel, lib_name }) catch continue;
         if (fileExists(p)) return p;
     }
     return null;
@@ -927,9 +934,10 @@ pub fn fileFingerprint(path: []const u8) ?u64 {
     const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return null;
-    const size: u64 = @intCast(@max(st.size, 0));
+    // Size via lseek-to-end: std.c.Stat/fstat are Darwin-only in 0.17, and
+    // this fingerprint runs on the Linux build too (libmlx.so gets mixed in).
+    const size: u64 = @intCast(@max(std.c.lseek(fd, 0, std.c.SEEK.END), 0));
+    if (size == 0) return null;
     var h = std.hash.Fnv1a_64.init();
     h.update(std.mem.asBytes(&size));
     const win: u64 = 65536;

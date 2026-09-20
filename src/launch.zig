@@ -87,8 +87,7 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\      "compat": {{
         \\        "supportsDeveloperRole": false,
         \\        "supportsReasoningEffort": true,
-        \\        "maxTokensField": "max_tokens",
-        \\        "thinkingFormat": "qwen"
+        \\        "maxTokensField": "max_tokens"
         \\      }},
         \\      "models": [
     , .{base_url});
@@ -96,7 +95,8 @@ pub fn piModelsJson(allocator: std.mem.Allocator, base_url: []const u8, entries:
         try out.print(allocator,
             \\{s}
             \\        {{"id": "{s}", "name": "{s} (mlx-serve)", "input": [{s}],
-            \\         "contextWindow": {d}, "maxTokens": {d}, "reasoning": true}}
+            \\         "contextWindow": {d}, "maxTokens": {d}, "reasoning": true,
+            \\         "thinkingLevelMap": {{"off": "none"}}}}
         , .{
             if (i == 0) "" else ",",
             e.id,
@@ -989,6 +989,20 @@ test "pi models.json and opencode config parse as JSON and stay single-quote-fre
         // opencode's config rides single-quoted inside the launch script.
         try t.expect(std.mem.indexOf(u8, json, "'") == null);
     }
+}
+
+test "pi models.json sends the thinking level as reasoning_effort, off as none" {
+    // thinkingFormat "qwen" makes pi send only enable_thinking: low/medium never
+    // reached the server and every turn thought unbounded.
+    const entries = [_]Entry{.{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true }};
+    const json = try piModelsJson(t.allocator, "http://127.0.0.1:11234", &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const mlx_p = parsed.value.object.get("providers").?.object.get("mlx").?.object;
+    try t.expect(mlx_p.get("compat").?.object.get("thinkingFormat") == null);
+    const m = mlx_p.get("models").?.array.items[0].object;
+    try t.expectEqualStrings("none", m.get("thinkingLevelMap").?.object.get("off").?.string);
 }
 
 test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {

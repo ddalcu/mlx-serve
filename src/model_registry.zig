@@ -29,8 +29,8 @@ const token_mask_mod = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
-const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
-const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
+const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
@@ -689,6 +689,9 @@ pub const ModelRegistry = struct {
     /// specifies the literal "mlx-serve"). Borrowed from the corresponding
     /// entry's `id`; valid for the registry's lifetime.
     default_id: []const u8,
+    /// The default came from a headless load, not `--model` or an explicit
+    /// `setDefault`, so it follows the latest chat-capable load.
+    default_promoted: bool = false,
 
     /// Cap on `.ready` entries. ensureLoaded evicts before exceeding.
     max_resident_models: u32,
@@ -894,6 +897,7 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
+        self.default_promoted = false;
     }
 
     /// Look up an entry by its on-disk path (trailing slashes ignored).
@@ -1208,12 +1212,16 @@ pub const ModelRegistry = struct {
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
         // user loads a chat model via /v1/load-model — the live gen-first→
-        // chat-later hole (2026-07-05). The FIRST chat-capable model to finish
-        // loading becomes the default; media engines and embedding encoders
-        // never qualify, and an existing default is never stolen.
-        if (self.default_id.len == 0 and chatCapable(entry)) {
+        // chat-later hole (2026-07-05). The LATEST chat-capable load is the
+        // default, so a model-less request never swaps back to an older model;
+        // media engines and embedding encoders never qualify, and an explicit
+        // default (`--model`, `setDefault`) is never stolen.
+        if ((self.default_id.len == 0 or self.default_promoted) and chatCapable(entry) and
+            !std.mem.eql(u8, self.default_id, entry.id))
+        {
             self.default_id = entry.id;
-            log.info("[registry] default model -> {s} (first chat-capable load on a headless server)\n", .{entry.id});
+            self.default_promoted = true;
+            log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
         self.state_cond.broadcast(self.io);
     }
@@ -2096,11 +2104,18 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     try testing.expectEqual(chat, via_alias);
     reg.release(via_alias);
 
-    // A LATER chat load never steals an existing default.
+    // A promoted default follows the latest chat load...
     const chat2 = try reg.registerStub("qwen", "/m/qwen", 64);
     var chat2_cfg = model_mod.ModelConfig{};
     chat2_cfg.model_type = "qwen3";
     chat2.config = &chat2_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(chat2, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("qwen", reg.default_id);
+
+    // ...but an explicit default is never stolen.
+    try reg.setDefault("gemma");
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
     reg.mutex.unlock(reg.io);

@@ -1,5 +1,55 @@
 # Changelog
 
+## v26.9.5 — Bonsai - unreleased
+
+### Highlights
+- **Prism Bonsai 2 runs.** `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (Hadamard-rotated 2-bit Qwen3.8-27B, text + vision) loads and serves like any Qwen 27B.
+
+- **Bonsai 2 runs in its own numerics.** f16 activations over the pack's f16 scales and an f32 GatedDeltaNet state, as Prism's reference runtime does: 60x closer to an f32 reference of the pack than the old bf16 path (KL 2.9e-6 vs 1.7e-4), same speed.
+
+### Changes
+- Several long requests restored from the prefix cache at once no longer overrun GPU memory (a failed generation, or a kernel panic on a 16 GB Mac): each is billed against what the others were promised, and the server now leaves the OS a memory reserve (`--os-reserve-gib`, a toggle in Settings).
+- Concurrent long prompts that do not fit in GPU memory together now wait their turn instead of overrunning it (a crash, or a kernel panic on macOS 26.5); a DFlash drafter's context is part of the memory bill.
+- With a DFlash drafter loaded, concurrent requests use the MTP head so they batch: four streams on the 27B went from 64 to 122 tok/s (M4 Max).
+- 8-bit KV is now as fast as or faster than bf16 KV at long context: quantized attention runs through Apple's matmul2d tensor op (Qwen3.8-27B MTP on M4 Max: 16K 45 to 55 tok/s, 32K 37 to 51).
+- A long prompt arriving while other requests stream no longer freezes them for a whole 8192-token chunk: prefill narrows to 2048 and runs several decode ticks per chunk boundary.
+- The first request of a burst no longer stays on the DFlash drafter beside the batched group; it joins the group.
+- MTP on sidecar-head models can fall back to plain decode when measured rounds cost more per token (32k+ context).
+- Qwen3.8 family: a thinking request that names no `reasoning_effort` renders as low and now gets low's 2048-token budget on chat, messages and responses; an explicit effort or `--reasoning-budget` still wins.
+- `/v1/responses` enforces the reasoning budget (effort word or `reasoning_budget_tokens`) like chat; a capped thought used to run until `max_output_tokens`.
+- Logprobs are computed in f32: f16-logit models returned `-inf`/NaN (invalid JSON) and bf16 ones were rounded.
+- 2-bit packs take the dequant+GEMM prefill route from 384-token chunks (was 2048): +7-8% prefill on prompts under 2k tokens.
+- `mlx-serve launch pi` sends the picked thinking level as `reasoning_effort` (was `enable_thinking` only, which dropped low/medium).
+- Stopping a request while another one was decoding could crash the server.
+- MTP auto draft depth settles closer to the best depth for the content at short context and no longer pauses mid-round to read draft confidences (Qwen3.8-27B 4-bit, M4 Max: code +2%, prose +2%, short echo +3%); `MLX_SERVE_MTP_DEPTH_POLICY=legacy` restores the old planner.
+- Concurrent requests decode faster on M4-family Macs: four MTP streams share one verify forward and draft together (Qwen3.8-27B 4-bit, M4 Max: 72 to 119 tok/s aggregate), and batched decode past 1k tokens of context no longer copies every stream's KV per step (4 streams at 28k: 26 to 64 tok/s).
+
+## v26.9.4 — Correctness Fixes, Chinese Translation, Benchmarks
+
+### Highlights
+
+- **Benchmark your Mac from the menu bar.** Run a standardized context-and-coding benchmark against the loaded model using the server's own timings. Results stay local, with optional anonymous sharing to the community benchmarks at mlxserve.com/benchmarks.
+
+- **Qwen3.8 Flash Next now handles 32 concurrent streams.** Fixed a crash that occurred when running more than 10 streams. On an M4 Max, 32 streams can now decode at **185 tok/s aggregate**.
+
+- **`top_p: 0` is now greedy.** It behaves like `top_k: 1`, selecting only the highest-probability token.
+
+- **Invalid images now return useful errors.** Unreadable images, bad base64, and unsupported image payloads now return a clear **400 error** instead of silently disappearing from the prompt.
+
+- **More reliable structured output.** Invalid `json_schema` requests are rejected properly, empty stop sequences no longer terminate responses immediately, and JSON output now starts and ends cleanly at the root value.
+
+- **Better Ollama and embeddings compatibility.** Ollama's model-load handshake now works correctly, and empty embedding requests return a proper 400 instead of a server error.
+
+- **`/props` now reports active serving settings.** Inspect the effective KV quantization, MTP, drafter, PLD, attention quantization, prefill chunking, and other settings used by the loaded model.
+
+- **Model-less requests now use the latest loaded model.** Requests without a `model` no longer accidentally reload an older model and evict the one currently loaded.
+
+- **Prompt-cache hits now produce identical greedy output.** Fixed a hybrid-model issue where warm and cold requests could produce different tokens due to different kernel tiling.
+
+- **Concurrent speculative decoding is more reliable.** Fixed `generation failed` errors when sampled requests with different draft lengths shared a Qwen 3.5/3.8 verification pass.
+
+---
+
 ## v26.9.3 — Flash Next on 64 GB, speculation for everyone, Neural Engine media
 
 ### Highlights

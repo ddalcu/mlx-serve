@@ -57,6 +57,7 @@ let supportedModelTypes: Set<String> = [
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
+    "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
@@ -280,8 +281,11 @@ struct HFModel: Identifiable, Codable {
     var isSupportedArchitecture: Bool {
         if isGgufRepo || isServedMediaRepo { return true }
         guard let tags, !tags.isEmpty else { return true }
+        // HF tags every repo with its config.json model_type, so a served
+        // model_type counts verbatim, no family prefix needed.
         return tags.contains { tag in
-            supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
+            supportedModelTypes.contains(tag)
+                || supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
     }
 
@@ -412,6 +416,10 @@ struct HFModel: Identifiable, Codable {
         }
         if lower.contains("fp16") { return "FP16" }
         if lower.contains("bf16") { return "BF16" }
+        if let m = mixedBitRegex.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)),
+           let lo = Range(m.range(at: 1), in: lower), let hi = Range(m.range(at: 2), in: lower) {
+            return "\(lower[lo])/\(lower[hi])-bit"
+        }
         if let s = firstCapture(lower, quantBitRegex) { return "\(s)-bit" }
         if let s = firstCapture(lower, ggufQuantRegex) { return "\(s)-bit" }
         return nil
@@ -420,6 +428,9 @@ struct HFModel: Identifiable, Codable {
     /// MLX-style width: digits (optionally fractional) immediately before an
     /// optional hyphen and "bit" — "4bit", "8-bit", "3.5bit".
     private static let quantBitRegex = try! NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)-?bit"#)
+    /// A mixed-width pack ("mixed-4-8bit"): no single width, so it prices
+    /// nothing and the size comes from the file tree.
+    private static let mixedBitRegex = try! NSRegularExpression(pattern: #"mixed[-_](\d+)[-_](\d+)[-_]?bit"#)
     /// GGUF-style width: "qN_" / "iqN_" (e.g. "Q4_K_M", "IQ3_M").
     private static let ggufQuantRegex = try! NSRegularExpression(pattern: #"i?q(\d+)_"#)
 

@@ -7,6 +7,7 @@ test {
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");
+    _ = @import("mtp_replay_test.zig");
     _ = @import("server.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");
@@ -16,6 +17,9 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
+    _ = @import("rht.zig");
+    _ = @import("qmv2.zig");
+    _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
     _ = @import("json_grammar.zig");

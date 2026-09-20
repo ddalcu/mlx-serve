@@ -86,7 +86,7 @@ final class ToolModelRootsTests: XCTestCase {
         let lms = makeHomeDir(".lmstudio/models")
         let dest = makeHomeDir("dest")
 
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         let scanned = roots.scanRoots(toolRoots: ToolModelRoots(lmStudio: lms, mtplx: mtplx, osaurus: osaurus))
 
@@ -112,7 +112,7 @@ final class ToolModelRootsTests: XCTestCase {
     /// `main.zig` EXITS on one `--model-dir` past its cap, so the client's list
     /// is bounded by the server's own number however many tools are installed.
     func testDetectedFoldersCannotPushPastTheServerCap() {
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = makeHomeDir("dest")
         roots.customRoot = makeHomeDir("custom")
         let tools = ToolModelRoots(lmStudio: makeHomeDir(".lmstudio/models"),
@@ -125,7 +125,7 @@ final class ToolModelRootsTests: XCTestCase {
     /// destination IS `~/MLXModels` must not get it scanned as both.
     func testAFolderReachedTwiceIsScannedOnce() {
         let shared = makeHomeDir("MLXModels")
-        var roots = ModelRoots(defaults: defaults)
+        let roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = shared
         let scanned = roots.scanRoots(toolRoots: ToolModelRoots(osaurus: shared))
         XCTAssertEqual(scanned.filter { $0 == shared }.count, 1)

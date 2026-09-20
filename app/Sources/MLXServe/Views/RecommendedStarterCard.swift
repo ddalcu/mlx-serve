@@ -32,7 +32,7 @@ struct RecommendedStarterCard: View {
                     .foregroundColor(.accentColor)
                     .frame(width: 24, alignment: .center)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(Self.lead(for: pick))
+                    Text(L10n.text(Self.lead(for: pick)))
                         .font(.subheadline.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
                     Text(pick.name)
@@ -72,8 +72,10 @@ struct RecommendedStarterCard: View {
                 Button {
                     startDownload()
                 } label: {
-                    Text(Self.actionTitle(hasPartial: downloads.hasPartialDownload(pick.repoId),
-                                          failed: state?.status == .failed))
+                    Text(L10n.text(
+                                          Self.actionTitle(hasPartial: downloads.hasPartialDownload(pick.repoId),
+                                          failed: state?.status == .failed)
+))
                         .font(.subheadline.weight(.medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 3)

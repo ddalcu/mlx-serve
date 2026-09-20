@@ -271,11 +271,11 @@ final class MCPTests: XCTestCase {
             XCTAssertFalse(entry.id.isEmpty, "Entry has empty id")
             XCTAssertFalse(entry.name.isEmpty, "\(entry.id) has empty name")
             XCTAssertFalse(entry.command.isEmpty, "\(entry.id) has empty command")
-            XCTAssertFalse((entry.args ?? []).isEmpty, "\(entry.id) has empty args")
+            XCTAssertFalse(entry.args.isEmpty, "\(entry.id) has empty args")
             // Arg placeholders must appear in args (so materialize() can find them).
             for input in entry.inputs {
                 if case .arg(let placeholder) = input.kind {
-                    XCTAssertTrue((entry.args ?? []).contains(placeholder),
+                    XCTAssertTrue(entry.args.contains(placeholder),
                                   "\(entry.id): arg placeholder \(placeholder) missing from args")
                 }
             }
@@ -298,8 +298,8 @@ final class MCPTests: XCTestCase {
         guard let dbhub = MCPCatalog.entry(for: "dbhub") else { return XCTFail("dbhub missing") }
         let dsn = "postgres://u:p@host:5432/db"
         let entry = dbhub.materialize(values: ["dsn": dsn])
-        XCTAssertTrue((entry.args ?? []).contains(dsn), "DSN should be spliced into args; got \(entry.args)")
-        XCTAssertFalse((entry.args ?? []).contains("<DSN>"), "Placeholder should be replaced; got \(entry.args)")
+        XCTAssertTrue((entry.args ?? []).contains(dsn), "DSN should be spliced into args; got \(entry.args ?? [])")
+        XCTAssertFalse((entry.args ?? []).contains("<DSN>"), "Placeholder should be replaced; got \(entry.args ?? [])")
 
         let extracted = dbhub.extractValues(from: entry)
         XCTAssertEqual(extracted["dsn"], dsn)
@@ -310,7 +310,7 @@ final class MCPTests: XCTestCase {
     func testAzureDevOpsDefaultsToInteractiveAuth() {
         guard let ado = MCPCatalog.entry(for: "azure-devops") else { return XCTFail("azure-devops missing") }
         // Base args should NOT pin an auth mode — that lets the server use its interactive default.
-        XCTAssertFalse((ado.args ?? []).contains("--authentication"),
+        XCTAssertFalse(ado.args.contains("--authentication"),
                        "ADO base args should not pre-set an auth mode; got \(ado.args)")
 
         // PAT field exists but is OPTIONAL.
@@ -322,7 +322,7 @@ final class MCPTests: XCTestCase {
         let interactive = ado.materialize(values: ["ado_org": "contoso"])
         XCTAssertTrue((interactive.args ?? []).contains("contoso"))
         XCTAssertFalse((interactive.args ?? []).contains("--authentication"),
-                       "Empty PAT should leave args interactive; got \(interactive.args)")
+                       "Empty PAT should leave args interactive; got \(interactive.args ?? [])")
         XCTAssertNil(interactive.env?["PERSONAL_ACCESS_TOKEN"])
     }
 
@@ -331,9 +331,9 @@ final class MCPTests: XCTestCase {
         let entry = ado.materialize(values: ["ado_org": "contoso", "ado_pat": "abcdef123"])
         XCTAssertTrue((entry.args ?? []).contains("contoso"))
         XCTAssertTrue((entry.args ?? []).contains("--authentication"),
-                      "Filling PAT should append --authentication; got \(entry.args)")
+                      "Filling PAT should append --authentication; got \(entry.args ?? [])")
         XCTAssertTrue((entry.args ?? []).contains("pat"),
-                      "Auth flag should be 'pat'; got \(entry.args)")
+                      "Auth flag should be 'pat'; got \(entry.args ?? [])")
 
         guard let encoded = entry.env?["PERSONAL_ACCESS_TOKEN"] else {
             return XCTFail("PERSONAL_ACCESS_TOKEN should be set; got env=\(entry.env ?? [:])")

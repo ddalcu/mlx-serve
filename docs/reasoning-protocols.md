@@ -1,3 +1,5 @@
+[English](reasoning-protocols.md) · [简体中文](zh-CN/reasoning-protocols.md)
+
 # Reasoning with constrained JSON
 
 The MLX generation path uses one bounded protocol state machine followed by the

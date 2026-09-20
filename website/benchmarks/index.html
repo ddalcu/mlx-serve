@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local LLM Speed on Apple Silicon — Community Benchmarks · mlx-serve</title>
+  <meta name="description" content="Real tokens per second for local LLMs on Apple Silicon, submitted by people running them. Filter by chip, GPU cores and memory to see what your Mac will actually do.">
+  <meta name="keywords" content="local LLM benchmark Mac, M4 Max tokens per second, Apple Silicon LLM speed, MLX benchmark, M3 Ultra LLM performance, how fast local LLM Mac, tok/s Apple Silicon">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://mlxserve.com/benchmarks/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://mlxserve.com/benchmarks/">
+  <meta property="og:title" content="Community Benchmarks — what local LLMs actually do on your Mac">
+  <meta property="og:description" content="Tokens per second by chip, GPU cores and memory, measured by the people running the models. Not marketing numbers.">
+  <meta property="og:image" content="https://mlxserve.com/appiconb.png">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Community Benchmarks — local LLM speed on Apple Silicon">
+  <meta name="twitter:description" content="Real tok/s by chip, GPU cores and memory, submitted by people running the models.">
+  <meta name="twitter:image" content="https://mlxserve.com/appiconb.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://mlxserve.com/" },
+      { "@type": "ListItem", "position": 2, "name": "Benchmarks", "item": "https://mlxserve.com/benchmarks/" }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>:root { --accent: #5e5ce6; --accent2: #bf5af2; }</style>
+  <style>
+    /* ─── benchmarks-specific styles (extends feature.css) ─── */
+    .board-wrap { max-width: 1100px; margin: 0 auto; padding: 0 24px 40px; }
+
+    .intro { padding: 28px 0 18px; }
+    .intro h1 { font-size: clamp(28px, 4vw, 40px); margin: 0 0 10px; }
+    .intro p { color: var(--text-secondary); max-width: 70ch; margin: 0 0 6px; }
+
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end;
+      padding: 16px; border: 1px solid var(--border); border-radius: 12px;
+      background: var(--bg-alt); margin-bottom: 18px;
+    }
+    .control { display: flex; flex-direction: column; gap: 5px; }
+    .control label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary); }
+    .control select {
+      background: var(--white); color: var(--text-primary); border: 1px solid var(--border);
+      border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px; min-width: 150px;
+    }
+    .modes { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .modes button {
+      background: var(--white); color: var(--text-secondary); border: 0; padding: 8px 14px;
+      font: inherit; font-size: 13px; cursor: pointer;
+    }
+    .modes button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 12px; text-align: left; white-space: nowrap; }
+    th {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--text-secondary); border-bottom: 1px solid var(--border); font-weight: 600;
+    }
+    td { border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: 0; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .model-cell { white-space: normal; min-width: 220px; word-break: break-word; }
+
+    .badge {
+      display: inline-block; font-size: 11px; font-weight: 600;
+      padding: 2px 7px; border-radius: 999px; margin-left: 6px;
+    }
+    .badge.thin  { background: rgba(255,159,10,.14); color: #ff9f0a; }
+    .chip {
+      display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+      background: var(--white); border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px;
+    }
+    .chips { white-space: normal; min-width: 180px; }
+    .note-cell { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+    .gain { color: #30d158; font-weight: 600; }
+    .loss { color: var(--text-secondary); }
+
+    .note { color: var(--text-secondary); font-size: 13px; margin-top: 12px; max-width: 76ch; }
+    .state { padding: 48px 24px; text-align: center; color: var(--text-secondary); }
+
+    @media (max-width: 640px) {
+      .control select { min-width: 0; width: 100%; }
+      .control { flex: 1 1 100%; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+      <span class="nav-ver"></span>
+    </a>
+    <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
+    <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Overview <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu">
+          <li><a href="../#explore">Deep dives</a></li>
+          <li><a href="../#performance">Performance</a></li>
+          <li><a href="../#features">Features</a></li>
+          <li><a href="../#faq">FAQ</a></li>
+        </ul>
+      </li>
+      <li class="nav-sub hide-mobile">
+        <a href="../#explore" class="nav-sub-trigger" aria-haspopup="true">Features <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4"/></svg></a>
+        <ul class="nav-submenu nav-submenu-wide">
+          <li><a href="../onboarding/">Getting started</a></li>
+          <li><a href="../image-generation/">Image generation</a></li>
+          <li><a href="../video-generation/">Video generation</a></li>
+          <li><a href="../music-generation/">Music generation</a></li>
+          <li><a href="../3d-generation/">3D generation</a></li>
+          <li><a href="../voice-cloning/">Voice cloning</a></li>
+          <li><a href="../claude-code-local/">Claude Code, local</a></li>
+          <li><a href="../local-ai-assistant/">AI assistant</a></li>
+          <li><a href="../agent-sandbox/">Agent sandbox</a></li>
+          <li><a href="../speculative-decoding/">Speculative decoding</a></li>
+          <li><a href="../tool-calling/">Tool calling</a></li>
+          <li><a href="../lm-studio-alternative/">vs LM Studio</a></li>
+          <li><a href="../ollama-alternative/">vs Ollama</a></li>
+        </ul>
+      </li>
+      <li><a href="../api/" class="hide-mobile">API</a></li>
+      <li><a href="../cli/" class="hide-mobile">CLI</a></li>
+      <li><a href="../llm-tier-list/" class="hide-mobile">Tier list</a></li>
+      <li><a href="./" class="hide-mobile nav-current">Benchmarks</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl nav-dl-desktop">Download</a></li>
+      <li><a href="https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518" class="nav-appstore" target="_blank" rel="noopener"><img src="../assets/appstore.svg" alt="Download on the App Store" width="120" height="40"></a></li>
+    </ul>
+    <label for="nav-toggle" class="nav-burger" aria-label="Menu"><span></span><span></span><span></span></label>
+  </nav>
+
+<div class="board-wrap" style="padding-top: 72px;">
+
+  <div class="intro">
+    <h1>Community Benchmarks</h1>
+    <p>Tokens per second measured by the people running the models, not by us. Pick your chip to see what to expect, or compare settings to find out which ones are worth turning on.</p>
+    <p>Every result comes from the same pinned workload: a context ladder (512 / 1k / 2k / 4k / 8k / 16k tokens of synthetic code with a planted constant). Run it yourself from the menu bar in <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a>.</p>
+  </div>
+
+  <div class="controls">
+    <div class="control">
+      <label for="f-chip">Chip</label>
+      <select id="f-chip"><option value="">Any</option></select>
+    </div>
+    <div class="control">
+      <label for="f-ram">Memory</label>
+      <select id="f-ram"><option value="">Any</option></select>
+    </div>
+    <div class="control">
+      <label for="f-model">Model</label>
+      <select id="f-model"><option value="">Any</option></select>
+    </div>
+    <div class="control">
+      <label for="f-quality">Quality</label>
+      <select id="f-quality">
+        <option value="all">All settings</option>
+        <option value="lossless">Lossless only</option>
+      </select>
+    </div>
+    <div class="control">
+      <label>View</label>
+      <div class="modes">
+        <button id="mode-absolute" aria-pressed="true">Decode</button>
+        <button id="mode-prefill" aria-pressed="false">Prefill</button>
+        <button id="mode-ratio" aria-pressed="false">Speculation headroom</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="board-state" class="state">Loading results…</div>
+
+  <div class="table-wrap" id="table-wrap" hidden>
+    <table id="board">
+      <thead id="board-head"></thead>
+      <tbody id="board-body"></tbody>
+    </table>
+  </div>
+
+  <p class="note" id="board-note"></p>
+
+</div>
+
+<script src="../assets/feature.js"></script>
+<script type="module">
+  // ════════════════════════════════════════════════════════════════════════
+  // Community benchmark board.
+  //
+  // Storage is Firebase Realtime Database read over plain HTTPS — no SDK, one
+  // request. RTDB was chosen over Firestore precisely so this page can be a
+  // static file with a bare fetch().
+  //
+  // DOCUMENTED DUPLICATION: `familyKey`, `settingsSignature`, `median` and
+  // `aggregateFamilies` below mirror `BenchmarkStore` and
+  // `BenchmarkSettings` in the Swift app
+  // (app/Sources/MLXServe/Services/BenchmarkStore.swift,
+  // app/Sources/MLXServe/Models/BenchmarkModels.swift). They must stay in
+  // sync — if the grouping diverges, the app and the website quote different
+  // numbers for the same data. Both sides are unit-tested.
+  //
+  // Phase 1 has no tamper protection by design, so the READER is where
+  // robustness lives: rows are validated one at a time and anything malformed
+  // is skipped rather than breaking the page.
+  // ════════════════════════════════════════════════════════════════════════
+
+  const DB_URL = "https://mlxserve-default-rtdb.firebaseio.com/results.json";
+  const FETCH_LIMIT = 2000;
+  const LADDER = [512, 1024, 2048, 4096, 8192, 16384];
+
+  function fetchURL() {
+    return `${DB_URL}?orderBy=${encodeURIComponent('"$key"')}&limitToLast=${FETCH_LIMIT}`;
+  }
+
+  // ── row validation ───────────────────────────────────────────────────────
+  // An openly-writable database means a row can be anything. A row that fails
+  // any of these checks is dropped: a board that renders "undefined tok/s" is
+  // worse than one that renders one row fewer. v1 rows (the retired 2K suite)
+  // still validate; v2 rows must carry their rung and their settings.
+  function isValidRow(r) {
+    if (!r || typeof r !== "object") return false;
+    if (typeof r.suiteId !== "string" || !r.suiteId) return false;
+    if (typeof r.armId !== "string" || !r.armId) return false;
+    if (typeof r.modelId !== "string" || !r.modelId) return false;
+    if (typeof r.decodeTps !== "number" || !isFinite(r.decodeTps) || r.decodeTps <= 0) return false;
+    if (typeof r.prefillTps !== "number" || !isFinite(r.prefillTps) || r.prefillTps < 0) return false;
+    const hw = r.hardware;
+    if (!hw || typeof hw !== "object") return false;
+    if (typeof hw.chip !== "string" || !hw.chip) return false;
+    if (typeof hw.ramGB !== "number" || hw.ramGB <= 0) return false;
+    // Ladder rows only: the pre-release single-prompt suite carried no rung.
+    if ((r.schemaVersion || 1) < 2) return false;
+    if (!Number.isInteger(r.targetTokens) || r.targetTokens <= 0) return false;
+    if (!r.settings || typeof r.settings !== "object") return false;
+    if (r.note !== undefined && typeof r.note !== "string") return false;
+    if (r.driftPercent !== undefined && typeof r.driftPercent !== "number") return false;
+    return true;
+  }
+
+  /// RTDB returns an OBJECT keyed by push id, or literal null when empty.
+  function parseRows(payload) {
+    if (!payload || typeof payload !== "object") return [];
+    return Object.values(payload).filter(isValidRow);
+  }
+
+  // ── stats (mirrors BenchmarkStats.median) ────────────────────────────────
+  function median(values) {
+    if (!values.length) return 0;
+    const s = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  }
+
+  // ── settings (mirrors BenchmarkSettings) ─────────────────────────────────
+  // What changes a request's speed, so what may not share a median. Cache
+  // size, concurrency and the server version stay out — fragmenting by
+  // release would leave every cell at n=1 forever.
+  function settingsSignature(s) {
+    s = s || {};
+    const flag = (k) => (s[k] === "true" ? "1" : s[k] === "false" ? "0" : "?");
+    return ["kv" + (s.kv_quant ?? "?"), "daq" + flag("decode_attn_quant"),
+            "mtp" + flag("mtp_default_on"), "pld" + flag("pld_default_on"),
+            s.drafter ?? "?"].join("|");
+  }
+
+  function settingsChips(s) {
+    s = s || {};
+    const chips = [];
+    if (s.kv_quant !== undefined) chips.push(s.kv_quant === "off" ? "KV off" : `KV ${s.kv_quant}-bit`);
+    if (s.decode_attn_quant === "true") chips.push("Attn quant");
+    if (s.pld_default_on === "true") chips.push("PLD");
+    if (s.mtp_default_on !== undefined) chips.push(s.mtp_default_on === "true" ? "MTP" : "MTP off");
+    if (s.drafter && s.drafter !== "none") chips.push(s.drafter === "dflash" ? "DFlash" : "Drafter");
+    const ctx = parseInt(s.n_ctx, 10);
+    if (ctx > 0) chips.push(`ctx ${Math.floor(ctx / 1024)}K`);
+    return chips;
+  }
+
+  function rungOf(r) { return r.targetTokens; }
+
+  // ── cell families (mirrors BenchmarkStore.familyKey / aggregateSessions) ─
+  // One row per machine × model × settings, with a median per rung and the
+  // number of results behind each. GPU cores are part of the key: a 32-core
+  // and a 40-core M4 Max report the same chip string and do not share a
+  // decode speed. The settings signature is part of it: a kv-quant 8 row and
+  // a dense row describe different speeds.
+  function familyKey(r) {
+    return [r.modelId, settingsSignature(r.settings),
+            r.hardware.chip, String(r.hardware.gpuCores || 0), String(r.hardware.ramGB)].join("|");
+  }
+
+  function aggregateFamilies(rows) {
+    const groups = new Map();
+    for (const r of rows) {
+      const key = familyKey(r);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    }
+    const out = [];
+    for (const [key, members] of groups) {
+      const first = members[0];
+      const byRung = new Map();
+      for (const m of members) {
+        const t = rungOf(m);
+        if (!byRung.has(t)) byRung.set(t, []);
+        byRung.get(t).push(m);
+      }
+      const rungs = new Map();
+      for (const [t, rs] of byRung) {
+        const ceilings = rs.map((m) => m.ceilingDecodeTps).filter((v) => typeof v === "number" && v > 0);
+        rungs.set(t, {
+          decodeTps: median(rs.map((m) => m.decodeTps)),
+          prefillTps: median(rs.map((m) => m.prefillTps)),
+          ceilingDecodeTps: median(ceilings),
+          sampleCount: rs.length,
+        });
+      }
+      out.push({
+        key,
+        modelId: first.modelId,
+        settings: first.settings || {},
+        isLossy: members.some((m) => !!m.isLossy),
+        hardware: first.hardware,
+        // Free text the submitters typed; distinct, capped at three.
+        notes: [...new Set(members.map((m) => (m.note || "").trim()).filter(Boolean))].slice(0, 3),
+        rungs,
+        sessionCount: new Set(members.map((m) => m.sessionId)).size,
+      });
+    }
+    const lead = (f) => { const t = [...f.rungs.keys()].sort((a, b) => a - b)[0]; return f.rungs.get(t)?.decodeTps || 0; };
+    return out.sort((a, b) => lead(b) - lead(a));
+  }
+
+  // ── speculation headroom ─────────────────────────────────────────────────
+  // ceiling ÷ decode per rung: how much a draft path could still gain at that
+  // context size. Measured inside ONE session over the same prefix, so it
+  // survives thermals and machine differences the way raw tok/s does not.
+  function headroomByCell(rows) {
+    const families = aggregateFamilies(rows);
+    for (const f of families) {
+      for (const [t, r] of f.rungs) {
+        r.headroom = r.ceilingDecodeTps > 0 && r.decodeTps > 0 ? r.ceilingDecodeTps / r.decodeTps : null;
+      }
+    }
+    return families.filter((f) => [...f.rungs.values()].some((r) => r.headroom !== null));
+  }
+
+  // ── filtering ────────────────────────────────────────────────────────────
+  function applyFilters(rows, f) {
+    return rows.filter((r) => {
+      if (f.chip && r.hardware.chip !== f.chip) return false;
+      if (f.ram && String(r.hardware.ramGB) !== f.ram) return false;
+      if (f.model && r.modelId !== f.model) return false;
+      if (f.quality === "lossless" && r.isLossy) return false;
+      return true;
+    });
+  }
+
+  function optionsFor(rows, pick) {
+    return [...new Set(rows.map(pick).filter(Boolean))].sort();
+  }
+
+  // ── rendering ────────────────────────────────────────────────────────────
+
+  const state = { rows: [], mode: "absolute" };
+
+  const $ = (id) => document.getElementById(id);
+
+  function currentFilters() {
+    return {
+      chip: $("f-chip").value,
+      ram: $("f-ram").value,
+      model: $("f-model").value,
+      quality: $("f-quality").value,
+    };
+  }
+
+  function fillSelect(el, values, formatter) {
+    const current = el.value;
+    el.innerHTML = '<option value="">Any</option>';
+    for (const v of values) {
+      const opt = document.createElement("option");
+      opt.value = String(v);
+      opt.textContent = formatter ? formatter(v) : String(v);
+      el.appendChild(opt);
+    }
+    if (values.map(String).includes(current)) el.value = current;
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  function machineLabel(hw) {
+    const parts = [hw.chip];
+    if (hw.gpuCores) parts.push(`${hw.gpuCores} GPU`);
+    parts.push(`${hw.ramGB} GB`);
+    return parts.join(" · ");
+  }
+
+  function rungTitle(t) { return t >= 1024 ? `${Math.round(t / 1024)}k` : String(t); }
+
+  function chipsHtml(f) {
+    return settingsChips(f.settings).map((c) => `<span class="chip">${esc(c)}</span>`).join("");
+  }
+
+  /// One row per family with a column per ladder rung; `pick` reads the
+  /// figure to show, `fmt` renders it.
+  function renderFamilies(families, columnsTitle, pick, fmt, note) {
+    const columns = LADDER;
+    $("board-head").innerHTML = `
+      <tr>
+        <th>Machine</th><th>Model</th><th>Settings</th>
+        ${columns.map((t) => `<th class="num">${esc(rungTitle(t))}</th>`).join("")}
+        <th class="num">n</th>
+      </tr>`;
+    $("board-body").innerHTML = families.map((f) => `
+      <tr>
+        <td>${esc(machineLabel(f.hardware))}</td>
+        <td class="model-cell">${esc(f.modelId)}${f.notes.length ? `<div class="note-cell">${esc(f.notes.join(" · "))}</div>` : ""}</td>
+        <td class="chips">${chipsHtml(f)}</td>
+        ${columns.map((t) => {
+          const r = f.rungs.get(t);
+          const v = r ? pick(r) : null;
+          return `<td class="num">${v ? fmt(v) : "—"}</td>`;
+        }).join("")}
+        <td class="num">${f.sessionCount}${f.sessionCount === 1 ? '<span class="badge thin">n=1</span>' : ""}</td>
+      </tr>`).join("");
+    $("board-note").textContent = `${columnsTitle} ${note}`;
+    return families.length;
+  }
+
+  function renderAbsolute(rows) {
+    return renderFamilies(aggregateFamilies(rows), "Decode tokens per second per context size,",
+      (r) => r.decodeTps, (v) => v.toFixed(1),
+      "median of every submission in each cell. n is how many sessions that row came from — a row at n=1 is one person's data point, not a benchmark. Lossy settings trade output quality for speed.");
+  }
+
+  function renderPrefill(rows) {
+    return renderFamilies(aggregateFamilies(rows), "Prefill tokens per second per context size,",
+      (r) => r.prefillTps, (v) => String(Math.round(v)),
+      "median of every submission in each cell. Prefill is how fast the prompt is read; it decides the wait before the first token.");
+  }
+
+  function renderRatio(rows) {
+    return renderFamilies(headroomByCell(rows), "Speculation headroom per context size:",
+      (r) => r.headroom, (v) => `${v.toFixed(2)}×`,
+      "the count-to-200 ceiling divided by the coding decode rate, measured inside one session over the same prefix. 1.0× means speculation has nothing left to gain there.");
+  }
+
+  function render() {
+    const filtered = applyFilters(state.rows, currentFilters());
+    const count = state.mode === "absolute" ? renderAbsolute(filtered)
+                : state.mode === "prefill" ? renderPrefill(filtered)
+                : renderRatio(filtered);
+    const empty = count === 0;
+    $("table-wrap").hidden = empty;
+    $("board-state").hidden = !empty;
+    if (empty) {
+      $("board-state").textContent = state.rows.length
+        ? "No results match those filters yet."
+        : "No results yet. Be the first to share one from MLX Core.";
+      $("board-note").textContent = "";
+    }
+  }
+
+  function setMode(mode) {
+    state.mode = mode;
+    for (const m of ["absolute", "prefill", "ratio"]) {
+      $(`mode-${m}`).setAttribute("aria-pressed", String(mode === m));
+    }
+    render();
+  }
+
+  async function boot() {
+    $("mode-absolute").addEventListener("click", () => setMode("absolute"));
+    $("mode-prefill").addEventListener("click", () => setMode("prefill"));
+    $("mode-ratio").addEventListener("click", () => setMode("ratio"));
+    for (const id of ["f-chip", "f-ram", "f-model", "f-quality"]) {
+      $(id).addEventListener("change", render);
+    }
+
+    try {
+      const response = await fetch(fetchURL());
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      state.rows = parseRows(await response.json());
+    } catch (e) {
+      $("board-state").textContent = "Couldn't load results. Try again in a moment.";
+      $("board-state").hidden = false;
+      $("table-wrap").hidden = true;
+      return;
+    }
+
+    fillSelect($("f-chip"), optionsFor(state.rows, (r) => r.hardware.chip));
+    fillSelect($("f-ram"),
+               optionsFor(state.rows, (r) => r.hardware.ramGB).sort((a, b) => a - b),
+               (v) => `${v} GB`);
+    fillSelect($("f-model"), optionsFor(state.rows, (r) => r.modelId));
+    render();
+  }
+
+  boot();
+</script>
+
+<script src="../assets/version.js"></script>
+
+</body>
+</html>

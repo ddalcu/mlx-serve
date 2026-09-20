@@ -305,6 +305,17 @@ final class ChatModelResolutionTests: XCTestCase {
         XCTAssertNil(mgr.chatModelInfo)
     }
 
+    /// A headless server sorts no default first: its first row is an unloaded stub.
+    @MainActor
+    func testAHeadlessServersFirstRowIsNotResident() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        mgr.allModels = [info("ddalcu/Qwen3.8-27B-MLX-Serve-4bit", ["chat"], loaded: false)]
+        mgr.modelInfo = mgr.allModels[0]
+
+        XCTAssertNil(mgr.chatModelInfo)
+    }
+
     /// An embedding model is in the registry too (folder indexing loads one)
     /// and is just as unable to hold a conversation.
     @MainActor

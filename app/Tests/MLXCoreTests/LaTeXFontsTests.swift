@@ -22,6 +22,21 @@ final class LaTeXFontsTests: XCTestCase {
         XCTAssertEqual(located, bundle)
     }
 
+    /// Xcode 26+'s SwiftPM (the Swift Build backend) emits resource bundles as
+    /// real macOS bundles — fonts under `Contents/Resources/Fonts/`, not the
+    /// old flat `Fonts/`. The SwaTex-side lookup goes through the Bundle API
+    /// and reads both; this probe must too, or every equation in a build from
+    /// that toolchain renders as its own source with a green test suite.
+    func testFontsAreFoundInAMacOSStyleResourceBundle() {
+        let resources = URL(fileURLWithPath: "/b/debug")
+        let bundle = resources.appendingPathComponent(LaTeXFonts.bundleName)
+        let located = LaTeXFonts.locate(
+            searching: [resources],
+            fileExists: present([bundle.appendingPathComponent("Contents/Resources/Fonts/KaTeX_Main-Regular.ttf").path])
+        )
+        XCTAssertEqual(located, bundle)
+    }
+
     func testAFontBundleWithoutItsFontsIsNotAHit() {
         let resources = URL(fileURLWithPath: "/Applications/MLX Core.app/Contents/Resources")
         XCTAssertNil(

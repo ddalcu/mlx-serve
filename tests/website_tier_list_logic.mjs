@@ -113,6 +113,11 @@ const FIX_TEXT = [
   { id: "meta-llama/Llama-2-7b-hf", downloads: 700000,
     tags: ["transformers", "safetensors", "llama", "text-generation"],
     safetensors: { total: 6700000000 }, createdAt: "2023-07-18T00:00:00.000Z" },
+  // Qwen3.8 Flash Next: official, arch qwen4_exp, no "-aNb" in the name so
+  // the MoE tag has to come from the arch
+  { id: "Qwen/Qwen3.8-Flash-Next", downloads: 689347,
+    tags: ["transformers", "safetensors", "qwen4_exp", "text-generation"],
+    safetensors: { total: 125000000000 }, createdAt: "2026-08-24T00:00:00.000Z" },
   // new-lab official release (Ornith = deepreinforce-ai, arch qwen3_5_moe)
   { id: "deepreinforce-ai/Ornith-1.0-35B", downloads: 1350838,
     tags: ["transformers", "safetensors", "qwen3_5_moe", "text-generation"],
@@ -146,6 +151,9 @@ assert(groups.filter((g) => g.id.includes("qwen3.6-27b")).length === 1, "one ent
 assert(!groups.some((g) => g.id.includes("dolphin")), "community finetunes rejected");
 assert(!groups.some((g) => g.id.includes("weirdarch")), "unknown non-GGUF architectures rejected");
 assert(byId["gpt-oss-20b"], "modern arch beyond native dispatch is listed (gpt_oss)");
+const flashNext = byId["qwen3.8-flash-next"];
+assert(flashNext, "Qwen3.8 Flash Next (qwen4_exp) is listed");
+assert(flashNext.tags.includes("moe"), "qwen4_exp is a MoE arch (got " + (flashNext && flashNext.tags) + ")");
 assert(!byId["qwen2.5-7b"], "legacy archs stay off the board even from official orgs");
 assert(!byId["llama-2-7b"], "pre-2024 releases rejected by the date floor");
 assert(byId["ornith-1.0-35b"] && byId["ornith-1.0-35b"].name === "Ornith 1.0 35B",
@@ -169,16 +177,20 @@ for (const g of groups) {
 // seed union: pinned models HF can't surface (GGUF-only) survive, no dupes
 const merged = mergeWithSeed(groups, SEED_MODELS);
 assert(merged.some((m) => m.id === "deepseek-v4-flash"), "pinned seed survives merge when not found dynamically");
-assert(merged.filter((m) => m.id === "qwen3.6-27b").length === 1, "dynamic entry wins over same-id seed");
+assert(merged.filter((m) => m.id === "gemma-4-e2b").length === 1, "dynamic entry wins over same-id seed");
+// a superseded release stays off the board even while HF still ranks it
+assert(!merged.some((m) => m.id === "qwen3.6-27b"), "Qwen3.6 27B is superseded by 3.8 and never reaches the board");
+assert(!SEED_MODELS.some((m) => m.id === "qwen3.6-27b"), "and it is not seeded either");
+assert(SEED_MODELS.some((m) => m.id === "qwen3.8-flash-next"), "Qwen3.8 Flash Next is seeded for the offline board");
 
 // ── vote sanitization: at most one exact ±1 per KNOWN model per account ────
 setActiveModels(merged);
-const s = sanitize({ "qwen3.6-27b": 1, "bogus-model": 1, "gemma-4-e2b": 2, "deepseek-v4-flash": -1 });
-assert(JSON.stringify(s) === JSON.stringify({ "qwen3.6-27b": 1, "deepseek-v4-flash": -1 }),
+const s = sanitize({ "gpt-oss-20b": 1, "bogus-model": 1, "gemma-4-e2b": 2, "deepseek-v4-flash": -1 });
+assert(JSON.stringify(s) === JSON.stringify({ "gpt-oss-20b": 1, "deepseek-v4-flash": -1 }),
   "sanitize drops unknown ids and non-plus-minus-1 values");
 
-const t = talliesFrom([{ "qwen3.6-27b": 1 }, { "qwen3.6-27b": 1, "deepseek-v4-flash": -1 }]);
-assert(t["qwen3.6-27b"].up === 2 && t["qwen3.6-27b"].down === 0 && t["deepseek-v4-flash"].down === 1,
+const t = talliesFrom([{ "gpt-oss-20b": 1 }, { "gpt-oss-20b": 1, "deepseek-v4-flash": -1 }]);
+assert(t["gpt-oss-20b"].up === 2 && t["gpt-oss-20b"].down === 0 && t["deepseek-v4-flash"].down === 1,
   "tallies aggregate across voter docs");
 
 // ── unranked table: text filter + vote-independent ordering ────────────────
@@ -421,6 +433,8 @@ assert(estimateDecodeTps({ id: "gemma-4-e4b", paramsB: 8, activeB: 4, tags: [] }
   assert(specMultiplier("pld", "prose", moe) >= 1, "PLD never slows a request in the model");
   // an MTP head ships inside a checkpoint — it is not a switch you can flip
   assert(specSupported("mtp", { id: "qwen3.6-27b" }) === true, "qwen3.6 ships a native MTP head");
+  assert(specSupported("mtp", { id: "qwen3.8-27b" }) === true, "qwen3.8 ships a native MTP head");
+  assert(specSupported("mtp", { id: "qwen3.8-flash-next" }) === true, "so does Flash Next");
   assert(specSupported("mtp", { id: "ling-3.0-flash" }) === true, "ling ships a native MTP head");
   assert(specSupported("mtp", { id: "llama-3.3-70b" }) === false, "no MTP head on llama 3.3");
   assert(specSupported("pld", { id: "llama-3.3-70b" }) === true, "PLD is model-agnostic");
@@ -474,7 +488,12 @@ assert(estimateDecodeTps({ id: "gemma-4-e4b", paramsB: 8, activeB: 4, tags: [] }
 
   // intelligence mode: the score decides, votes are ignored
   assert(tierForModel(m("deepseek-v4-flash"), noVotes, "intelligence") === "S", "50 on the index is S");
-  assert(tierForModel(m("qwen3.6-27b"), noVotes, "intelligence") === "A", "37 is A");
+  assert(tierForModel(m("inkling"), noVotes, "intelligence") === "A", "41 is A");
+  // Editorial placements: measured in mlx-serve, not on the AA snapshot.
+  // They apply on the intelligence board only; votes are the community's.
+  assert(tierForModel(m("qwen3.8-27b"), noVotes, "intelligence") === "A", "Qwen3.8 27B is pinned A");
+  assert(tierForModel(m("qwen3.8-flash-next"), noVotes, "intelligence") === "A", "Qwen3.8 Flash Next is pinned A");
+  assert(tierForModel(m("qwen3.8-27b"), noVotes, "votes") === "U", "a pin never overrides the vote board");
   assert(tierForModel(m("gemma-4-31b"), noVotes, "intelligence") === "B", "29 is B");
   assert(tierForModel(m("gemma-4-12b"), noVotes, "intelligence") === "C", "22 is C");
   assert(tierForModel(m("llama-3.3-70b"), noVotes, "intelligence") === "D", "9 is D");
@@ -592,7 +611,7 @@ function assert(c, m) { if (!c) { console.error("ASSERT FAIL: " + m); process.ex
 
 const rigAsserts = `
 // boot the panel the way the page's boot block does
-rig.modelId = "qwen3.6-27b";
+rig.modelId = "qwen3.8-27b";
 renderRig();
 
 const num = (id) => parseFloat(String(DOM[id].textContent || DOM[id]._html).replace(/[^0-9.]/g, ""));
@@ -603,10 +622,10 @@ assert(DOM["rig-tier"].children[3].textContent === "Ultra" && DOM["rig-tier"].ch
 assert(DOM["rig-tier"].children[2].disabled === false, "M4 Max is selectable");
 assert(DOM["rig-ram"].children.length > 1, "RAM options rendered for the selected chip");
 assert(DOM["rig-bits"].children.length === QUANT_BITS.length, "every quantization rung is offered");
-// qwen3.6-27b is dense, so the mixed-expert rung must be visible but dead
+// qwen3.8-27b is dense, so the mixed-expert rung must be visible but dead
 assert(DOM["rig-bits"].children.find((b) => b.textContent === "Mixed").disabled === true,
   "mixed precision is not selectable on a dense model");
-assert(DOM["rig-model-name"].textContent === "Qwen3.6 27B", "trigger names the selected model");
+assert(DOM["rig-model-name"].textContent === "Qwen3.8 27B", "trigger names the selected model");
 assert(DOM["rig-model-meta"].textContent.length > 0, "trigger carries the model's params");
 assert(/GPU/.test(DOM["rig-spec"].textContent) && /GB\\/s/.test(DOM["rig-spec"].textContent),
   "chip spec line names cores and bandwidth (got: " + DOM["rig-spec"].textContent + ")");
@@ -681,7 +700,7 @@ assert(/Won't fit/.test(DOM["out-verdict"].textContent),
 // settings — a list of names would not need a modal.
 {
   const el = (id) => document.getElementById(id);
-  rig.modelId = "qwen3.6-27b"; rig.bits = 4; rig.ram = 64;
+  rig.modelId = "qwen3.8-27b"; rig.bits = 4; rig.ram = 64;
   rig.gen = "M4"; rig.tier = "Max"; rig.spec = "none";
   renderRig();
 
@@ -697,7 +716,7 @@ assert(/Won't fit/.test(DOM["out-verdict"].textContent),
     "the modal states what the cards are scored on (got: " + el("model-modal-sub").textContent + ")");
 
   const card = (id) => cards.find((c) => c.dataset.model === id);
-  const qwen = card("qwen3.6-27b");
+  const qwen = card("qwen3.8-27b");
   assert(/mcard-num/.test(qwen.innerHTML), "card carries stat tiles");
   assert((qwen.innerHTML.match(/mcard-num"/g) || []).length === 3, "three numbers per card: tok/s, prompt, intel");
   assert(/iq-have/.test(qwen.innerHTML) && /iq-lost/.test(qwen.innerHTML), "card carries the intelligence bar");
@@ -756,14 +775,14 @@ assert(/Won't fit/.test(DOM["out-verdict"].textContent),
 
   // cards re-score when the hardware changes
   el("rig-model").handlers.click();
-  const before = el("model-grid").children.find((c) => c.dataset.model === "qwen3.6-27b").innerHTML;
+  const before = el("model-grid").children.find((c) => c.dataset.model === "qwen3.8-27b").innerHTML;
   closeModelModal();
   el("rig-gen").children.find((b) => b.textContent === "M1").handlers.click();
   el("rig-tier").children.find((b) => b.textContent === "Base").handlers.click();
   el("rig-model").handlers.click();
-  const after = el("model-grid").children.find((c) => c.dataset.model === "qwen3.6-27b").innerHTML;
+  const after = el("model-grid").children.find((c) => c.dataset.model === "qwen3.8-27b").innerHTML;
   assert(before !== after, "cards are re-scored against the selected Mac, not cached");
-  assert(/mcard nofit/.test(el("model-grid").children.find((c) => c.dataset.model === "qwen3.6-27b").className),
+  assert(/mcard nofit/.test(el("model-grid").children.find((c) => c.dataset.model === "qwen3.8-27b").className),
     "a 27B does not fit a 16 GB M1, and its card says so");
 
   // escape closes
@@ -773,7 +792,7 @@ assert(/Won't fit/.test(DOM["out-verdict"].textContent),
   el("model-modal-backdrop").handlers.click();
   assert(el("model-modal").hidden === true, "clicking the backdrop closes the modal");
 
-  rig.gen = "M4"; rig.tier = "Max"; rig.ram = 64; rig.modelId = "qwen3.6-27b"; renderRig();
+  rig.gen = "M4"; rig.tier = "Max"; rig.ram = 64; rig.modelId = "qwen3.8-27b"; renderRig();
 }
 
 // ── NO LAYOUT SHIFT ───────────────────────────────────────────────────────
@@ -797,7 +816,7 @@ assert(/Won't fit/.test(DOM["out-verdict"].textContent),
     rig.gen = chip.gen; rig.tier = chip.tier;
     for (const ram of chip.ram) {
       rig.ram = ram;
-      for (const mid of ["gemma-4-e2b", "qwen3.6-27b", "hy3", "deepseek-v4-flash"]) {
+      for (const mid of ["gemma-4-e2b", "qwen3.8-27b", "hy3", "deepseek-v4-flash"]) {
         rig.modelId = mid;
         for (const bits of QUANT_BITS) {
           for (const ctx of [4096, 131072]) {

@@ -430,7 +430,7 @@ final class ChunkedDownloadTests: XCTestCase {
     }
 
     private static func partialSize(_ path: String) -> Int64 {
-        (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) as? Int64 ?? 0
+        (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
     }
 
     // MARK: - Hugging Face auth

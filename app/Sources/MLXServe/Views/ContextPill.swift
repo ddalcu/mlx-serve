@@ -34,7 +34,7 @@ struct ContextPill: View {
     var body: some View {
         Button { showDetail.toggle() } label: {
             HStack(spacing: 5) {
-                Text(stats.percentText)
+                Text(L10n.text(stats.percentText))
                     .font(.caption.monospacedDigit().weight(.medium))
                     .foregroundStyle(stats.pressure == .comfortable ? Color.secondary : tint)
                 ring
@@ -46,7 +46,11 @@ struct ContextPill: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help("Context window — \(stats.percentText) of \(ContextWindowStats.compact(stats.contextLength)) tokens used. Click for the breakdown.")
+        .help(L10n.format(
+            "Context window — %@ of %@ tokens used. Click for the breakdown.",
+            stats.percentText,
+            ContextWindowStats.compact(stats.contextLength)
+        ))
         .popover(isPresented: $showDetail, arrowEdge: .top) {
             ContextWindowDetail(stats: stats, modelName: modelName, decodeSpeed: decodeSpeed)
         }
@@ -94,7 +98,7 @@ struct ContextWindowDetail: View {
                     Text("Context window")
                         .font(.callout.weight(.semibold))
                     if let modelName, !modelName.isEmpty {
-                        Text(modelName)
+                        Text(L10n.text(modelName))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -109,7 +113,7 @@ struct ContextWindowDetail: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(stats.percentText)
+                    Text(L10n.text(stats.percentText))
                         .font(.system(size: 26, weight: .semibold, design: .rounded))
                         .foregroundStyle(tint)
                     Spacer()
@@ -164,7 +168,7 @@ struct ContextWindowDetail: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .frame(width: 14)
-            Text(label)
+            Text(L10n.text(label))
                 .font(.callout)
             Spacer()
             Text(value)
@@ -178,7 +182,7 @@ struct ContextWindowDetail: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .frame(width: 14)
-            Text(label)
+            Text(L10n.text(label))
                 .font(.callout)
             Spacer()
             // Exact figures here — the pill rounds, this is where you check.

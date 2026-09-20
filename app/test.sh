@@ -1,22 +1,11 @@
 #!/bin/bash
-# The Swift suite in ~24s instead of ~55s.
+# The Swift suite, ~30s on an M4 Max once built.
 #
-# `swift test --parallel` runs each test CLASS in its own PROCESS, and a
-# handful of classes read and write `UserDefaults.standard` — the real app
-# domain, shared by every worker — so in parallel they read each other's
-# writes and go red (measured 2026-09-10: ModelRootsTests reading another
-# worker's model root, TranscriptTypographyTests reading its text size).
-# Everything else parallelises cleanly, so those classes run serially after.
-set -uo pipefail
+# One process, deliberately not `swift test --parallel`: SwiftPM's parallel
+# mode launches a fresh xctest process per TEST, ~3500 of them, and that
+# launch cost now outweighs the parallelism (measured 2026-09-18: 30s serial
+# vs 49s parallel). It also kept tripping over the classes that share
+# `UserDefaults.standard`, which a single process never does.
+set -euo pipefail
 cd "$(dirname "$0")"
-
-SHARED_STATE='ModelRootsTests|ToolModelRootsTests|TranscriptTypographyTests|VoiceModeControllerTests|AgentWorkspaceDefaultTests'
-FAIL=0
-
-echo "=== parallel ==="
-swift test --parallel --skip "$SHARED_STATE" || FAIL=1
-echo "=== serial (shared UserDefaults) ==="
-swift test --filter "$SHARED_STATE" || FAIL=1
-
-[ "$FAIL" = 0 ] && echo "=== suite green ===" || echo "=== suite FAILED ==="
-exit "$FAIL"
+swift test "$@"

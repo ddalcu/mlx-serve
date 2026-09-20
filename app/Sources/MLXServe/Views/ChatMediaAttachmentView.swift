@@ -171,12 +171,12 @@ private struct ChatAudioAttachment: View {
                 .help(isPlaying ? "Stop" : "Play")
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(ref.filename)
+                    Text(L10n.text(ref.filename))
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if let duration {
-                        Text(duration)
+                        Text(L10n.text(duration))
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -253,7 +253,7 @@ struct MediaProgressCard: View {
                     Image(systemName: progress.kind.icon)
                         .font(.callout)
                         .foregroundStyle(.tint)
-                    Text(progress.title)
+                    Text(L10n.text(progress.title))
                         .font(.caption.weight(.semibold))
                     Spacer(minLength: 8)
                     TimelineView(.periodic(from: progress.startedAt, by: 1)) { context in
@@ -272,7 +272,7 @@ struct MediaProgressCard: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                Text(progress.detailText)
+                Text(L10n.text(progress.detailText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

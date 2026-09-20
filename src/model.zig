@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -142,6 +143,8 @@ pub const ModelConfig = struct {
     rms_norm_eps: f32 = 1e-6,
     /// K2-Horizon: every RMS norm normalizes `hidden_size / norm_groups`-wide channel groups on their own rms, then applies the full weight.
     norm_groups: u32 = 1,
+    /// Prism Hadamard packs: every `<linear>.signs` weight reads `H_block(signs * x)` (rht.zig); 0 = none.
+    hadamard_block: u32 = 0,
 
     // RoPE
     rope_theta: f32 = 1000000.0,
@@ -442,6 +445,8 @@ pub const ModelConfig = struct {
     mtp_override: ?bool = null,
     /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+    /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
+    drafter_ctx_bytes_per_token: u64 = 0,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -858,12 +863,32 @@ pub const ModelConfig = struct {
         if (self.linear_num_value_heads == 0) return 0;
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
         if (linear_layers == 0) return 0;
+        const state_elem: u64 = if (self.ssmStateDtype() == .float32) 4 else 2;
         const state: u64 = @as(u64, self.linear_num_value_heads) *
-            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * 2;
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * state_elem;
         const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
             @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
         const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
         return linear_layers * (state + conv * conv_dim * 2);
+    }
+
+    /// Activation dtype: f16 for a Prism Hadamard pack (its own contract: f16
+    /// activations over f16 scales), bf16 everywhere else.
+    pub fn actDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.hadamard_block > 0) .float16 else .bfloat16;
+    }
+
+    /// GatedDeltaNet recurrent state dtype: f32 on Hadamard packs, as the
+    /// reference runtime keeps it; bf16 elsewhere.
+    pub fn ssmStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.hadamard_block > 0) .float32 else .bfloat16;
+    }
+
+    /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
+    /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
+    pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
+        if (configured == 0 and self.hadamard_block > 0) return 2;
+        return configured;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1609,6 +1634,19 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
 /// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
 /// vision token ids). The generic vision_config block already set
 /// `has_vision`; this reads Qwen's own keys into `qv_*`.
+/// One block for every packed module; mixed blocks are not a layout we serve.
+fn prismHadamardBlock(root: std.json.ObjectMap) !u32 {
+    const modules = (root.get("modules") orelse return error.UnsupportedHadamardLayout).array.items;
+    var block: i64 = 0;
+    for (modules) |m| {
+        const b = (m.object.get("block") orelse return error.UnsupportedHadamardLayout).integer;
+        if (b <= 0 or (block != 0 and b != block)) return error.UnsupportedHadamardLayout;
+        block = b;
+    }
+    if (block == 0) return error.UnsupportedHadamardLayout;
+    return @intCast(block);
+}
+
 fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj: std.json.ObjectMap) void {
     if (root.get("vision_config")) |vc_val| {
         if (vc_val == .object) {
@@ -2395,9 +2433,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
-        std.mem.eql(u8, model_type, "qwen3_5_text"))
+        std.mem.eql(u8, model_type, "qwen3_5_text") or
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
     {
         config.model_type = "qwen3_5_moe";
+        if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
         config.weight_prefix = "language_model.model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3573,6 +3613,24 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// that already loaded binds byte-identically. Scan order puts the most
 /// specific spelling first: a `model.language_model.*` checkpoint also
 /// satisfies the bare "model" probe.
+/// Prism Hadamard packs run f16 activations over f16 scales (the pack's own
+/// contract) and ship the unpacked tensors f32 (norms, conv, the dense GDN a/b
+/// rows, A_log, dt_bias): an f32 table widens the f16 residual, so those
+/// narrow to f16. Signs stay f32: the rotation runs in f32.
+pub fn narrowHadamardPackTables(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !void {
+    if (config.hadamard_block == 0) return;
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const v = kv.value_ptr.*;
+        if (mlx.mlx_array_dtype(v) != .float32) continue;
+        if (std.mem.endsWith(u8, kv.key_ptr.*, ".signs")) continue;
+        var cast = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cast, v, config.actDtype(), s));
+        _ = mlx.mlx_array_free(v);
+        kv.value_ptr.* = cast;
+    }
+}
+
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
     const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
     var known = false;
@@ -3594,7 +3652,17 @@ pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, false);
+    return loadWeightsOpt(io, allocator, model_dir, .{});
+}
+
+/// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
+/// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
+/// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+
+/// The text model's weights for `config`.
+pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3609,7 +3677,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 
     const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
     defer allocator.free(pathz);
-    try loadSafetensorsFile(allocator, &weights, pathz, s, false);
+    try loadSafetensorsFile(allocator, &weights, pathz, s, .{});
 
     if (weights.count() == 0) {
         log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
@@ -3619,13 +3687,13 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 }
 
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, true);
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
-fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_vision: bool) !Weights {
+fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDir(io, allocator, dir, model_dir, load_vision);
+    return loadWeightsFromOpenDir(io, allocator, dir, model_dir, opts);
 }
 
 /// Load every `*.safetensors` in an already-open `dir` into a Weights map.
@@ -3633,7 +3701,7 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// absolute path for `mlx_load_safetensors` and to phrase the error message.
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
-fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
+fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, opts: LoadOpts) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -3665,7 +3733,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
+        try loadSafetensorsFile(allocator, &weights, path, s, opts);
         file_count += 1;
     }
 
@@ -3728,7 +3796,12 @@ var narrow_1d_env: ?bool = null;
 fn narrow1dEnabled() bool {
     if (narrow_1d_env) |v| return v;
     const on = blk: {
-        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse break :blk true;
+        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse
+            break :blk builtin.os.tag.isDarwin();
+        // Default ON for Metal (bf16 is the wired-format win there). The
+        // Omarchy Vulkan backend has no bf16 GPU kernel ("No GPU kernel
+        // exists for it"), so off Darwin the default is OFF unless the env
+        // explicitly forces it.
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     narrow_1d_env = on;
@@ -3751,8 +3824,9 @@ pub fn loadSafetensorsFile(
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
-    load_vision: bool,
+    opts: LoadOpts,
 ) !void {
+    const load_vision = opts.vision;
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
 
@@ -3785,7 +3859,7 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+        if (!opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -3936,7 +4010,7 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
 
     try std.testing.expectError(
         error.NoWeightFiles,
-        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
+        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", .{}),
     );
 }
 
@@ -3960,7 +4034,7 @@ test "loadWeights reads only the shards the index names (issue #274)" {
     const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
     const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
     defer allocator.free(dir);
-    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
@@ -3983,7 +4057,7 @@ test "loadWeights ignores an index that names no shard on disk (re-sharded uploa
     const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
     const dir = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
     defer allocator.free(dir);
-    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, false);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
 }
@@ -5680,6 +5754,25 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
     try testing.expect(config.qwen_vision);
     try testing.expectEqual(@as(u32, 65536), config.qv_min_pixels);
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
+}
+
+test "ModelConfig prism_hadamard_qwen35 is qwen3_5 with the module Hadamard block" {
+    const json =
+        \\{
+        \\  "model_type": "prism_hadamard_qwen35",
+        \\  "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120, "num_hidden_layers": 64},
+        \\  "modules": [{"path": "lm_head", "block": 1024}, {"path": "model.layers.0.mlp.up_proj", "block": 1024}],
+        \\  "quantization": {"bits": 2, "group_size": 128, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqual(@as(u32, 1024), config.hadamard_block);
+    const mixed =
+        \\{"model_type": "prism_hadamard_qwen35", "text_config": {"hidden_size": 5120},
+        \\ "modules": [{"path": "a", "block": 1024}, {"path": "b", "block": 512}]}
+    ;
+    try testing.expectError(error.UnsupportedHadamardLayout, parseConfigFromJson(testing.allocator, mixed));
 }
 
 test "ModelConfig text-only qwen3_5 has no qwen_vision" {

@@ -1,3 +1,5 @@
+[English](cli.md) · [简体中文](zh-CN/cli.md)
+
 # CLI & server flags
 
 ## Ollama-style commands

@@ -70,7 +70,7 @@ struct ToolApprovalSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Allow this tool call?")
                         .font(.headline)
-                    Text(headline)
+                    Text(L10n.text(headline))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -83,7 +83,7 @@ struct ToolApprovalSheet: View {
                     .foregroundStyle(.secondary)
                 if argPairs.isEmpty && !request.rawArguments.isEmpty {
                     ScrollView {
-                        Text(request.rawArguments)
+                        Text(L10n.text(request.rawArguments))
                             .font(.system(size: 11, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -101,10 +101,10 @@ struct ToolApprovalSheet: View {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(argPairs, id: \.0) { (k, v) in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(k)
+                                    Text(L10n.text(k))
                                         .font(.system(size: 11, design: .monospaced).weight(.semibold))
                                         .foregroundStyle(.secondary)
-                                    Text(v)
+                                    Text(L10n.text(v))
                                         .font(.system(size: 11, design: .monospaced))
                                         .textSelection(.enabled)
                                         .lineLimit(8)
@@ -222,7 +222,7 @@ private struct AttachmentPreviewRow: View {
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(detail)
+                    Text(L10n.text(detail))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -253,11 +253,11 @@ private struct DocumentFolderChip: View {
                 .background(tint.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 1) {
-                Text(index.folderName)
+                Text(L10n.text(index.folderName))
                     .font(.caption.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(statusText)
+                Text(L10n.text(statusText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -1331,7 +1331,7 @@ struct ChatSidebar: View {
     private func sectionHeader<T: View>(_ title: String,
                                         @ViewBuilder trailing: () -> T) -> some View {
         HStack(spacing: 4) {
-            Text(title)
+        Text(L10n.text(title))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1423,8 +1423,9 @@ struct ChatSidebar: View {
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
-                    Text(ChatSessionTitle.display(title: session.title,
-                                                  agentName: agent?.name))
+                    let displayTitle = ChatSessionTitle.display(title: session.title,
+                                                                agentName: agent?.name)
+                    Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
@@ -1437,7 +1438,7 @@ struct ChatSidebar: View {
                 // one is a single line exactly like a destination row.
                 if let subject = ChatSessionTitle.subject(title: session.title,
                                                           agentName: agent?.name) {
-                    Text(subject)
+                    Text(L10n.text(subject))
                         .font(.caption2)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -1536,7 +1537,7 @@ struct ChatSidebar: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(t.displayName)
+                    Text(L10n.text(t.displayName))
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
@@ -1599,7 +1600,7 @@ struct ChatSidebar: View {
                         set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
                 }
             }
-            Button(t.isActive ? "End Session" : "Close", role: .destructive) {
+            Button(L10n.text(t.isActive ? "End Session" : "Close"), role: .destructive) {
                 requestCloseTerminal(t.id)
             }
         }
@@ -1747,7 +1748,7 @@ struct ChatSidebar: View {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
                 .frame(width: 16)
-            Text(title).font(.subheadline.weight(.medium))
+            Text(L10n.text(title)).font(.subheadline.weight(.medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
@@ -2003,7 +2004,7 @@ struct ChatDetailView: View {
                     } else {
                         Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
                     }
-                    Text(control.title)
+                    Text(L10n.text(control.title))
                         .font(.caption.weight(.semibold))
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
@@ -2035,7 +2036,7 @@ struct ChatDetailView: View {
             Button {
                 pickAttachment()
             } label: {
-                Label(attachmentMenuLabel, systemImage: "photo.on.rectangle")
+                Label(L10n.text(attachmentMenuLabel), systemImage: "photo.on.rectangle")
             }
             Button {
                 pickDocumentFolder()
@@ -2158,7 +2159,7 @@ struct ChatDetailView: View {
     @ViewBuilder private var reasoningEffortMenu: some View {
         Picker("Reasoning", selection: $reasoningEffort) {
             ForEach(ReasoningEffort.allCases) { effort in
-                Text(effort.label).tag(effort)
+                Text(L10n.text(effort.label)).tag(effort)
             }
         }
         .pickerStyle(.inline)
@@ -2261,16 +2262,16 @@ struct ChatDetailView: View {
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
             let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
             if !tools.isEmpty {
-            Section(group.title) {
+            Section(L10n.text(group.title)) {
                 ForEach(tools, id: \.self) { tool in
                     let allowed = agentAllowedTools.contains(tool)
                     Button {
                         setTool(tool, enabled: !isToolEnabled(tool))
                     } label: {
                         if isToolEnabled(tool) {
-                            Label(tool.displayName, systemImage: "checkmark")
+                            Label(L10n.text(tool.displayName), systemImage: "checkmark")
                         } else if allowed {
-                            Text(tool.displayName)
+                            Text(L10n.text(tool.displayName))
                         } else {
                             // The agent forbids it — say so rather than showing
                             // an off switch the user can't turn on.
@@ -2290,7 +2291,7 @@ struct ChatDetailView: View {
             }
         }
         .disabled(isExternalBridgeSession)
-        Text(session?.workingDirectory ?? "No workspace set")
+        Text(L10n.text(session?.workingDirectory ?? "No workspace set"))
     }
 
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
@@ -2393,7 +2394,7 @@ struct ChatDetailView: View {
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
                                                     serverRunning: canAnswer) {
-                Text(subtitle)
+                Text(L10n.text(subtitle))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -2745,17 +2746,18 @@ struct ChatDetailView: View {
                         }
                     }
                 } else if videoSupported, provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
-                    // Decode inside the closure — the temp URL is only valid here.
+                    // The temp URL is only valid inside the closure and frame
+                    // extraction is async, so decode from a copy we own.
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
                         guard let url = url else { return }
-                        let name = url.lastPathComponent
-                        let frames = VideoPreprocessor.extractFrames(url: url)
+                        let copy = FileManager.default.temporaryDirectory
+                            .appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+                        guard (try? FileManager.default.copyItem(at: url, to: copy)) != nil else {
+                            DispatchQueue.main.async { showVideoError(url.lastPathComponent) }
+                            return
+                        }
                         DispatchQueue.main.async {
-                            if let frames, !frames.isEmpty {
-                                pendingVideos.append(ChatVideo(name: name, frames: frames))
-                            } else {
-                                showVideoError(name)
-                            }
+                            addVideoAttachment(copy, name: url.lastPathComponent, removeAfter: true)
                         }
                     }
                 } else if let imageType = provider.registeredTypeIdentifiers.first(where: {
@@ -3015,7 +3017,7 @@ struct ChatDetailView: View {
             }
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
-                    Text(composerPlaceholder)
+                    Text(L10n.text(composerPlaceholder))
                         .font(.body)
                         .foregroundStyle(.secondary)
                         .padding(.leading, ComposerTextMetrics.placeholderLeading)
@@ -3279,11 +3281,12 @@ struct ChatDetailView: View {
 
     /// Extract frames from a video file (off the main thread — AVFoundation
     /// decode can be slow) and add it as a pending attachment.
-    private func addVideoAttachment(_ url: URL) {
-        let name = url.lastPathComponent
-        DispatchQueue.global(qos: .userInitiated).async {
-            let frames = VideoPreprocessor.extractFrames(url: url)
-            DispatchQueue.main.async {
+    private func addVideoAttachment(_ url: URL, name: String? = nil, removeAfter: Bool = false) {
+        let name = name ?? url.lastPathComponent
+        Task.detached(priority: .userInitiated) {
+            let frames = await VideoPreprocessor.extractFrames(url: url)
+            if removeAfter { try? FileManager.default.removeItem(at: url) }
+            await MainActor.run {
                 if let frames, !frames.isEmpty {
                     pendingVideos.append(ChatVideo(name: name, frames: frames))
                 } else {
@@ -3953,7 +3956,7 @@ struct GeneratingIndicator: View {
                     .foregroundStyle(memColor)
                 Text("·")
                     .foregroundStyle(.tertiary)
-                Text(whimsy)
+                Text(L10n.text(whimsy))
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
                 Text("·")
@@ -4146,7 +4149,7 @@ struct MessageBubble: View {
                     HStack(spacing: 6) {
                         Image(systemName: "brain")
                             .symbolEffect(.pulse, isActive: isThinkingNow)
-                        Text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds))
+                        Text(L10n.text(ThinkingDuration.label(seconds: isThinkingNow ? nil : message.thinkingSeconds)))
                         Spacer(minLength: 8)
                         Image(systemName: "chevron.right")
                             .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
@@ -4158,7 +4161,7 @@ struct MessageBubble: View {
                 .buttonStyle(.plain)
 
                 if thinkingExpanded {
-                    Text(reasoning)
+                    Text(L10n.text(reasoning))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -4303,7 +4306,7 @@ struct MessageBubble: View {
                                             .controlSize(.mini)
                                             .colorScheme(.dark)
                                     } else {
-                                        Button(isFolded ? "Show more" : "Show less") { toggleLongTurn() }
+                                        Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
                                             .buttonStyle(.plain)
                                             .font(.caption.weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
@@ -4352,7 +4355,7 @@ struct MessageBubble: View {
                 // under the bubble — never appended into content, which rides
                 // back to the model as history.
                 if let notice = message.truncationNotice, !message.isStreaming {
-                    Text(notice.text)
+                    Text(L10n.text(notice.text))
                         .font(.callout)
                         .italic()
                         .foregroundStyle(.secondary)
@@ -4588,8 +4591,10 @@ struct MessageBubble: View {
                                                                 count: message.revisions.count))
                     }
                     .disabled(!MessageRevisions.canGoBack(index: message.activeRevision))
-                    Text(MessageRevisions.label(index: message.activeRevision,
-                                                count: message.revisions.count))
+                    Text(
+                                                MessageRevisions.label(index: message.activeRevision,
+                                                count: message.revisions.count)
+)
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                     footerButton("chevron.right", help: "Next version of this reply") {
@@ -4707,7 +4712,7 @@ private struct FooterIconButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(help)
+        .help(L10n.text(help))
     }
 }
 
@@ -4754,7 +4759,7 @@ private struct StatPill: View {
     }
 
     private func label(_ string: String) -> some View {
-        Text(string)
+        Text(L10n.text(string))
             .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -5035,7 +5040,7 @@ private struct ToolCallRow: View {
     /// The one place a tool's name is drawn, so `server__tool` reads as a path
     /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
     @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
-        Text(ToolCallDisplay.displayName(name))
+        Text(L10n.text(ToolCallDisplay.displayName(name)))
             .font(.caption.monospaced())
             .foregroundStyle(Color.accentColor.opacity(0.7))
         if let variant {
@@ -5138,7 +5143,7 @@ private struct ToolCallRow: View {
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.leading)
                         .fixedSize(horizontal: true, vertical: false)
-                    Text(result)
+                    Text(L10n.text(result))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)

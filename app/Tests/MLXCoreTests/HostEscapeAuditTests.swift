@@ -87,7 +87,6 @@ final class HostEscapeAuditTests: XCTestCase {
     /// Entries in `known` that no longer spawn anything must be deleted, or the
     /// list rots into a permanent excuse.
     func testKnownEscapeListHasNoStaleEntries() throws {
-        let fm = FileManager.default
         let regex = try NSRegularExpression(pattern: Self.spawnPattern)
 
         var stale: [String] = []

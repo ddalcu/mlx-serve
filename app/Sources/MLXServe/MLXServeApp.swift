@@ -96,8 +96,8 @@ struct MLXCoreApp: App {
                         path: path, title: ModelDisplayName.pretty((path as NSString).lastPathComponent))
                     openAndFocus("modelSettings")
                 },
-                openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
+                openBenchmarks: { openAndFocus("benchmarks") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -205,6 +205,18 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 560)
 
+        // Benchmarks: run a pinned suite against the loaded model, keep the
+        // history locally, and compare against what other people measured.
+        // Its own window rather than a tray popover because a run takes
+        // minutes and a popover dismisses the moment you click away.
+        Window("Benchmarks", id: "benchmarks") {
+            BenchmarkView()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .appAppearance()
+        }
+        .defaultSize(width: 1040, height: 680)
+
         // Per-model settings for the tray's selected model. A window, not a
         // sheet: the MenuBarExtra popover cannot host one.
         Window("Model Settings", id: "modelSettings") {
@@ -271,6 +283,12 @@ struct MLXCoreApp: App {
 
                 Button("Browser") { openAndFocus("browser") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
+
+                // The tray button is disabled until the server is running;
+                // this stays reachable so the History and Community panes can
+                // be opened without a live server.
+                Button("Benchmarks…") { openAndFocus("benchmarks") }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
 
                 Button("Settings…") { appState.showSettings() }
                     .keyboardShortcut(",", modifiers: [.command])

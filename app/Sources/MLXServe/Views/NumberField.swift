@@ -36,7 +36,7 @@ struct NumberField: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
             // Body, not caption: a bezeled field is as tall as its font, and a
             // caption-sized box sat visibly below the pickers beside it.
@@ -83,7 +83,7 @@ struct OptionalNumberField: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
             // Body, not caption: a bezeled field is as tall as its font, and a
             // caption-sized box sat visibly below the pickers beside it.

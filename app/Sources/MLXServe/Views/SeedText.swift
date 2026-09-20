@@ -104,7 +104,7 @@ struct SeedField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             // 4pt, tighter than the gap between two form controls: the dice
             // belongs to the box beside it, not to the row.
             HStack(spacing: 4) {
@@ -134,7 +134,7 @@ struct SeedField: View {
     }
 
     private var field: some View {
-        TextField(placeholder, text: $text)
+        TextField(L10n.text(placeholder), text: $text)
                 .textFieldStyle(.roundedBorder)
                 // Body, not caption: the bezel follows the font, and a smaller
                 // one sits below the controls it shares a row with.

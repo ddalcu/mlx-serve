@@ -356,6 +356,22 @@ else
     bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$(grep -c 'dflash context restored' "$LOG")"
 fi
 
+# [11b] The first request of a burst is admitted alone and arms DFlash; once the
+# others arrive it must yield and decode in the batched group, not tick serial beside it.
+gen "Write a long story about a lighthouse keeper and the winter storms." 200 ", \"enable_drafter\": true" > /dev/null &
+BURST_PIDS="$!"
+sleep 1
+for i in 2 3 4; do
+    gen "Write a long story about harbour pilot number $i and the fog." 120 "" > /dev/null &
+    BURST_PIDS="$BURST_PIDS $!"
+done
+wait $BURST_PIDS
+if grep -q "dflash=disabled (company" "$LOG"; then
+    ok "a DFlash slot that gains company yields to the batched group"
+else
+    bad "a DFlash slot that gains company yields to the batched group" "$(grep -c 'mode=dflash' "$LOG") dflash requests, no company yield logged"
+fi
+
 # [12] The assistant context also survives the SSD tier (v4 spec sidecar):
 # same prompt across a SERVER RESTART with --prefix-cache-disk must restore
 # the trunk from disk AND the dflash context beside it — a disk hit used to

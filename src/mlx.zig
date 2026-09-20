@@ -73,6 +73,7 @@ pub extern "c" fn mlx_string_free(str: mlx_string) c_int;
 // Device
 pub extern "c" fn mlx_device_new() mlx_device;
 pub extern "c" fn mlx_device_new_type(dtype: mlx_device_type, index: c_int) mlx_device;
+pub extern "c" fn mlx_device_is_available(avail: *bool, dev: mlx_device) c_int;
 pub extern "c" fn mlx_device_free(dev: mlx_device) c_int;
 pub extern "c" fn mlx_get_default_device(dev: *mlx_device) c_int;
 pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
@@ -211,6 +212,7 @@ pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_hadamard_transform(res: *mlx_array, a: mlx_array, scale: mlx_optional_float, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
@@ -346,6 +348,7 @@ pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_me
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
@@ -360,6 +363,7 @@ pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 // Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
 // Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 
@@ -419,7 +423,18 @@ var no_gpu_backend_cache: ?bool = null;
 pub fn noGpuBackend() bool {
     if (no_gpu_backend_cache == null) {
         var avail: bool = false;
-        _ = mlx_metal_is_available(&avail);
+        if (comptime builtin.os.tag.isDarwin()) {
+            _ = mlx_metal_is_available(&avail);
+        } else {
+            // Non-Darwin backends (mlx-omarchy Vulkan) are invisible to
+            // mlx_metal_is_available. Ask the device API directly: the GPU
+            // device reports availability whether the backend is Metal,
+            // Vulkan or CUDA, and mlx_default_gpu_stream_new() resolves to
+            // that device's stream.
+            const dev = mlx_device_new_type(.gpu, 0);
+            defer _ = mlx_device_free(dev);
+            _ = mlx_device_is_available(&avail, dev);
+        }
         no_gpu_backend_cache = !avail;
     }
     return no_gpu_backend_cache.?;

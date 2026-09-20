@@ -23,7 +23,7 @@ struct AudioGenView: View {
         VStack(spacing: 0) {
             Picker("", selection: $tab) {
                 ForEach(Tab.allCases, id: \.self) { t in
-                    Text(t.rawValue).tag(t)
+                    Text(L10n.text(t.rawValue)).tag(t)
                 }
             }
             .pickerStyle(.segmented)
@@ -75,7 +75,7 @@ struct AudioHistoryShelf: View {
         Group {
             if !paths.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     ScrollView {
                         VStack(spacing: 2) {
                             ForEach(paths, id: \.self) { path in
@@ -269,7 +269,7 @@ struct VoiceGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -321,7 +321,7 @@ struct VoiceGenView: View {
             )
         }
         .buttonStyle(.plain)
-        .help(dictating ? "Stop dictation" : "Dictate the text instead of typing it")
+        .help(L10n.text(dictating ? "Stop dictation" : "Dictate the text instead of typing it"))
     }
 
     private func toggleDictation() {
@@ -475,7 +475,7 @@ struct VoiceGenView: View {
                     trailing: MediaDropWellOption(
                         title: "Record audio…",
                         systemImage: "microphone.badge.plus",
-                        caption: "~\(model.recommendedRefSeconds)s recommended",
+                        caption: L10n.format("~%llds recommended", Int64(model.recommendedRefSeconds)),
                         action: startRecording))
             }
 

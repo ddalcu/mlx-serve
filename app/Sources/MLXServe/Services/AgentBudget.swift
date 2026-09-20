@@ -124,9 +124,11 @@ enum AgentConfigs {
     /// `supportsReasoningEffort: true` is what lets pi's own reasoning-level
     /// picker reach the server. With it false the level was a local label pi
     /// never transmitted, so every request arrived effort-less and took the
-    /// server's default. It rides BOTH surfaces (here and the extension's
-    /// per-model COMPAT) because applyExtension does not inherit provider
-    /// compat — `AgentBudgetTests` pins the two together.
+    /// server's default. No `thinkingFormat`: pi's `qwen` format sends only
+    /// `enable_thinking` and drops the level; the default sends it as
+    /// `reasoning_effort`, and `thinkingLevelMap.off` makes off an explicit
+    /// "none". Both ride BOTH surfaces (here and the extension's per-model
+    /// definition) because applyExtension does not inherit provider compat.
     static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
                              apiKey: String = "mlx-serve") -> String {
         """
@@ -139,12 +141,12 @@ enum AgentConfigs {
               "compat": {
                 "supportsDeveloperRole": false,
                 "supportsReasoningEffort": true,
-                "maxTokensField": "max_tokens",
-                "thinkingFormat": "qwen"
+                "maxTokensField": "max_tokens"
               },
               "models": [
                 {"id": "\(model)", "name": "mlx-\(model)", "input": ["text"],
-                 "contextWindow": \(budget.context), "maxTokens": \(budget.output), "reasoning": true}
+                 "contextWindow": \(budget.context), "maxTokens": \(budget.output), "reasoning": true,
+                 "thinkingLevelMap": {"off": "none"}}
               ]
             }
           }
@@ -190,7 +192,7 @@ enum AgentConfigs {
     /// snapshot. `models.json` keeps the served model as the static
     /// fallback — an unreachable server registers NOTHING.
     ///
-    /// Contracts verified against pi 0.80.10 (the pinned sandbox version):
+    /// Contracts verified against pi 0.80.10:
     /// extensions default-export a factory; `applyExtension` spreads ONLY
     /// the model definition, so `compat` must ride EVERY model (the
     /// provider-level compat in models.json is not inherited); `cost` is a
@@ -205,7 +207,6 @@ enum AgentConfigs {
           supportsDeveloperRole: false,
           supportsReasoningEffort: true,
           maxTokensField: "max_tokens",
-          thinkingFormat: "qwen",
         };
 
         async function fetchMlxModels() {
@@ -240,6 +241,7 @@ enum AgentConfigs {
                   contextWindow: ctx,
                   maxTokens: maxTokens,
                   compat: COMPAT,
+                  thinkingLevelMap: { off: "none" },
                 };
               });
           } catch {

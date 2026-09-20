@@ -6,8 +6,8 @@ import XCTest
 /// the full chat-capable registry (LAN @peer entries included).
 ///
 /// pi is special: its models.json list is static, but pi ships a first-class
-/// extension API (`pi.registerProvider`, verified in 0.80.10 — the pinned
-/// sandbox version). We write an extension that fetches the server's live
+/// extension API (`pi.registerProvider`, verified in 0.80.10).
+/// We write an extension that fetches the server's live
 /// `/v1/models` at session start, so pi's picker tracks reality (LAN peers
 /// come and go) instead of a launch-time snapshot. opencode and hermes have
 /// no such hook — they get the snapshot baked into their configs.
@@ -107,9 +107,9 @@ final class AgentModelListTests: XCTestCase {
         // provider-composer's applyExtension spreads ONLY the definition —
         // provider-level compat from models.json is NOT stamped onto
         // extension-registered models. Without per-model compat pi would use
-        // max_completion_tokens + the wrong thinking format.
+        // max_completion_tokens, and without the level map "off" would send nothing.
         let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://h:1")
-        for needle in ["maxTokensField", "max_tokens", "thinkingFormat", "qwen",
+        for needle in ["maxTokensField", "max_tokens", "thinkingLevelMap",
                        "supportsDeveloperRole", "supportsReasoningEffort"] {
             XCTAssertTrue(js.contains(needle), "compat field \(needle) missing: \(js)")
         }

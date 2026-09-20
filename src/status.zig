@@ -102,6 +102,8 @@ var prev_ticks: [4]u64 = @splat(0);
 // ── Public metric helpers ──
 
 pub fn getAppRssMb() u32 {
+    if (comptime !builtin.os.tag.isDarwin())
+        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
     var info = std.mem.zeroes(TaskBasicInfo);
     var count: u32 = @sizeOf(TaskBasicInfo) / @sizeOf(i32);
     if (task_info(mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
@@ -111,7 +113,11 @@ pub fn getAppRssMb() u32 {
 /// Process physical memory footprint in MB (TASK_VM_INFO flavor 22). Unlike
 /// resident_size, this includes MLX's Metal/IOKit + compressed memory — the
 /// only figure that reflects a loaded model's true footprint on Apple Silicon.
+/// On Linux the honest analog is VmRSS (unified-memory footprint has no
+/// equivalent); swap-paged-out pages are invisible to it.
 pub fn getAppMemFootprintMb() u32 {
+    if (comptime !builtin.os.tag.isDarwin())
+        return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
     var info = std.mem.zeroes(TaskVmInfo);
     var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
     if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
@@ -158,8 +164,9 @@ pub fn getProcAvailableMemBytes() u64 {
     return @intCast(os_proc_available_memory());
 }
 
-/// Total physical RAM (hw.memsize; works on macOS and iOS). 0 on failure.
+/// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
 pub fn getTotalMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemTotal:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -167,6 +174,7 @@ pub fn getTotalMemBytes() u64 {
 }
 
 pub fn getAvailableMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -179,6 +187,49 @@ pub fn getAvailableMemBytes() u64 {
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
     return computeAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, vm.internal_page_count, vm.purgeable_count, page);
+}
+
+/// One `/proc/meminfo` field in KiB ("MemTotal:", "MemAvailable:", …).
+/// 0 when missing or unreadable — callers treat 0 as "unknown".
+fn linuxMemInfoKib(key: []const u8) u64 {
+    var buf: [8192]u8 = undefined;
+    const n = readProcFile("/proc/meminfo", &buf) orelse return 0;
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const val = std.mem.trim(u8, line[key.len..], " \t");
+        const end = std.mem.indexOf(u8, val, " kB") orelse val.len;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch 0;
+    }
+    return 0;
+}
+
+/// One `/proc/self/status` field in KiB ("VmRSS:", "VmHWM:", …). 0 unknown.
+fn linuxProcStatusKib(key: []const u8) u64 {
+    var buf: [8192]u8 = undefined;
+    const n = readProcFile("/proc/self/status", &buf) orelse return 0;
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const val = std.mem.trim(u8, line[key.len..], " \t");
+        const end = std.mem.indexOf(u8, val, " kB") orelse val.len;
+        return std.fmt.parseInt(u64, std.mem.trim(u8, val[0..end], " \t"), 10) catch 0;
+    }
+    return 0;
+}
+
+/// Whole-file read of a small procfs file. Returns null when missing/unreadable.
+fn readProcFile(path: []const u8, buf: []u8) ?usize {
+    if (path.len >= std.fs.max_path_bytes) return null;
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0].ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    return @intCast(n);
 }
 
 test "computeAvailableBytes counts the resident anon set, not file cache or purgeable" {
@@ -213,6 +264,14 @@ test "computeAvailableBytes counts the resident anon set, not file cache or purg
 }
 
 pub fn getSysMemPct() u32 {
+    if (comptime !builtin.os.tag.isDarwin()) {
+        // (total - available) / total — available already excludes reclaimable
+        // page cache, so this matches the Mach wire+compressor+anon intent.
+        const total = linuxMemInfoKib("MemTotal:");
+        if (total == 0) return 0;
+        const avail = linuxMemInfoKib("MemAvailable:");
+        return @intCast((total -| avail) * 100 / total);
+    }
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
@@ -230,6 +289,37 @@ pub fn getSysMemPct() u32 {
 }
 
 pub fn getCpuPct() u32 {
+    if (comptime !builtin.os.tag.isDarwin()) {
+        // /proc/stat aggregate line: "cpu  user nice system idle iowait irq
+        // softirq steal ...". Delta over the calls, idle = nice-adjusted idle
+        // columns, mirroring the Mach ticks loop below.
+        var buf: [512]u8 = undefined;
+        const n = readProcFile("/proc/stat", &buf) orelse return 0;
+        const line_end = std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n;
+        var it = std.mem.tokenizeAny(u8, buf[0..line_end], " \t");
+        _ = it.next(); // "cpu"
+        var ticks: [4]u64 = @splat(0);
+        var all: [10]u64 = @splat(0);
+        var i: usize = 0;
+        while (it.next()) |tok| : (i += 1) {
+            if (i >= 10) break;
+            all[i] = std.fmt.parseInt(u64, tok, 10) catch 0;
+        }
+        ticks[0] = all[0] + all[1] + all[2]; // user+nice+system
+        ticks[1] = 0;
+        ticks[2] = 0;
+        ticks[3] = all[3] + all[4]; // idle + iowait
+        var total: u64 = 0;
+        var idle: u64 = 0;
+        for (0..4) |j| {
+            const delta = ticks[j] -| prev_ticks[j];
+            total += delta;
+            if (j == 3) idle = delta;
+            prev_ticks[j] = ticks[j];
+        }
+        if (total == 0) return 0;
+        return @intCast((total - idle) * 100 / total);
+    }
     var info = std.mem.zeroes(CpuLoadInfo);
     var count: u32 = 4;
     if (host_statistics(mach_host_self(), 3, @ptrCast(&info), &count) != 0) return 0;

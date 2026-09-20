@@ -2,6 +2,9 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Five request edges that answered 200 with the wrong thing (2026-09-16)
+A one-model sweep of malformed and out-of-range bodies (`tests/test_api_edges.sh`, 58 checks over the four text surfaces + Ollama) found five silent misbehaviours, none crashing, all answering: `stop: ""` (and `""` inside a stop array) matched at position 0 and returned an empty reply with `finish_reason: stop`; `response_format: {type: json_schema}` with no `schema`, or a non-object one, fell open to prompt-only JSON and shipped `{"text": "Hello".}`; an `image_url` the server could not decode — a remote `http://` URL (never fetched), bad base64, an unreadable payload — was dropped from the prompt and the model answered "Since you haven't provided an image" with a 200, on all three surfaces; an empty `/v1/embeddings` input was a 500; and Ollama's load handshake (`/api/generate` with no prompt, what open-webui sends to warm a model) was a 400. Fixes: empty stops are skipped at every parse site; a `json_schema` without an object schema is a named 400 on all three surfaces (`output_config.format` and `text.format` fell open the same way); `appendImageUrlContent` reports whether it appended and an active-turn image that did not is a named 400 on chat, messages and responses (historical images are never decoded, so never refused); empty embedding entries are a 400; the handshake answers `done: true, done_reason: load` without a forward. Guards: `tests/test_api_edges.sh`, `parseInput records an input_image the decoder could not read` (responses.zig), `ollama: generate with no prompt is the load handshake` (ollama.zig).
+
 ### A reasoning budget that only trims delivery cannot stop a thought from eating max_tokens 
 pi on Qwen3.8-Flash-Next with `contextWindow` 8k then 24k: every design turn came back `length` with empty content. Two causes, one per effort level. At `low` pi sends `reasoning_effort: low`; on Qwen3.8 the template reads the word, so since 2026-08-14 no budget was derived from it, and even where a budget applied it was a display trim after generation: nothing ever closed the think block. At `xhigh` no budget exists by design, and the launcher's output share (ctx/4 = 6144 at 24k, shrunk further by pi's per-turn estimate) was smaller than one thought. vLLM and SGLang enforce a thinking budget in-stream, Qwen's recipe: at the budget append "Considering the limited time by the user, I have to give the solution based on the thinking directly now." plus `</think>` and keep generating. Fix, both halves: `armThinkBound` resolves atomic opener/closer ids + the forced sequence per request and hangs a `ThinkBound` on the sampling params; `thinkBoundTick` (inside the pre-step guard every decode path runs) commits the forced tokens as one multi-token forward from any inter-tick state and routes the rest of the request regular; the surfaces get budget -1 so the closed thought streams whole. The effort word maps to a budget on consuming templates again, but only where the bound can arm. The launcher share moved to ctx/2 in all three copies. Not live-tested: the batched (N>1) path after a fire, and MTP-armed requests (the answer decodes plain, `.think_bound`). Guards: `ThinkBound` unit test, `tests/test_reasoning_budget_stream.sh` (stream + non-stream, closed thought, answer present), `budgetForContext` + `AgentBudgetTests`.
 
@@ -2129,10 +2132,15 @@ was `\n`, the grammar accepted free whitespace without bound, and thirty of them
 tripped the exact-cycle loop guard: `finish_reason "length"`, empty content, valid
 JSON never produced. Cold requests were fine, and main and PR #407 behaved the same.
 
-Fix: `json_grammar` counts consecutive free-whitespace bytes (`ws_run`, carried by
-snapshots) and rejects past `MAX_FREE_WS` (16) between tokens and after the root, so
-the mask forces the next structural byte. Content is never constrained by it, only
-formatting. Guard: `free whitespace is capped so a masked model cannot idle forever`.
+Fix: the grammar admits no whitespace outside the root value (before or after it) and
+keeps the capped free whitespace inside it, so the mask forces `{` at once and the
+model's own layout stays. llmprobe (2026-09-16) had caught Flash Next at high effort
+answering `\r   \r   \r  {` with 2-space indentation streamed and 6-space non-streamed;
+the cause was the warm-restore prefill split (engine-mlx.md, same date), and a fully
+compact grammar shipped first as the symptom fix. Compact cost quality: on a 0.8B the
+forced `:"` boundary decoded the rare name `Olu` as `Ohu` in 4 of 30 extraction records
+(30/30 with its own layout, Flash Next 30/30 either way), so only the outside is
+compact. Guard: `grammar admits free whitespace inside the root value only`.
 
 ## ds4 sessions were per request; embeddings segfaulted on an engine-backed model (2026-09-14)
 
@@ -2192,3 +2200,82 @@ Fix: `server.encodeText` owns the branch (ds4 vocab, llama.cpp vocab, else BPE) 
 sites call it. Live on ds4 / llama.cpp / MLX: 196 / 590 / 67 reasoning tokens.
 
 Guard: the format matrix's `usage reasoning_tokens > 0` check on a GGUF arm.
+
+## Logprobs in the logits dtype; Responses dropped the budget (2026-09-18)
+
+- `computeLogprobs` ran `log(softmax(x))` in the logits dtype: bf16 rounded
+  every probability before the log (logprobs off by up to ~0.06 at -16), and
+  f16 logits underflowed to `-inf` plus a NaN, which is invalid JSON on
+  `/v1/completions`. Now `logits - logsumexp` in f32. Guard: unit test
+  `computeLogprobs: f16 logits keep finite, exact log-probabilities`.
+- `/v1/responses` parsed `reasoning.effort` and discarded the budget, so a
+  capped effort thought until `max_output_tokens` and ended `incomplete`. It
+  now takes chat's precedence (`reasoning_budget_tokens` > effort word >
+  `--reasoning-budget`, Qwen3.8 implicit low) and arms the decode-time bound.
+  Guard: `tests/test_reasoning_budget_stream.sh` (responses cases).
+
+## Cancel mid-tick read a freed ThinkBound (2026-09-18)
+
+Stopping a pi request while a second MTP stream decoded killed the server: SIGSEGV in
+`thinkBoundTick` under `runMtpGroups`, at a thread-stack address.
+
+Cause: `sampling.think_bound` (and `constraint`) point into the request handler's frame.
+`complete` removed the slot from `decoding` and returned; the handler freed its state, but
+the inference thread was already inside a tick whose snapshot held the slot, and the group
+fallback ticked it without re-checking `cancelled`.
+
+Fix: `Slot.in_pass` counts inference-thread passes holding the slot, taken under
+`queue_mu` wherever a pass takes it (prefill pop, the step-3 snapshot, `interleaveDecodeTick`).
+`complete` waits for zero before handing the slot to the cleanup queue.
+
+Guard: `tests/test_cancel_mid_tick.sh` (two MTP streams, kill one every 3 s):
+HEAD crashed on the 2nd cancel, the fix survived 15.
+
+## Concurrent long prompts were each admitted against the same free memory
+
+Defect: four 64K requests arriving together on a 27B under a 36 GB wired limit were all admitted
+(8.4 GB each against the same 19.9 GB available); the fourth prefill overran the limit. On macOS
+26.5 that was not a Metal OOM but an IOGPU kernel panic.
+
+Cause: the admission bill runs on the connection thread, before any sibling has allocated. The
+inference-thread re-ask that sees live memory was armed for `longCtxGated` archs only. A DFlash
+drafter's per-request context K/V (20 KB/token on the 27B pack) was in no bill at all.
+
+Fix: before each prefill the inference thread re-asks the cold bill against live memory
+(`scheduler.slotHoldsForMemory`). A request that does not fit while others are live goes back
+to the head of `pending` and waits for one to finish (`holdsForMemory`); alone it proceeds as
+before, so nothing can wait forever. `ModelConfig.drafter_ctx_bytes_per_token` is stamped at
+load and billed per prompt row.
+
+Guard: `tests/test_memory_pressure_4way.sh` (2B model under `MLX_SERVE_GPU_CEILING_MB`, which
+bounds the guards' arithmetic only) asserts served-or-named, an `[admission] held` line, and a
+live server. Rule: a transient or per-request state that scales with KV length is billed, or
+capped, before it is allocated.
+
+## A chunk boundary is the only yield point, so the chunk IS the stall (2026-09-20)
+
+Cold 4-way long prompts on the 27B starved the streams already decoding: client-side they
+saw one tick per prefill chunk. The fix attempted first (up to 8 ticks per boundary,
+`interleaveTicksFor`, a quarter of wall time) changed nothing at 8K because the pinned chunk
+is 8192 there: an 8K prompt has NO boundary, a 33 s stall. `companyPrefillChunk` narrows the
+prefill to 2048 while anyone decodes. What this buys is the inter-token GAP. It does not move
+4-way aggregate (28.4 vs 28.7 tok/s at 8K, 16.0 vs 15.9 at 16K, last TTFT flat): three
+serialized prefills sit inside the window, and the batched tail is the efficient place to
+decode anyway. Guard: `tests/test_prefill_interleave.sh`, unit tests on both pure functions.
+
+## A re-bill against live memory cannot see a sibling that has not allocated yet (2026-09-20)
+
+Round 1 re-billed every request against live memory before its prefill. Four 32K requests
+restored from the hot cache still overran a 36 GB limit (`Insufficient Memory` in the batched
+verify, all four "generation failed"), and the same build kernel-panicked a 16 GB M4 mini at
+8K x4 (15.4 GB wired, 14 MB free). The log shows why: each sibling read `needed=3027 MB
+available=9499 MB`. A restored prefix shares the cached buffers by refcount until its first
+append, so active memory does not move when it is admitted; the next bill sees the same free
+bytes, and all of them grow together during decode. Fix: `PromiseLedger` carries what admitted
+requests were promised and have not allocated (promised minus the growth of active memory since
+the first outstanding admit), and the hold reads `needed + outstanding <= available`. Second
+half: `physicalMemoryCeiling` counted ALL free RAM as ours; MLX wires what it allocates, so
+`osReserveBytes` (an eighth of RAM, 2..8 GB) stays out of the plan. A promise is dropped once its slot has decoded 64 tokens (the restored KV is copied on the first
+append, so the claim is in live memory by then), and a sibling keeps 2 GB of slack under the
+ceiling because a group's verify transients grow with its lanes. The failing cell now serves
+4/4 together after short holds (TTFT 3.6 / 7.6 s), peak 35.6 -> 33.2 GB, no Metal error.

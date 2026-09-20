@@ -20,7 +20,7 @@ struct ModelDetailSheet: View {
                     Text(request.title)
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
-                    Text(request.repoId)
+                    Text(L10n.text(request.repoId))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)

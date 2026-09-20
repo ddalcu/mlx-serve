@@ -113,12 +113,12 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                 if !cur.detail.isEmpty || cur.ram != nil {
                     HStack(spacing: 4) {
                         if !cur.detail.isEmpty {
-                            Text(cur.detail)
+                            Text(L10n.text(cur.detail))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         if let ram = cur.ram {
-                            Text(ram)
+                            Text(L10n.text(ram))
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
                         }
@@ -188,9 +188,9 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                             onSelectLan(m.name)
                         } label: {
                             if lanModel == m.name {
-                                Label(m.lanDisplayName, systemImage: "checkmark")
+                                Label(L10n.text(m.lanDisplayName), systemImage: "checkmark")
                             } else {
-                                Text(m.lanDisplayName)
+                                Text(L10n.text(m.lanDisplayName))
                             }
                         }
                     }
@@ -212,9 +212,9 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
             onSelect(preset)
         } label: {
             if lanModel == nil && preset.id == selectedId {
-                Label(title, systemImage: "checkmark")
+                Label(L10n.text(title), systemImage: "checkmark")
             } else {
-                Text(title)
+                Text(L10n.text(title))
             }
         }
     }
@@ -249,7 +249,7 @@ extension MediaModelChooser {
             lanModel: lanModel.wrappedValue,
             capabilityOf: capabilityOf,
             isDownloaded: { downloads.bundleReady(bundleOf($0)) },
-            downloadLabel: { "Download \(bundleOf($0).approxSizeLabel)" },
+            downloadLabel: { L10n.format("Download %@", bundleOf($0).approxSizeLabel) },
             onSelect: { preset in
                 lanModel.wrappedValue = nil
                 selected.wrappedValue = preset

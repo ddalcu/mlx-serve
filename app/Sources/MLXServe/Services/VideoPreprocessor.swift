@@ -28,9 +28,10 @@ enum VideoPreprocessor {
 
     /// Returns JPEG frame bytes (one per sampled frame, in playback order), or
     /// nil if the file can't be read or has no readable duration.
-    static func extractFrames(url: URL, maxFrames: Int = maxFrames) -> [Data]? {
+    nonisolated static func extractFrames(url: URL, maxFrames: Int = maxFrames) async -> [Data]? {
         let asset = AVURLAsset(url: url)
-        let seconds = CMTimeGetSeconds(asset.duration)
+        guard let duration = try? await asset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
         guard seconds.isFinite, seconds > 0, maxFrames > 0 else { return nil }
 
         let gen = AVAssetImageGenerator(asset: asset)
@@ -43,7 +44,7 @@ enum VideoPreprocessor {
         frames.reserveCapacity(maxFrames)
         for t in frameTimes(duration: seconds, count: maxFrames) {
             let time = CMTime(seconds: t, preferredTimescale: 600)
-            guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { return nil }
+            guard let cg = try? await gen.image(at: time).image else { return nil }
             let rep = NSBitmapImageRep(cgImage: cg)
             guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
             else { return nil }

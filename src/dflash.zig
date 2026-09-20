@@ -1170,6 +1170,11 @@ fn loadDynConv(
 
 // ── Per-request context cache ──
 
+/// Bytes of `DflashCtx` K/V one trunk token costs (dense bf16, every assistant layer).
+pub fn ctxBytesPerToken(cfg: *const DflashConfig) u64 {
+    return @as(u64, cfg.num_hidden_layers) * 2 * cfg.num_key_value_heads * cfg.head_dim * 2;
+}
+
 /// The assistant's context K/V, one entry per ASSISTANT layer, dense.
 /// Grows with committed trunk tokens; block K/V transit through spare
 /// capacity and are truncated straight back out (never cached). Invariant

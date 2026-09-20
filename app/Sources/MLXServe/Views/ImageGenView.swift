@@ -128,7 +128,7 @@ struct ImageGenView: View {
                 pendingRequest = nil
             }
         } message: {
-            Text(ramWarningMessage)
+            Text(L10n.text(ramWarningMessage))
         }
     }
 
@@ -146,7 +146,7 @@ struct ImageGenView: View {
                     ForEach(model.promptExamples(editing: isEditing), id: \.name) { group in
                         Menu(group.name) {
                             ForEach(group.examples, id: \.title) { ex in
-                                Button(ex.title) { prompt = ex.body; persist() }
+                                Button(L10n.text(ex.title)) { prompt = ex.body; persist() }
                             }
                         }
                     }
@@ -244,7 +244,7 @@ struct ImageGenView: View {
                 MediaDropWell(title: sourceImageButtonLabel,
                               systemImage: "photo.badge.plus",
                               isTargeted: isDropTargeted) { chooseSourceImage() }
-                Text(sourceImageHint)
+                Text(L10n.text(sourceImageHint))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -358,13 +358,13 @@ struct ImageGenView: View {
                 Text("Quality").font(.subheadline.weight(.semibold))
                 Picker("", selection: $quality) {
                     ForEach(QualityPreset.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-                Text(qualityHint)
+                Text(L10n.text(qualityHint))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -375,7 +375,7 @@ struct ImageGenView: View {
     /// front. CFG is deliberately absent: no image backend reads a guidance
     /// field, so quoting one would be inventing a knob.
     private var qualityHint: String {
-        "\(model.settings(quality).steps) steps"
+        L10n.format("%lld steps", Int64(model.settings(quality).steps))
     }
 
     private var resolutionSection: some View {
@@ -383,7 +383,7 @@ struct ImageGenView: View {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
                 ForEach(model.resolutionOptions(editMode: isEditing)) { r in
-                    Text(r.label).tag(r)
+                    Text(L10n.text(r.label)).tag(r)
                 }
             }
             .labelsHidden()
@@ -417,7 +417,7 @@ struct ImageGenView: View {
                 labelledSizeField("Height", text: $customHeightText)
             }
             if let hint = verdict.hint {
-                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
                     .font(.caption2)
                     // A correction is information; a refusal is the reason
                     // Generate is disabled, so only that one is coloured.
@@ -428,7 +428,7 @@ struct ImageGenView: View {
 
     private func labelledSizeField(_ title: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.secondary)
+            Text(L10n.text(title)).font(.caption2).foregroundStyle(.secondary)
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 80)
@@ -701,7 +701,7 @@ struct ImageGenView: View {
 
     private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
+            Text(L10n.text(label)).font(.caption)
             Stepper(value: value, step: step) {
                 Text(String(value.wrappedValue))
             }

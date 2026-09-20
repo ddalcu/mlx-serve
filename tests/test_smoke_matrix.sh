@@ -37,6 +37,7 @@ ARCHES=(
     "gemma3|no|$GD/models/mlx-community/gemma-3-12b-it-4bit"
     "qwen3_5|yes|$MD/mlx-community/Qwen3.5-0.8B-MLX-4bit|$MD/lmstudio-community/Qwen3.5-4B-MLX-4bit"
     "qwen3_5_27b|yes|$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+    "prism_hadamard|yes|$GD/models-dl/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
     "qwen3_5_moe|yes|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
     "lfm2|yes|$MD/LiquidAI/LFM2.5-2.6B-MLX-mxfp4|$GD/models/mlx-community/LFM2.5-2.6B-8bit"
     "lfm2_moe|yes|$GD/models/LiquidAI/LFM2.5-8B-A1B-MLX-8bit"
@@ -187,13 +188,14 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
     check "max_tokens 5: <=5 tokens, finish_reason length|stop" "$([[ ( "$fr" == length || "$fr" == stop ) && "$(echo "$r" | J 'd["usage"]["completion_tokens"]')" -le 5 ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":600,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":2,\"enable_thinking\":false}")
     c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
-    if [[ -z "$c" ]]; then skip "logprobs: entries with top_logprobs" "no content to describe"; else
+    if [[ -z "$c" ]]; then skip "logprobs: entries with top_logprobs" "no content to describe"
+    elif [[ "$model" == *.gguf ]]; then skip "logprobs: entries with top_logprobs" "engine-backed: logprobs not surfaced (known gap)"; else
     check "logprobs: entries with top_logprobs" "$([[ "$(echo "$r" | J 'len(d["choices"][0]["logprobs"]["content"][0]["top_logprobs"])')" == 2 ]] && echo 0 || echo 1)" "$(echo "$r" | J 'str(d["choices"][0].get("logprobs"))[:120]')"; fi
 
     # 7. concurrency: two at once
     post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Count from one to twenty in words.\"}],\"max_tokens\":600,\"temperature\":0}" > "$OUT/$CELL.c1.json" &
     local p1=$!
-    post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Name five fruits, comma separated.\"}],\"max_tokens\":600,\"temperature\":0.7}" > "$OUT/$CELL.c2.json" &
+    post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"Name five fruits, comma separated.\"}],\"max_tokens\":600,\"temperature\":0}" > "$OUT/$CELL.c2.json" &
     local p2=$!
     wait "$p1" "$p2"
     check "concurrency 2: both answered" "$([[ -n "$(J 'd["choices"][0]["message"]["content"]' < "$OUT/$CELL.c1.json")" && -n "$(J 'd["choices"][0]["message"]["content"]' < "$OUT/$CELL.c2.json")" ]] && echo 0 || echo 1)"

@@ -333,17 +333,15 @@ fn freeWhitespace(g: *Grammar) StepResult {
 }
 
 fn advanceOneInner(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
-    if (g.stack.items.len == 0) {
-        // Past the root; only whitespace allowed.
-        return if (isWs(byte)) freeWhitespace(g) else .reject;
-    }
-
-    if (g.stack.items.len == 1 and g.topConst().sub == .accepted) {
-        return if (isWs(byte)) freeWhitespace(g) else .reject;
-    }
+    // Nothing outside the root value: whitespace there is a greedy near-tie
+    // the model pads with (`\r   \r   \r  {`) or idles on, and it carries no
+    // formatting the model prefers. Inside the root its own layout stays.
+    if (g.stack.items.len == 0) return .reject;
+    if (g.stack.items.len == 1 and g.topConst().sub == .accepted) return .reject;
+    const before_root = g.stack.items.len == 1 and g.topConst().sub == .expect_value;
 
     // Free whitespace handling for between-token positions.
-    if (isWs(byte) and canAcceptFreeWhitespace(g.topConst())) {
+    if (isWs(byte) and !before_root and canAcceptFreeWhitespace(g.topConst())) {
         return freeWhitespace(g);
     }
 
@@ -1008,7 +1006,8 @@ test "grammar respects minItems and maxItems" {
     }
 }
 
-test "grammar accepts whitespace between tokens" {
+// The model keeps its own layout inside the root; outside it nothing is admitted.
+test "grammar admits free whitespace inside the root value only" {
     var schema = try parseSchema(testing.allocator,
         \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
     );
@@ -1016,8 +1015,12 @@ test "grammar accepts whitespace between tokens" {
 
     var g = try Grammar.init(testing.allocator, &schema);
     defer g.deinit();
-    try feed(&g, "  {\n  \"x\" : 42\n}\n");
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte('\n'));
+    try feed(&g, "{\n  \"x\" : 42\n}");
     try testing.expect(g.isComplete());
+    for (" \t\n\r") |ws| try testing.expect(!(try g.allowedBytes()).contains(ws));
+    try testing.expect(!try g.acceptByte(' '));
 }
 
 test "grammar relaxes anyOf to any-json" {
@@ -1042,7 +1045,6 @@ test "allowedBytes initial returns object opener" {
     defer g.deinit();
     const mask = try g.allowedBytes();
     try testing.expect(mask.contains('{'));
-    try testing.expect(mask.contains(' ')); // whitespace
     try testing.expect(!mask.contains('['));
     try testing.expect(!mask.contains('"'));
 }
@@ -1157,7 +1159,7 @@ test "cruise-app-style nested schema parses sample response" {
 
 // A masked model whose real argmax is off-schema falls back to whitespace,
 // which the grammar admitted forever; the bar is that a free-whitespace run
-// ends and structure is forced, before and after the root value.
+// ends and structure is forced.
 test "free whitespace is capped so a masked model cannot idle forever" {
     var schema = try parseSchema(testing.allocator,
         \\{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
@@ -1166,24 +1168,22 @@ test "free whitespace is capped so a masked model cannot idle forever" {
     var g = try Grammar.init(testing.allocator, &schema);
     defer g.deinit();
 
+    try testing.expect(try g.acceptByte('{'));
     var i: usize = 0;
     while (i < MAX_FREE_WS) : (i += 1) try testing.expect(try g.acceptByte('\n'));
     try testing.expect(!try g.acceptByte('\n'));
     const capped = try g.allowedBytes();
     try testing.expect(!capped.contains(' '));
-    try testing.expect(capped.contains('{'));
+    try testing.expect(capped.contains('"'));
 
     // A snapshot carries the run; a structural byte resets it.
     const snap = try g.snapshot();
     defer g.discardSnapshot(snap);
-    try testing.expect(try g.acceptByte('{'));
+    try feed(&g, "\"x\":");
     try testing.expect(try g.acceptByte(' '));
     try g.restoreFrom(snap);
     try testing.expect(!try g.acceptByte(' '));
 
-    try feed(&g, "{\"x\":1}");
+    try feed(&g, "\"x\":1}");
     try testing.expect(g.isComplete());
-    i = 0;
-    while (i < MAX_FREE_WS) : (i += 1) try testing.expect(try g.acceptByte(' '));
-    try testing.expect(!try g.acceptByte(' '));
 }

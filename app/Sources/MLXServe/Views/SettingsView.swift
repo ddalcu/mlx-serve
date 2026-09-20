@@ -173,7 +173,7 @@ struct SettingsView: View {
                     ) {
                         ForEach(CommunityLinks.all) { item in
                             SettingsRow(title: item.title, explainer: item.explainer) {
-                                Link(item.actionLabel, destination: item.url)
+                                Link(L10n.text(item.actionLabel), destination: item.url)
                             }
                         }
                     }
@@ -219,7 +219,7 @@ private struct SettingsSidebar: View {
                 .tag(SettingsSelection.all)
             Section {
                 ForEach(categories) { category in
-                    Label(category.sidebarLabel, systemImage: category.icon)
+                    Label(L10n.text(category.sidebarLabel), systemImage: category.icon)
                         .tag(SettingsSelection.category(category))
                 }
             }
@@ -361,7 +361,7 @@ private struct ResetDefaultsFooter: View {
                     Button(role: .destructive) {
                         showConfirm = true
                     } label: {
-                        Label(label, systemImage: "arrow.uturn.backward.circle")
+                        Label(L10n.text(label), systemImage: "arrow.uturn.backward.circle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -379,7 +379,7 @@ private struct ResetDefaultsFooter: View {
                     .keyboardShortcut(.defaultAction)
                     Button("Cancel", role: .cancel) { }
                 } message: {
-                    Text(helpText)
+                    Text(L10n.text(helpText))
                 }
             }
         }
@@ -589,9 +589,9 @@ private struct SettingsSection<Content: View>: View {
         VStack(alignment: .leading, spacing: collapsed ? 0 : 12) {
             if !collapsed {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
+                    Text(L10n.text(title))
                         .font(.title3.weight(.semibold))
-                    Text(subtitle)
+                    Text(L10n.text(subtitle))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -631,7 +631,7 @@ private struct SettingsRow<Control: View>: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
-                        Text(title)
+                        Text(L10n.text(title))
                             .font(.body)
                         if isDirty {
                             Image(systemName: "arrow.clockwise.circle.fill")
@@ -644,12 +644,12 @@ private struct SettingsRow<Control: View>: View {
                     control
                         .frame(maxWidth: 280, alignment: .trailing)
                 }
-                Text(explainer)
+            Text(L10n.text(explainer))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let cost {
-                    Text(cost)
+                    Text(L10n.text(cost))
                         .font(.caption)
                         .fontWeight(costActive ? .semibold : .regular)
                         .foregroundStyle(costActive ? Color.orange : Color.secondary)
@@ -732,8 +732,8 @@ private struct ModelFoldersSectionContent: View {
                     }
                 }
                 Text(unavailable
-                     ? "That folder isn't reachable right now, so downloads are going to \(ModelRoots.builtInRoot) instead."
-                     : Self.defaultExplainer)
+                     ? L10n.format("That folder isn't reachable right now, so downloads are going to %@ instead.", ModelRoots.builtInRoot)
+                     : L10n.text(Self.defaultExplainer))
                     .font(.caption2)
                     .foregroundStyle(unavailable ? .orange : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -786,7 +786,7 @@ private struct ModelFoldersSectionContent: View {
                         .font(.body)
                     Spacer(minLength: 12)
                     HStack(spacing: 8) {
-                        Text(pathText)
+                        Text(L10n.text(pathText))
                             .font(.caption.monospaced())
                             .foregroundStyle(hasPath ? .primary : .secondary)
                             .lineLimit(1)
@@ -802,7 +802,7 @@ private struct ModelFoldersSectionContent: View {
                         .disabled(!hasPath)
                     }
                 }
-                Text(Self.explainer)
+                Text(L10n.text(Self.explainer))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -882,7 +882,7 @@ private struct LanSharingSectionContent: View {
         // The privacy disclosure — sharing means running other people's
         // prompts, and using a network model means the host reads yours.
         SearchableRow(searchText: ["Privacy", Self.privacyNote]) {
-            Text(Self.privacyNote)
+            Text(L10n.text(Self.privacyNote))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -967,7 +967,7 @@ private struct ProvidersSectionContent: View {
                 .help("Write providers.json and ask the server to re-probe now")
             }
             if let saveError {
-                Text(saveError).font(.caption).foregroundStyle(.red)
+                Text(L10n.text(saveError)).font(.caption).foregroundStyle(.red)
             }
             Text("Keys are stored in plain text in ~/.mlx-serve/providers.json. Prefer an environment variable name for a shared machine. Provider models are never shared over the LAN.")
                 .font(.caption)
@@ -1063,9 +1063,9 @@ private struct ProviderRow: View {
                 }
             }
             if let problem {
-                Text(problem).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(problem)).font(.caption2).foregroundStyle(.orange)
             } else if let status {
-                Text(statusLine(status)).font(.caption2).foregroundStyle(.secondary)
+                Text(L10n.text(statusLine(status))).font(.caption2).foregroundStyle(.secondary)
             }
         }
         .padding(8)
@@ -1226,7 +1226,7 @@ private struct ServerSectionContent: View {
         ) {
             Picker("", selection: $appState.startupModelMode) {
                 ForEach(StartupModelChoice.Mode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+                    Text(L10n.text(mode.label)).tag(mode)
                 }
             }
             .labelsHidden()
@@ -1241,7 +1241,7 @@ private struct ServerSectionContent: View {
                 Picker("", selection: startupModelDisplay) {
                     let dupNames = LocalModel.duplicateNames(in: pickable)
                     ForEach(pickable) { model in
-                        Text(startupModelLabel(model, dupNames: dupNames)).tag(model.path)
+                        Text(L10n.text(startupModelLabel(model, dupNames: dupNames))).tag(model.path)
                     }
                     // A selection that matches no row renders blank, so empty and
                     // uninstalled selections each get a row of their own.
@@ -1349,7 +1349,7 @@ private struct ServerSectionContent: View {
             ) {
                 Picker("", selection: $appState.serverOptions.logLevel) {
                     ForEach(ServerOptions.LogLevel.allCases) { lvl in
-                        Text(lvl.label).tag(lvl)
+                        Text(L10n.text(lvl.label)).tag(lvl)
                     }
                 }
                 .labelsHidden()
@@ -1418,6 +1418,17 @@ private struct ServerSectionContent: View {
                 isDirty: dirty.dirty(\.skipMemPreflight)
             ) {
                 Toggle("", isOn: $appState.serverOptions.skipMemPreflight)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["osMemoryReserve"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.osMemoryReserve)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.osMemoryReserve)
                     .labelsHidden()
                     .toggleStyle(.switch)
             }
@@ -1556,7 +1567,7 @@ private struct ContextSizeRow: View {
                             .frame(minWidth: 56, alignment: .trailing)
                     }
                 }
-                Text(ContextSizeDisplay.helpText)
+                Text(L10n.text(ContextSizeDisplay.helpText))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1597,7 +1608,7 @@ private struct ContextSizeRow: View {
         let labelColor: Color = warn ? .orange : .secondary
         let valueColor: Color = warn ? .orange : .primary
         HStack(spacing: 4) {
-            Text(label)
+            Text(L10n.text(label))
                 .font(.caption2)
                 .foregroundStyle(labelColor)
             Text(value)
@@ -1711,7 +1722,11 @@ private struct SpecDecodeSectionContent: View {
                     // beside "Probe" would ask a question nobody can answer
                     // without benchmarking. It DISPLAYS what it resolved to
                     // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
-                    Text(server.specCost?.automaticLabel ?? "Automatic").tag(0)
+                    if let specCost = server.specCost {
+                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).tag(0)
+                    } else {
+                        Text("Automatic").tag(0)
+                    }
                     ForEach(1...6, id: \.self) { n in
                         Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
                     }
@@ -1763,7 +1778,7 @@ private struct SettingsSubheader: View {
 
     var body: some View {
         if SettingsSearch.tokens(query).isEmpty {
-            Text(text)
+            Text(L10n.text(text))
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
@@ -1798,7 +1813,7 @@ private struct PerformanceSectionContent: View {
                             .font(.body.monospacedDigit())
                     }
                     if let b = server.batching {
-                        Text(b.label)
+                        Text(L10n.text(b.label))
                             .font(.caption)
                             .foregroundStyle(b.supported ? .secondary : Color.orange)
                     }
@@ -1831,7 +1846,7 @@ private struct PerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.kvQuant) {
                     ForEach(ServerOptions.KVQuant.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .labelsHidden()
@@ -1931,7 +1946,7 @@ private struct NeuralEngineSectionContent: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                     if let caution = AnePrefillAdvice.liveCaution {
-                        Text(caution)
+                        Text(L10n.text(caution))
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .multilineTextAlignment(.trailing)
@@ -2013,7 +2028,7 @@ private struct LlamaPerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.llamaKvQuant) {
                     ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
-                        Text(q.label).tag(q)
+                        Text(L10n.text(q.label)).tag(q)
                     }
                 }
                 .labelsHidden()
@@ -2161,7 +2176,7 @@ private struct DrafterRow: View {
                 control
                     .frame(maxWidth: 280, alignment: .trailing)
             }
-            Text(explainer)
+            Text(L10n.text(explainer))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2183,8 +2198,10 @@ private struct DrafterRow: View {
                 .padding(.top, 2)
             } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
                 // A dense Gemma 4 is loaded but its drafter isn't on disk —
-                Button(downloads.downloads[repo]?.status == .downloading
-                       ? "Downloading drafter…" : "Download drafter") {
+                Button(L10n.text(
+                       downloads.downloads[repo]?.status == .downloading
+                       ? "Downloading drafter…" : "Download drafter"
+)) {
                     downloads.start(repoId: repo) { appState.refreshModels() }
                 }
                 .controlSize(.small)
@@ -2251,7 +2268,7 @@ private struct InterfaceSectionContent: View {
         SettingsRow(title: "Appearance", explainer: "Follow the system setting, or force light/dark for this app only.") {
             Picker("", selection: $appearanceModeRaw) {
                 ForEach(AppAppearanceMode.allCases) { mode in
-                    Text(mode.label).tag(mode.rawValue)
+                    Text(L10n.text(mode.label)).tag(mode.rawValue)
                 }
             }
             .labelsHidden()
@@ -2261,7 +2278,7 @@ private struct InterfaceSectionContent: View {
         SettingsRow(title: "Accent Color", explainer: "Tint for buttons, links and the selected message bubble.") {
             Picker("", selection: $accentColorRaw) {
                 ForEach(AppAccentColor.allCases) { accent in
-                    Text(accent.label).tag(accent.rawValue)
+                    Text(L10n.text(accent.label)).tag(accent.rawValue)
                 }
             }
             .labelsHidden()
@@ -2270,7 +2287,7 @@ private struct InterfaceSectionContent: View {
         SettingsRow(title: "Text Size", explainer: "Size of the chat transcript's prose and code.") {
             Picker("", selection: $textSizeRaw) {
                 ForEach(ChatTextSize.allCases) { size in
-                    Text(size.label).tag(size.rawValue)
+                    Text(L10n.text(size.label)).tag(size.rawValue)
                 }
             }
             .labelsHidden()
@@ -2280,7 +2297,7 @@ private struct InterfaceSectionContent: View {
                     explainer: "How wide a conversation reads. Narrow and Medium are fixed widths, so resizing the window moves the margins rather than the text; Wide follows the window. Also on ⌘⌥1-3, under View ▸ Interface.") {
             Picker("", selection: $chatColumnRaw) {
                 ForEach(ChatColumnWidth.allCases) { width in
-                    Text(width.label).tag(width.rawValue)
+                    Text(L10n.text(width.label)).tag(width.rawValue)
                 }
             }
             .labelsHidden()
@@ -2414,9 +2431,11 @@ private struct RequestDefaultsSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer) {
                 VStack(alignment: .trailing, spacing: 4) {
                     Stepper(value: opts.defaultTopK, in: 0...1000) {
-                        Text(appState.serverOptions.defaultTopK == 0
+                        Text(L10n.text(
+                             appState.serverOptions.defaultTopK == 0
                              ? "Disabled"
-                             : "\(appState.serverOptions.defaultTopK)")
+                             : "\(appState.serverOptions.defaultTopK)"
+))
                             .font(.body.monospacedDigit())
                     }
                     // Top-k is the one sampling field that actually falls
@@ -2478,7 +2497,7 @@ private struct RequestDefaultsSectionContent: View {
         if let value {
             let color: Color = active ? .green : .secondary
             HStack(spacing: 4) {
-                Text(active ? "Model default (in effect):" : "Model recommends:")
+                Text(L10n.text(active ? "Model default (in effect):" : "Model recommends:"))
                     .font(.caption2)
                 Text(value)
                     .font(.caption2.monospacedDigit().weight(.medium))
@@ -2512,7 +2531,7 @@ private struct WakePhraseSectionContent: View {
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 220)
-                Text(Self.explainer)
+                Text(L10n.text(Self.explainer))
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
@@ -2577,12 +2596,12 @@ private struct VoiceCloneSectionContent: View {
             Text("Voice engine").font(.subheadline.weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
                 ForEach(VoiceEngine.allCases, id: \.self) { e in
-                    Text(e.label).tag(e)
+                    Text(L10n.text(e.label)).tag(e)
                 }
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            Text(Self.engineExplainer(appState.serverOptions.voiceEngine))
+            Text(L10n.text(Self.engineExplainer(appState.serverOptions.voiceEngine)))
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -2612,7 +2631,7 @@ private struct VoiceCloneSectionContent: View {
                     // Grouped by language so 54 entries are navigable, and named
                     // rather than shown as raw wire ids.
                     ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
-                        Section(group.language) {
+                        Section(L10n.text(group.language)) {
                             ForEach(group.voices, id: \.self) { v in
                                 Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
                             }
@@ -2643,7 +2662,7 @@ private struct VoiceCloneSectionContent: View {
                 .font(.caption2).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let e = previewer.error {
-                Text(e).font(.caption).foregroundStyle(.orange)
+                Text(L10n.text(e)).font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -2682,17 +2701,17 @@ private struct VoiceCloneSectionContent: View {
                 Button { chooseVoiceFile() } label: { Label("Choose file…", systemImage: "folder") }
                 if recorder.isRecording {
                     Button(role: .destructive) { stopRecording() } label: {
-                        Label(String(format: "Stop (%.1fs)", recorder.duration), systemImage: "stop.circle")
+                        Label(L10n.format("Stop (%.1fs)", recorder.duration), systemImage: "stop.circle")
                     }
                 } else {
                     Button { startRecording() } label: { Label("Record", systemImage: "mic") }
                 }
             }
             .font(.caption)
-            Text(Self.explainer)
+            Text(L10n.text(Self.explainer))
                 .font(.caption2).foregroundStyle(.secondary)
             if let voiceError {
-                Text(voiceError).font(.caption).foregroundStyle(.red)
+                Text(L10n.text(voiceError)).font(.caption).foregroundStyle(.red)
             }
         }
     }
@@ -2946,7 +2965,7 @@ private struct MessagingSectionContent: View {
                         .font(.body)
                     Spacer(minLength: 12)
                     HStack(spacing: 8) {
-                        Text(lockLabel)
+                        Text(L10n.text(lockLabel))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
                         Button("Reset lock") {
@@ -2957,7 +2976,7 @@ private struct MessagingSectionContent: View {
                         .disabled(telegram.allowedChatIds.isEmpty)
                     }
                 }
-                Text(Self.lockExplainer)
+                Text(L10n.text(Self.lockExplainer))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3171,7 +3190,7 @@ private func snappingSlider(
             step: 1
         )
         .frame(width: 200)
-        Text(label)
+        Text(L10n.text(label))
             .font(.body.monospacedDigit())
             .frame(minWidth: 70, alignment: .trailing)
     }

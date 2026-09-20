@@ -94,7 +94,8 @@ else
     # already cut that month, which is the same UpdateChecker dead end as an
     # unstamped bundle from the other direction. An empty month still yields 0
     # through the jq's own `// 0`; only the COMMAND failing stops the build.
-    if ! LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null); then
+    # A pre-release tag (vYY.M.N-pre-release.P) does not consume N, as in release.yml.
+    if ! LAST_N=$(gh release list --limit 100 --json tagName --jq "[.[] | .tagName | select(test(\"^v${YM}\\\\.[0-9]+$\")) | sub(\"^v${YM}\\\\.\"; \"\") | tonumber] | max // 0" 2>/dev/null); then
         echo "ERROR: \`gh release list\` failed, so the next CalVer number is unknown."
         echo "       Defaulting it would stamp v${YM}.1, behind what is already published."
         echo "       Fix it (\`gh auth login\`), or build for yourself: FAST_DEV=1 bash app/build.sh"
@@ -147,8 +148,8 @@ swift package resolve
 bash "$PROJECT_ROOT/scripts/patch-swatex-font-lookup.sh" "$SCRIPT_DIR/.build/checkouts/SwaTex"
 # No test step here, and never add one: this script is also the FAST_DEV
 # iteration loop (build, look, adjust — about two seconds when nothing
-# changed), and the Swift suite costs 24s parallel / 55s serial. Run
-# `swift test --parallel` yourself before landing.
+# changed), and the Swift suite costs ~30s. Run `bash app/test.sh`
+# yourself before landing.
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
 SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)"
 SWIFT_BIN="$SWIFT_BIN_DIR/MLXCore"
