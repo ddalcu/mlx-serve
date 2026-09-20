@@ -251,9 +251,9 @@ struct MusicGenView: View {
                             RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                         )
                     if lyrics.isEmpty {
-                        Text(L10n.text(model.requiresLyrics
-                             ? "This model sings your lyrics. Section tags go on their own lines: \(MusicOptions.sectionTagHint)"
-                             : "Leave empty, or tick Instrumental, for a track with no vocals. Section tags: \(MusicOptions.sectionTagHint)"))
+                        Text(model.requiresLyrics
+                             ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint)
+                             : L10n.format("Leave empty, or tick Instrumental, for a track with no vocals. Section tags: %@", MusicOptions.sectionTagHint))
                             .font(.body)
                             .foregroundStyle(.secondary.opacity(0.6))
                             .padding(.horizontal, 5)

@@ -304,7 +304,7 @@ struct VideoGenView: View {
         .font(.caption)
         .foregroundStyle(.orange)
         .hoverReveal(placement: .pointerClamped(width: bubbleWidth, container: promptRow)) {
-            Self.hoverBubble(hint)
+            Self.hoverBubble(L10n.text(hint))
         }
     }
 
@@ -369,10 +369,11 @@ struct VideoGenView: View {
     /// The tips link lives IN the menu rather than beside it: it is the same
     /// kind of thing as the templates (help with the prompt).
     private var templatesMenu: some View {
-        Menu {
-            Section(H3PromptExamples.templatesTitle(for: model.promptFormat)) {
+        let title = H3PromptExamples.templatesTitle(for: model.promptFormat)
+        return Menu {
+            Section(L10n.text(title)) {
                 ForEach(examplePrompts, id: \.title) { ex in
-                    Button(ex.title) { prompt = ex.body }
+                    Button(L10n.text(ex.title)) { prompt = ex.body }
                 }
             }
             Divider()
@@ -507,7 +508,7 @@ struct VideoGenView: View {
     private func qualityPicker(segmented: Bool) -> some View {
         let picker = Picker("", selection: qualitySelection) {
             ForEach(QualityPreset.allCases) { q in
-                Text(q.label).tag(QualitySelection.preset(q))
+                Text(L10n.text(q.label)).tag(QualitySelection.preset(q))
             }
             if matchedQuality == nil {
                 Text("Custom").tag(QualitySelection.custom)
@@ -541,7 +542,7 @@ struct VideoGenView: View {
     /// What the three guidance sliders read while a clip forces two stages:
     /// `requestBody` omits them then, and the server applies its own set.
     private var guidanceLockedReadout: String? {
-        modeUpgradedForAudio ? "server default" : nil
+        modeUpgradedForAudio ? L10n.text("server default") : nil
     }
 
     private var modeHint: String {
@@ -1127,7 +1128,7 @@ struct VideoGenView: View {
                             .foregroundStyle(.orange)
                             .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                                     container: refHeaderRow)) {
-                                Self.hoverBubble("Some previously added references were not found on disk. Double-check the media identifiers in the prompt and adjust them if necessary.")
+                                Self.hoverBubble(L10n.text("Some previously added references were not found on disk. Double-check the media identifiers in the prompt and adjust them if necessary."))
                             }
                     }
                     Text("optional, the model follows them")
@@ -1145,7 +1146,7 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                     .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                             container: refHeaderRow)) {
-                        Self.hoverBubble(H3RefLimits.combinedCapNote)
+                        Self.hoverBubble(L10n.text(H3RefLimits.combinedCapNote))
                     }
                 }
                 // Painted over the well below it — see the prompt heading.
@@ -1856,9 +1857,9 @@ struct VideoGenView: View {
                         // caption under the Quality switcher. Shows the
                         // EFFECTIVE mode and locks while a clip forces it.
                         Picker("", selection: modeSelection) {
-                            Text(modeLabel(.oneStage)).tag(VideoPipelineMode.oneStage)
-                            Text(modeLabel(.twoStage)).tag(VideoPipelineMode.twoStage)
-                            Text(modeLabel(.twoStageHQ)).tag(VideoPipelineMode.twoStageHQ)
+                            Text(L10n.text(modeLabel(.oneStage))).tag(VideoPipelineMode.oneStage)
+                            Text(L10n.text(modeLabel(.twoStage))).tag(VideoPipelineMode.twoStage)
+                            Text(L10n.text(modeLabel(.twoStageHQ))).tag(VideoPipelineMode.twoStageHQ)
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
@@ -1877,7 +1878,7 @@ struct VideoGenView: View {
                                          help: "Steps in the second, full-resolution pass. Auto uses the reference schedule (3).")
                         .frame(maxWidth: .infinity)
                 }
-                Text(modeHint)
+                Text(L10n.text(modeHint))
                     .font(.caption2).foregroundStyle(.secondary)
             }
 
@@ -2177,12 +2178,13 @@ struct VideoGenView: View {
                                       disabled: Bool = false,
                                       disabledReadout: String? = nil,
                                       help: String? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        let shown = disabled ? (disabledReadout ?? readout(range.lowerBound))
+                             : readout(value.wrappedValue)
+        return VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(label).font(.caption)
+                Text(L10n.text(label)).font(.caption)
                 Spacer()
-                Text(disabled ? (disabledReadout ?? readout(range.lowerBound))
-                              : readout(value.wrappedValue))
+                Text(L10n.text(shown))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }

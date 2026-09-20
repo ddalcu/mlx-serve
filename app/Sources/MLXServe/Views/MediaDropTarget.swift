@@ -359,7 +359,7 @@ struct MediaWellAction: View {
                     linkTitle(centred: false)
                 }
             }
-            Text(caption)
+            Text(L10n.text(caption))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 // Centres every LINE, for the reason `MediaDropWellOption`
@@ -369,7 +369,7 @@ struct MediaWellAction: View {
     }
 
     private func linkTitle(centred: Bool) -> some View {
-        Text(title)
+        Text(L10n.text(title))
             .font(.caption)
             .foregroundStyle(Color(nsColor: .linkColor))
             .multilineTextAlignment(centred ? .center : .leading)

@@ -2,6 +2,7 @@
    Keys are the English source strings; anything not listed here
    falls back to English. */
 
+" (Turbo)" = " （Turbo）";
 " (our estimate)" = " （我们的估算）";
 " (with its built-in draft head)" = " （自带草稿头）";
 " The running server keeps its current flags until you hit Restart Now." = " 正在运行的服务器会保留当前启动参数，直到你点击“立即重启”。";
@@ -26,6 +27,7 @@
 "%@ — no longer installed" = "%@ —— 已不再安装";
 "%@ — not in %@'s capabilities" = "%@ —— 不在 %@ 的能力范围内";
 "%@ — use" = "%@ —— 使用";
+"%@, %lld steps%@, %lld frames (~%.1fs)" = "%@，%lld 步%@，%lld 帧（~%.1fs）";
 "%@, %lld steps, %lld frames (~%.1fs)" = "%@，%lld 步，%lld 帧（~%.1fs）";
 "%@: browse and search only — its %@-token window has no room for the rest." = "%@：仅能浏览和搜索 —— 它的 %@ Token 上下文窗口容不下其余工具。";
 "%lld WEB SOURCE%@" = "%lld 个网页来源";
@@ -36,6 +38,7 @@
 "%lld source%@" = "%lld 个来源";
 "%lld steps" = "%lld 步";
 "%lld tool%@" = "%lld 个工具";
+"%lld windows joined end to end — %lld frames, and roughly %lldx the time of a single window." = "%lld 个窗口首尾相接 —— %lld 帧，耗时约为单个窗口的 %lld 倍。";
 "%lld windows joined end to end — about %lld frames, and roughly %lldx the time of a single window." = "%lld 个窗口首尾相接 —— 约 %lld 帧，耗时约为单个窗口的 %lld 倍。";
 "(missing command or url)" = "（缺少 command 或 url）";
 "(no arguments)" = "（无参数）";
@@ -251,6 +254,7 @@
 "Capabilities" = "能力";
 "Capabilities, model, workspace and sampling. Most agents need none of these." = "能力、模型、工作区与采样。多数 Agent 都不需要这些。";
 "Capability" = "能力";
+"Chained windows" = "链式窗口";
 "Chained windows: %lld" = "链式窗口：%lld";
 "Change Directory" = "切换目录";
 "Change Model" = "更换模型";
@@ -301,7 +305,9 @@
 "Clear the haze" = "去除雾霾";
 "Clear the in-memory log buffer (does not affect the running server)" = "清除内存中的日志缓冲区（不影响正在运行的服务器）";
 "Click Restart Now to apply, or Discard to revert the unsaved server-launch fields." = "点击“立即重启”以应用，或点击“放弃”以还原未保存的服务器启动项。";
+"Clip height" = "片段高度";
 "Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts." = "片段长度。LTX 在其 8N+1 阶梯上只生成 %lld–%lld 帧；滑块会自动吸附到有效帧数。";
+"Clip width" = "片段宽度";
 "Clips" = "片段";
 "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed." = "克隆一次你的声音 —— 免提语音模式会通过本地 TTS 模型用它来回答。未设置片段时：使用 macOS 系统语音回答。从下一句语音开始生效 —— 无需重启。";
 "Close" = "关闭";
@@ -1531,6 +1537,7 @@
 "no chat yet (first to message wins)" = "还没有会话（先发消息者胜出）";
 "no working folder is set for this session — the agent's file tools always run confined to one, in every mode. Set a working folder (the folder icon on the Agent pill, or Settings → Agent Sandbox) and retry." = "本次会话没有设置工作文件夹 —— 无论哪种模式，Agent 的文件工具始终被限制在一个文件夹内运行。请设置一个工作文件夹（Agent 胶囊上的文件夹图标，或设置 → Agent 沙盒），然后重试。";
 "nothing found" = "未找到任何结果";
+"optional, ends here" = "可选，在此结束";
 "optional — audio-to-video" = "可选 —— 音频生视频";
 "optional — ends here" = "可选 —— 在此结束";
 "optional — the generation follows them" = "可选 —— 生成会跟随它们";
