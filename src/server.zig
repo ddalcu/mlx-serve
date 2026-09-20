@@ -16758,7 +16758,13 @@ fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []cons
     }
 }
 
-fn responsesToolExists(tools_val: ?std.json.Value, name: []const u8) bool {
+fn responsesToolExists(
+    tools_val: ?std.json.Value,
+    name: []const u8,
+    aliases: ?*const responses_mod.NamespaceAliases,
+) bool {
+    // A wire name we synthesized by expanding a namespace group is declared.
+    if (responses_mod.splitNamespaceToolName(aliases, name)) |_| return true;
     const v = tools_val orelse return false;
     if (v != .array) return false;
     for (v.array.items) |tool_val| {
@@ -16871,7 +16877,8 @@ fn handleResponsesCompact(
 
     // ── parse → resolved message history ──
     // Compaction drops images, so the preprocessing selector is irrelevant here.
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, .{}) catch |err| {
+    // No tool aliases are built: an echoed call keeps the name it was declared with.
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, null, appendImageUrlContent, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -17106,9 +17113,15 @@ fn handleResponsesInner(
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
     if (!tool_choice.include_tools) has_tools = false;
 
+    // Maps every name the model may spell a namespaced call with (expanded
+    // wire names, unique bare child names) back to (namespace, name), so a
+    // resulting call returns with its namespace intact.
+    var namespace_aliases = responses_mod.NamespaceAliases.init(allocator);
+    defer responses_mod.freeNamespaceAliases(allocator, &namespace_aliases);
+
     if (has_tools) {
         if (root.get("tools")) |tools_val| if (tools_val == .array) {
-            const reshaped = try responses_mod.buildToolsJson(allocator, tools_val.array);
+            const reshaped = try responses_mod.buildToolsJson(allocator, tools_val.array, &namespace_aliases);
             tools_json = reshaped;
             tools_json_owned = true;
             if (reshaped.len <= 2) has_tools = false; // "[]" — no function tools
@@ -17144,7 +17157,7 @@ fn handleResponsesInner(
     }
 
     // ── parse input → messages ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -17900,7 +17913,7 @@ fn handleResponsesInner(
 
     if (tool_calls) |tcs| if (tcs.len > 0) {
         for (tcs) |tc| {
-            if (!responsesToolExists(root.get("tools"), tc.name)) {
+            if (!responsesToolExists(root.get("tools"), tc.name, &namespace_aliases)) {
                 log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
                 continue;
             }
@@ -17908,6 +17921,11 @@ fn handleResponsesInner(
                 log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
                 continue;
             }
+            // Split an expanded namespace wire name back into (namespace, name)
+            // so the client resolves the call by its declared namespace.
+            const split = responses_mod.splitNamespaceToolName(&namespace_aliases, tc.name);
+            const emit_name = if (split) |s| s.name else tc.name;
+            const emit_ns: ?[]const u8 = if (split) |s| s.namespace else null;
             const fc_id = try responses_mod.makeId(stream.io, allocator, "fc");
             defer allocator.free(fc_id);
             const call_id = try responses_mod.makeId(stream.io, allocator, "call");
@@ -17918,10 +17936,10 @@ fn handleResponsesInner(
                 return err;
             };
             if (emitted > 0) try out_buf.append(allocator, ',');
-            try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
+            try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, emit_name, tc.arguments, emit_ns);
             emitted += 1;
             if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
+                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, emit_name, tc.arguments, emit_ns);
             }
             output_index += 1;
         }
@@ -18848,6 +18866,7 @@ fn emitResponsesFunctionCallEvents(
     call_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
+    namespace: ?[]const u8,
 ) !void {
     const esc_id = try jsonEscape(allocator, fc_id);
     defer allocator.free(esc_id);
@@ -18857,11 +18876,22 @@ fn emitResponsesFunctionCallEvents(
     defer allocator.free(esc_name);
     const esc_args = try jsonEscape(allocator, arguments_json);
     defer allocator.free(esc_args);
+    // A namespace-qualified call carries "namespace" so the client resolves it
+    // by (namespace, name); flat calls serialize no such field.
+    var ns_field: []const u8 = "";
+    var ns_owned: ?[]u8 = null;
+    defer if (ns_owned) |o| allocator.free(o);
+    if (namespace) |ns| {
+        const esc_ns = try jsonEscape(allocator, ns);
+        defer allocator.free(esc_ns);
+        ns_owned = try std.fmt.allocPrint(allocator, ",\"namespace\":{s}", .{esc_ns});
+        ns_field = ns_owned.?;
+    }
 
     {
         const item_added = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
-        , .{ output_index, esc_id, esc_call, esc_name });
+            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s}{s},"arguments":"","status":"in_progress"}}}}
+        , .{ output_index, esc_id, esc_call, esc_name, ns_field });
         defer allocator.free(item_added);
         try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
     }
@@ -18881,8 +18911,8 @@ fn emitResponsesFunctionCallEvents(
     }
     {
         const item_done = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":{s},"status":"completed"}}}}
-        , .{ output_index, esc_id, esc_call, esc_name, esc_args });
+            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s}{s},"arguments":{s},"status":"completed"}}}}
+        , .{ output_index, esc_id, esc_call, esc_name, ns_field, esc_args });
         defer allocator.free(item_done);
         try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
     }
@@ -19986,8 +20016,23 @@ test "responsesToolExists validates Responses function tool names" {
     , .{});
     defer parsed.deinit();
 
-    try testing.expect(responsesToolExists(parsed.value, "smartSearch"));
-    try testing.expect(!responsesToolExists(parsed.value, "cruise_cards"));
+    try testing.expect(responsesToolExists(parsed.value, "smartSearch", null));
+    try testing.expect(!responsesToolExists(parsed.value, "cruise_cards", null));
+}
+
+test "responsesToolExists accepts an expanded namespace wire name" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"get_weather"}]}]
+    , .{});
+    defer parsed.deinit();
+    var aliases = responses_mod.NamespaceAliases.init(testing.allocator);
+    defer responses_mod.freeNamespaceAliases(testing.allocator, &aliases);
+    const reshaped = try responses_mod.buildToolsJson(testing.allocator, parsed.value.array, &aliases);
+    defer testing.allocator.free(reshaped);
+    try testing.expect(responsesToolExists(parsed.value, "mcp__demo__get_weather", &aliases));
+    // A unique bare member name resolves too, and splits back to its namespace.
+    try testing.expect(responsesToolExists(parsed.value, "get_weather", &aliases));
+    try testing.expectEqualStrings("mcp__demo__", responses_mod.splitNamespaceToolName(&aliases, "get_weather").?.namespace);
 }
 
 test "buildResponsesJsonInstruction scopes schema prompt when tools are active" {
