@@ -46,6 +46,7 @@
 "+%lld other tool%@" = "+%lld 个其他工具";
 "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic. Applies to the app's chats immediately; also becomes the server default for external clients that omit temperature (Claude Code) after a restart." = "0 = 确定性贪心。0.6–1.0 适合典型聊天。高于 1.0 会变得不稳定。对本应用的聊天立即生效；重启后也会成为未指定 temperature 的外部客户端（Claude Code）的服务器默认值。";
 "0 starts from pure noise (the default). Higher starts closer to the original audio, so more of it comes through." = "0 表示从纯噪声开始（默认）。数值越高，起点越接近原始音频，保留的原音频成分也越多。";
+"1-stage" = "单阶段";
 "1. In Telegram, open @BotFather and send /newbot." = "1. 在 Telegram 中打开 @BotFather，并发送 /newbot。";
 "10 seconds to 10 minutes. The new track is exactly as long as this clip." = "10 秒到 10 分钟。新曲目的长度与这段音频片段完全一致。";
 "1024 × 1024 (square)" = "1024 × 1024（方形）";
@@ -65,6 +66,7 @@
 "1536 × 672 (21:9 cinematic) — 2.9x slower" = "1536 × 672（21:9 电影宽幅）—— 慢 2.9 倍";
 "1600 × 896 (landscape 16:9) — recommended" = "1600 × 896（横版 16:9）—— 推荐";
 "1920 × 1088 (landscape 16:9) — LTX's own canvas, slowest" = "1920 × 1088（横版 16:9）—— LTX 原生画布，最慢";
+"2-stage" = "两阶段";
 "2-stage HQ" = "两阶段 HQ";
 "2. Copy the token it gives you and paste it above." = "2. 复制它给出的令牌，粘贴到上方。";
 "2048 × 1152 (16:9, large)" = "2048 × 1152（16:9，大尺寸）";
@@ -1538,10 +1540,12 @@
 "no chat yet (first to message wins)" = "还没有会话（先发消息者胜出）";
 "no working folder is set for this session — the agent's file tools always run confined to one, in every mode. Set a working folder (the folder icon on the Agent pill, or Settings → Agent Sandbox) and retry." = "本次会话没有设置工作文件夹 —— 无论哪种模式，Agent 的文件工具始终被限制在一个文件夹内运行。请设置一个工作文件夹（Agent 胶囊上的文件夹图标，或设置 → Agent 沙盒），然后重试。";
 "nothing found" = "未找到任何结果";
-"optional, ends here" = "可选，在此结束";
 "optional — audio-to-video" = "可选 —— 音频生视频";
 "optional — ends here" = "可选 —— 在此结束";
 "optional — the generation follows them" = "可选 —— 生成会跟随它们";
+"optional, I2V" = "可选，I2V";
+"optional, ends here" = "可选，在此结束";
+"optional, starts here" = "可选，在此开始";
 "or drag one here" = "或把文件拖到这里";
 "or env var, e.g. OPENAI_API_KEY" = "或环境变量，例如 OPENAI_API_KEY";
 "prefill tok/s" = "预填充 tok/s";

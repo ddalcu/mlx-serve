@@ -14,7 +14,7 @@ struct FoldingSectionHeader: View {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                Text(title)
+                Text(L10n.text(title))
                 Spacer()
             }
             // A section heading like the others: a disclosure is still a

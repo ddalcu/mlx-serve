@@ -1560,8 +1560,9 @@ struct VideoGenView: View {
                 // The trim note rides here rather than the clip row: the row
                 // is the file's name, and a fact about its length against the
                 // video is a fact about the request.
-                Text("Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline."
-                     + (clipOutlastsVideo ? " The clip is longer than the video and is trimmed to it." : ""))
+                Text(L10n.text(clipOutlastsVideo
+                     ? "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline. The clip is longer than the video and is trimmed to it."
+                     : "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline."))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else if audioSource == .none {

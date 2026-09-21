@@ -317,7 +317,7 @@ struct MediaDropWellOption: View {
             Button(L10n.text(title), action: action)
                 .buttonStyle(.link)
                 .font(.caption)
-            Text(caption)
+            Text(L10n.text(caption))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 // A caption long enough to wrap centres every line, not just

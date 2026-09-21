@@ -56,18 +56,16 @@ struct Model3DGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        // ONE onChange on the snapshot, as Music and Video do: the pane
-        // unmounts on navigation, so the photo, which lived only in `@State`,
-        // was gone on the way to Chat and back.
+        // ONE observation of the whole blob (the Music pane's mechanism):
+        // anything in `stickySnapshot` is sticky by construction.
         .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var readyView: some View {
         HSplitView {
             ScrollView {
-                // The model decides what the rest of the pane means — whether
-                // the weights are on this Mac at all, and what Advanced holds —
-                // so it is read before the photo it acts on.
+                // The model decides whether the weights are on this Mac at
+                // all, so it is read before the photo it acts on.
                 VStack(alignment: .leading, spacing: 14) {
                     modelSection
                     photoSection
@@ -75,9 +73,8 @@ struct Model3DGenView: View {
                     // Generate stands apart from the settings it acts on.
                     actionRow.padding(.top, 14)
                 }
-                // Full-width, leading-aligned frame OUTSIDE the padding: a
-                // child that will not compress otherwise makes the stack
-                // oversized, and the ScrollView centres the overflow.
+                // Full-width, leading-aligned frame OUTSIDE the padding — see
+                // AudioGenView.
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -155,8 +152,7 @@ struct Model3DGenView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Photo").font(.subheadline.weight(.semibold))
             if let url = photoURL {
-                // Same surface and same floor height as the empty well: a
-                // picked photo must not change where the form sits.
+                // Same surface and same floor height as the empty well.
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
                     HStack(spacing: 8) {
                         if let img = NSImage(contentsOf: url) {
