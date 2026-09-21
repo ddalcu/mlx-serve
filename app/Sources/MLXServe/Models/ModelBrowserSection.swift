@@ -225,7 +225,7 @@ enum ModelBrowserUse {
 
     static func groupTitle(_ source: LocalModelSource) -> String {
         switch source {
-        case .mlxServe:    return "Downloaded by MLX Core"
+        case .mlxServe:    return "Downloaded by MLX-Serve"
         case .lmStudio:    return "LM Studio Models"
         case .huggingFace: return "Hugging Face Cache"
         case .mtplx:       return LocalModelSource.mtplx.sectionTitle

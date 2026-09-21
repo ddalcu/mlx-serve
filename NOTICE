@@ -65,6 +65,17 @@ that mlx-serve does not use. Those notices are omitted here as permitted by
 Apache-2.0 section 4(d).
 
 --------------------------------------------------------------------------------
+Inco Splash
+https://github.com/incoai/splash
+Licensed under the Apache License, Version 2.0.
+
+The matmul2d packed-KV attention kernel (msv_qkv_mpp in src/transformer.zig)
+follows the structure of Splash's q8 attention tile
+(runtime/metal/kernels/common/q8_attention_tile.h): per-page QK and PV through
+the MetalPerformancePrimitives tensor op with an online softmax and split-KV
+partials. Re-implemented over MLX's affine group-quantized cache.
+
+--------------------------------------------------------------------------------
 dflash-mlx
 https://github.com/bstnxbt/dflash-mlx
 Copyright dflash-mlx contributors

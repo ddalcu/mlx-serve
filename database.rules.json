@@ -14,6 +14,7 @@
         "schemaVersion": { ".validate": "newData.isNumber() && newData.val() >= 1" },
         "id":            { ".validate": "newData.isString() && newData.val().length <= 64" },
         "sessionId":     { ".validate": "newData.isString() && newData.val().length <= 64" },
+        "installId":     { ".validate": "newData.isString() && newData.val().length <= 64" },
         "suiteId":       { ".validate": "newData.isString() && newData.val().length <= 64" },
         "armId":         { ".validate": "newData.isString() && newData.val().length <= 64" },
         "armLabel":      { ".validate": "newData.isString() && newData.val().length <= 64" },

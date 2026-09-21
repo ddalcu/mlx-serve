@@ -1,4 +1,4 @@
-/* MLX Core — 简体中文 (zh-Hans)
+/* MLX-Serve — 简体中文 (zh-Hans)
    Keys are the English source strings; anything not listed here
    falls back to English. */
 
@@ -450,7 +450,7 @@
 "Download this model — you can keep using the app while it transfers" = "下载这个模型 —— 传输过程中你可以继续使用本应用";
 "Download v%lld, install, and relaunch" = "下载 v%lld、安装并重新启动";
 "Downloaded and ready to use" = "已下载，可直接使用";
-"Downloaded by MLX Core" = "由 MLX Core 下载";
+"Downloaded by MLX-Serve" = "由 MLX-Serve 下载";
 "Downloading %@ %@" = "正在下载 %@ %@";
 "Downloading drafter…" = "正在下载草稿模型…";
 "Downloading model %lld/%lld: " = "正在下载模型 %lld/%lld：";
@@ -638,12 +638,12 @@
 "Image detail" = "图像细节";
 "Image generation" = "图像生成";
 "Images" = "图像";
-"In LM Studio’s models folder — manage it in LM Studio. MLX Core loads it read-only." = "在 LM Studio 的模型文件夹中 —— 请在 LM Studio 中管理。MLX Core 会以只读方式加载。";
-"In MTPLX’s models folder — manage it in MTPLX. MLX Core loads it read-only." = "在 MTPLX 的模型文件夹中 —— 请在 MTPLX 中管理。MLX Core 会以只读方式加载。";
+"In LM Studio’s models folder — manage it in LM Studio. MLX-Serve loads it read-only." = "在 LM Studio 的模型文件夹中 —— 请在 LM Studio 中管理。MLX-Serve 会以只读方式加载。";
+"In MTPLX’s models folder — manage it in MTPLX. MLX-Serve loads it read-only." = "在 MTPLX 的模型文件夹中 —— 请在 MTPLX 中管理。MLX-Serve 会以只读方式加载。";
 "In Memory" = "内存中";
-"In Osaurus’s models folder — manage it in Osaurus. MLX Core loads it read-only." = "在 Osaurus 的模型文件夹中 —— 请在 Osaurus 中管理。MLX Core 会以只读方式加载。";
-"In a custom models folder you added — MLX Core loads it read-only and won’t delete it." = "在你添加的自定义模型文件夹中 —— MLX Core 会以只读方式加载，且不会删除它。";
-"In the Hugging Face cache — manage with huggingface-cli. MLX Core loads it read-only." = "在 Hugging Face 缓存中 —— 请用 huggingface-cli 管理。MLX Core 会以只读方式加载。";
+"In Osaurus’s models folder — manage it in Osaurus. MLX-Serve loads it read-only." = "在 Osaurus 的模型文件夹中 —— 请在 Osaurus 中管理。MLX-Serve 会以只读方式加载。";
+"In a custom models folder you added — MLX-Serve loads it read-only and won’t delete it." = "在你添加的自定义模型文件夹中 —— MLX-Serve 会以只读方式加载，且不会删除它。";
+"In the Hugging Face cache — manage with huggingface-cli. MLX-Serve loads it read-only." = "在 Hugging Face 缓存中 —— 请用 huggingface-cli 管理。MLX-Serve 会以只读方式加载。";
 "In the sandbox" = "在沙盒中";
 "In use" = "使用中";
 "Includes %lld models (e.g. a text encoder)" = "包含 %lld 个模型（例如文本编码器）";
@@ -733,8 +733,8 @@
 "MCP Marketplace" = "MCP 市场";
 "MCP Marketplace…" = "MCP 市场…";
 "MCP tools" = "MCP 工具";
-"MLX Core runs models on your own Mac, so there's a one-time download first." = "MLX Core 在你自己的 Mac 上运行模型，因此首次需要先下载一次。";
-"MLX Core v%lld is available" = "MLX Core v%lld 现已可用";
+"MLX-Serve runs models on your own Mac, so there's a one-time download first." = "MLX-Serve 在你自己的 Mac 上运行模型，因此首次需要先下载一次。";
+"MLX-Serve v%lld is available" = "MLX-Serve v%lld 现已可用";
 "MLX-Serve Models" = "MLX-Serve 模型";
 "MTP acceptance" = "MTP 接受策略";
 "MTPLX Models" = "MTPLX 模型";
@@ -1018,7 +1018,7 @@
 "Quick Launcher (%@)" = "快速启动器（%@）";
 "Quick Launcher Shortcut" = "快速启动器快捷键";
 "Quit" = "退出";
-"Quit MLX Core — stops the server and closes the app" = "退出 MLX Core —— 停止服务器并关闭应用";
+"Quit MLX-Serve — stops the server and closes the app" = "退出 MLX-Serve —— 停止服务器并关闭应用";
 "Qwen 3.5 (9B)" = "Qwen 3.5（9B）";
 "Qwen 3.5 / 3.8 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off." = "自带训练好的 MTP 头的 Qwen 3.5 / 3.8 模型会一次猜出后面的若干 Token，并在单次传递中全部校验 —— 通常能大幅加快回复速度，且输出与常规解码完全一致。对于有该头的模型它会自动开启，对没有的模型则不起作用，因此几乎没有理由关闭它。";
 "Qwen 3.8 27B (4-bit, MTP)" = "Qwen 3.8 27B（4-bit，MTP）";
@@ -1332,7 +1332,7 @@
 "Text/image-to-video, with optional audio." = "文字/图片生成视频，可选音频。";
 "Texture (PBR)" = "纹理（PBR）";
 "That folder isn't reachable right now, so downloads are going to %@ instead." = "该文件夹目前无法访问，因此下载会改为保存到 %@。";
-"That is the server MLX Core is running — add an mlx-serve on a different port" = "那是 MLX Core 正在运行的服务器 —— 请在另一个端口上添加 mlx-serve";
+"That is the server MLX-Serve is running — add an mlx-serve on a different port" = "那是 MLX-Serve 正在运行的服务器 —— 请在另一个端口上添加 mlx-serve";
 "The %@ session could not start" = "%@ 会话无法启动";
 "The 4-bit build of MiniMax-H3: same generation speed, a 40 GB download instead of 69, and it fits comfortably on 32 GB Macs. Slightly softer detail than the 8-bit build — pick that one if you have 48 GB or more." = "MiniMax-H3 的 4-bit 版本：生成速度相同，下载 40 GB 而不是 69 GB，32 GB 的 Mac 也能轻松运行。细节比 8-bit 版本略柔和 —— 如果你有 48 GB 或以上内存，请选 8-bit。";
 "The C bindings the server links MLX through (pinned submodule revision)." = "服务器用来链接 MLX 的 C 绑定（固定子模块版本）。";
@@ -1450,7 +1450,7 @@
 "Voice clone clip" = "语音克隆片段";
 "Voice engine" = "语音引擎";
 "Voice mode (%@) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled)." = "语音模式（%@）—— 免提与模型对话。语音转文字和文字转语音都在你的 Mac 上本地运行；模型只处理文本（以及启用后的工具与思考）。";
-"Voice mode can't hear you — Microphone access is off for MLX Core. " = "语音模式听不到你 —— MLX Core 的麦克风访问权限已关闭。 ";
+"Voice mode can't hear you — Microphone access is off for MLX-Serve. " = "语音模式听不到你 —— MLX-Serve 的麦克风访问权限已关闭。 ";
 "Voice mode needs Speech Recognition access (a separate permission from Microphone). " = "语音模式需要语音识别权限（与麦克风分开的另一项权限）。 ";
 "Voice mode transcribes on-device — your audio never leaves this Mac — but on-device " = "语音模式在设备端转写 —— 你的音频永远不会离开这台 Mac —— 但在设备端 ";
 "Voices blend: type several separated by commas (af_bella,af_sky) to make a new one." = "音色混合：输入多个以逗号分隔的音色（af_bella,af_sky）即可创建一个新音色。";
@@ -1512,7 +1512,7 @@
 "every weekday at 8am · or a cron expression" = "每个工作日早上 8 点 · 或 cron 表达式";
 "exceeds maximum context length" = "超出最大上下文长度";
 "in LM Studio’s models folder" = "在 LM Studio 的模型文件夹中";
-"in MLX Core’s own models folder" = "在 MLX Core 自己的模型文件夹中";
+"in MLX-Serve’s own models folder" = "在 MLX-Serve 自己的模型文件夹中";
 "in MTPLX’s models folder" = "在 MTPLX 的模型文件夹中";
 "in Osaurus’s models folder" = "在 Osaurus 的模型文件夹中";
 "in a custom folder you added" = "在你添加的自定义文件夹中";
@@ -1569,3 +1569,5 @@
 "↩ ask · esc close" = "↩ 提问 · esc 关闭";
 "✓ On disk" = "✓ 已在本地";
 "🎙️ I couldn't make out any speech in that clip. Try recording again." = "🎙️ 这段音频里听不出任何说话声。请重新录制。";
+"The 27B, sized for 16 GB" = "为 16 GB 精简的 27B";
+"Qwen 3.8 27B squeezed down to about 2 bits per weight by prism-ml, so one of the strongest models here fits a Mac with 16 GB of memory. It gives up some accuracy against the full-size 27B and replies slower on a small Mac, but it is far smarter than anything else that fits in 16 GB. It reads images too, and uses the same built-in speed trick as the 27B." = "由 prism-ml 将 Qwen 3.8 27B 压缩到每个权重约 2 位，让这里最强的模型之一可以在 16 GB 内存的 Mac 上运行。与完整的 27B 相比它会损失一些准确度，在小内存 Mac 上回复也更慢，但比其他能放进 16 GB 的模型聪明得多。它也能读图片，并使用与 27B 相同的内置提速技巧。";

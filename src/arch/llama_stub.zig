@@ -8,7 +8,7 @@
 
 const std = @import("std");
 
-const unavailable = "llama.cpp engine is unavailable on the iOS build (MLX safetensors only)";
+const unavailable = "llama.cpp engine is unavailable on this build (macOS-only embedded engine)";
 
 pub const Error = error{
     EngineOpenFailed,
@@ -21,8 +21,6 @@ pub const Error = error{
 pub const OpenOptions = struct {
     n_gpu_layers: i32 = 999,
 };
-
-pub const ChatTurn = struct { role: []const u8, content: []const u8 };
 
 pub const LlamaKvQuant = enum(u8) {
     off,
@@ -60,6 +58,10 @@ pub fn commonPrefixLen(a: []const i32, b: []const i32) usize {
 }
 
 pub const LlamaEngine = struct {
+    // The real arch/llama.zig nests ChatTurn inside LlamaEngine; main.zig's
+    // offline llama path addresses it as LlamaEngine.ChatTurn.
+    pub const ChatTurn = struct { role: []const u8, content: []const u8 };
+
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*LlamaEngine {
         _ = allocator;
         _ = model_path;

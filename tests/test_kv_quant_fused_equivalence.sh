@@ -296,7 +296,8 @@ fi
 sleep 2
 VER_FUSED_COMPL=""
 VER_FUSED_TOK=""
-run_and_tokenize "verify fused" "--kv-attn-mode fused --pld" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+# =1 keeps every width on the kernel (the default declines past 12 q rows).
+MLX_SERVE_KV_ATTN_VERIFY=1 run_and_tokenize "verify fused" "--kv-attn-mode fused --pld" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
 MODEL="$SAVED_MODEL"
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm fused boot never engaged PLD — the arm proves nothing."

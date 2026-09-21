@@ -69,7 +69,7 @@ struct ChatModelGateSheet: View {
         case .downloading:
             return "Chat opens as soon as this finishes — you can leave it running."
         default:
-            return "MLX Core runs models on your own Mac, so there's a one-time download first."
+            return "MLX-Serve runs models on your own Mac, so there's a one-time download first."
         }
     }
 }

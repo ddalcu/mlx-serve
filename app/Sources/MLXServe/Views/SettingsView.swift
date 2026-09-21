@@ -1422,6 +1422,17 @@ private struct ServerSectionContent: View {
                     .toggleStyle(.switch)
             }
         }
+        if let m = meta["osMemoryReserve"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.osMemoryReserve)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.osMemoryReserve)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
     }
 }
 
@@ -3094,7 +3105,7 @@ private struct UpdatesSectionContent: View {
 
         if let update = updates.available {
             SettingsRow(
-                title: "MLX Core v\(update.version) is available",
+                title: "MLX-Serve v\(update.version) is available",
                 explainer: "Downloads MLXCore.dmg from the release, replaces the app, and relaunches."
             ) {
                 switch updates.phase {

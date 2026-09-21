@@ -48,7 +48,7 @@ enum AppActivation {
     /// the call sites that bypassed `openAndFocus` couldn't reach it.
     static func windowTitle(for id: String) -> String {
         switch id {
-        case "chat":         return "MLX Core"
+        case "chat":         return "MLX-Serve"
         case "serverLog":    return "Server Log"
         default:             return "Browser"
         }

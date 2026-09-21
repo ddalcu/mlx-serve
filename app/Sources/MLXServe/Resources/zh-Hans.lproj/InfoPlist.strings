@@ -1,7 +1,7 @@
-/* MLX Core 简体中文 — Info.plist 文案 */
+/* MLX-Serve 简体中文 — Info.plist 文案 */
 
-"CFBundleDisplayName" = "MLX Core";
-"NSAppleEventsUsageDescription" = "MLX Core 在 Agent 模式下通过 AppleScript 控制 Safari 和其他应用。";
-"NSLocalNetworkUsageDescription" = "只有在设置里开启局域网共享时，MLX Core 才会使用你的局域网：通过 Bonjour 广播你选择共享的模型，并发现其他 Mac 共享的模型。任何数据都不会离开你的网络。";
-"NSMicrophoneUsageDescription" = "MLX Core 会录制麦克风音频，让多模态模型（例如 Gemma 4 12B）能听到并回应你的语音。";
-"NSSpeechRecognitionUsageDescription" = "MLX Core 在语音模式下使用 Apple 的端上语音识别，让你即使没有网络也能免手与模型对话。你的音频完全在本机转写；本应用强制使用端上识别，绝不把你的语音发送到 Apple 的服务器。（以上措辞是 Apple 为该权限提供的标准文本。）";
+"CFBundleDisplayName" = "MLX-Serve";
+"NSAppleEventsUsageDescription" = "MLX-Serve 在 Agent 模式下通过 AppleScript 控制 Safari 和其他应用。";
+"NSLocalNetworkUsageDescription" = "只有在设置里开启局域网共享时，MLX-Serve 才会使用你的局域网：通过 Bonjour 广播你选择共享的模型，并发现其他 Mac 共享的模型。任何数据都不会离开你的网络。";
+"NSMicrophoneUsageDescription" = "MLX-Serve 会录制麦克风音频，让多模态模型（例如 Gemma 4 12B）能听到并回应你的语音。";
+"NSSpeechRecognitionUsageDescription" = "MLX-Serve 在语音模式下使用 Apple 的端上语音识别，让你即使没有网络也能免手与模型对话。你的音频完全在本机转写；本应用强制使用端上识别，绝不把你的语音发送到 Apple 的服务器。（以上措辞是 Apple 为该权限提供的标准文本。）";

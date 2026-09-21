@@ -2116,3 +2116,32 @@ Two more came out of the first llmprobe run (all cells failing were ours):
   band-name prompt). `applyTopK` now keeps the k argpartition indices and
   `applyTopP` decides the nucleus in argsort space and scatters the mask back
   (`generate.zig`); non-tied rows mask identically. Every model, not K2.
+
+## Bonsai 2 served in bf16 (2026-09-18)
+
+- Defect: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` ships f16 scales and biases
+  and f32 norm/GDN tables, and Prism's reference runtime runs it in f16 with an
+  f32 GatedDeltaNet state. We narrowed every f16 side tensor to bf16 at load
+  (3 mantissa bits off each group scale), ran bf16 activations and kept the GDN
+  state bf16: KL 1.7e-4 vs an f32 reference of the pack, top-1 98.3%.
+- Fix: `ModelConfig.actDtype` (f16) and `ssmStateDtype` (f32) for Hadamard
+  packs; the loader keeps f16 as stored (`LoadOpts.keep_f16`), f32 tables
+  narrow to f16; every kernel on the path takes f16 (qmv2, gdn_decode, GDN
+  prework/norm-gate, QK-norm+RoPE 256, msv_attn_p256), and the grafted bf16 MTP
+  head casts at its two boundaries. KL 2.9e-6 / top-1 99.1%, the reference's
+  own fp16 distance. Same speed: fp16 GEMMs run at bf16's rate.
+- Two bf16 constants surfaced only under f16: the batched decode mask (sdpa
+  requires the mask to promote to the output dtype, so 4 concurrent MTP
+  requests 500'd) and the M-RoPE full-rotation cast.
+- Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
+  self-contained f32 reference, KL < 1e-5); red on the old engine.
+
+## Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
+
+Defect: the first 1024² generation on the 4-bit pack reported an 18 GB peak process footprint; the staged engine holds 5.5 GB and the 40-step denoise is flat at that. `mlx_get_peak_memory` read 4.9 GB throughout, so nothing MLX-side pointed at it.
+
+Cause: two things in the f32 decoder's last two stages. MLX's 3x3 conv holds an unfolded copy of its input (H·W·9·C_in floats: 11 GB at 288 channels x 1024²), outside its own memory counters. And a stage's ResBlocks keep half a dozen full-resolution intermediates alive at once (1.2 GB each).
+
+Fix: both exact. Large 3x3 convs run in row strips over a once-padded input (`Conv.forwardStrips`). Whole stages run in row bands with a `2·resnets + 2` row halo that is cropped (`Stage.banded`): the channel norm is per-pixel (it is `rms_norm`, which also replaced a five-tensor spelled-out chain), the shortcuts fold/unfold 2x2 cells, so only the 3x3 convs look sideways. Peak 18.1 → 9.5 GB, same pixels.
+
+Guard: `QwenImage VAE parity` re-runs the reference oracle with every stage forced into 8-row bands; `QwenImage strip conv equals the whole-image conv`. An uncapped MLX buffer pool in a test binary also reads as a leak: the e2e test sets the 1 GB cap the server sets in `main()`.

@@ -70,6 +70,9 @@ struct EmbeddedTerminalView: NSViewRepresentable {
             terminalView = LocalProcessTerminalView(frame: .zero)
             delegate = ProcessDelegate(onExit: onExit)
             terminalView.processDelegate = delegate
+            // SwiftTerm's default is 500 lines; one agent turn's diff or test
+            // output scrolls past that.
+            terminalView.getTerminal().changeScrollback(20_000)
             // Default environment (TERM=xterm-256color etc.) — ssh needs nothing
             // from the host env; every path it uses arrives via argv.
             terminalView.startProcess(executable: executable, args: args)
@@ -77,6 +80,8 @@ struct EmbeddedTerminalView: NSViewRepresentable {
 
         /// SIGTERM to the spawned process, which drops the PTY and fires onExit.
         func terminate() { terminalView.terminate() }
+
+        var scrollbackLines: Int { terminalView.getTerminal().options.scrollback }
 
         /// Paint a theme (the 16 ANSI slots + text) on `background`. Live:
         /// SwiftTerm recomputes its palette and redraws.

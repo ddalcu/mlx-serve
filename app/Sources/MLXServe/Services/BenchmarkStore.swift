@@ -267,7 +267,11 @@ enum BenchmarkCommunityError: LocalizedError {
 actor BenchmarkCommunityClient {
 
     private let session: URLSession
-    init(session: URLSession = .shared) { self.session = session }
+    private let installId: String
+    init(session: URLSession = .shared, installId: String = InstallId.current()) {
+        self.session = session
+        self.installId = installId
+    }
 
     /// Fetch the newest community rows.
     func fetch(limit: Int = 500) async throws -> [BenchmarkResult] {
@@ -292,7 +296,8 @@ actor BenchmarkCommunityClient {
     func submit(_ rows: [BenchmarkResult]) async -> Outcome {
         var outcome = Outcome()
         guard let url = BenchmarkStore.communitySubmitURL() else { return outcome }
-        for row in rows {
+        for var row in rows {
+            row.installId = installId
             do {
                 var request = URLRequest(url: url)
                 request.httpMethod = "POST"

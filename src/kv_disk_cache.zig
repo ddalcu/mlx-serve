@@ -47,6 +47,7 @@
 //! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
@@ -114,7 +115,25 @@ const DarwinStatfs = extern struct {
     f_ffree: u64,
     tail: [4096]u8,
 };
-extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
+
+/// Linux glibc `struct statfs` (LP64: __fsword_t = long, fsblkcnt_t = unsigned long).
+const LinuxStatfs = extern struct {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: extern struct { val: [2]i32 },
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [4]i64,
+};
+
+const StatfsBuf = if (builtin.os.tag.isDarwin()) DarwinStatfs else LinuxStatfs;
+extern "c" fn statfs(path: [*:0]const u8, buf: *StatfsBuf) c_int;
 extern fn msv_volume_free_for_use(path: [*:0]const u8) u64;
 
 pub const VolumeSpace = struct { free: u64, total: u64 };
@@ -126,9 +145,9 @@ pub fn volumeSpace(path: []const u8) ?VolumeSpace {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    var st: DarwinStatfs = undefined;
+    var st: StatfsBuf = undefined;
     if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
-    const bsize: u64 = st.f_bsize;
+    const bsize: u64 = @intCast(@max(st.f_bsize, 0));
     if (bsize < 512 or bsize > (1 << 20) or !std.math.isPowerOfTwo(bsize)) return null;
     if (st.f_blocks == 0 or st.f_bavail > st.f_blocks) return null;
     const total = bsize *| st.f_blocks;
@@ -6138,13 +6157,15 @@ test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
 
 test "volumeSpace: free is what the OS grants, never less than statfs' f_bavail" {
     // Purgeable space is not in f_bavail; the tier used to refuse a volume with 117 GB usable.
-    var st: DarwinStatfs = undefined;
+    // Three separate live probes: other writers move free space between them, hence the slack.
+    const slack: u64 = 1 << 30;
+    var st: StatfsBuf = undefined;
     try testing.expect(statfs("/", &st) == 0);
     const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
     const granted = msv_volume_free_for_use("/");
     try testing.expect(granted > 0);
-    try testing.expect(vs.free >= @as(u64, st.f_bsize) * st.f_bavail);
-    if (granted <= vs.total) try testing.expectEqual(granted, vs.free);
+    try testing.expect(vs.free + slack >= @as(u64, st.f_bsize) * st.f_bavail);
+    if (granted <= vs.total) try testing.expect(@max(granted, vs.free) - @min(granted, vs.free) < slack);
 }
 
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {

@@ -163,7 +163,17 @@ The standing min-M sweep was also width-specific. Relative to the plain lane, q4
 
 **DFlash outranks the MTP head (2026-09-03)** — a pack can ship both (Qwen3.8-27B: in-checkpoint `mtp.*` + an in-dir `drafter/`), and every dispatch site used to pick MTP first, so the drafter silently never ran. Now a loaded DFlash sidecar wins (it is the explicit choice: `--drafter` or the pack's own `drafter/`; the head ships with every checkpoint) and `--no-drafter` / `enable_drafter:false` hand the round back to MTP; the gemma cross-attention drafter stays below MTP. The eight server sites (four surfaces x stream/non-stream) that each hand-rolled `use_mtp`/`use_drafter`/`use_pld` now read ONE `server.requestSpecModes`, twinned by `scheduler.specInitWiring` + `specTickMode`.
 
-**Wide verify does not pay on an M4 Max (2026-09-04, round 2)** — NOTE: the ladder below was measured with an experimental `sg8` simdgroup-matrix lane serving M 8..16 off-NAX, which has since been REVERTED. Without it those widths fall to stock qmm (S=8 is 89.6 ms, not 61.3), so every conclusion here holds a fortiori. The block that actually serves is 5, whose verify input is `[t1, 4 drafts]` = 5 rows, which routes to split-K either way. Verify-forward ladder for the pack (fwd_ubench, one boot per rung, `--no-drafter --no-mtp`, M4 Max): S=1 33.7 | 4 39.4 | 6 49.1 | 8 61.3 | 12 90.9 | 16 89.4 ms. Round 1's S=8 66.6 does not reproduce (61.3 here); S=12 costs MORE than S=16 because a 12-row call wastes four rows of the same two row-tiles. The round model `emitted / (verify(S) + draft)` with draft ~9 ms predicts the live block sweep to within 3%, which is what makes the widths decidable on paper: at 100% acceptance the CEILING is 94 tok/s at block 5, 103 at 6, 113 at 8, 160 at 16 — so code past 100 needs block >= 6 AND near-perfect acceptance, and no linear block draft here comes close.
+**Wide verify pays at four lanes, not at one (M4 Max, 27B 4-bit)** — everything below this entry is an N=1 result and still holds: one request cannot fill a wide block with drafts worth verifying. Four concurrent requests need the rows anyway, and that is where we lost to Inco Splash (94.6 tok/s aggregate vs our 71.9). Three causes, three fixes. (1) No verify lane past 7 rows off-NAX, so four MTP slots fell to the plain batched tick. The M5 `matmul2d` tile was only ever gated off on the M4, never measured: it runs there as shader code at 11.2 TFLOP/s, and its row height is a template int now (`VqmmTile.shader`, 8/16/24-row tiles, whole-forward qmm 62.6 / 73.3 / 104.3 ms vs stock 84.7 / 133 / 134). A 32-row tile exceeds threadgroup memory and stock is at 12.2 TFLOP/s there, so stock serves it. Splash's own tiles measured no faster on this box; their win was tokens per round. (2) `mtpSubGroupPlan` puts 4..8 lanes in ONE 16-row verify and every lane drafts to the cap: the group pays for its widest lane's rows, and lanes planning solo depths wasted them (one boot read 93 tok/s instead of 109). Two or three lanes stay on split-K, a 16-row tile costs more than they can fill. (3) The pad-waste cap read `cache.step` on the 27B (kv_len 4..10, "1.67x waste") and sent one slot serial every tick; and past 1024 tokens the stacked arm copied every slot's KV per layer per tick, so a group now attends per slot (`perSlotBatchedAttn`). Measured, same box, greedy: N=4 short 71.9 → 109 (Splash 94.6), N=8 105 → 129, 4 x 28k warm 26.0 → 64.2 at bf16 KV and 55.4 at kv8 (Splash, always q8 KV: 56.8); gemma-4-e4b N=4 at 7.5k 124 → 189. Guards: the lane-table + parity tests, `per-slot batched attention equals the stacked arm`, `tests/test_mtp_batched.sh` (four-stream arm). Unmeasured: M4 base/Pro, M1-M3 (tile stays off there), the 35B MoE.
+
+**After the wide verify, the group round was draft overhead (M4 Max, 27B 4-bit)** — the 16-row verify was already at the GPU's rate; of a 125 ms round, ~21 ms was the draft chain built one lane after another (12 head steps) and ~13 ms was evals and host work interleaved with those chains. Two facts decided the fix. The coarse top-32 readout behind every rerank draft is ALU-bound on this GPU, 1.1 ms per ROW (4 rows 4.5 ms; packing four rows into one weight pass only reached 3.6), while MLX's own 4-bit matmul on the exact trunk head serves 4 rows in 2.1 ms. And a batched head step whose proposal stays per lane is still 4 readouts, so batching the layer alone measured +1%. Now a group drafts as rows of ONE head forward (`mtp.forwardLanes`: shared projections and MLP, per-lane cache append and attention), greedy lanes propose off the exact head (`draftSelectBatched`), sampled lanes draw from the top-32 of that same readout (`exactShortlistsBatched`, nothing to re-score), and the next round's chain is built and dispatched for the whole group before anything is published (`Generator.mtpGroupPreDraft`). Round 125 → 102-110 ms; N=4 greedy 109 → 119.5, N=4 at temperature 0.7 105 → 118, N=5 113 → 120, N=8 129 → 137, 4 x 28k warm 64 → 68, solo unchanged (fixed depth 3: 70.2 on both binaries). One accept eval for the group measured nothing once the chains stopped interleaving and was not kept. The tick is GPU-bound now (80% of it is eval back-pressure), and the round still grows ~8 ms over the first 1k tokens of context on the stacked attention arm. Auto-mode N=1 cells moved 4% between boots of the SAME binary while this was measured; only the fixed-depth arm could acquit the solo path. Guards: `mtp: forwardLanes equals N solo steps`, `mtp: exact batched shortlists hold each row's own head argmax`, `tests/test_mtp_batched.sh`.
+
+**Auto MTP depth: plan tokens from the acceptance EMAs, price only TIME from the table, one chunk below 8k (M4 Max, 27B 4-bit, 2026-09-19)** — auto read 3-4% under forced depth 3 on code (66.0-66.7 vs 69.2). Two causes. The chunk-A confidence read blocks the CPU while the pre-drafted chain runs, so the verify build cannot overlap it: 6.5 ms per considered round at short context. And the base depth wandered over 2..5 because the m_lo loop scored measured widths with the table's `tok` column: only the standing width's cell sees current content, a width is abandoned exactly when it reads bad, and a stale cell reseeds at weight 0.5, so one 1-token trial round took w4 from 18 to 27 ms/tok for ~500 rounds.
+Live A/Bs could not decide between planners: greedy text diverges with draft depth (first difference at char 400-1200, even between two auto runs), so tok/s is content luck. The instrument is `src/mtp_replay_test.zig`: forced-depth-6 acceptance traces (`src/fixtures/mtp_accept_traces.txt`, recorder `tests/record_mtp_accept_traces.py`) unrolled to one flag per token and replayed through the real planner functions. A round-level replay reads shallow depths 3% low, because chain degradation is strong: aligned forced-depth 1/3/6 runs show a draft that missed at index j >= 1 lands 71% / 52% / 24% of the time at index 0 / 1 / 2, while a hit lands anywhere. With that table the replay reproduces the live forced-depth ladder within 0.4% at all six depths.
+Fix (`MtpDepthPolicy.accept`, default; `MLX_SERVE_MTP_DEPTH_POLICY=legacy` restores the old planner): expected tokens come from the acceptance EMAs (every round refreshes every index it drafted), the table prices round time only, the plan is ONE chunk, the width trial is the probe that refreshes `a[m_lo]` (`mtpProbePeriod`, drag rule over the EV rates), an untimed next width is probed at once and one clean sample prices it. Replay, % of the best fixed depth, legacy -> accept: code 97.6 -> 99.7, prose 95.8 -> 99.0, echo 93.4 -> 98.6, mixed 94.2 -> 97.6. Live, alternating boots: code 66.9 -> 68.2 (forced 3: 69.4), prose 52.2 -> 53.4, short echo 100.5 -> ~103 warm, Flash Next solo 88.3 -> 89.8; 192-token requests +2.2% novel, +2.6% code. M4 base, Qwen3.5-9B (cap row 4): code +3.2%, prose +3.2%, echo +4.6%, echo at 4k +8.7%, standing at w5/w6 once timed. A single llmprobe run cannot see any of this: the 16k rung, the same code path in both arms, read 4.8% apart.
+Scoped below 8192 KV tokens (`mtpDepthPolicyFor`). From there up the verify forward dominates, the confidence read overlaps GPU work, and base 4 + chunk B is cheaper per token than ANY single-chunk depth (16k echo: legacy 83, forced 4/5/6 = 77.0 / 80.2 / 80.9); the acceptance-planned base climbs into the slower shape, so long context keeps the legacy planner. A width switch at 16k also costs ~5 slow rounds (63.7 ms steady, 65-74 after a probe block). Tried and dropped in replay: streak extension (+0.4% code, -0.9% prose), slower acceptance EMAs, one-round probes, a smaller standing margin.
+The opt-in DFlash `WidthChooser` rides the same plan under `.accept` (`dflashAcceptWidth`: falls any number of widths per decision, climbs one per round): DFlash2 on the 27B, 8k echo 79 -> 87 tok/s, code unchanged within noise (69.1 vs MTP 68.5 short; MTP still leads echo by 5-20%), so it stays opt-in.
+
+**Wide verify does not pay on an M4 Max at N=1 (2026-09-04, round 2)** — NOTE: the ladder below was measured with an experimental `sg8` simdgroup-matrix lane serving M 8..16 off-NAX, which has since been REVERTED. Without it those widths fall to stock qmm (S=8 is 89.6 ms, not 61.3), so every conclusion here holds a fortiori. The block that actually serves is 5, whose verify input is `[t1, 4 drafts]` = 5 rows, which routes to split-K either way. Verify-forward ladder for the pack (fwd_ubench, one boot per rung, `--no-drafter --no-mtp`, M4 Max): S=1 33.7 | 4 39.4 | 6 49.1 | 8 61.3 | 12 90.9 | 16 89.4 ms. Round 1's S=8 66.6 does not reproduce (61.3 here); S=12 costs MORE than S=16 because a 12-row call wastes four rows of the same two row-tiles. The round model `emitted / (verify(S) + draft)` with draft ~9 ms predicts the live block sweep to within 3%, which is what makes the widths decidable on paper: at 100% acceptance the CEILING is 94 tok/s at block 5, 103 at 6, 113 at 8, 160 at 16 — so code past 100 needs block >= 6 AND near-perfect acceptance, and no linear block draft here comes close.
 
 Live block sweep, incoai/Qwen3.8-27B-DFlash2 against the 4-bit pack (greedy, 400 tokens, code/prose tok/s, accepted-per-round): b4 77.9/47.4 (2.60), **b5 82.0/50.4 (3.21)**, b6 81.3/45.8 (3.71), b7 77.4/40.3 (4.26), b8 79.8/38.5 (4.71). Acceptance climbs monotonically with width and throughput still peaks at 5 — the extra verify rows cost more than the extra tokens are worth. llmprobe at the 8k rung says the same thing per traffic shape: MTP depth 6 = 93.5 predictable / 39.6 novel / 69.7 decode; DFlash2 b5 = 92.4 / 40.2 / 69.9; b8 = 101.2 / **26.7** / 59.6. So wide blocks clear the 100 tok/s predictable bar and pay for it with a novel rung below SERIAL (30.3).
 
@@ -2522,6 +2532,32 @@ decode-width packed kernel remains default-on: after this gate, the fused arm
 was +0.03%/+0.39%/+0.26% at q4/q6/q8, respectively. Machine-specific
 adoption belongs in a named predicate; a kernel's mathematical eligibility is
 not evidence that its previous machine's default transfers.
+
+**The M4 adoption result expired too (2026-09-20).** Splash's M5 Pro table showed
+kv8 MTP well under bf16 KV at 16K/32K. A one-process surface µbench
+(`MLX_SERVE_KVQ_UBENCH=1`, 27B shapes, kv 4K..64K x t_q 1..8, packed vs dequant +
+sdpa vs bf16 sdpa) read the same ratio at EVERY kv length: packed wins at t_q 1-2,
+ties at 3-4, loses 1.7-1.9x at 5-8. The kernel keeps one accumulator per q row
+(gqa x t_q); past 12 they spill out of registers, and the dense arm got faster
+since August (mlx 0.32.2, `splitCausalSdpa`). Local arrays, float4 lanes and
+threadgroup-memory accumulation were all slower; 12-row passes only tie. Fix:
+`qkvVerifyRowsPay` declines past 12 rows unless `MLX_SERVE_KV_ATTN_VERIFY=1`.
+27B kv8 32K, forced depth 5: 131.5 -> 111.0 ms/round; depth 3 unchanged (83 vs 82).
+Guard: `qkv verify kernel serves by default only...`.
+
+**What closed the gap: `matmul2d` over a threadgroup tile (`qkvAttnMppKernel`).** A
+hand-rolled MSL dot product cannot match the tensor op's compute rate, and dequant +
+sdpa pays a full-KV write per layer per round. Splash feeds int8 pages to
+MetalPerformancePrimitives `matmul2d` directly; our cache is affine gs64, so each
+32-token page is dequantized into THREADGROUP memory (one thread per row-group:
+contiguous word loads, one scale, one bias) and QK / PV run through `matmul2d`
+(8 simdgroups, rows padded to a multiple of 8 with zero queries), online softmax with
+a running rescale, split-KV partials into the shared merge. 27B shapes, 32K, ms per
+layer: t_q 1 0.44 (old packed 0.54, bf16 sdpa 0.37), t_q 4 0.77 (dequant path 1.54,
+bf16 0.98), t_q 8 1.22 (2.65, 1.99). Window `qkvMppWins`: t_q>=4 from 2K, 2-3 from
+8K, 1 from 16K. e2e 27B kv8 MTP: 16K 45.1 -> 54.7, 32K 37.1 -> 50.8 tok/s (bf16 KV
+51.9 / 46.1). The first cut dequantized one thread per ELEMENT (3 strided loads each)
+and lost to everything at t_q 1. NAX check (A20 Pro, hermetic, two runs): parity 21/21, mpp at or under the dequant path in 35 of 36 cells and under the old packed kernel inside the whole window, so the window holds there; against bf16 KV it wins at t_q 6-8 everywhere and at t_q 4 from 16K. Guards: `qkv matmul2d kernel parity`, `qkvMppWins`.
 
 **Two pre-existing t_q==1 losses found by the gemma4 sanity pass** (auto was
 a 1.45x decode LOSS on gemma4-12B kv8 at 11k — 21.1 vs 30.5 tok/s, present
@@ -5137,3 +5173,33 @@ Fix: `verifyRows2d` slices the first `1+m` rows before the reshape in both graph
 short block is `error.MtpVerifyBlockShape`, never an MLX raise), and the finish filters
 only the `1+m` rows it reads. Guard: `batched corrections read only 1+m rows of a
 group-padded verify block`.
+
+## 2-bit GEMV: half2 sums were fast and not exact (2026-09-18)
+
+- The Bonsai decode/verify GEMV (`qmv2.zig`) decoded codes with a half2
+  magic-number trick and accumulated 8-term partials in half2 with x
+  prescaled by 2^-6. Under bf16 output rounding hid it; under f16 it cost
+  1.55x stock's RMS error vs f32 truth (and the prescale pushed |x| < 2^-8
+  into half subnormals).
+- Fix: keep the exact half2 decode, sum in f32. M=1 got faster (1.45x stock,
+  was 1.31x). At verify widths the ALU doubles: pairing two exact half
+  products per f32 flush was still 1.21x RMS / 1.45x max worse, so the M 2..3
+  kernel sums in f32 with stock's error; M >= 4 goes to stock.
+- The first exact M 2..3 kernel held x and the widened codes in f32 registers
+  and staged x through threadgroup memory, which made it slower than the half2
+  one. Keeping codes and x half2 in registers, widened at the FMA (same math),
+  and reading x straight from device each bought ~1.8 ms: 3-row trunk forward
+  32.2 ms vs half2 33.3, first exact 35.4, stock 40.6. R=8 rows spills (2x).
+- Bar: `qmv2: no worse than stock ... against f32 truth` (within 5% of
+  stock's RMS and max error, bf16 + f16, both bias layouts). A tolerance vs
+  stock's OUTPUT (the old test) passed the half2 kernel.
+
+## DFlash beside company decoded serial
+
+Defect: with a DFlash sidecar loaded, four concurrent streams aggregated BELOW one stream
+(27B, M4 Max: 64 vs 74 tok/s). DFlash slots carry `BatchVerdict.spec_active` and tick serially;
+only MTP slots draft and verify as a group.
+
+Fix: `server.requestSpecModes` takes `has_company` (`Scheduler.hasCompany`, any request in
+flight at admission) and hands a DFlash round to a loaded, enabled MTP head. Same cell: 122.
+Known gap: the first request of a burst sees no company and stays DFlash until it finishes.

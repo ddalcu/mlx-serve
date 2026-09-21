@@ -22,7 +22,7 @@ struct MLXCoreEntryPoint {
 struct MLXCoreApp: App {
     private static let menuBarIcon: NSImage = {
         guard let img = BundledAsset.image("tray.png") else {
-            return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
+            return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX-Serve")!
         }
         img.size = NSSize(width: 18, height: 18)
         img.isTemplate = true
@@ -33,20 +33,23 @@ struct MLXCoreApp: App {
     /// The View ▸ Interface menu writes the same keys the Settings rows do.
     @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
-    @StateObject private var appState = AppState()
-    @StateObject private var hfSearch = HFSearchService()
-    @ObservedObject private var browser = BrowserManager.shared
+    /// Held, NOT observed: `AppState` publishes every streamed chat delta, and
+    /// an observing App body rebuilds every scene root per delta. What the
+    /// scene graph reads from it lives in the small observing views below.
+    @State private var roots = Roots()
+    private var appState: AppState { roots.appState }
+    private var hfSearch: HFSearchService { roots.hfSearch }
+
+    /// Built at first body, as `@StateObject` did: `AppState.init` needs `NSApp`,
+    /// which does not exist yet during `App.init`.
+    @MainActor private final class Roots {
+        lazy var appState = AppState()
+        lazy var hfSearch = HFSearchService()
+    }
     @Environment(\.openWindow) private var openWindow
 
-    private func menuBarIcon(for status: ServerStatus) -> NSImage {
-        let color: NSColor?
-        switch status {
-        case .running: color = nil
-        case .starting: color = .systemOrange
-        case .stopped, .error: color = .systemRed
-        }
-        guard let color else { return Self.menuBarIcon }
-        let base = Self.menuBarIcon
+    private static func tinted(_ color: NSColor) -> NSImage {
+        let base = menuBarIcon
         let tinted = NSImage(size: base.size, flipped: false) { rect in
             base.draw(in: rect)
             color.set()
@@ -57,19 +60,19 @@ struct MLXCoreApp: App {
         return tinted
     }
 
+    private static let startingMenuBarIcon = tinted(.systemOrange)
+    private static let stoppedMenuBarIcon = tinted(.systemRed)
     /// Accent-tinted variant of the tray icon, shown while the voice assistant
     /// is running so the menu bar reflects the active session at a glance.
-    private static let activeMenuBarIcon: NSImage = {
-        let base = menuBarIcon
-        let tinted = NSImage(size: base.size, flipped: false) { rect in
-            base.draw(in: rect)
-            NSColor.controlAccentColor.set()
-            rect.fill(using: .sourceAtop)
-            return true
+    private static let activeMenuBarIcon = tinted(.controlAccentColor)
+
+    fileprivate static func menuBarIcon(for status: ServerStatus) -> NSImage {
+        switch status {
+        case .running: return menuBarIcon
+        case .starting: return startingMenuBarIcon
+        case .stopped, .error: return stoppedMenuBarIcon
         }
-        tinted.isTemplate = false
-        return tinted
-    }()
+    }
 
     /// Opening a window used to be `openWindow(id:)` → `activate()` while the
     /// app was still `.accessory` — the inverted order that left the window
@@ -106,32 +109,16 @@ struct MLXCoreApp: App {
         } label: {
             // Observe the voice controller so the tray icon picks up the accent
             // tint the instant a hands-free session starts or stops.
-            MenuBarLabel(idleIcon: menuBarIcon(for: appState.server.status),
-                         activeIcon: Self.activeMenuBarIcon,
-                         voice: appState.voice)
-                // A tapped task notification deep-links here; open the Tasks window
-                // (the label is always present, so this fires even with no window open).
-                .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
-                    // A tapped task notification: the Tasks pane is part of the
-                    // chat window now, so this brings that window up on it and
-                    // TaskListPane consumes the id in .onAppear/.onChange.
-                    if taskId != nil { appState.showTasks() }
-                }
-                // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
-                // the launcher panel can't reach SwiftUI's openWindow itself.
-                .onChange(of: appState.pendingChatOpenTick) { _, _ in
-                    openAndFocus("chat")
-                }
-                // A tool handler has no SwiftUI environment: browse{show} bumps
-                // this on the manager and the scene opens the window.
-                .onChange(of: browser.showRequestTick) { _, _ in
-                    openAndFocus("browser")
-                }
-
+            MenuBarLabel(activeIcon: Self.activeMenuBarIcon,
+                         appState: appState,
+                         server: appState.server,
+                         voice: appState.voice,
+                         browser: BrowserManager.shared,
+                         open: openAndFocus)
         }
         .menuBarExtraStyle(.window)
 
-        Window("MLX Core", id: "chat") {
+        Window("MLX-Serve", id: "chat") {
             ChatView()
                 .environmentObject(appState)
                 // The Model Browser is a MODE of this window now
@@ -166,19 +153,7 @@ struct MLXCoreApp: App {
                 // composer row carries the model pill now — smaller floors
                 // clipped them.
                 .frame(minWidth: 1070, minHeight: 500)
-                // The intro screen, as a DIALOG over the chat window rather
-                // than a floating window of its own. The injections below are
-                // NOT redundant: a sheet does not inherit the environment of
-                // the view it hangs on (`SheetEnvironmentAuditTests`).
-                .sheet(isPresented: $appState.showWelcome) {
-                    WelcomeView(onDismiss: { appState.showWelcome = false },
-                                hasChatModels: appState.welcomeHasChatModels,
-                                onOpenModelBrowser: { appState.showModels() },
-                                onOpenChat: { appState.pendingChatOpenTick += 1 })
-                        .environmentObject(appState)
-                        .environmentObject(appState.downloads)
-                        .environmentObject(appState.server)
-                }
+                .modifier(WelcomePresenter(appState: appState))
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
                 }
@@ -221,12 +196,7 @@ struct MLXCoreApp: App {
         // Per-model settings for the tray's selected model. A window, not a
         // sheet: the MenuBarExtra popover cannot host one.
         Window("Model Settings", id: "modelSettings") {
-            if let request = appState.modelSettingsRequest {
-                ModelSettingsSheet(request: request)
-                    .environmentObject(appState)
-                    .environmentObject(appState.server)
-                    .appAppearance()
-            }
+            ModelSettingsWindowRoot(appState: appState)
         }
         .windowResizability(.contentSize)
 
@@ -274,9 +244,7 @@ struct MLXCoreApp: App {
                     // a ScrollView of plain Buttons never is — see the note in
                     // `ChatSidebar.conversationsSidebar`. It also makes the
                     // shortcut discoverable, which a bare key never was.
-                    Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
-                        .keyboardShortcut(.delete, modifiers: [.command])
-                        .disabled(appState.chatDeletionTarget == nil)
+                    DeleteChatCommand(appState: appState)
                 }
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }
@@ -410,15 +378,77 @@ struct MLXCoreApp: App {
     }
 }
 
-/// Menu-bar label that swaps to an accent-tinted icon while the voice assistant
-/// is running. A tiny view so it can `@ObservedObject` the controller — the App
-/// scene's `label:` closure can't otherwise react to voice state changes.
+/// Menu-bar label: server-status tint, accent tint while the voice assistant
+/// runs. It is always present, so it is also the bridge for requests that
+/// arrive with no SwiftUI environment (notification taps, the quick launcher,
+/// tool handlers).
 private struct MenuBarLabel: View {
-    let idleIcon: NSImage
     let activeIcon: NSImage
+    @ObservedObject var appState: AppState
+    @ObservedObject var server: ServerManager
     @ObservedObject var voice: VoiceModeController
+    @ObservedObject var browser: BrowserManager
+    let open: (String) -> Void
 
     var body: some View {
-        Image(nsImage: voice.isActive ? activeIcon : idleIcon)
+        Image(nsImage: voice.isActive ? activeIcon : MLXCoreApp.menuBarIcon(for: server.status))
+            // A tapped task notification: the Tasks pane is part of the chat
+            // window, so this brings that window up on it and TaskListPane
+            // consumes the id in .onAppear/.onChange.
+            .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
+                if taskId != nil { appState.showTasks() }
+            }
+            // Quick launcher "Open in chat" (⌘↩): the launcher panel can't
+            // reach SwiftUI's openWindow itself.
+            .onChange(of: appState.pendingChatOpenTick) { _, _ in
+                open("chat")
+            }
+            // browse{show} bumps this on the manager and the scene opens the window.
+            .onChange(of: browser.showRequestTick) { _, _ in
+                open("browser")
+            }
+    }
+}
+
+/// The intro screen, as a DIALOG over the chat window. The injections are NOT
+/// redundant: a sheet does not inherit the environment of the view it hangs on
+/// (`SheetEnvironmentAuditTests`).
+private struct WelcomePresenter: ViewModifier {
+    @ObservedObject var appState: AppState
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $appState.showWelcome) {
+                WelcomeView(onDismiss: { appState.showWelcome = false },
+                            hasChatModels: appState.welcomeHasChatModels,
+                            onOpenModelBrowser: { appState.showModels() },
+                            onOpenChat: { appState.pendingChatOpenTick += 1 })
+                    .environmentObject(appState)
+                    .environmentObject(appState.downloads)
+                    .environmentObject(appState.server)
+            }
+    }
+}
+
+private struct ModelSettingsWindowRoot: View {
+    @ObservedObject var appState: AppState
+
+    var body: some View {
+        if let request = appState.modelSettingsRequest {
+            ModelSettingsSheet(request: request)
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .appAppearance()
+        }
+    }
+}
+
+private struct DeleteChatCommand: View {
+    @ObservedObject var appState: AppState
+
+    var body: some View {
+        Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+            .keyboardShortcut(.delete, modifiers: [.command])
+            .disabled(appState.chatDeletionTarget == nil)
     }
 }

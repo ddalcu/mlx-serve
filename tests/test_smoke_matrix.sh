@@ -37,6 +37,7 @@ ARCHES=(
     "gemma3|no|$GD/models/mlx-community/gemma-3-12b-it-4bit"
     "qwen3_5|yes|$MD/mlx-community/Qwen3.5-0.8B-MLX-4bit|$MD/lmstudio-community/Qwen3.5-4B-MLX-4bit"
     "qwen3_5_27b|yes|$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+    "prism_hadamard|yes|$GD/models-dl/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
     "qwen3_5_moe|yes|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
     "lfm2|yes|$MD/LiquidAI/LFM2.5-2.6B-MLX-mxfp4|$GD/models/mlx-community/LFM2.5-2.6B-8bit"
     "lfm2_moe|yes|$GD/models/LiquidAI/LFM2.5-8B-A1B-MLX-8bit"

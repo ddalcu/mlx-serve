@@ -117,5 +117,44 @@ check "non-stream: thought closed by the server" "$NS_CLOSED"
 check "non-stream: content present and finish_reason stop (got '$NS_FIN')" "$([ "$NS_CONTENT" = 1 ] && [ "$NS_FIN" = "stop" ] && echo 1 || echo 0)"
 check "non-stream: reasoning inside the budget plus the forced close" "$([ "$NS_RCHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
 
+# /v1/responses: the same budget, enforced the same way (it used to be parsed and dropped).
+curl -s -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
+  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"max_output_tokens\":600, \"temperature\":0, \"reasoning\":{\"effort\":\"high\"},
+  \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
+eval "$(python3 - "$OUT" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1])); r=""; text=""
+for it in d.get("output",[]):
+    if it.get("type")=="reasoning":
+        for part in (it.get("summary") or [])+(it.get("content") or []): r+=part.get("text","")
+    if it.get("type")=="message":
+        for part in it.get("content") or []: text+=part.get("text","")
+print(f"RS_STATUS={d.get('status')}; RS_CLOSED={1 if 'Considering the limited time' in r else 0}; RS_TEXT={1 if text.strip() else 0}; RS_RCHARS={len(r)}")
+PY
+)"
+check "responses: thought closed by the server" "$RS_CLOSED"
+check "responses: message text present, status completed (got '$RS_STATUS')" "$([ "$RS_TEXT" = 1 ] && [ "$RS_STATUS" = "completed" ] && echo 1 || echo 0)"
+check "responses: reasoning inside the budget plus the forced close" "$([ "$RS_RCHARS" -le $(((BUDGET + 40) * 8)) ] && echo 1 || echo 0)"
+
+curl -sN -m 300 "$BASE/v1/responses" -H 'content-type: application/json' -d "{
+  \"model\":\"x\", \"input\":\"Explain in two sentences why the sky is blue. Think it through carefully first.\",
+  \"max_output_tokens\":600, \"temperature\":0, \"stream\":true, \"reasoning\":{\"effort\":\"high\"},
+  \"reasoning_budget_tokens\":$BUDGET}" > "$OUT"
+eval "$(python3 - "$OUT" <<'PY'
+import json,sys
+r=""; done=""
+for l in open(sys.argv[1]).read().splitlines():
+    if not l.startswith("data: "): continue
+    try: d=json.loads(l[6:])
+    except Exception: continue
+    if d.get("type","").startswith("response.reasoning") and d.get("type","").endswith(".delta"): r+=d.get("delta","")
+    if d.get("type")=="response.completed": done=d["response"].get("status","")
+print(f"RSS_CLOSED={1 if 'Considering the limited time' in r else 0}; RSS_STATUS={done}")
+PY
+)"
+check "responses stream: thought closed by the server" "$RSS_CLOSED"
+check "responses stream: completes (got '$RSS_STATUS')" "$([ "$RSS_STATUS" = "completed" ] && echo 1 || echo 0)"
+
 echo "[budget-stream] $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

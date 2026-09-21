@@ -1,6 +1,6 @@
-//! Fused single-token GatedDeltaNet step for Hadamard packs (B=1, S=1, bf16
-//! state, swish output gate): two dispatches instead of prework + recurrence +
-//! norm-gate + rotation. K1 runs one head over SPLIT threadgroups, each
+//! Fused single-token GatedDeltaNet step for Hadamard packs (B=1, S=1, swish
+//! output gate; activations T, recurrent state StT): two dispatches instead of
+//! prework + recurrence + norm-gate + rotation. K1 runs one head over SPLIT threadgroups, each
 //! recomputing the conv/silu/q-k norm prework for its head (cheaper than a
 //! barrier between kernels) before its slice of the recurrence rows. K2 does
 //! the per-head gated RMS norm for a 1024 block (8 heads) and rotates it for
@@ -91,7 +91,7 @@ const K1_SOURCE =
     \\  for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
     \\  out = simd_sum(out);
     \\  uint base = (hv * DV + dv) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<T>(st[j][i]);
+    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
     \\  if (lane == 0) y[hv * DV + dv] = static_cast<T>(out);
     \\}
 ;
@@ -176,29 +176,59 @@ pub const Inputs = struct {
 
 pub const Outputs = struct { rot: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
 
-/// Null when the geometry is outside the kernels (caller keeps the chain).
-pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
-    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
-    for ([_]mlx.mlx_array{ in.qkv, in.z, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.norm_w }) |arr|
-        if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
+const CfgKey = struct { g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
+var cfg_key: ?CfgKey = null;
+var cfg1: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+var cfg2: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+
+fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     const c = 2 * g.hk * g.dk + g.hv * g.dv;
     const vd = g.hv * g.dv;
-    if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
-    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
-
     const c1 = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(c1);
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c1);
     const y_shape = [_]c_int{ 1, 1, g.hv, g.dv };
     const cs_shape = [_]c_int{ 1, 3, c };
     const st_shape = [_]c_int{ 1, g.hv, g.dv, g.dk };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &y_shape, 4, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &cs_shape, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &st_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &y_shape, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &cs_shape, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &st_shape, 4, st));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c1, g.hv * SPLIT * NT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c1, NT, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "T", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "StT", st));
     inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c1, kv[0], kv[1]));
+    const c2 = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c2);
+    const rot_shape = [_]c_int{ 1, 1, vd };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c2, &rot_shape, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c2, @divExact(vd, 1024) * 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c2, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c2, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "DV", g.dv));
+    if (cfg1.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg1);
+    if (cfg2.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg2);
+    cfg1 = c1;
+    cfg2 = c2;
+    cfg_key = .{ .g = g, .dt = dt, .st = st };
+}
+
+/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
+pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.z, in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.norm_w, in.q_scale, in.k_scale }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
+    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
+    const key = CfgKey{ .g = g, .dt = dt, .st = st };
+    if (cfg_key == null or !std.meta.eql(cfg_key.?, key)) try buildConfigs(g, dt, st);
+    const c1 = cfg1;
+    const c2 = cfg2;
+
     const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
     defer _ = mlx.mlx_vector_array_free(v1);
@@ -215,14 +245,6 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     try mlx.check(mlx.mlx_vector_array_get(&conv_out, o1, 1));
     try mlx.check(mlx.mlx_vector_array_get(&state_out, o1, 2));
 
-    const c2 = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(c2);
-    const rot_shape = [_]c_int{ 1, 1, vd };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c2, &rot_shape, 3, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c2, @divExact(vd, 1024) * 128, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c2, 128, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c2, "T", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "DV", g.dv));
     const in2 = [_]mlx.mlx_array{ y, in.z, in.norm_w, in.eps, in.signs };
     const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
     defer _ = mlx.mlx_vector_array_free(v2);

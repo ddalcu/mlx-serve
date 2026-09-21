@@ -2200,3 +2200,98 @@ Fix: `server.encodeText` owns the branch (ds4 vocab, llama.cpp vocab, else BPE) 
 sites call it. Live on ds4 / llama.cpp / MLX: 196 / 590 / 67 reasoning tokens.
 
 Guard: the format matrix's `usage reasoning_tokens > 0` check on a GGUF arm.
+
+## Logprobs in the logits dtype; Responses dropped the budget (2026-09-18)
+
+- `computeLogprobs` ran `log(softmax(x))` in the logits dtype: bf16 rounded
+  every probability before the log (logprobs off by up to ~0.06 at -16), and
+  f16 logits underflowed to `-inf` plus a NaN, which is invalid JSON on
+  `/v1/completions`. Now `logits - logsumexp` in f32. Guard: unit test
+  `computeLogprobs: f16 logits keep finite, exact log-probabilities`.
+- `/v1/responses` parsed `reasoning.effort` and discarded the budget, so a
+  capped effort thought until `max_output_tokens` and ended `incomplete`. It
+  now takes chat's precedence (`reasoning_budget_tokens` > effort word >
+  `--reasoning-budget`, Qwen3.8 implicit low) and arms the decode-time bound.
+  Guard: `tests/test_reasoning_budget_stream.sh` (responses cases).
+
+## Cancel mid-tick read a freed ThinkBound (2026-09-18)
+
+Stopping a pi request while a second MTP stream decoded killed the server: SIGSEGV in
+`thinkBoundTick` under `runMtpGroups`, at a thread-stack address.
+
+Cause: `sampling.think_bound` (and `constraint`) point into the request handler's frame.
+`complete` removed the slot from `decoding` and returned; the handler freed its state, but
+the inference thread was already inside a tick whose snapshot held the slot, and the group
+fallback ticked it without re-checking `cancelled`.
+
+Fix: `Slot.in_pass` counts inference-thread passes holding the slot, taken under
+`queue_mu` wherever a pass takes it (prefill pop, the step-3 snapshot, `interleaveDecodeTick`).
+`complete` waits for zero before handing the slot to the cleanup queue.
+
+Guard: `tests/test_cancel_mid_tick.sh` (two MTP streams, kill one every 3 s):
+HEAD crashed on the 2nd cancel, the fix survived 15.
+
+## Concurrent long prompts were each admitted against the same free memory
+
+Defect: four 64K requests arriving together on a 27B under a 36 GB wired limit were all admitted
+(8.4 GB each against the same 19.9 GB available); the fourth prefill overran the limit. On macOS
+26.5 that was not a Metal OOM but an IOGPU kernel panic.
+
+Cause: the admission bill runs on the connection thread, before any sibling has allocated. The
+inference-thread re-ask that sees live memory was armed for `longCtxGated` archs only. A DFlash
+drafter's per-request context K/V (20 KB/token on the 27B pack) was in no bill at all.
+
+Fix: before each prefill the inference thread re-asks the cold bill against live memory
+(`scheduler.slotHoldsForMemory`). A request that does not fit while others are live goes back
+to the head of `pending` and waits for one to finish (`holdsForMemory`); alone it proceeds as
+before, so nothing can wait forever. `ModelConfig.drafter_ctx_bytes_per_token` is stamped at
+load and billed per prompt row.
+
+Guard: `tests/test_memory_pressure_4way.sh` (2B model under `MLX_SERVE_GPU_CEILING_MB`, which
+bounds the guards' arithmetic only) asserts served-or-named, an `[admission] held` line, and a
+live server. Rule: a transient or per-request state that scales with KV length is billed, or
+capped, before it is allocated.
+
+## A chunk boundary is the only yield point, so the chunk IS the stall (2026-09-20)
+
+Cold 4-way long prompts on the 27B starved the streams already decoding: client-side they
+saw one tick per prefill chunk. The fix attempted first (up to 8 ticks per boundary,
+`interleaveTicksFor`, a quarter of wall time) changed nothing at 8K because the pinned chunk
+is 8192 there: an 8K prompt has NO boundary, a 33 s stall. `companyPrefillChunk` narrows the
+prefill to 2048 while anyone decodes. What this buys is the inter-token GAP. It does not move
+4-way aggregate (28.4 vs 28.7 tok/s at 8K, 16.0 vs 15.9 at 16K, last TTFT flat): three
+serialized prefills sit inside the window, and the batched tail is the efficient place to
+decode anyway. Guard: `tests/test_prefill_interleave.sh`, unit tests on both pure functions.
+
+## A re-bill against live memory cannot see a sibling that has not allocated yet (2026-09-20)
+
+Round 1 re-billed every request against live memory before its prefill. Four 32K requests
+restored from the hot cache still overran a 36 GB limit (`Insufficient Memory` in the batched
+verify, all four "generation failed"), and the same build kernel-panicked a 16 GB M4 mini at
+8K x4 (15.4 GB wired, 14 MB free). The log shows why: each sibling read `needed=3027 MB
+available=9499 MB`. A restored prefix shares the cached buffers by refcount until its first
+append, so active memory does not move when it is admitted; the next bill sees the same free
+bytes, and all of them grow together during decode. Fix: `PromiseLedger` carries what admitted
+requests were promised and have not allocated (promised minus the growth of active memory since
+the first outstanding admit), and the hold reads `needed + outstanding <= available`. Second
+half: `physicalMemoryCeiling` counted ALL free RAM as ours; MLX wires what it allocates, so
+`osReserveBytes` (an eighth of RAM, 2..8 GB) stays out of the plan. A promise is dropped once its slot has decoded 64 tokens (the restored KV is copied on the first
+append, so the claim is in live memory by then), and a sibling keeps 2 GB of slack under the
+ceiling because a group's verify transients grow with its lanes. The failing cell now serves
+4/4 together after short holds (TTFT 3.6 / 7.6 s), peak 35.6 -> 33.2 GB, no Metal error.
+
+## The load preflight compared weights with free RAM, never the GPU limit (2026-09-20)
+
+Defect: with `iogpu.wired_limit_mb` lowered to 36 GB on a 128 GB Mac, the 70 GB Flash-Next pack
+passed preflight (98 GB free), hit `Insufficient Memory` nine times in warmup, pinned an 870-token
+context and then refused every request with "only ~0MB is available". Inkling (82 GB) and the
+42 GB ds4 GGUF failed the same way. The release smoke matrix found it.
+
+Cause: `effectiveAvailableBytes` read host/process free memory only. Metal's
+`max_recommended_working_set_size` follows the sysctl and is the real bound on what MLX can wire.
+
+Fix: the preflight's available figure is `min(free, mlx.maxRecommendedWorkingSet())` at both the
+text and the media site, so the load refuses by name with the 36 GB figure in the message.
+Guard: `effectiveAvailableBytes is capped by the GPU working-set limit` in `scheduler.zig`.
+Not covered: the embedded engines (ds4 / llama.cpp) keep their own open-time failure.
+

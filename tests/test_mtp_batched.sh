@@ -2,7 +2,8 @@
 # Concurrent MTP users on one model: every stream's greedy output at a FIXED draft depth
 # must be byte-identical to its solo run (the byte bar for spec decode), whether the
 # rounds ride one batched verify (qwen3_5 dense/MoE) or interleave with their own head
-# state (qwen4_exp). A crowd of 4 must still complete on the plain batched tick.
+# state (qwen4_exp). Four streams ride ONE batched verify where a matmul2d verify tile is
+# live (M4/M5 families) and the plain batched tick elsewhere; either way they match solo.
 # Usage: MTP_BATCHED_MODEL=<dir with an MTP head> ./tests/test_mtp_batched.sh [port]
 set -u
 MODEL="${MTP_BATCHED_MODEL:?set MTP_BATCHED_MODEL}"
@@ -30,12 +31,14 @@ pids=(); for i in $(seq 0 $LAST); do req "${P[$i]}" > "$OUT/conc$i" & pids+=($!)
 # to serial, so a divergence is acquitted at a serial top-2 gap <= 0.15 nats (the MTP
 # equivalence bar). qwen4 rounds are solo forwards and must match byte for byte.
 fail=0
-for i in $(seq 0 $LAST); do
-    if cmp -s "$OUT/solo$i" "$OUT/conc$i"; then continue; fi
+# check_streams <prefix> <last index>: every "$OUT/<prefix>$i" against "$OUT/solo$i".
+check_streams() {
+for i in $(seq 0 $2); do
+    if cmp -s "$OUT/solo$i" "$OUT/$1$i"; then continue; fi
     if [ "$IS_QWEN4" = 1 ]; then
-        echo -e "${RED}FAIL${NC} stream $i at N=$N differs from its solo run"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1; continue
+        echo -e "${RED}FAIL${NC} stream $i ($1) differs from its solo run"; diff "$OUT/solo$i" "$OUT/$1$i" | head -6; fail=1; continue
     fi
-    gap=$(python3 - "$BASE" "${P[$i]}" "$OUT/solo$i" "$OUT/conc$i" <<'PYEOF'
+    gap=$(python3 - "$BASE" "${P[$i]}" "$OUT/solo$i" "$OUT/$1$i" <<'PYEOF'
 import sys, json, urllib.request
 base, prompt, solo, conc = sys.argv[1], sys.argv[2], open(sys.argv[3]).read(), open(sys.argv[4]).read()
 def tok(t):
@@ -46,7 +49,7 @@ idx = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), 
 # Score the gap on the SHARED prefix: a serial run diverges from both at its own near-tie.
 r = urllib.request.urlopen(urllib.request.Request(base + "/detokenize", json.dumps({"tokens": a[:idx]}).encode(), {"Content-Type": "application/json"}))
 prefix = json.load(r)["content"]
-body = {"model": "mlx-serve", "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": prefix}], "continue_final_message": True, "max_tokens": 1, "temperature": 0, "logprobs": True, "top_logprobs": 2, "enable_mtp": False}
+body = {"model": "mlx-serve", "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": prefix}], "continue_final_message": True, "max_tokens": 4, "temperature": 0, "logprobs": True, "top_logprobs": 2, "enable_mtp": False}
 r = urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"}))
 t = json.load(r)["choices"][0]["logprobs"]["content"][0]["top_logprobs"]
 print(round(t[0]["logprob"] - t[1]["logprob"], 4), idx)
@@ -56,9 +59,11 @@ PYEOF
     if python3 -c "import sys; sys.exit(0 if float('$g') <= 0.15 else 1)"; then
         echo -e "  ${YELLOW}near-tie${NC} stream $i diverged at token $idx, serial top-2 gap $g nats: acquitted"
     else
-        echo -e "${RED}FAIL${NC} stream $i at N=$N diverged at token $idx with a serial top-2 gap of $g nats"; diff "$OUT/solo$i" "$OUT/conc$i" | head -6; fail=1
+        echo -e "${RED}FAIL${NC} stream $i ($1) diverged at token $idx with a serial top-2 gap of $g nats"; diff "$OUT/solo$i" "$OUT/$1$i" | head -6; fail=1
     fi
 done
+}
+check_streams conc $LAST
 [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} $N concurrent MTP streams match solo (fixed depth 2; near-ties acquitted on the batched verify)"
 if [ "$IS_QWEN4" = 1 ]; then
     grep -q "gdn batched verify engaged" "$LOG" && { echo -e "${RED}FAIL${NC} qwen4 rounds must stay solo (no batched verify yet)"; fail=1; }
@@ -68,11 +73,17 @@ else
     [ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} batched verify engaged: $(grep -o 'gdn batched verify engaged.*' "$LOG" | head -1)"
 fi
 
+[ -s "$OUT/solo3" ] || req "${P[3]}" > "$OUT/solo3"
 pids=(); for i in 0 1 2 3; do req "${P[$i]}" > "$OUT/crowd$i" & pids+=($!); done; wait "${pids[@]}"
 for i in 0 1 2 3; do [ -s "$OUT/crowd$i" ] || { echo -e "${RED}FAIL${NC} crowd stream $i returned nothing"; fail=1; }; done
 if [ "$IS_QWEN4" = 0 ]; then
-    grep -q "gdn batched decode engaged (slots=4)" "$LOG" || { echo -e "${YELLOW}NOT RUN${NC} the four MTP streams never overlapped into one plain batched tick"; }
+    check_streams crowd 3
+    if grep -q "NAX verify lane engaged" "$LOG"; then
+        grep -q "gdn batched verify engaged (slots=4" "$LOG" || { echo -e "${YELLOW}NOT RUN${NC} the four MTP streams never shared one batched verify"; }
+    else
+        grep -q "gdn batched decode engaged (slots=4)" "$LOG" || { echo -e "${YELLOW}NOT RUN${NC} the four MTP streams never overlapped into one plain batched tick"; }
+    fi
 fi
-[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} four MTP streams complete (crowd arm)"
+[ "$fail" = 0 ] && echo -e "${GREEN}PASS${NC} four MTP streams match solo (crowd arm): $(grep -o 'gdn batched verify engaged (slots=4.*' "$LOG" | head -1)"
 grep -ciE "panic|Segmentation" "$LOG" | grep -q "^0$" || { echo -e "${RED}FAIL${NC} server log has a crash"; fail=1; }
 exit $fail

@@ -1024,11 +1024,11 @@ struct LocalModel: Identifiable, Hashable {
         if defect != nil { return nil }
         switch source {
         case .mlxServe: return nil
-        case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
-        case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX Core loads it read-only."
-        case .mtplx: return "In MTPLX\u{2019}s models folder \u{2014} manage it in MTPLX. MLX Core loads it read-only."
-        case .osaurus: return "In Osaurus\u{2019}s models folder \u{2014} manage it in Osaurus. MLX Core loads it read-only."
-        case .custom: return "In a custom models folder you added \u{2014} MLX Core loads it read-only and won\u{2019}t delete it."
+        case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX-Serve loads it read-only."
+        case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX-Serve loads it read-only."
+        case .mtplx: return "In MTPLX\u{2019}s models folder \u{2014} manage it in MTPLX. MLX-Serve loads it read-only."
+        case .osaurus: return "In Osaurus\u{2019}s models folder \u{2014} manage it in Osaurus. MLX-Serve loads it read-only."
+        case .custom: return "In a custom models folder you added \u{2014} MLX-Serve loads it read-only and won\u{2019}t delete it."
         }
     }
 

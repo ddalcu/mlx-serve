@@ -94,7 +94,8 @@ else
     # already cut that month, which is the same UpdateChecker dead end as an
     # unstamped bundle from the other direction. An empty month still yields 0
     # through the jq's own `// 0`; only the COMMAND failing stops the build.
-    if ! LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null); then
+    # A pre-release tag (vYY.M.N-pre-release.P) does not consume N, as in release.yml.
+    if ! LAST_N=$(gh release list --limit 100 --json tagName --jq "[.[] | .tagName | select(test(\"^v${YM}\\\\.[0-9]+$\")) | sub(\"^v${YM}\\\\.\"; \"\") | tonumber] | max // 0" 2>/dev/null); then
         echo "ERROR: \`gh release list\` failed, so the next CalVer number is unknown."
         echo "       Defaulting it would stamp v${YM}.1, behind what is already published."
         echo "       Fix it (\`gh auth login\`), or build for yourself: FAST_DEV=1 bash app/build.sh"

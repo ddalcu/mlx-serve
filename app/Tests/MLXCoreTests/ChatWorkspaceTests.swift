@@ -177,7 +177,7 @@ final class ChatWorkspaceTests: XCTestCase {
         XCTAssertFalse(types.isEmpty, "the regex stopped matching — fix the audit, not the app")
 
         let app = try source("Sources/MLXServe/MLXServeApp.swift")
-        guard let chatScene = app.range(of: #"Window("MLX Core", id: "chat")"#),
+        guard let chatScene = app.range(of: #"Window("MLX-Serve", id: "chat")"#),
               let nextScene = app.range(of: "Window(", range: chatScene.upperBound..<app.endIndex) else {
             return XCTFail("the chat Window scene moved — update this audit")
         }

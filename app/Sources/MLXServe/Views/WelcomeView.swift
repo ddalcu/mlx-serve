@@ -33,9 +33,7 @@ struct WelcomeView: View {
     @State private var cliInstalling = false
     @State private var cliError: String?
 
-    /// The white monochrome mark (not the colored app icon) — reads cleanly on
-    /// the dark welcome surface.
-    private static let logoImage: NSImage? = BundledAsset.image("mlx-white.png")
+    private static let logoImage: NSImage? = BundledAsset.image("appicon.png")
 
     /// Derived from `UpdateChecker.repo` (the app's single source of truth
     /// for the GitHub repo) so the star link can never drift from it.
@@ -119,7 +117,7 @@ struct WelcomeView: View {
         HStack(alignment: .center, spacing: 14) {
             logoTile
             VStack(alignment: .leading, spacing: 2) {
-                Text("MLX Core")
+                Text("MLX-Serve")
                     .font(.system(size: 22, weight: .semibold))
                 Text("Local AI on Apple Silicon")
                     .font(.subheadline)
@@ -150,18 +148,16 @@ struct WelcomeView: View {
 
     private var logoTile: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.06))
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
             if let logo = Self.logoImage {
                 Image(nsImage: logo)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 30, height: 30)
             }
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
         }
         .frame(width: 46, height: 46)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     // MARK: - Feature list (the selector)

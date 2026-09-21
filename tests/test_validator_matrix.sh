@@ -122,10 +122,9 @@ for entry in "${MODELS[@]}"; do
             node "$LLMPROBE_MJS" "127.0.0.1:$PORT" --timeout "$probe_timeout" \
                 2>&1 | strip_ansi > "$probe_log"
             probe_rc=${PIPESTATUS[0]}
-            # Per-suite lines: "Results: X passed, Y failed, Z skipped, N total"
-            probe_cell=$(awk '/^Results:/ {gsub(/[^0-9 ]/,""); p+=$1; f+=$2; s+=$3; t+=$4}
-                END { if (t=="") print "no-results"; else printf "%d/%d", p, t-s }' "$probe_log")
-            failed_ids=$(grep '^Failed:' "$probe_log" | sed 's/^Failed: //' | paste -sd';' - | head -c 300)
+            # llmprobe's scorecard line: "ENGINE CONFORMANCE   98.9%"
+            probe_cell=$(awk '/^ENGINE CONFORMANCE/ {print $NF; found=1} END { if (!found) print "no-results" }' "$probe_log")
+            failed_ids=$(grep -E '^  ✗ [a-z/_ ()]+: ' "$probe_log" | sed 's/^  ✗ //' | paste -sd';' - | head -c 300)
             if [[ "$probe_rc" -ne 0 || "$probe_cell" == "no-results" ]]; then
                 overall_fail=1
                 notes="$notes probe-fail:[${failed_ids:-see $probe_log}]"

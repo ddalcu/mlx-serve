@@ -48,9 +48,13 @@ enum DockReopen {
     }
 }
 
-/// App delegate installed via `@NSApplicationDelegateAdaptor` — exists solely
-/// for the Dock-reopen hook (SwiftUI has no scene-level equivalent).
+/// App delegate installed via `@NSApplicationDelegateAdaptor`: the Dock-reopen
+/// hook (SwiftUI has no scene-level equivalent) and launch-time setup.
 final class MLXCoreAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = InstallId.current()
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
         let minimized = sender.windows.contains { $0.isMiniaturized }

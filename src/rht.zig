@@ -462,17 +462,17 @@ test "rht: block-1024 transform (kernel + composed) matches the reference butter
     defer std.testing.allocator.free(want);
     for ([_]bool{ false, true }) |inverse| {
         for ([_]bool{ true, false }) |fused| {
-        const got = if (fused) try transform(xa, sa, @intCast(block), inverse, s) else try transformComposed(xa, sa, @intCast(block), inverse, s);
-        defer _ = mlx.mlx_array_free(got);
-        try mlx.check(mlx.mlx_array_eval(got));
-        for (0..rows * n) |i| want[i] = if (inverse) x[i] else x[i] * signs[i % n];
-        var c: usize = 0;
-        while (c < rows * n) : (c += block) refHadamard(want[c .. c + block]);
-        if (inverse) for (0..rows * n) |i| {
-            want[i] *= signs[i % n];
-        };
-        const data = mlx.mlx_array_data_float32(got).?;
-        for (0..rows * n) |i| try std.testing.expectApproxEqAbs(want[i], data[i], 1e-4);
+            const got = if (fused) try transform(xa, sa, @intCast(block), inverse, s) else try transformComposed(xa, sa, @intCast(block), inverse, s);
+            defer _ = mlx.mlx_array_free(got);
+            try mlx.check(mlx.mlx_array_eval(got));
+            for (0..rows * n) |i| want[i] = if (inverse) x[i] else x[i] * signs[i % n];
+            var c: usize = 0;
+            while (c < rows * n) : (c += block) refHadamard(want[c .. c + block]);
+            if (inverse) for (0..rows * n) |i| {
+                want[i] *= signs[i % n];
+            };
+            const data = mlx.mlx_array_data_float32(got).?;
+            for (0..rows * n) |i| try std.testing.expectApproxEqAbs(want[i], data[i], 1e-4);
         }
     }
 }

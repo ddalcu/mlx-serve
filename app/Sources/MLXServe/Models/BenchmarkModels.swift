@@ -122,6 +122,9 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
     /// machine hold its speed? Same values on every row of a session.
     var driftDecodeTps: Double?
     var driftPercent: Double?
+    /// Random per-install id (`InstallId`), stamped at Share time.
+    /// Absent on rows shared by older apps.
+    var installId: String?
 
     static let maxNoteLength = 120
 
@@ -231,6 +234,7 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
         note = try c.decodeIfPresent(String.self, forKey: .note)
         driftDecodeTps = try c.decodeIfPresent(Double.self, forKey: .driftDecodeTps)
         driftPercent = try c.decodeIfPresent(Double.self, forKey: .driftPercent)
+        installId = try c.decodeIfPresent(String.self, forKey: .installId)
         isLossy = try c.decodeIfPresent(Bool.self, forKey: .isLossy) ?? BenchmarkSettings.isLossy(settings ?? [:])
     }
 

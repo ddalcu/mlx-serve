@@ -73,6 +73,7 @@ pub extern "c" fn mlx_string_free(str: mlx_string) c_int;
 // Device
 pub extern "c" fn mlx_device_new() mlx_device;
 pub extern "c" fn mlx_device_new_type(dtype: mlx_device_type, index: c_int) mlx_device;
+pub extern "c" fn mlx_device_is_available(avail: *bool, dev: mlx_device) c_int;
 pub extern "c" fn mlx_device_free(dev: mlx_device) c_int;
 pub extern "c" fn mlx_get_default_device(dev: *mlx_device) c_int;
 pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
@@ -423,7 +424,18 @@ var no_gpu_backend_cache: ?bool = null;
 pub fn noGpuBackend() bool {
     if (no_gpu_backend_cache == null) {
         var avail: bool = false;
-        _ = mlx_metal_is_available(&avail);
+        if (comptime builtin.os.tag.isDarwin()) {
+            _ = mlx_metal_is_available(&avail);
+        } else {
+            // Non-Darwin backends (mlx-omarchy Vulkan) are invisible to
+            // mlx_metal_is_available. Ask the device API directly: the GPU
+            // device reports availability whether the backend is Metal,
+            // Vulkan or CUDA, and mlx_default_gpu_stream_new() resolves to
+            // that device's stream.
+            const dev = mlx_device_new_type(.gpu, 0);
+            defer _ = mlx_device_free(dev);
+            _ = mlx_device_is_available(&avail, dev);
+        }
         no_gpu_backend_cache = !avail;
     }
     return no_gpu_backend_cache.?;

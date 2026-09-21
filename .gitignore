@@ -26,6 +26,9 @@ zig-out/
 /lib/mlx/
 /lib/mlx
 /lib/.mlx-build/
+# Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
+/.work-mlx-linux/
+/lib/jinja_cpp/libjinja-linux.a
 
 # Swift / app build. No leading slash, so it also catches the stray root
 # .build/ SwiftPM drops when a swift command is run from the repo root.

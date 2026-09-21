@@ -139,6 +139,7 @@ enum FluxVariant: String, Hashable, Codable {
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
     case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
     case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
+    case qwenImage21      // Qwen-Image-2.1 block-causal DiT — served by the qwen_image backend; undistilled (40 steps, optional real CFG)
 }
 
 struct ImageQualitySettings: Hashable {
@@ -439,6 +440,60 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
     )
 
+    /// Qwen-Image-2.1 is undistilled and ~1 MP-trained: a step costs the same
+    /// at any shape, so the menu stays at the sizes a 40-step run finishes in
+    /// reasonable time on a laptop.
+    private static let qwenImageResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fastest)"),
+        .init(width: 832,  height: 1248, label: "832 × 1248 (portrait 2:3)"),
+        .init(width: 1248, height: 832,  label: "1248 × 832 (landscape 3:2)"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+    ]
+
+    private static let qwenImageQuality: [QualityPreset: ImageQualitySettings] = [
+        .fast:         .init(steps: 20),
+        .good:         .init(steps: 30),
+        .quality:      .init(steps: 40),
+        .superQuality: .init(steps: 50),
+    ]
+
+    /// Qwen-Image-2.1, DiT + text encoder 8-bit (`tests/convert_qwen_image21_weights.py
+    /// --preset 32gb`). On a 32 GB Mac the server stages the text encoder per
+    /// request, so the resident set is the DiT + VAE.
+    static let qwenImage21_8bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-8bit",
+        name: "Qwen-Image 2.1 8-bit (~18 GB)",
+        variant: .qwenImage21,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-MLX-Serve-8bit",
+        approxDownloadGB: 18,
+        approxRAMGB: 22,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageQuality,
+        defaultQuality: .quality,
+        description: "Alibaba's second-generation image model — strong prompt understanding and in-image text, in English and Chinese. Undistilled: 40 steps by default, so it is slower than the Turbo models. Open (Apache-2.0)."
+    )
+
+    /// The 4-bit pack (`--preset 16gb`) for 16 GB Macs.
+    static let qwenImage21_4bit = ImageModelPreset(
+        id: "ddalcu/qwen-image-2.1-4bit",
+        name: "Qwen-Image 2.1 4-bit (~10 GB)",
+        variant: .qwenImage21,
+        configName: "qwen_image21",
+        repo: "ddalcu/Qwen-Image-2.1-MLX-Serve-4bit",
+        approxDownloadGB: 10,
+        approxRAMGB: 12,
+        resolutions: qwenImageResolutions,
+        defaultResolution: qwenImageResolutions[0],
+        qualityProfiles: qwenImageQuality,
+        defaultQuality: .quality,
+        description: "Qwen-Image 2.1 quantized to 4-bit for smaller Macs — the same 40-step model at about half the memory, with some loss of fine detail. Open (Apache-2.0)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
@@ -446,7 +501,9 @@ struct ImageModelPreset: Identifiable, Hashable {
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
         .flux2Klein9B_Q4,                              // 10
         .flux2Klein9BBase_Q4,                          // 10
+        .qwenImage21_4bit,                             // 10
         .krea2Turbo,                                   // 15
+        .qwenImage21_8bit,                             // 18
     ]
 }
 
@@ -1962,7 +2019,7 @@ extension ImageModelPreset {
     var condWeightCount: Int {
         switch variant {
         case .krea2Turbo: return 12
-        case .mageFlowTurbo, .mageFlowEditTurbo: return 0
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return 0
         default: return 3
         }
     }
@@ -1974,7 +2031,7 @@ extension ImageModelPreset {
         switch variant {
         // `clampKreaDim` — VAE ×8 + DiT patch ×2. Mage-Flow is native-resolution
         // with a ×16 VAE downsample and shares the same clamp server-side.
-        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo:
+        case .krea2Turbo, .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21:
             return ResolutionGrid(alignment: 16, minDim: 256, maxDim: 2048)
         // `clampFluxDim` — klein's /32 crop granularity, 1536 covering the
         // widest preset edge.
@@ -1995,8 +2052,10 @@ extension ImageModelPreset {
     /// is a no-op there), but only the undistilled base checkpoint has an
     /// unconditional pathway worth opposing a prompt against; distilled klein
     /// collapsed it into the weights, so the field stays hidden for it.
+    /// Qwen-Image-2.1 is undistilled too: 1.0 (its recommended default) runs
+    /// one forward per step, anything else two.
     var supportsGuidance: Bool {
-        variant == .flux2Klein9BBase
+        variant == .flux2Klein9BBase || variant == .qwenImage21
     }
 
     // ── Capability flags: what the Advanced panel is allowed to offer ──
@@ -2018,7 +2077,7 @@ extension ImageModelPreset {
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21: return false
         default: return true
         }
     }

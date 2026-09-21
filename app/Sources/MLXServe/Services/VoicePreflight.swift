@@ -53,7 +53,7 @@ enum VoicePreflight {
     static func detail(for issue: Issue) -> String {
         switch issue {
         case .microphoneDenied:
-            return "Voice mode can't hear you — Microphone access is off for MLX Core. " +
+            return "Voice mode can't hear you — Microphone access is off for MLX-Serve. " +
                 "Turn it on in System Settings → Privacy & Security → Microphone, then enable Voice again."
         case .speechDenied:
             return "Voice mode needs Speech Recognition access (a separate permission from Microphone). " +

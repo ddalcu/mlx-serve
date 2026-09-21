@@ -89,7 +89,7 @@ enum CoverWeightsFetch {
         case .downloading:
             return "Fetching \(fileName) (\(approxMB) MB) into this pack. Cover works as soon as it lands."
         case .missingUnwritable(let dir):
-            return "Cover needs \(fileName) (\(approxMB) MB), and MLX Core cannot write to this pack's "
+            return "Cover needs \(fileName) (\(approxMB) MB), and MLX-Serve cannot write to this pack's "
                 + "folder. Download it from the model's Hugging Face page and put it in:\n\(dir)"
         case .unavailableRemotely:
             return "Cover runs on the Mac hosting this model; it needs \(fileName) in ITS copy of the pack."

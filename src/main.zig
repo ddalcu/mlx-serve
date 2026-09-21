@@ -18,9 +18,8 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = @import("arch/ds4.zig");
-const llama_arch = @import("arch/llama.zig");
-const ds4_ffi = @import("ds4_ffi.zig");
+const ds4_arch = if (build_options.macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
@@ -36,6 +35,18 @@ pub const VERSION: []const u8 = build_options.version;
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
+
+// The embedded llama.cpp engine only links on macOS builds (macos_engines);
+// elsewhere the stub engine replaces it, so the libllama symbols above are
+// not referenced and `--version` reports these placeholders instead.
+fn ggmlEngineVersion() []const u8 {
+    if (comptime !build_options.macos_engines) return "unavailable (no embedded llama.cpp)";
+    return std.mem.span(ggml_version());
+}
+fn ggmlEngineCommit() []const u8 {
+    if (comptime !build_options.macos_engines) return "";
+    return std.mem.span(ggml_commit());
+}
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
@@ -136,6 +147,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
+        \\  --os-reserve-gib <n>  Free RAM left out of every memory plan so macOS keeps
+        \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
+        \\                        it off: more context and concurrency, but a small Mac
+        \\                        under heavy load can freeze or restart.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -400,6 +415,7 @@ pub fn main(init: std.process.Init) !void {
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
+    server_mod.applyGpuCeilingEnv();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -567,8 +583,8 @@ pub fn main(init: std.process.Init) !void {
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
                 .nax = transformer_mod.naxStatus(),
-                .ggml = std.mem.span(ggml_version()),
-                .ggml_commit = std.mem.span(ggml_commit()),
+                .ggml = ggmlEngineVersion(),
+                .ggml_commit = ggmlEngineCommit(),
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
                 .ds4_commit = build_options.ds4_commit,
@@ -841,6 +857,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
+            i += 1;
+            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+                log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
@@ -854,8 +876,7 @@ pub fn main(init: std.process.Init) !void {
             // compression, some quality impact). Auto-enables flash-attn
             // in the shim because llama's plain SDPA needs F16/F32 KV.
             i += 1;
-            const arch_llama = @import("arch/llama.zig");
-            if (arch_llama.LlamaKvQuant.fromString(args[i])) |q| {
+            if (llama_arch.LlamaKvQuant.fromString(args[i])) |q| {
                 server_mod.llama_kv_quant = q;
             } else {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
@@ -1454,10 +1475,7 @@ pub fn main(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         log.info("Loading weights...\n", .{});
-        var weights = if (load_vision)
-            try model_mod.loadWeightsWithVision(io, allocator, model_dir)
-        else
-            try model_mod.loadWeights(io, allocator, model_dir);
+        var weights = try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();
         model_mod.resolveWeightPrefix(config, &weights);
         try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());

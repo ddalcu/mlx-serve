@@ -1,0 +1,19 @@
+The fork (mlx-omarchy, MLX 0.32.3 + Omarchy patches) inserted a
+`const std::optional<array>& global_scale` parameter into gather_qmm before
+`sorted_indices`; the pinned mlx-c @56b2d39 predates that and passes
+`sorted_indices` (bool) in its place, which fails to compile. Every other
+extended signature this mlx-c revision already matches the fork (quantize,
+dequantize, qqmm all carry global_scale here). Shim: pass no global scale —
+the C ABI has no surface for it yet.
+
+--- a/mlx/c/ops.cpp
++++ b/mlx/c/ops.cpp
+@@ -1501,5 +1501,7 @@
+             (bits.has_value ? std::make_optional<int>(bits.value)
+                             : std::nullopt),
+             std::string(mode),
+-            sorted_indices,
++            /* global_scale: no C ABI surface yet */
++            std::nullopt,
++            sorted_indices,
+             mlx_stream_get_(s)));

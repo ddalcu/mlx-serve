@@ -14,7 +14,7 @@ import Foundation
 /// (voice picker) and `Picker` (model) keep working from their own NSMenu
 /// event-tracking loop. That's the same "tray locks up but the dropdown still
 /// opens" wedge the static `VoiceTrayDot` fixed for animations — here the source
-/// is data churn, not a `TimelineView`. Throttling the deltas to ~20 Hz leaves
+/// is data churn, not a `TimelineView`. Throttling the deltas to ~10 Hz leaves
 /// the run loop idle between flushes, so events get dispatched and the buttons
 /// respond again. Final content is byte-identical; only the *cadence* changes.
 ///
@@ -22,10 +22,10 @@ import Foundation
 /// batching is deterministic and unit-testable with no real time — see
 /// `StreamCoalescerTests`.
 struct StreamCoalescer {
-    /// Max UI-update cadence. 50 ms (~20 Hz): fluid streaming text while leaving
-    /// the main run loop mostly idle between flushes, so `Button` hit-testing in
-    /// the tray popover isn't starved during a long answer.
-    static let defaultInterval: TimeInterval = 0.05
+    /// Max UI-update cadence. 100 ms (~10 Hz): every flush re-lays the live
+    /// reply's markdown, so the cadence is the multiplier on the UI's CPU cost;
+    /// 10 Hz still reads as fluid text and leaves the run loop mostly idle.
+    static let defaultInterval: TimeInterval = 0.1
 
     let interval: TimeInterval
     private var pendingContent = ""
