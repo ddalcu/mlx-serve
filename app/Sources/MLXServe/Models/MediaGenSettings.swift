@@ -514,6 +514,10 @@ struct Model3DGenSettings: Codable, Equatable {
     var turntable: Bool = true
     /// P2 paint stage (full PBR texture). Off until validated end to end.
     var texture: Bool = false
+    /// The draft: the pane unmounts on navigation, so the photo and the
+    /// disclosure state live here or are lost on the way to Chat and back.
+    var photoPath: String? = nil
+    var showAdvanced: Bool = false
 
     private static let storageKey = "model3dGenSettings"
 
@@ -551,5 +555,7 @@ extension Model3DGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .photoPath) { photoPath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }
 }

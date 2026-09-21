@@ -253,8 +253,22 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolution = 128
         s.keepResident = true
         s.turntable = false
+        s.texture = true
+        s.photoPath = "/tmp/object.png"
+        s.showAdvanced = true
         let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
+    }
+
+    /// A blob from before the draft was persisted decodes to the defaults for
+    /// the new keys: no photo, Advanced closed.
+    func testModel3DBlobWithoutTheDraftKeysStillDecodes() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(Model3DGenSettings())) as! [String: Any]
+        for key in ["photoPath", "showAdvanced"] { obj.removeValue(forKey: key) }
+        let decoded = try JSONDecoder().decode(
+            Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded, Model3DGenSettings())
     }
 
     func testModel3DLegacy380ResolutionMigratesTo384() throws {

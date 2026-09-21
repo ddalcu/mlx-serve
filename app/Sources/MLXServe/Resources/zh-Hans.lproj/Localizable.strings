@@ -604,6 +604,7 @@
 "Give this style a name to reuse it from the Examples menu." = "给这个风格起个名字，即可从“示例”菜单中重复使用。";
 "Global gain" = "全局增益";
 "Go ahead…" = "请说吧…";
+"Guidance" = "引导";
 "Guidance (%@)" = "引导（%@）";
 "Guidance scale" = "引导强度";
 "Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0." = "引导强度 —— 视频跟随提示词的紧密程度。1.0 = 关闭：最快，画面也最自然。数值越高，贴合提示词越严格，但速度更慢，画面可能过饱和。LTX 默认为 3.0。";
