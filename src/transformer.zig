@@ -39843,6 +39843,7 @@ test "qkv verify kernel parity: TQ 2..8 x bits x GQA (strided views, causal tail
 }
 
 test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many splits, pad rows" {
+    if (verifyQmmTile() == .off) return error.SkipZigTest; // no matmul2d tile (CI's paravirtual GPU)
     for ([_]u8{ 8, 4 }) |bits| {
         for ([_]c_int{ 1, 2, 4, 5, 8 }) |tq| {
             try qkvVerParityCaseWith(24, 4, 256, bits, 700, tq, true);

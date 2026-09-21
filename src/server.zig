@@ -19305,6 +19305,10 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
     server_config.max_context_size = 0;
+    // The OS reserve alone eats a 7 GB CI runner's free RAM; it is not what is on trial.
+    const orig_reserve = os_reserve_override;
+    defer os_reserve_override = orig_reserve;
+    os_reserve_override = 0;
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.
