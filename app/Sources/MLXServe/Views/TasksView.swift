@@ -282,7 +282,7 @@ private struct RunRow: View {
                 Image(systemName: run.status.iconName)
                     .foregroundStyle(run.status.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(L10n.text(run.summary ?? run.status.label))
+                    Text(verbatim: run.summary ?? L10n.text(run.status.label))
                         .font(.callout)
                         .lineLimit(2)
                     Text("\(run.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(run.triggerReason)")

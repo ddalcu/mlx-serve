@@ -151,7 +151,11 @@ for path in sorted(Path(sys.argv[1]).glob("*.json")):
     bench = (json.loads(path.read_text()) or {}).get("bench") or {}
     decode = (bench.get("decodeTokPerSec") or {}).get("median")
     prefill = (bench.get("prefillTokPerSec") or {}).get("median")
-    tps = (bench.get("speculative") or {}).get("tokensPerStep") or 1.0
+    # llmprobe leaves the top-level block null on a noisy predictable/novel pair:
+    # the shortest context rung carries the same measurement.
+    rungs = bench.get("contextScaling") or [{}]
+    tps = ((bench.get("speculative") or {}).get("tokensPerStep")
+           or (rungs[0].get("speculative") or {}).get("tokensPerStep") or 1.0)
     # WHICH speculative mode ran is only knowable from the server's own log
     # (llmprobe reports that one engaged, not which one). Name it in the cell
     # only when it actually paid: armed-but-not-accepting is not "mtp".

@@ -1900,7 +1900,7 @@ struct ChatDetailView: View {
     /// Skills answering the half-typed command, or none when the menu is
     /// closed. Guarded by `SlashCommands.query` FIRST: the skills folder is
     /// stat-ed on read, and this property is evaluated on every body pass
-    /// (including ~20 Hz while a reply streams).
+    /// (including ~10 Hz while a reply streams).
     private var slashMatches: [SkillSummary] {
         guard !slashDismissed, let q = SlashCommands.query(in: inputText) else { return [] }
         return SlashCommands.matches(query: q, in: AgentPrompt.skillManager.summaries)
@@ -2511,6 +2511,7 @@ struct ChatDetailView: View {
                                     onWillResize: { applyScroll(.rowWillResize) },
                                     onDidResize: { applyScroll(.rowDidResize) },
                                     foldStore: foldStore)
+                                .equatable()
                                 .id(m.id)
                             case .toolCall(let call, let results, let calls, let owned):
                                 ToolCallRow(call: call, results: results, calls: calls,
@@ -3356,7 +3357,7 @@ struct ChatDetailView: View {
     private func showMicPermissionError() {
         let alert = NSAlert()
         alert.messageText = "Microphone access needed"
-        alert.informativeText = "Enable microphone access for MLX Core in System Settings → Privacy & Security → Microphone, then try again."
+        alert.informativeText = "Enable microphone access for MLX-Serve in System Settings → Privacy & Security → Microphone, then try again."
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3917,56 +3918,35 @@ struct GeneratingIndicator: View {
     @State private var startDate = Date()
 
     var body: some View {
-        TimelineView(.animation) { context in
-            let elapsed = context.date.timeIntervalSince(startDate)
-            let outerAngle = elapsed * 120  // degrees per second
-            let innerAngle = -elapsed * 168 // counter-rotate, slightly faster
-
-            HStack(spacing: 8) {
-                // Spinning arcs — continuous, no reset
-                ZStack {
-                    // Outer arc — GPU usage mapped to arc length
-                    Circle()
-                        .trim(from: 0, to: max(0.1, Double(gpuPercent) / 100.0))
-                        .stroke(gpuColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: 18, height: 18)
-                        .rotationEffect(.degrees(outerAngle))
-
-                    // Inner arc — memory
-                    Circle()
-                        .trim(from: 0, to: max(0.1, Double(memPercent) / 100.0))
-                        .stroke(memColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: 10, height: 10)
-                        .rotationEffect(.degrees(innerAngle))
-
-                    // Center dot pulses with GPU activity
-                    Circle()
-                        .fill(gpuColor)
-                        .frame(width: 3, height: 3)
-                        .scaleEffect(1.0 + 0.3 * sin(elapsed * 4))
-                }
+        // The rings spin in Core Animation, not a per-frame SwiftUI timeline:
+        // a timeline re-renders this window's whole hosting view every frame.
+        HStack(spacing: 8) {
+            ActivityRings(outer: max(0.1, Double(gpuPercent) / 100.0),
+                          inner: max(0.1, Double(memPercent) / 100.0),
+                          outerColor: gpuNSColor, innerColor: memNSColor)
                 .frame(width: 20, height: 20)
 
-                // Stats + whimsy
-                Text("GPU \(gpuPercent)%")
-                    .foregroundStyle(gpuColor)
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text("Mem \(memPercent)%")
-                    .foregroundStyle(memColor)
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(L10n.text(whimsy))
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(Self.formatElapsed(elapsed))
+            // Stats + whimsy
+            Text("GPU \(gpuPercent)%")
+                .foregroundStyle(gpuColor)
+            Text("·")
+                .foregroundStyle(.tertiary)
+            Text("Mem \(memPercent)%")
+                .foregroundStyle(memColor)
+            Text("·")
+                .foregroundStyle(.tertiary)
+            Text(L10n.text(whimsy))
+                .foregroundStyle(.secondary)
+                .transition(.opacity)
+            Text("·")
+                .foregroundStyle(.tertiary)
+            TimelineView(.periodic(from: startDate, by: 1)) { context in
+                Text(Self.formatElapsed(context.date.timeIntervalSince(startDate)))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            .font(.system(size: 10, weight: .medium, design: .monospaced))
         }
+        .font(.system(size: 10, weight: .medium, design: .monospaced))
         .onAppear {
             startDate = Date()
             pollMetrics()
@@ -3980,16 +3960,19 @@ struct GeneratingIndicator: View {
         }
     }
 
-    private var gpuColor: Color {
-        if gpuPercent > 80 { return .orange }
-        if gpuPercent > 50 { return .green }
-        return .blue
+    private var gpuColor: Color { Color(nsColor: gpuNSColor) }
+    private var memColor: Color { Color(nsColor: memNSColor) }
+
+    private var gpuNSColor: NSColor {
+        if gpuPercent > 80 { return .systemOrange }
+        if gpuPercent > 50 { return .systemGreen }
+        return .systemBlue
     }
 
-    private var memColor: Color {
-        if memPercent > 85 { return .red }
-        if memPercent > 70 { return .orange }
-        return .secondary
+    private var memNSColor: NSColor {
+        if memPercent > 85 { return .systemRed }
+        if memPercent > 70 { return .systemOrange }
+        return .secondaryLabelColor
     }
 
     private func pollMetrics() {
@@ -4034,6 +4017,89 @@ struct GeneratingIndicator: View {
     }
 }
 
+/// Two counter-rotating arcs and a pulsing dot, animated by the render server.
+private struct ActivityRings: NSViewRepresentable {
+    let outer: Double
+    let inner: Double
+    let outerColor: NSColor
+    let innerColor: NSColor
+
+    func makeNSView(context: Context) -> RingsView { RingsView() }
+
+    func updateNSView(_ view: RingsView, context: Context) {
+        view.set(outer: outer, inner: inner, outerColor: outerColor, innerColor: innerColor)
+    }
+
+    final class RingsView: NSView {
+        private let outerRing = CAShapeLayer()
+        private let innerRing = CAShapeLayer()
+        private let dot = CALayer()
+
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            wantsLayer = true
+            for ring in [outerRing, innerRing] {
+                ring.fillColor = nil
+                ring.lineWidth = 2
+                ring.lineCap = .round
+                layer?.addSublayer(ring)
+            }
+            dot.cornerRadius = 1.5
+            layer?.addSublayer(dot)
+        }
+
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        func set(outer: Double, inner: Double, outerColor: NSColor, innerColor: NSColor) {
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                outerRing.strokeColor = outerColor.cgColor
+                innerRing.strokeColor = innerColor.cgColor
+                dot.backgroundColor = outerColor.cgColor
+            }
+            outerRing.strokeEnd = outer
+            innerRing.strokeEnd = inner
+        }
+
+        override func layout() {
+            super.layout()
+            place(outerRing, diameter: 18)
+            place(innerRing, diameter: 10)
+            dot.bounds = CGRect(x: 0, y: 0, width: 3, height: 3)
+            dot.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
+
+        private func place(_ ring: CAShapeLayer, diameter: CGFloat) {
+            ring.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
+            ring.position = CGPoint(x: bounds.midX, y: bounds.midY)
+            ring.path = CGPath(ellipseIn: ring.bounds, transform: nil)
+        }
+
+        /// A layer drops its animations when it leaves a window.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else { return }
+            spin(outerRing, degreesPerSecond: -120)
+            spin(innerRing, degreesPerSecond: 168)
+            let pulse = CABasicAnimation(keyPath: "transform.scale")
+            pulse.fromValue = 0.7
+            pulse.toValue = 1.3
+            pulse.duration = 0.8
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            dot.add(pulse, forKey: "pulse")
+        }
+
+        private func spin(_ ring: CALayer, degreesPerSecond: Double) {
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.fromValue = 0
+            spin.toValue = 2 * Double.pi * (degreesPerSecond < 0 ? -1 : 1)
+            spin.duration = 360 / abs(degreesPerSecond)
+            spin.repeatCount = .infinity
+            ring.add(spin, forKey: "spin")
+        }
+    }
+}
+
 // `SystemMetrics` (GPU utilization, memory pressure, and the libproc/Mach
 // replacements for lsof/ps/vm_stat) lives in Services/SystemMetrics.swift.
 
@@ -4056,6 +4122,31 @@ private struct DoubleClickToEdit: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// A growing text as its lines, so a view per line leaves all but the last
+/// untouched by a streamed batch. A blank line keeps its height as a space.
+enum StreamingLines {
+    static func split(_ text: String) -> [String] {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.isEmpty ? " " : String($0) }
+    }
+}
+
+/// A streamed batch rebuilds the transcript; a row whose inputs did not change
+/// skips its body. The callbacks are compared by PRESENCE: each one only
+/// routes to the session by id, and which ones a row carries is what changes
+/// what it draws.
+extension MessageBubble: Equatable {
+    static func == (a: MessageBubble, b: MessageBubble) -> Bool {
+        a.message == b.message && a.sources == b.sources
+            && (a.onDelete == nil) == (b.onDelete == nil)
+            && (a.onEdit == nil) == (b.onEdit == nil)
+            && (a.onRegenerate == nil) == (b.onRegenerate == nil)
+            && (a.onContinue == nil) == (b.onContinue == nil)
+            && (a.onSelectRevision == nil) == (b.onSelectRevision == nil)
+            && (a.onFork == nil) == (b.onFork == nil)
     }
 }
 
@@ -4161,11 +4252,25 @@ struct MessageBubble: View {
                 .buttonStyle(.plain)
 
                 if thinkingExpanded {
-                    Text(L10n.text(reasoning))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // Model text is never localized. While the thought grows it
+                    // is one Text per LINE: a single Text is re-measured whole,
+                    // several times per streamed batch, by the window's size
+                    // pass. Selection waits until it has stopped growing.
+                    Group {
+                        if isThinkingNow {
+                            VStack(alignment: .leading, spacing: 0) {
+                                ForEach(Array(StreamingLines.split(reasoning).enumerated()),
+                                        id: \.offset) { _, line in
+                                    Text(verbatim: line)
+                                }
+                            }
+                        } else {
+                            Text(verbatim: reasoning).textSelection(.enabled)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             // Collapsed = one line of type at the column edge, no container.
@@ -5143,7 +5248,7 @@ private struct ToolCallRow: View {
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.leading)
                         .fixedSize(horizontal: true, vertical: false)
-                    Text(L10n.text(result))
+                    Text(verbatim: result)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -5943,11 +6048,33 @@ struct MarkdownText: View {
         let latex: String
         let raw: String
     }
+    /// A streaming reply rebuilds its whole string per flush while only its
+    /// last block changed; every earlier block's inline render is a hit here.
+    private static let inlineRenderCache: NSCache<NSString, NSAttributedString> = {
+        let c = NSCache<NSString, NSAttributedString>()
+        c.countLimit = 4096
+        return c
+    }()
+
     static func renderInline(
         _ text: String,
         theme: LaTeXTheme,
         weight: NSFont.Weight = .regular,
         fontSize: CGFloat = ChatMetrics.transcriptFontSize
+    ) -> NSAttributedString {
+        let key = "\(theme.rawValue)\u{0}\(weight.rawValue)\u{0}\(fontSize)\u{0}\(text)" as NSString
+        if let hit = inlineRenderCache.object(forKey: key) { return hit }
+        let built = NSAttributedString(attributedString:
+            buildInline(text, theme: theme, weight: weight, fontSize: fontSize))
+        inlineRenderCache.setObject(built, forKey: key)
+        return built
+    }
+
+    private static func buildInline(
+        _ text: String,
+        theme: LaTeXTheme,
+        weight: NSFont.Weight,
+        fontSize: CGFloat
     ) -> NSAttributedString {
         let bodyFont = NSFont.systemFont(ofSize: fontSize, weight: weight)
         let prepared = inlineMathPlaceholders(in: text)

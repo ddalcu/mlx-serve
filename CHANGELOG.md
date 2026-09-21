@@ -1,17 +1,33 @@
 # Changelog
 
-## v26.9.5 — Bonsai - unreleased
+## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 
 ### Highlights
 - **Prism Bonsai 2 runs.** `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (Hadamard-rotated 2-bit Qwen3.8-27B, text + vision) loads and serves like any Qwen 27B.
 
-- **Bonsai 2 runs in its own numerics.** f16 activations over the pack's f16 scales and an f32 GatedDeltaNet state, as Prism's reference runtime does: 60x closer to an f32 reference of the pack than the old bf16 path (KL 2.9e-6 vs 1.7e-4), same speed.
+- **Qwen-Image-2.1 image generation.** Text-to-image, image-to-image and negative-prompt guidance from two quantized packs: `ddalcu/Qwen-Image-2.1-MLX-Serve-8bit` for 32 GB Macs and `-4bit` for 16 GB. On smaller Macs the text encoder is loaded per request and freed before the denoise.
+
+- **Four chats at once, much faster.** Four MTP streams share one verify forward and draft together (Qwen3.8-27B 4-bit, M4 Max: 72 to 119 tok/s aggregate), batched decode past 1k tokens of context no longer copies every stream's KV per step (4 streams at 28k: 26 to 64 tok/s), and with a DFlash drafter loaded concurrent requests switch to the MTP head so they batch (64 to 122 tok/s).
+
+- **8-bit KV is as fast as bf16 KV at long context.** Quantized attention runs through Apple's matmul2d tensor op (Qwen and Spark models).
+
+- **Linux.** The server builds and serves against the mlx-omarchy Vulkan MLX fork (`scripts/build-mlx-linux.sh`); Apple-only engines (ds4, llama.cpp, ANE) are left out. Thanks @joshuaswarren (#473).
 
 ### Changes
+- Bonsai 2 with MTP decodes at 73.5 tok/s on an M4 Max (exact 2-bit verify kernel).
+- Benchmarks: the screen loads the picked model itself, ds4/GGUF models report only what their engine runs, and quantized packs no longer read as lossy; the LOSSY badge is gone from the app and website.
+- More of the app is translated to Simplified Chinese.
+- The model browser's RAM estimate for Qwen3.8 Flash Next is corrected.
+- Codex on `/v1/responses` with Qwen models: a system message that is not first no longer drops the request to the fallback prompt, which doubled the tool schema and lost the stop token. Thanks @kmahara (#461).
+- Qwen3.8 Flash Next accepts an unquantized BF16 `ngram_table.bin` (#476).
+- The app uses far less CPU while a reply streams (74% to about 41% on an M4 Max).
+- Bonsai 2 is the recommended pack for Macs under 16 GB
+- The sandbox terminal keeps 20k lines of scrollback.
+- A model larger than the GPU memory limit (a lowered `iogpu.wired_limit_mb`) is refused at load with a clear message; it used to load, fail in warmup and then refuse every request.
+- Downloads into a model folder on an exFAT, NTFS or network drive no longer fail with "only 0 B available" (#474).
+- The app is now called MLX-Serve everywhere in its UI, same as the server; the welcome screen shows the new app icon.
 - Several long requests restored from the prefix cache at once no longer overrun GPU memory (a failed generation, or a kernel panic on a 16 GB Mac): each is billed against what the others were promised, and the server now leaves the OS a memory reserve (`--os-reserve-gib`, a toggle in Settings).
 - Concurrent long prompts that do not fit in GPU memory together now wait their turn instead of overrunning it (a crash, or a kernel panic on macOS 26.5); a DFlash drafter's context is part of the memory bill.
-- With a DFlash drafter loaded, concurrent requests use the MTP head so they batch: four streams on the 27B went from 64 to 122 tok/s (M4 Max).
-- 8-bit KV is now as fast as or faster than bf16 KV at long context: quantized attention runs through Apple's matmul2d tensor op (Qwen3.8-27B MTP on M4 Max: 16K 45 to 55 tok/s, 32K 37 to 51).
 - A long prompt arriving while other requests stream no longer freezes them for a whole 8192-token chunk: prefill narrows to 2048 and runs several decode ticks per chunk boundary.
 - The first request of a burst no longer stays on the DFlash drafter beside the batched group; it joins the group.
 - MTP on sidecar-head models can fall back to plain decode when measured rounds cost more per token (32k+ context).
@@ -22,7 +38,8 @@
 - `mlx-serve launch pi` sends the picked thinking level as `reasoning_effort` (was `enable_thinking` only, which dropped low/medium).
 - Stopping a request while another one was decoding could crash the server.
 - MTP auto draft depth settles closer to the best depth for the content at short context and no longer pauses mid-round to read draft confidences (Qwen3.8-27B 4-bit, M4 Max: code +2%, prose +2%, short echo +3%); `MLX_SERVE_MTP_DEPTH_POLICY=legacy` restores the old planner.
-- Concurrent requests decode faster on M4-family Macs: four MTP streams share one verify forward and draft together (Qwen3.8-27B 4-bit, M4 Max: 72 to 119 tok/s aggregate), and batched decode past 1k tokens of context no longer copies every stream's KV per step (4 streams at 28k: 26 to 64 tok/s).
+- Special thanks to Zhijian Liu & IncoAI for finding concurrency bugs and their matmul2d packed-KV attention kernel !
+- ⚠️ Next release, MLX Core.app will become MLX-Serve.app, this will reset your app settings & updates ⚠️
 
 ## v26.9.4 — Correctness Fixes, Chinese Translation, Benchmarks
 

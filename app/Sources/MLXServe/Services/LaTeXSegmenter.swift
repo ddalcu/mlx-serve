@@ -22,6 +22,11 @@ enum LaTeXSegmenter {
 
     static func segments(_ source: String) -> [Segment] {
         guard !source.isEmpty else { return [.text("")] }
+        // Every delimiter starts with `$` or `\`; a streaming reply is
+        // re-segmented per flush and most prose has neither.
+        if !source.utf8.contains(where: { $0 == UInt8(ascii: "$") || $0 == UInt8(ascii: "\\") }) {
+            return [.text(source)]
+        }
 
         var result: [Segment] = []
         var plainStart = source.startIndex

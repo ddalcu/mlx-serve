@@ -18,6 +18,7 @@ const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
+const qwen_image = @import("qwen_image.zig");
 const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
@@ -93,13 +94,14 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
+    if (std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -465,6 +467,7 @@ const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
     mage_flow: *mage_flow_mod.Engine,
+    qwen_image: *qwen_image.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -549,6 +552,11 @@ pub const ImageEngine = struct {
                 self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
                 return self;
             }
+            if (std.mem.startsWith(u8, mt, "qwen_image")) {
+                const staged = qwenImageStagesTextEncoder(estimateResidentBytes(io, model_dir), mlx.maxRecommendedWorkingSet());
+                self.backend = .{ .qwen_image = try qwen_image.Engine.load(io, allocator, model_dir, staged) };
+                return self;
+            }
         }
         self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
@@ -560,6 +568,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
             .mage_flow => |m| m.deinit(),
+            .qwen_image => |q| q.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -569,6 +578,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.s,
             .krea => |k| k.s,
             .mage_flow => |m| m.s,
+            .qwen_image => |q| q.s,
         };
     }
 
@@ -578,6 +588,7 @@ pub const ImageEngine = struct {
             .flux => 3,
             .krea => 12,
             .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
+            .qwen_image => 0, // one final-norm hidden state, no layer taps
         };
     }
 
@@ -587,6 +598,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
             .mage_flow => false, // img2img lands with the MageFlow VAE encoder
+            .qwen_image => true, // the VAE encoder loads on first use
         };
     }
 
@@ -597,6 +609,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
+            .qwen_image => false, // text-to-image checkpoint
         };
     }
 
@@ -608,11 +621,17 @@ pub const ImageEngine = struct {
     }
 
     /// True when real classifier-free guidance (`guidance_scale`/`negative_prompt`)
-    /// is wired — FLUX only. Distilled klein still accepts the fields (1.0
-    /// is a no-op, matching mflux's basic guider); Krea/Mage-Flow have no
-    /// negative-encode path.
+    /// is wired — FLUX and Qwen-Image. Distilled klein still accepts the
+    /// fields (1.0 is a no-op, matching mflux's basic guider); Krea/Mage-Flow
+    /// have no negative-encode path.
     pub fn supportsGuidance(self: *const ImageEngine) bool {
-        return self.backend == .flux;
+        return self.backend == .flux or self.backend == .qwen_image;
+    }
+
+    /// Steps for a request that names none: the distilled backends' few-step
+    /// default, or an undistilled checkpoint's own recommendation.
+    pub fn defaultSteps(self: *const ImageEngine) u32 {
+        return if (self.backend == .qwen_image) qwen_image.DEFAULT_STEPS else 4;
     }
 
     /// Reconcile the engine's attached LoRA stack with the request: an empty
@@ -639,7 +658,7 @@ pub const ImageEngine = struct {
             const arch: lora_mod.Arch = switch (self.backend) {
                 .flux => .flux2,
                 .krea => .krea2,
-                .mage_flow => .generic,
+                .mage_flow, .qwen_image => .generic,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -651,6 +670,7 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+            .qwen_image => 0, // no LoRA key mapping yet (matches mflux)
         };
         if (matched == 0) {
             stack.deinit();
@@ -665,7 +685,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
-            .mage_flow => {}, // no LoRA attached
+            .mage_flow, .qwen_image => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -699,6 +719,15 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .qwen_image => |q| blk: {
+                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
+                break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                    .guidance_scale = opts.guidance_scale,
+                    .negative_prompt = opts.negative_prompt,
+                }, progress);
+            },
         };
     }
 
@@ -718,6 +747,8 @@ pub const ImageEngine = struct {
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
             // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // Qwen-Image-2.1: one latent token per 16x16 tile.
+            .qwen_image => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 
@@ -728,7 +759,7 @@ pub const ImageEngine = struct {
     pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
         return switch (kind) {
             .flux => 1536,
-            .krea, .mage_flow => 2048,
+            .krea, .mage_flow, .qwen_image => 2048,
         };
     }
 
@@ -1828,7 +1859,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2011,7 +2042,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         negative_prompt = negative_prompt_owned.?;
     }
     if (guidance_scale != 1.0 and !engine.supportsGuidance())
-        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 model");
+        return sendError(conn, 400, "'guidance_scale' requires a FLUX.2 or Qwen-Image model");
 
     // Style LoRA(s): one or more absolute paths to .safetensors adapters,
     // each with an optional scale — mirrors mflux's `--lora-paths`/
@@ -3857,6 +3888,24 @@ pub fn stagedPeakBytes(resident: u64, stages: []const u64) u64 {
     return resident + biggest;
 }
 
+/// A 1024² denoise plus the f32 VAE decode, on top of the weights.
+const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = 4 << 30;
+
+/// Qwen-Image-2.1's text encoder is half the pack and idle for the whole
+/// denoise, so a machine the full set would crowd (past 3/4 of the GPU working
+/// set) loads it per request and frees it before the first DiT forward. The
+/// engine and the residency bill read this ONE answer.
+pub fn qwenImageStagesTextEncoder(weights: u64, working_set: u64) bool {
+    if (working_set == 0) return false;
+    return (weights + QWEN_IMAGE_GEN_TRANSIENT_BYTES) / 3 > working_set / 4;
+}
+
+pub fn qwenImagePeakBytes(text_encoder: u64, rest: u64, working_set: u64) u64 {
+    if (qwenImageStagesTextEncoder(text_encoder + rest, working_set))
+        return stagedPeakBytes(rest, &.{ text_encoder, QWEN_IMAGE_GEN_TRANSIENT_BYTES });
+    return text_encoder + rest + QWEN_IMAGE_GEN_TRANSIENT_BYTES;
+}
+
 /// LTX's plan. Its engine is RESIDENT (transformer + connector + VAEs + audio
 /// stay on `LtxVideoEngine` for its lifetime), with two corrections the
 /// directory sum cannot make:
@@ -3953,6 +4002,12 @@ pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []co
             sz(io, dir, "video_vae.safetensors"),
             sz(io, dir, "audio_vae.safetensors"),
         );
+    }
+    if (std.mem.startsWith(u8, model_type, "qwen_image")) {
+        var te_dir = dir.openDir(io, "text_encoder", .{ .iterate = true }) catch return sumSafetensorsIn(io, dir);
+        defer te_dir.close(io);
+        const te = sumSafetensorsIn(io, te_dir);
+        return qwenImagePeakBytes(te, sumSafetensorsIn(io, dir) -| te, mlx.maxRecommendedWorkingSet());
     }
     if (std.mem.eql(u8, model_type, "minimax_music3")) {
         // The whole engine is resident for its lifetime (no staging), so the
@@ -4436,6 +4491,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
     try testing.expectEqual(Modality.image, modalityFromType("mage_flow").?);
     try testing.expectEqual(Modality.image, modalityFromType("mageflow").?);
+    try testing.expectEqual(Modality.image, modalityFromType("qwen_image21").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
 }
@@ -4663,6 +4719,7 @@ test "maxDim matches what normalizeSize actually clamps to (drift guard)" {
     try testing.expectEqual(clampFluxDim(99999), ImageEngine.maxDimFor(.flux));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.krea));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.mage_flow));
+    try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.qwen_image));
 }
 
 test "Modality.mesh advertises the 3d capability" {
@@ -5296,6 +5353,21 @@ test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {
     try std.testing.expectEqual(8 * GB, stagedPeakBytes(0, &.{ 8 * GB, 3 * GB }));
     // Nothing known → 0, which the preflight reads as "unknown, never block".
     try std.testing.expectEqual(@as(u64, 0), stagedPeakBytes(0, &.{ 0, 0 }));
+}
+
+test "Qwen-Image stages its text encoder only where the full set crowds the GPU" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // The 8-bit pack (TE 9 + DiT/VAE 9) on a 32 GB Mac's ~22 GB working set.
+    try std.testing.expect(qwenImageStagesTextEncoder(18 * GB, 22 * GB));
+    try std.testing.expectEqual(18 * GB, qwenImagePeakBytes(9 * GB, 9 * GB, 22 * GB));
+    // Same pack with room to spare: resident, and the bill is everything.
+    try std.testing.expect(!qwenImageStagesTextEncoder(18 * GB, 48 * GB));
+    try std.testing.expectEqual(22 * GB, qwenImagePeakBytes(9 * GB, 9 * GB, 48 * GB));
+    // The 4-bit pack on a 16 GB Mac; a small encoder still bills the denoise.
+    try std.testing.expect(qwenImageStagesTextEncoder(10 * GB, 11 * GB));
+    try std.testing.expectEqual(8 * GB, qwenImagePeakBytes(2 * GB, 4 * GB, 11 * GB));
+    // Unknown working set never stages.
+    try std.testing.expect(!qwenImageStagesTextEncoder(18 * GB, 0));
 }
 
 test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {

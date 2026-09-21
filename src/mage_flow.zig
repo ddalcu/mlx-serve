@@ -3568,8 +3568,6 @@ fn mergerForward(mw: *const VitMergerW, cfg: VitConfig, hidden: mlx.mlx_array, p
 const TE_HEADS: c_int = 32;
 const TE_KV: c_int = 8;
 const TE_HEAD_DIM: c_int = 128;
-const TE_HIDDEN: c_int = 2560;
-const TE_INTER: c_int = 9728;
 const TE_LAYERS = 36;
 const TE_THETA: f64 = 5_000_000.0;
 const TE_EPS: f32 = 1e-6;
@@ -3618,6 +3616,9 @@ pub const TextEncoder = struct {
     s: S,
     dtype: mlx.mlx_dtype,
     embed_table: mlx.mlx_array, // [vocab, hidden] compute dtype
+    /// Read off the checkpoint: the 4B tower (MageFlow) and the 8B one
+    /// (Qwen-Image-2.1) differ only in these two widths.
+    hidden: c_int,
     layers: [TE_LAYERS]TeLayerW,
     final_norm: mlx.mlx_array, // f32
 
@@ -3640,6 +3641,10 @@ pub const TextEncoder = struct {
         const raw_emb = try ownWeight(&w, ek);
         defer _ = mlx.mlx_array_free(raw_emb);
         self.embed_table = try astype(raw_emb, dtype, s);
+        self.hidden = mlx.getShape(raw_emb)[1];
+        const hidden: u32 = @intCast(self.hidden);
+        const gate0 = w.get(pfx ++ "layers.0.mlp.gate_proj.weight") orelse return error.MissingMageFlowWeight;
+        const inter: u32 = @intCast(mlx.getShape(gate0)[0]);
 
         for (&self.layers, 0..) |*layer, i| {
             const p_in = try std.fmt.allocPrint(a, "{s}layers.{d}.input_layernorm", .{ pfx, i });
@@ -3667,15 +3672,15 @@ pub const TextEncoder = struct {
             layer.* = .{
                 .input_ln = try loadVec(&w, a, p_in, "weight", s),
                 .post_ln = try loadVec(&w, a, p_post, "weight", s),
-                .qw = try MfLinear.load(&w, a, qp, TE_HIDDEN, dtype, s),
-                .kw = try MfLinear.load(&w, a, kp, TE_HIDDEN, dtype, s),
-                .vw = try MfLinear.load(&w, a, vp, TE_HIDDEN, dtype, s),
+                .qw = try MfLinear.load(&w, a, qp, hidden, dtype, s),
+                .kw = try MfLinear.load(&w, a, kp, hidden, dtype, s),
+                .vw = try MfLinear.load(&w, a, vp, hidden, dtype, s),
                 .ow = try MfLinear.load(&w, a, op, TE_HEADS * TE_HEAD_DIM, dtype, s),
                 .q_norm = try loadVec(&w, a, qn, "weight", s),
                 .k_norm = try loadVec(&w, a, kn, "weight", s),
-                .gate_w = try MfLinear.load(&w, a, gp, TE_HIDDEN, dtype, s),
-                .up_w = try MfLinear.load(&w, a, upp, TE_HIDDEN, dtype, s),
-                .down_w = try MfLinear.load(&w, a, dp, TE_INTER, dtype, s),
+                .gate_w = try MfLinear.load(&w, a, gp, hidden, dtype, s),
+                .up_w = try MfLinear.load(&w, a, upp, hidden, dtype, s),
+                .down_w = try MfLinear.load(&w, a, dp, inter, dtype, s),
             };
         }
         self.final_norm = try loadVec(&w, a, pfx ++ "norm", "weight", s);
@@ -3702,7 +3707,7 @@ pub const TextEncoder = struct {
         var taken = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(taken);
         try mlx.check(mlx.mlx_take_axis(&taken, self.embed_table, id_arr, 0, s));
-        var x = try reshape(taken, &[_]c_int{ 1, seq, TE_HIDDEN }, s);
+        var x = try reshape(taken, &[_]c_int{ 1, seq, self.hidden }, s);
 
         const attn_mask = try buildTeMask(self.allocator, mask, seq, self.dtype, s);
         defer _ = mlx.mlx_array_free(attn_mask);
@@ -3787,7 +3792,7 @@ pub const TextEncoder = struct {
         defer _ = mlx.mlx_array_free(merged_dt);
         const replaced = try scatterRows(taken, pos_arr, merged_dt, false, s); // [seq,2560]
         defer _ = mlx.mlx_array_free(replaced);
-        var x = try reshape(replaced, &[_]c_int{ 1, seq, TE_HIDDEN }, s);
+        var x = try reshape(replaced, &[_]c_int{ 1, seq, self.hidden }, s);
 
         const attn_mask = try buildTeMask(self.allocator, mask, seq, self.dtype, s);
         defer _ = mlx.mlx_array_free(attn_mask);
@@ -3804,11 +3809,11 @@ pub const TextEncoder = struct {
             if (i < 3) { // DeepStack scatter-add at LM layers 0/1/2.
                 const ds_dt = try astype(vout.deepstack[i], self.dtype, s);
                 defer _ = mlx.mlx_array_free(ds_dt);
-                const xf = try reshape(x, &[_]c_int{ seq, TE_HIDDEN }, s);
+                const xf = try reshape(x, &[_]c_int{ seq, self.hidden }, s);
                 defer _ = mlx.mlx_array_free(xf);
                 const scat = try scatterRows(xf, pos_arr, ds_dt, true, s);
                 defer _ = mlx.mlx_array_free(scat);
-                const nx2 = try reshape(scat, &[_]c_int{ 1, seq, TE_HIDDEN }, s);
+                const nx2 = try reshape(scat, &[_]c_int{ 1, seq, self.hidden }, s);
                 _ = mlx.mlx_array_free(x);
                 x = nx2;
             }

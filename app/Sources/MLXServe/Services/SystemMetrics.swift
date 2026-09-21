@@ -79,7 +79,13 @@ enum SystemMetrics {
     ///
     /// The within-tier differentiator the chip string can't express: a 32-core
     /// and a 40-core M4 Max both report "Apple M4 Max".
-    static func gpuCoreCount() -> Int {
+    static func gpuCoreCount() -> Int { cachedGpuCoreCount }
+
+    /// The core count cannot change while the app runs, and the IORegistry
+    /// walk is reached from view inits that re-run constantly.
+    private static let cachedGpuCoreCount: Int = readGpuCoreCount()
+
+    private static func readGpuCoreCount() -> Int {
         var iter: io_iterator_t = 0
         guard let matching = IOServiceMatching("AGXAccelerator") else { return 0 }
         guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS else { return 0 }

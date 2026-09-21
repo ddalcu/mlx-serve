@@ -2279,3 +2279,19 @@ half: `physicalMemoryCeiling` counted ALL free RAM as ours; MLX wires what it al
 append, so the claim is in live memory by then), and a sibling keeps 2 GB of slack under the
 ceiling because a group's verify transients grow with its lanes. The failing cell now serves
 4/4 together after short holds (TTFT 3.6 / 7.6 s), peak 35.6 -> 33.2 GB, no Metal error.
+
+## The load preflight compared weights with free RAM, never the GPU limit (2026-09-20)
+
+Defect: with `iogpu.wired_limit_mb` lowered to 36 GB on a 128 GB Mac, the 70 GB Flash-Next pack
+passed preflight (98 GB free), hit `Insufficient Memory` nine times in warmup, pinned an 870-token
+context and then refused every request with "only ~0MB is available". Inkling (82 GB) and the
+42 GB ds4 GGUF failed the same way. The release smoke matrix found it.
+
+Cause: `effectiveAvailableBytes` read host/process free memory only. Metal's
+`max_recommended_working_set_size` follows the sysctl and is the real bound on what MLX can wire.
+
+Fix: the preflight's available figure is `min(free, mlx.maxRecommendedWorkingSet())` at both the
+text and the media site, so the load refuses by name with the 36 GB figure in the message.
+Guard: `effectiveAvailableBytes is capped by the GPU working-set limit` in `scheduler.zig`.
+Not covered: the embedded engines (ds4 / llama.cpp) keep their own open-time failure.
+

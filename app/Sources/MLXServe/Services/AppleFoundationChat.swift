@@ -39,7 +39,14 @@ enum AppleFoundationChat {
         var isAvailable: Bool { self == .available }
     }
 
-    static var availability: Availability {
+    /// View bodies read this on every evaluation and the framework call is
+    /// slow, so the answer is held briefly. It can change at runtime (the user
+    /// turns Apple Intelligence on), hence a short hold rather than forever.
+    static var availability: Availability { heldAvailability.value }
+
+    private static let heldAvailability = HeldValue(hold: 5, read: readAvailability)
+
+    private static func readAvailability() -> Availability {
         switch SystemLanguageModel.default.availability {
         case .available: return .available
         case .unavailable(let reason):

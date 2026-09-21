@@ -66,7 +66,7 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
         let u = url.trimmingCharacters(in: .whitespaces)
         if !(u.hasPrefix("http://") || u.hasPrefix("https://")) { return "URL must start with http:// or https://" }
         if let serverPort, Self.isLoopback(url: u, port: serverPort) {
-            return "That is the server MLX Core is running — add an mlx-serve on a different port"
+            return "That is the server MLX-Serve is running — add an mlx-serve on a different port"
         }
         return nil
     }

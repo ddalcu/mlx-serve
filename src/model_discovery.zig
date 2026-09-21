@@ -86,6 +86,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
         std.mem.eql(u8, model_type, "mageflow") or
+        std.mem.startsWith(u8, model_type, "qwen_image") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
@@ -484,7 +485,8 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.startsWith(u8, model_type, "mage_flow") or
-        std.mem.eql(u8, model_type, "mageflow")) return .image;
+        std.mem.eql(u8, model_type, "mageflow") or
+        std.mem.startsWith(u8, model_type, "qwen_image")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
@@ -1218,6 +1220,8 @@ test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
     try testing.expect(isMediaModelType("mage_flow"));
     try testing.expect(isMediaModelType("mageflow"));
     try testing.expectEqual(ModelKind.image, modelKindFromType("mage_flow"));
+    try testing.expect(isMediaModelType("qwen_image21"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("qwen_image21"));
     try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
     // Guardrail: a regular LM must not be swept up by the prefix match.
     try testing.expect(!isMediaModelType("gemma4"));

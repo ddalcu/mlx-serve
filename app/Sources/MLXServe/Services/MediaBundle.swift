@@ -438,6 +438,23 @@ extension MediaBundle {
         )
     }
 
+    /// Qwen-Image-2.1 (mlx-serve pack): the diffusers layout plus the root
+    /// `config.json` our converter writes LAST, which is what names the backend.
+    static func qwenImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "qwenimage:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "transformer", "vae", "text_encoder", "processor"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The subdirectory LTX 2.5 ships its own text encoder in. Cross-pinned
     /// with the server's `ltx_video.LtxVersion.textEncoderSubdir` — the server
     /// resolves the encoder from this exact path, so a rename here silently
@@ -463,6 +480,8 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .qwenImage21:
+            return .qwenImage(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .flux2Klein9B, .flux2Klein9BBase:
             // The MLX conversions of klein 9B — distilled and base alike —
             // ship no root config.json.

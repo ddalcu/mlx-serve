@@ -3109,17 +3109,8 @@ fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
     if (static_ceiling_override) |v| return v;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) == 0) {
-        var max_rec: usize = 0;
-        if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-            return @as(u64, max_rec);
-        }
-    }
-    return getMetalBufferLimit();
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    return if (max_rec > 0) max_rec else getMetalBufferLimit();
 }
 
 /// PURE (unit-testable): the real ceiling a NEW MLX allocation must fit under.
