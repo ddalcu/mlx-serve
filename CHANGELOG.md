@@ -4,6 +4,7 @@
 
 ### Highlights
 - **Prism Bonsai 2 runs.** `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (Hadamard-rotated 2-bit Qwen3.8-27B, text + vision) loads and serves like any Qwen 27B.
+- **SeedVR2 upscaling.** One-step diffusion restoration for photos: sharpens detail, removes compression artifacts, and fills in real detail rather than resizing. Pick a model in the Image window, then drag the divider across the result to compare it with the picture you started from.
 
 - **Qwen-Image-2.1 image generation.** Text-to-image, image-to-image and negative-prompt guidance from two quantized packs: `ddalcu/Qwen-Image-2.1-MLX-Serve-8bit` for 32 GB Macs and `-4bit` for 16 GB. On smaller Macs the text encoder is loaded per request and freed before the denoise.
 

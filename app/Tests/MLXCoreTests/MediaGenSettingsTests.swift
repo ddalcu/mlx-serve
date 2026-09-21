@@ -37,7 +37,10 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(s.resolutionId, "1216x832")
         XCTAssertTrue(s.keepResident)
         XCTAssertEqual(s.strength, 0.4)
-        XCTAssertFalse(s.editMode)
+        // `editMode` retired into `ImageSourceVerb` when Enlarge joined Edit
+        // and Variation. The legacy flag still has to land on the verb it
+        // meant — the migration is pinned in detail by `ImagePaneFlowTests`.
+        XCTAssertEqual(s.sourceVerb, .variation)
     }
 
     func testAudioSettingsRoundTrips() throws {
