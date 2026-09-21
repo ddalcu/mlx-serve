@@ -321,6 +321,13 @@ pub fn buildToolsJson(
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
+    // A null `aliases` still gets a map so every expanded wire name is owned and
+    // freed exactly once here; `taken` borrows those keys, so they are freed only
+    // after `taken` is deinited (defer LIFO).
+    var owned_aliases = NamespaceAliases.init(allocator);
+    const aliases_ref: *NamespaceAliases = if (aliases) |a| a else &owned_aliases;
+    defer freeNamespaceAliases(allocator, &owned_aliases);
+
     // Flat function names are reserved first so an expanded member never
     // shadows a tool the client already resolves by its bare name.
     var taken = std.StringHashMap(void).init(allocator);
@@ -372,12 +379,16 @@ pub fn buildToolsJson(
                 if (child.len == 0) continue;
                 const ns_wire = try namespaceWireName(allocator, ns_name, child, &taken);
                 const wire = ns_wire.wire;
-                var wire_owned = true; // the alias map takes ownership on put
+                // `wire` is in `taken` (borrowed) and handed to the alias map below,
+                // which frees it after `taken` is gone; on a handoff error it is still
+                // ours, so free it here. (Same shape as the `bare` registration.)
+                var wire_owned = true;
                 defer if (wire_owned) allocator.free(wire);
                 if (emitted > 0) try buf.append(allocator, ',');
                 emitted += 1;
                 try appendNestedFunctionTool(allocator, &buf, member, wire);
-                if (aliases) |al| {
+                {
+                    const al = aliases_ref;
                     // Put before any later fallible step; the map owns the key
                     // on success, so error paths free it (never a live key).
                     try al.aliases.put(wire, .{ .namespace = ns_name, .name = child });
@@ -1240,6 +1251,97 @@ test "buildToolsJson skips the bare alias on ambiguity or flat collision" {
     // The flat tool owns the bare name; only the wire form is namespaced.
     try testing.expect(splitNamespaceToolName(&aliases_c, "go") == null);
     try testing.expect(splitNamespaceToolName(&aliases_c, "ns__go") != null);
+}
+
+// Fixed-pool, LIFO free-list allocator: a freed <=64B slot is reused by the next
+// same-size alloc. SafeAllocator never reuses a just-freed slot, so only this
+// reproduces the `taken` use-after-free.
+const SlotAllocator = struct {
+    const Self = @This();
+    const SLOT = 64;
+    const NSLOT = 1024;
+    const NFREE = 1024;
+    pool: [SLOT * NSLOT]u8,
+    bump: usize,
+    free_stack: [NFREE]usize,
+    free_top: usize,
+    const Allocator = std.mem.Allocator;
+    const Alignment = std.mem.Alignment;
+    fn init() Self {
+        return .{ .pool = undefined, .bump = 0, .free_stack = undefined, .free_top = 0 };
+    }
+    fn selfOf(ctx: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn basePtr(self: *Self) [*]u8 {
+        return @ptrCast(&self.pool[0]);
+    }
+    fn rawAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+        const self = selfOf(ctx);
+        if (len <= SLOT and alignment.toByteUnits() <= SLOT) {
+            if (self.free_top > 0) {
+                self.free_top -= 1;
+                return self.basePtr() + (self.free_stack[self.free_top] * SLOT);
+            }
+            if (self.bump + SLOT > self.pool.len) return null;
+            const idx = self.bump / SLOT;
+            self.bump += SLOT;
+            return self.basePtr() + (idx * SLOT);
+        }
+        return std.heap.page_allocator.rawAlloc(len, alignment, ra);
+    }
+    fn rawFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+        const self = selfOf(ctx);
+        const b = @intFromPtr(self.basePtr());
+        const p = @intFromPtr(memory.ptr);
+        if (p >= b and (p - b) < self.pool.len) {
+            self.free_stack[self.free_top] = (p - b) / SLOT;
+            self.free_top += 1;
+        } else {
+            std.heap.page_allocator.rawFree(memory, alignment, ra);
+        }
+    }
+    fn rawResize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return false;
+    }
+    fn rawRemap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return null;
+    }
+    const VTable = Allocator.VTable;
+    const vtable = VTable{ .alloc = rawAlloc, .resize = rawResize, .remap = rawRemap, .free = rawFree };
+    fn allocator(self: *Self) Allocator {
+        return Allocator{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "buildToolsJson namespaced output is independent of the aliases map" {
+    // The two children's joined names share a length and a Wyhash fingerprint, so
+    // a dangling `taken` key (freed wire, slot reused) reads the second as a false
+    // collision and suffixes it. Bar: both emit unsuffixed, the `_2` form absent.
+    var slot_alloc: SlotAllocator = .init();
+    const alloc = slot_alloc.allocator();
+    const json =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"00000000","parameters":{}},{"type":"function","name":"00000623","parameters":{}}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const out_null = try buildToolsJson(alloc, parsed.value.array, null);
+    defer alloc.free(out_null);
+
+    try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000000\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000623\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out_null, "mcp__demo__00000623_2") == null);
 }
 
 test "parseInput rewrites a namespaced function_call echo to its declared wire name" {
