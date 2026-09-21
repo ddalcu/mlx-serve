@@ -28,6 +28,8 @@ if [ -f "$STAMP" ] && [ -x "$DEST/zig" ]; then
     exit 0
   fi
   echo "[fetch-zig] staged version '$(cat "$STAMP")' != '$ZIG_VERSION' — refetching"
+  # The build cache holds configure-time paths from the old toolchain.
+  rm -rf "$REPO_ROOT/.zig-cache"
 fi
 
 case "$(uname -m)" in
