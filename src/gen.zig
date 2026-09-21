@@ -930,12 +930,17 @@ pub const RestoreEngine = struct {
         // casts it to the compute dtype regardless, so only the key differs.
         const pe = ew.get("pos_emb") orelse ew.get("embedding") orelse return error.MissingSeedVr2PosEmb;
         var pos = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(pos);
         try mlx.check(mlx.mlx_array_set(&pos, pe));
 
+        var encoder = try seedvr2_vae.loadEncoder(allocator, &vw, s);
+        errdefer encoder.deinit();
+        var decoder = try seedvr2_vae.loadDecoder(allocator, &vw, s);
+        errdefer decoder.deinit();
         self.* = .{
             .allocator = allocator,
-            .encoder = try seedvr2_vae.loadEncoder(allocator, &vw, s),
-            .decoder = try seedvr2_vae.loadDecoder(allocator, &vw, s),
+            .encoder = encoder,
+            .decoder = decoder,
             .dit = try seedvr2_dit.load(allocator, &dw, dit_cfg, s),
             .pos_emb = pos,
         };
@@ -5000,6 +5005,60 @@ test "restore is a first-class modality, not an image backend" {
     try testing.expectEqualStrings("restore", Modality.restore.capability());
     // The marker round-trips, like every other modality.
     try testing.expectEqual(Modality.restore, modalityFromType(Modality.restore.modelType()).?);
+}
+
+/// Whether this process holds a descriptor on `real_path` (macOS `F_GETPATH`).
+/// A lazily loaded mlx array keeps its safetensors reader, and so its fd, open.
+fn fdOpenOn(real_path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var fd: c_int = 0;
+    while (fd < 4096) : (fd += 1) {
+        if (std.c.fcntl(fd, std.c.F.GETPATH, &buf) == -1) continue;
+        if (std.mem.eql(u8, std.mem.sliceTo(&buf, 0), real_path)) return true;
+    }
+    return false;
+}
+
+test "seedvr2 live: a RestoreEngine load that fails in the DiT releases the VAE and pos_emb" {
+    // Bar: no descriptor on either file survives the failed load.
+    //   SEEDVR2_MODEL_DIR=~/.mlx-serve/models/mlx-community/SeedVR2-3B-mlx-int8 \
+    //   zig build test -Doptimize=ReleaseFast -Dtest-filter="seedvr2 live: a RestoreEngine"
+    const a = testing.allocator;
+    const io = std.testing.io;
+    const pack = std.c.getenv("SEEDVR2_MODEL_DIR") orelse return error.SkipZigTest;
+
+    var vae_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var emb_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const vae_z = try std.fmt.bufPrintSentinel(&p, "{s}/vae.safetensors", .{std.mem.span(pack)}, 0);
+    const vae = std.mem.span(std.c.realpath(vae_z, &vae_buf) orelse return error.SkipZigTest);
+    const emb_z = try std.fmt.bufPrintSentinel(&p, "{s}/pos_emb.safetensors", .{std.mem.span(pack)}, 0);
+    const emb = std.mem.span(std.c.realpath(emb_z, &emb_buf) orelse return error.SkipZigTest);
+
+    // The probe sees a live weights map, so a clean result below is not vacuous.
+    {
+        var w = try model_mod.loadWeightsSingleFile(a, vae);
+        try testing.expect(fdOpenOn(vae));
+        w.deinit();
+    }
+    try testing.expect(!fdOpenOn(vae));
+
+    // pos_emb.safetensors standing in for the DiT fails at its first tensor,
+    // after the encoder, decoder and pos_emb copy are all built.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.symLink(io, vae, "vae.safetensors", .{});
+    try tmp.dir.symLink(io, emb, "pos_emb.safetensors", .{});
+    try tmp.dir.symLink(io, emb, "dit.safetensors", .{});
+
+    if (RestoreEngine.load(io, a, root)) |e| {
+        e.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expect(!fdOpenOn(vae));
+    try testing.expect(!fdOpenOn(emb));
 }
 
 test "both upscale routes share one modality and one engine slot" {
