@@ -1582,9 +1582,9 @@ test "diffvae tiled decode agrees with the whole-volume decode, seams included" 
         }
     };
 
-    var all = std.ArrayList(usize){ .items = &.{}, .capacity = 0 };
+    var all: std.ArrayList(usize) = .empty;
     defer all.deinit(alloc);
-    var seam = std.ArrayList(usize){ .items = &.{}, .capacity = 0 };
+    var seam: std.ArrayList(usize) = .empty;
     defer seam.deinit(alloc);
     const w_lo = width / 2 - width / 8;
     const w_hi = width / 2 + width / 8;
