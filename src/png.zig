@@ -1,5 +1,5 @@
 //! PNG encoding for the native image-generation endpoint, via stb_image_write
-//! (vendored `lib/stb_image_write.h`). Encodes an RGB8 buffer to PNG bytes in
+//! (vendored `lib/stb_image_write.h`). Encodes an RGB8/RGBA8 buffer to PNG bytes in
 //! memory (no temp file) using the `_to_func` callback variant.
 
 const std = @import("std");
@@ -33,11 +33,19 @@ fn writeCb(context: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) vo
 /// Encode `rgb` (interleaved RGB8, `w*h*3` bytes, row-major) as PNG bytes.
 /// Caller owns the returned slice.
 pub fn encodeRgb(allocator: std.mem.Allocator, rgb: []const u8, w: u32, h: u32) ![]u8 {
-    std.debug.assert(rgb.len == @as(usize, w) * @as(usize, h) * 3);
+    return encodePixels(allocator, rgb, w, h, 3);
+}
+
+pub fn encodeRgba(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) ![]u8 {
+    return encodePixels(allocator, rgba, w, h, 4);
+}
+
+fn encodePixels(allocator: std.mem.Allocator, pixels: []const u8, w: u32, h: u32, channels: u32) ![]u8 {
+    std.debug.assert(pixels.len == @as(usize, w) * @as(usize, h) * channels);
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
     var sink = Sink{ .list = &list, .allocator = allocator };
-    const rc = stbi_write_png_to_func(writeCb, &sink, @intCast(w), @intCast(h), 3, rgb.ptr, @intCast(w * 3));
+    const rc = stbi_write_png_to_func(writeCb, &sink, @intCast(w), @intCast(h), @intCast(channels), pixels.ptr, @intCast(w * channels));
     if (rc == 0 or sink.err) return error.PngEncodeFailed;
     return list.toOwnedSlice(allocator);
 }
