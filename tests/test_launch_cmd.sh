@@ -42,9 +42,10 @@ else
     export CODEX_HOME
     OWN_CODEX_HOME=1
 fi
-printf '; sentinel\n' > "$CODEX_HOME/config.toml"
+mkdir -p "$CODEX_HOME"
+printf '# sentinel\n' > "$CODEX_HOME/config.toml"
 codex_home_guard() {
-    if [ -f "$CODEX_HOME/config.toml" ] && ! grep -q "^; sentinel$" "$CODEX_HOME/config.toml" 2>/dev/null; then
+    if [ -f "$CODEX_HOME/config.toml" ] && ! grep -q "^# sentinel$" "$CODEX_HOME/config.toml" 2>/dev/null; then
         echo "FAIL: $CODEX_HOME/config.toml was modified — a writer is ignoring the profile"
         exit 1
     fi
@@ -135,7 +136,7 @@ grep -q 'wire_api = "responses"' "$CODEX_HOME/mlx-serve.config.toml" || OK=0
 grep -q "model_context_window = $ADV_CTX" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
 grep -q "base_url = \"$BASE/v1\"" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
 # the user's own config.toml is never written
-grep -q "^; sentinel$" "$CODEX_HOME/config.toml" || OK=0
+grep -q "^# sentinel$" "$CODEX_HOME/config.toml" || OK=0
 if [ "$OK" = 1 ]; then
     run_test "codex profile targets /v1/responses with the advertised context" PASS
 else
