@@ -227,6 +227,40 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(round.type, "remote")
     }
 
+    /// The same class one step out: this build models eight keys, and a save
+    /// rewrites the file whole. Whatever else another MCP host wrote — its own
+    /// allow-list, a timeout, a top-level schema — has to come back out.
+    func testKeysThisBuildDoesNotModelSurviveSaveAndLoad() throws {
+        let tmp = NSTemporaryDirectory().appending("mcp-extra-\(UUID().uuidString).json")
+        setenv("MCP_CONFIG_PATH", tmp, 1)
+        defer { unsetenv("MCP_CONFIG_PATH"); try? FileManager.default.removeItem(atPath: tmp) }
+
+        let source = #"""
+        {
+          "$schema": "https://example.invalid/mcp.schema.json",
+          "mcpServers": {
+            "github": {
+              "command": "npx",
+              "args": ["-y", "@modelcontextprotocol/server-github"],
+              "alwaysAllow": ["search_repositories"],
+              "timeout": 30
+            }
+          }
+        }
+        """#
+        try source.data(using: .utf8)!.write(to: URL(fileURLWithPath: tmp))
+
+        try MCPConfigStore.save(MCPConfigStore.load())
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: tmp))
+        let raw = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(raw["$schema"] as? String, "https://example.invalid/mcp.schema.json")
+        let github = try XCTUnwrap((raw["mcpServers"] as? [String: Any])?["github"] as? [String: Any])
+        XCTAssertEqual(github["alwaysAllow"] as? [String], ["search_repositories"])
+        XCTAssertEqual(github["timeout"] as? Int, 30)
+        XCTAssertEqual(github["args"] as? [String], ["-y", "@modelcontextprotocol/server-github"])
+    }
+
     /// The parsed headers must actually ride every HTTP request the transport makes —
     /// `connectHTTP` passes them through the SDK's `requestModifier` via this helper.
     /// A header the transport already set (Accept, Mcp-Session-Id) wins over the user's:
