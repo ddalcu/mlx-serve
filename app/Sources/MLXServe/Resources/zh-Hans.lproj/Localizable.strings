@@ -1155,6 +1155,7 @@
 "Save style prompt" = "保存风格提示词";
 "Save the log to a .log file" = "把日志保存为 .log 文件";
 "Saved" = "已保存";
+"Saved agents couldn't be read" = "无法读取已保存的智能体";
 "Save…" = "保存…";
 "Say this to hand the conversation to %@. Blank uses the app's own phrase." = "说出这句话即可把对话交给 %@。留空则使用应用自带的短语。";
 "Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off." = "缩放每个已接入的文本编码器层的贡献（1 = 中性）。留空 = 关闭。";
@@ -1343,6 +1344,7 @@
 "The document index is still being prepared (resolving the embedding model). Wait a moment and search again." = "文档索引仍在准备中（正在解析嵌入模型）。请稍候片刻再搜索。";
 "The downloaded disk image contains no app bundle" = "下载的磁盘映像中不包含应用包";
 "The edit comes back at the source image's own size." = "编辑结果会按源图自身的尺寸返回。";
+"The file is kept at %@." = "文件已保留在 %@。";
 "The fastest model here" = "这里最快的模型";
 "The first chat that messages the bot is adopted as the owner; everyone else is refused. Reset to hand the bot to a different chat." = "第一个给机器人发消息的会话会被设为主人；其他所有会话都会被拒绝。重置后可把机器人交给另一个会话。";
 "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare." = "这里保真度最高的全精度语音模型 —— 内存充足时最适合富有表现力的长篇朗读。";

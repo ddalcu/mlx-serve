@@ -13,6 +13,10 @@ final class AgentStore: ObservableObject {
     /// The user's own agents (starters are constants — see `allAgents`).
     @Published private(set) var agents: [Agent] = []
 
+    /// Where an `index.json` that would not decode was kept, so a window can say
+    /// the file is still on disk instead of leaving an empty list unexplained.
+    @Published private(set) var undecodableIndexURL: URL?
+
     private let rootDir: URL
     private var indexURL: URL { rootDir.appendingPathComponent("index.json") }
 
@@ -86,14 +90,37 @@ final class AgentStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
+        guard FileManager.default.fileExists(atPath: indexURL.path) else {
+            agents = []
+            return
+        }
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? Self.decoder.decode([Agent].self, from: data) else {
+            // A save would rewrite the whole file, so the one thing that must not
+            // happen here is leaving an unreadable file where persist() writes.
             agents = []
+            quarantineIndex()
             return
         }
         // A starter's id can never be shadowed by a stored row.
         let starterIds = Set(Agent.starters.map(\.id))
         agents = decoded.filter { !$0.isBuiltIn && !starterIds.contains($0.id) }
+    }
+
+    /// Keeps the bytes of an index that would not decode: a move, or a copy when
+    /// the move fails. Both fail only where a write would fail too.
+    private func quarantineIndex() {
+        let dest = rootDir.appendingPathComponent("index.json.corrupt-\(Self.stamp())")
+        do {
+            try FileManager.default.moveItem(at: indexURL, to: dest)
+        } catch {
+            guard (try? FileManager.default.copyItem(at: indexURL, to: dest)) != nil else { return }
+        }
+        undecodableIndexURL = dest
+    }
+
+    private static func stamp() -> String {
+        ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     }
 
     private func persist() {
