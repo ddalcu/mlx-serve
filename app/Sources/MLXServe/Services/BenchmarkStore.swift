@@ -33,8 +33,6 @@ enum BenchmarkStore {
 
     // MARK: - Local history
 
-    /// The folder name deliberately does not follow the app's own name: pointing
-    /// it at a new one would read as the entire history having been deleted.
     static var historyURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MLX Core", isDirectory: true)
