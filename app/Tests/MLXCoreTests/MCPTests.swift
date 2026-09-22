@@ -328,6 +328,21 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(extracted["github_token"], "ghp_abc123")
     }
 
+    /// The marketplace is a second writer of `mcp.json`, so re-materializing a
+    /// row must not evaporate the keys this build does not model: the memberwise
+    /// init would drop them exactly the way the old whitelist did.
+    func testCatalogMaterializeKeepsUnmodelledKeysOfTheStoredEntry() {
+        guard let github = MCPCatalog.entry(for: "github") else { return XCTFail("github missing") }
+        var stored = github.materialize(values: ["github_token": "ghp_abc123"])
+        stored.extra = ["alwaysAllow": .array([.string("search_repositories")]), "timeout": .int(30)]
+
+        let rematerialized = MCPMarketplaceView.materialized(github, over: stored, values: ["github_token": "ghp_abc123"])
+
+        XCTAssertEqual(rematerialized.extra["alwaysAllow"], .array([.string("search_repositories")]))
+        XCTAssertEqual(rematerialized.extra["timeout"], .int(30))
+        XCTAssertEqual(rematerialized.env?["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_abc123")
+    }
+
     func testCatalogMaterializeReplacesArgPlaceholder() {
         guard let dbhub = MCPCatalog.entry(for: "dbhub") else { return XCTFail("dbhub missing") }
         let dsn = "postgres://u:p@host:5432/db"
