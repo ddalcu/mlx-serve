@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Qwen-Image-2.1 on the ONE main server: headless boot -> load the converted
-# pack by absolute path -> txt2img PNG of the requested size -> real CFG engages
-# (two forwards per step, by the log) and changes the render -> img2img -> the
-# named 400s for what the backend cannot honor -> unload.
+# Qwen-Image-2.1 on the ONE main server: headless boot -> load the pack by
+# absolute path -> txt2img PNG of the requested size -> real CFG engages
+# (two forwards per step, by the log) and changes the render -> img2img ->
+# an 11th reference is a 400 -> an edit PNG when the pack still has the vision
+# tower -> the named 400 for cond_weights -> unload.
 #
 # SKIPs without a pack (tests/convert_qwen_image21_weights.py). Few steps at
 # 512x512: only the wire contract is asserted, never picture quality.
@@ -13,7 +14,7 @@ PORT="${1:-11398}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-MODEL="${QWEN_IMAGE_MODEL:-$(ls -d /Users/Shared/mlx-serve/ddalcu/Qwen-Image-2.1-MLX-Serve-* ~/.mlx-serve/models/ddalcu/Qwen-Image-2.1-MLX-Serve-* 2>/dev/null | head -1)}"
+MODEL="${QWEN_IMAGE_MODEL:-$(ls -d /Users/Shared/mlx-serve/ddalcu/Qwen-Image-2.1-MLX-Serve-* ~/.mlx-serve/models/ddalcu/Qwen-Image-2.1-MLX-Serve-* ~/.mlx-serve/models/mlx-community/Qwen-Image-2.1-MLX-* 2>/dev/null | head -1)}"
 [ -n "$MODEL" ] && [ -f "$MODEL/config.json" ] || { echo "SKIP: no Qwen-Image-2.1 pack (set QWEN_IMAGE_MODEL)"; exit 0; }
 
 OUT="$(mktemp -d)"
@@ -67,8 +68,49 @@ PY
   && pass "img2img -> PNG" || fail "img2img"
 grep -q "img2img" "$LOG" && pass "img2img engaged" || fail "no img2img log line"
 
-[ "$(gen "$OUT/d.json" "\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src.b64")\"")" = 400 ] \
-  && pass "edit mode is a 400" || fail "edit mode was not refused"
+# Eleven pictures: the primary plus 10 refs. Rejected before denoise.
+python3 - "$OUT/too-many.json" "$ID" <<'PY'
+import json, sys
+json.dump({
+    "model": sys.argv[2],
+    "size": "512x512",
+    "steps": 1,
+    "seed": 1,
+    "mode": "edit",
+    "prompt": "x",
+    "image": "QQ==",
+    "ref_images": ["QQ=="] * 10,
+}, open(sys.argv[1], "w"))
+PY
+code=$(curl -s -m 60 -o "$OUT/d.json" -w '%{http_code}' \
+  -H 'Content-Type: application/json' --data-binary @"$OUT/too-many.json" \
+  "http://127.0.0.1:$PORT/v1/images/generations")
+[ "$code" = 400 ] && grep -q "at most 10" "$OUT/d.json" \
+  && pass "11 references is a 400" || fail "11 references was not refused (HTTP $code)"
+
+if python3 - "$MODEL" <<'PY'
+import struct, sys
+from pathlib import Path
+root = Path(sys.argv[1]) / "text_encoder"
+idx = root / "model.safetensors.index.json"
+if idx.is_file():
+    text = idx.read_text()
+    sys.exit(0 if "vision_tower.patch_embed" in text or "model.visual.patch_embed" in text else 1)
+st = root / "model.safetensors"
+if not st.is_file():
+    sys.exit(1)
+with st.open("rb") as f:
+    n = struct.unpack("<Q", f.read(8))[0]
+    header = f.read(min(n, 8_000_000))
+sys.exit(0 if b"vision_tower.patch_embed" in header or b"model.visual.patch_embed" in header else 1)
+PY
+then
+  [ "$(gen "$OUT/edit.json" "\"prompt\":\"put a blue scarf on the fox in image 1\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src.b64")\"")" = 200 ] \
+    && png_check "$OUT/edit.json" && grep -q "edit 1 ref" "$LOG" \
+    && pass "edit -> PNG" || fail "edit"
+else
+  echo "SKIP: pack has no vision tower, edit render not attempted"
+fi
 [ "$(gen "$OUT/e.json" '"prompt":"x","cond_weights":"1 1 1"')" = 400 ] \
   && pass "cond_weights is a 400" || fail "cond_weights was not refused"
 
