@@ -27,6 +27,8 @@ const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
+const qvis = @import("qwen_vision.zig");
+const stb = @import("stb");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -40,6 +42,10 @@ const VAE_DOWNSAMPLE: u32 = 16;
 /// The DiT + text encoder run in bf16 like the checkpoint; the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 const MAX_PROMPT_TOKENS: usize = 2048;
+/// Ten 1024² references are about 10k vision tokens, plus the prompt.
+const MAX_EDIT_TOKENS: usize = 24576;
+pub const MAX_REFS: usize = 10;
+const IMAGE_PAD_TOKEN: i32 = 151655;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
 const SYSTEM_PREFIX = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
@@ -339,13 +345,30 @@ pub fn computeSigmas(a: std.mem.Allocator, steps: u32, image_seq_len: u32) ![]f3
 
 // ── DiT ──
 
-/// Per-request constants of the joint [text | image] sequence.
+/// One span of the joint sequence. Text is causal; an image span is
+/// bidirectional inside itself and causal against everything before it.
+const Seg = struct { start: c_int, end: c_int, image: bool };
+
+/// Per-request constants of the joint sequence. Text-to-image is one text
+/// span then one image span. A reference edit interleaves condition-image
+/// spans into the text and appends the target.
 pub const Geometry = struct {
     text_len: c_int,
+    /// First joint-sequence index of the target image, and its token count.
+    target_start: c_int = 0,
+    target_len: c_int = 0,
     cos: A, // [1, L, 1, head_dim/2, 1] f32
     sin: A,
-    /// [L] i32: 1 for a text token (the t=0 modulation row), 0 for an image one.
+    /// [L] i32: 1 for a t=0 token (text and condition images), 0 for a target token.
     mod_row: A,
+    segs: []const Seg = &.{},
+    seg_owned: ?[]Seg = null,
+    /// When set, image latents are scattered into `use_img` positions.
+    has_scatter: bool = false,
+    text_index: A = .{ .ctx = null },
+    img_index: A = .{ .ctx = null },
+    use_img: A = .{ .ctx = null },
+    allocator: ?std.mem.Allocator = null,
 
     pub fn init(a: std.mem.Allocator, cfg: DitConfig, text_len: usize, lat_h: usize, lat_w: usize) !Geometry {
         const L = text_len + lat_h * lat_w;
@@ -383,6 +406,8 @@ pub const Geometry = struct {
         const rsh = [_]c_int{@intCast(L)};
         return .{
             .text_len = @intCast(text_len),
+            .target_start = @intCast(text_len),
+            .target_len = @intCast(lat_h * lat_w),
             .cos = mlx.mlx_array_new_data(cosb.ptr, &sh, sh.len, .float32),
             .sin = mlx.mlx_array_new_data(sinb.ptr, &sh, sh.len, .float32),
             .mod_row = mlx.mlx_array_new_data(rows.ptr, &rsh, 1, .int32),
@@ -393,6 +418,12 @@ pub const Geometry = struct {
         free(self.cos);
         free(self.sin);
         free(self.mod_row);
+        if (self.seg_owned) |buf| if (self.allocator) |al| al.free(buf);
+        if (self.has_scatter) {
+            free(self.text_index);
+            free(self.img_index);
+            free(self.use_img);
+        }
     }
 };
 
@@ -478,9 +509,21 @@ pub const Dit = struct {
         self.txt_norm = try addScalar(tn, 1.0, s);
         self.txt_in = try loadLinear(&w, a, cfg.context, dtype, s, "txt_in.in_layer", .{});
         self.txt_out = try loadLinear(&w, a, H, dtype, s, "txt_in.out_layer", .{});
-        self.t1 = try loadLinear(&w, a, 256, dtype, s, "time_text_embed.timestep_embedder.linear_1", .{});
-        self.t2 = try loadLinear(&w, a, H, dtype, s, "time_text_embed.timestep_embedder.linear_2", .{});
-        self.modulation = try loadLinear(&w, a, H, dtype, s, "modulation.1", .{});
+        // ddalcu nests these under timestep_embedder / modulation.1.
+        // mlx-community flattens them to linear_1 / modulation.0.
+        const time_nested = w.get("time_text_embed.timestep_embedder.linear_1.weight") != null;
+        self.t1 = if (time_nested)
+            try loadLinear(&w, a, 256, dtype, s, "time_text_embed.timestep_embedder.linear_1", .{})
+        else
+            try loadLinear(&w, a, 256, dtype, s, "time_text_embed.linear_1", .{});
+        self.t2 = if (time_nested)
+            try loadLinear(&w, a, H, dtype, s, "time_text_embed.timestep_embedder.linear_2", .{})
+        else
+            try loadLinear(&w, a, H, dtype, s, "time_text_embed.linear_2", .{});
+        self.modulation = if (w.get("modulation.1.weight") != null)
+            try loadLinear(&w, a, H, dtype, s, "modulation.1", .{})
+        else
+            try loadLinear(&w, a, H, dtype, s, "modulation.0", .{});
         self.norm_out = try loadLinear(&w, a, H, dtype, s, "norm_out.linear", .{});
         self.proj_out = try loadLinear(&w, a, H, dtype, s, "proj_out", .{});
 
@@ -610,6 +653,7 @@ pub const Dit = struct {
     /// Block-causal attention as the reference segments it: causal over the
     /// text prefix, then the image block against the whole sequence.
     fn attention(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !A {
+        if (geo.segs.len != 0) return self.attentionSegs(b, x, geo);
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
@@ -636,6 +680,56 @@ pub const Dit = struct {
             defer free(txt_out);
             break :blk try concat(&.{ txt_out, img_out }, 2, s);
         };
+        defer free(joined);
+        const back = try transpose(joined, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer free(back);
+        const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
+        defer free(flat);
+        return b.o.forward(flat, null, s);
+    }
+
+    /// Block-causal attention over an arbitrary run of text and image spans.
+    /// A text span is causal against everything up to its end. An image span
+    /// sees that same prefix bidirectionally, including itself, and nothing after.
+    fn attentionSegs(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !A {
+        const s = self.s;
+        const sh = mlx.getShape(x);
+        const q = try self.headsOf(&b.q, b.norm_q, x, geo);
+        defer free(q);
+        const k = try self.headsOf(&b.k, b.norm_k, x, geo);
+        defer free(k);
+        const v = try self.headsOf(&b.v, null, x, geo);
+        defer free(v);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
+
+        var parts: std.ArrayList(A) = .empty;
+        defer {
+            for (parts.items) |p| free(p);
+            parts.deinit(self.allocator);
+        }
+        for (geo.segs) |seg| {
+            if (seg.end <= seg.start) continue;
+            if (!seg.image) {
+                const qp = try sliceAxis(q, 2, 0, seg.end, s);
+                defer free(qp);
+                const kp = try sliceAxis(k, 2, 0, seg.end, s);
+                defer free(kp);
+                const vp = try sliceAxis(v, 2, 0, seg.end, s);
+                defer free(vp);
+                const all = try sdpa(qp, kp, vp, scale, "causal", s);
+                defer free(all);
+                try parts.append(self.allocator, try sliceAxis(all, 2, seg.start, seg.end, s));
+            } else {
+                const qs = try sliceAxis(q, 2, seg.start, seg.end, s);
+                defer free(qs);
+                const kp = try sliceAxis(k, 2, 0, seg.end, s);
+                defer free(kp);
+                const vp = try sliceAxis(v, 2, 0, seg.end, s);
+                defer free(vp);
+                try parts.append(self.allocator, try sdpa(qs, kp, vp, scale, "", s));
+            }
+        }
+        const joined = try concat(parts.items, 2, s);
         defer free(joined);
         const back = try transpose(joined, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer free(back);
@@ -689,8 +783,30 @@ pub const Dit = struct {
         return self.txt_out.forward(act, null, s);
     }
 
+    /// Drop projected latents into the image slots of the expanded text stream.
+    fn splice(self: *const Dit, th: A, ih: A, geo: *const Geometry) !A {
+        const s = self.s;
+        var t_rows = mlx.mlx_array_new();
+        defer free(t_rows);
+        try mlx.check(mlx.mlx_take_axis(&t_rows, th, geo.text_index, 1, s));
+        var i_rows = mlx.mlx_array_new();
+        defer free(i_rows);
+        try mlx.check(mlx.mlx_take_axis(&i_rows, ih, geo.img_index, 1, s));
+        const use = try astype(geo.use_img, self.dtype, s);
+        defer free(use);
+        const neg = try mulScalar(use, -1.0, s);
+        defer free(neg);
+        const keep = try addScalar(neg, 1.0, s);
+        defer free(keep);
+        const text_part = try mulA(t_rows, keep, s);
+        defer free(text_part);
+        const img_part = try mulA(i_rows, use, s);
+        defer free(img_part);
+        return addA(text_part, img_part, s);
+    }
+
     /// Velocity for one flow step. img [1, N, in_ch], txt [1, T, context] →
-    /// [1, N, out_ch] in the compute dtype. Caller owns the result.
+    /// [1, target_len, out_ch] in the compute dtype. Caller owns the result.
     pub fn forward(self: *const Dit, img: A, txt: A, t: f32, geo: *const Geometry) !A {
         const s = self.s;
         const temb = try self.timeEmbed(t);
@@ -704,7 +820,7 @@ pub const Dit = struct {
         defer free(th);
         const ih = try self.img_in.forward(img, null, s);
         defer free(ih);
-        var x = try concat(&.{ th, ih }, 1, s);
+        var x = if (geo.has_scatter) try self.splice(th, ih, geo) else try concat(&.{ th, ih }, 1, s);
         errdefer free(x);
         for (self.blocks) |*b| {
             const nx = try self.blockForward(b, x, &mod, geo);
@@ -715,8 +831,7 @@ pub const Dit = struct {
 
         // Only image tokens leave the model, and LayerNorm is per token, so the
         // final norm reads the image rows and the sampled-t scale alone.
-        const L = mlx.getShape(x)[1];
-        const xi = try sliceAxis(x, 1, geo.text_len, L, s);
+        const xi = try sliceAxis(x, 1, geo.target_start, geo.target_start + geo.target_len, s);
         defer free(xi);
         const n = try layerNorm(xi, self.cfg.eps, s);
         defer free(n);
@@ -751,9 +866,15 @@ const Conv = struct {
         const wk = try std.fmt.allocPrint(a, fmt ++ ".weight", args);
         defer a.free(wk);
         const raw = w.get(wk) orelse return null;
-        const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 1 }, s); // OIHW → OHWI
-        defer free(t);
-        const tc = try contig(t, s);
+        // Diffusers stores OIHW. mlx-community already stores OHWI: the two
+        // spatial axes sit in the middle and the channel axis is last.
+        const shape = mlx.getShape(raw);
+        const already_ohwi = shape.len == 4 and shape[1] == shape[2] and shape[3] != shape[1];
+        const tc = if (already_ohwi) try contig(raw, s) else blk: {
+            const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 1 }, s);
+            defer free(t);
+            break :blk try contig(t, s);
+        };
         defer free(tc);
         const wf = try astype(tc, .float32, s);
         errdefer free(wf);
@@ -1327,10 +1448,324 @@ pub const GenOpts = struct {
     /// `negative_prompt` (blank = the reference's empty-prompt encode).
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
+    /// Up to 10 reference images, raw PNG/JPEG bytes, in prompt order
+    /// (image 1, image 2, …). Empty means text-to-image.
+    refs: []const []const u8 = &.{},
 };
 
 pub fn cfgActive(opts: GenOpts) bool {
     return opts.guidance_scale != 1.0;
+}
+
+/// Official condition-image size: area ≈ 1024², each side a multiple of 32.
+pub fn conditionPixels(sw: u32, sh: u32) struct { w: u32, h: u32 } {
+    const area: f64 = 1024.0 * 1024.0;
+    const ratio = @as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(sh));
+    const width = @sqrt(area * ratio);
+    const height = width / ratio;
+    return .{
+        .w = @intFromFloat(qvis.roundHalfEven(width / 32.0) * 32.0),
+        .h = @intFromFloat(qvis.roundHalfEven(height / 32.0) * 32.0),
+    };
+}
+
+fn alignEditDim(v: u32) u32 {
+    if (v % 32 == 0 and v >= 256 and v <= 2048) return v;
+    const rounded = ((v + 16) / 32) * 32;
+    return std.math.clamp(rounded, 256, 2048);
+}
+
+const JointLayout = struct {
+    joint_len: usize,
+    text_index: []i32,
+    img_index: []i32,
+    use_img: []f32,
+    is_image: []bool,
+    segs: []Seg,
+    frame: []i64,
+    height: []i64,
+    width: []i64,
+    mod_row: []i32,
+    target_start: c_int,
+    target_len: c_int,
+
+    fn deinit(self: *JointLayout, a: std.mem.Allocator) void {
+        a.free(self.text_index);
+        a.free(self.img_index);
+        a.free(self.use_img);
+        a.free(self.is_image);
+        a.free(self.segs);
+        a.free(self.frame);
+        a.free(self.height);
+        a.free(self.width);
+        a.free(self.mod_row);
+    }
+};
+
+/// Expand kept VLM tokens the way the official transformer does: each
+/// `<|image_pad|>` becomes 4 latent tokens, then the target grid is appended.
+/// `shapes` is the condition latent grids followed by the target grid.
+fn buildJointLayout(a: std.mem.Allocator, kept: []const i32, shapes: []const [2]usize) !JointLayout {
+    if (shapes.len < 2) return error.QwenImageBadConfig;
+    var pads: usize = 0;
+    for (kept) |id| {
+        if (id == IMAGE_PAD_TOKEN) pads += 1;
+    }
+    var cond_tokens: usize = 0;
+    for (shapes[0 .. shapes.len - 1]) |sh| {
+        if (sh[0] == 0 or sh[1] == 0 or (sh[0] * sh[1]) % 4 != 0) return error.QwenImageBadConfig;
+        cond_tokens += sh[0] * sh[1];
+    }
+    const target = shapes[shapes.len - 1];
+    if (target[0] == 0 or target[1] == 0 or (target[0] * target[1]) % 4 != 0) return error.QwenImageBadConfig;
+    if (cond_tokens != pads * 4) return error.QwenImageVisionTokenMismatch;
+    const target_tokens = target[0] * target[1];
+    const target_slots = target_tokens / 4;
+    const mask_len = kept.len + target_slots;
+
+    var joint_len: usize = 0;
+    for (0..mask_len) |j| {
+        const is_img = if (j < kept.len) kept[j] == IMAGE_PAD_TOKEN else true;
+        joint_len += if (is_img) 4 else 1;
+    }
+
+    const text_index = try a.alloc(i32, joint_len);
+    errdefer a.free(text_index);
+    const img_index = try a.alloc(i32, joint_len);
+    errdefer a.free(img_index);
+    const use_img = try a.alloc(f32, joint_len);
+    errdefer a.free(use_img);
+    const is_image = try a.alloc(bool, joint_len);
+    errdefer a.free(is_image);
+
+    var text_cursor: i32 = 0;
+    var img_cursor: i32 = 0;
+    var out_i: usize = 0;
+    for (0..mask_len) |j| {
+        const is_img = if (j < kept.len) kept[j] == IMAGE_PAD_TOKEN else true;
+        if (is_img) {
+            for (0..4) |_| {
+                text_index[out_i] = 0;
+                img_index[out_i] = img_cursor;
+                use_img[out_i] = 1;
+                is_image[out_i] = true;
+                img_cursor += 1;
+                out_i += 1;
+            }
+        } else {
+            text_index[out_i] = text_cursor;
+            img_index[out_i] = 0;
+            use_img[out_i] = 0;
+            is_image[out_i] = false;
+            out_i += 1;
+        }
+        if (j < kept.len) text_cursor += 1;
+    }
+
+    var segs: std.ArrayList(Seg) = .empty;
+    errdefer segs.deinit(a);
+    const frame = try a.alloc(i64, joint_len);
+    errdefer a.free(frame);
+    const height = try a.alloc(i64, joint_len);
+    errdefer a.free(height);
+    const width_ax = try a.alloc(i64, joint_len);
+    errdefer a.free(width_ax);
+    const mod_row = try a.alloc(i32, joint_len);
+    errdefer a.free(mod_row);
+    @memset(mod_row, 1);
+
+    var cursor: usize = 0;
+    var position: i64 = 0;
+    var target_start: c_int = 0;
+    for (shapes, 0..) |sh, si| {
+        const h = sh[0];
+        const w = sh[1];
+        var block_start = cursor;
+        while (block_start < joint_len and !is_image[block_start]) block_start += 1;
+        if (block_start >= joint_len) return error.QwenImageVisionTokenMismatch;
+        if (block_start > cursor) {
+            try segs.append(a, .{ .start = @intCast(cursor), .end = @intCast(block_start), .image = false });
+            for (cursor..block_start) |p| {
+                const fp = position + @as(i64, @intCast(p - cursor));
+                frame[p] = fp;
+                height[p] = fp;
+                width_ax[p] = fp;
+            }
+            position += @as(i64, @intCast(block_start - cursor));
+        }
+        const block_end = block_start + h * w;
+        if (block_end > joint_len) return error.QwenImageVisionTokenMismatch;
+        for (block_start..block_end) |p| if (!is_image[p]) return error.QwenImageVisionTokenMismatch;
+        try segs.append(a, .{ .start = @intCast(block_start), .end = @intCast(block_end), .image = true });
+        const h0: i64 = -@as(i64, @intCast(h - h / 2));
+        const w0: i64 = -@as(i64, @intCast(w - w / 2));
+        var q: usize = 0;
+        while (q < h * w) : (q += 1) {
+            const p = block_start + q;
+            frame[p] = position;
+            height[p] = h0 + @as(i64, @intCast(q / w));
+            width_ax[p] = w0 + @as(i64, @intCast(q % w));
+        }
+        if (si + 1 == shapes.len) {
+            target_start = @intCast(block_start);
+            for (block_start..block_end) |p| mod_row[p] = 0;
+        }
+        position += @as(i64, @intCast(@max(h, w)));
+        cursor = block_end;
+    }
+    if (cursor < joint_len) {
+        try segs.append(a, .{ .start = @intCast(cursor), .end = @intCast(joint_len), .image = false });
+        for (cursor..joint_len) |p| {
+            const fp = position + @as(i64, @intCast(p - cursor));
+            frame[p] = fp;
+            height[p] = fp;
+            width_ax[p] = fp;
+        }
+    }
+    const owned = try segs.toOwnedSlice(a);
+    return .{
+        .joint_len = joint_len,
+        .text_index = text_index,
+        .img_index = img_index,
+        .use_img = use_img,
+        .is_image = is_image,
+        .segs = owned,
+        .frame = frame,
+        .height = height,
+        .width = width_ax,
+        .mod_row = mod_row,
+        .target_start = target_start,
+        .target_len = @intCast(target_tokens),
+    };
+}
+
+fn editGeometry(a: std.mem.Allocator, cfg: DitConfig, kept: []const i32, shapes: []const [2]usize) !Geometry {
+    var layout = try buildJointLayout(a, kept, shapes);
+    defer layout.deinit(a);
+    const L = layout.joint_len;
+    const half: usize = cfg.head_dim / 2;
+    const cosb = try a.alloc(f32, L * half);
+    defer a.free(cosb);
+    const sinb = try a.alloc(f32, L * half);
+    defer a.free(sinb);
+    for (0..L) |p| {
+        const pos = [_]i64{ layout.frame[p], layout.height[p], layout.width[p] };
+        var col: usize = 0;
+        for (cfg.axes, pos) |dim, ax_pos| {
+            for (0..dim / 2) |k| {
+                const expo = @as(f32, @floatFromInt(2 * k)) / @as(f32, @floatFromInt(dim));
+                const omega: f32 = 1.0 / std.math.pow(f32, 10000.0, expo);
+                const ang: f32 = @as(f32, @floatFromInt(ax_pos)) * omega;
+                cosb[p * half + col] = @cos(ang);
+                sinb[p * half + col] = @sin(ang);
+                col += 1;
+            }
+        }
+    }
+    const cos_sh = [_]c_int{ 1, @intCast(L), 1, @intCast(half), 1 };
+    const row_sh = [_]c_int{@intCast(L)};
+    const use_sh = [_]c_int{ 1, @intCast(L), 1 };
+    const segs = try a.dupe(Seg, layout.segs);
+    return .{
+        .text_len = 0,
+        .target_start = layout.target_start,
+        .target_len = layout.target_len,
+        .cos = mlx.mlx_array_new_data(cosb.ptr, &cos_sh, cos_sh.len, .float32),
+        .sin = mlx.mlx_array_new_data(sinb.ptr, &cos_sh, cos_sh.len, .float32),
+        .mod_row = mlx.mlx_array_new_data(layout.mod_row.ptr, &row_sh, 1, .int32),
+        .segs = segs,
+        .seg_owned = segs,
+        .has_scatter = true,
+        .text_index = mlx.mlx_array_new_data(layout.text_index.ptr, &row_sh, 1, .int32),
+        .img_index = mlx.mlx_array_new_data(layout.img_index.ptr, &row_sh, 1, .int32),
+        .use_img = mlx.mlx_array_new_data(layout.use_img.ptr, &use_sh, use_sh.len, .float32),
+        .allocator = a,
+    };
+}
+
+fn editPrompt(a: std.mem.Allocator, prompt: []const u8, ntoks: []const u32) ![]u8 {
+    var sb: std.ArrayList(u8) = .empty;
+    errdefer sb.deinit(a);
+    try sb.appendSlice(a, SYSTEM_PREFIX);
+    try sb.appendSlice(a, USER_PREFIX);
+    for (ntoks, 0..) |n, i| {
+        if (i > 0) try sb.append(a, ' ');
+        const hdr = try std.fmt.allocPrint(a, "<image{d}><|vision_start|>", .{i + 1});
+        defer a.free(hdr);
+        try sb.appendSlice(a, hdr);
+        for (0..n) |_| try sb.appendSlice(a, "<|image_pad|>");
+        try sb.appendSlice(a, "<|vision_end|>");
+    }
+    const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+    try sb.appendSlice(a, if (trimmed.len == 0) " " else prompt);
+    try sb.appendSlice(a, PROMPT_SUFFIX);
+    return sb.toOwnedSlice(a);
+}
+
+const PreparedRef = struct {
+    lat: A,
+    pv: A,
+    gh: i64,
+    gw: i64,
+    ntok: u32,
+    lat_h: usize,
+    lat_w: usize,
+};
+
+fn prepareRef(allocator: std.mem.Allocator, bytes: []const u8, vae: *const VaeEncoder, s: S) !PreparedRef {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const src_ptr = stb.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &w, &h, &ch, 3) orelse return error.QwenImageBadImage;
+    defer stb.stbi_image_free(src_ptr);
+    const sw: u32 = @intCast(w);
+    const sh: u32 = @intCast(h);
+    if (sw == 0 or sh == 0) return error.QwenImageBadImage;
+    const dim = conditionPixels(sw, sh);
+    const rgb = src_ptr[0 .. @as(usize, sw) * sh * 3];
+    const chw = try allocator.alloc(f32, @as(usize, dim.w) * dim.h * 3);
+    defer allocator.free(chw);
+    try qvis.resizeRgbBicubicNormalizedChw(allocator, chw, rgb, sh, sw, dim.h, dim.w);
+
+    const shape = [_]c_int{ 1, 3, @intCast(dim.h), @intCast(dim.w) };
+    const raw = mlx.mlx_array_new_data(chw.ptr, &shape, 4, .float32);
+    defer free(raw);
+    const pix = try contig(raw, s);
+    defer free(pix);
+    const z = try vae.encode(pix);
+    const nhwc = try transpose(z, &[_]c_int{ 0, 2, 3, 1 }, s);
+    free(z);
+    const zsh = mlx.getShape(nhwc);
+    const lat_h: usize = @intCast(zsh[1]);
+    const lat_w: usize = @intCast(zsh[2]);
+    const packed_lat = try reshape(nhwc, &[_]c_int{ 1, @intCast(lat_h * lat_w), zsh[3] }, s);
+    free(nhwc);
+    const lat = try contig(packed_lat, s);
+    free(packed_lat);
+    errdefer free(lat);
+
+    const gh: u32 = dim.h / 16;
+    const gw: u32 = dim.w / 16;
+    const ntok: u32 = (gh / 2) * (gw / 2);
+    const pv_buf = try allocator.alloc(f32, @as(usize, gh) * gw * 1536);
+    defer allocator.free(pv_buf);
+    qvis.buildPixelValues(pv_buf, chw, 3, dim.h, dim.w, 16, 2, 2);
+    const pv_sh = [_]c_int{ @intCast(gh * gw), 1536 };
+    const pv_raw = mlx.mlx_array_new_data(pv_buf.ptr, &pv_sh, 2, .float32);
+    defer free(pv_raw);
+    const pv = try contig(pv_raw, s);
+    errdefer free(pv);
+    try mlx.check(mlx.mlx_array_eval(lat));
+    try mlx.check(mlx.mlx_array_eval(pv));
+    return .{
+        .lat = lat,
+        .pv = pv,
+        .gh = gh,
+        .gw = gw,
+        .ntok = ntok,
+        .lat_h = lat_h,
+        .lat_w = lat_w,
+    };
 }
 
 pub const Engine = struct {
@@ -1350,6 +1785,8 @@ pub const Engine = struct {
     /// before the first DiT forward.
     staged: bool,
     te: ?TextEncoder = null,
+    /// Loaded on the first reference-image request. Text-to-image never pays for it.
+    vit: ?mage_flow.VisionTower = null,
     /// Loaded on the first img2img request; txt2img never pays for it.
     vae_enc: ?VaeEncoder = null,
 
@@ -1398,6 +1835,7 @@ pub const Engine = struct {
 
     pub fn deinit(self: *Engine) void {
         if (self.te) |*t| t.deinit();
+        if (self.vit) |*v| v.deinit();
         if (self.vae_enc) |*e| e.deinit();
         self.vae.deinit();
         self.dit.deinit();
@@ -1449,6 +1887,7 @@ pub const Engine = struct {
 
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
+        if (opts.refs.len != 0) return self.generateWithRefs(allocator, prompt, width, height, seed, steps, opts, progress);
         const s = self.s;
         const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
         const lat_h: usize = height / VAE_DOWNSAMPLE;
@@ -1547,6 +1986,198 @@ pub const Engine = struct {
         defer free(mixed);
         return astype(mixed, COMPUTE, s);
     }
+
+    fn releaseConditioner(self: *Engine) void {
+        if (self.te) |*t| t.deinit();
+        self.te = null;
+        if (self.vit) |*v| v.deinit();
+        self.vit = null;
+        _ = mlx.mlx_clear_cache();
+    }
+
+    const EditCond = struct { emb: A, kept: []i32 };
+
+    fn encodeEditText(self: *Engine, allocator: std.mem.Allocator, text: []const u8, pixels: A, grids: []const [3]i64) !EditCond {
+        const enc = try self.tok.encode(allocator, text);
+        defer allocator.free(enc);
+        if (enc.len > MAX_EDIT_TOKENS or enc.len <= self.drop_tokens) {
+            log.err("[qwen-image] edit prompt is {d} tokens (drop {d}, cap {d})\n", .{ enc.len, self.drop_tokens, MAX_EDIT_TOKENS });
+            return error.QwenImagePromptTooLong;
+        }
+        const ids = try allocator.alloc(i32, enc.len);
+        defer allocator.free(ids);
+        const mask = try allocator.alloc(i32, enc.len);
+        defer allocator.free(mask);
+        for (enc, 0..) |tok, i| {
+            ids[i] = @intCast(tok);
+            mask[i] = 1;
+        }
+        const te = if (self.te) |*t| t else return error.TextEncoderNotLoaded;
+        const vit = if (self.vit) |*v| v else return error.TextEncoderNotLoaded;
+        const out = try te.encodeEditOpts(vit, ids, mask, pixels, grids, .{
+            .drop = self.drop_tokens,
+            .max_keep = enc.len,
+            .mrope = true,
+        });
+        errdefer free(out.embeddings);
+        const keep: usize = @intCast(out.keep);
+        if (keep == 0 or self.drop_tokens + keep > ids.len) return error.QwenImagePromptTooLong;
+        const kept = try allocator.alloc(i32, keep);
+        @memcpy(kept, ids[self.drop_tokens..][0..keep]);
+        try mlx.check(mlx.mlx_array_eval(out.embeddings));
+        return .{ .emb = out.embeddings, .kept = kept };
+    }
+
+    /// Reference-image edit. `opts.refs` is 1..10 PNG/JPEG bytes, in order.
+    /// Returns [1,3,H,W] f32 in [0,1] (owned; caller frees).
+    fn generateWithRefs(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
+        if (opts.refs.len > MAX_REFS) return error.TooManyEditImages;
+        const s = self.s;
+        const width_o = alignEditDim(width);
+        const height_o = alignEditDim(height);
+        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const lat_h: usize = height_o / VAE_DOWNSAMPLE;
+        const lat_w: usize = width_o / VAE_DOWNSAMPLE;
+        const n_img: c_int = @intCast(lat_h * lat_w);
+        const zch: c_int = @intCast(self.dit_cfg.in_ch);
+        log.info("[qwen-image] edit {d} ref(s) -> {d}x{d} steps={d} guidance={d:.1} ({s})\n", .{
+            opts.refs.len, width_o, height_o, n_steps, opts.guidance_scale,
+            if (cfgActive(opts)) "two forwards per step" else "one forward per step",
+        });
+
+        if (self.vae_enc == null) self.vae_enc = try VaeEncoder.load(self.io, self.allocator, s, self.model_dir, self.vae_cfg);
+        if (self.te == null) self.te = try TextEncoder.load(self.io, self.allocator, s, self.model_dir, COMPUTE);
+        if (self.vit == null) {
+            log.info("[qwen-image] loading vision tower\n", .{});
+            self.vit = try mage_flow.VisionTower.loadQwenImage21(self.io, self.allocator, s, self.model_dir, COMPUTE);
+        }
+        defer if (self.staged) self.releaseConditioner();
+
+        if (progress) |p| p.emit("Encoding references", 0, n_steps);
+        var lats: std.ArrayList(A) = .empty;
+        defer {
+            for (lats.items) |x| free(x);
+            lats.deinit(allocator);
+        }
+        var pvs: std.ArrayList(A) = .empty;
+        defer {
+            for (pvs.items) |x| free(x);
+            pvs.deinit(allocator);
+        }
+        var grids: std.ArrayList([3]i64) = .empty;
+        defer grids.deinit(allocator);
+        var ntoks: std.ArrayList(u32) = .empty;
+        defer ntoks.deinit(allocator);
+        var shapes: std.ArrayList([2]usize) = .empty;
+        defer shapes.deinit(allocator);
+
+        for (opts.refs, 0..) |bytes, i| {
+            const prep = try prepareRef(allocator, bytes, &self.vae_enc.?, s);
+            lats.append(allocator, prep.lat) catch |e| {
+                free(prep.lat);
+                free(prep.pv);
+                return e;
+            };
+            pvs.append(allocator, prep.pv) catch |e| {
+                free(prep.pv);
+                return e;
+            };
+            try grids.append(allocator, .{ 1, prep.gh, prep.gw });
+            try ntoks.append(allocator, prep.ntok);
+            try shapes.append(allocator, .{ prep.lat_h, prep.lat_w });
+            log.info("[qwen-image] ref {d}: {d} vision tokens, latent {d}x{d}\n", .{ i + 1, prep.ntok, prep.lat_w, prep.lat_h });
+        }
+        try shapes.append(allocator, .{ lat_h, lat_w });
+
+        const lat_cat = try concat(lats.items, 1, s);
+        const lat_dt = try astype(lat_cat, COMPUTE, s);
+        free(lat_cat);
+        const cond_lat = try contig(lat_dt, s);
+        free(lat_dt);
+        defer free(cond_lat);
+        try mlx.check(mlx.mlx_array_eval(cond_lat));
+        for (lats.items) |x| free(x);
+        lats.clearRetainingCapacity();
+
+        const pv_cat = try concat(pvs.items, 0, s);
+        defer free(pv_cat);
+        try mlx.check(mlx.mlx_array_eval(pv_cat));
+        for (pvs.items) |x| free(x);
+        pvs.clearRetainingCapacity();
+
+        const pos_text = try editPrompt(allocator, prompt, ntoks.items);
+        defer allocator.free(pos_text);
+        const pos = try self.encodeEditText(allocator, pos_text, pv_cat, grids.items);
+        defer free(pos.emb);
+        defer allocator.free(pos.kept);
+        var geo = try editGeometry(allocator, self.dit_cfg, pos.kept, shapes.items);
+        defer geo.deinit();
+
+        var neg_emb: ?A = null;
+        defer if (neg_emb) |n| free(n);
+        var neg_geo: ?Geometry = null;
+        defer if (neg_geo) |*g| g.deinit();
+        if (cfgActive(opts)) {
+            const neg_text = try editPrompt(allocator, opts.negative_prompt, ntoks.items);
+            defer allocator.free(neg_text);
+            const neg = try self.encodeEditText(allocator, neg_text, pv_cat, grids.items);
+            defer allocator.free(neg.kept);
+            neg_geo = try editGeometry(allocator, self.dit_cfg, neg.kept, shapes.items);
+            neg_emb = neg.emb;
+        }
+        if (self.staged) self.releaseConditioner();
+        logMemory("edit encode");
+
+        const sigmas = try computeSigmas(allocator, n_steps, @intCast(n_img));
+        defer allocator.free(sigmas);
+        var key = mlx.mlx_array_new();
+        defer free(key);
+        try mlx.check(mlx.mlx_random_key(&key, seed));
+        const nsh = [_]c_int{ 1, n_img, zch };
+        var noise = mlx.mlx_array_new();
+        defer free(noise);
+        try mlx.check(mlx.mlx_random_normal(&noise, &nsh, 3, .float32, 0.0, 1.0, key, s));
+        var target = try astype(noise, COMPUTE, s);
+        defer free(target);
+
+        for (0..n_steps) |i| {
+            if (progress) |p| if (p.cancelled()) return error.Cancelled;
+            const all = try concat(&.{ cond_lat, target }, 1, s);
+            defer free(all);
+            var v = try self.dit.forward(all, pos.emb, sigmas[i], &geo);
+            defer free(v);
+            if (neg_emb) |neg| {
+                const vn = try self.dit.forward(all, neg, sigmas[i], &neg_geo.?);
+                defer free(vn);
+                const diff = try subA(v, vn, s);
+                defer free(diff);
+                const scaled = try mulScalar(diff, opts.guidance_scale, s);
+                defer free(scaled);
+                const blended = try addA(vn, scaled, s);
+                free(v);
+                v = blended;
+            }
+            const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
+            defer free(dv);
+            const next = try addA(target, dv, s);
+            free(target);
+            target = next;
+            try mlx.check(mlx.mlx_array_eval(target));
+            if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
+        }
+
+        logMemory("denoise");
+        if (progress) |p| p.emit("Decoding image", n_steps, n_steps);
+        const grid = try reshape(target, &[_]c_int{ 1, @intCast(lat_h), @intCast(lat_w), zch }, s);
+        defer free(grid);
+        const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
+        defer free(latent);
+        const decoded = try self.vae.decode(latent);
+        defer free(decoded);
+        try mlx.check(mlx.mlx_array_eval(decoded));
+        logMemory("vae decode");
+        return denormImage(decoded, s);
+    }
 };
 
 /// [-1,1] → clip(x·0.5 + 0.5, 0, 1).
@@ -1622,6 +2253,58 @@ test "QwenImage stages band only when their activations are large" {
     try testing.expectEqual(@as(c_int, 56), bandRows(&.{ 1, 512, 512, 576 }, 288, 2));
     // Never below 8 rows, always even.
     try testing.expectEqual(@as(c_int, 8), bandRows(&.{ 1, 4096, 8192, 1152 }, 1152, 2));
+}
+
+test "QwenImage condition size matches the official 1MP resize" {
+    const sq = conditionPixels(100, 100);
+    try testing.expectEqual(@as(u32, 1024), sq.w);
+    try testing.expectEqual(@as(u32, 1024), sq.h);
+    const land = conditionPixels(3, 2);
+    try testing.expectEqual(@as(u32, 1248), land.w);
+    try testing.expectEqual(@as(u32, 832), land.h);
+    const port = conditionPixels(2, 3);
+    try testing.expectEqual(@as(u32, 832), port.w);
+    try testing.expectEqual(@as(u32, 1248), port.h);
+    const wide = conditionPixels(16, 9);
+    try testing.expectEqual(@as(u32, 1376), wide.w);
+    try testing.expectEqual(@as(u32, 768), wide.h);
+}
+
+test "QwenImage joint layout splices one reference and the target" {
+    const a = testing.allocator;
+    const kept = [_]i32{ 10, IMAGE_PAD_TOKEN, 11 };
+    const shapes = [_][2]usize{ .{ 2, 2 }, .{ 2, 2 } };
+    var layout = try buildJointLayout(a, &kept, &shapes);
+    defer layout.deinit(a);
+    try testing.expectEqual(@as(usize, 10), layout.joint_len);
+    try testing.expectEqual(@as(c_int, 6), layout.target_start);
+    try testing.expectEqual(@as(c_int, 4), layout.target_len);
+    try testing.expectEqual(@as(i32, 0), layout.text_index[0]);
+    try testing.expectEqual(@as(i32, 2), layout.text_index[5]);
+    try testing.expectEqual(@as(i32, 0), layout.img_index[1]);
+    try testing.expectEqual(@as(i32, 3), layout.img_index[4]);
+    try testing.expectEqual(@as(i32, 4), layout.img_index[6]);
+    try testing.expectEqual(@as(i32, 7), layout.img_index[9]);
+    try testing.expect(!layout.is_image[0]);
+    try testing.expect(layout.is_image[1]);
+    try testing.expect(!layout.is_image[5]);
+    try testing.expect(layout.is_image[6]);
+    try testing.expectEqual(@as(i32, 1), layout.mod_row[0]);
+    try testing.expectEqual(@as(i32, 1), layout.mod_row[1]);
+    try testing.expectEqual(@as(i32, 0), layout.mod_row[6]);
+    try testing.expectEqual(@as(usize, 4), layout.segs.len);
+    try testing.expect(!layout.segs[0].image);
+    try testing.expect(layout.segs[1].image);
+    try testing.expectEqual(@as(c_int, 1), layout.segs[1].start);
+    try testing.expectEqual(@as(c_int, 5), layout.segs[1].end);
+    try testing.expectEqual(@as(c_int, 6), layout.segs[3].start);
+    // Text token, then a 2×2 condition block frozen at that position.
+    try testing.expectEqual(@as(i64, 0), layout.frame[0]);
+    try testing.expectEqual(@as(i64, 1), layout.frame[1]);
+    try testing.expectEqual(@as(i64, -1), layout.height[1]);
+    try testing.expectEqual(@as(i64, -1), layout.width[1]);
+    try testing.expectEqual(@as(i64, 3), layout.frame[5]);
+    try testing.expectEqual(@as(i64, 4), layout.frame[6]);
 }
 
 test "QwenImage guidance 1.0 never pays for the second forward" {
