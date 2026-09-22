@@ -45,6 +45,29 @@ final class AgentStoreTests: XCTestCase {
         }
     }
 
+    /// The kept name is second-resolution, and a name already taken refuses both
+    /// the move and the copy: two quarantines in one second must not collide.
+    func testTwoQuarantinesInTheSameSecondKeepBothFiles() throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = #"{"agents":[{"name":"Chef"}]}"#
+
+        try write(original, to: root)
+        let first = try XCTUnwrap(AgentStore(rootDir: root).undecodableIndexURL)
+
+        // The index is back (a save, or the copy path that cannot remove it) and
+        // still unreadable: the same second must not reuse the first name.
+        try write(original, to: root)
+        let second = try XCTUnwrap(AgentStore(rootDir: root).undecodableIndexURL,
+                                   "the second quarantine kept nothing")
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(try String(contentsOf: first, encoding: .utf8), original)
+        XCTAssertEqual(try String(contentsOf: second, encoding: .utf8), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("index.json").path),
+                       "the unreadable file is still where the next save writes")
+    }
+
     func testRoundTripsEveryField() throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

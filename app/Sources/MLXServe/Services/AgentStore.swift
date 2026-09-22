@@ -110,7 +110,15 @@ final class AgentStore: ObservableObject {
     /// Keeps the bytes of an index that would not decode: a move, or a copy when
     /// the move fails. Both fail only where a write would fail too.
     private func quarantineIndex() {
-        let dest = rootDir.appendingPathComponent("index.json.corrupt-\(Self.stamp())")
+        let stamp = "index.json.corrupt-\(Self.stamp())"
+        var dest = rootDir.appendingPathComponent(stamp)
+        // The stamp is second-resolution, and a name already on disk refuses both
+        // the move and the copy — which would leave the unreadable file in place.
+        var dup = 1
+        while FileManager.default.fileExists(atPath: dest.path) {
+            dup += 1
+            dest = rootDir.appendingPathComponent("\(stamp)-\(dup)")
+        }
         do {
             try FileManager.default.moveItem(at: indexURL, to: dest)
         } catch {
