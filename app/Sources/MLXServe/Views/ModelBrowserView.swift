@@ -1169,6 +1169,22 @@ private struct UseMediaModelButton: View {
     }
 }
 
+private struct UseDecisionModelButton: View {
+    let path: String
+    let name: String
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Use") {
+            appState.decisionsModelPath = path
+            AppActivation.openWindow(id: "layaDecisions", using: openWindow)
+        }
+        .controlSize(.small)
+        .help("Open \(name) in Laya Decisions")
+    }
+}
+
 // MARK: - In-use badge
 
 /// Replaces the "Use" button on the model the server is pointed at, so clicking
@@ -1955,6 +1971,8 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
+                } else if model.modelType == "laya" {
+                    UseDecisionModelButton(path: model.path, name: model.name)
                 } else if let modality = MediaModality(modelType: model.modelType) {
                     // A media checkpoint is a real, loadable, servable model —
                     // it just is not a CHAT model, and until now that meant the

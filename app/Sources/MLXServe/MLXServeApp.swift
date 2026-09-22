@@ -192,6 +192,14 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 1040, height: 680)
 
+        Window("Laya Decisions", id: "layaDecisions") {
+            LayaDecisionsWindow()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .appAppearance()
+        }
+        .defaultSize(width: 980, height: 720)
+
         // Per-model settings for the tray's selected model. A window, not a
         // sheet: the MenuBarExtra popover cannot host one.
         Window("Model Settings", id: "modelSettings") {

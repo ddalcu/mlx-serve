@@ -390,6 +390,9 @@ class AppState: ObservableObject {
         pendingChatOpenTick += 1
     }
 
+    /// The checkpoint dir the Laya Decisions window shows.
+    @Published var decisionsModelPath: String?
+
     /// Show a sandbox terminal — the one way in, same shape as `showTasks()`.
     func showTerminal(_ id: UUID) {
         chatWorkspace = .terminal(id)
