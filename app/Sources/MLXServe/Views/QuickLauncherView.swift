@@ -86,7 +86,7 @@ struct QuickLauncherView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let question = convo.messages.last(where: { $0.role == .user })?.content,
                    !question.isEmpty {
-                    Text(L10n.text(question))
+                    Text(verbatim: question)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)

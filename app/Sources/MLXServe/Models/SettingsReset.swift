@@ -56,6 +56,7 @@ enum SettingsReset {
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
+                f("osMemoryReserve") { $0.osMemoryReserve = $1.osMemoryReserve },
                 f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
                 f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
                 f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },

@@ -8,8 +8,8 @@
 # shape), then restores again. Every turn must 200; the log must not contain
 # `prefill failed for slot: QsaHistoryGap`. The self-heal line is allowed
 # and counted as WARN. After inherit, one request is posted TWICE verbatim so
-# the 1-token tail / full-reuse shape actually occurs; the script fails if it
-# never did.
+# the full-reuse shape (a tail inside the 30-token snapshot backoff) actually
+# occurs; the script fails if it never did.
 #
 # Warm and cold run sequentially on ONE port: warm phase, capture greedy
 # texts, stop, wait for the port and for free+inactive+speculative pages,
@@ -198,13 +198,13 @@ import re,sys
 text=open(sys.argv[1]).read()
 for m in re.finditer(r'reused ([0-9]+)/([0-9]+) tokens', text):
     a,b=int(m.group(1)),int(m.group(2))
-    if b-a==1:
+    if 1 <= b-a <= 31:  # a full-match restore forwards the backoff tail as one span
         raise SystemExit(0)
 raise SystemExit(1)
 " "$LOGFILE"; then
-    echo -e "${GREEN}PASS${NC} 1-token prefill shape occurred"
+    echo -e "${GREEN}PASS${NC} full-reuse short-tail prefill shape occurred"
 else
-    echo -e "${RED}FAIL${NC} never saw a reused N/(N+1) 1-token prefill line"
+    echo -e "${RED}FAIL${NC} never saw a full-reuse short-tail (<= 31 tokens) prefill line"
     grep -n "hot-cache" "$LOGFILE" | head -20
     fail=1
 fi

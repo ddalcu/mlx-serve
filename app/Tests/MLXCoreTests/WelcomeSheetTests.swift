@@ -89,7 +89,7 @@ final class WelcomeSheetTests: XCTestCase {
     /// the hand-injection the `NSHostingView` needed.
     func testTheWelcomeIsPresentedAsASheetOnTheChatScene() throws {
         let s = try source("Sources/MLXServe/MLXServeApp.swift")
-        guard let chat = s.range(of: "Window(\"MLX Core\", id: \"chat\")") else {
+        guard let chat = s.range(of: "Window(\"MLX-Serve\", id: \"chat\")") else {
             return XCTFail("the chat scene moved — update this audit")
         }
         let after = String(s[chat.upperBound...])

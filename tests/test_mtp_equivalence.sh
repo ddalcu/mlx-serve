@@ -319,18 +319,19 @@ else
 fi
 
 # EV-controller engagement (dispatch-hole lesson: output equality can't see a
-# silent fallback). An ECHO workload is the max-confidence case: past the
-# ~10-round warmup the chain confidence clears any tau, so chunk-B extension
-# must fire (ext_rounds > 0 in [spec-stats]) under the adaptive default.
+# silent fallback). An ECHO workload is the max-acceptance case: the adaptive
+# controller must climb past the warmup depth (mean drafted depth > 2).
 ECHO_PROMPT="Repeat the following code block back EXACTLY as written, no commentary: def gcd(a, b):\\n    while b:\\n        a, b = b, a % b\\n    return a\\n\\ndef fib(n, memo={}):\\n    if n in memo: return memo[n]\\n    if n < 2: return n\\n    memo[n] = fib(n-1, memo) + fib(n-2, memo)\\n    return memo[n]\\n\\ndef reverse_string(s):\\n    out = ''\\n    for ch in s:\\n        out = ch + out\\n    return out"
 curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
     $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
     \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
-EXT=$(grep -o 'ext_rounds=[0-9]*' "$LOG" | tail -1 | cut -d= -f2)
-if [ "${EXT:-0}" -gt 0 ]; then
-    echo "PASS [EV chunk-B extension engages on echo] (ext_rounds=$EXT)"; PASS=$((PASS+1))
+ECHO_STATS=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1)
+ECHO_ROUNDS=$(echo "$ECHO_STATS" | grep -o 'attempts=[0-9]*' | cut -d= -f2)
+ECHO_DRAFTED=$(echo "$ECHO_STATS" | grep -o ' drafted=[0-9]*' | cut -d= -f2)
+if [ "${ECHO_ROUNDS:-0}" -gt 0 ] && [ "${ECHO_DRAFTED:-0}" -gt $((2 * ECHO_ROUNDS)) ]; then
+    echo "PASS [EV controller climbs on echo] (drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"; PASS=$((PASS+1))
 else
-    echo "FAIL [EV chunk-B extension]: ext_rounds=${EXT:-none} on a max-confidence echo — extension path never fired"
+    echo "FAIL [EV controller climb]: drafted=${ECHO_DRAFTED:-none} over ${ECHO_ROUNDS:-none} rounds on a max-acceptance echo — depth never rose"
     FAIL=$((FAIL+1))
 fi
 if [ -n "$EXPECT_AUTO_DEPTH" ]; then

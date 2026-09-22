@@ -125,7 +125,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// Live count of tokens each in-flight reply has produced — for the chat
     /// composer's live "gen:" readout and growing context bar. Counted by tallying
     /// streamed `.content`/`.reasoning` deltas (one per token for this server) and
-    /// PUBLISHED only at the StreamCoalescer's ~20 Hz flush cadence, never per
+    /// PUBLISHED only at the StreamCoalescer's ~10 Hz flush cadence, never per
     /// token — per-token @Published churn is exactly what StreamCoalescer exists to
     /// avoid. Reset at the start of each streamed round; reconciled to the
     /// authoritative `usage.completion_tokens` when the stream reports usage.
@@ -384,7 +384,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     /// Stream one text/reasoning delta into the session and tally it toward the
     /// live token count. The published dict advances only when the coalescer
-    /// actually flushes (≤20 Hz), so the live readout never adds per-token churn.
+    /// actually flushes (≤10 Hz), so the live readout never adds per-token churn.
     private func streamDelta(content: String = "", reasoning: String = "",
                              coalescer: inout StreamCoalescer, to sessionId: UUID) {
         ledger.setLiveTokens(ledger.liveTokens(session: sessionId) + 1, session: sessionId)

@@ -1026,6 +1026,26 @@ final class MediaGenServiceTests: XCTestCase {
         }
     }
 
+    /// Each flag mirrors `gen.zig`'s `.qwen_image` arm.
+    func testQwenImagePresetsOfferOnlyWhatTheBackendHonors() {
+        for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit] {
+            XCTAssertTrue(p.supportsImg2Img, "\(p.id): VAE encoder loads on first use")
+            XCTAssertTrue(p.supportsGuidance, "\(p.id): undistilled, real CFG")
+            XCTAssertFalse(p.supportsLoRA, "\(p.id): 0 matched modules -> 400")
+            XCTAssertFalse(p.supportsReferenceEdit)
+            XCTAssertEqual(p.condWeightCount, 0)
+            XCTAssertFalse(p.stepsAreFixed)
+            XCTAssertEqual(p.settings(.quality).steps, 40, "\(p.id): the checkpoint's own default")
+            XCTAssertEqual(p.resolutionGrid.alignment, 16)
+            for r in p.resolutions {
+                XCTAssertEqual(r.width % 16, 0)
+                XCTAssertEqual(r.height % 16, 0)
+            }
+            XCTAssertTrue(ImageModelPreset.all.contains(p))
+            XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
+        }
+    }
+
     /// The 8-bit mirrors are the SAME architecture at half the download, so they
     /// reuse their bf16 sibling's variant — quantization is a property of the
     /// checkpoint, not of what the model can do. If they ever diverge on a

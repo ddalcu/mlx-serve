@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -444,6 +445,8 @@ pub const ModelConfig = struct {
     mtp_override: ?bool = null,
     /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+    /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
+    drafter_ctx_bytes_per_token: u64 = 0,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -3793,7 +3796,12 @@ var narrow_1d_env: ?bool = null;
 fn narrow1dEnabled() bool {
     if (narrow_1d_env) |v| return v;
     const on = blk: {
-        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse break :blk true;
+        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse
+            break :blk builtin.os.tag.isDarwin();
+        // Default ON for Metal (bf16 is the wired-format win there). The
+        // Omarchy Vulkan backend has no bf16 GPU kernel ("No GPU kernel
+        // exists for it"), so off Darwin the default is OFF unless the env
+        // explicitly forces it.
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     narrow_1d_env = on;

@@ -217,6 +217,9 @@ struct ServerOptions: Codable, Equatable {
     /// so a load it refuses often still fits — but a genuine over-commit can
     /// hard-crash the server, so this is opt-in.
     var skipMemPreflight: Bool = false
+    /// When false, launch with `--os-reserve-gib 0`: the server stops holding free RAM back for
+    /// macOS (an eighth of RAM, 2 to 8 GB) when it plans context and admits requests.
+    var osMemoryReserve: Bool = true
 
     // MARK: GGUF-only (llama.cpp engine)
     /// KV-cache quantization for the embedded llama.cpp engine. MLX's
@@ -529,6 +532,7 @@ struct ServerOptions: Codable, Equatable {
         maxResidentModels == other.maxResidentModels &&
         idleEvictSecs == other.idleEvictSecs &&
         skipMemPreflight == other.skipMemPreflight &&
+        osMemoryReserve == other.osMemoryReserve &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
         ssdStreaming == other.ssdStreaming &&
@@ -772,6 +776,9 @@ struct ServerOptions: Codable, Equatable {
         if skipMemPreflight {
             args += ["--skip-mem-preflight"]
         }
+        if !osMemoryReserve {
+            args += ["--os-reserve-gib", "0"]
+        }
         // ds4-only opt-in: stream DeepSeek-V4-Flash experts from SSD. The MLX
         // and llama.cpp engines ignore the flag, so it's safe to leave in argv
         // across engine switches; omitted by default to keep full residency.
@@ -895,6 +902,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .osMemoryReserve) { osMemoryReserve = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
@@ -1148,6 +1156,10 @@ extension ServerOptions {
         "idleEvictSecs": .init(
             title: "Unload idle models",
             explainer: "Free a model's memory once it has served nothing for this long; the next request reloads it. Off by default. Turn it on when something else needs the RAM between sessions. The trade is paid on the next request: a cold load (seconds to a minute for a large model) plus a full re-prefill of the conversation, and if the memory is gone by then the reload is refused and that request fails. A model with a request in flight is never evicted. Passes --idle-evict-secs.",
+            needsRestart: true),
+        "osMemoryReserve": .init(
+            title: "Keep a memory reserve for macOS",
+            explainer: "The server leaves an eighth of your RAM (2 to 8 GB) out of its plans so macOS always has room. Turning this off gives models more context and admits more requests at once, but on a small Mac under heavy load it can freeze or restart the machine. Leave it on unless you know the load fits.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

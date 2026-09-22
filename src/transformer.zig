@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -1630,6 +1631,7 @@ extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*us
 /// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
 /// Python's platform.mac_ver()[0]).
 pub fn macosProductVersion(buf: []u8) ?[]const u8 {
+    if (comptime !builtin.os.tag.isDarwin()) return null;
     var len: usize = buf.len;
     if (sysctlbyname("kern.osproductversion", buf.ptr, &len, null, 0) != 0) return null;
     var n = @min(len, buf.len);
@@ -13986,6 +13988,11 @@ pub fn qkvAttnDecodeKernel(
 ) !?mlx.mlx_array {
     if (!qkvDecKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
+    if (!qkvVerifyForced() and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4 and
+        qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2]))
+    {
+        if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
+    }
     if (view.bits != 4 and view.bits != 8) return null;
     if (view.group_size == 0) return null;
     if (mlx.mlx_array_ndim(q) != 4) return null;
@@ -14128,6 +14135,10 @@ fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: m
     try mlx.check(mlx.mlx_vector_array_get(&m_b, outputs_vec, 0));
     try mlx.check(mlx.mlx_vector_array_get(&l_b, outputs_vec, 1));
     try mlx.check(mlx.mlx_vector_array_get(&o_b, outputs_vec, 2));
+    return qkvMergeArrays(s, m_b, l_b, o_b, qdt);
+}
+
+fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
     var m_max = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_max);
     try mlx.check(mlx.mlx_max_axis(&m_max, m_b, 1, true, s));
@@ -14330,6 +14341,27 @@ fn qkvVerifyKernelEnabledFrom(nax_available: bool, raw: ?[]const u8) bool {
     return !nax_available;
 }
 
+/// The kernel keeps one accumulator per q row (gqa x t_q); past 12 they spill
+/// out of registers and dequant + dense sdpa wins at every kv length.
+const QKV_VERIFY_MAX_ROWS: c_int = 12;
+fn qkvVerifyRowsPay(gqa: c_int, t_q: c_int) bool {
+    return gqa * t_q <= QKV_VERIFY_MAX_ROWS;
+}
+
+/// `MLX_SERVE_KV_ATTN_VERIFY=0` still kills the whole verify width class.
+fn qkvVerifyEnvAllows() bool {
+    if (qkv_ver_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// MLX_SERVE_KV_ATTN_VERIFY=1 (and the test seam) keeps every width on the kernel.
+fn qkvVerifyForced() bool {
+    if (qkv_ver_override) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY") orelse return false;
+    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+}
+
 fn qkvVerifyKernelEnabled() bool {
     if (qkv_ver_override) |v| return v;
     if (qkv_ver_env) |v| return v;
@@ -14384,6 +14416,11 @@ pub fn qkvAttnVerifyKernel(
     scale: f32,
     mask_mode: []const u8,
 ) !?mlx.mlx_array {
+    if (!qkvVerifyForced() and view.has_quant_triple and mlx.mlx_array_ndim(q) == 4 and mlx.mlx_array_ndim(view.k_triple_q) == 4) {
+        if (qkvMppWins(mlx.getShape(q)[2], mlx.getShape(view.k_triple_q)[2])) {
+            if (try qkvAttnMppKernel(s, q, view, scale, mask_mode)) |o| return o;
+        }
+    }
     if (!qkvVerifyKernelEnabled()) return null;
     if (!view.has_quant_triple) return null;
     if (view.bits != 4 and view.bits != 8) return null;
@@ -14418,6 +14455,7 @@ pub fn qkvAttnVerifyKernel(
     const gqa: c_int = @divExact(h_q, h_kv);
     const lq: c_int = gqa * t_q;
     if (lq > QKV_DEC_NT) return null; // the m/l writer covers one row per thread
+    if (!qkvVerifyRowsPay(gqa, t_q) and !qkvVerifyForced()) return null;
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
     const ksc_sh = mlx.getShape(view.k_triple_scales);
@@ -14503,6 +14541,294 @@ pub fn qkvAttnVerifyKernel(
     return out;
 }
 
+// ── matmul2d packed attention (t_q 1..8) ──
+//
+// One threadgroup (256 threads, 8 simdgroups) per (kv head, kv split). Per 32-token page:
+// dequantize K into a threadgroup tile, QK through the matmul2d tensor op, an online
+// softmax per q row, dequantize V into the same tile, PV accumulated into a cooperative
+// running output that is rescaled when a row's max grows. Each split emits the same
+// (m, l, unnormalized O) partials as the other packed kernels. Structure after Inco
+// Splash's q8 attention tile (Apache-2.0, see NOTICE).
+const QKV_MPP_PAGE: c_int = 32;
+const QKV_MPP_MAX_SPLITS: c_int = 128;
+const QKV_MPP_PAGES_PER_SPLIT: c_int = 8;
+
+const QKV_MPP_KERNEL_SOURCE =
+    \\using namespace mpp::tensor_ops;
+    \\constexpr int VPW = 32 / BITS;
+    \\constexpr int MR = GQA * TQ;
+    \\constexpr int M = MPAD; // matmul2d wants rows in multiples of 8; pad rows carry zero queries
+    \\constexpr int N = 32;
+    \\constexpr int D = DK;
+    \\constexpr int NG = DK / GS; // N * NG dequant threads must fit the 256-thread group
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint hkv = threadgroup_position_in_grid.y;
+    \\const uint split = threadgroup_position_in_grid.z;
+    \\const uint nsplit = threadgroups_per_grid.z;
+    \\const int Tk = tk[0];
+    \\const float scale = scl[0];
+    \\const uint mask_bits = (1u << BITS) - 1u;
+    \\const int pages = (Tk + N - 1) / N;
+    \\const int per = (pages + int(nsplit) - 1) / int(nsplit);
+    \\const int pb = int(split) * per;
+    \\const int pe = min(pages, pb + per);
+    \\
+    \\threadgroup T tile[N * D];
+    \\threadgroup float scores[M * N];
+    \\threadgroup float probs[M * N];
+    \\threadgroup float rmax[M];
+    \\threadgroup float rsum[M];
+    \\threadgroup float pscale[M];
+    \\
+    \\if (tid < uint(M)) { rmax[tid] = -INFINITY; rsum[tid] = 0.0f; }
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\constexpr auto qk_desc = matmul2d_descriptor(M, N, D, false, true, false, matmul2d_descriptor::mode::multiply);
+    \\constexpr auto pv_desc = matmul2d_descriptor(M, D, N, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<qk_desc, execution_simdgroups<8>> qk;
+    \\matmul2d<pv_desc, execution_simdgroups<8>> pv;
+    \\auto qt = tensor((device T*)q + (long)hkv * M * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    \\auto tt = tensor(tile, dextents<int, 2>{D, N}, array<int, 2>{1, D});
+    \\auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
+    \\auto pt = tensor(probs, dextents<int, 2>{N, M}, array<int, 2>{1, N});
+    \\auto q0 = qt.template slice<D, M>(0, 0);
+    \\auto t0 = tt.template slice<D, N>(0, 0);
+    \\auto p0 = pt.template slice<N, M>(0, 0);
+    \\auto running = pv.template get_destination_cooperative_tensor<decltype(p0), decltype(t0), float>();
+    \\for (ushort i = 0; i < running.get_capacity(); ++i)
+    \\  if (running.is_valid_element(i)) running[i] = 0.0f;
+    \\
+    \\for (int page = pb; page < pe; ++page) {
+    \\  const int tok0 = page * N;
+    \\  // K page -> tile: thread d dequantizes element d of the page's 32 rows.
+    \\  if (tid < uint(N * NG)) {
+    \\    const int n = int(tid) / NG;
+    \\    const int g = int(tid) % NG;
+    \\    const long r = (long)min(tok0 + n, Tk - 1);
+    \\    const float sj = float(ksc[(long)hkv * ksc_strides[1] + r * ksc_strides[2] + g]);
+    \\    const float bj = float(kbi[(long)hkv * kbi_strides[1] + r * kbi_strides[2] + g]);
+    \\    const long wb = (long)hkv * kq_strides[1] + r * kq_strides[2] + (g * GS) / VPW;
+    \\    for (int wi = 0; wi < GS / VPW; ++wi) {
+    \\      const uint w = uint(kq[wb + wi]);
+    \\      for (int u = 0; u < VPW; ++u)
+    \\        tile[n * D + g * GS + wi * VPW + u] = T(float((w >> (u * BITS)) & mask_bits) * sj + bj);
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  auto page_scores = qk.template get_destination_cooperative_tensor<decltype(q0), decltype(t0), float>();
+    \\  qk.run(q0, t0, page_scores);
+    \\  page_scores.store(st.template slice<N, M>(0, 0));
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (tid < uint(M)) {
+    \\    const int m = int(tid);
+    \\    const int lim = m < MR ? Tk - TQ + 1 + (m % TQ) : Tk;
+    \\    float lmax = -INFINITY;
+    \\    for (int n = 0; n < N; ++n)
+    \\      if (tok0 + n < lim) lmax = max(lmax, scores[m * N + n] * scale);
+    \\    const float prev = rmax[m];
+    \\    const float next = max(prev, lmax);
+    \\    float lsum = 0.0f;
+    \\    for (int n = 0; n < N; ++n) {
+    \\      const float pr = (tok0 + n < lim) ? metal::exp(scores[m * N + n] * scale - next) : 0.0f;
+    \\      probs[m * N + n] = pr;
+    \\      lsum += pr;
+    \\    }
+    \\    const float sc = (next == -INFINITY || next == prev) ? 1.0f : metal::exp(prev - next);
+    \\    pscale[m] = sc;
+    \\    rsum[m] = rsum[m] * sc + lsum;
+    \\    rmax[m] = next;
+    \\  }
+    \\  // V page -> the same tile.
+    \\  if (tid < uint(N * NG)) {
+    \\    const int n = int(tid) / NG;
+    \\    const int g = int(tid) % NG;
+    \\    const long r = (long)min(tok0 + n, Tk - 1);
+    \\    const float sj = float(vsc[(long)hkv * vsc_strides[1] + r * vsc_strides[2] + g]);
+    \\    const float bj = float(vbi[(long)hkv * vbi_strides[1] + r * vbi_strides[2] + g]);
+    \\    const long wb = (long)hkv * vq_strides[1] + r * vq_strides[2] + (g * GS) / VPW;
+    \\    for (int wi = 0; wi < GS / VPW; ++wi) {
+    \\      const uint w = uint(vq[wb + wi]);
+    \\      for (int u = 0; u < VPW; ++u)
+    \\        tile[n * D + g * GS + wi * VPW + u] = T(float((w >> (u * BITS)) & mask_bits) * sj + bj);
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (ushort i = 0; i < running.get_capacity(); ++i) {
+    \\    if (!running.is_valid_element(i)) continue;
+    \\    const auto c = running.get_multidimensional_index(i);
+    \\    running[i] *= pscale[c[1]];
+    \\  }
+    \\  pv.run(p0, t0, running);
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\const long slot = (long)hkv * nsplit + split;
+    \\auto target = tensor(o_out + slot * M * D, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+    \\running.store(target.template slice<D, M>(0, 0));
+    \\if (tid < uint(M)) {
+    \\  m_out[slot * M + tid] = max(rmax[tid], -1e30f);
+    \\  l_out[slot * M + tid] = rsum[tid];
+    \\}
+;
+
+var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+const QkvMppCfgKey = struct { hq: c_int, dk: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, nsplit: c_int, dtype: mlx.mlx_dtype };
+var qkv_mpp_cfgs: [@intCast(QKV_VERIFY_MAX_TQ + 1)]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var qkv_mpp_cfg_keys: [@intCast(QKV_VERIFY_MAX_TQ + 1)]QkvMppCfgKey = @splat(std.mem.zeroes(QkvMppCfgKey));
+var qkv_mpp_engaged: bool = false;
+
+/// Measured window (M4 Max, 24/4 hd 256 kv8): the matmul2d kernel's per-page fixed cost
+/// needs rows or length to amortize.
+pub fn qkvMppWins(t_q: c_int, t_k: c_int) bool {
+    if (t_q >= 4) return t_k >= 2048;
+    if (t_q >= 2) return t_k >= 8192;
+    return t_k >= 16384;
+}
+
+pub fn qkvMppSplits(t_k: c_int) c_int {
+    const pages = @divTrunc(t_k + QKV_MPP_PAGE - 1, QKV_MPP_PAGE);
+    return std.math.clamp(@divTrunc(pages, QKV_MPP_PAGES_PER_SPLIT), 1, QKV_MPP_MAX_SPLITS);
+}
+
+/// Packed-KV attention through matmul2d, t_q 1..8, no mask or end-aligned causal. Null = declined.
+pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const DenseKVView, scale: f32, mask_mode: []const u8) !?mlx.mlx_array {
+    // Same machines as the verify-qmm matmul2d tile: M5 matrix units or M4-family shader code.
+    if (verifyQmmTile() == .off) return null;
+    if (!view.has_quant_triple or view.group_size == 0) return null;
+    if (view.bits != 4 and view.bits != 8) return null;
+    if (mlx.mlx_array_ndim(q_in) != 4) return null;
+    const qs = mlx.getShape(q_in);
+    const t_q: c_int = qs[2];
+    if (qs[0] != 1 or t_q < 1 or t_q > QKV_VERIFY_MAX_TQ) return null;
+    const causal = std.mem.eql(u8, mask_mode, "causal");
+    if (!causal and !(t_q == 1 and mask_mode.len == 0)) return null;
+    const qdt = mlx.mlx_array_dtype(q_in);
+    if (qdt != .bfloat16 and qdt != .float16) return null;
+    if (mlx.mlx_array_ndim(view.k_triple_q) != 4 or mlx.mlx_array_ndim(view.v_triple_q) != 4) return null;
+    const ks = mlx.getShape(view.k_triple_q);
+    const vs = mlx.getShape(view.v_triple_q);
+    const vpw: c_int = @divExact(@as(c_int, 32), @as(c_int, view.bits));
+    const dk: c_int = ks[3] * vpw;
+    if (qs[3] != dk or vs[3] != ks[3] or dk != 256) return null;
+    const gs: c_int = @intCast(view.group_size);
+    if (@rem(dk, gs) != 0 or @divExact(dk, gs) > 8) return null;
+    const h_q: c_int = qs[1];
+    const h_kv: c_int = ks[1];
+    if (h_kv <= 0 or @rem(h_q, h_kv) != 0 or vs[1] != h_kv or vs[2] != ks[2] or ks[0] != 1) return null;
+    const gqa: c_int = @divExact(h_q, h_kv);
+    if (gqa * t_q > 64) return null;
+    const t_k: c_int = ks[2];
+    if (t_k < t_q) return null;
+
+    if (qkv_mpp_kernel_cached == null) {
+        const input_names = [_][*:0]const u8{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk" };
+        const output_names = [_][*:0]const u8{ "m_out", "l_out", "o_out" };
+        const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kk = mlx.mlx_fast_metal_kernel_new("msv_qkv_mpp", in_vec, out_vec, QKV_MPP_KERNEL_SOURCE, QSA_SCORE_KERNEL_HEADER, false, false);
+        if (kk.ctx == null) return null;
+        qkv_mpp_kernel_cached = kk;
+    }
+    const nsplit = qkvMppSplits(t_k);
+    const real_rows: c_int = gqa * t_q;
+    const m_rows: c_int = @divTrunc(real_rows + 7, 8) * 8;
+    const slot: usize = @intCast(t_q);
+    const key = QkvMppCfgKey{ .hq = h_q, .dk = dk, .bits = view.bits, .gs = view.group_size, .gqa = gqa, .tq = t_q, .nsplit = nsplit, .dtype = qdt };
+    if (qkv_mpp_cfgs[slot] == null or !std.meta.eql(qkv_mpp_cfg_keys[slot], key)) {
+        if (qkv_mpp_cfgs[slot]) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        const ml_shape = [_]c_int{ h_kv, nsplit, m_rows };
+        const o_shape = [_]c_int{ h_kv, nsplit, m_rows, dk };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256, h_kv, nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", qdt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(view.bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", gs));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GQA", gqa));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "TQ", t_q));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "MPAD", m_rows));
+        qkv_mpp_cfgs[slot] = config;
+        qkv_mpp_cfg_keys[slot] = key;
+    }
+
+    // [1, Hq, TQ, D] is already (kv head, group head, row)-major: [Hkv, real_rows, D], zero-padded.
+    var q3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q3);
+    const q3_shape = [_]c_int{ h_kv, real_rows, dk };
+    try mlx.check(mlx.mlx_reshape(&q3, q_in, &q3_shape, 3, s));
+    var qp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qp);
+    {
+        const zero = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(zero);
+        const axes = [_]c_int{1};
+        const lo = [_]c_int{0};
+        const hi = [_]c_int{m_rows - real_rows};
+        try mlx.check(mlx.mlx_pad(&qp, q3, &axes, 1, &lo, 1, &hi, 1, zero, "constant", s));
+    }
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_contiguous(&q, qp, false, s));
+    const one = [_]c_int{1};
+    const scl_data = [_]f32{scale};
+    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    const tk_data = [_]i32{t_k};
+    const tk = mlx.mlx_array_new_data(&tk_data, &one, 1, .int32);
+    defer _ = mlx.mlx_array_free(tk);
+    const inputs_arr = [_]mlx.mlx_array{ q, view.k_triple_q, view.k_triple_scales, view.k_triple_biases, view.v_triple_q, view.v_triple_scales, view.v_triple_biases, scl, tk };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, qkv_mpp_kernel_cached.?, inputs_vec, qkv_mpp_cfgs[slot].?, s));
+
+    // [Hkv, NS, M(, D)] -> [Hkv*M, NS(, D)] for the shared merge.
+    var parts: [3]mlx.mlx_array = undefined;
+    var n_parts: usize = 0;
+    defer for (parts[0..n_parts]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (0..3) |i| {
+        var raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw);
+        try mlx.check(mlx.mlx_vector_array_get(&raw, outputs_vec, i));
+        var sw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sw);
+        const ax4 = [_]c_int{ 0, 2, 1, 3 };
+        try mlx.check(mlx.mlx_transpose_axes(&sw, raw, &ax4, if (i == 2) 4 else 3, s));
+        // Drop the pad rows: [Hkv, M, NS(, D)] -> [Hkv, real_rows, ...].
+        var cut = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cut);
+        const start = [_]c_int{ 0, 0, 0, 0 };
+        const stop = [_]c_int{ h_kv, real_rows, nsplit, dk };
+        const strd = [_]c_int{ 1, 1, 1, 1 };
+        const nd: usize = if (i == 2) 4 else 3;
+        try mlx.check(mlx.mlx_slice(&cut, sw, &start, nd, &stop, nd, &strd, nd, s));
+        var flat = mlx.mlx_array_new();
+        const sh3 = [_]c_int{ h_kv * real_rows, nsplit, dk };
+        try mlx.check(mlx.mlx_reshape(&flat, cut, &sh3, if (i == 2) 3 else 2, s));
+        parts[n_parts] = flat;
+        n_parts += 1;
+    }
+    const o_t = try qkvMergeArrays(s, parts[0], parts[1], parts[2], qdt);
+    defer _ = mlx.mlx_array_free(o_t);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const out_shape = [_]c_int{ 1, h_q, t_q, dk };
+    try mlx.check(mlx.mlx_reshape(&out, o_t, &out_shape, 4, s));
+    if (!qkv_mpp_engaged) {
+        qkv_mpp_engaged = true;
+        log.info("[kv-attn] matmul2d packed attention engaged: bits={d} gs={d} Hq={d} Hkv={d}\n", .{ view.bits, view.group_size, h_q, h_kv });
+    }
+    return out;
+}
+
 // ── Fused quant-attention gate (docs/kv-quant-perf.md Phase 1) ──
 
 var kv_attn_fused_env: ?bool = null;
@@ -14562,7 +14888,7 @@ fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
 /// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
 /// kills the whole width class on every machine.
 fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyKernelEnabled())) return false;
+    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();
@@ -20002,7 +20328,7 @@ pub const Transformer = struct {
     }
 
     /// Index `i` of `arr` along `axis` as an owned view handle (the axis keeps size 1).
-    fn axisView(s: mlx.mlx_stream, arr: mlx.mlx_array, axis: usize, i: usize) !mlx.mlx_array {
+    pub fn axisView(s: mlx.mlx_stream, arr: mlx.mlx_array, axis: usize, i: usize) !mlx.mlx_array {
         const shape = mlx.getShape(arr);
         var start: [8]c_int = @splat(0);
         var stop: [8]c_int = @splat(0);
@@ -39399,6 +39725,10 @@ test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
 }
 
 fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
+    return qkvVerParityCaseWith(h_q, h_kv, d, bits, t_prefill, t_q, false);
+}
+
+fn qkvVerParityCaseWith(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int, mpp: bool) !void {
     // Parity validates the explicit QA arm, independent of the measured
     // per-machine default (G17 defaults this kernel off).
     const old_qkv_ver_override = qkv_ver_override;
@@ -39450,7 +39780,7 @@ fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usiz
     const none = mlx.mlx_array{ .ctx = null };
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, dv.k, dv.v, scale, "causal", none, .{ .ctx = null }, false, s));
 
-    const cand = (try qkvAttnVerifyKernel(s, q, &dv, scale, "causal")) orelse return error.KernelDeclined;
+    const cand = (if (mpp) try qkvAttnMppKernel(s, q, &dv, scale, "causal") else try qkvAttnVerifyKernel(s, q, &dv, scale, "causal")) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(cand);
     const cand_shape = mlx.getShape(cand);
     try testing.expectEqual(@as(c_int, 1), cand_shape[0]);
@@ -39510,6 +39840,32 @@ test "qkv verify kernel parity: TQ 2..8 x bits x GQA (strided views, causal tail
     try qkvVerParityCase(4, 4, 128, 8, 21, 6); // MHA (GQA=1)
     try qkvVerParityCase(6, 1, 256, 8, 21, 8); // hd-256, deepest width
     try qkvVerParityCase(24, 4, 256, 8, 21, 4); // the qwen3_5 live geometry
+}
+
+test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many splits, pad rows" {
+    if (verifyQmmTile() == .off) return error.SkipZigTest; // no matmul2d tile (CI's paravirtual GPU)
+    for ([_]u8{ 8, 4 }) |bits| {
+        for ([_]c_int{ 1, 2, 4, 5, 8 }) |tq| {
+            try qkvVerParityCaseWith(24, 4, 256, bits, 700, tq, true);
+            try qkvVerParityCaseWith(16, 8, 256, bits, 3000, tq, true);
+        }
+    }
+    try qkvVerParityCaseWith(24, 4, 256, 8, 0, 4, true); // cache holds only the verify rows
+}
+
+test "qkvMppWins: the matmul2d window needs rows or length" {
+    try testing.expect(qkvMppWins(4, 2048));
+    try testing.expect(!qkvMppWins(2, 4096));
+    try testing.expect(qkvMppWins(2, 8192));
+    try testing.expect(!qkvMppWins(1, 8192));
+    try testing.expect(qkvMppWins(1, 16384));
+}
+
+test "qkv verify kernel serves by default only the row counts that stay in registers" {
+    try testing.expect(qkvVerifyRowsPay(6, 2));
+    try testing.expect(!qkvVerifyRowsPay(6, 3));
+    try testing.expect(qkvVerifyRowsPay(2, 6));
+    try testing.expect(!qkvVerifyRowsPay(2, 8));
 }
 
 test "qkv verify kernel defaults off on G17 but an explicit env value wins" {
@@ -39720,133 +40076,115 @@ test "qkv decode kernel declines non-decode widths and missing triples" {
     try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnDecodeKernel(s, q2, &view, 1.0, "", .{ .ctx = null }));
 }
 
-test "qkv decode kernel µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
-    // Times the kernel against (b) dense-mode dequant+SDPA and (c) kv-off
-    // SDPA at real decode geometries. Companion to kv_quant.zig's composed
-    // µbench; the live A/B decides defaults.
-    const raw = std.c.getenv("MLX_SERVE_KVQ_UBENCH");
-    if (raw == null or std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0")) return;
+test "qkv packed-attention surface µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
+    // Per (t_q, kv): (a) packed kernel, (b) dequant + dense sdpa, (c) bf16
+    // sdpa with no dequant. Arms interleave in one process and the cell order
+    // reverses per pass; BATCH launches share one eval so the sync barrier
+    // does not price the cell.
+    if (!diagEnvOn("MLX_SERVE_KVQ_UBENCH")) return;
+    const old_ver = qkv_ver_override;
+    qkv_ver_override = true;
+    defer qkv_ver_override = old_ver;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
+    const H_Q: c_int = 24;
+    const H_KV: c_int = 4;
+    const D: c_int = 256;
+    const BITS: u8 = 8;
+    const kvs = [_]usize{ 2048, 4096, 8192, 16384, 32768, 65536 };
+    const tqs = [_]c_int{ 1, 2, 3, 4, 6, 8 };
+    const PASSES = 4;
+    const BATCH = 8;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const none = mlx.mlx_array{ .ctx = null };
 
-    const cases = [_]struct { hq: c_int, hkv: c_int, d: c_int, t: usize, bits: u8 }{
-        .{ .hq = 48, .hkv = 8, .d = 128, .t = 8192, .bits = 8 },
-        .{ .hq = 48, .hkv = 8, .d = 128, .t = 32768, .bits = 8 },
-        .{ .hq = 48, .hkv = 8, .d = 128, .t = 32768, .bits = 4 },
-        .{ .hq = 32, .hkv = 8, .d = 128, .t = 8192, .bits = 8 },
-        .{ .hq = 32, .hkv = 8, .d = 128, .t = 32768, .bits = 8 },
-        .{ .hq = 16, .hkv = 8, .d = 256, .t = 32768, .bits = 8 },
-    };
-    const iters: usize = 30;
-    const warmup: usize = 5;
-    std.debug.print("\n[qkvdec-ubench] Hq/Hkv D T_k bits  kernel_ms  dense_ms  off_ms\n", .{});
-    for (cases) |cs| {
-        var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(cs.bits));
-        defer cache.deinit();
-        // One bulk update (prefill-shaped) then a decode token.
-        {
-            const shape = [_]c_int{ 1, cs.hkv, @intCast(cs.t - 1), cs.d };
-            var k = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k);
-            var v = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v);
+    const randBf16 = struct {
+        fn f(str: mlx.mlx_stream, shape: []const c_int, sd: f32) !mlx.mlx_array {
             var tmp = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(tmp);
-            try mlx.check(mlx.mlx_random_normal(&tmp, &shape, 4, .float32, 0.0, 0.2, .{ .ctx = null }, s));
-            try mlx.check(mlx.mlx_astype(&k, tmp, .bfloat16, s));
-            try mlx.check(mlx.mlx_astype(&v, tmp, .bfloat16, s));
-            var dv0 = try cache.update(0, k, v, s, 0);
-            dv0.deinit();
+            try mlx.check(mlx.mlx_random_normal(&tmp, shape.ptr, shape.len, .float32, 0.0, sd, .{ .ctx = null }, str));
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, tmp, .bfloat16, str));
+            return out;
         }
-        const one_shape = [_]c_int{ 1, cs.hkv, 1, cs.d };
-        var k1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k1);
-        {
-            var tmp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(tmp);
-            try mlx.check(mlx.mlx_random_normal(&tmp, &one_shape, 4, .float32, 0.0, 0.2, .{ .ctx = null }, s));
-            try mlx.check(mlx.mlx_astype(&k1, tmp, .bfloat16, s));
-        }
-        var dv = try cache.update(0, k1, k1, s, 0);
-        defer dv.deinit();
-        // Dense copies for the kv-off arm (materialized once, outside timing).
-        var k_off = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k_off);
-        var v_off = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v_off);
-        {
-            const zero = mlx.mlx_array_new_float(0.0);
-            defer _ = mlx.mlx_array_free(zero);
-            try mlx.check(mlx.mlx_add(&k_off, dv.k, zero, s));
-            try mlx.check(mlx.mlx_add(&v_off, dv.v, zero, s));
-            const ev = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(ev);
-            _ = mlx.mlx_vector_array_append_value(ev, k_off);
-            _ = mlx.mlx_vector_array_append_value(ev, v_off);
-            try mlx.check(mlx.mlx_eval(ev));
-        }
-        const q_shape = [_]c_int{ 1, cs.hq, 1, cs.d };
-        var q = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q);
-        {
-            var tmp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(tmp);
-            try mlx.check(mlx.mlx_random_normal(&tmp, &q_shape, 4, .float32, 0.0, 0.5, .{ .ctx = null }, s));
-            try mlx.check(mlx.mlx_astype(&q, tmp, .bfloat16, s));
-        }
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cs.d)));
-        const none = mlx.mlx_array{ .ctx = null };
+    }.f;
 
-        const evalOne = struct {
-            fn f(a: mlx.mlx_array) !void {
+    std.debug.print("\n[kvq-surface] Hq={d} Hkv={d} D={d} bits={d}\n[kvq-surface] {s:>6} {s:>3} {s:>9} {s:>9} {s:>9} {s:>9}\n", .{ H_Q, H_KV, D, BITS, "kv", "tq", "packed", "dq+sdpa", "bf16", "mpp" });
+    for (kvs) |kv| {
+        var ns: [tqs.len][4]u64 = @splat(@splat(0));
+        for (tqs, 0..) |tq, ti| {
+            // Own cache per width: the verify contract has the tq rows appended.
+            var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(BITS));
+            defer cache.deinit();
+            {
+                const k = try randBf16(s, &[_]c_int{ 1, H_KV, @intCast(kv - @as(usize, @intCast(tq))), D }, 0.2);
+                defer _ = mlx.mlx_array_free(k);
+                var dv0 = try cache.update(0, k, k, s, 0);
+                dv0.deinit();
+            }
+            const k1 = try randBf16(s, &[_]c_int{ 1, H_KV, tq, D }, 0.2);
+            defer _ = mlx.mlx_array_free(k1);
+            var dv = try cache.update(0, k1, k1, s, 0);
+            defer dv.deinit();
+            var k_off = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_off);
+            try mlx.check(mlx.mlx_contiguous(&k_off, dv.k, false, s));
+            const q = try randBf16(s, &[_]c_int{ 1, H_Q, tq, D }, 0.5);
+            defer _ = mlx.mlx_array_free(q);
+            {
                 const ev = mlx.mlx_vector_array_new();
                 defer _ = mlx.mlx_vector_array_free(ev);
-                _ = mlx.mlx_vector_array_append_value(ev, a);
+                _ = mlx.mlx_vector_array_append_value(ev, k_off);
+                _ = mlx.mlx_vector_array_append_value(ev, q);
                 try mlx.check(mlx.mlx_eval(ev));
             }
-        }.f;
+            const mode: [:0]const u8 = if (tq == 1) "" else "causal";
 
-        var mark = std.Io.Timestamp.now(io, .boot);
-        // (a) kernel
-        for (0..warmup + iters) |i| {
-            if (i == warmup) mark = std.Io.Timestamp.now(io, .boot);
-            const out = (try qkvAttnDecodeKernel(s, q, &dv, scale, "", none)) orelse return error.KernelDeclined;
-            defer _ = mlx.mlx_array_free(out);
-            try evalOne(out);
-        }
-        const kernel_ns: u64 = @intCast(mark.untilNow(io, .boot).nanoseconds);
-        // (b) dense mode: dequant + SDPA
-        for (0..warmup + iters) |i| {
-            if (i == warmup) mark = std.Io.Timestamp.now(io, .boot);
-            const kd = try kv_quant.dequantizeAffine(s, dv.k_triple_q, dv.k_triple_scales, dv.k_triple_biases, dv.group_size, dv.bits);
-            defer _ = mlx.mlx_array_free(kd);
-            const vdq = try kv_quant.dequantizeAffine(s, dv.v_triple_q, dv.v_triple_scales, dv.v_triple_biases, dv.group_size, dv.bits);
-            defer _ = mlx.mlx_array_free(vdq);
-            var out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vdq, scale, "", none, .{ .ctx = null }, false, s));
-            try evalOne(out);
-        }
-        const dense_ns: u64 = @intCast(mark.untilNow(io, .boot).nanoseconds);
-        // (c) off
-        for (0..warmup + iters) |i| {
-            if (i == warmup) mark = std.Io.Timestamp.now(io, .boot);
-            var out = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_off, v_off, scale, "", none, .{ .ctx = null }, false, s));
-            try evalOne(out);
-        }
-        const off_ns: u64 = @intCast(mark.untilNow(io, .boot).nanoseconds);
-
-        const ms = struct {
-            fn f(ns: u64, n: usize) f64 {
-                return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+            for (0..PASSES + 1) |pass| { // pass 0 = warmup
+                for (0..4) |a0| {
+                    const arm = if (pass % 2 == 0) a0 else 3 - a0;
+                    const ev = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ev);
+                    const mark = std.Io.Timestamp.now(io, .boot);
+                    for (0..BATCH) |_| {
+                        var out = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(out);
+                        switch (arm) {
+                            0 => out = (if (tq == 1)
+                                try qkvAttnDecodeKernel(s, q, &dv, scale, "", none)
+                            else
+                                try qkvAttnVerifyKernel(s, q, &dv, scale, "causal")) orelse return error.KernelDeclined,
+                            3 => out = (try qkvAttnMppKernel(s, q, &dv, scale, mode)) orelse return error.KernelDeclined,
+                            else => {
+                                var kd = k_off;
+                                if (arm == 1) kd = try kv_quant.dequantizeAffine(s, dv.k_triple_q, dv.k_triple_scales, dv.k_triple_biases, dv.group_size, dv.bits);
+                                defer if (arm == 1) {
+                                    _ = mlx.mlx_array_free(kd);
+                                };
+                                var vd = k_off;
+                                if (arm == 1) vd = try kv_quant.dequantizeAffine(s, dv.v_triple_q, dv.v_triple_scales, dv.v_triple_biases, dv.group_size, dv.bits);
+                                defer if (arm == 1) {
+                                    _ = mlx.mlx_array_free(vd);
+                                };
+                                if (tq > 1) {
+                                    if (try splitCausalSdpa(s, q, kd, vd, scale)) |sp| out = sp;
+                                }
+                                if (out.ctx == null) try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vd, scale, mode.ptr, none, .{ .ctx = null }, false, s));
+                            },
+                        }
+                        _ = mlx.mlx_vector_array_append_value(ev, out);
+                    }
+                    try mlx.check(mlx.mlx_eval(ev));
+                    if (pass > 0) ns[ti][arm] += @intCast(mark.untilNow(io, .boot).nanoseconds);
+                }
             }
-        }.f;
-        std.debug.print("[qkvdec-ubench] {d}/{d} {d} {d} {d}  {d:.3}  {d:.3}  {d:.3}\n", .{
-            cs.hq, cs.hkv, cs.d, cs.t, cs.bits, ms(kernel_ns, iters), ms(dense_ns, iters), ms(off_ns, iters),
-        });
-        _ = mlx.mlx_clear_cache();
+            _ = mlx.mlx_clear_cache();
+        }
+        for (tqs, 0..) |tq, ti| {
+            var ms: [4]f64 = undefined;
+            for (&ms, 0..) |*m, a| m.* = @as(f64, @floatFromInt(ns[ti][a])) / @as(f64, PASSES * BATCH) / 1e6;
+            std.debug.print("[kvq-surface] {d:>6} {d:>3} {d:>9.3} {d:>9.3} {d:>9.3} {d:>9.3}\n", .{ kv, tq, ms[0], ms[1], ms[2], ms[3] });
+        }
     }
 }
 

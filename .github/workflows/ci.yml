@@ -32,6 +32,14 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      # The pinned nightly tarball is ~50 MB off ziglang.org; fetch-zig.sh skips
+      # the download when the restored dir's stamp already matches the pin.
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
       - name: Install Zig (pinned nightly)
         run: |
           bash scripts/fetch-zig.sh

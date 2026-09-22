@@ -7117,7 +7117,8 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
     try t.expect(rep.admitted);
     try t.expectEqual(@as(usize, 1), rep.entries);
-    try t.expect(rep.bytes > 0);
+    // Billed bytes: the live allocator delta is not deterministic on the CI runner.
+    try t.expect(rep.accounted_bytes > 0);
 }
 test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
     // The qwen4_exp head's KV is meaningless without its index-key history, so the two halves

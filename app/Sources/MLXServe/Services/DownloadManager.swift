@@ -719,9 +719,7 @@ class DownloadManager: ObservableObject {
             var downloadedSize: Int64 = 0
 
             // Pre-check disk space
-            let destURL = URL(fileURLWithPath: destDir)
-            if let values = try? destURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-               let available = values.volumeAvailableCapacityForImportantUsage,
+            if let available = VolumeCapacity.available(atPath: destDir),
                available < totalSize {
                 throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError, userInfo: [
                     NSLocalizedDescriptionKey: "Not enough disk space. Need \(formatBytes(totalSize)) but only \(formatBytes(Int64(available))) available."
@@ -1389,9 +1387,7 @@ class DownloadManager: ObservableObject {
             }
             let totalSize = max(sizes.reduce(Int64(0), +), 1)
 
-            let destURL = URL(fileURLWithPath: destDir)
-            if let values = try? destURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-               let available = values.volumeAvailableCapacityForImportantUsage,
+            if let available = VolumeCapacity.available(atPath: destDir),
                totalSize > 1, available < totalSize {
                 throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError, userInfo: [
                     NSLocalizedDescriptionKey: "Not enough disk space. Need \(formatBytes(totalSize)) but only \(formatBytes(Int64(available))) available."

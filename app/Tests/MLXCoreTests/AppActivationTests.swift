@@ -63,7 +63,7 @@ final class AppActivationTests: XCTestCase {
     /// inline in a switch inside MLXServeApp, where the three call sites that
     /// bypass `openAndFocus` couldn't reach it.
     func testWindowTitleMapCoversEveryOpenableWindow() {
-        XCTAssertEqual(AppActivation.windowTitle(for: "chat"), "MLX Core")
+        XCTAssertEqual(AppActivation.windowTitle(for: "chat"), "MLX-Serve")
         // "modelBrowser" is deliberately absent: the Model Browser is a MODE
         // of the chat window now (`ChatWorkspace`), not a window to raise.
         XCTAssertNotEqual(AppActivation.windowTitle(for: "modelBrowser"), "Model Browser")
@@ -85,7 +85,7 @@ final class AppActivationTests: XCTestCase {
 
     /// The raise-by-title lookup was silently dead for the window users open
     /// most: `ChatView` sets `.navigationTitle("")`, so the chat window's
-    /// `NSWindow.title` is EMPTY and never equals "MLX Core". Matching must fall
+    /// `NSWindow.title` is EMPTY and never equals "MLX-Serve". Matching must fall
     /// back to the scene identifier.
     func testChatWindowIsMatchedByIdentifierWhenItsTitleIsBlank() {
         XCTAssertTrue(AppActivation.windowMatches(id: "chat", title: "", identifier: "chat"))

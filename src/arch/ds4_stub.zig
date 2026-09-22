@@ -7,7 +7,7 @@
 const std = @import("std");
 const ffi = @import("../ds4_ffi_stub.zig");
 
-const unavailable = "ds4 engine is unavailable on the iOS build (MLX safetensors only)";
+const unavailable = "ds4 engine is unavailable on this build (macOS-only embedded engine)";
 
 pub const Error = error{
     EngineOpenFailed,
@@ -26,6 +26,13 @@ pub const ds4_default_ctx: u32 = 32768;
 
 /// Pure helper mirrored from the real arch/ds4.zig (no engine dependency) so
 /// shared scheduler code that clamps a requested ctx size analyzes cleanly.
+pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    _ = io;
+    _ = allocator;
+    _ = path;
+    return false;
+}
+
 pub fn clampSessionCtx(requested: u32) u32 {
     if (requested == 0) return ds4_default_ctx;
     return @max(requested, ds4_prefill_chunk);
@@ -43,6 +50,7 @@ pub const OpenOptions = struct {
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
     dspark: bool = false,
+    embedded_mtp: bool = false,
     ssd_streaming: bool = false,
     ssd_streaming_cold: bool = false,
     ssd_streaming_cache_experts: u32 = 0,
@@ -59,6 +67,9 @@ pub const Ds4Snapshot = struct {
 
 pub const Ds4Engine = struct {
     pub const ChatTurn = struct { role: []const u8, content: []const u8 };
+    // Read by the scheduler's MTP engagement gate; the stub engine never
+    // opens, so the value is never observed.
+    embedded_mtp: bool = false,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
         _ = allocator;
@@ -168,6 +179,23 @@ pub const Ds4Session = struct {
     pub fn eval(self: *Ds4Session, token: i32) Error!void {
         _ = self;
         _ = token;
+        @panic(unavailable);
+    }
+    pub fn evalSpeculativeSampled(
+        self: *Ds4Session,
+        first_token: i32,
+        max_tokens: i32,
+        eos_token: i32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        rng: *u64,
+        out_tokens: []i32,
+    ) Error!i32 {
+        _ = self; _ = first_token; _ = max_tokens; _ = eos_token;
+        _ = temperature; _ = top_k; _ = top_p; _ = min_p; _ = rng;
+        _ = out_tokens;
         @panic(unavailable);
     }
     pub fn argmax(self: *Ds4Session) i32 {

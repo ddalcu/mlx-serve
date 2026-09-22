@@ -837,10 +837,8 @@ private struct MyModelsPane: View {
     }
 
     private func updateDiskSpace() {
-        let values = try? URL(fileURLWithPath: downloads.modelsDir)
-            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
         freeDiskSpace = ModelBrowserMetrics.freeSpaceLabel(
-            availableBytes: values?.volumeAvailableCapacityForImportantUsage
+            availableBytes: VolumeCapacity.available(atPath: downloads.modelsDir)
         )
     }
 }

@@ -43,6 +43,7 @@ enum CustomMediaModels {
         if arch.hasPrefix("mage_flow") || arch == "mageflow" {
             return isEditDir(id) ? .mageFlowEditTurbo : .mageFlowTurbo
         }
+        if arch.hasPrefix("qwen_image") { return .qwenImage21_8bit }
         return nil
     }
 

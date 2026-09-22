@@ -42,7 +42,7 @@ enum ModelRowActions {
         // this read "a folder you added's folder".
         let where_: String
         switch model.source {
-        case .mlxServe: where_ = "in MLX Core\u{2019}s own models folder"
+        case .mlxServe: where_ = "in MLX-Serve\u{2019}s own models folder"
         case .lmStudio: where_ = "in LM Studio\u{2019}s models folder"
         case .huggingFace: where_ = "in the Hugging Face cache, where models share files"
         case .mtplx: where_ = "in MTPLX\u{2019}s models folder"

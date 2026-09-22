@@ -52,6 +52,14 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      # The pinned nightly tarball is ~50 MB off ziglang.org; fetch-zig.sh skips
+      # the download when the restored dir's stamp already matches the pin.
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
       - name: Install Zig
         run: |
           bash scripts/fetch-zig.sh
@@ -72,6 +80,7 @@ jobs:
           echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+          echo "submodules=$(git submodule status | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Cache self-built mlx + mlx-c
         uses: actions/cache@v4
@@ -176,6 +185,15 @@ jobs:
 
       - name: Fetch libllama (llama.cpp GGUF engine)
         run: bash scripts/fetch-llama.sh
+
+      # Same key as ci.yml, so a tag build restores what main's CI already compiled.
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.mlxpin.outputs.submodules }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx-serve (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
