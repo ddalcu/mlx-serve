@@ -135,6 +135,41 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         liveTokensBySession[sessionId] ?? 0
     }
 
+    /// Notes typed while a chat's turn runs (`SteeringNotes`). The composer
+    /// writes them; the agent loop reads its session's note at every step
+    /// boundary and, when there is one, ends the turn there and starts the
+    /// next with the note as the user message (`resumeWithSteeringNote`).
+    @Published private(set) var steering = SteeringNotes()
+
+    func setSteeringNote(_ text: String, for sessionId: UUID) {
+        steering.set(text, for: sessionId)
+    }
+
+    func clearSteeringNote(for sessionId: UUID) {
+        steering.clear(for: sessionId)
+    }
+
+    /// A note left over after a turn that did not reach a boundary (the user
+    /// pressed Stop, or the reply ended in an error) is sent from here as a
+    /// turn of its own, once the chat is idle.
+    func sendSteeringNoteNow(for sessionId: UUID, config: TurnConfig,
+                             approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard composerState(for: sessionId) == .idle,
+              let note = steering.take(for: sessionId) else { return }
+        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+                config: config, approval: approval)
+    }
+
+    /// A turn that completed on its own hands an armed note to the next one.
+    /// Called after `endTurn`, never on a cancel: a stopped turn keeps its note
+    /// for the user to send or drop.
+    private func resumeWithSteeringNote(sessionId: UUID, config: TurnConfig,
+                                        approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard let note = steering.take(for: sessionId) else { return }
+        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+                config: config, approval: approval)
+    }
+
     /// The turn table: token-identified turn per session (see `TurnLedger`)
     /// plus the driving Task, cancelled by `stop(sessionId:)`.
     private var ledger = TurnLedger()
@@ -641,6 +676,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig,
                                      token: UUID, continuing: Bool = false) async {
+        var failed = false
         do {
             let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
             let stream: AsyncThrowingStream<SSEEvent, Error>
@@ -711,10 +747,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             print("[ChatTurnEngine] Chat error: \(error)")
             try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
             appendErrorNotice(error, to: sessionId)
+            failed = true
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
         appState.saveChatHistory()
         endTurn(sessionId: sessionId, token: token)
+        // Plain chat never asks for tool approval, and the note runs with this
+        // same config, so the closure is never called.
+        if !failed {
+            resumeWithSteeringNote(sessionId: sessionId, config: config, approval: { _ in false })
+        }
     }
 
     // MARK: - Agent mode (native tool calling)
@@ -780,9 +822,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 print("[ChatTurnEngine] Agent error: \(error)")
                 try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 self.appendErrorNotice(error, to: sessionId)
+                self.appState.saveChatHistory()
+                self.endTurn(sessionId: sessionId, token: token)
+                return
             }
             self.appState.saveChatHistory()
             self.endTurn(sessionId: sessionId, token: token)
+            self.resumeWithSteeringNote(sessionId: sessionId, config: config, approval: approval)
         }
     }
 
@@ -935,12 +981,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     hasPersona: !config.systemPromptPrefix.isEmpty)
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
-            // a user message. Add a nudge so the model knows to synthesize a response —
-            // asks explicitly for a short plain-text summary when finished so the user
-            // never sees a conversation that ends on a bare tool-call echo.
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."])
+                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
             }
             messages.append(contentsOf: history)
 
@@ -1361,6 +1403,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 appState.appendMessage(to: sessionId, message: msg)
                 return
             }
+
+            // A steering note ends the turn here, after the tool results and
+            // before the model is asked to continue; the note starts the next
+            // turn (`resumeWithSteeringNote`), so the round count starts over
+            // and the transcript reads as a user turn between two agent runs.
+            if steering.note(for: sessionId) != nil { return }
         }
 
         // Max iterations reached
