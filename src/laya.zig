@@ -645,6 +645,40 @@ pub fn maxOptions(cfg: *const Config) usize {
     return cfg.max_len -| 3;
 }
 
+/// The `questions` object of one request, validated. Needs no tokenizer and no
+/// MLX, so the server builds it before the request queues for the inference
+/// thread. Borrows `questions`.
+pub const Questions = struct {
+    ids: [][]const u8,
+    qs: []Question,
+
+    pub fn init(a: std.mem.Allocator, questions: std.json.Value, max_questions: usize, max_options: usize) !Questions {
+        if (questions != .object) return error.QuestionsNotObject;
+        const qobj = questions.object;
+        if (qobj.count() > max_questions) return error.TooManyQuestions;
+        const ids = try a.alloc([]const u8, qobj.count());
+        errdefer a.free(ids);
+        const qs = try a.alloc(Question, qobj.count());
+        var n: usize = 0;
+        errdefer {
+            for (qs[0..n]) |*q| q.deinit(a);
+            a.free(qs);
+        }
+        var it = qobj.iterator();
+        while (it.next()) |kv| : (n += 1) {
+            ids[n] = kv.key_ptr.*;
+            qs[n] = try Question.fromJson(a, kv.value_ptr.*, max_options);
+        }
+        return .{ .ids = ids, .qs = qs };
+    }
+
+    pub fn deinit(self: *Questions, a: std.mem.Allocator) void {
+        for (self.qs) |*q| q.deinit(a);
+        a.free(self.qs);
+        a.free(self.ids);
+    }
+};
+
 /// `render_options`: option texts in label-index order. Caller frees each and the slice.
 pub fn renderOptions(a: std.mem.Allocator, q: *const Question) ![][]u8 {
     const n = q.optionCount();
@@ -1937,7 +1971,7 @@ pub fn tempBucket(buf: []u8, qt: QType, k: usize) []const u8 {
 
 // ── Engine: request JSON in, laya `predict` JSON out ──
 
-/// How `predictJson` splits rows into forwards: row indices sorted by token
+/// How `predictMany` splits rows into forwards: row indices sorted by token
 /// length, cut into batches (`order[ends[b - 1]..ends[b]]`) of at most
 /// `MAX_ROWS` rows and `MAX_TOKENS` tokens as `Model.bucketShape` pads them,
 /// where a longer row may add at most `MAX_PAD_GROWTH` padding tokens to the
@@ -2032,104 +2066,187 @@ pub const Engine = struct {
         self.allocator.destroy(self);
     }
 
-    /// Run the reference `predict` for one state and a `questions` object;
-    /// returns the response JSON (caller frees). Validation errors are the
-    /// named `error.*` values in `errorMessage`.
-    pub fn predictJson(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: std.json.Value) ![]u8 {
-        if (questions != .object) return error.QuestionsNotObject;
-        const qobj = questions.object;
-        const nq = qobj.count();
-        if (nq > self.max_questions) return error.TooManyQuestions;
-        const cfg = &self.model.cfg;
+    /// `questions` validated against this engine's limits (`limitMessage`).
+    pub fn parseQuestions(self: *const Engine, a: std.mem.Allocator, questions: std.json.Value) !Questions {
+        return Questions.init(a, questions, self.max_questions, maxOptions(&self.model.cfg));
+    }
 
+    /// `parseQuestions` + `predict`.
+    pub fn predictJson(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: std.json.Value) ![]u8 {
+        var q = try self.parseQuestions(a, questions);
+        defer q.deinit(a);
+        return self.predict(a, model_id, state, &q);
+    }
+
+    /// Run the reference `predict` for one state and validated questions;
+    /// returns the response JSON (caller frees). Validation errors are the
+    /// named `error.*` values in `errorMessage` and `limitMessage`.
+    pub fn predict(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: *const Questions) ![]u8 {
+        var jobs = [_]Job{.{ .a = a, .model_id = model_id, .state = state, .questions = questions }};
+        self.predictMany(&jobs);
+        return jobs[0].result;
+    }
+
+    /// One request of `predictMany`: `result` is its response JSON (owned by
+    /// `a`) or its own error.
+    pub const Job = struct {
+        a: std.mem.Allocator,
+        model_id: []const u8,
+        state: std.json.Value,
+        questions: *const Questions,
+        result: anyerror![]u8 = error.NotRun,
+    };
+
+    /// Answer several requests with shared forwards: the questions of every
+    /// job go through one `BatchPlan`. Each job fails on its own (its prompt,
+    /// its input-token limit, a non-finite row of its own); a failed forward
+    /// fails the jobs that had rows in it.
+    pub fn predictMany(self: *Engine, jobs: []Job) void {
+        const a = self.allocator;
+        const works = a.alloc(Work, jobs.len) catch {
+            for (jobs) |*j| j.result = error.OutOfMemory;
+            return;
+        };
+        defer a.free(works);
+        for (works, jobs) |*w, *j| {
+            w.* = self.prepareJob(j) catch |err| .{ .err = err };
+        }
+        defer for (works) |*w| w.deinit(a);
+        self.runJobs(jobs, works) catch |err| for (works) |*w| {
+            if (w.err == null) w.err = err;
+        };
+        for (jobs, works) |*j, *w| {
+            j.result = if (w.err) |err| err else writeAnswers(j.a, j.model_id, j.questions, w);
+        }
+    }
+
+    /// A job's sequences and answers, in the order of its questions.
+    const Work = struct {
+        seqs: []Sequence = &.{},
+        probs: [][]f64 = &.{},
+        acts: []f64 = &.{},
+        input_tokens: usize = 0,
+        err: ?anyerror = null,
+
+        fn deinit(self: *Work, a: std.mem.Allocator) void {
+            for (self.seqs) |*sq| sq.deinit(a);
+            a.free(self.seqs);
+            for (self.probs) |p| a.free(p);
+            a.free(self.probs);
+            a.free(self.acts);
+        }
+    };
+
+    fn prepareJob(self: *Engine, job: *const Job) !Work {
+        const a = self.allocator;
+        const qs = job.questions.qs;
+        const cfg = &self.model.cfg;
+        var w: Work = .{};
         // No question: Python never serializes the state and answers `{}`.
-        const state_text = if (nq == 0) try a.alloc(u8, 0) else try renderValue(a, state);
+        if (qs.len == 0) return w;
+        errdefer w.deinit(a);
+        const state_text = try renderValue(a, job.state);
         defer a.free(state_text);
         const state_ids = try encodeClean(a, &self.model.tok, null, cfg.mask_token, state_text);
         defer a.free(state_ids);
-
-        const qs = try a.alloc(Question, nq);
-        var nqs: usize = 0;
-        defer {
-            for (qs[0..nqs]) |*q| q.deinit(a);
-            a.free(qs);
-        }
-        const seqs = try a.alloc(Sequence, nq);
+        w.probs = try a.alloc([]f64, qs.len);
+        for (w.probs) |*p| p.* = &.{};
+        w.acts = try a.alloc(f64, qs.len);
+        const seqs = try a.alloc(Sequence, qs.len);
         var nseq: usize = 0;
-        defer {
+        errdefer {
             for (seqs[0..nseq]) |*sq| sq.deinit(a);
             a.free(seqs);
         }
-        const qids = try a.alloc([]const u8, nq);
-        defer a.free(qids);
-        const t_prep = std.Io.Timestamp.now(trace_io, .boot);
-        var it = qobj.iterator();
-        var qi: usize = 0;
-        while (it.next()) |kv| : (qi += 1) {
-            qids[qi] = kv.key_ptr.*;
-            qs[qi] = try Question.fromJson(a, kv.value_ptr.*, maxOptions(cfg));
-            nqs += 1;
-        }
-        var input_tokens: usize = 0;
         for (qs, seqs) |*q, *sq| {
             sq.* = try buildSequence(a, &self.model.tok, &self.model.tok_cache, cfg, state_ids, q);
             nseq += 1;
             if (sq.markers.len != q.optionCount()) return error.TooManyOptions;
-            input_tokens += sq.ids.len;
+            w.input_tokens += sq.ids.len;
         }
-        if (input_tokens > self.max_input_tokens) return error.TooManyInputTokens;
+        if (w.input_tokens > self.max_input_tokens) return error.TooManyInputTokens;
+        w.seqs = seqs;
+        return w;
+    }
 
-        log.debug("[laya] prepare {d} question(s): {d:.2} ms\n", .{ nq, msSince(t_prep) });
+    /// Forward every question of the jobs without an error, in length-sorted batches.
+    fn runJobs(self: *Engine, jobs: []const Job, works: []Work) !void {
+        const a = self.allocator;
+        const cfg = &self.model.cfg;
+        const Row = struct { job: u32, q: u32 };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(a);
+        var lens: std.ArrayList(usize) = .empty;
+        defer lens.deinit(a);
+        for (works, 0..) |*w, ji| {
+            if (w.err != null) continue;
+            for (w.seqs, 0..) |sq, qi| {
+                try rows.append(a, .{ .job = @intCast(ji), .q = @intCast(qi) });
+                try lens.append(a, sq.ids.len);
+            }
+        }
+        var plan = try BatchPlan.init(a, lens.items);
+        defer plan.deinit(a);
+        const ids = try a.alloc([]const u32, BatchPlan.MAX_ROWS);
+        defer a.free(ids);
+        const markers = try a.alloc([]const u32, BatchPlan.MAX_ROWS);
+        defer a.free(markers);
+        const qtypes = try a.alloc(QType, BatchPlan.MAX_ROWS);
+        defer a.free(qtypes);
+        var b_start: usize = 0;
+        for (plan.ends) |b_end| {
+            const batch = plan.order[b_start..b_end];
+            defer b_start = b_end;
+            for (batch, 0..) |ri, r| {
+                const row = rows.items[ri];
+                const sq = works[row.job].seqs[row.q];
+                ids[r] = sq.ids;
+                markers[r] = sq.markers;
+                qtypes[r] = jobs[row.job].questions.qs[row.q].t;
+            }
+            var res = self.model.forward(.{ .ids = ids[0..batch.len], .markers = markers[0..batch.len], .qtype = qtypes[0..batch.len] }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                for (batch) |ri| {
+                    const w = &works[rows.items[ri].job];
+                    if (w.err == null) w.err = err;
+                }
+                continue;
+            };
+            defer res.deinit(a);
+            for (batch, 0..) |ri, r| {
+                const row = rows.items[ri];
+                const w = &works[row.job];
+                const q = &jobs[row.job].questions.qs[row.q];
+                const k = w.seqs[row.q].markers.len;
+                const logits = res.logits[r * res.k_pad .. r * res.k_pad + k];
+                const act = res.act[r * res.n_actions .. (r + 1) * res.n_actions];
+                for (logits) |v| if (!std.math.isFinite(v)) {
+                    w.err = error.NonFiniteOutput;
+                };
+                for (act) |v| if (!std.math.isFinite(v)) {
+                    w.err = error.NonFiniteOutput;
+                };
+                var bucket_buf: [32]u8 = undefined;
+                const bucket = tempBucket(&bucket_buf, q.t, k);
+                const scale: f64 = cfg.temperature_by_options.get(bucket) orelse cfg.temperature[@intFromEnum(q.t)];
+                w.probs[row.q] = try a.alloc(f64, k);
+                softmaxInto(logits, scale, w.probs[row.q]);
+                w.acts[row.q] = act[0];
+            }
+        }
+    }
+
+    /// Laya's `predict` JSON for one job's answers, in the order of its questions.
+    fn writeAnswers(a: std.mem.Allocator, model_id: []const u8, questions: *const Questions, w: *const Work) ![]u8 {
+        const qs = questions.qs;
+        const qids = questions.ids;
+        const probs = w.probs;
+        const acts = w.acts;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
         try out.appendSlice(a, "{\"model\":");
         try pyJsonString(a, &out, model_id, false);
         try out.appendSlice(a, ",\"answers\":{");
-
-        // Forward in length-sorted batches; answers are written in request order below.
-        const probs = try a.alloc([]f64, nq);
-        for (probs) |*p| p.* = &.{};
-        defer {
-            for (probs) |p| a.free(p);
-            a.free(probs);
-        }
-        const acts = try a.alloc(f64, nq);
-        defer a.free(acts);
-        const lens = try a.alloc(usize, nq);
-        defer a.free(lens);
-        for (seqs, lens) |sq, *l| l.* = sq.ids.len;
-        var plan = try BatchPlan.init(a, lens);
-        defer plan.deinit(a);
-        var b_start: usize = 0;
-        for (plan.ends) |b_end| {
-            const rows = plan.order[b_start..b_end];
-            defer b_start = b_end;
-            const ids = try a.alloc([]const u32, rows.len);
-            defer a.free(ids);
-            const markers = try a.alloc([]const u32, rows.len);
-            defer a.free(markers);
-            const qtypes = try a.alloc(QType, rows.len);
-            defer a.free(qtypes);
-            for (rows, 0..) |i, r| {
-                ids[r] = seqs[i].ids;
-                markers[r] = seqs[i].markers;
-                qtypes[r] = qs[i].t;
-            }
-            var res = try self.model.forward(.{ .ids = ids, .markers = markers, .qtype = qtypes });
-            defer res.deinit(a);
-            for (res.logits) |v| if (!std.math.isFinite(v)) return error.NonFiniteOutput;
-            for (res.act) |v| if (!std.math.isFinite(v)) return error.NonFiniteOutput;
-            for (rows, 0..) |i, r| {
-                const k = seqs[i].markers.len;
-                var bucket_buf: [32]u8 = undefined;
-                const bucket = tempBucket(&bucket_buf, qs[i].t, k);
-                const scale: f64 = cfg.temperature_by_options.get(bucket) orelse cfg.temperature[@intFromEnum(qs[i].t)];
-                probs[i] = try a.alloc(f64, k);
-                softmaxInto(res.logits[r * res.k_pad .. r * res.k_pad + k], scale, probs[i]);
-                acts[i] = res.act[r * res.n_actions];
-            }
-        }
-
         for (qs, 0..) |*q, i| {
             const p = probs[i];
             const k = p.len;
@@ -2190,7 +2307,7 @@ pub const Engine = struct {
             }
             try out.append(a, '}');
         }
-        try out.print(a, "}},\"usage\":{{\"input_tokens\":{d},\"output_tokens\":0}}}}", .{input_tokens});
+        try out.print(a, "}},\"usage\":{{\"input_tokens\":{d},\"output_tokens\":0}}}}", .{w.input_tokens});
         return out.toOwnedSlice(a);
     }
 };
@@ -2684,6 +2801,65 @@ test "laya: predict reproduces laya_mlx answers for the en/fr/hi states (toleran
         }
     }
     std.debug.print("\n[laya] predict parity max|diff| {d:.4}\n", .{max_diff});
+}
+
+test "laya: requests answered in one pass match their serial answers; errors stay per request" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const engine = try Engine.load(testIo(), a, dir, s);
+    defer engine.deinit();
+    // The second request has more options than fit in the prompt.
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(a);
+    try many.appendSlice(a, "[\"o0\"");
+    for (1..400) |i| try many.print(a, ",\"o{d}\"", .{i});
+    try many.append(a, ']');
+    const text = try std.fmt.allocPrint(a,
+        \\[{{"state": {{"board": "P . G", "moves": ["up", "left"]}},
+        \\  "questions": {{"up": {{"type": "score", "instructions": "How good is up?", "criteria": ["bad", "ok", "good"]}},
+        \\                "left": {{"type": "noul", "instructions": "Is left safe?"}}}}}},
+        \\ {{"state": "x", "questions": {{"q": {{"type": "choice", "instructions": "?", "criteria": {s}}}}}}},
+        \\ {{"state": "I was charged twice for my order and want a refund today",
+        \\  "questions": {{"team": {{"type": "choice", "instructions": "Which team?", "criteria": ["billing", "sales", "tech"]}},
+        \\                "angry": {{"type": "noul", "instructions": "Is the customer angry?"}}}}}}]
+    , .{many.items});
+    defer a.free(text);
+    var req = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer req.deinit();
+    const items = req.value.array.items;
+    var qs: [3]Questions = undefined;
+    for (items, &qs) |it, *q| q.* = try engine.parseQuestions(a, it.object.get("questions").?);
+    defer for (&qs) |*q| q.deinit(a);
+    var jobs: [3]Engine.Job = undefined;
+    for (items, &qs, &jobs) |it, *q, *j| j.* = .{ .a = a, .model_id = "m", .state = it.object.get("state").?, .questions = q };
+    engine.predictMany(&jobs);
+    defer for (jobs) |j| if (j.result) |out| a.free(out) else |_| {};
+    try testing.expectError(error.TooManyOptions, jobs[1].result);
+    for (items, &qs, jobs, 0..) |it, *q, j, i| {
+        if (i == 1) continue;
+        const serial = try engine.predict(a, "m", it.object.get("state").?, q);
+        defer a.free(serial);
+        var ps = try std.json.parseFromSlice(std.json.Value, a, serial, .{});
+        defer ps.deinit();
+        var pm = try std.json.parseFromSlice(std.json.Value, a, try j.result, .{});
+        defer pm.deinit();
+        try expectJsonClose(ps.value, pm.value, 1e-4);
+    }
+}
+
+fn expectJsonClose(want: std.json.Value, got: std.json.Value, tol: f64) !void {
+    switch (want) {
+        .object => |o| {
+            try testing.expectEqual(o.count(), got.object.count());
+            var it = o.iterator();
+            while (it.next()) |e| try expectJsonClose(e.value_ptr.*, got.object.get(e.key_ptr.*) orelse return error.MissingKey, tol);
+        },
+        .float, .integer => try testing.expectApproxEqAbs(numF64(want), numF64(got), tol),
+        .string => |x| try testing.expectEqualStrings(x, got.string),
+        else => {},
+    }
 }
 
 const FixtureRows = struct {
