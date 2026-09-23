@@ -860,19 +860,22 @@ pub const AudioEngine = struct {
 pub const DecisionEngine = struct {
     allocator: std.mem.Allocator,
     engine: *laya.Engine,
+    stream: mlx.mlx_stream,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        const s = mlx.mlx_default_gpu_stream_new();
-        self.engine = try laya.Engine.load(io, allocator, model_dir, s);
+        self.stream = mlx.mlx_default_gpu_stream_new();
+        errdefer _ = mlx.mlx_stream_free(self.stream);
+        self.engine = try laya.Engine.load(io, allocator, model_dir, self.stream);
         log.info("[decision] Laya engine ready\n", .{});
         return self;
     }
 
     pub fn deinit(self: *DecisionEngine) void {
         self.engine.deinit();
+        _ = mlx.mlx_stream_free(self.stream);
         self.allocator.destroy(self);
     }
 };
