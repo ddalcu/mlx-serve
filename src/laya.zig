@@ -1151,7 +1151,12 @@ pub const Model = struct {
                 mlx.dropLatchedErrorUnless(had_error);
             }
         }
-        return self.runGraphOnce(in, null, n, t);
+        const had_error = mlx.errorPending();
+        return self.runGraphOnce(in, null, n, t) catch |e| {
+            // The caller gets the error; a latch left set would fail the next request.
+            mlx.dropLatchedErrorUnless(had_error);
+            return e;
+        };
     }
 
     fn runGraphOnce(self: *Model, in: Inputs, cls: ?mlx.mlx_closure, n: usize, t: usize) ![2]A {
@@ -1972,11 +1977,15 @@ test "laya: a compiled-path failure reruns the batch on the lazy graph and is ne
         try testing.expect(model.ensureCompiled() == null);
         for (ref.logits, out.logits) |w, g| try testing.expectApproxEqAbs(w, g, 0.05);
     }
-    // A lazy-graph failure is returned, not retried.
-    mlx.armLatchingFaultForTest(1);
+    // A failing lazy rerun is returned, not retried, and leaves no latch behind.
+    model.compile_failed = false;
+    var prime = try model.forward(batch);
+    prime.deinit(a);
+    mlx.fault.arm(1);
+    mlx.armLatchingFaultForTest(2);
     try testing.expectError(error.MlxError, model.forward(batch));
-    var buf: [512]u8 = undefined;
-    _ = mlx.takeError(&buf);
+    try testing.expect(mlx.latchingFaultFiredForTest());
+    try testing.expect(!mlx.errorPending());
 }
 
 test "laya: forward latency breakdown (LAYA_BENCH=1)" {
