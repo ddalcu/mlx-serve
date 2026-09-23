@@ -125,6 +125,7 @@ LABELS="$(post_file "$TMP/labels.json" '%{http_code} %{time_total}')"
 check "250k choice labels -> 400" "${LABELS% *}" "400"
 check "250k labels refused in under 1 s (got ${LABELS#* } s)" "$(python3 -c "print(${LABELS#* } < 1)")" "True"
 check "5 MB body -> 413" "$(post_file "$TMP/big.json" '%{http_code}')" "413"
+check "5 MB body with a query string -> 413" "$(curl -s -H 'Expect:' -o /dev/null -w '%{http_code}' -m 120 -X POST "localhost:$PORT/v1/decisions?x=1" -H 'content-type: application/json' --data-binary @"$TMP/big.json")" "413"
 
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"
