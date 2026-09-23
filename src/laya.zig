@@ -552,7 +552,9 @@ pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, 
         }
     }
     markers.shrinkRetainingCapacity(kept);
-    return .{ .ids = try ids.toOwnedSlice(a), .markers = try markers.toOwnedSlice(a) };
+    const owned_markers = try markers.toOwnedSlice(a);
+    errdefer a.free(owned_markers);
+    return .{ .ids = try ids.toOwnedSlice(a), .markers = owned_markers };
 }
 
 // ── MLX primitives ──
@@ -1982,4 +1984,29 @@ test "laya: forward latency breakdown (LAYA_BENCH=1)" {
     }
     std.mem.sort(f64, &times, {}, std.sort.asc(f64));
     std.debug.print("[laya-bench] encoder only: median {d:.2} ms p10 {d:.2} p90 {d:.2}\n", .{ times[15], times[3], times[27] });
+}
+
+fn buildSequenceOnce(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const Config, state: []const u8, q: *const Question) !void {
+    var seq = try buildSequence(a, tok, cfg, state, q);
+    seq.deinit(a);
+}
+
+test "laya: buildSequence frees everything when any allocation fails" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const tok_dir = try std.fmt.allocPrint(a, "{s}/tokenizer", .{dir});
+    defer a.free(tok_dir);
+    var tok = try tokenizer_mod.loadTokenizer(testIo(), a, tok_dir);
+    defer tok.deinit();
+    var cfg = try parseConfig(testIo(), a, dir, &tok);
+    defer cfg.deinit();
+    var qv = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type": "choice", "instructions": "Which team?", "criteria": {"billing": "refunds", "sales": ""}}
+    , .{});
+    defer qv.deinit();
+    var q = try Question.fromJson(a, qv.value);
+    defer q.deinit(a);
+    // Refuse in-place shrinks so every toOwnedSlice allocates and can fail.
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(no_remap.allocator(), buildSequenceOnce, .{ &tok, &cfg, "I was charged twice.", &q });
 }
