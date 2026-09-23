@@ -175,6 +175,9 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *cons
     for (temperature) |t| if (!(t > 0) or !std.math.isFinite(t)) return error.InvalidLayaConfig;
     var tit = by_opt.valueIterator();
     while (tit.next()) |t| if (!(t.* > 0) or !std.math.isFinite(t.*)) return error.InvalidLayaConfig;
+    for (&temperature, 0..) |*t, i| clampTemperature(@as(QType, @enumFromInt(i)).name(), t);
+    var cit = by_opt.iterator();
+    while (cit.next()) |kv| clampTemperature(kv.key_ptr.*, kv.value_ptr);
 
     const n_actions: u32 = if (g.get("act_costs")) |ac| (if (ac == .object) @as(u32, @intCast(ac.object.count())) + 1 else 1) else 1;
     const max_len = jsonInt(g.get("max_len"), 512);
@@ -224,6 +227,17 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *cons
         .mask_token = try a.dupe(u8, mask.text),
         .allocator = a,
     };
+}
+
+/// `TEMP_MIN`/`TEMP_MAX` of laya 0.3.5 and laya-mlx 0.2.0: a fitted temperature below 0.5
+/// sharpens the logits enough to report a coin flip as a certainty.
+const TEMP_MIN: f32 = 0.5;
+const TEMP_MAX: f32 = 5.0;
+
+fn clampTemperature(name: []const u8, t: *f32) void {
+    const c = std.math.clamp(t.*, TEMP_MIN, TEMP_MAX);
+    if (c != t.*) log.warn("[laya] calibration temperature {s}={d} is outside [{d}, {d}]; using {d}\n", .{ name, t.*, TEMP_MIN, TEMP_MAX, c });
+    t.* = c;
 }
 
 // ── Prompt construction (laya_mlx.common.build_sequence) ──
@@ -1523,7 +1537,7 @@ pub const Engine = struct {
                 const scale: f64 = cfg.temperature_by_options.get(bucket) orelse cfg.temperature[@intFromEnum(q.t)];
                 const p = try a.alloc(f64, k);
                 defer a.free(p);
-                softmaxInto(res.logits[row * res.k_pad .. row * res.k_pad + k], @max(1e-3, scale), p);
+                softmaxInto(res.logits[row * res.k_pad .. row * res.k_pad + k], scale, p);
                 const act_prob = res.act[row * res.n_actions];
                 if (i > 0) try out.append(a, ',');
                 try pyJsonString(a, &out, qids[i], false);
@@ -1982,4 +1996,36 @@ test "laya: forward latency breakdown (LAYA_BENCH=1)" {
     }
     std.mem.sort(f64, &times, {}, std.sort.asc(f64));
     std.debug.print("[laya-bench] encoder only: median {d:.2} ms p10 {d:.2} p90 {d:.2}\n", .{ times[15], times[3], times[27] });
+}
+
+test "laya: calibration temperatures are clamped to [0.5, 5] at load" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [1024]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    for ([_][]const u8{ "encoder", "tokenizer" }) |name| {
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
+        defer a.free(from);
+        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, name });
+        defer a.free(to);
+        try std.Io.Dir.symLinkAbsolute(io, from, to, .{});
+    }
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "rl_agent_config.json",
+        .data =
+        \\{"temperature": [0.1, 1.0, 9.0], "temperature_by_options": {"choice:11+": 0.1006, "noul:2": 2.0}}
+        ,
+    });
+    const tok_dir = try std.fmt.allocPrint(a, "{s}/tokenizer", .{dir});
+    defer a.free(tok_dir);
+    var tok = try tokenizer_mod.loadTokenizer(io, a, tok_dir);
+    defer tok.deinit();
+    var cfg = try parseConfig(io, a, root, &tok);
+    defer cfg.deinit();
+    try testing.expectEqual([3]f32{ 0.5, 1.0, 5.0 }, cfg.temperature);
+    try testing.expectEqual(@as(f32, 0.5), cfg.temperature_by_options.get("choice:11+").?);
+    try testing.expectEqual(@as(f32, 2.0), cfg.temperature_by_options.get("noul:2").?);
 }
