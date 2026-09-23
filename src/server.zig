@@ -6906,7 +6906,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         return;
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
-    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
