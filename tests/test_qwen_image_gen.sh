@@ -54,6 +54,20 @@ grep -q "\[image\] Qwen-Image-2.1 ready" "$LOG" && pass "qwen_image backend enga
   && pass "txt2img -> 512x512 PNG" || fail "txt2img"
 grep -q "one forward per step" "$LOG" && pass "guidance 1.0 runs one forward per step" || fail "no one-forward log line"
 
+if [[ "$MODEL" == *4bit* ]]; then
+  code=$(curl -s -m 3600 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$ID\",\"size\":\"768x768\",\"steps\":2,\"seed\":3,\"prompt\":\"a red fox in the snow\"}" \
+    -o "$OUT/wide.json" -w '%{http_code}')
+  [ "$code" = 200 ] && python3 - "$OUT/wide.json" <<'PY'
+import sys, json, base64, struct
+b = base64.b64decode(json.load(open(sys.argv[1]))["data"][0]["b64_json"])
+assert b[:8] == b"\x89PNG\r\n\x1a\n" and struct.unpack(">II", b[16:24]) == (768, 768)
+PY
+  png_ok=$?
+  [ "$code" = 200 ] && [ "$png_ok" = 0 ] && grep -q '\[mf-linear\] dq-gemm engaged (rows=' "$LOG" \
+    && pass "Q4 wide GEMM engages at 768x768" || fail "Q4 wide GEMM did not engage"
+fi
+
 [ "$(gen "$OUT/b.json" '"prompt":"a red fox in the snow","guidance_scale":4,"negative_prompt":"blurry"')" = 200 ] && png_check "$OUT/b.json" \
   && pass "guided txt2img -> PNG" || fail "guided txt2img"
 grep -q "two forwards per step" "$LOG" && pass "CFG engaged" || fail "CFG did not engage"
