@@ -860,6 +860,10 @@ pub const AudioEngine = struct {
 pub const DecisionEngine = struct {
     allocator: std.mem.Allocator,
     engine: *laya.Engine,
+    /// How long the inference thread waits for more decision requests to
+    /// answer in the same pass (`MLX_SERVE_LAYA_BATCH_WINDOW_US`, default 0:
+    /// only requests already queued are merged).
+    batch_window_us: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
@@ -867,6 +871,13 @@ pub const DecisionEngine = struct {
         self.allocator = allocator;
         const s = mlx.mlx_default_gpu_stream_new();
         self.engine = try laya.Engine.load(io, allocator, model_dir, s);
+        self.batch_window_us = if (std.c.getenv("MLX_SERVE_LAYA_BATCH_WINDOW_US")) |raw|
+            std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch blk: {
+                log.warn("[decision] ignoring MLX_SERVE_LAYA_BATCH_WINDOW_US={s} (want microseconds)\n", .{raw});
+                break :blk 0;
+            }
+        else
+            0;
         log.info("[decision] Laya engine ready\n", .{});
         return self;
     }
@@ -877,27 +888,91 @@ pub const DecisionEngine = struct {
     }
 };
 
-/// `POST /v1/decisions` `{"model", "state": <string|object|array>, "questions": {id: {...}}}`
-/// -> laya's `predict` JSON. Runs on the inference thread like every gen job.
-pub fn handleDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *DecisionEngine, model_id: []const u8) !void {
+/// A `/v1/decisions` body parsed and validated on the connection thread,
+/// before the request queues for the inference thread.
+pub const DecisionRequest = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    state: std.json.Value,
+    questions: laya.Questions,
+
+    pub fn deinit(self: *DecisionRequest, allocator: std.mem.Allocator) void {
+        self.questions.deinit(allocator);
+        self.parsed.deinit();
+    }
+};
+
+/// Parse and validate `{"model", "state": <string|object|array>, "questions": {id: {...}}}`.
+/// An invalid body is answered 400 here and gives null.
+pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const u8) !?DecisionRequest {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return sendError(conn, 400, "request body is not valid JSON");
+        try sendError(conn, 400, "request body is not valid JSON");
+        return null;
     };
-    defer parsed.deinit();
-    if (parsed.value != .object) return sendError(conn, 400, "request body must be a JSON object");
+    var keep = false;
+    defer if (!keep) parsed.deinit();
+    if (parsed.value != .object) {
+        try sendError(conn, 400, "request body must be a JSON object");
+        return null;
+    }
     const obj = parsed.value.object;
-    const state = obj.get("state") orelse return sendError(conn, 400, "missing 'state'");
-    const questions = obj.get("questions") orelse return sendError(conn, 400, "missing 'questions'");
-    const t0 = std.Io.Timestamp.now(conn.io, .boot);
-    const out = engine.engine.predictJson(allocator, model_id, state, questions) catch |err| {
-        if (laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
-        log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
-        return sendError(conn, 500, "decision forward failed");
+    const state = obj.get("state") orelse {
+        try sendError(conn, 400, "missing 'state'");
+        return null;
     };
-    defer allocator.free(out);
-    const nq: usize = if (questions == .object) questions.object.count() else 0;
-    log.info("[decision] {d} question(s) in {d:.1} ms\n", .{ nq, @as(f64, @floatFromInt(t0.untilNow(conn.io, .boot).nanoseconds)) / 1e6 });
-    try sendBytesJson(conn, allocator, out);
+    const questions = obj.get("questions") orelse {
+        try sendError(conn, 400, "missing 'questions'");
+        return null;
+    };
+    const qs = laya.Questions.init(allocator, questions) catch |err| {
+        try sendError(conn, 400, laya.errorMessage(err) orelse return err);
+        return null;
+    };
+    keep = true;
+    return .{ .parsed = parsed, .state = state, .questions = qs };
+}
+
+/// One queued `/v1/decisions` request.
+pub const DecisionJob = struct {
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    req: *const DecisionRequest,
+};
+
+/// Laya's `predict` JSON for prepared requests, answered in one pass and sent
+/// to each connection. Runs on the inference thread like every gen job; one
+/// request's error is that request's response only.
+pub fn handleDecisions(engine: *DecisionEngine, model_id: []const u8, jobs: []const DecisionJob) void {
+    const t0 = std.Io.Timestamp.now(jobs[0].conn.io, .boot);
+    var buf: [16]laya.Engine.Job = undefined;
+    const pj = if (jobs.len <= buf.len) buf[0..jobs.len] else engine.allocator.alloc(laya.Engine.Job, jobs.len) catch {
+        for (jobs) |j| sendError(j.conn, 500, "out of memory") catch {};
+        return;
+    };
+    defer if (jobs.len > buf.len) engine.allocator.free(pj);
+    var nq: usize = 0;
+    for (pj, jobs) |*p, j| {
+        p.* = .{ .a = j.allocator, .model_id = model_id, .state = j.req.state, .questions = &j.req.questions };
+        nq += j.req.questions.qs.len;
+    }
+    engine.engine.predictMany(pj);
+    const ms = @as(f64, @floatFromInt(t0.untilNow(jobs[0].conn.io, .boot).nanoseconds)) / 1e6;
+    if (jobs.len > 1)
+        log.info("[decision] {d} requests merged, {d} question(s) in {d:.1} ms\n", .{ jobs.len, nq, ms })
+    else
+        log.info("[decision] {d} question(s) in {d:.1} ms\n", .{ nq, ms });
+    for (pj, jobs) |p, j| sendDecision(j, p.result) catch |err| {
+        log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn sendDecision(job: DecisionJob, result: anyerror![]u8) !void {
+    const out = result catch |err| {
+        if (laya.errorMessage(err)) |msg| return sendError(job.conn, 400, msg);
+        log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
+        return sendError(job.conn, 500, "decision forward failed");
+    };
+    defer job.allocator.free(out);
+    try sendBytesJson(job.conn, job.allocator, out);
 }
 
 /// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d

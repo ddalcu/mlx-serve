@@ -3264,7 +3264,7 @@ pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
 /// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
 /// app always launches) came to silently eat the `--pld*` flags.
 ///
-/// Never RAISES a tighter existing cap: `scheduler.runGenRequest` drops the pool
+/// Never RAISES a tighter existing cap: `scheduler.runGenRequests` drops the pool
 /// to 1 GB on small-RAM machines during media gen, and iOS boots at 384 MB.
 pub fn applyMlxCacheLimit() void {
     const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CACHE_LIMIT")) |p|
@@ -6853,6 +6853,8 @@ const GenJob = struct {
     body: []const u8,
     lm: *model_registry_mod.LoadedModel,
     route: media_mod.GenRoute,
+    /// `.decisions`: the body, parsed and validated before queueing.
+    decision: ?*const media_mod.DecisionRequest = null,
 };
 
 /// Inference-thread entry point for a gen job. Dispatches on the engine slot
@@ -6865,11 +6867,27 @@ fn genJobRun(ctx: *anyopaque) void {
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .decisions => if (job.lm.decision_engine) |e| media_mod.handleDecisions(job.allocator, job.conn, job.body, e, job.lm.id) else error.WrongModality,
+        .decisions => {
+            genJobRunMany(&.{ctx});
+            return;
+        },
     };
     result catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
     };
+}
+
+/// Inference-thread entry point for decision jobs queued back to back for one
+/// model (`GenRequest.merge`): they are answered in one pass.
+fn genJobRunMany(ctxs: []const *anyopaque) void {
+    const first: *GenJob = @ptrCast(@alignCast(ctxs[0]));
+    const e = first.lm.decision_engine orelse return;
+    var buf: [scheduler_mod.MAX_MERGED_WEIGHT]media_mod.DecisionJob = undefined;
+    for (ctxs, buf[0..ctxs.len]) |c, *d| {
+        const job: *GenJob = @ptrCast(@alignCast(c));
+        d.* = .{ .allocator = job.allocator, .conn = job.conn, .req = job.decision.? };
+    }
+    media_mod.handleDecisions(e, first.lm.id, buf[0..ctxs.len]);
 }
 
 /// Dispatch a media-generation request to the inference thread. `lm` is the
@@ -6892,8 +6910,18 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);
         return;
     }
-    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
+    var decision: ?media_mod.DecisionRequest = null;
+    defer if (decision) |*d| d.deinit(allocator);
+    if (route == .decisions) {
+        decision = try media_mod.prepareDecisions(allocator, stream, body) orelse return;
+    }
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
+    if (decision) |*d| req.merge = .{
+        .run_many = genJobRunMany,
+        .weight = d.questions.qs.len,
+        .window_us = lm.decision_engine.?.batch_window_us,
+    };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);

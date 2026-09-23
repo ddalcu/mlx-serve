@@ -122,6 +122,41 @@ EOF
 )"
 check "20 mixed-length questions match their one-at-a-time answers, in request order" "$MIX" "same"
 
+echo "=== concurrent requests: answered in one pass, same answers as one at a time ==="
+MERGED_BEFORE=$(grep -c 'requests merged' "$LOG" || true)
+CONC="$(python3 - "$PORT" "$MODEL_ID" <<'EOF'
+import json, sys, threading, urllib.request
+port, model = sys.argv[1], sys.argv[2]
+def post(state, qs):
+    body = json.dumps({"model": model, "state": state, "questions": qs}).encode()
+    req = urllib.request.Request(f"http://localhost:{port}/v1/decisions", data=body, headers={"Content-Type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=120))
+    except urllib.error.HTTPError as e:
+        return e.code
+qs = {"up": {"type": "score", "instructions": "How good is it to move up?", "criteria": ["bad", "ok", "good"]},
+      "safe": {"type": "noul", "instructions": "Is the next cell safe?"},
+      "team": {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "sales", "tech"]}}
+busy = {f"q{i}": {"type": "noul", "instructions": f"question {i}?"} for i in range(64)}
+reqs = [(f"ghost {i} steps away, {i * 3} pellets left", qs) for i in range(12)]
+reqs.append(("x", {"q": {"type": "choice", "instructions": "?", "criteria": [f"o{i}" for i in range(400)]}}))  # too many options: 400 alone, the others still answer
+serial = [post(*r) for r in reqs]
+out = [None] * len(reqs)
+def go(i): out[i] = post(*reqs[i])
+first = threading.Thread(target=post, args=("keep the model busy " * 60, busy)); first.start()
+th = [threading.Thread(target=go, args=(i,)) for i in range(len(reqs))]
+[t.start() for t in th]; [t.join() for t in th]; first.join()
+def close(a, b):
+    if isinstance(a, dict): return a.keys() == b.keys() and all(close(a[k], b[k]) for k in a)
+    if isinstance(a, (int, float)) and not isinstance(a, bool): return abs(a - b) <= 1e-4
+    return a == b
+print("same" if all(close(a, b) for a, b in zip(serial, out)) else f"differ {serial} {out}", out[-1])
+EOF
+)"
+check "12 concurrent requests match their serial answers; the bad one is a 400" "$CONC" "same 400"
+MERGED_AFTER=$(grep -c 'requests merged' "$LOG" || true)
+check "concurrent requests were merged into one pass" "$([ "$MERGED_AFTER" -gt "$MERGED_BEFORE" ] && echo yes || echo "no merge line")" "yes"
+
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"
 for _ in 1 2 3 4 5; do decide "$BODY" >/dev/null; done
