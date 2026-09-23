@@ -256,23 +256,27 @@ fn clampTemperature(name: []const u8, t: *f32) void {
 
 // ── Prompt construction (laya_mlx.common.build_sequence) ──
 
-/// Python `json.dumps(v, separators=(", ", ": "))` — key order, spacing and
-/// escaping must match because the result is TOKENIZED. `ascii` mirrors
-/// `ensure_ascii`. Ceiling: floats print as shortest decimal, never in
-/// Python's exponent form (|x| >= 1e16 or < 1e-4); ints/strings are exact.
+/// Python `json.dumps(v, separators=(", ", ": "))` — key order, spacing,
+/// escaping and number spelling must match because the result is TOKENIZED.
+/// `ascii` mirrors `ensure_ascii`. Request bodies come from `parseRequestJson`
+/// (numbers kept as text). A number past the f64 range is `error.NonFiniteNumber`:
+/// Python would write `Infinity`, which is not JSON.
 pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool) !void {
     switch (v) {
         .null => try out.appendSlice(a, "null"),
         .bool => |b| try out.appendSlice(a, if (b) "true" else "false"),
         .integer => |i| try out.print(a, "{d}", .{i}),
-        .float => |f| {
-            if (f == @trunc(f) and @abs(f) < 1e16) {
-                try out.print(a, "{d:.1}", .{f});
+        .float => |f| try pyFloat(a, out, f),
+        .number_string => |s| {
+            if (std.mem.eql(u8, s, "-0")) {
+                try out.append(a, '0');
+            } else if (std.json.isNumberFormattedLikeAnInteger(s)) {
+                // JSON integers have no leading zeros: the text is Python's `int` repr.
+                try out.appendSlice(a, s);
             } else {
-                try out.print(a, "{d}", .{f});
+                try pyFloat(a, out, std.fmt.parseFloat(f64, s) catch return error.NonFiniteNumber);
             }
         },
-        .number_string => |s| try out.appendSlice(a, s),
         .string => |s| try pyJsonString(a, out, s, ascii),
         .array => |arr| {
             try out.append(a, '[');
@@ -297,6 +301,52 @@ pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, 
     }
 }
 
+/// Python `float.__repr__`: shortest round-trip digits; exponent form (`1e-05`,
+/// `1.5e+300`) when the decimal point position is <= -4 or > 16, else fixed
+/// notation with at least one fraction digit (`1.0`, `-0.0`).
+fn pyFloat(a: std.mem.Allocator, out: *std.ArrayList(u8), f: f64) !void {
+    if (!std.math.isFinite(f)) return error.NonFiniteNumber;
+    var buf: [std.fmt.float.min_buffer_size]u8 = undefined;
+    var sci = std.fmt.float.render(&buf, f, .{ .mode = .scientific }) catch unreachable; // "[-]D[.DDD]e[-]X"
+    if (sci[0] == '-') {
+        try out.append(a, '-');
+        sci = sci[1..];
+    }
+    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const exp10 = std.fmt.parseInt(i32, sci[e_at + 1 ..], 10) catch unreachable;
+    var digits_buf: [24]u8 = undefined;
+    var nd: usize = 0;
+    for (sci[0..e_at]) |c| if (c != '.') {
+        digits_buf[nd] = c;
+        nd += 1;
+    };
+    const digits = digits_buf[0..nd];
+    const decpt = exp10 + 1; // value = 0.DIGITS * 10^decpt
+    if (decpt <= -4 or decpt > 16) {
+        try out.append(a, digits[0]);
+        if (nd > 1) {
+            try out.append(a, '.');
+            try out.appendSlice(a, digits[1..]);
+        }
+        try out.print(a, "e{c}{d:0>2}", .{ @as(u8, if (exp10 < 0) '-' else '+'), @abs(exp10) });
+    } else if (decpt <= 0) {
+        try out.appendSlice(a, "0.");
+        try out.appendNTimes(a, '0', @intCast(-decpt));
+        try out.appendSlice(a, digits);
+    } else {
+        const int_len: usize = @intCast(decpt);
+        if (int_len >= nd) {
+            try out.appendSlice(a, digits);
+            try out.appendNTimes(a, '0', int_len - nd);
+            try out.appendSlice(a, ".0");
+        } else {
+            try out.appendSlice(a, digits[0..int_len]);
+            try out.append(a, '.');
+            try out.appendSlice(a, digits[int_len..]);
+        }
+    }
+}
+
 fn pyJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, ascii: bool) !void {
     try out.append(a, '"');
     var i: usize = 0;
@@ -306,7 +356,8 @@ fn pyJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, as
             const n = std.unicode.utf8ByteSequenceLength(c) catch 1;
             const end = @min(i + n, s.len);
             if (ascii) {
-                const cp = std.unicode.utf8Decode(s[i..end]) catch 0xFFFD;
+                // WTF-8 (`parseRequestJson`): a lone surrogate re-emits as its `\udXXX` escape, like Python.
+                const cp = std.unicode.wtf8Decode(s[i..end]) catch 0xFFFD;
                 if (cp >= 0x10000) {
                     const u = cp - 0x10000;
                     try out.print(a, "\\u{x:0>4}\\u{x:0>4}", .{ 0xD800 + (u >> 10), 0xDC00 + (u & 0x3FF) });
@@ -325,10 +376,119 @@ fn pyJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, as
             0x08 => try out.appendSlice(a, "\\b"),
             0x0C => try out.appendSlice(a, "\\f"),
             0...7, 0x0B, 0x0E...0x1F => try out.print(a, "\\u{x:0>4}", .{c}),
+            // ensure_ascii escapes everything outside ' '..'~', DEL included.
+            0x7F => if (ascii) try out.appendSlice(a, "\\u007f") else try out.append(a, c),
             else => try out.append(a, c),
         }
     }
     try out.append(a, '"');
+}
+
+/// A string in the response body: raw UTF-8, except a string holding a lone surrogate (a
+/// question id sent as `"\ud800"`), which goes out `\u`-escaped as Python's `json.dumps` writes it.
+fn wireString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    return pyJsonString(a, out, s, !std.unicode.utf8ValidateSlice(s));
+}
+
+/// Parse a `/v1/decisions` body the way Python's `json.loads` reads it, for `pyJson`:
+/// numbers keep their text, a repeated key keeps its LAST value at its FIRST position, and a
+/// lone UTF-16 surrogate escape (`"\ud800"`, which `std.json` rejects) is kept as WTF-8.
+pub fn parseRequestJson(a: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    const opts: std.json.ParseOptions = .{ .parse_numbers = false, .duplicate_field_behavior = .use_last, .allocate = .alloc_always };
+    if (!try scanLoneSurrogates(body, null)) return std.json.parseFromSlice(std.json.Value, a, body, opts);
+    // `std.json` sees each lone surrogate as NUL + its 4 hex digits, and a real `\u0000` as
+    // NUL + "0000", so every NUL in a parsed string is followed by its marker; then the
+    // strings are decoded back.
+    var marked: std.ArrayList(u8) = .empty;
+    defer marked.deinit(a);
+    try marked.ensureTotalCapacity(a, body.len + body.len / 2);
+    _ = try scanLoneSurrogates(body, .{ .a = a, .out = &marked });
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, marked.items, opts);
+    errdefer parsed.deinit();
+    try unmarkValue(parsed.arena.allocator(), &parsed.value);
+    return parsed;
+}
+
+const MarkedOut = struct { a: std.mem.Allocator, out: *std.ArrayList(u8) };
+
+/// Whether a string in the JSON text holds a lone surrogate escape; with `mark`, also
+/// writes the body with the NUL markers of `parseRequestJson`. Malformed escapes are
+/// copied as they are for the parser to reject.
+fn scanLoneSurrogates(body: []const u8, mark: ?MarkedOut) !bool {
+    var in_string = false;
+    var lone = false;
+    var i: usize = 0;
+    var copied: usize = 0; // body[0..copied] already written to `mark`
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (c == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string or c != '\\' or i + 1 >= body.len) continue;
+        i += 1;
+        if (body[i] != 'u') continue;
+        const cp = hex4(body, i + 1) orelse continue;
+        const esc_start = i - 1;
+        i += 4; // at the last hex digit
+        if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 < body.len and body[i + 1] == '\\' and body[i + 2] == 'u') {
+            if (hex4(body, i + 3)) |lo| if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                i += 6; // a proper pair
+                continue;
+            };
+        }
+        const surrogate = cp >= 0xD800 and cp <= 0xDFFF;
+        lone = lone or surrogate;
+        if (mark) |m| if (surrogate or cp == 0) {
+            try m.out.appendSlice(m.a, body[copied..esc_start]);
+            try m.out.print(m.a, "\\u0000{x:0>4}", .{cp});
+            copied = i + 1;
+        };
+    }
+    if (mark) |m| try m.out.appendSlice(m.a, body[copied..]);
+    return lone;
+}
+
+fn hex4(body: []const u8, at: usize) ?u16 {
+    if (at + 4 > body.len) return null;
+    return std.fmt.parseInt(u16, body[at .. at + 4], 16) catch null;
+}
+
+/// Decode the NUL markers of `parseRequestJson` in every string and key under `v`.
+fn unmarkValue(arena: std.mem.Allocator, v: *std.json.Value) !void {
+    switch (v.*) {
+        .string => |s| v.* = .{ .string = try unmarkString(arena, s) },
+        .array => |*arr| for (arr.items) |*item| try unmarkValue(arena, item),
+        .object => |*obj| {
+            for (obj.keys()) |*k| k.* = try unmarkString(arena, k.*);
+            try obj.reIndex(arena);
+            for (obj.values()) |*item| try unmarkValue(arena, item);
+        },
+        else => {},
+    }
+}
+
+fn unmarkString(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, 0) == null) return s;
+    var out: std.ArrayList(u8) = try .initCapacity(arena, s.len);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] != 0 or i + 5 > s.len) {
+            out.appendAssumeCapacity(s[i]);
+            i += 1;
+            continue;
+        }
+        const cp = std.fmt.parseInt(u16, s[i + 1 .. i + 5], 16) catch {
+            out.appendAssumeCapacity(0);
+            i += 1;
+            continue;
+        };
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.wtf8Encode(cp, &buf) catch unreachable; // cp < 0x10000
+        out.appendSliceAssumeCapacity(buf[0..n]);
+        i += 5;
+    }
+    return out.items;
 }
 
 /// `serialize_state` / `render_criterion`: strings pass through, anything
@@ -490,8 +650,10 @@ pub fn renderOptions(a: std.mem.Allocator, q: *const Question) ![][]u8 {
 }
 
 /// Encode `text` with the mask token blanked (`text.replace(mask_tok, " ")`),
-/// no specials added.
+/// no specials added. A lone surrogate (WTF-8 from `parseRequestJson`) is
+/// `error.LoneSurrogate`: Python's tokenizer refuses a str holding one.
 fn encodeClean(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, mask_token: []const u8, text: []const u8) ![]u32 {
+    if (!std.unicode.utf8ValidateSlice(text)) return error.LoneSurrogate;
     if (std.mem.indexOf(u8, text, mask_token) == null) return tok.encode(a, text);
     const cleaned = try std.mem.replaceOwned(u8, a, text, mask_token, " ");
     defer a.free(cleaned);
@@ -1544,10 +1706,10 @@ pub const Engine = struct {
         if (questions != .object) return error.QuestionsNotObject;
         const qobj = questions.object;
         const nq = qobj.count();
-        if (nq == 0) return error.NoQuestions;
         const cfg = &self.model.cfg;
 
-        const state_text = try renderValue(a, state);
+        // No question: Python never serializes the state and answers `{}`.
+        const state_text = if (nq == 0) try a.alloc(u8, 0) else try renderValue(a, state);
         defer a.free(state_text);
 
         const qs = try a.alloc(Question, nq);
@@ -1616,7 +1778,7 @@ pub const Engine = struct {
                 softmaxInto(res.logits[row * res.k_pad .. row * res.k_pad + k], scale, p);
                 const act_prob = res.act[row * res.n_actions];
                 if (i > 0) try out.append(a, ',');
-                try pyJsonString(a, &out, qids[i], false);
+                try wireString(a, &out, qids[i]);
                 try out.appendSlice(a, ":{\"type\":\"");
                 try out.appendSlice(a, q.t.name());
                 try out.appendSlice(a, "\",\"confidence\":");
@@ -1635,11 +1797,11 @@ pub const Engine = struct {
                             best = j;
                         };
                         try out.appendSlice(a, ",\"choice\":");
-                        try pyJsonString(a, &out, q.labels[best], false);
+                        try wireString(a, &out, q.labels[best]);
                         try out.appendSlice(a, ",\"probabilities\":{");
                         for (q.labels, 0..) |label, j| {
                             if (j > 0) try out.append(a, ',');
-                            try pyJsonString(a, &out, label, false);
+                            try wireString(a, &out, label);
                             try out.append(a, ':');
                             try appendRounded(a, &out, p[j]);
                         }
@@ -1686,7 +1848,6 @@ fn appendRounded(a: std.mem.Allocator, out: *std.ArrayList(u8), x: f64) !void {
 pub fn errorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.QuestionsNotObject => "'questions' must be an object keyed by question id",
-        error.NoQuestions => "'questions' is empty",
         error.QuestionNotObject => "each question must be an object",
         error.UnknownQuestionType => "question 'type' must be one of choice, score, noul",
         error.MissingInstructions => "question is missing 'instructions'",
@@ -1694,6 +1855,8 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.BadScoreCriteria => "score 'criteria' must be a nonempty list",
         error.BadNoulCriteria => "noul 'criteria' must be an object with false/true descriptions",
         error.TooManyOptions => "a question has too many options for the token budget",
+        error.NonFiniteNumber => "a number in the request is outside the float64 range",
+        error.LoneSurrogate => "a text the model reads holds a lone UTF-16 surrogate escape (\\ud800-\\udfff)",
         else => null,
     };
 }
@@ -1731,6 +1894,55 @@ test "laya: pyJson matches Python json.dumps spacing, escaping and ensure_ascii"
     out.clearRetainingCapacity();
     try pyJson(a, &out, parsed.value.object.get("l").?, true);
     try testing.expectEqualStrings("[1, \"\\u00e9\"]", out.items);
+
+    // Numbers as the HTTP handler parses them (text kept): Python repr spelling.
+    var nums = try parseRequestJson(a,
+        \\[1e-5, 0.0001, 1e16, 1e15, 1.0, -0.0, -0, 1.5e300, 12345678901234567890, 5e-324, 1E5]
+    );
+    defer nums.deinit();
+    out.clearRetainingCapacity();
+    try pyJson(a, &out, nums.value, false);
+    try testing.expectEqualStrings("[1e-05, 0.0001, 1e+16, 1000000000000000.0, 1.0, -0.0, 0, 1.5e+300, 12345678901234567890, 5e-324, 100000.0]", out.items);
+    var inf = try parseRequestJson(a, "{\"x\": 1e999}");
+    defer inf.deinit();
+    try testing.expectError(error.NonFiniteNumber, renderValue(a, inf.value));
+}
+
+test "laya: request JSON reads like Python json.loads (repeated keys, lone surrogates, DEL)" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    var dup = try parseRequestJson(a, "{\"k\": 1, \"j\": 2, \"k\": [3]}");
+    defer dup.deinit();
+    try pyJson(a, &out, dup.value, false);
+    try testing.expectEqualStrings("{\"k\": [3], \"j\": 2}", out.items);
+
+    // Lone surrogates re-emit as escapes; a real NUL, a proper pair and marker-like text do not change.
+    var lone = try parseRequestJson(a,
+        \\{"\udfff": ["a\ud800b", "\u0000", "\ud83d\ude00", "\uDBFF\ud800", "x\u0000d800", "\\ud800"]}
+    );
+    defer lone.deinit();
+    out.clearRetainingCapacity();
+    try pyJson(a, &out, lone.value, true);
+    try testing.expectEqualStrings(
+        \\{"\udfff": ["a\ud800b", "\u0000", "\ud83d\ude00", "\udbff\ud800", "x\u0000d800", "\\ud800"]}
+    , out.items);
+    out.clearRetainingCapacity();
+    try wireString(a, &out, lone.value.object.keys()[0]);
+    try testing.expectEqualStrings("\"\\udfff\"", out.items);
+
+    out.clearRetainingCapacity();
+    try pyJsonString(a, &out, "a\x7fb", true);
+    try testing.expectEqualStrings("\"a\\u007fb\"", out.items);
+
+    for ([_][]const u8{ "{\"a\": \"\\ud800\"", "[\"\\uZZZZ\"]", "[\"\\ud800\" 1]" }) |bad| {
+        if (parseRequestJson(a, bad)) |p| {
+            var pp = p;
+            pp.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }
 
 test "laya: renderOptions for the three question types" {
@@ -1995,6 +2207,92 @@ test "laya: predict reproduces laya_mlx answers for the en/fr/hi states (toleran
         }
     }
     std.debug.print("\n[laya] predict parity max|diff| {d:.4}\n", .{max_diff});
+}
+
+test "laya: request serialization matches Python json.dumps text and token ids" {
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const path = try std.fmt.allocPrint(a, "{s}/numeric_cases.json", .{fx_dir});
+    defer a.free(path);
+    const text = try readWholeFile(testIo(), a, path);
+    defer a.free(text);
+    var fx = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer fx.deinit();
+    const root = fx.value.object;
+
+    var tok: ?tokenizer_mod.Tokenizer = null;
+    defer if (tok) |*t| t.deinit();
+    var cfg: ?Config = null;
+    defer if (cfg) |*c| c.deinit();
+    if (testModelDir()) |dir| {
+        const tok_dir = try std.fmt.allocPrint(a, "{s}/tokenizer", .{dir});
+        defer a.free(tok_dir);
+        tok = try tokenizer_mod.loadTokenizer(testIo(), a, tok_dir);
+        cfg = try parseConfig(testIo(), a, dir, &tok.?);
+    }
+    var state_q = try Question.fromJson(a, root.get("question").?);
+    defer state_q.deinit(a);
+
+    // `cases`: a state object; `ascii_cases`: non-string instructions over the state "x".
+    for ([_][]const u8{ "cases", "ascii_cases" }) |kind| for (root.get(kind).?.array.items) |cv| {
+        const c = cv.object;
+        const is_state = std.mem.eql(u8, kind, "cases");
+        const body = if (is_state) try a.dupe(u8, c.get("json").?.string) else try std.fmt.allocPrint(a, "{{\"type\": \"noul\", \"instructions\": {s}}}", .{c.get("json").?.string});
+        defer a.free(body);
+        var v = try parseRequestJson(a, body);
+        defer v.deinit();
+        const state_text = if (is_state) try renderValue(a, v.value) else try a.dupe(u8, "x");
+        defer a.free(state_text);
+        var q: ?Question = if (is_state) null else try Question.fromJson(a, v.value);
+        defer if (q) |*qq| qq.deinit(a);
+        testing.expectEqualStrings(c.get("dumps").?.string, if (is_state) state_text else q.?.ins) catch |e| {
+            std.debug.print("{s} {s}\n", .{ kind, c.get("name").?.string });
+            return e;
+        };
+        if (tok == null) continue;
+        var seq = try buildSequence(a, &tok.?, &cfg.?, state_text, if (q) |*qq| qq else &state_q);
+        defer seq.deinit(a);
+        const want_ids = try jsonU32Slice(a, c.get("ids").?);
+        defer a.free(want_ids);
+        const want_markers = try jsonU32Slice(a, c.get("markers").?);
+        defer a.free(want_markers);
+        try testing.expectEqualSlices(u32, want_ids, seq.ids);
+        try testing.expectEqualSlices(u32, want_markers, seq.markers);
+    };
+    for (root.get("rejected").?.array.items) |r| {
+        var state = try parseRequestJson(a, r.string);
+        defer state.deinit();
+        try testing.expectError(error.NonFiniteNumber, renderValue(a, state.value));
+    }
+}
+
+test "laya: predict answers {} for no question and refuses lone surrogates the tokenizer would see" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const engine = try Engine.load(testIo(), a, dir, s);
+    defer engine.deinit();
+
+    // No question: Python never serializes the state, so even an unrenderable one answers.
+    var empty = try parseRequestJson(a, "{\"state\": {\"x\": 1e999}, \"questions\": {}}");
+    defer empty.deinit();
+    const ej = try engine.predictJson(a, "m", empty.value.object.get("state").?, empty.value.object.get("questions").?);
+    defer a.free(ej);
+    try testing.expectEqualStrings("{\"model\":\"m\",\"answers\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}", ej);
+
+    var req = try parseRequestJson(a,
+        \\{"ok": {"\ud800": {"type": "noul", "instructions": ["\udc00"]}},
+        \\ "bad_ins": {"q": {"type": "noul", "instructions": "\udc00"}},
+        \\ "bad_state": "a\ud800b"}
+    );
+    defer req.deinit();
+    const o = req.value.object;
+    const json = try engine.predictJson(a, "m", .{ .string = "x" }, o.get("ok").?);
+    defer a.free(json);
+    try testing.expect(std.mem.startsWith(u8, json, "{\"model\":\"m\",\"answers\":{\"\\ud800\":{\"type\":\"noul\""));
+    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", .{ .string = "x" }, o.get("bad_ins").?));
+    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", o.get("bad_state").?, o.get("ok").?));
 }
 
 test "laya: a compiled-path failure reruns the batch on the lazy graph and is never retried" {
