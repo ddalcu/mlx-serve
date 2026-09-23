@@ -1112,24 +1112,11 @@ pub const Model = struct {
         const t: usize = @intCast(mlx.mlx_array_shape(in.ids)[1]);
         const k_pad: usize = @intCast(mlx.mlx_array_shape(in.marker_pos)[1]);
 
-        const t_start = std.Io.Timestamp.now(trace_io, .boot);
-        const outs = if (self.ensureCompiled()) |cls| self.applyCompiled(cls, in) catch |e| blk: {
-            log.warn("[laya] compiled forward failed ({s}); lazy graph from now on\n", .{@errorName(e)});
-            self.compile_failed = true;
-            break :blk try self.forwardBody(in);
-        } else try self.forwardBody(in);
+        const outs = try self.runGraph(in, n, t);
         const masked = outs[0];
         defer free(masked);
         const act32 = outs[1];
         defer free(act32);
-        const ev = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(ev);
-        try mlx.check(mlx.mlx_vector_array_append_value(ev, masked));
-        try mlx.check(mlx.mlx_vector_array_append_value(ev, act32));
-        const build_ms = msSince(t_start);
-        const t_built = std.Io.Timestamp.now(trace_io, .boot);
-        try mlx.check(mlx.mlx_eval(ev));
-        log.debug("[laya] forward n={d} t={d}: graph {d:.2} ms, eval {d:.2} ms\n", .{ n, t, build_ms, msSince(t_built) });
 
         const logits = try a.alloc(f32, n * k_pad);
         errdefer a.free(logits);
@@ -1149,6 +1136,39 @@ pub const Model = struct {
         return .{ .logits = logits, .k_pad = k_pad, .act = act, .n_actions = n_act };
     }
 
+    /// Build and evaluate the graph for `in`. A compiled-path failure (apply or
+    /// eval) turns compile off for good and reruns this batch once on the lazy
+    /// graph; a lazy-graph failure is returned.
+    fn runGraph(self: *Model, in: Inputs, n: usize, t: usize) ![2]A {
+        if (self.ensureCompiled()) |cls| {
+            const had_error = mlx.errorPending();
+            if (self.runGraphOnce(in, cls, n, t)) |outs| return outs else |e| {
+                log.warn("[laya] compiled forward failed ({s}); lazy graph from now on\n", .{@errorName(e)});
+                self.compile_failed = true;
+                _ = mlx.mlx_closure_free(cls);
+                self.compiled = null;
+                // Handled by the rerun: the latch must not fail the next, unrelated request.
+                mlx.dropLatchedErrorUnless(had_error);
+            }
+        }
+        return self.runGraphOnce(in, null, n, t);
+    }
+
+    fn runGraphOnce(self: *Model, in: Inputs, cls: ?mlx.mlx_closure, n: usize, t: usize) ![2]A {
+        const t_start = std.Io.Timestamp.now(trace_io, .boot);
+        const outs = if (cls) |c| try self.applyCompiled(c, in) else try self.forwardBody(in);
+        errdefer for (outs) |o| free(o);
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        try mlx.check(mlx.mlx_vector_array_append_value(ev, outs[0]));
+        try mlx.check(mlx.mlx_vector_array_append_value(ev, outs[1]));
+        const build_ms = msSince(t_start);
+        const t_built = std.Io.Timestamp.now(trace_io, .boot);
+        try mlx.check(mlx.mlx_eval(ev));
+        log.debug("[laya] forward n={d} t={d} compiled={}: graph {d:.2} ms, eval {d:.2} ms\n", .{ n, t, cls != null, build_ms, msSince(t_built) });
+        return outs;
+    }
+
     fn compileEnabled() bool {
         const raw = std.c.getenv("MLX_SERVE_LAYA_COMPILE") orelse return true;
         return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
@@ -1157,8 +1177,8 @@ pub const Model = struct {
     /// The compiled forward, built on first use. Null: lazy graph
     /// (`MLX_SERVE_LAYA_COMPILE=0`, or compile failed once).
     fn ensureCompiled(self: *Model) ?mlx.mlx_closure {
-        if (self.compiled) |c| return c;
         if (self.compile_failed or !compileEnabled()) return null;
+        if (self.compiled) |c| return c;
         const raw = mlx.mlx_closure_new_func_payload(&forwardClosure, @ptrCast(self), null);
         var compiled = mlx.mlx_closure{ .ctx = null };
         const rc = mlx.mlx_compile(&compiled, raw, false);
@@ -1913,6 +1933,50 @@ fn numF64(v: std.json.Value) f64 {
         .float => |f| f,
         else => std.math.nan(f64),
     };
+}
+
+test "laya: a compiled-path failure reruns the batch on the lazy graph and is never retried" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var model = try Model.load(testIo(), a, dir, s);
+    defer model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    const c = fx.cases()[0].object;
+    const ids = try jsonU32Slice(a, c.get("ids").?);
+    defer a.free(ids);
+    const markers = try jsonU32Slice(a, c.get("markers").?);
+    defer a.free(markers);
+    const batch = Model.Batch{ .ids = &.{ids}, .markers = &.{markers}, .qtype = &.{.choice} };
+
+    var ref = try model.forward(batch);
+    defer ref.deinit(a);
+    if (model.compiled == null) return error.SkipZigTest;
+    const ops0 = mlx.op_count.load(.monotonic);
+    var warm = try model.forward(batch);
+    warm.deinit(a);
+    const replay_ops = mlx.op_count.load(.monotonic) - ops0;
+    // A replayed trace: checked op 1 is the closure apply, the last one the eval.
+    for ([_]u64{ 1, replay_ops }) |k| {
+        model.compile_failed = false;
+        var prime = try model.forward(batch);
+        prime.deinit(a);
+        mlx.armLatchingFaultForTest(k);
+        var out = try model.forward(batch);
+        defer out.deinit(a);
+        try testing.expect(mlx.latchingFaultFiredForTest());
+        try testing.expect(!mlx.errorPending());
+        try testing.expect(model.ensureCompiled() == null);
+        for (ref.logits, out.logits) |w, g| try testing.expectApproxEqAbs(w, g, 0.05);
+    }
+    // A lazy-graph failure is returned, not retried.
+    mlx.armLatchingFaultForTest(1);
+    try testing.expectError(error.MlxError, model.forward(batch));
+    var buf: [512]u8 = undefined;
+    _ = mlx.takeError(&buf);
 }
 
 test "laya: forward latency breakdown (LAYA_BENCH=1)" {
