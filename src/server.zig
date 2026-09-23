@@ -796,6 +796,9 @@ fn routeExists(path: []const u8) bool {
 
 pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A decision prompt keeps at most `max_len` state tokens, so a larger body only
+/// buys tokenizer work on the inference thread.
+pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
@@ -804,6 +807,7 @@ pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
 pub fn maxRequestBytesFor(path: []const u8) usize {
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -22977,6 +22981,7 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
     }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
     for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+    try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
 }
 
 test "the 413 names both counts it compared" {
