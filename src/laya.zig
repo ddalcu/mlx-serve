@@ -1062,6 +1062,9 @@ pub const Model = struct {
     weights: ltx.Component,
     stream: S,
     tok_embeddings: A,
+    /// With `embed_int8`: the token embedding table as int8
+    /// (affine, group 64: q, scales, biases); `tok_embeddings` is then freed.
+    emb_q: ?[3]A = null,
     emb_norm: A,
     layers: []EncoderLayer,
     final_norm: A,
@@ -1158,7 +1161,7 @@ pub const Model = struct {
         return .{ .w_t = w, .b = b };
     }
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !Model {
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S, embed_int8: bool) !Model {
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
         var tok = try tokenizer_mod.loadTokenizer(io, allocator, tok_dir);
@@ -1200,7 +1203,7 @@ pub const Model = struct {
 
         const D = cfg.hidden_size;
         const I = cfg.intermediate_size;
-        self.tok_embeddings = try self.getW("encoder.embeddings.tok_embeddings.weight", .{}, &.{ cfg.vocab_size, D });
+        self.tok_embeddings = try self.getW(EMB_KEY, .{}, &.{ cfg.vocab_size, D });
         self.emb_norm = try self.getW("encoder.embeddings.norm.weight", .{}, &.{D});
         self.final_norm = try self.getW("encoder.final_norm.weight", .{}, &.{D});
         self.type_emb = try self.getW("type_emb.weight", .{}, &.{ 3, D });
@@ -1260,8 +1263,65 @@ pub const Model = struct {
         while (wit.next()) |w| try mlx.check(mlx.mlx_vector_array_append_value(vec, w.*));
         for (self.owned.items) |w| try mlx.check(mlx.mlx_vector_array_append_value(vec, w));
         try mlx.check(mlx.mlx_eval(vec));
+        if (embed_int8) try self.quantizeEmbeddings();
         log.info("[laya] ready — {d} tensors, {d} encoder layers, {d} head layers, max_len {d}\n", .{ weights.count(), cfg.num_layers, cfg.head_layers, cfg.max_len });
         return self;
+    }
+
+    fn embedInt8Enabled() bool {
+        const raw = std.c.getenv("MLX_SERVE_LAYA_EMBED_INT8") orelse return false;
+        return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    }
+
+    const EMB_KEY = "encoder.embeddings.tok_embeddings.weight";
+    const EMB_GROUP = 64;
+    const EMB_BITS = 8;
+
+    /// Store the token embedding table as int8 and free the fp16 one. Lossy
+    /// (answers move slightly), hence opt-in.
+    fn quantizeEmbeddings(self: *Model) !void {
+        const empty = mlx.mlx_array_new();
+        defer free(empty);
+        var vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_quantize(&vec, self.tok_embeddings, mlx.mlx_optional_int.some(EMB_GROUP), mlx.mlx_optional_int.some(EMB_BITS), "affine", empty, self.stream));
+        try mlx.check(mlx.mlx_eval(vec));
+        var q: [3]A = undefined;
+        var q_bytes: usize = 0;
+        for (&q, 0..) |*x, i| {
+            var part = mlx.mlx_array_new();
+            errdefer free(part);
+            try mlx.check(mlx.mlx_vector_array_get(&part, vec, i));
+            try self.owned.append(self.allocator, part);
+            q_bytes += mlx.mlx_array_size(part) * mlx.mlx_array_itemsize(part);
+            x.* = part;
+        }
+        const fp16_bytes = mlx.mlx_array_size(self.tok_embeddings) * mlx.mlx_array_itemsize(self.tok_embeddings);
+        const kv = self.weights.map.fetchRemove(EMB_KEY) orelse return error.MissingWeight;
+        free(kv.value);
+        self.weights.allocator.free(kv.key);
+        // Freed buffers stay in MLX's allocator cache; drop the fp16 table's.
+        _ = mlx.mlx_clear_cache();
+        self.tok_embeddings = none;
+        self.emb_q = q;
+        log.info("[laya] int8 embedding table (MLX_SERVE_LAYA_EMBED_INT8): {d} MB -> {d} MB\n", .{ fp16_bytes >> 20, q_bytes >> 20 });
+    }
+
+    /// Embedding rows of `ids` (`[n, T]`) as fp16 `[n, T, D]`.
+    fn embed(self: *Model, ids: A, s: S) !A {
+        const q = self.emb_q orelse return take(self.tok_embeddings, ids, 0, s);
+        const shape = mlx.mlx_array_shape(ids);
+        const flat = try reshape(ids, &[_]c_int{shape[0] * shape[1]}, s);
+        defer free(flat);
+        var rows: [3]A = .{ none, none, none };
+        defer for (rows) |r| if (r.ctx != null) free(r);
+        for (&rows, q) |*r, part| r.* = try take(part, flat, 0, s);
+        const empty = mlx.mlx_array_new();
+        defer free(empty);
+        var dq = mlx.mlx_array_new();
+        defer free(dq);
+        try mlx.check(mlx.mlx_dequantize(&dq, rows[0], rows[1], rows[2], mlx.mlx_optional_int.some(EMB_GROUP), mlx.mlx_optional_int.some(EMB_BITS), "affine", empty, .{ .value = .float16, .has_value = true }, s));
+        return reshape(dq, &[_]c_int{ shape[0], shape[1], @intCast(self.cfg.hidden_size) }, s);
     }
 
     fn freeOwned(self: *Model) void {
@@ -1416,7 +1476,7 @@ pub const Model = struct {
         const full_mask = m.full;
         const local_mask = m.local;
 
-        const emb = try take(self.tok_embeddings, ids_arr, 0, s);
+        const emb = try self.embed(ids_arr, s);
         defer free(emb);
         var x = try layerNorm(emb, self.emb_norm, null, self.cfg.norm_eps, s);
         errdefer free(x);
@@ -2034,7 +2094,7 @@ pub const Engine = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .model = try Model.load(io, allocator, model_dir, s),
+            .model = try Model.load(io, allocator, model_dir, s, Model.embedInt8Enabled()),
             .max_questions = envLimit("MLX_SERVE_LAYA_MAX_QUESTIONS", DEFAULT_MAX_QUESTIONS),
             .max_input_tokens = envLimit("MLX_SERVE_LAYA_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS),
         };
@@ -2666,7 +2726,7 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -2803,6 +2863,66 @@ test "laya: predict reproduces laya_mlx answers for the en/fr/hi states (toleran
     std.debug.print("\n[laya] predict parity max|diff| {d:.4}\n", .{max_diff});
 }
 
+test "laya: int8 embedding table keeps every top choice and moves probabilities by < 0.02" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var engine = Engine{ .allocator = a, .model = try Model.load(testIo(), a, dir, s, false) };
+    defer engine.model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    const root = fx.parsed.value.object;
+    const questions = root.get("questions").?;
+    const states = root.get("states").?.object.values();
+    const fp16 = try a.alloc([]u8, states.len);
+    defer {
+        for (fp16) |o| a.free(o);
+        a.free(fp16);
+    }
+    for (states, fp16) |st, *o| o.* = try engine.predictJson(a, "m", st, questions);
+    var int8 = Engine{ .allocator = a, .model = try Model.load(testIo(), a, dir, s, true) };
+    defer int8.model.deinit();
+    var worst: f64 = 0;
+    for (states, fp16) |st, want| {
+        const got = try int8.predictJson(a, "m", st, questions);
+        defer a.free(got);
+        var pw = try std.json.parseFromSlice(std.json.Value, a, want, .{});
+        defer pw.deinit();
+        var pg = try std.json.parseFromSlice(std.json.Value, a, got, .{});
+        defer pg.deinit();
+        var it = pw.value.object.get("answers").?.object.iterator();
+        while (it.next()) |e| {
+            const aw = e.value_ptr.object;
+            const ag = pg.value.object.get("answers").?.object.get(e.key_ptr.*).?.object;
+            if (aw.get("noul")) |n| worst = @max(worst, @abs(numF64(n) - numF64(ag.get("noul").?)));
+            const pr = aw.get("probabilities") orelse continue;
+            var best_w: []const u8 = "";
+            var best_g: []const u8 = "";
+            var bw: f64 = -1;
+            var bg: f64 = -1;
+            var pit = pr.object.iterator();
+            while (pit.next()) |pe| {
+                const vw = numF64(pe.value_ptr.*);
+                const vg = numF64(ag.get("probabilities").?.object.get(pe.key_ptr.*).?);
+                worst = @max(worst, @abs(vw - vg));
+                if (vw > bw) {
+                    bw = vw;
+                    best_w = pe.key_ptr.*;
+                }
+                if (vg > bg) {
+                    bg = vg;
+                    best_g = pe.key_ptr.*;
+                }
+            }
+            try testing.expectEqualStrings(best_w, best_g);
+        }
+    }
+    std.debug.print("\n[laya] int8 embedding: max probability drift {d:.4} over {d} states\n", .{ worst, states.len });
+    try testing.expect(worst > 0 and worst < 0.02);
+}
+
 test "laya: requests answered in one pass match their serial answers; errors stay per request" {
     const dir = testModelDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
@@ -2890,7 +3010,7 @@ test "laya: dummy rows of a bucketed batch leave the real rows bit-identical" {
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -2933,7 +3053,7 @@ test "laya: past the compiled-shape cap a new input shape runs the lazy graph" {
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -3065,7 +3185,7 @@ test "laya: a compiled-path failure reruns the batch on the lazy graph and is ne
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -3126,7 +3246,7 @@ test "laya: the loaded model holds each checkpoint tensor once" {
     _ = mlx.mlx_clear_cache();
     var active0: usize = 0;
     _ = mlx.mlx_get_active_memory(&active0);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -3159,7 +3279,7 @@ test "laya: forward latency breakdown (LAYA_BENCH=1)" {
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var model = try Model.load(testIo(), a, dir, s);
+    var model = try Model.load(testIo(), a, dir, s, false);
     defer model.deinit();
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
@@ -3272,7 +3392,7 @@ test "laya: a config that does not match its weights or the reference fails the 
         defer tmp.cleanup();
         const root = try mutatedCheckpoint(a, &tmp, dir, c.enc, c.agent);
         defer a.free(root);
-        if (Model.load(testIo(), a, root, s)) |m| {
+        if (Model.load(testIo(), a, root, s, false)) |m| {
             var mm = m;
             mm.deinit();
             return error.TestUnexpectedResult;
