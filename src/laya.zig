@@ -67,13 +67,20 @@ pub const Config = struct {
     }
 };
 
-fn jsonInt(v: ?std.json.Value, default: u32) u32 {
+/// A negative, fractional or out-of-range config integer is `error.InvalidLayaConfig`.
+fn jsonInt(v: ?std.json.Value, default: u32) !u32 {
     const x = v orelse return default;
     return switch (x) {
-        .integer => |i| @intCast(i),
-        .float => |f| @intFromFloat(f),
+        .integer => |i| std.math.cast(u32, i) orelse error.InvalidLayaConfig,
+        .float => |f| if (f >= 0 and f <= std.math.maxInt(u32) and @floor(f) == f) @intFromFloat(f) else error.InvalidLayaConfig,
+        .number_string => error.InvalidLayaConfig,
         else => default,
     };
+}
+
+fn badConfig(comptime fmt: []const u8, args: anytype) error{InvalidLayaConfig} {
+    log.err("[laya] invalid checkpoint: " ++ fmt ++ "\n", args);
+    return error.InvalidLayaConfig;
 }
 
 fn jsonF32(v: ?std.json.Value, default: f32) f32 {
@@ -118,14 +125,15 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *cons
     if (e.get("hidden_activation")) |act| {
         if (act != .string or !std.mem.eql(u8, act.string, "gelu")) return error.UnsupportedEncoder;
     }
-    const hidden = jsonInt(e.get("hidden_size"), 0);
-    const heads = jsonInt(e.get("num_attention_heads"), 0);
-    const layers = jsonInt(e.get("num_hidden_layers"), 0);
+    const hidden = try jsonInt(e.get("hidden_size"), 0);
+    const heads = try jsonInt(e.get("num_attention_heads"), 0);
+    const layers = try jsonInt(e.get("num_hidden_layers"), 0);
     if (hidden == 0 or heads == 0 or layers == 0 or hidden % heads != 0 or (hidden / heads) % 2 != 0) return error.InvalidLayaConfig;
 
     const layer_global = try a.alloc(bool, layers);
     errdefer a.free(layer_global);
-    const every_n = jsonInt(e.get("global_attn_every_n_layers"), 3);
+    const every_n = try jsonInt(e.get("global_attn_every_n_layers"), 3);
+    if (every_n == 0) return badConfig("global_attn_every_n_layers is 0", .{});
     for (layer_global, 0..) |*lg, i| lg.* = (i % every_n == 0);
     if (e.get("layer_types")) |lt| {
         if (lt != .array or lt.array.items.len != layers) return error.InvalidLayaConfig;
@@ -177,9 +185,11 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *cons
     while (tit.next()) |t| if (!(t.* > 0) or !std.math.isFinite(t.*)) return error.InvalidLayaConfig;
 
     const n_actions: u32 = if (g.get("act_costs")) |ac| (if (ac == .object) @as(u32, @intCast(ac.object.count())) + 1 else 1) else 1;
-    const max_len = jsonInt(g.get("max_len"), 512);
-    const head_max_len = jsonInt(g.get("head_max_len"), 192);
-    if (!(4 < head_max_len and head_max_len < max_len)) return error.InvalidLayaConfig;
+    const max_len = try jsonInt(g.get("max_len"), 512);
+    const head_max_len = try jsonInt(g.get("head_max_len"), 192);
+    const max_pos = try jsonInt(e.get("max_position_embeddings"), 8192);
+    if (!(4 < head_max_len and head_max_len < max_len and max_len <= max_pos))
+        return badConfig("want 4 < head_max_len ({d}) < max_len ({d}) <= max_position_embeddings ({d})", .{ head_max_len, max_len, max_pos });
 
     const specialId = struct {
         fn f(t: *const tokenizer_mod.Tokenizer, obj: std.json.ObjectMap, key: []const u8) !struct { id: u32, text: []const u8 } {
@@ -198,20 +208,24 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, dir: []const u8, tok: *cons
     const sep = try specialId(tok, tc, "sep_token");
     const pad = try specialId(tok, tc, "pad_token");
     const mask = try specialId(tok, tc, "mask_token");
+    const vocab_size = try jsonInt(e.get("vocab_size"), 0);
+    for ([_]u32{ cls.id, sep.id, pad.id, mask.id, @intCast(tok.definedVocabSize() -| 1) }) |id| {
+        if (id >= vocab_size) return badConfig("token id {d} is outside vocab_size {d}", .{ id, vocab_size });
+    }
 
     return .{
-        .vocab_size = jsonInt(e.get("vocab_size"), 0),
+        .vocab_size = vocab_size,
         .hidden_size = hidden,
-        .intermediate_size = jsonInt(e.get("intermediate_size"), 0),
+        .intermediate_size = try jsonInt(e.get("intermediate_size"), 0),
         .num_layers = layers,
         .num_heads = heads,
         .head_dim = hidden / heads,
         .norm_eps = jsonF32(e.get("norm_eps"), jsonF32(e.get("layer_norm_eps"), 1e-5)),
-        .local_attention = jsonInt(e.get("local_attention"), 128),
+        .local_attention = try jsonInt(e.get("local_attention"), 128),
         .layer_global = layer_global,
         .rope_theta_global = theta_global,
         .rope_theta_local = theta_local,
-        .head_layers = jsonInt(g.get("head_layers"), 2),
+        .head_layers = try jsonInt(g.get("head_layers"), 2),
         .max_len = max_len,
         .head_max_len = head_max_len,
         .n_actions = n_actions,
@@ -760,24 +774,45 @@ pub const Model = struct {
     compiled: ?mlx.mlx_closure = null,
     compile_failed: bool = false,
 
-    fn getW(self: *Model, comptime fmt: []const u8, args: anytype) !A {
+    /// Width of the act head's hidden layer (`nn.Linear(dims + 4, 256)` in laya_mlx).
+    const ACT_HIDDEN = 256;
+
+    /// The tensor `fmt`/`args`, which must have the shape `want` the config implies
+    /// (laya_mlx loads with `strict=True`).
+    fn getW(self: *Model, comptime fmt: []const u8, args: anytype, want: []const u32) !A {
         var buf: [160]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, fmt, args);
-        return self.weights.get(key) orelse {
+        const w = self.weights.get(key) orelse {
             log.err("[laya] missing weight {s}\n", .{key});
             return error.MissingWeight;
         };
+        try checkShape(key, w, want);
+        return w;
     }
 
-    fn optW(self: *Model, comptime fmt: []const u8, args: anytype) ?A {
+    fn optW(self: *Model, comptime fmt: []const u8, args: anytype, want: []const u32) !?A {
         var buf: [160]u8 = undefined;
-        const key = std.fmt.bufPrint(&buf, fmt, args) catch return null;
-        return self.weights.get(key);
+        const key = try std.fmt.bufPrint(&buf, fmt, args);
+        const w = self.weights.get(key) orelse return null;
+        try checkShape(key, w, want);
+        return w;
+    }
+
+    fn checkShape(key: []const u8, w: A, want: []const u32) !void {
+        const got = mlx.mlx_array_shape(w)[0..mlx.mlx_array_ndim(w)];
+        const same = got.len == want.len and for (got, want) |g, x| {
+            if (g != x) break false;
+        } else true;
+        if (!same) {
+            log.err("[laya] invalid checkpoint: {s} has shape {any}, the config implies {any}\n", .{ key, got, want });
+            return error.WeightShapeMismatch;
+        }
     }
 
     /// Materialize `w^T` once (weights are `[out, in]`, PyTorch layout).
-    fn linearW(self: *Model, comptime prefix: []const u8, args: anytype) !Linear {
-        const w = try self.getW(prefix ++ ".weight", args);
+    fn linearW(self: *Model, comptime prefix: []const u8, args: anytype, out_dim: u32, in_dim: u32) !Linear {
+        const w = try self.getW(prefix ++ ".weight", args, &.{ out_dim, in_dim });
+        const b = try self.optW(prefix ++ ".bias", args, &.{out_dim});
         var tr = mlx.mlx_array_new();
         errdefer free(tr);
         try mlx.check(mlx.mlx_transpose(&tr, w, self.stream));
@@ -786,7 +821,7 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_contiguous(&w_t, tr, false, self.stream));
         free(tr);
         try self.owned.append(self.allocator, w_t);
-        return .{ .w_t = w_t, .b = self.optW(prefix ++ ".bias", args) };
+        return .{ .w_t = w_t, .b = b };
     }
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !Model {
@@ -827,42 +862,45 @@ pub const Model = struct {
         };
         errdefer self.freeOwned();
 
-        self.tok_embeddings = try self.getW("encoder.embeddings.tok_embeddings.weight", .{});
-        self.emb_norm = try self.getW("encoder.embeddings.norm.weight", .{});
-        self.final_norm = try self.getW("encoder.final_norm.weight", .{});
-        self.type_emb = try self.getW("type_emb.weight", .{});
+        const D = cfg.hidden_size;
+        const I = cfg.intermediate_size;
+        self.tok_embeddings = try self.getW("encoder.embeddings.tok_embeddings.weight", .{}, &.{ cfg.vocab_size, D });
+        self.emb_norm = try self.getW("encoder.embeddings.norm.weight", .{}, &.{D});
+        self.final_norm = try self.getW("encoder.final_norm.weight", .{}, &.{D});
+        self.type_emb = try self.getW("type_emb.weight", .{}, &.{ 3, D });
 
         self.layers = try allocator.alloc(EncoderLayer, cfg.num_layers);
         for (self.layers, 0..) |*l, i| {
             l.* = .{
-                .attn_norm = if (i == 0) null else try self.getW("encoder.layers.{d}.attn_norm.weight", .{i}),
-                .wqkv = try self.linearW("encoder.layers.{d}.attn.Wqkv", .{i}),
-                .wo = try self.linearW("encoder.layers.{d}.attn.Wo", .{i}),
-                .mlp_norm = try self.getW("encoder.layers.{d}.mlp_norm.weight", .{i}),
-                .wi = try self.linearW("encoder.layers.{d}.mlp.Wi", .{i}),
-                .wo2 = try self.linearW("encoder.layers.{d}.mlp.Wo", .{i}),
+                .attn_norm = if (i == 0) null else try self.getW("encoder.layers.{d}.attn_norm.weight", .{i}, &.{D}),
+                .wqkv = try self.linearW("encoder.layers.{d}.attn.Wqkv", .{i}, 3 * D, D),
+                .wo = try self.linearW("encoder.layers.{d}.attn.Wo", .{i}, D, D),
+                .mlp_norm = try self.getW("encoder.layers.{d}.mlp_norm.weight", .{i}, &.{D}),
+                .wi = try self.linearW("encoder.layers.{d}.mlp.Wi", .{i}, 2 * I, D),
+                .wo2 = try self.linearW("encoder.layers.{d}.mlp.Wo", .{i}, D, I),
                 .global = cfg.layer_global[i],
             };
         }
         self.head = try allocator.alloc(HeadLayer, cfg.head_layers);
         for (self.head, 0..) |*h, i| {
             h.* = .{
-                .norm1_w = try self.getW("head.layers.{d}.norm1.weight", .{i}),
-                .norm1_b = try self.getW("head.layers.{d}.norm1.bias", .{i}),
-                .in_proj = try self.linearW("head.layers.{d}.self_attn.in_proj", .{i}),
-                .out_proj = try self.linearW("head.layers.{d}.self_attn.out_proj", .{i}),
-                .norm2_w = try self.getW("head.layers.{d}.norm2.weight", .{i}),
-                .norm2_b = try self.getW("head.layers.{d}.norm2.bias", .{i}),
-                .linear1 = try self.linearW("head.layers.{d}.linear1", .{i}),
-                .linear2 = try self.linearW("head.layers.{d}.linear2", .{i}),
+                .norm1_w = try self.getW("head.layers.{d}.norm1.weight", .{i}, &.{D}),
+                .norm1_b = try self.getW("head.layers.{d}.norm1.bias", .{i}, &.{D}),
+                .in_proj = try self.linearW("head.layers.{d}.self_attn.in_proj", .{i}, 3 * D, D),
+                .out_proj = try self.linearW("head.layers.{d}.self_attn.out_proj", .{i}, D, D),
+                .norm2_w = try self.getW("head.layers.{d}.norm2.weight", .{i}, &.{D}),
+                .norm2_b = try self.getW("head.layers.{d}.norm2.bias", .{i}, &.{D}),
+                .linear1 = try self.linearW("head.layers.{d}.linear1", .{i}, 4 * D, D),
+                .linear2 = try self.linearW("head.layers.{d}.linear2", .{i}, D, 4 * D),
             };
         }
-        self.scorer_norm_w = try self.getW("scorer.layers.0.weight", .{});
-        self.scorer_norm_b = try self.getW("scorer.layers.0.bias", .{});
-        self.scorer_l1 = try self.linearW("scorer.layers.1", .{});
-        self.scorer_l3 = try self.linearW("scorer.layers.3", .{});
-        self.act_l0 = try self.linearW("act_head.layers.0", .{});
-        self.act_l2 = try self.linearW("act_head.layers.2", .{});
+        self.scorer_norm_w = try self.getW("scorer.layers.0.weight", .{}, &.{D});
+        self.scorer_norm_b = try self.getW("scorer.layers.0.bias", .{}, &.{D});
+        self.scorer_l1 = try self.linearW("scorer.layers.1", .{}, D, D);
+        self.scorer_l3 = try self.linearW("scorer.layers.3", .{}, 1, D);
+        // Pooled CLS row + 4 confidence features in, `len(act_costs) + 1` actions out.
+        self.act_l0 = try self.linearW("act_head.layers.0", .{}, ACT_HIDDEN, D + 4);
+        self.act_l2 = try self.linearW("act_head.layers.2", .{}, cfg.n_actions, ACT_HIDDEN);
 
         // Force the transposes now so the first request pays no load cost.
         const vec = mlx.mlx_vector_array_new();
@@ -1982,4 +2020,62 @@ test "laya: forward latency breakdown (LAYA_BENCH=1)" {
     }
     std.mem.sort(f64, &times, {}, std.sort.asc(f64));
     std.debug.print("[laya-bench] encoder only: median {d:.2} ms p10 {d:.2} p90 {d:.2}\n", .{ times[15], times[3], times[27] });
+}
+
+/// A checkpoint dir in `tmp` linking `src`'s tokenizer and weights, with `src`'s two config
+/// files each edited by one text substitution (`.{ needle, replacement }`, "" = none).
+fn mutatedCheckpoint(a: std.mem.Allocator, tmp: *std.testing.TmpDir, src: []const u8, enc_edit: [2][]const u8, agent_edit: [2][]const u8) ![]u8 {
+    const io = testIo();
+    var buf: [1024]u8 = undefined;
+    const root = try a.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
+    errdefer a.free(root);
+    try tmp.dir.createDirPath(io, "encoder");
+    for ([_][]const u8{ "tokenizer", "model.safetensors" }) |name| {
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ src, name });
+        defer a.free(from);
+        const to = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, name });
+        defer a.free(to);
+        try std.Io.Dir.symLinkAbsolute(io, from, to, .{});
+    }
+    for ([_][]const u8{ "encoder/config.json", "rl_agent_config.json" }, [_][2][]const u8{ enc_edit, agent_edit }) |rel, edit| {
+        const from = try std.fmt.allocPrint(a, "{s}/{s}", .{ src, rel });
+        defer a.free(from);
+        const text = try readWholeFile(io, a, from);
+        defer a.free(text);
+        if (edit[0].len > 0 and std.mem.indexOf(u8, text, edit[0]) == null) return error.TestEditNotFound;
+        const data = if (edit[0].len > 0) try std.mem.replaceOwned(u8, a, text, edit[0], edit[1]) else try a.dupe(u8, text);
+        defer a.free(data);
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = data });
+    }
+    return root;
+}
+
+test "laya: a config that does not match its weights or the reference fails the load by name" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const none_edit = [2][]const u8{ "", "" };
+    const Case = struct { enc: [2][]const u8 = none_edit, agent: [2][]const u8 = none_edit, err: anyerror };
+    const cases = [_]Case{
+        .{ .enc = .{ "\"global_attn_every_n_layers\": 3", "\"global_attn_every_n_layers\": 0" }, .err = error.InvalidLayaConfig },
+        .{ .agent = .{ "\"head_layers\": 2", "\"head_layers\": -1" }, .err = error.InvalidLayaConfig },
+        .{ .agent = .{ "\"max_len\": 1024", "\"max_len\": 9000" }, .err = error.InvalidLayaConfig },
+        .{ .agent = .{ "\"max_len\": 1024", "\"max_len\": 1024.5" }, .err = error.InvalidLayaConfig },
+        .{ .enc = .{ "\"vocab_size\": 256000", "\"vocab_size\": 4" }, .err = error.InvalidLayaConfig },
+        .{ .agent = .{ "\"escalate\": 0.5", "\"escalate\": 0.5, \"wait\": 1.0" }, .err = error.WeightShapeMismatch },
+        .{ .enc = .{ "\"hidden_size\": 768", "\"hidden_size\": 1536" }, .err = error.WeightShapeMismatch },
+        .{ .enc = .{ "\"intermediate_size\": 1152", "\"intermediate_size\": 1024" }, .err = error.WeightShapeMismatch },
+    };
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try mutatedCheckpoint(a, &tmp, dir, c.enc, c.agent);
+        defer a.free(root);
+        if (Model.load(testIo(), a, root, s)) |m| {
+            var mm = m;
+            mm.deinit();
+            return error.TestUnexpectedResult;
+        } else |e| try testing.expectEqual(c.err, e);
+    }
 }
