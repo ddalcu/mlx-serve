@@ -1921,6 +1921,8 @@ test "laya: the loaded model holds each checkpoint tensor once" {
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
+    // Finished work releases its buffers asynchronously; settle before reading.
+    _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
     var active0: usize = 0;
     _ = mlx.mlx_get_active_memory(&active0);
@@ -1938,6 +1940,7 @@ test "laya: the loaded model holds each checkpoint tensor once" {
         var out = try model.forward(.{ .ids = &.{row}, .markers = &.{markers}, .qtype = &.{.choice} });
         out.deinit(a);
     }
+    _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
