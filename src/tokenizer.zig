@@ -129,6 +129,48 @@ pub const Tokenizer = struct {
     /// arena; the slice itself is owned and freed in deinit.
     flagged_specials: []const FlaggedSpecial = &.{},
 
+    /// `special_tokens` bucketed for `encode`, built once by the loader. Null
+    /// (a tokenizer assembled by hand): `encode` builds it per call.
+    special_index: ?SpecialIndex = null,
+
+    /// Special tokens sorted by first byte, longest first within a byte;
+    /// `start[b]..start[b + 1]` are the candidates starting with byte `b`.
+    pub const SpecialIndex = struct {
+        cands: []Cand,
+        start: [257]u32,
+
+        pub const Cand = struct { bytes: []const u8, id: u32 };
+
+        pub fn init(allocator: std.mem.Allocator, specials: *const std.StringHashMap(u32)) !SpecialIndex {
+            const cands = try allocator.alloc(Cand, specials.count());
+            var i: usize = 0;
+            var sit = specials.iterator();
+            while (sit.next()) |entry| : (i += 1) {
+                cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
+            }
+            std.mem.sort(Cand, cands, {}, struct {
+                fn lessThan(_: void, a: Cand, b: Cand) bool {
+                    const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
+                    const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
+                    if (ab != bb) return ab < bb;
+                    return a.bytes.len > b.bytes.len;
+                }
+            }.lessThan);
+            var start: [257]u32 = @splat(0);
+            var ci: usize = 0;
+            for (0..256) |b| {
+                start[b] = @intCast(ci);
+                while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
+            }
+            start[256] = @intCast(cands.len);
+            return .{ .cands = cands, .start = start };
+        }
+
+        pub fn deinit(self: *SpecialIndex, allocator: std.mem.Allocator) void {
+            allocator.free(self.cands);
+        }
+    };
+
     const MergePair = struct {
         left: []const u8,
         right: []const u8,
@@ -172,6 +214,7 @@ pub const Tokenizer = struct {
         // JSON is held (e.g., the test-only constructors). Freeing the
         // parsed JSON deinits its arena in one shot.
         if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
+        if (self.special_index) |*x| x.deinit(self.allocator);
         if (self.marker_aliases) |*m| m.deinit();
         if (self.marker_closers) |*m| m.deinit();
         if (self.parsed_json) |*p| {
@@ -225,40 +268,20 @@ pub const Tokenizer = struct {
         // remaining text for EVERY special token per segment
         // (O(specials × text) — ~12 s per 66 KB prompt on gemma-3's
         // 6415-special vocabulary; gemma-4's 24 specials never noticed).
-        // Instead: bucket the specials by first byte once per call (~µs),
-        // then a single left-to-right pass tries only the candidates whose
-        // first byte matches. Semantics unchanged — earliest occurrence
-        // wins, longest special wins at the same position (buckets are
-        // sorted by descending length, so the first hit is the longest).
-        const n_special = self.special_tokens.count();
-        const Cand = struct { bytes: []const u8, id: u32 };
-        const cands = try allocator.alloc(Cand, n_special);
-        defer allocator.free(cands);
-        {
-            var i: usize = 0;
-            var sit = self.special_tokens.iterator();
-            while (sit.next()) |entry| : (i += 1) {
-                cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
-            }
-        }
-        std.mem.sort(Cand, cands, {}, struct {
-            fn lessThan(_: void, a: Cand, b: Cand) bool {
-                const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
-                const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
-                if (ab != bb) return ab < bb;
-                return a.bytes.len > b.bytes.len;
-            }
-        }.lessThan);
-        // bucket_start[b]..bucket_start[b+1] = candidates whose first byte is b.
-        var bucket_start: [257]u32 = @splat(0);
-        {
-            var ci: usize = 0;
-            for (0..256) |b| {
-                bucket_start[b] = @intCast(ci);
-                while (ci < cands.len and cands[ci].bytes.len > 0 and cands[ci].bytes[0] == b) ci += 1;
-            }
-            bucket_start[256] = @intCast(cands.len);
-        }
+        // Instead: specials bucketed by first byte (`SpecialIndex`, built
+        // once at load), then a single left-to-right pass tries only the
+        // candidates whose first byte matches. Semantics unchanged — earliest
+        // occurrence wins, longest special wins at the same position
+        // (buckets are sorted by descending length, so the first hit is the longest).
+        var local_index: ?SpecialIndex = null;
+        defer if (local_index) |*x| x.deinit(allocator);
+        const index = if (self.special_index) |*x| x else blk: {
+            local_index = try SpecialIndex.init(allocator, &self.special_tokens);
+            break :blk &local_index.?;
+        };
+        const cands = index.cands;
+        const bucket_start = &index.start;
+        const Cand = SpecialIndex.Cand;
 
         var pos: usize = 0;
         var seg_start: usize = 0;
@@ -1450,7 +1473,10 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         },
     });
 
+    var special_index = try Tokenizer.SpecialIndex.init(allocator, &special_tokens);
+    errdefer special_index.deinit(allocator);
     var built: Tokenizer = .{
+        .special_index = special_index,
         .vocab = vocab,
         .id_to_token = id_to_token,
         .merge_ranks = merge_ranks,

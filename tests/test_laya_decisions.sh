@@ -157,6 +157,21 @@ check "250k choice labels -> 400" "${LABELS% *}" "400"
 check "250k labels refused in under 1 s (got ${LABELS#* } s)" "$(python3 -c "print(${LABELS#* } < 1)")" "True"
 check "5 MB body -> 413" "$(post_file "$TMP/big.json" '%{http_code}')" "413"
 check "5 MB body with a query string -> 413" "$(curl -s -H 'Expect:' -o /dev/null -w '%{http_code}' -m 120 -X POST "localhost:$PORT/v1/decisions?x=1" -H 'content-type: application/json' --data-binary @"$TMP/big.json")" "413"
+echo "=== mixed-length questions: same answers as one at a time, in request order ==="
+MIX="$(python3 - "$PORT" "$MODEL_ID" <<'EOF'
+import json, sys, urllib.request
+port, model = sys.argv[1], sys.argv[2]
+def post(qs):
+    body = json.dumps({"model": model, "state": "I was charged twice for my order and want a refund today", "questions": qs}).encode()
+    req = urllib.request.Request(f"http://localhost:{port}/v1/decisions", data=body, headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=120))["answers"]
+qs = {f"q{i}": {"type": "choice", "instructions": "Which team? " + "Read every detail. " * (i * 7 % 40), "criteria": ["billing", "sales", "tech"]} for i in range(20)}
+together = post(qs)
+diff = max(abs(together[k]["probabilities"][l] - post({k: v})[k]["probabilities"][l]) for k, v in qs.items() for l in ("billing", "sales", "tech"))
+print("same" if list(together) == list(qs) and diff <= 1e-3 else f"differ {diff} {list(together)}")
+EOF
+)"
+check "20 mixed-length questions match their one-at-a-time answers, in request order" "$MIX" "same"
 
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"
