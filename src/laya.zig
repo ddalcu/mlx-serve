@@ -759,6 +759,11 @@ pub const Model = struct {
     /// failed).
     compiled: ?mlx.mlx_closure = null,
     compile_failed: bool = false,
+    /// Bucketed `[rows, tokens, options]` shapes the closure has traced. Each
+    /// trace keeps its own graph and buffers, so past the cap a new shape runs lazy.
+    compiled_shapes: std.AutoHashMapUnmanaged([3]usize, void) = .empty,
+
+    pub const MAX_COMPILED_SHAPES: usize = 64;
 
     fn getW(self: *Model, comptime fmt: []const u8, args: anytype) !A {
         var buf: [160]u8 = undefined;
@@ -882,6 +887,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         if (self.compiled) |c| _ = mlx.mlx_closure_free(c);
+        self.compiled_shapes.deinit(self.allocator);
         self.freeOwned();
         self.weights.deinit();
         self.cfg.deinit();
@@ -909,9 +915,16 @@ pub const Model = struct {
         }
     };
 
-    /// Sequence length padding granularity: bounds the number of distinct
-    /// shapes the compiled forward has to trace (one trace per `[n, t, k]`).
+    /// Padding granularity of the input shape `[n, t, k]`: bounds the number of
+    /// distinct shapes the compiled forward traces. Rows past 8 go to a multiple
+    /// of 8 with dummy rows; neither those nor masked option slots change a real row.
     pub const PAD_T: usize = 16;
+    pub const PAD_K: usize = 8;
+
+    pub fn bucketShape(n: usize, t: usize, k: usize) [3]usize {
+        const rows = if (n > 8) (n + 7) / 8 * 8 else @max(n, 1);
+        return .{ rows, (t + PAD_T - 1) / PAD_T * PAD_T, (@max(k, 2) + PAD_K - 1) / PAD_K * PAD_K };
+    }
 
     /// The five device inputs of `DecisionModel.__call__` (`input_ids`,
     /// `attention_mask`, `marker_pos`, `marker_mask`, `qtype`).
@@ -923,14 +936,13 @@ pub const Model = struct {
         qtype: A, // [n] int32
 
         pub fn fromBatch(a: std.mem.Allocator, batch: Batch, pad_id: u32) !Inputs {
-            const n = batch.ids.len;
-            var t: usize = 0;
-            var k: usize = 2;
+            var t_max: usize = 0;
+            var k_max: usize = 0;
             for (batch.ids, batch.markers) |row, m| {
-                t = @max(t, row.len);
-                k = @max(k, m.len);
+                t_max = @max(t_max, row.len);
+                k_max = @max(k_max, m.len);
             }
-            t = (t + PAD_T - 1) / PAD_T * PAD_T;
+            const n, const t, const k = bucketShape(batch.ids.len, t_max, k_max);
             const ids = try a.alloc(i32, n * t);
             defer a.free(ids);
             const valid = try a.alloc(bool, n * t);
@@ -942,17 +954,20 @@ pub const Model = struct {
             const qt = try a.alloc(i32, n);
             defer a.free(qt);
             for (0..n) |i| {
+                // A dummy row: one valid pad token (no all-masked softmax row), no option.
+                const row: []const u32 = if (i < batch.ids.len) batch.ids[i] else &.{pad_id};
+                const marks: []const u32 = if (i < batch.ids.len) batch.markers[i] else &.{};
                 for (0..t) |j| {
-                    const in_row = j < batch.ids[i].len;
-                    ids[i * t + j] = if (in_row) @intCast(batch.ids[i][j]) else @intCast(pad_id);
+                    const in_row = j < row.len;
+                    ids[i * t + j] = if (in_row) @intCast(row[j]) else @intCast(pad_id);
                     valid[i * t + j] = in_row;
                 }
                 for (0..k) |j| {
-                    const in_row = j < batch.markers[i].len;
-                    mpos[i * k + j] = if (in_row) @intCast(batch.markers[i][j]) else 0;
+                    const in_row = j < marks.len;
+                    mpos[i * k + j] = if (in_row) @intCast(marks[j]) else 0;
                     mmask[i * k + j] = in_row;
                 }
-                qt[i] = @intFromEnum(batch.qtype[i]);
+                qt[i] = if (i < batch.ids.len) @intFromEnum(batch.qtype[i]) else 0;
             }
             const N: c_int = @intCast(n);
             const T: c_int = @intCast(t);
@@ -1108,12 +1123,14 @@ pub const Model = struct {
         if (batch.ids.len == 0) return error.EmptyBatch;
         var in = try Inputs.fromBatch(a, batch, self.cfg.pad_id);
         defer in.deinit();
-        const n: usize = @intCast(mlx.mlx_array_shape(in.ids)[0]);
+        const n = batch.ids.len; // rows past `n` are bucket padding
         const t: usize = @intCast(mlx.mlx_array_shape(in.ids)[1]);
         const k_pad: usize = @intCast(mlx.mlx_array_shape(in.marker_pos)[1]);
+        const shape = [3]usize{ @intCast(mlx.mlx_array_shape(in.ids)[0]), t, k_pad };
 
         const t_start = std.Io.Timestamp.now(trace_io, .boot);
-        const outs = if (self.ensureCompiled()) |cls| self.applyCompiled(cls, in) catch |e| blk: {
+        const compiled = if (self.ensureCompiled()) |cls| (if (self.admitShape(shape)) cls else null) else null;
+        const outs = if (compiled) |cls| self.applyCompiled(cls, in) catch |e| blk: {
             log.warn("[laya] compiled forward failed ({s}); lazy graph from now on\n", .{@errorName(e)});
             self.compile_failed = true;
             break :blk try self.forwardBody(in);
@@ -1147,6 +1164,15 @@ pub const Model = struct {
             for (pr, 0..) |v, jj| act[i * n_act + jj] = @floatCast(v);
         }
         return .{ .logits = logits, .k_pad = k_pad, .act = act, .n_actions = n_act };
+    }
+
+    /// May `shape` run compiled: already traced, or room for one more trace.
+    fn admitShape(self: *Model, shape: [3]usize) bool {
+        if (self.compiled_shapes.contains(shape)) return true;
+        if (self.compiled_shapes.count() >= MAX_COMPILED_SHAPES) return false;
+        self.compiled_shapes.put(self.allocator, shape, {}) catch return false;
+        if (self.compiled_shapes.count() == MAX_COMPILED_SHAPES) log.info("[laya] {d} compiled input shapes; new shapes run the lazy graph\n", .{MAX_COMPILED_SHAPES});
+        return true;
     }
 
     fn compileEnabled() bool {
@@ -1913,6 +1939,94 @@ fn numF64(v: std.json.Value) f64 {
         .float => |f| f,
         else => std.math.nan(f64),
     };
+}
+
+const FixtureRows = struct {
+    ids: [18][]const u32,
+    markers: [18][]const u32,
+    qtype: [18]QType,
+
+    fn load(a: std.mem.Allocator, fx: *const Fixtures) !FixtureRows {
+        var r: FixtureRows = undefined;
+        for (fx.cases(), 0..) |cv, i| {
+            r.ids[i] = try jsonU32Slice(a, cv.object.get("ids").?);
+            r.markers[i] = try jsonU32Slice(a, cv.object.get("markers").?);
+            r.qtype[i] = @enumFromInt(cv.object.get("qtype").?.integer);
+        }
+        return r;
+    }
+    fn deinit(self: *FixtureRows, a: std.mem.Allocator) void {
+        for (self.ids, self.markers) |x, m| {
+            a.free(x);
+            a.free(m);
+        }
+    }
+};
+
+test "laya: dummy rows of a bucketed batch leave the real rows bit-identical" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var model = try Model.load(testIo(), a, dir, s);
+    defer model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    var r = try FixtureRows.load(a, &fx);
+    defer r.deinit(a);
+    // 9 rows pad to 16 with dummy rows; 16 real rows (7 repeated) have the same shape.
+    var ids: [16][]const u32 = undefined;
+    var markers: [16][]const u32 = undefined;
+    var qtype: [16]QType = undefined;
+    for (0..16) |i| {
+        ids[i] = r.ids[i % 9];
+        markers[i] = r.markers[i % 9];
+        qtype[i] = r.qtype[i % 9];
+    }
+    var nine = try model.forward(.{ .ids = ids[0..9], .markers = markers[0..9], .qtype = qtype[0..9] });
+    defer nine.deinit(a);
+    var sixteen = try model.forward(.{ .ids = &ids, .markers = &markers, .qtype = &qtype });
+    defer sixteen.deinit(a);
+    try testing.expectEqual(nine.k_pad, sixteen.k_pad);
+    try testing.expectEqualSlices(f32, nine.logits, sixteen.logits[0..nine.logits.len]);
+    try testing.expectEqualSlices(f32, nine.act, sixteen.act[0..nine.act.len]);
+}
+
+fn countForwardOps(model: *Model, len: usize, n: usize, fx: *const FixtureRows) !u64 {
+    var long: [256]u32 = undefined;
+    for (&long, 0..) |*x, i| x.* = fx.ids[0][i % fx.ids[0].len];
+    const rows: [8][]const u32 = @splat(long[0..len]);
+    const markers: [8][]const u32 = @splat(fx.markers[0]);
+    const qtype: [8]QType = @splat(.choice);
+    const ops0 = mlx.op_count.load(.monotonic);
+    var out = try model.forward(.{ .ids = rows[0..n], .markers = markers[0..n], .qtype = qtype[0..n] });
+    out.deinit(model.allocator);
+    _ = mlx.mlx_clear_cache();
+    return mlx.op_count.load(.monotonic) - ops0;
+}
+
+test "laya: past the compiled-shape cap a new input shape runs the lazy graph" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var model = try Model.load(testIo(), a, dir, s);
+    defer model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    var r = try FixtureRows.load(a, &fx);
+    defer r.deinit(a);
+    // Read the lazily loaded table first, or every trace keeps its own copy of it.
+    try mlx.check(mlx.mlx_array_eval(model.tok_embeddings));
+    // 1..8 rows of 32..144 tokens: one trace per shape up to the cap.
+    for (0..Model.MAX_COMPILED_SHAPES) |i| _ = try countForwardOps(&model, 32 + 16 * (i / 8), 1 + i % 8, &r);
+    if (model.compiled == null) return error.SkipZigTest;
+    const replay = try countForwardOps(&model, 32, 1, &r);
+    _ = try countForwardOps(&model, 160, 1, &r);
+    // A replayed trace issues a handful of ops; the lazy graph issues every op again.
+    try testing.expect(try countForwardOps(&model, 160, 1, &r) > 10 * replay);
 }
 
 test "laya: forward latency breakdown (LAYA_BENCH=1)" {

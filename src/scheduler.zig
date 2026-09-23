@@ -1272,6 +1272,9 @@ pub const GenRequest = struct {
     /// The media model. `gen_busy` is set/cleared around the run for
     /// visibility; the conn thread's refcount already pins it against eviction.
     model: *model_registry_mod.LoadedModel,
+    /// Clear MLX's allocator cache after the job only once it holds this many
+    /// bytes (0: always). A decision job's buffers are reused by the next request.
+    keep_cache_bytes: usize = 0,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
@@ -5087,7 +5090,9 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     // clears every 256 steps in generate.zig) a media gen frees tens of GB
     // of denoise/VAE/encoder buffers in one burst — without this, each
     // generation ratchets process RSS upward (observed ~100 GB by gen 2).
-    _ = mlx.mlx_clear_cache();
+    var cached: usize = 0;
+    if (req.keep_cache_bytes > 0) _ = mlx.mlx_get_cache_memory(&cached);
+    if (cached >= req.keep_cache_bytes) _ = mlx.mlx_clear_cache();
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
     req.done_cond.broadcast(sch.io);
