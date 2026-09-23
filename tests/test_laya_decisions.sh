@@ -106,6 +106,38 @@ check "chat refusal names /v1/decisions" "$(grep -c '/v1/decisions' "$TMP/err.js
 expect_code "string state + list criteria + noul criteria -> 200" 200 "{\"model\":\"$MODEL_ID\",\"state\":\"Refund me now or I cancel.\",\"questions\":{\"team\":{\"type\":\"choice\",\"instructions\":\"Which team?\",\"criteria\":[\"billing\",\"sales\"]},\"churn\":{\"type\":\"noul\",\"instructions\":\"Threatens to cancel?\",\"criteria\":{\"false\":\"no threat\",\"true\":\"explicit threat\"}}}}"
 check "loaded model advertises decisions" "$(curl -s "localhost:$PORT/v1/models" | python3 -c "import sys,json; print('decisions' in next(m for m in json.load(sys.stdin)['data'] if m['id']=='$MODEL_ID').get('capabilities',[]))")" "True"
 
+echo "=== request JSON read like Python json.loads, state serialized like json.dumps ==="
+expect_code "number past float64 range -> 400" 400 "{\"model\":\"$MODEL_ID\",\"state\":{\"x\":1e999},\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"?\"}}}"
+PY="$(python3 - "$PORT" "$MODEL_ID" <<'EOF'
+import json, sys, urllib.request, urllib.error
+port, model = sys.argv[1], sys.argv[2]
+def post(raw):
+    req = urllib.request.Request(f"http://localhost:{port}/v1/decisions", data=raw.encode(), headers={"Content-Type": "application/json"})
+    try:
+        r = urllib.request.urlopen(req, timeout=120); return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, None
+out = []
+# A repeated key keeps its last value at its first position.
+c, r = post('{"model": "%s", "state": "x", "questions": {"a": {"type": "noul", "instructions": "?"}, "b": {"type": "noul", "instructions": "?"}, "a": {"type": "choice", "instructions": "?", "criteria": ["x", "y"]}}}' % model)
+out.append(c == 200 and list(r["answers"]) == ["a", "b"] and r["answers"]["a"]["type"] == "choice")
+c, r = post('{"model": "%s", "state": "x", "questions": {}}' % model)
+out.append(c == 200 and r["answers"] == {} and r["usage"]["input_tokens"] == 0)
+# Lone surrogates: answered in a question id and list instructions (sent as ASCII JSON), refused in the state.
+c, r = post('{"model": "%s", "state": "x", "questions": {"\\ud800": {"type": "noul", "instructions": ["\\udc00"]}}}' % model)
+out.append(c == 200 and list(r["answers"]) == ["\ud800"])
+c, r = post('{"model": "%s", "state": "a\\ud800b", "questions": {"q": {"type": "noul", "instructions": "?"}}}' % model)
+out.append(c == 400)
+# A structured state and its json.dumps string give the same answer and token count.
+q = {"q": {"type": "noul", "instructions": "Is x greater than 0.00002?"}}
+for state in ({"x": 1e-5}, {"a": [1e16, 1e15, 0.0001, -0.0, 1.0], "n": 123456789012345678901}):
+    res = [post(json.dumps({"model": model, "state": rep, "questions": q}))[1] for rep in (state, json.dumps(state))]
+    out.append(res[0]["answers"] == res[1]["answers"] and res[0]["usage"] == res[1]["usage"])
+print(" ".join("ok" if x else "FAIL" for x in out))
+EOF
+)"
+check "repeated keys, empty questions, lone surrogates, structured == string state" "$PY" "ok ok ok ok ok ok"
+
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"
 for _ in 1 2 3 4 5; do decide "$BODY" >/dev/null; done

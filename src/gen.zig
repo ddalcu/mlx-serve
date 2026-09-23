@@ -880,7 +880,7 @@ pub const DecisionEngine = struct {
 /// `POST /v1/decisions` `{"model", "state": <string|object|array>, "questions": {id: {...}}}`
 /// -> laya's `predict` JSON. Runs on the inference thread like every gen job.
 pub fn handleDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *DecisionEngine, model_id: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+    var parsed = laya.parseRequestJson(allocator, body) catch {
         return sendError(conn, 400, "request body is not valid JSON");
     };
     defer parsed.deinit();
