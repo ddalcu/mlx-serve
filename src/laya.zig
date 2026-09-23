@@ -707,7 +707,7 @@ fn astype(x: A, dt: mlx.mlx_dtype, s: S) !A {
 // ── Weights ──
 
 const Linear = struct {
-    /// `[in, out]` (pre-transposed, contiguous) so the forward is one matmul.
+    /// `[in, out]` transpose view of the `[out, in]` checkpoint weight.
     w_t: A,
     b: ?A,
 };
@@ -751,7 +751,7 @@ pub const Model = struct {
     scorer_l3: Linear,
     act_l0: Linear,
     act_l2: Linear,
-    /// Pre-transposed weights not owned by `weights`.
+    /// Transpose views (`Linear.w_t`) not owned by `weights`.
     owned: std.ArrayList(A),
     /// `forwardBody` wrapped by `mlx_compile`: traced once per input shape,
     /// then replayed with fused elementwise kernels (the reference wraps its
@@ -775,16 +775,13 @@ pub const Model = struct {
         return self.weights.get(key);
     }
 
-    /// Materialize `w^T` once (weights are `[out, in]`, PyTorch layout).
+    /// `w^T` as a view: matmul reads the transposed strides, so a contiguous
+    /// copy would hold every linear weight twice for the same output.
     fn linearW(self: *Model, comptime prefix: []const u8, args: anytype) !Linear {
         const w = try self.getW(prefix ++ ".weight", args);
-        var tr = mlx.mlx_array_new();
-        errdefer free(tr);
-        try mlx.check(mlx.mlx_transpose(&tr, w, self.stream));
         var w_t = mlx.mlx_array_new();
         errdefer free(w_t);
-        try mlx.check(mlx.mlx_contiguous(&w_t, tr, false, self.stream));
-        free(tr);
+        try mlx.check(mlx.mlx_transpose(&w_t, w, self.stream));
         try self.owned.append(self.allocator, w_t);
         return .{ .w_t = w_t, .b = self.optW(prefix ++ ".bias", args) };
     }
@@ -864,9 +861,12 @@ pub const Model = struct {
         self.act_l0 = try self.linearW("act_head.layers.0", .{});
         self.act_l2 = try self.linearW("act_head.layers.2", .{});
 
-        // Force the transposes now so the first request pays no load cost.
+        // Read every tensor now: a tensor left lazy is read again, and kept, by
+        // every compiled input shape that uses it.
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
+        var wit = self.weights.map.valueIterator();
+        while (wit.next()) |w| try mlx.check(mlx.mlx_vector_array_append_value(vec, w.*));
         for (self.owned.items) |w| try mlx.check(mlx.mlx_vector_array_append_value(vec, w));
         try mlx.check(mlx.mlx_eval(vec));
         log.info("[laya] ready — {d} tensors, {d} encoder layers, {d} head layers, max_len {d}\n", .{ weights.count(), cfg.num_layers, cfg.head_layers, cfg.max_len });
@@ -1913,6 +1913,41 @@ fn numF64(v: std.json.Value) f64 {
         .float => |f| f,
         else => std.math.nan(f64),
     };
+}
+
+test "laya: the loaded model holds each checkpoint tensor once" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Finished work releases its buffers asynchronously; settle before reading.
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var active0: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active0);
+    var model = try Model.load(testIo(), a, dir, s);
+    defer model.deinit();
+    var fx = try Fixtures.load(a, fx_dir);
+    defer fx.parsed.deinit();
+    const c = fx.cases()[0].object;
+    const ids = try jsonU32Slice(a, c.get("ids").?);
+    defer a.free(ids);
+    const markers = try jsonU32Slice(a, c.get("markers").?);
+    defer a.free(markers);
+    // Two input shapes: two graphs over the same tensors.
+    for ([_][]const u32{ ids, ids[0..32] }) |row| {
+        var out = try model.forward(.{ .ids = &.{row}, .markers = &.{markers}, .qtype = &.{.choice} });
+        out.deinit(a);
+    }
+    _ = mlx.mlx_synchronize(s);
+    _ = mlx.mlx_clear_cache();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    var tensor_bytes: usize = 0;
+    var it = model.weights.map.valueIterator();
+    while (it.next()) |w| tensor_bytes += mlx.mlx_array_size(w.*) * mlx.mlx_array_itemsize(w.*);
+    try testing.expect(active -| active0 < tensor_bytes + tensor_bytes / 8);
 }
 
 test "laya: forward latency breakdown (LAYA_BENCH=1)" {
