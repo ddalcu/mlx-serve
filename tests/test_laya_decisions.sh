@@ -106,6 +106,22 @@ check "chat refusal names /v1/decisions" "$(grep -c '/v1/decisions' "$TMP/err.js
 expect_code "string state + list criteria + noul criteria -> 200" 200 "{\"model\":\"$MODEL_ID\",\"state\":\"Refund me now or I cancel.\",\"questions\":{\"team\":{\"type\":\"choice\",\"instructions\":\"Which team?\",\"criteria\":[\"billing\",\"sales\"]},\"churn\":{\"type\":\"noul\",\"instructions\":\"Threatens to cancel?\",\"criteria\":{\"false\":\"no threat\",\"true\":\"explicit threat\"}}}}"
 check "loaded model advertises decisions" "$(curl -s "localhost:$PORT/v1/models" | python3 -c "import sys,json; print('decisions' in next(m for m in json.load(sys.stdin)['data'] if m['id']=='$MODEL_ID').get('capabilities',[]))")" "True"
 
+echo "=== mixed-length questions: same answers as one at a time, in request order ==="
+MIX="$(python3 - "$PORT" "$MODEL_ID" <<'EOF'
+import json, sys, urllib.request
+port, model = sys.argv[1], sys.argv[2]
+def post(qs):
+    body = json.dumps({"model": model, "state": "I was charged twice for my order and want a refund today", "questions": qs}).encode()
+    req = urllib.request.Request(f"http://localhost:{port}/v1/decisions", data=body, headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=120))["answers"]
+qs = {f"q{i}": {"type": "choice", "instructions": "Which team? " + "Read every detail. " * (i * 7 % 40), "criteria": ["billing", "sales", "tech"]} for i in range(20)}
+together = post(qs)
+diff = max(abs(together[k]["probabilities"][l] - post({k: v})[k]["probabilities"][l]) for k, v in qs.items() for l in ("billing", "sales", "tech"))
+print("same" if list(together) == list(qs) and diff <= 1e-3 else f"differ {diff} {list(together)}")
+EOF
+)"
+check "20 mixed-length questions match their one-at-a-time answers, in request order" "$MIX" "same"
+
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"
 for _ in 1 2 3 4 5; do decide "$BODY" >/dev/null; done

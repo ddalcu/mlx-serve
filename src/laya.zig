@@ -463,12 +463,56 @@ pub fn renderOptions(a: std.mem.Allocator, q: *const Question) ![][]u8 {
 
 /// Encode `text` with the mask token blanked (`text.replace(mask_tok, " ")`),
 /// no specials added.
-fn encodeClean(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, mask_token: []const u8, text: []const u8) ![]u32 {
-    if (std.mem.indexOf(u8, text, mask_token) == null) return tok.encode(a, text);
-    const cleaned = try std.mem.replaceOwned(u8, a, text, mask_token, " ");
-    defer a.free(cleaned);
-    return tok.encode(a, cleaned);
+fn encodeClean(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cache: ?*TokenCache, mask_token: []const u8, text: []const u8) ![]u32 {
+    if (cache) |c| if (c.map.get(text)) |ids| return a.dupe(u32, ids);
+    const ids = if (std.mem.indexOf(u8, text, mask_token) == null) try tok.encode(a, text) else blk: {
+        const cleaned = try std.mem.replaceOwned(u8, a, text, mask_token, " ");
+        defer a.free(cleaned);
+        break :blk try tok.encode(a, cleaned);
+    };
+    if (cache) |c| c.put(text, ids);
+    return ids;
 }
+
+/// Token ids of question and option texts, keyed by text: a client polling
+/// the same questions skips the tokenizer for them. At most `MAX` entries of
+/// texts up to `MAX_TEXT` bytes; when full it starts over.
+pub const TokenCache = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged([]u32) = .empty,
+
+    pub const MAX = 256;
+    pub const MAX_TEXT = 4096;
+
+    /// Store a copy of `ids` for `text`; out of memory only skips the entry.
+    pub fn put(self: *TokenCache, text: []const u8, ids: []const u32) void {
+        if (text.len > MAX_TEXT or self.map.contains(text)) return;
+        if (self.map.count() >= MAX) self.clear();
+        const key = self.allocator.dupe(u8, text) catch return;
+        const val = self.allocator.dupe(u32, ids) catch {
+            self.allocator.free(key);
+            return;
+        };
+        self.map.put(self.allocator, key, val) catch {
+            self.allocator.free(key);
+            self.allocator.free(val);
+        };
+    }
+
+    fn clear(self: *TokenCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.map.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *TokenCache) void {
+        self.clear();
+        self.map.deinit(self.allocator);
+    }
+};
 
 pub const Sequence = struct {
     ids: []u32,
@@ -480,8 +524,9 @@ pub const Sequence = struct {
 };
 
 /// `build_sequence`: [CLS] <type> question: ins [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP],
-/// with the head capped at `head_max_len` and the state filling `max_len`.
-pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cfg: *const Config, state_text: []const u8, q: *const Question) !Sequence {
+/// with the head capped at `head_max_len` and the state's token ids `state_ids` filling `max_len`.
+/// `cache` (optional) holds the token ids of question and option texts.
+pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, cache: ?*TokenCache, cfg: *const Config, state_ids: []const u32, q: *const Question) !Sequence {
     const opts = try renderOptions(a, q);
     defer {
         for (opts) |o| a.free(o);
@@ -489,7 +534,7 @@ pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, 
     }
     const head_text = try std.fmt.allocPrint(a, "{s} question: {s}", .{ q.t.name(), q.ins });
     defer a.free(head_text);
-    var head_ids = try encodeClean(a, tok, cfg.mask_token, head_text);
+    var head_ids = try encodeClean(a, tok, cache, cfg.mask_token, head_text);
     defer a.free(head_ids);
 
     var opt_ids = try a.alloc([]u32, opts.len);
@@ -501,7 +546,7 @@ pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, 
     for (opts, 0..) |opt, i| {
         const spaced = try std.fmt.allocPrint(a, " {s}", .{opt});
         defer a.free(spaced);
-        const enc = try encodeClean(a, tok, cfg.mask_token, spaced);
+        const enc = try encodeClean(a, tok, cache, cfg.mask_token, spaced);
         defer a.free(enc);
         const keep = @min(enc.len, 48);
         const o = try a.alloc(u32, 1 + keep);
@@ -539,9 +584,7 @@ pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, 
     try ids.append(a, cfg.sep_id);
 
     const room: usize = @as(usize, cfg.max_len) -| (ids.items.len + 1);
-    const st = try encodeClean(a, tok, cfg.mask_token, state_text);
-    defer a.free(st);
-    try ids.appendSlice(a, st[0..@min(st.len, room)]);
+    try ids.appendSlice(a, state_ids[0..@min(state_ids.len, room)]);
     try ids.append(a, cfg.sep_id);
     if (ids.items.len > cfg.max_len) ids.shrinkRetainingCapacity(cfg.max_len);
     var kept: usize = 0;
@@ -655,14 +698,19 @@ fn transposeAxes(x: A, axes: []const c_int, s: S) !A {
 
 /// `[N, T, 3*H*Dh]` -> three `[N, H, T, Dh]` (q, k, v). Caller frees all three.
 fn splitQkv(qkv: A, n: c_int, t: c_int, heads: c_int, head_dim: c_int, s: S) ![3]A {
-    const r = try reshape(qkv, &[_]c_int{ n, t, 3, heads, head_dim }, s);
+    return splitHeads(3, qkv, n, t, heads, head_dim, s);
+}
+
+/// `[N, T, P*H*Dh]` -> `P` arrays `[N, H, T, Dh]`. Caller frees all of them.
+fn splitHeads(comptime P: usize, x: A, n: c_int, t: c_int, heads: c_int, head_dim: c_int, s: S) ![P]A {
+    const r = try reshape(x, &[_]c_int{ n, t, P, heads, head_dim }, s);
     defer free(r);
     var parts = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(parts);
-    try mlx.check(mlx.mlx_split(&parts, r, 3, 2, s));
-    var out: [3]A = .{ none, none, none };
+    try mlx.check(mlx.mlx_split(&parts, r, P, 2, s));
+    var out: [P]A = @splat(none);
     errdefer for (out) |o| if (o.ctx != null) free(o);
-    for (0..3) |i| {
+    for (0..P) |i| {
         var part = mlx.mlx_array_new();
         defer free(part);
         try mlx.check(mlx.mlx_vector_array_get(&part, parts, i));
@@ -751,6 +799,11 @@ pub const Model = struct {
     scorer_l3: Linear,
     act_l0: Linear,
     act_l2: Linear,
+    /// The last head layer's `in_proj` split into its query and key/value
+    /// columns: that layer computes queries for the CLS and marker rows only.
+    last_q: Linear = undefined,
+    last_kv: Linear = undefined,
+    tok_cache: TokenCache,
     /// Pre-transposed weights not owned by `weights`.
     owned: std.ArrayList(A),
     /// `forwardBody` wrapped by `mlx_compile`: traced once per input shape,
@@ -789,6 +842,26 @@ pub const Model = struct {
         return .{ .w_t = w_t, .b = self.optW(prefix ++ ".bias", args) };
     }
 
+    /// Output columns `[lo, hi)` of `l`, copied contiguous.
+    fn sliceOut(self: *Model, l: Linear, lo: c_int, hi: c_int) !Linear {
+        const rows = mlx.mlx_array_shape(l.w_t)[0];
+        var view = mlx.mlx_array_new();
+        defer free(view);
+        try mlx.check(mlx.mlx_slice(&view, l.w_t, &[_]c_int{ 0, lo }, 2, &[_]c_int{ rows, hi }, 2, &[_]c_int{ 1, 1 }, 2, self.stream));
+        var w = mlx.mlx_array_new();
+        errdefer free(w);
+        try mlx.check(mlx.mlx_contiguous(&w, view, false, self.stream));
+        try self.owned.append(self.allocator, w);
+        const b = if (l.b) |bias| blk: {
+            var out = mlx.mlx_array_new();
+            errdefer free(out);
+            try mlx.check(mlx.mlx_slice(&out, bias, &[_]c_int{lo}, 1, &[_]c_int{hi}, 1, &[_]c_int{1}, 1, self.stream));
+            try self.owned.append(self.allocator, out);
+            break :blk out;
+        } else null;
+        return .{ .w_t = w, .b = b };
+    }
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !Model {
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
@@ -823,6 +896,7 @@ pub const Model = struct {
             .scorer_l3 = undefined,
             .act_l0 = undefined,
             .act_l2 = undefined,
+            .tok_cache = .{ .allocator = allocator },
             .owned = .empty,
         };
         errdefer self.freeOwned();
@@ -863,6 +937,12 @@ pub const Model = struct {
         self.scorer_l3 = try self.linearW("scorer.layers.3", .{});
         self.act_l0 = try self.linearW("act_head.layers.0", .{});
         self.act_l2 = try self.linearW("act_head.layers.2", .{});
+        if (self.head.len > 0) {
+            const D: c_int = @intCast(cfg.hidden_size);
+            const last = self.head[self.head.len - 1].in_proj;
+            self.last_q = try self.sliceOut(last, 0, D);
+            self.last_kv = try self.sliceOut(last, D, 3 * D);
+        }
 
         // Force the transposes now so the first request pays no load cost.
         const vec = mlx.mlx_vector_array_new();
@@ -874,6 +954,7 @@ pub const Model = struct {
     }
 
     fn freeOwned(self: *Model) void {
+        self.tok_cache.deinit();
         for (self.owned.items) |w| free(w);
         self.owned.deinit(self.allocator);
         if (self.layers.len > 0) self.allocator.free(self.layers);
@@ -971,9 +1052,39 @@ pub const Model = struct {
         }
     };
 
+    /// Attention masks of one forward, built once and shared by every
+    /// encoder and head layer. Additive fp16 (0 keeps a key, -inf drops it):
+    /// the attention kernel adds them to the scores as they are.
+    pub const Masks = struct {
+        full: A, // [n, 1, 1, T]: every valid key
+        local: A, // [n, 1, T, T]: `localMask`
+
+        pub fn init(valid: A, half: c_int, s: S) !Masks {
+            const shape = mlx.mlx_array_shape(valid);
+            const N = shape[0];
+            const T = shape[1];
+            const full_b = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
+            defer free(full_b);
+            const local_b = try localMask(valid, N, T, half, s);
+            defer free(local_b);
+            const full = try additiveMask(full_b, s);
+            errdefer free(full);
+            return .{ .full = full, .local = try additiveMask(local_b, s) };
+        }
+
+        pub fn deinit(self: *Masks) void {
+            free(self.full);
+            free(self.local);
+        }
+    };
+
+    pub fn masks(self: *const Model, valid: A) !Masks {
+        return Masks.init(valid, @intCast(self.cfg.local_attention / 2), self.stream);
+    }
+
     /// Encoder only: `[n, T, D]` fp16 (final norm applied) from `ids` `[n, T]`
-    /// int32 and `valid` `[n, T]` bool. Caller frees.
-    pub fn encode(self: *Model, ids_arr: A, valid: A) !A {
+    /// int32 and the forward's `masks`. Caller frees.
+    pub fn encode(self: *Model, ids_arr: A, m: Masks) !A {
         const s = self.stream;
         const D: c_int = @intCast(self.cfg.hidden_size);
         const H: c_int = @intCast(self.cfg.num_heads);
@@ -981,11 +1092,8 @@ pub const Model = struct {
         const shape = mlx.mlx_array_shape(ids_arr);
         const N = shape[0];
         const T = shape[1];
-
-        const full_mask = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
-        defer free(full_mask);
-        const local_mask = try localMask(valid, N, T, @intCast(self.cfg.local_attention / 2), s);
-        defer free(local_mask);
+        const full_mask = m.full;
+        const local_mask = m.local;
 
         const emb = try take(self.tok_embeddings, ids_arr, 0, s);
         defer free(emb);
@@ -1046,9 +1154,12 @@ pub const Model = struct {
     }
 
     /// Decision head over encoder output `enc` (`[n, T, D]`): type embedding
-    /// (`qt_arr` `[n]` int32), head layers with the padding key mask (`valid`
-    /// `[n, T]` bool). Caller frees.
-    pub fn headForward(self: *Model, enc: A, valid: A, qt_arr: A) !A {
+    /// (`qt_arr` `[n]` int32), head layers with the padding key mask `mask`
+    /// (`Masks.full`). With `rows` (`[n * S]` flat row indices into `[n * T]`)
+    /// the last layer computes queries, out_proj and FFN for those rows only
+    /// (keys and values still cover every row) and the result is `[n, S, D]`;
+    /// otherwise `[n, T, D]`. Caller frees.
+    pub fn headForward(self: *Model, enc: A, mask: A, qt_arr: A, rows: ?A) !A {
         const s = self.stream;
         const shape = mlx.mlx_array_shape(enc);
         const N = shape[0];
@@ -1059,9 +1170,6 @@ pub const Model = struct {
         const dh = @divExact(D, heads);
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dh)));
 
-        const mask = try reshape(valid, &[_]c_int{ N, 1, 1, T }, s);
-        defer free(mask);
-
         const te = try take(self.type_emb, qt_arr, 0, s);
         defer free(te);
         const te3 = try reshape(te, &[_]c_int{ N, 1, D }, s);
@@ -1069,20 +1177,49 @@ pub const Model = struct {
         var x = try add(enc, te3, s);
         errdefer free(x);
 
-        for (self.head) |*l| {
+        for (self.head, 0..) |*l, li| {
             const h = try layerNorm(x, l.norm1_w, l.norm1_b, 1e-5, s);
             defer free(h);
-            const qkv = try linear(h, l.in_proj.w_t, l.in_proj.b, s);
-            defer free(qkv);
-            const parts = try splitQkv(qkv, N, T, heads, dh, s);
-            defer for (parts) |p| free(p);
-            const att = try sdpa(parts[0], parts[1], parts[2], scale, mask, s);
+            const sel = if (li + 1 == self.head.len) rows else null;
+            var q: A = none;
+            defer if (q.ctx != null) free(q);
+            var kv: [2]A = .{ none, none };
+            defer for (kv) |p| if (p.ctx != null) free(p);
+            var S_ = T;
+            if (sel) |idx| {
+                S_ = @divExact(mlx.mlx_array_shape(idx)[0], N);
+                const kv_all = try linear(h, self.last_kv.w_t, self.last_kv.b, s);
+                defer free(kv_all);
+                kv = try splitHeads(2, kv_all, N, T, heads, dh, s);
+                const h_flat = try reshape(h, &[_]c_int{ N * T, D }, s);
+                defer free(h_flat);
+                const hs = try take(h_flat, idx, 0, s);
+                defer free(hs);
+                const q_rows = try linear(hs, self.last_q.w_t, self.last_q.b, s);
+                defer free(q_rows);
+                q = (try splitHeads(1, q_rows, N, S_, heads, dh, s))[0];
+            } else {
+                const qkv = try linear(h, l.in_proj.w_t, l.in_proj.b, s);
+                defer free(qkv);
+                const parts = try splitQkv(qkv, N, T, heads, dh, s);
+                q = parts[0];
+                kv = .{ parts[1], parts[2] };
+            }
+            const att = try sdpa(q, kv[0], kv[1], scale, mask, s);
             defer free(att);
-            const merged = try mergeHeads(att, N, T, D, s);
+            const merged = try mergeHeads(att, N, S_, D, s);
             defer free(merged);
             const proj = try linear(merged, l.out_proj.w_t, l.out_proj.b, s);
             defer free(proj);
-            const x1 = try add(x, proj, s);
+            const res = if (sel) |idx| blk: {
+                const x_flat = try reshape(x, &[_]c_int{ N * T, D }, s);
+                defer free(x_flat);
+                const xs = try take(x_flat, idx, 0, s);
+                defer free(xs);
+                break :blk try reshape(xs, &[_]c_int{ N, S_, D }, s);
+            } else x;
+            defer if (sel != null) free(res);
+            const x1 = try add(res, proj, s);
             free(x);
             x = x1;
 
@@ -1218,29 +1355,64 @@ pub const Model = struct {
         const K_ = mlx.mlx_array_shape(in.marker_pos)[1];
         const D: c_int = @intCast(self.cfg.hidden_size);
 
-        const enc = try self.encode(in.ids, in.valid);
+        var m = try self.masks(in.valid);
+        defer m.deinit();
+        const enc = try self.encode(in.ids, m);
         defer free(enc);
-        const h = try self.headForward(enc, in.valid, in.qtype);
-        defer free(h);
-        const h_flat = try reshape(h, &[_]c_int{ N_ * T_, D }, s);
-        defer free(h_flat);
 
-        // Marker rows (`h[b, max(marker_pos, 0)]`; padded slots gather row 0
-        // of their sequence and are masked below) and the CLS rows.
-        var row0 = mlx.mlx_array_new();
-        defer free(row0);
-        try mlx.check(mlx.mlx_arange(&row0, 0, @floatFromInt(N_ * T_), @floatFromInt(T_), .int32, s));
-        const cidx_arr = row0;
-        const row0c = try reshape(row0, &[_]c_int{ N_, 1 }, s);
-        defer free(row0c);
+        // Rows the answer reads: CLS (`b * T`) and the markers
+        // (`b * T + max(marker_pos, 0)`; padded slots read their CLS row and
+        // are masked below).
         const zero = mlx.mlx_array_new_int(0);
         defer free(zero);
+        var cls_t = mlx.mlx_array_new();
+        defer free(cls_t);
+        try mlx.check(mlx.mlx_arange(&cls_t, 0, @floatFromInt(N_ * T_), @floatFromInt(T_), .int32, s));
+        const cls_tc = try reshape(cls_t, &[_]c_int{ N_, 1 }, s);
+        defer free(cls_tc);
         var mp0 = mlx.mlx_array_new();
         defer free(mp0);
         try mlx.check(mlx.mlx_maximum(&mp0, in.marker_pos, zero, s));
+        var mrow = mlx.mlx_array_new();
+        defer free(mrow);
+        try mlx.check(mlx.mlx_add(&mrow, mp0, cls_tc, s));
+
+        // The last head layer runs on those `1 + K` rows per sequence only;
+        // `h` is then `[n, 1 + K, D]` with CLS at 0 and marker j at 1 + j.
+        const pick = self.head.len > 0;
+        const rows = if (pick) blk: {
+            const pair = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(pair);
+            try mlx.check(mlx.mlx_vector_array_append_value(pair, cls_tc));
+            try mlx.check(mlx.mlx_vector_array_append_value(pair, mrow));
+            var cat = mlx.mlx_array_new();
+            defer free(cat);
+            try mlx.check(mlx.mlx_concatenate_axis(&cat, pair, 1, s));
+            break :blk try reshape(cat, &[_]c_int{N_ * (K_ + 1)}, s);
+        } else null;
+        defer if (rows) |r| free(r);
+        const h = try self.headForward(enc, m.full, in.qtype, rows);
+        defer free(h);
+        const Tv: c_int = if (pick) K_ + 1 else T_;
+        const h_flat = try reshape(h, &[_]c_int{ N_ * Tv, D }, s);
+        defer free(h_flat);
+
+        var row0 = mlx.mlx_array_new();
+        defer free(row0);
+        try mlx.check(mlx.mlx_arange(&row0, 0, @floatFromInt(N_ * Tv), @floatFromInt(Tv), .int32, s));
+        const cidx_arr = row0;
+        const row0c = try reshape(row0, &[_]c_int{ N_, 1 }, s);
+        defer free(row0c);
         var midx2 = mlx.mlx_array_new();
         defer free(midx2);
-        try mlx.check(mlx.mlx_add(&midx2, mp0, row0c, s));
+        if (pick) {
+            var ar = mlx.mlx_array_new();
+            defer free(ar);
+            try mlx.check(mlx.mlx_arange(&ar, 1, @floatFromInt(K_ + 1), 1, .int32, s));
+            const ar2 = try reshape(ar, &[_]c_int{ 1, K_ }, s);
+            defer free(ar2);
+            try mlx.check(mlx.mlx_add(&midx2, ar2, row0c, s));
+        } else try mlx.check(mlx.mlx_array_set(&midx2, mrow));
         const midx_arr = try reshape(midx2, &[_]c_int{N_ * K_}, s);
         defer free(midx_arr);
         // k = max(marker count, 2) as f32 [n, 1]
@@ -1354,6 +1526,21 @@ pub const Model = struct {
     }
 };
 
+/// `keep` (bool) as an additive fp16 mask: 0 where true, -inf where false.
+fn additiveMask(keep: A, s: S) !A {
+    const no_shape = [_]c_int{};
+    const zero: f16 = 0;
+    const ninf: f16 = -std.math.inf(f16);
+    const z = mlx.mlx_array_new_data(&zero, &no_shape, 0, .float16);
+    defer free(z);
+    const n = mlx.mlx_array_new_data(&ninf, &no_shape, 0, .float16);
+    defer free(n);
+    var out = mlx.mlx_array_new();
+    errdefer free(out);
+    try mlx.check(mlx.mlx_where(&out, keep, z, n, s));
+    return out;
+}
+
 /// `attention_masks` sliding mask: `[n, 1, T, T]` bool, key within `half`
 /// positions of the query and valid; padded queries see every valid key (no
 /// all-masked softmax rows).
@@ -1428,11 +1615,56 @@ pub fn tempBucket(buf: []u8, qt: QType, k: usize) []const u8 {
 
 // ── Engine: request JSON in, laya `predict` JSON out ──
 
+/// How `predictJson` splits rows into forwards: row indices sorted by token
+/// length, cut into batches (`order[ends[b - 1]..ends[b]]`) of at most
+/// `MAX_ROWS` rows and `MAX_TOKENS` padded tokens, where a longer row may add
+/// at most `MAX_PAD_GROWTH` padding tokens to the rows already in the batch.
+pub const BatchPlan = struct {
+    order: []u32,
+    ends: []usize,
+
+    pub const MAX_ROWS: usize = 64;
+    pub const MAX_PAD_GROWTH: usize = 512;
+    pub const MAX_TOKENS: usize = 16 * 1024;
+
+    pub fn init(a: std.mem.Allocator, lens: []const usize) !BatchPlan {
+        const order = try a.alloc(u32, lens.len);
+        errdefer a.free(order);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        var ends: std.ArrayList(usize) = .empty;
+        errdefer ends.deinit(a);
+        std.mem.sort(u32, order, lens, struct {
+            fn lessThan(l: []const usize, x: u32, y: u32) bool {
+                return l[x] < l[y] or (l[x] == l[y] and x < y);
+            }
+        }.lessThan);
+        const pad = Model.PAD_T;
+        var start: usize = 0;
+        var t_max: usize = 0; // padded length of the current batch
+        for (order, 0..) |o, i| {
+            const n = i - start; // rows already in the batch
+            const t = (lens[o] + pad - 1) / pad * pad;
+            const tokens = (n + 1) * @max(t, t_max);
+            const growth = n * (@max(t, t_max) - t_max);
+            if (n > 0 and (n == MAX_ROWS or tokens > MAX_TOKENS or growth > MAX_PAD_GROWTH)) {
+                try ends.append(a, i);
+                start = i;
+                t_max = t;
+            } else t_max = @max(t, t_max);
+        }
+        if (lens.len > 0) try ends.append(a, lens.len);
+        return .{ .order = order, .ends = try ends.toOwnedSlice(a) };
+    }
+
+    pub fn deinit(self: *BatchPlan, a: std.mem.Allocator) void {
+        a.free(self.order);
+        a.free(self.ends);
+    }
+};
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     model: Model,
-
-    pub const BATCH_SIZE: usize = 16;
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
@@ -1459,6 +1691,8 @@ pub const Engine = struct {
 
         const state_text = try renderValue(a, state);
         defer a.free(state_text);
+        const state_ids = try encodeClean(a, &self.model.tok, null, cfg.mask_token, state_text);
+        defer a.free(state_ids);
 
         const qs = try a.alloc(Question, nq);
         var nqs: usize = 0;
@@ -1481,7 +1715,7 @@ pub const Engine = struct {
             qids[qi] = kv.key_ptr.*;
             qs[qi] = try Question.fromJson(a, kv.value_ptr.*);
             nqs += 1;
-            seqs[qi] = try buildSequence(a, &self.model.tok, cfg, state_text, &qs[qi]);
+            seqs[qi] = try buildSequence(a, &self.model.tok, &self.model.tok_cache, cfg, state_ids, &qs[qi]);
             nseq += 1;
             if (seqs[qi].markers.len != qs[qi].optionCount()) return error.TooManyOptions;
         }
@@ -1494,93 +1728,110 @@ pub const Engine = struct {
         try out.appendSlice(a, ",\"answers\":{");
         var input_tokens: usize = 0;
 
-        var start: usize = 0;
-        while (start < nq) : (start += BATCH_SIZE) {
-            const end = @min(nq, start + BATCH_SIZE);
-            const ids = try a.alloc([]const u32, end - start);
+        // Forward in length-sorted batches; answers are written in request order below.
+        const probs = try a.alloc([]f64, nq);
+        for (probs) |*p| p.* = &.{};
+        defer {
+            for (probs) |p| a.free(p);
+            a.free(probs);
+        }
+        const acts = try a.alloc(f64, nq);
+        defer a.free(acts);
+        const lens = try a.alloc(usize, nq);
+        defer a.free(lens);
+        for (seqs, lens) |sq, *l| l.* = sq.ids.len;
+        var plan = try BatchPlan.init(a, lens);
+        defer plan.deinit(a);
+        var b_start: usize = 0;
+        for (plan.ends) |b_end| {
+            const rows = plan.order[b_start..b_end];
+            defer b_start = b_end;
+            const ids = try a.alloc([]const u32, rows.len);
             defer a.free(ids);
-            const markers = try a.alloc([]const u32, end - start);
+            const markers = try a.alloc([]const u32, rows.len);
             defer a.free(markers);
-            const qtypes = try a.alloc(QType, end - start);
+            const qtypes = try a.alloc(QType, rows.len);
             defer a.free(qtypes);
-            for (start..end) |i| {
-                ids[i - start] = seqs[i].ids;
-                markers[i - start] = seqs[i].markers;
-                qtypes[i - start] = qs[i].t;
+            for (rows, 0..) |i, r| {
+                ids[r] = seqs[i].ids;
+                markers[r] = seqs[i].markers;
+                qtypes[r] = qs[i].t;
                 input_tokens += seqs[i].ids.len;
             }
             var res = try self.model.forward(.{ .ids = ids, .markers = markers, .qtype = qtypes });
             defer res.deinit(a);
             for (res.logits) |v| if (!std.math.isFinite(v)) return error.NonFiniteOutput;
             for (res.act) |v| if (!std.math.isFinite(v)) return error.NonFiniteOutput;
-
-            for (start..end) |i| {
-                const row = i - start;
-                const q = &qs[i];
+            for (rows, 0..) |i, r| {
                 const k = seqs[i].markers.len;
                 var bucket_buf: [32]u8 = undefined;
-                const bucket = tempBucket(&bucket_buf, q.t, k);
-                const scale: f64 = cfg.temperature_by_options.get(bucket) orelse cfg.temperature[@intFromEnum(q.t)];
-                const p = try a.alloc(f64, k);
-                defer a.free(p);
-                softmaxInto(res.logits[row * res.k_pad .. row * res.k_pad + k], @max(1e-3, scale), p);
-                const act_prob = res.act[row * res.n_actions];
-                if (i > 0) try out.append(a, ',');
-                try pyJsonString(a, &out, qids[i], false);
-                try out.appendSlice(a, ":{\"type\":\"");
-                try out.appendSlice(a, q.t.name());
-                try out.appendSlice(a, "\",\"confidence\":");
-                const conf = switch (q.t) {
-                    .noul => @max(p[1], 1.0 - p[1]),
-                    else => confidenceFromProbs(p, k),
-                };
-                try appendRounded(a, &out, conf);
-                try out.appendSlice(a, ",\"action\":{\"act_probability\":");
-                try appendRounded(a, &out, act_prob);
-                try out.append(a, '}');
-                switch (q.t) {
-                    .choice => {
-                        var best: usize = 0;
-                        for (p, 0..) |v, j| if (v > p[best]) {
-                            best = j;
-                        };
-                        try out.appendSlice(a, ",\"choice\":");
-                        try pyJsonString(a, &out, q.labels[best], false);
-                        try out.appendSlice(a, ",\"probabilities\":{");
-                        for (q.labels, 0..) |label, j| {
-                            if (j > 0) try out.append(a, ',');
-                            try pyJsonString(a, &out, label, false);
-                            try out.append(a, ':');
-                            try appendRounded(a, &out, p[j]);
-                        }
-                        try out.append(a, '}');
-                    },
-                    .score => {
-                        var score: f64 = 0;
-                        for (p, 0..) |v, j| score += @as(f64, @floatFromInt(j)) * v;
-                        try out.appendSlice(a, ",\"score\":");
-                        try appendRounded(a, &out, score);
-                        try out.appendSlice(a, ",\"legend\":{");
-                        for (q.crit.?.array.items, 0..) |c, j| {
-                            if (j > 0) try out.append(a, ',');
-                            try out.print(a, "\"{d}\":", .{j});
-                            try pyJson(a, &out, c, false);
-                        }
-                        try out.appendSlice(a, "},\"probabilities\":{");
-                        for (p, 0..) |v, j| {
-                            if (j > 0) try out.append(a, ',');
-                            try out.print(a, "\"{d}\":", .{j});
-                            try appendRounded(a, &out, v);
-                        }
-                        try out.append(a, '}');
-                    },
-                    .noul => {
-                        try out.appendSlice(a, ",\"noul\":");
-                        try appendRounded(a, &out, p[1]);
-                    },
-                }
-                try out.append(a, '}');
+                const bucket = tempBucket(&bucket_buf, qs[i].t, k);
+                const scale: f64 = cfg.temperature_by_options.get(bucket) orelse cfg.temperature[@intFromEnum(qs[i].t)];
+                probs[i] = try a.alloc(f64, k);
+                softmaxInto(res.logits[r * res.k_pad .. r * res.k_pad + k], @max(1e-3, scale), probs[i]);
+                acts[i] = res.act[r * res.n_actions];
             }
+        }
+
+        for (qs, 0..) |*q, i| {
+            const p = probs[i];
+            const k = p.len;
+            const act_prob = acts[i];
+            if (i > 0) try out.append(a, ',');
+            try pyJsonString(a, &out, qids[i], false);
+            try out.appendSlice(a, ":{\"type\":\"");
+            try out.appendSlice(a, q.t.name());
+            try out.appendSlice(a, "\",\"confidence\":");
+            const conf = switch (q.t) {
+                .noul => @max(p[1], 1.0 - p[1]),
+                else => confidenceFromProbs(p, k),
+            };
+            try appendRounded(a, &out, conf);
+            try out.appendSlice(a, ",\"action\":{\"act_probability\":");
+            try appendRounded(a, &out, act_prob);
+            try out.append(a, '}');
+            switch (q.t) {
+                .choice => {
+                    var best: usize = 0;
+                    for (p, 0..) |v, j| if (v > p[best]) {
+                        best = j;
+                    };
+                    try out.appendSlice(a, ",\"choice\":");
+                    try pyJsonString(a, &out, q.labels[best], false);
+                    try out.appendSlice(a, ",\"probabilities\":{");
+                    for (q.labels, 0..) |label, j| {
+                        if (j > 0) try out.append(a, ',');
+                        try pyJsonString(a, &out, label, false);
+                        try out.append(a, ':');
+                        try appendRounded(a, &out, p[j]);
+                    }
+                    try out.append(a, '}');
+                },
+                .score => {
+                    var score: f64 = 0;
+                    for (p, 0..) |v, j| score += @as(f64, @floatFromInt(j)) * v;
+                    try out.appendSlice(a, ",\"score\":");
+                    try appendRounded(a, &out, score);
+                    try out.appendSlice(a, ",\"legend\":{");
+                    for (q.crit.?.array.items, 0..) |c, j| {
+                        if (j > 0) try out.append(a, ',');
+                        try out.print(a, "\"{d}\":", .{j});
+                        try pyJson(a, &out, c, false);
+                    }
+                    try out.appendSlice(a, "},\"probabilities\":{");
+                    for (p, 0..) |v, j| {
+                        if (j > 0) try out.append(a, ',');
+                        try out.print(a, "\"{d}\":", .{j});
+                        try appendRounded(a, &out, v);
+                    }
+                    try out.append(a, '}');
+                },
+                .noul => {
+                    try out.appendSlice(a, ",\"noul\":");
+                    try appendRounded(a, &out, p[1]);
+                },
+            }
+            try out.append(a, '}');
         }
         try out.print(a, "}},\"usage\":{{\"input_tokens\":{d},\"output_tokens\":0}}}}", .{input_tokens});
         return out.toOwnedSlice(a);
@@ -1712,6 +1963,43 @@ test "laya: calibration helpers" {
     try testing.expectEqualStrings("0.8788", out.items);
 }
 
+test "laya: batches are sorted by length and cut by rows, tokens and padding growth" {
+    const a = testing.allocator;
+    // Short and long rows interleaved: two batches, each sorted, short first.
+    const lens = [_]usize{ 700, 20, 710, 25, 30, 690 };
+    var plan = try BatchPlan.init(a, &lens);
+    defer plan.deinit(a);
+    try testing.expectEqualSlices(u32, &.{ 1, 3, 4, 5, 0, 2 }, plan.order);
+    // Adding a 704-token row to three 32-token rows would pad them by 3 * 672.
+    try testing.expectEqualSlices(usize, &.{ 3, 6 }, plan.ends);
+
+    var same: [100]usize = @splat(40);
+    var p2 = try BatchPlan.init(a, &same);
+    defer p2.deinit(a);
+    try testing.expectEqualSlices(usize, &.{ 64, 100 }, p2.ends);
+    var long: [40]usize = @splat(1024);
+    var p3 = try BatchPlan.init(a, &long);
+    defer p3.deinit(a);
+    try testing.expectEqualSlices(usize, &.{ 16, 32, 40 }, p3.ends);
+    const grow = [_]usize{ 100, 110, 120, 130, 140, 150 };
+    var p4 = try BatchPlan.init(a, &grow);
+    defer p4.deinit(a);
+    try testing.expectEqualSlices(usize, &.{6}, p4.ends);
+}
+
+test "laya: the token cache stays bounded" {
+    const a = testing.allocator;
+    var cache: TokenCache = .{ .allocator = a };
+    defer cache.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..TokenCache.MAX + 10) |i| cache.put(try std.fmt.bufPrint(&buf, "text {d}", .{i}), &.{@intCast(i)});
+    try testing.expect(cache.map.count() <= TokenCache.MAX);
+    try testing.expectEqualSlices(u32, &.{TokenCache.MAX + 9}, cache.map.get("text 265").?);
+    const big: [TokenCache.MAX_TEXT + 1]u8 = @splat('a');
+    cache.put(&big, &.{1});
+    try testing.expect(cache.map.get(&big) == null);
+}
+
 const Fixtures = struct {
     parsed: std.json.Parsed(std.json.Value),
     fn load(a: std.mem.Allocator, dir: []const u8) !Fixtures {
@@ -1766,13 +2054,18 @@ test "laya: prompt construction reproduces laya_mlx token ids and markers" {
 
     var fx = try Fixtures.load(a, fx_dir);
     defer fx.parsed.deinit();
-    for (fx.cases()) |c| {
+    var cache: TokenCache = .{ .allocator = a };
+    defer cache.deinit();
+    // Twice through the token cache: the second pass reads every question and option from it.
+    for (0..2) |_| for (fx.cases()) |c| {
         const o = c.object;
         const state_text = try renderValue(a, o.get("state").?);
         defer a.free(state_text);
+        const state_ids = try encodeClean(a, &tok, null, cfg.mask_token, state_text);
+        defer a.free(state_ids);
         var q = try Question.fromJson(a, o.get("question").?);
         defer q.deinit(a);
-        var seq = try buildSequence(a, &tok, &cfg, state_text, &q);
+        var seq = try buildSequence(a, &tok, &cache, &cfg, state_ids, &q);
         defer seq.deinit(a);
         const want_ids = try jsonU32Slice(a, o.get("ids").?);
         defer a.free(want_ids);
@@ -1783,7 +2076,7 @@ test "laya: prompt construction reproduces laya_mlx token ids and markers" {
             return err;
         };
         try testing.expectEqualSlices(u32, want_markers, seq.markers);
-    }
+    };
 }
 
 test "laya: encoder and head hidden states match laya_mlx (en/department)" {
@@ -1805,7 +2098,9 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
 
     var in = try Model.Inputs.fromBatch(a, batch, model.cfg.pad_id);
     defer in.deinit();
-    const enc = try model.encode(in.ids, in.valid);
+    var m = try model.masks(in.valid);
+    defer m.deinit();
+    const enc = try model.encode(in.ids, m);
     defer free(enc);
     const enc32 = try astype(enc, .float32, s);
     defer free(enc32);
@@ -1822,7 +2117,7 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
     std.debug.print("\n[laya] encoder max|diff| {d:.4} (max|ref| {d:.2})\n", .{ max_abs, max_ref });
     try testing.expect(max_abs < 0.05 * max_ref);
 
-    const h = try model.headForward(enc, in.valid, in.qtype);
+    const h = try model.headForward(enc, m.full, in.qtype, null);
     defer free(h);
     const h32 = try astype(h, .float32, s);
     defer free(h32);
@@ -1838,6 +2133,26 @@ test "laya: encoder and head hidden states match laya_mlx (en/department)" {
     }
     std.debug.print("[laya] head max|diff| {d:.4} (max|ref| {d:.2})\n", .{ hmax, href });
     try testing.expect(hmax < 0.05 * href);
+
+    // The last layer on the CLS and marker rows only matches those rows of the full head.
+    const D = model.cfg.hidden_size;
+    const picked = try a.alloc(i32, 1 + markers.len);
+    defer a.free(picked);
+    picked[0] = 0;
+    for (markers, 1..) |mk, j| picked[j] = @intCast(mk);
+    const rows = mlx.mlx_array_new_data(picked.ptr, &[_]c_int{@intCast(picked.len)}, 1, .int32);
+    defer free(rows);
+    const hs = try model.headForward(enc, m.full, in.qtype, rows);
+    defer free(hs);
+    const hs32 = try astype(hs, .float32, s);
+    defer free(hs32);
+    try mlx.check(mlx.mlx_array_eval(hs32));
+    const got_rows = mlx.mlx_array_data_float32(hs32).?;
+    var rmax: f32 = 0;
+    for (picked, 0..) |row, j| {
+        for (0..D) |d| rmax = @max(rmax, @abs(got_rows[j * D + d] - got_h[@as(usize, @intCast(row)) * D + d]));
+    }
+    try testing.expect(rmax <= 1e-3 * href);
 
     var out = try model.forward(batch);
     defer out.deinit(a);
@@ -1975,7 +2290,9 @@ test "laya: forward latency breakdown (LAYA_BENCH=1)" {
     defer in.deinit();
     for (0..5 + 30) |i| {
         const t0 = std.Io.Timestamp.now(trace_io, .boot);
-        const enc = try model.encode(in.ids, in.valid);
+        var m = try model.masks(in.valid);
+        defer m.deinit();
+        const enc = try model.encode(in.ids, m);
         defer free(enc);
         try mlx.check(mlx.mlx_array_eval(enc));
         if (i >= 5) times[i - 5] = msSince(t0);
