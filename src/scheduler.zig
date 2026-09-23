@@ -1272,9 +1272,8 @@ pub const GenRequest = struct {
     /// The media model. `gen_busy` is set/cleared around the run for
     /// visibility; the conn thread's refcount already pins it against eviction.
     model: *model_registry_mod.LoadedModel,
-    /// Clear MLX's allocator cache after the job only once it holds this many
-    /// bytes (0: always). A decision job's buffers are reused by the next request.
-    keep_cache_bytes: usize = 0,
+    /// A decision job: its buffers are reused by the next request (`shouldClearCache`).
+    decision: bool = false,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
@@ -5091,12 +5090,18 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     // of denoise/VAE/encoder buffers in one burst — without this, each
     // generation ratchets process RSS upward (observed ~100 GB by gen 2).
     var cached: usize = 0;
-    if (req.keep_cache_bytes > 0) _ = mlx.mlx_get_cache_memory(&cached);
-    if (cached >= req.keep_cache_bytes) _ = mlx.mlx_clear_cache();
+    if (req.decision) _ = mlx.mlx_get_cache_memory(&cached);
+    if (shouldClearCache(req.decision, cached)) _ = mlx.mlx_clear_cache();
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
     req.done_cond.broadcast(sch.io);
     req.done_mu.unlock(sch.io);
+}
+
+/// Clear MLX's allocator cache after a job holding `cached` bytes: always for
+/// media, from 256 MiB for decision jobs.
+fn shouldClearCache(decision: bool, cached: usize) bool {
+    return !decision or cached >= 256 << 20;
 }
 
 /// Free a model's resident mlx state on the inference thread (stream-bound,
@@ -10180,4 +10185,10 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
     const text_only = [_]u32{ 7, 8, image_id, 9 };
     try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
     try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
+}
+
+test "a media job always clears the allocator cache, a decision job only from 256 MiB" {
+    try testing.expect(shouldClearCache(false, 0));
+    try testing.expect(!shouldClearCache(true, (256 << 20) - 1));
+    try testing.expect(shouldClearCache(true, 256 << 20));
 }
