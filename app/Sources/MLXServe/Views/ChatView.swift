@@ -2660,14 +2660,7 @@ struct ChatDetailView: View {
                 // The note waiting for the agent's next step, where the user
                 // is looking during a long run.
                 if let note = steeringNote {
-                    SteeringNoteRow(note: note,
-                                    canSendNow: composerState == .idle && canAnswer,
-                                    onEdit: { editSteeringNote() },
-                                    onRemove: { chatEngine.clearSteeringNote(for: sessionId) },
-                                    onSendNow: {
-                                        chatEngine.sendSteeringNoteNow(for: sessionId, config: buildTurnConfig(),
-                                                                       approval: { await requestToolApproval($0) })
-                                    })
+                    SteeringNoteRow(note: note, onPause: { pauseSteeringNote() })
                 }
 
                 // One rounded container, two rows: the input on top with the
@@ -2856,6 +2849,7 @@ struct ChatDetailView: View {
             inputFocused = true
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            recoverSteeringNoteIfIdle()
             applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
@@ -2932,7 +2926,12 @@ struct ChatDetailView: View {
             appState.chatSessions[idx].useMCP = newValue
         }
         .onChange(of: composerState) { _, state in
-            if state == .idle { inputFocused = true }
+            if state == .idle {
+                // A turn that ended without reaching a step (Stop, an error)
+                // leaves its note nowhere to go: back into the composer.
+                pauseSteeringNote()
+                inputFocused = true
+            }
         }
         // The keyboard arriving in the composer collapses the sidebar selection
         // to this chat. Keyed on the focus MIRROR rather than on the click, so
@@ -2961,6 +2960,7 @@ struct ChatDetailView: View {
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            recoverSteeringNoteIfIdle()
             // Scroll state is per-view, and the view is reused across tabs — so
             // without this, leaving one chat scrolled up opened the next one
             // unpinned at whatever offset the previous conversation's content
@@ -3709,7 +3709,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
+        if canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -3733,13 +3733,20 @@ struct ChatDetailView: View {
         composerWalk = .idle
     }
 
-    /// Editing takes the note back into the composer, so nothing fires
-    /// while it is being rewritten; Return queues it again.
-    private func editSteeringNote() {
+    /// Pausing takes the note back into the composer, ahead of whatever is
+    /// typed there, so nothing fires while it is being rewritten; Return
+    /// queues it again.
+    private func pauseSteeringNote() {
         guard let note = steeringNote else { return }
         chatEngine.clearSteeringNote(for: sessionId)
-        inputText = inputText.isEmpty ? note : note + "\n" + inputText
+        inputText = SteeringNotes.joined(note, inputText)
         inputFocused = true
+    }
+
+    /// A note whose turn ended while this chat was in another tab: nobody
+    /// watched the state flip, so it is recovered on the way in.
+    private func recoverSteeringNoteIfIdle() {
+        if composerState == .idle { pauseSteeringNote() }
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -3863,6 +3870,13 @@ struct ChatDetailView: View {
     /// caret inside a draft.
     private func recallHistory(_ direction: ComposerHistory.Direction,
                                caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        // A waiting steering note is the newest thing said and not yet sent:
+        // ↑ on an empty draft takes it back first, exactly as Pause does.
+        if direction == .up, steeringNote != nil,
+           inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pauseSteeringNote()
+            return true
+        }
         let entries = ComposerHistory.entries(session?.messages ?? [])
         let action = direction == .up
             ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
@@ -6646,8 +6660,6 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var minLines: Int = 1
     var maxLines: Int = 15
     var isIdle: Bool
-    /// A busy chat takes a bare Return as a steering note (`ComposerKey.onReturn`).
-    /// Defaults to false: the in-place message editor has no agent to steer.
     var canSteer: Bool = false
     var onSend: () -> Void
     /// Escape, from the responder chain. Defaults to nothing so a field that

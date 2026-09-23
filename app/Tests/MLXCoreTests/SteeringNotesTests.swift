@@ -8,31 +8,44 @@ final class SteeringNotesTests: XCTestCase {
     func testSetStoresTrimmedTextPerSession() {
         var notes = SteeringNotes()
         let a = UUID(), b = UUID()
-        notes.set("  the VPN is off now, rerun the same command  ", for: a)
+        notes.append("  the VPN is off now, rerun the same command  ", for: a)
         XCTAssertEqual(notes.note(for: a), "the VPN is off now, rerun the same command")
         XCTAssertNil(notes.note(for: b), "another chat's note never leaks across sessions")
     }
 
-    func testANewNoteReplacesTheOldOne() {
+    /// A second note joins the first, one blank line between: the user is
+    /// adding a thought, not taking the first one back.
+    func testASecondNoteIsAppendedWithOneBlankLine() {
         var notes = SteeringNotes()
         let s = UUID()
-        notes.set("first", for: s)
-        notes.set("second", for: s)
-        XCTAssertEqual(notes.note(for: s), "second")
+        notes.append("This is a text.", for: s)
+        notes.append("And this is another one.", for: s)
+        XCTAssertEqual(notes.note(for: s), "This is a text.\n\nAnd this is another one.")
     }
 
-    func testBlankTextClearsInsteadOfStoringNothing() {
+    func testJoinAddsOnlyTheLineBreaksThatAreMissing() {
+        XCTAssertEqual(SteeringNotes.joined("A.", "B."), "A.\n\nB.")
+        XCTAssertEqual(SteeringNotes.joined("A.\n", "\nB."), "A.\n\nB.")
+        XCTAssertEqual(SteeringNotes.joined("A.\n\n", "\n\nB.\n\n"), "A.\n\nB.")
+        XCTAssertEqual(SteeringNotes.joined("A.\n\nB.", "\nC.\n"), "A.\n\nB.\n\nC.")
+        XCTAssertEqual(SteeringNotes.joined("", "B."), "B.")
+        XCTAssertEqual(SteeringNotes.joined("A.", "  \n"), "A.")
+    }
+
+    func testBlankTextChangesNothing() {
         var notes = SteeringNotes()
         let s = UUID()
-        notes.set("something", for: s)
-        notes.set("   \n", for: s)
-        XCTAssertNil(notes.note(for: s))
+        notes.append("   \n", for: s)
+        XCTAssertNil(notes.note(for: s), "nothing to say, nothing stored")
+        notes.append("something", for: s)
+        notes.append("   \n", for: s)
+        XCTAssertEqual(notes.note(for: s), "something")
     }
 
     func testTakeFiresOnce() {
         var notes = SteeringNotes()
         let s = UUID()
-        notes.set("use port 8081", for: s)
+        notes.append("use port 8081", for: s)
         XCTAssertEqual(notes.take(for: s), "use port 8081")
         XCTAssertNil(notes.take(for: s), "a note that fired is gone")
         XCTAssertNil(notes.note(for: s))
@@ -41,7 +54,7 @@ final class SteeringNotesTests: XCTestCase {
     func testClearDropsTheNote() {
         var notes = SteeringNotes()
         let s = UUID()
-        notes.set("never mind", for: s)
+        notes.append("never mind", for: s)
         notes.clear(for: s)
         XCTAssertNil(notes.note(for: s))
     }
