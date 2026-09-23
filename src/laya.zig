@@ -773,6 +773,8 @@ pub const Model = struct {
     /// failed).
     compiled: ?mlx.mlx_closure = null,
     compile_failed: bool = false,
+    /// Keys `getW`/`optW` found; `load` refuses any other checkpoint key, then empties this.
+    requested: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Width of the act head's hidden layer (`nn.Linear(dims + 4, 256)` in laya_mlx).
     const ACT_HIDDEN = 256;
@@ -782,20 +784,19 @@ pub const Model = struct {
     fn getW(self: *Model, comptime fmt: []const u8, args: anytype, want: []const u32) !A {
         var buf: [160]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, fmt, args);
-        const w = self.weights.get(key) orelse {
+        return try self.optW("{s}", .{key}, want) orelse {
             log.err("[laya] missing weight {s}\n", .{key});
             return error.MissingWeight;
         };
-        try checkShape(key, w, want);
-        return w;
     }
 
     fn optW(self: *Model, comptime fmt: []const u8, args: anytype, want: []const u32) !?A {
         var buf: [160]u8 = undefined;
         const key = try std.fmt.bufPrint(&buf, fmt, args);
-        const w = self.weights.get(key) orelse return null;
-        try checkShape(key, w, want);
-        return w;
+        const e = self.weights.map.getEntry(key) orelse return null;
+        try checkShape(key, e.value_ptr.*, want);
+        try self.requested.put(self.allocator, e.key_ptr.*, {});
+        return e.value_ptr.*;
     }
 
     fn checkShape(key: []const u8, w: A, want: []const u32) !void {
@@ -861,6 +862,7 @@ pub const Model = struct {
             .owned = .empty,
         };
         errdefer self.freeOwned();
+        errdefer self.requested.deinit(allocator);
 
         const D = cfg.hidden_size;
         const I = cfg.intermediate_size;
@@ -901,6 +903,15 @@ pub const Model = struct {
         // Pooled CLS row + 4 confidence features in, `len(act_costs) + 1` actions out.
         self.act_l0 = try self.linearW("act_head.layers.0", .{}, ACT_HIDDEN, D + 4);
         self.act_l2 = try self.linearW("act_head.layers.2", .{}, cfg.n_actions, ACT_HIDDEN);
+        // A buffer of the reference model; calibration reads `temperature` from rl_agent_config.json.
+        _ = try self.getW("temperature", .{}, &.{3});
+        var keys = self.weights.map.keyIterator();
+        while (keys.next()) |k| if (!self.requested.contains(k.*)) {
+            log.err("[laya] invalid checkpoint: unexpected weight {s} (the config implies no such tensor)\n", .{k.*});
+            return error.UnexpectedWeight;
+        };
+        self.requested.deinit(allocator);
+        self.requested = .empty;
 
         // Force the transposes now so the first request pays no load cost.
         const vec = mlx.mlx_vector_array_new();
@@ -2064,6 +2075,7 @@ test "laya: a config that does not match its weights or the reference fails the 
         .{ .agent = .{ "\"escalate\": 0.5", "\"escalate\": 0.5, \"wait\": 1.0" }, .err = error.WeightShapeMismatch },
         .{ .enc = .{ "\"hidden_size\": 768", "\"hidden_size\": 1536" }, .err = error.WeightShapeMismatch },
         .{ .enc = .{ "\"intermediate_size\": 1152", "\"intermediate_size\": 1024" }, .err = error.WeightShapeMismatch },
+        .{ .agent = .{ "\"head_layers\": 2", "\"head_layers\": 1" }, .err = error.UnexpectedWeight },
     };
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
