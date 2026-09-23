@@ -883,6 +883,7 @@ pub const DecisionEngine = struct {
 /// `POST /v1/decisions` `{"model", "state": <string|object|array>, "questions": {id: {...}}}`
 /// -> laya's `predict` JSON. Runs on the inference thread like every gen job.
 pub fn handleDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *DecisionEngine, model_id: []const u8) !void {
+    laya.checkJsonDepth(body) catch |err| return sendError(conn, 400, laya.errorMessage(err).?);
     var parsed = laya.parseRequestJson(allocator, body) catch {
         return sendError(conn, 400, "request body is not valid JSON");
     };
@@ -893,7 +894,8 @@ pub fn handleDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const 
     const questions = obj.get("questions") orelse return sendError(conn, 400, "missing 'questions'");
     const t0 = std.Io.Timestamp.now(conn.io, .boot);
     const out = engine.engine.predictJson(allocator, model_id, state, questions) catch |err| {
-        if (laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
+        var limit_buf: [160]u8 = undefined;
+        if (engine.engine.limitMessage(&limit_buf, err) orelse laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
         log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
         return sendError(conn, 500, "decision forward failed");
     };

@@ -137,6 +137,26 @@ print(" ".join("ok" if x else "FAIL" for x in out))
 EOF
 )"
 check "repeated keys, empty questions, lone surrogates, structured == string state" "$PY" "ok ok ok ok ok ok"
+echo "=== request limits: refused before any model work ==="
+TOO_MANY="$(python3 -c "import json; print(json.dumps({'model': '$MODEL_ID', 'state': 'x', 'questions': {f'q{i}': {'type': 'noul', 'instructions': '?'} for i in range(65)}}))")"
+expect_code "65 questions -> 400" 400 "$TOO_MANY"
+check "question limit is named" "$(grep -c 'limit 64' "$TMP/err.json")" "1"
+python3 - "$TMP" "$MODEL_ID" <<'EOF'
+import json, sys
+tmp, model = sys.argv[1], sys.argv[2]
+deep = "[" * 100_000 + "]" * 100_000
+open(f"{tmp}/deep.json", "w").write('{"model": "%s", "state": %s, "questions": {"q": {"type": "noul", "instructions": "?"}}}' % (model, deep))
+json.dump({"model": model, "state": "x", "questions": {"q": {"type": "choice", "instructions": "?", "criteria": [f"l{i}" for i in range(250_000)]}}}, open(f"{tmp}/labels.json", "w"))
+json.dump({"model": model, "state": "x" * (5 << 20), "questions": {"q": {"type": "noul", "instructions": "?"}}}, open(f"{tmp}/big.json", "w"))
+EOF
+post_file() { curl -s -H 'Expect:' -o "$TMP/err.json" -w "$2" -m 120 -X POST "localhost:$PORT/v1/decisions" -H 'content-type: application/json' --data-binary @"$1"; }
+check "100k-deep state -> 400" "$(post_file "$TMP/deep.json" '%{http_code}')" "400"
+check "server still healthy" "$(curl -s -o /dev/null -w '%{http_code}' "localhost:$PORT/health")" "200"
+LABELS="$(post_file "$TMP/labels.json" '%{http_code} %{time_total}')"
+check "250k choice labels -> 400" "${LABELS% *}" "400"
+check "250k labels refused in under 1 s (got ${LABELS#* } s)" "$(python3 -c "print(${LABELS#* } < 1)")" "True"
+check "5 MB body -> 413" "$(post_file "$TMP/big.json" '%{http_code}')" "413"
+check "5 MB body with a query string -> 413" "$(curl -s -H 'Expect:' -o /dev/null -w '%{http_code}' -m 120 -X POST "localhost:$PORT/v1/decisions?x=1" -H 'content-type: application/json' --data-binary @"$TMP/big.json")" "413"
 
 echo "=== latency: 1 request, 3 questions (en state), median of 30 after 5 warm-ups ==="
 BODY="$(grep '^en	' "$TMP/bodies.txt" | cut -f2-)"

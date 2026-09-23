@@ -796,14 +796,19 @@ fn routeExists(path: []const u8) bool {
 
 pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A decision prompt keeps at most `max_len` state tokens, so a larger body only
+/// buys tokenizer work on the inference thread.
+pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
 /// reference images approach 500 MB (issue #151) — while no JSON chat body
 /// has any business near 64 MB.
-pub fn maxRequestBytesFor(path: []const u8) usize {
+pub fn maxRequestBytesFor(target: []const u8) usize {
+    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -2072,6 +2077,14 @@ fn handleConnection(
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
         log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+        // Closing with body bytes unread resets the connection, and the client
+        // can lose the 413 before reading it: read what is left, up to the chat cap.
+        var left = @min(total_size, max_request_bytes) -| total_read;
+        while (left > 0) {
+            const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
+            if (n == 0) break;
+            left -= n;
+        }
         return;
     }
 
@@ -22977,6 +22990,8 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
     }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
     for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+    try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
+    try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
 }
 
 test "the 413 names both counts it compared" {

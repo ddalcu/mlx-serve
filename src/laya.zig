@@ -261,7 +261,13 @@ fn clampTemperature(name: []const u8, t: *f32) void {
 /// `ascii` mirrors `ensure_ascii`. Request bodies come from `parseRequestJson`
 /// (numbers kept as text). A number past the f64 range is `error.NonFiniteNumber`:
 /// Python would write `Infinity`, which is not JSON.
+/// Nesting past `MAX_JSON_DEPTH` is `error.NestingTooDeep` (one call frame per level).
 pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool) !void {
+    return pyJsonDepth(a, out, v, ascii, 0);
+}
+
+fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool, depth: usize) !void {
+    if ((v == .array or v == .object) and depth >= MAX_JSON_DEPTH) return error.NestingTooDeep;
     switch (v) {
         .null => try out.appendSlice(a, "null"),
         .bool => |b| try out.appendSlice(a, if (b) "true" else "false"),
@@ -282,7 +288,7 @@ pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, 
             try out.append(a, '[');
             for (arr.items, 0..) |item, i| {
                 if (i > 0) try out.appendSlice(a, ", ");
-                try pyJson(a, out, item, ascii);
+                try pyJsonDepth(a, out, item, ascii, depth + 1);
             }
             try out.append(a, ']');
         },
@@ -294,7 +300,7 @@ pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, 
                 if (i > 0) try out.appendSlice(a, ", ");
                 try pyJsonString(a, out, kv.key_ptr.*, ascii);
                 try out.appendSlice(a, ": ");
-                try pyJson(a, out, kv.value_ptr.*, ascii);
+                try pyJsonDepth(a, out, kv.value_ptr.*, ascii, depth + 1);
             }
             try out.append(a, '}');
         },
@@ -491,6 +497,34 @@ fn unmarkString(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// Deepest `[`/`{` nesting a request may carry. Python's `json` stops at its recursion
+/// limit; the serializer here takes one call frame per level.
+pub const MAX_JSON_DEPTH = 512;
+
+/// `error.NestingTooDeep` when JSON text nests past `MAX_JSON_DEPTH`. A byte scan, so it
+/// runs before any recursive parse, serialize or free; brackets inside strings do not count.
+pub fn checkJsonDepth(body: []const u8) !void {
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            '"' => in_string = !in_string,
+            '\\' => if (in_string) {
+                i += 1;
+            },
+            '[', '{' => if (!in_string) {
+                depth += 1;
+                if (depth > MAX_JSON_DEPTH) return error.NestingTooDeep;
+            },
+            ']', '}' => if (!in_string) {
+                depth -|= 1;
+            },
+            else => {},
+        }
+    }
+}
+
 /// `serialize_state` / `render_criterion`: strings pass through, anything
 /// else is compact-ish JSON with non-ASCII kept.
 fn renderValue(a: std.mem.Allocator, v: std.json.Value) ![]u8 {
@@ -525,7 +559,8 @@ pub const Question = struct {
         if (self.labels.len > 0) a.free(self.labels);
     }
 
-    pub fn fromJson(a: std.mem.Allocator, def: std.json.Value) !Question {
+    /// `max_options` (`maxOptions`) bounds every option list before any per-option work.
+    pub fn fromJson(a: std.mem.Allocator, def: std.json.Value, max_options: usize) !Question {
         if (def != .object) return error.QuestionNotObject;
         const o = def.object;
         const kind_v = o.get("type") orelse return error.UnknownQuestionType;
@@ -549,17 +584,22 @@ pub const Question = struct {
                 switch (c) {
                     .array => |arr| {
                         if (arr.items.len == 0) return error.BadChoiceCriteria;
+                        if (arr.items.len > max_options) return error.TooManyOptions;
                         const ls = try a.alloc([]const u8, arr.items.len);
                         errdefer a.free(ls);
+                        var seen: std.StringHashMapUnmanaged(void) = .empty;
+                        defer seen.deinit(a);
+                        try seen.ensureTotalCapacity(a, @intCast(arr.items.len));
                         for (arr.items, 0..) |v, i| {
                             if (v != .string) return error.BadChoiceCriteria;
-                            for (ls[0..i]) |prev| if (std.mem.eql(u8, prev, v.string)) return error.BadChoiceCriteria;
+                            if (seen.getOrPutAssumeCapacity(v.string).found_existing) return error.BadChoiceCriteria;
                             ls[i] = v.string;
                         }
                         labels = ls;
                     },
                     .object => |obj| {
                         if (obj.count() == 0) return error.BadChoiceCriteria;
+                        if (obj.count() > max_options) return error.TooManyOptions;
                         const ls = try a.alloc([]const u8, obj.count());
                         errdefer a.free(ls);
                         var it = obj.iterator();
@@ -573,6 +613,7 @@ pub const Question = struct {
             .score => {
                 const c = crit orelse return error.BadScoreCriteria;
                 if (c != .array or c.array.items.len == 0) return error.BadScoreCriteria;
+                if (c.array.items.len > max_options) return error.TooManyOptions;
             },
             .noul => {
                 if (crit) |c| if (c != .null and c != .object) return error.BadNoulCriteria;
@@ -596,6 +637,13 @@ pub const Question = struct {
         };
     }
 };
+
+/// Most options a question can carry: each option holds at least its marker token, placed
+/// after [CLS], at least one head token and [SEP], and a marker at or past `max_len` is lost
+/// (`build_sequence`), so more than `max_len - 3` options never fit.
+pub fn maxOptions(cfg: *const Config) usize {
+    return cfg.max_len -| 3;
+}
 
 /// `render_options`: option texts in label-index order. Caller frees each and the slice.
 pub fn renderOptions(a: std.mem.Allocator, q: *const Question) ![][]u8 {
@@ -1683,15 +1731,45 @@ pub fn tempBucket(buf: []u8, qt: QType, k: usize) []const u8 {
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     model: Model,
+    /// Per-request bounds, checked before any forward: one request runs to
+    /// completion on the inference thread, so these bound how long it holds it.
+    max_questions: usize = DEFAULT_MAX_QUESTIONS,
+    max_input_tokens: usize = DEFAULT_MAX_INPUT_TOKENS,
 
     pub const BATCH_SIZE: usize = 16;
+    pub const DEFAULT_MAX_QUESTIONS: usize = 64;
+    pub const DEFAULT_MAX_INPUT_TOKENS: usize = 32 * 1024;
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
-        self.allocator = allocator;
-        self.model = try Model.load(io, allocator, model_dir, s);
+        self.* = .{
+            .allocator = allocator,
+            .model = try Model.load(io, allocator, model_dir, s),
+            .max_questions = envLimit("MLX_SERVE_LAYA_MAX_QUESTIONS", DEFAULT_MAX_QUESTIONS),
+            .max_input_tokens = envLimit("MLX_SERVE_LAYA_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS),
+        };
         return self;
+    }
+
+    fn envLimit(name: [*:0]const u8, default: usize) usize {
+        const raw = std.c.getenv(name) orelse return default;
+        const v = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (v == 0) {
+            log.warn("[laya] ignoring {s}={s} (want a positive integer)\n", .{ name, raw });
+            return default;
+        }
+        return v;
+    }
+
+    /// 400 text for a limit error, naming the limit in force; null for other errors.
+    pub fn limitMessage(self: *const Engine, buf: []u8, err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.TooManyQuestions => std.fmt.bufPrint(buf, "too many questions in one request (limit {d}, MLX_SERVE_LAYA_MAX_QUESTIONS)", .{self.max_questions}) catch null,
+            error.TooManyInputTokens => std.fmt.bufPrint(buf, "the questions total more than {d} input tokens (MLX_SERVE_LAYA_MAX_INPUT_TOKENS); split them over several requests", .{self.max_input_tokens}) catch null,
+            error.TooManyOptions => std.fmt.bufPrint(buf, "a question has more options than fit in the {d}-token input (never more than {d})", .{ self.model.cfg.max_len, maxOptions(&self.model.cfg) }) catch null,
+            else => null,
+        };
     }
 
     pub fn deinit(self: *Engine) void {
@@ -1706,6 +1784,7 @@ pub const Engine = struct {
         if (questions != .object) return error.QuestionsNotObject;
         const qobj = questions.object;
         const nq = qobj.count();
+        if (nq > self.max_questions) return error.TooManyQuestions;
         const cfg = &self.model.cfg;
 
         // No question: Python never serializes the state and answers `{}`.
@@ -1731,12 +1810,17 @@ pub const Engine = struct {
         var qi: usize = 0;
         while (it.next()) |kv| : (qi += 1) {
             qids[qi] = kv.key_ptr.*;
-            qs[qi] = try Question.fromJson(a, kv.value_ptr.*);
+            qs[qi] = try Question.fromJson(a, kv.value_ptr.*, maxOptions(cfg));
             nqs += 1;
-            seqs[qi] = try buildSequence(a, &self.model.tok, cfg, state_text, &qs[qi]);
-            nseq += 1;
-            if (seqs[qi].markers.len != qs[qi].optionCount()) return error.TooManyOptions;
         }
+        var input_tokens: usize = 0;
+        for (qs, seqs) |*q, *sq| {
+            sq.* = try buildSequence(a, &self.model.tok, cfg, state_text, q);
+            nseq += 1;
+            if (sq.markers.len != q.optionCount()) return error.TooManyOptions;
+            input_tokens += sq.ids.len;
+        }
+        if (input_tokens > self.max_input_tokens) return error.TooManyInputTokens;
 
         log.debug("[laya] prepare {d} question(s): {d:.2} ms\n", .{ nq, msSince(t_prep) });
         var out: std.ArrayList(u8) = .empty;
@@ -1744,7 +1828,6 @@ pub const Engine = struct {
         try out.appendSlice(a, "{\"model\":");
         try pyJsonString(a, &out, model_id, false);
         try out.appendSlice(a, ",\"answers\":{");
-        var input_tokens: usize = 0;
 
         var start: usize = 0;
         while (start < nq) : (start += BATCH_SIZE) {
@@ -1759,7 +1842,6 @@ pub const Engine = struct {
                 ids[i - start] = seqs[i].ids;
                 markers[i - start] = seqs[i].markers;
                 qtypes[i - start] = qs[i].t;
-                input_tokens += seqs[i].ids.len;
             }
             var res = try self.model.forward(.{ .ids = ids, .markers = markers, .qtype = qtypes });
             defer res.deinit(a);
@@ -1857,6 +1939,7 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
         error.TooManyOptions => "a question has too many options for the token budget",
         error.NonFiniteNumber => "a number in the request is outside the float64 range",
         error.LoneSurrogate => "a text the model reads holds a lone UTF-16 surrogate escape (\\ud800-\\udfff)",
+        error.NestingTooDeep => std.fmt.comptimePrint("the request nests arrays/objects more than {d} levels deep", .{MAX_JSON_DEPTH}),
         else => null,
     };
 }
@@ -1945,6 +2028,62 @@ test "laya: request JSON reads like Python json.loads (repeated keys, lone surro
     }
 }
 
+test "laya: nesting past MAX_JSON_DEPTH is refused before parsing or serializing" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"state\": ");
+    try body.appendNTimes(a, '[', 100_000);
+    try body.appendNTimes(a, ']', 100_000);
+    try body.append(a, '}');
+    try testing.expectError(error.NestingTooDeep, checkJsonDepth(body.items));
+    // Exactly MAX_JSON_DEPTH levels pass; brackets inside strings do not count.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(a);
+    try ok.appendNTimes(a, '[', MAX_JSON_DEPTH - 1);
+    try ok.appendSlice(a, "[\"[[[[{{{{\\\"[[\"]");
+    try ok.appendNTimes(a, ']', MAX_JSON_DEPTH - 1);
+    try checkJsonDepth(ok.items);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, ok.items, .{});
+    defer parsed.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try pyJson(a, &out, parsed.value, false);
+    // A deeper value handed to the serializer directly is refused too.
+    try ok.insert(a, 0, '[');
+    try ok.append(a, ']');
+    try testing.expectError(error.NestingTooDeep, checkJsonDepth(ok.items));
+    var deeper = try std.json.parseFromSlice(std.json.Value, a, ok.items, .{});
+    defer deeper.deinit();
+    try testing.expectError(error.NestingTooDeep, pyJson(a, &out, deeper.value, false));
+}
+
+test "laya: option lists past maxOptions are refused before de-duplication" {
+    const a = testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try body.appendSlice(a, "{\"type\": \"choice\", \"instructions\": \"?\", \"criteria\": [");
+    for (0..250_000) |i| try body.print(a, "{s}\"l{d}\"", .{ if (i > 0) "," else "", i });
+    try body.appendSlice(a, "]}");
+    var big = try std.json.parseFromSlice(std.json.Value, a, body.items, .{});
+    defer big.deinit();
+    try testing.expectError(error.TooManyOptions, Question.fromJson(a, big.value, 1021));
+    // Every question type, both choice forms; at the bound duplicates are still found.
+    var shapes = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"list": {"type": "choice", "instructions": "", "criteria": ["a", "b", "c"]},
+        \\ "obj": {"type": "choice", "instructions": "", "criteria": {"a": 1, "b": 2, "c": 3}},
+        \\ "score": {"type": "score", "instructions": "", "criteria": [1, 2, 3]},
+        \\ "dup": {"type": "choice", "instructions": "", "criteria": ["a", "b", "a"]}}
+    , .{});
+    defer shapes.deinit();
+    for ([_][]const u8{ "list", "obj", "score" }) |name| {
+        try testing.expectError(error.TooManyOptions, Question.fromJson(a, shapes.value.object.get(name).?, 2));
+        var q = try Question.fromJson(a, shapes.value.object.get(name).?, 3);
+        q.deinit(a);
+    }
+    try testing.expectError(error.BadChoiceCriteria, Question.fromJson(a, shapes.value.object.get("dup").?, 3));
+}
+
 test "laya: renderOptions for the three question types" {
     const a = testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, a,
@@ -1957,7 +2096,7 @@ test "laya: renderOptions for the three question types" {
     defer parsed.deinit();
     const o = parsed.value.object;
 
-    var q1 = try Question.fromJson(a, o.get("department").?);
+    var q1 = try Question.fromJson(a, o.get("department").?, 1021);
     defer q1.deinit(a);
     const r1 = try renderOptions(a, &q1);
     defer {
@@ -1968,7 +2107,7 @@ test "laya: renderOptions for the three question types" {
     try testing.expectEqualStrings("billing: invoices, payments, refunds", r1[0]);
     try testing.expectEqualStrings("sales", r1[2]);
 
-    var q2 = try Question.fromJson(a, o.get("urgency").?);
+    var q2 = try Question.fromJson(a, o.get("urgency").?, 1021);
     defer q2.deinit(a);
     const r2 = try renderOptions(a, &q2);
     defer {
@@ -1978,7 +2117,7 @@ test "laya: renderOptions for the three question types" {
     try testing.expectEqualStrings("level 0: not urgent", r2[0]);
     try testing.expectEqualStrings("level 1: {\"desc\": \"soon\"}", r2[1]);
 
-    var q3 = try Question.fromJson(a, o.get("churn").?);
+    var q3 = try Question.fromJson(a, o.get("churn").?, 1021);
     defer q3.deinit(a);
     const r3 = try renderOptions(a, &q3);
     defer {
@@ -1988,7 +2127,7 @@ test "laya: renderOptions for the three question types" {
     try testing.expectEqualStrings("false: no, the statement does not hold", r3[0]);
     try testing.expectEqualStrings("true: yes, the statement holds", r3[1]);
 
-    var q4 = try Question.fromJson(a, o.get("labels").?);
+    var q4 = try Question.fromJson(a, o.get("labels").?, 1021);
     defer q4.deinit(a);
     try testing.expectEqualStrings("42", q4.ins);
     try testing.expectEqual(@as(usize, 2), q4.labels.len);
@@ -1997,7 +2136,7 @@ test "laya: renderOptions for the three question types" {
         \\{"type": "choice", "instructions": "x", "criteria": ["a", "a"]}
     , .{});
     defer dup.deinit();
-    try testing.expectError(error.BadChoiceCriteria, Question.fromJson(a, dup.value));
+    try testing.expectError(error.BadChoiceCriteria, Question.fromJson(a, dup.value, 1021));
 }
 
 test "laya: calibration helpers" {
@@ -2072,7 +2211,7 @@ test "laya: prompt construction reproduces laya_mlx token ids and markers" {
         const o = c.object;
         const state_text = try renderValue(a, o.get("state").?);
         defer a.free(state_text);
-        var q = try Question.fromJson(a, o.get("question").?);
+        var q = try Question.fromJson(a, o.get("question").?, 1021);
         defer q.deinit(a);
         var seq = try buildSequence(a, &tok, &cfg, state_text, &q);
         defer seq.deinit(a);
@@ -2209,6 +2348,29 @@ test "laya: predict reproduces laya_mlx answers for the en/fr/hi states (toleran
     std.debug.print("\n[laya] predict parity max|diff| {d:.4}\n", .{max_diff});
 }
 
+test "laya: question and input-token limits reject a request before any forward" {
+    const dir = testModelDir() orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const engine = try Engine.load(testIo(), a, dir, s);
+    defer engine.deinit();
+    var qs = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"a": {"type": "noul", "instructions": "x?"}, "b": {"type": "noul", "instructions": "y?"}, "c": {"type": "noul", "instructions": "z?"}}
+    , .{});
+    defer qs.deinit();
+    const state = std.json.Value{ .string = "some state" };
+    engine.max_questions = 2;
+    try testing.expectError(error.TooManyQuestions, engine.predictJson(a, "m", state, qs.value));
+    engine.max_questions = 3;
+    engine.max_input_tokens = 10;
+    try testing.expectError(error.TooManyInputTokens, engine.predictJson(a, "m", state, qs.value));
+    var buf: [160]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, engine.limitMessage(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
+    engine.max_input_tokens = Engine.DEFAULT_MAX_INPUT_TOKENS;
+    a.free(try engine.predictJson(a, "m", state, qs.value));
+}
+
 test "laya: request serialization matches Python json.dumps text and token ids" {
     const fx_dir = testFixturesDir() orelse return error.SkipZigTest;
     const a = testing.allocator;
@@ -2230,7 +2392,7 @@ test "laya: request serialization matches Python json.dumps text and token ids" 
         tok = try tokenizer_mod.loadTokenizer(testIo(), a, tok_dir);
         cfg = try parseConfig(testIo(), a, dir, &tok.?);
     }
-    var state_q = try Question.fromJson(a, root.get("question").?);
+    var state_q = try Question.fromJson(a, root.get("question").?, 1021);
     defer state_q.deinit(a);
 
     // `cases`: a state object; `ascii_cases`: non-string instructions over the state "x".
@@ -2243,7 +2405,7 @@ test "laya: request serialization matches Python json.dumps text and token ids" 
         defer v.deinit();
         const state_text = if (is_state) try renderValue(a, v.value) else try a.dupe(u8, "x");
         defer a.free(state_text);
-        var q: ?Question = if (is_state) null else try Question.fromJson(a, v.value);
+        var q: ?Question = if (is_state) null else try Question.fromJson(a, v.value, 1021);
         defer if (q) |*qq| qq.deinit(a);
         testing.expectEqualStrings(c.get("dumps").?.string, if (is_state) state_text else q.?.ins) catch |e| {
             std.debug.print("{s} {s}\n", .{ kind, c.get("name").?.string });
@@ -2564,7 +2726,7 @@ test "laya: buildSequence frees everything when any allocation fails" {
         \\{"type": "choice", "instructions": "Which team?", "criteria": {"billing": "refunds", "sales": ""}}
     , .{});
     defer qv.deinit();
-    var q = try Question.fromJson(a, qv.value);
+    var q = try Question.fromJson(a, qv.value, maxOptions(&cfg));
     defer q.deinit(a);
     // Refuse in-place shrinks so every toOwnedSlice allocates and can fail.
     var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
