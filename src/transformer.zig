@@ -29116,8 +29116,10 @@ pub const Transformer = struct {
         down_qp: anytype,
         D: c_int,
         K: c_int,
-        B: c_int,
+        batch: c_int,
+        seq: c_int,
     ) !bool {
+        const B = batch * seq; // one kernel row per token
         if (!gatherQmvDownReduceRowsEligible(self.config.hidden_act, gate_qp, up_qp, down_qp, D)) return false;
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
@@ -29166,8 +29168,12 @@ pub const Transformer = struct {
         )) orelse return false;
         defer _ = mlx.mlx_array_free(sum_2d);
         const hidden = mlx.getShape(sum_2d)[1];
-        const bsh_shape = [_]c_int{ B, 1, hidden };
+        const bsh_shape = [_]c_int{ batch, seq, hidden };
         try mlx.check(mlx.mlx_reshape(out, sum_2d, &bsh_shape, 3, self.s));
+        if (seq > 1 and !moe_verify_rows_logged) {
+            moe_verify_rows_logged = true;
+            log.info("[moe-rows] verify rows engaged: S={d} K={d}\n", .{ seq, K });
+        }
         reduced.* = true;
         return true;
     }
@@ -29342,7 +29348,7 @@ pub const Transformer = struct {
 
         if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
-            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B))
+            try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
         {
             moe_rows_fused_layers +%= 1;
             cost_arm = 1;
@@ -36534,17 +36540,39 @@ fn moeRowsFusedEnabled() bool {
     return enabled;
 }
 
+pub var moe_verify_rows_override: ?bool = null; // test seam
+var moe_verify_rows_cached: ?bool = null;
+var moe_verify_rows_logged: bool = false;
+
+/// Single-slot verify widths (B == 1, 2 <= S <= 8) through the rows arm. On by
+/// default on Ultra chips only; MLX_SERVE_MOE_VERIFY_ROWS=1/0 forces it on any chip.
+fn moeVerifyRowsEnabled() bool {
+    if (moe_verify_rows_override) |v| return v;
+    if (moe_verify_rows_cached) |v| return v;
+    var buf: [128]u8 = undefined;
+    const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_ROWS");
+    const on = moeVerifyRowsFor(if (raw) |r| std.mem.sliceTo(r, 0) else null, ane_offload.chipBrandString(&buf));
+    moe_verify_rows_cached = on;
+    return on;
+}
+
+fn moeVerifyRowsFor(env: ?[]const u8, chip: []const u8) bool {
+    if (env) |e| return !std.mem.eql(u8, e, "0");
+    return std.mem.indexOf(u8, chip, "Ultra") != null;
+}
+
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
 
 /// ONE place decides the decode MoE arm: fused rows for S == 1 and
-/// 2 <= B <= 8 without expert bias; the single-row gatherQmv at B == 1; the
-/// sorted chain otherwise, and whenever a stand-in diagnostic wants the stock path.
+/// 2 <= B <= 8, or B == 1 and 2 <= S <= 8 (verify), without expert bias; the
+/// single-row gatherQmv at B == 1; the sorted chain otherwise, and whenever a
+/// stand-in diagnostic wants the stock path.
 fn moeDecodeDispatchArm(B: c_int, S: c_int, K: c_int, has_expert_bias: bool) MoeDecodeDispatchArm {
     const total_inds: c_int = B * S * K;
     const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias;
-    if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !has_expert_bias and
-        !qwen4Standin().moe_gateup and !qwen4Standin().moe_down)
-        return .rows;
+    const stock = has_expert_bias or qwen4Standin().moe_gateup or qwen4Standin().moe_down;
+    if (S == 1 and B >= 2 and B <= 8 and moeRowsFusedEnabled() and !stock) return .rows;
+    if (B == 1 and S >= 2 and S <= 8 and moeVerifyRowsEnabled() and !stock) return .rows;
     if (do_sort) return .sorted;
     return .gather_qmv;
 }
@@ -43331,6 +43359,31 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
     qwen4_standin_override = .{ .moe_down = true };
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, K, false));
     qwen4_standin_override = .{};
+}
+
+test "moe decode dispatch: single-slot verify widths take the rows arm when enabled" {
+    qwen4_standin_override = .{};
+    defer qwen4_standin_override = null;
+    moe_verify_rows_override = true;
+    defer moe_verify_rows_override = null;
+    const K: c_int = 10;
+    var s: c_int = 2;
+    while (s <= 8) : (s += 1) {
+        try std.testing.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(1, s, K, false));
+    }
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 9, K, false));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, true));
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 4, K, false));
+    qwen4_standin_override = .{ .moe_gateup = true };
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+    qwen4_standin_override = .{};
+    moe_verify_rows_override = false;
+    try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
+
+    try std.testing.expect(moeVerifyRowsFor(null, "Apple M5 Ultra"));
+    try std.testing.expect(!moeVerifyRowsFor(null, "Apple M5 Max"));
+    try std.testing.expect(!moeVerifyRowsFor("0", "Apple M5 Ultra"));
+    try std.testing.expect(moeVerifyRowsFor("1", "Apple M5 Max"));
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {
