@@ -23,6 +23,10 @@
 - The app's chats and agents send earlier images again on every turn (Qwen, LFM2-VL, Muse); Gemma still sends only the latest message's images. LFM2-VL models loaded from the app get their image markers back, and LFM2-VL 1.6B no longer drops agent tool turns to a generic prompt format.
 - Models without vision tell an agent when its tool returned an image they cannot see, instead of dropping it silently.
 - opencode and opencode2 launchers turn thinking on (medium by default, with none/low/medium/high variants); Claude Code launched from the app skips permission prompts.
+- Qwen3.8 27B and Flash Next decode a few percent faster: each GDN layer runs its prework and recurrence as one GPU dispatch, in plain decode and MTP verify (M4 Max +1-3%, M5 Ultra +4%). Thanks @STRML (#517).
+- On Ultra chips, MTP decode with Qwen3.8 Flash Next is about 14% faster: verify steps use the fused MoE kernel. Thanks @STRML (#519).
+- A request without `tools` gets the model's reply as-is, like other engines: tool-call markup the model writes anyway is no longer cut to an empty answer when not streaming, and streaming returns the same text.
+- "Choose file…" in the Voice, Music, Video, Image and 3D panes opens over the window instead of in the bottom-left corner of the screen. Thanks @lojza3d (#521).
 
 ## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 

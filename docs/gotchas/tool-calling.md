@@ -832,3 +832,19 @@ model's `chat_template_kwargs` in `model-settings.json`, or the request's own,
 can turn it back on. Precedence: request, model settings, generation_config, arch.
 Guard: the `preserve_thinking` test beside `serializeExtraContext`,
 `resolveChatThinking` in `server.zig`.
+
+## A no-tools reply was scrubbed to nothing, but only when not streaming (LFM2.5, 2026-09-24)
+
+A system prompt that listed a tool in LFM's own format, with no `tools` field,
+made LFM2.5 answer `<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>`.
+Streaming sent it raw; non-stream returned `content: ""` with `finish_reason: stop`
+on chat, messages and responses.
+
+Cause: `splitThinkBlock` runs `trimLeakedToolMarkup` on every non-stream reply,
+and `"<|tool_call"` is a prefix of LFM's opener. The stream gate only runs with
+tools. vLLM, SGLang, llama.cpp and Ollama parse tool calls only when the request
+has tools and otherwise pass the text through.
+
+Fix: the non-stream split keeps markup when the request has no tools (chat,
+messages, responses), matching the stream and the other engines.
+Guard: `tests/test_no_tools_markup_passthrough.sh`.

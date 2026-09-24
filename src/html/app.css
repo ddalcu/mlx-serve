@@ -77,14 +77,8 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   padding: 6px 8px 14px;
 }
 .wordmark { font-size: 16px; font-weight: 600; letter-spacing: -.01em; flex: 1 }
-.logo {
-  width: 20px;
-  height: 20px;
-  flex: 0 0 20px;
-  background: linear-gradient(135deg, #8ab4f8, #c58af9 55%, #f28b82);
-  /* Four-point sparkle, drawn — the page stays one self-contained document. */
-  clip-path: polygon(50% 0%, 61% 39%, 100% 50%, 61% 61%, 50% 100%, 39% 61%, 0% 50%, 39% 39%);
-}
+/* The app icon, inlined as a data URI so the page stays one self-contained document. */
+.logo { width: 24px; height: 24px; flex: 0 0 24px; border-radius: 6px }
 
 .side-toggle, .side-open {
   width: 26px;
@@ -129,13 +123,10 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 
 /* Icons: small CSS drawings, so the page stays one self-contained document. */
 .ic { width: 16px; height: 16px; flex: 0 0 16px; position: relative; color: var(--dim) }
-.ic-new::before {
-  content: ""; position: absolute; left: 1px; top: 10px; width: 13px; height: 2px;
-  background: currentColor; transform: rotate(-45deg); border-radius: 1px;
-}
-.ic-new::after {
-  content: ""; position: absolute; right: 0; top: 1px; width: 5px; height: 5px;
-  border: 2px solid currentColor; border-radius: 1px; transform: rotate(45deg);
+.ic svg {
+  width: 16px; height: 16px; display: block;
+  fill: none; stroke: currentColor; stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
 }
 .ic-monitor::before {
   content: ""; position: absolute; inset: 1px; border: 1.6px solid currentColor;
@@ -145,12 +136,6 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   content: ""; position: absolute; left: 7px; top: 4px; width: 1.6px; height: 5px;
   background: currentColor; transform-origin: bottom; transform: rotate(38deg);
 }
-.ic-api::before, .ic-api::after {
-  content: ""; position: absolute; width: 5px; height: 5px;
-  border: 1.6px solid currentColor; border-radius: 1.5px;
-}
-.ic-api::before { left: 1px; top: 2px; box-shadow: 8px 0 0 -1.6px currentColor inset }
-.ic-api::after { left: 1px; bottom: 2px; width: 12px }
 
 .recents { flex: 1; overflow-y: auto; margin-top: 18px; min-height: 0 }
 .recents-h {
@@ -252,23 +237,6 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 }
 .composer:focus-within { border-color: #3c4043 }
 
-.plus {
-  width: 36px; height: 36px;
-  border-radius: 50%;
-  flex: 0 0 36px;
-  position: relative;
-  cursor: pointer;
-  color: var(--dim);
-}
-.plus:hover { background: #2f3133; color: var(--fg) }
-.plus::before, .plus::after {
-  content: ""; position: absolute; left: 50%; top: 50%;
-  background: currentColor; border-radius: 1px;
-  transform: translate(-50%, -50%);
-}
-.plus::before { width: 15px; height: 1.8px }
-.plus::after { width: 1.8px; height: 15px }
-
 .composer textarea {
   flex: 1;
   min-width: 0;
@@ -283,27 +251,24 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 }
 .composer textarea::placeholder { color: var(--faint) }
 
-.pill {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+/* Round icon buttons in the composer (Lucide icons, see NOTICE); `.on` is the lit state. */
+.ibtn {
+  width: 36px; height: 36px;
+  flex: 0 0 36px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
   background: #2f3133;
-  border-radius: 999px;
-  padding: 7px 12px;
-  color: var(--fg);
-  font-size: 13px;
-  white-space: nowrap;
-  max-width: 230px;
-  flex: 0 0 auto;
+  color: #c4c7c5;
+  cursor: pointer;
 }
-.pill:hover { background: #3a3c3f }
-.pill span:first-child { overflow: hidden; text-overflow: ellipsis }
-.chev {
-  width: 7px; height: 7px; flex: 0 0 7px;
-  border-right: 1.6px solid var(--dim);
-  border-bottom: 1.6px solid var(--dim);
-  transform: rotate(45deg) translate(-2px, -2px);
+.ibtn[hidden] { display: none }
+.ibtn:hover { background: #3a3c3f; color: var(--fg) }
+.ibtn svg {
+  width: 18px; height: 18px;
+  fill: none; stroke: currentColor; stroke-width: 1.6;
+  stroke-linecap: round; stroke-linejoin: round;
 }
+.ibtn.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent) }
 
 .send {
   width: 36px; height: 36px;
@@ -403,7 +368,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   margin-top: 8px;
 }
 
-/* Waiting on the model: three rising dots plus whatever we currently know
+/* Waiting on the model: three pulsing dots plus whatever we currently know
  * ("loading <model>…", "thinking…", "Generating 2/4…"). It lives IN the
  * transcript because that is where the answer will appear — a status line under
  * the composer is too far from where you're looking. */
@@ -415,20 +380,19 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   color: var(--dim);
   font-size: 14px;
 }
-.dots { display: inline-flex; align-items: flex-end; gap: 4px; height: 16px; flex: 0 0 auto }
+.dots { display: inline-flex; align-items: center; gap: 5px; height: 16px; flex: 0 0 auto }
 .dots i {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   background: currentColor;
-  animation: dotwave 1.2s infinite ease-in-out;
+  animation: dotpulse 1.2s infinite ease-in-out;
 }
-.dots i:nth-child(1) { margin-bottom: 0; animation-delay: 0s }
-.dots i:nth-child(2) { margin-bottom: 4px; animation-delay: .16s }
-.dots i:nth-child(3) { margin-bottom: 8px; animation-delay: .32s }
-@keyframes dotwave {
-  0%, 65%, 100% { opacity: .3; transform: translateY(0) }
-  30% { opacity: 1; transform: translateY(-3px) }
+.dots i:nth-child(2) { animation-delay: .16s }
+.dots i:nth-child(3) { animation-delay: .32s }
+@keyframes dotpulse {
+  0%, 65%, 100% { opacity: .3; transform: scale(.8) }
+  30% { opacity: 1; transform: scale(1) }
 }
 @media (prefers-reduced-motion: reduce) {
   .dots i { animation: none; opacity: .6 }
@@ -565,6 +529,8 @@ table.models .state.error { color: #f28b82 }
   .greeting { font-size: 30px }
   .scroll, .log { padding-left: 16px; padding-right: 16px }
   .dock { padding-left: 12px; padding-right: 12px }
+  .composer { gap: 4px }
+  .ibtn { width: 32px; height: 32px; flex-basis: 32px }
 }
 
 
@@ -572,11 +538,4 @@ table.models .state.error { color: #f28b82 }
    The mic lives in the COMPOSER row, not the toolbar: the header's width
    budget is full and anything added there re-triggers » eviction at small
    widths (same reason the sandbox shield sits here). */
-#chat-voice.on {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-  border-color: var(--accent);
-  color: var(--accent);
-}
-#chat-voice.listening #chat-voice-label::after { content: " ● "; color: #e5534b; }
-#chat-voice.speaking #chat-voice-label::after { content: " ♪"; }
-#chat-voice.thinking #chat-voice-label::after { content: " …"; }
+#chat-voice.listening { color: #e5534b; background: color-mix(in srgb, #e5534b 18%, transparent) }

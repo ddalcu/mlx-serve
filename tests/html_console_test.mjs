@@ -470,6 +470,11 @@ test('systemPrompt teaches the model this server, its models and its tools', () 
   assert.match(p, /generate_music/);
 });
 
+test('systemPrompt with tools switched off advertises none', () => {
+  const p = C.systemPrompt({ models: FLEET, api: [], origin: 'http://127.0.0.1:11434', tools: [] });
+  assert.doesNotMatch(p, /generate_image|generate_music|generate_speech|edit_image/);
+});
+
 test('systemPrompt carries the real base URL and real request fields', () => {
   // A path list alone is not enough to answer "how do I edit an image?": live,
   // the model filled the gap itself and produced

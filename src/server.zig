@@ -9837,7 +9837,7 @@ fn handleNonStreamingGeneration(
     defer if (budget_reasoning_allocated) allocator.free(budget_truncated_reasoning.?);
 
     if (enable_thinking and reasoning_budget >= 0) {
-        const think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
+        const think_split = if (has_tools) chat_mod.splitThinkBlock(final_text, true, opens_think) else chat_mod.splitThinkBlockKeepingMarkup(final_text, true, opens_think);
         if (think_split.reasoning_content) |reasoning| {
             // Count tokens in reasoning by encoding it
             const reasoning_ids = try tok.encode(allocator, reasoning);
@@ -9958,7 +9958,7 @@ fn handleNonStreamingGeneration(
     // stripped (tokens we discarded still counted against tok/s).
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, !has_tools, opens_think);
     const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
@@ -15268,7 +15268,7 @@ fn handleAnthropicNonStreaming(
         const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
-            const t = chat_mod.trimLeakedToolMarkup(r);
+            const t = if (has_tools) chat_mod.trimLeakedToolMarkup(r) else r;
             break :blk if (t.len > 0) t else null;
         } else null;
         if (split_reasoning) |reasoning| {
@@ -15359,7 +15359,7 @@ fn handleAnthropicNonStreaming(
     } else {
         // No tools — emit text block
         if (block_count > 0) try content.append(allocator, ',');
-        const esc_text = try jsonEscape(allocator, if (routed != null) final_text else chat_mod.trimLeakedToolMarkup(final_text));
+        const esc_text = try jsonEscape(allocator, if (routed != null or !has_tools) final_text else chat_mod.trimLeakedToolMarkup(final_text));
         defer allocator.free(esc_text);
         const text_block = try std.fmt.allocPrint(allocator,
             \\{{"type":"text","text":{s}}}
@@ -17417,7 +17417,7 @@ fn handleResponsesInner(
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, !has_tools, promptOpensThink(allocator, lm, tok, prompt_ids));
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 

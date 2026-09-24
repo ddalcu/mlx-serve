@@ -341,7 +341,7 @@
   function systemPrompt(o) {
     var models = (o && o.models) || [];
     var api = (o && o.api) || [];
-    var tools = mediaTools(models);
+    var tools = o && o.tools ? o.tools : mediaTools(models);
     var parts = [];
     parts.push(
       'You are the assistant built into the mlx-serve web console. mlx-serve is a native ' +
@@ -872,12 +872,13 @@
   var MODELS = [];
   var API_ENTRIES = [];
 
-  var STORE = { chats: 'mlx-serve.chats', model: 'mlx-serve.model', think: 'mlx-serve.thinking' };
+  var STORE = { chats: 'mlx-serve.chats', model: 'mlx-serve.model', think: 'mlx-serve.thinking', tools: 'mlx-serve.tools' };
   var lsGet = function (k, d) { try { var v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } };
   var lsSet = function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode / quota */ } };
 
   var CURRENT_MODEL = lsGet(STORE.model, '') || '';
   var THINKING = lsGet(STORE.think, '0') === '1';
+  var TOOLS = lsGet(STORE.tools, '1') === '1';
   var HISTORY = [];
   var CHAT_ID = null;
 
@@ -997,8 +998,17 @@
 
   function syncModelPill() {
     var id = currentModel();
-    $('chat-model-name').textContent = shortModelName(id);
-    $('chat-model').title = id || 'no chat model on this server';
+    $('chat-model').title = id ? 'Model: ' + id : 'no chat model on this server';
+    syncToggle('chat-think', THINKING, 'Thinking');
+    syncToggle('chat-tools-toggle', TOOLS, 'Media tools');
+    $('chat-tools-toggle').hidden = !mediaTools(MODELS).length;
+  }
+
+  function syncToggle(id, on, name) {
+    var b = $(id);
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    b.title = name + (on ? ' on' : ' off');
   }
 
   function buildMenu() {
@@ -1035,31 +1045,6 @@
       });
       menu.appendChild(b);
     });
-
-    var sep = document.createElement('div');
-    sep.className = 'menu-sep';
-    menu.appendChild(sep);
-
-    var think = document.createElement('button');
-    think.className = 'menu-item';
-    var tick2 = document.createElement('span');
-    tick2.className = 'tick';
-    tick2.textContent = THINKING ? '✓' : '';
-    var txt2 = document.createElement('span');
-    var n2 = document.createElement('div');
-    n2.className = 'mt';
-    n2.textContent = 'Extended thinking';
-    var s2 = document.createElement('div');
-    s2.className = 'ms';
-    s2.textContent = 'shows the model\'s reasoning';
-    txt2.appendChild(n2); txt2.appendChild(s2);
-    think.appendChild(tick2); think.appendChild(txt2);
-    think.addEventListener('click', function () {
-      THINKING = !THINKING;
-      lsSet(STORE.think, THINKING ? '1' : '0');
-      buildMenu();
-    });
-    menu.appendChild(think);
   }
 
   function openMenu() {
@@ -1580,6 +1565,8 @@
   var chatAbort = null;
   var MAX_TOOL_ROUNDS = 4;
 
+  function chatTools() { return TOOLS ? mediaTools(MODELS) : []; }
+
   function chatBusy(busy) {
     $('chat-send').hidden = busy;
     $('chat-stop').hidden = !busy;
@@ -1597,10 +1584,10 @@
       signal: chatAbort.signal,
       body: JSON.stringify(chatBody({
         model: model,
-        system: systemPrompt({ models: MODELS, api: API_ENTRIES, origin: location.origin }),
+        system: systemPrompt({ models: MODELS, api: API_ENTRIES, origin: location.origin, tools: chatTools() }),
         turns: sTurns,
         thinking: THINKING,
-        tools: mediaTools(MODELS),
+        tools: chatTools(),
       })),
     });
     if (!res.ok) throw new Error(await failureText(res));
@@ -1842,9 +1829,8 @@
     if (next === VOICE.state) return;
     VOICE.state = next;
     var b = $('chat-voice');
-    b.className = 'pill' + (next === 'off' ? '' : ' on ' + next);
-    $('chat-voice-label').textContent =
-      next === 'off' ? 'Voice'
+    b.className = 'ibtn' + (next === 'off' ? '' : ' on ' + next);
+    b.title = next === 'off' ? 'Voice mode: speak, and hear the reply'
       : next === 'listening' ? 'Listening'
       : next === 'thinking' ? 'Thinking'
       : 'Speaking';
@@ -1960,6 +1946,17 @@
       voiceSet(VOICE.state === 'off' ? 'enable' : 'disable');
     });
   }
+
+  $('chat-think').addEventListener('click', function () {
+    THINKING = !THINKING;
+    lsSet(STORE.think, THINKING ? '1' : '0');
+    syncModelPill();
+  });
+  $('chat-tools-toggle').addEventListener('click', function () {
+    TOOLS = !TOOLS;
+    lsSet(STORE.tools, TOOLS ? '1' : '0');
+    syncModelPill();
+  });
 
   $('chat-send').addEventListener('click', sendChat);
   $('chat-stop').addEventListener('click', function () {
