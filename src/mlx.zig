@@ -139,6 +139,11 @@ pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
 pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
 pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
 pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
+// Graph printing, for the decode-graph dump diagnostic (MLX_SERVE_DECODE_GRAPH_DUMP).
+pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_node_namer_new() mlx_node_namer;
+pub extern "c" fn mlx_node_namer_free(namer: mlx_node_namer) c_int;
+pub extern "c" fn mlx_print_graph(os: *std.c.FILE, namer: mlx_node_namer, outputs: mlx_vector_array) c_int;
 pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
 pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
 pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
