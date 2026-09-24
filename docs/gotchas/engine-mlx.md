@@ -22,6 +22,12 @@ A restored cache SHARES the donor entry's buffer; the first append copied the WH
 - Same issue: evict-to-admit was gated on `longCtxGated()` (qwen4 only), so every other arch refused a long prompt it could fit by dropping cache. Both gates removed.
 - Guard: `KVCache: an append after a short restore sizes its copy from the prefix` unit test; live `~/claude-tmp/issue492/hi_size.sh` (resident MB of the hi entry).
 
+### A warm turn that could not SHARE its prefix was refused (PR #518)
+A 27B 8-bit agent turn on a 64 GB Mac, 46k of 47.7k tokens warm, got `PrefillDoesNotFit`. Off SSD-first a restore shares the entry's buffers and the first append copies the whole prefix, so the bill (the full cold prompt) was honest: the machine could not hold two copies. The move path that avoids the copy was armed only in SSD-first mode.
+- Fix: when the admission pass finds the share does not fit on a full-entry hit, it takes the checkout on demand (`HotPrefixCache.checkoutRestored`), credits the resident rows (`prefillRequestTerms` off the gate) and re-bills. A share that fits is unchanged. Tradeoff: a request that fails mid-prefill after donating loses the entry.
+- Same pass: a repeated ONE-token prompt fully matched its own entry and restored it whole, leaving nothing to forward; `Generator.initWithOptions` segfaulted. The lookup now declines it (cold prefill).
+- Guards: `restore by move ON DEMAND` and `a one-token prompt that hits its own entry` unit tests; live `~/claude-tmp/rel-2696-20260923/move/move_repro.py` (red 400 on the old binary, green 200 with byte-equal output vs the share on Qwen3.5-2B, gemma-4-e4b, kv8).
+
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 

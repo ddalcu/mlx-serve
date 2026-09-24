@@ -293,7 +293,8 @@ var restore_move_env_cached: ?bool = null;
 pub var restore_move_override: ?bool = null;
 
 /// Restore by move. `MLX_SERVE_RESTORE_MOVE=0` restores the refcount share whose first append
-/// copies the whole prefix. Armed only where `HotPrefixCache.ssd_first` is.
+/// copies the whole prefix. Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
+/// does not fit (`checkoutRestored`).
 pub fn restoreMoveEnabled() bool {
     if (restore_move_override) |v| return v;
     if (restore_move_env_cached) |v| return v;
@@ -423,6 +424,8 @@ pub const HotPrefixCache = struct {
     disk_dirty: bool = false,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
+    /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).
+    last_restored_shared: usize = 0,
     last_restored_disk_id: ?u64 = null,
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
@@ -1255,6 +1258,13 @@ pub const HotPrefixCache = struct {
             });
             return .{ .matched = 0, .full_match = false };
         }
+        // A full reuse re-forwards the last token; a one-token prompt has nothing before it.
+        if (prompt_ids.len == 1) {
+            try target_cache.truncate(0, s);
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
+            target_moe_seq_offset.* = 0;
+            return .{ .matched = 0, .full_match = false };
+        }
         const would_full = m.shared == prompt_ids.len and m.shared > 1;
         const restore_cap: usize = blk: {
             if (target_ssm_entries == null or !would_full) break :blk m.shared;
@@ -1272,6 +1282,7 @@ pub const HotPrefixCache = struct {
         e.last_used = self.bumpCounter();
         // Identity of the entry this request runs on: evicting it frees nothing (shared buffers).
         self.last_restored_used = e.last_used;
+        self.last_restored_shared = m.shared;
 
         // The sole caller reads an error as "no match" and cold-prefills the whole prompt, so a
         // failed restore must hand back an EMPTY cache, never a half-bound one.
@@ -1430,6 +1441,22 @@ pub const HotPrefixCache = struct {
         e.checked_out_by = slot_id;
         log.info("  [hot-cache] checked out {d}-token entry to the slot (restore by move; the append donates in place)\n", .{e.tokens.len});
         return true;
+    }
+
+    /// Restore by move on demand: the admission pass found this slot's share does not fit (its first
+    /// append would copy the whole prefix). Takes the checkout `checkoutIfEligible` takes up front in
+    /// SSD-first mode, on the entry the slot just restored.
+    pub fn checkoutRestored(self: *HotPrefixCache, slot_id: usize, prompt_len: usize) bool {
+        const used = self.last_restored_used orelse return false;
+        for (self.entries.items) |*e| {
+            if (e.last_used != used) continue;
+            if (e.checked_out_by != null) return false;
+            if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
+            e.checked_out_by = slot_id;
+            log.info("  [hot-cache] checked out {d}-token entry to the slot (the share does not fit; the append donates in place)\n", .{e.tokens.len});
+            return true;
+        }
+        return false;
     }
 
     /// Restore by move, the transfer: give up the entry's own handles so the slot is the sole
@@ -8239,6 +8266,57 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
     cache.evalState();
     const p = mlx.mlx_array_data_float32(cache.entries[layer].keys) orelse return error.NotEvaluated;
     for (out, 0..) |*v, i| v.* = p[row * 8 + i];
+}
+
+test "a one-token prompt that hits its own entry prefills cold: a restore leaves a token to forward" {
+    const s = mlx.gpuStream();
+    const tokens = [_]u32{42};
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 64);
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &tokens, false, &.{}, null, null, 7);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expectEqual(@as(usize, 0), moe_off);
+    try testing.expect(hc.last_restored_used == null);
+}
+
+test "restore by move ON DEMAND: a share that does not fit is taken over, off SSD-first" {
+    // The admission pass converts a full-entry hit into a checkout; a partial hit and a second call decline.
+    const s = mlx.gpuStream();
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    var diverged = prompt;
+    diverged[500] = 999_999;
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    try testCheckoutCache(&hc, s, &tokens, 4096);
+
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var moe_off: usize = 0;
+    const partial = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &diverged, false, &.{}, null, null, 7);
+    try testing.expectEqual(@as(usize, 500), partial.matched);
+    try testing.expect(!hc.checkoutRestored(7, diverged.len));
+
+    const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, &.{}, null, null, 7);
+    try testing.expectEqual(@as(usize, 600), res.matched);
+    try testing.expect(!res.checked_out);
+    try testing.expect(hc.checkoutRestored(7, prompt.len));
+    try testing.expectEqual(@as(?usize, 7), hc.entries.items[0].checked_out_by);
+    try testing.expect(!hc.checkoutRestored(7, prompt.len));
+
+    hc.releaseCheckout(7, "prefill refused");
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(?usize, null), hc.entries.items[0].checked_out_by);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
 }
 
 test "restore by move: a partial-prefix hit keeps the refcount-share" {

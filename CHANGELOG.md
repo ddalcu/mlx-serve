@@ -16,6 +16,7 @@
 ### Changes
 - Claude Code on `/v1/messages` streams thinking as it is generated when tools are on, instead of showing nothing and then one block.
 - A long prompt that does not fit in memory frees prefix cache from other chats to make room instead of being refused. Before, only Qwen3.8 Flash Next did this.
+- A long agent turn whose cached context no longer fits twice in memory reuses the cache in place instead of being refused (PR #518). A repeated one-token prompt on `/v1/completions` no longer crashes the server.
 - A short chat that starts like a long one (same system prompt, e.g. a "hi" in omp) no longer pushes the long session out of the prefix cache and forces it to re-read its whole context.
 - `/v1/chat/completions` reads a request's `chat_template_kwargs` (vLLM style): `{"enable_thinking": false}` there turns thinking off.
 - Mistral 7B v0.3 and other SentencePiece models with byte fallback tokenize like Hugging Face: newlines and tabs were dropped from the prompt, and no stray space is added after special tokens.

@@ -5115,8 +5115,8 @@ pub const PrefillRequestTerms = struct {
     /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
     shared_resident_bytes: u64 = 0,
     /// Old KV buffers that coexist with the new ones while a warm append GROWS the cache.
-    /// Zero when nothing grows, when the restore was shared (the whole copy is billed
-    /// uncredited instead), and on every arch outside the gate.
+    /// Zero when nothing grows and when the restore was shared (the whole copy is billed
+    /// uncredited instead).
     grow_coexist_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
@@ -5339,11 +5339,18 @@ fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
 
 /// The per-request terms of the admission bill, in one place.
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
-    // Arch gate for every term (all new, all measured on qwen4_exp alone; the reservation's
-    // allocator twin is gated too, so an ungated guard billed memory never reserved). `.{}` is
-    // the identity: `prefillMemoryNeeded` then reduces to the previous expression.
+    // Arch gate for the reservation and state terms (measured on qwen4_exp alone; the
+    // reservation's allocator twin is gated too, so an ungated guard billed memory never reserved).
     const dq_min_rows: u64 = transformer_mod.prefillDqGemmMinRows(config.quant_bits);
-    if (!config.longCtxGated()) return .{ .dq_min_rows = dq_min_rows };
+    if (!config.longCtxGated()) {
+        // A checked-out entry is the slot's own buffer on every arch; both terms are zero for a share.
+        const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+        return .{
+            .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
+            .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
+            .dq_min_rows = dq_min_rows,
+        };
+    }
     // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
@@ -23265,7 +23272,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     try t.expect(prefillChunkCap(&q4, ceiling, weights, 48 * GiB, ask) < share_bar);
 }
 
-test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
+test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated warm is credited everywhere" {
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     // The allocator side of the reservation is gated (`generate.reservedPrefillTokens`); the
@@ -23282,8 +23289,10 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
     try t.expect(q35.ssmCheckpointBytes() > 0);
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
-    // Supplies the donating case so the qwen4_exp assertion below is falsifiable; the ungated loop reads 0 through `.{}`.
+    // A donating warm is credited its resident rows on every arch (a checked-out entry is the slot's own
+    // buffer); a shared one is not, and then the ungated bill is exactly the previous expression.
     const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
+    const shared = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
@@ -23291,11 +23300,14 @@ test "prefillRequestTerms: the admission bill's new terms are qwen4_exp-only" {
         try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
         try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
         try t.expectEqual(@as(u64, 0), terms.state_bytes);
-        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
-        // `.{}` is the identity: the whole bill is the previous expression.
+        try t.expectEqual(@as(u64, 0), terms.grow_coexist_bytes);
+        const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits);
+        try t.expectEqual(100_000 * kv_per_tok, terms.shared_resident_bytes);
+        const sh = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, shared);
+        try t.expectEqual(@as(u64, 0), sh.shared_resident_bytes);
         try t.expectEqual(
             prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
-            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), terms),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), sh),
         );
     }
 

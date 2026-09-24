@@ -6403,6 +6403,14 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 ve.emb_cache.clear();
                 fits = Probe.call(&probe);
             };
+            // A shared restore is billed a whole second copy; taking the entry over moves it instead.
+            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
+                if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
+                    hot_checked_out = true;
+                    probe.warm_will_donate = true;
+                    fits = Probe.call(&probe);
+                }
+            };
             if (!fits) {
                 // The width admission was billed at, read before anything is evicted.
                 if (prefill_request_chunk) |pick_pre| {
