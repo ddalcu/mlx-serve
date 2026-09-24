@@ -770,6 +770,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/completions",
+    "/v1/decisions",
     "/v1/embeddings",
     "/v1/images/edits",
     "/v1/images/generations",
@@ -795,14 +796,19 @@ fn routeExists(path: []const u8) bool {
 
 pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A decision prompt keeps at most `max_len` state tokens, so a larger body only
+/// buys tokenizer work on the inference thread.
+pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
 /// reference images approach 500 MB (issue #151) — while no JSON chat body
 /// has any business near 64 MB.
-pub fn maxRequestBytesFor(path: []const u8) usize {
+pub fn maxRequestBytesFor(target: []const u8) usize {
+    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -1872,6 +1878,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
+    log.info("  POST /v1/decisions (Laya)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2070,6 +2077,14 @@ fn handleConnection(
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
         log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+        // Closing with body bytes unread resets the connection, and the client
+        // can lose the 413 before reading it: read what is left, up to the chat cap.
+        var left = @min(total_size, max_request_bytes) -| total_read;
+        while (left > 0) {
+            const n = stream.read(hdr_buf[0..@min(left, hdr_buf.len)]) catch break;
+            if (n == 0) break;
+            left -= n;
+        }
         return;
     }
 
@@ -2540,6 +2555,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/decisions")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .decisions);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/music-generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3258,7 +3277,7 @@ pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
 /// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
 /// app always launches) came to silently eat the `--pld*` flags.
 ///
-/// Never RAISES a tighter existing cap: `scheduler.runGenRequest` drops the pool
+/// Never RAISES a tighter existing cap: `scheduler.runGenRequests` drops the pool
 /// to 1 GB on small-RAM machines during media gen, and iOS boots at 384 MB.
 pub fn applyMlxCacheLimit() void {
     const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CACHE_LIMIT")) |p|
@@ -6152,6 +6171,7 @@ const ReadyCaps = struct {
     has_music_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
+    has_decision_engine: bool = false,
 };
 
 /// Chat capability for a READY entry. Template presence is NOT the gate for
@@ -6195,6 +6215,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
+    if (c.has_decision_engine) try append_cap(allocator, &caps, &n_caps, "decisions");
     try caps.append(allocator, ']');
     return caps;
 }
@@ -6211,6 +6232,7 @@ const TextGenTarget = struct {
     has_audio_engine: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
+    has_decision_engine: bool = false,
     /// A text-capable LM is resident (transformer / ds4 / llama engine) —
     /// or the entry isn't loaded yet, in which case stubs default to
     /// "assume text until the arch hint or a load says otherwise".
@@ -6255,6 +6277,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
         if (t.has_video_engine) break :blk .video;
         if (t.has_mesh_engine) break :blk .mesh;
         if (t.has_audio_engine) break :blk .audio;
+        if (t.has_decision_engine) break :blk .decision;
         break :blk media_mod.modalityFromType(t.arch_hint);
     };
     if (modality) |m| return switch (m) {
@@ -6262,6 +6285,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
         .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
+        .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
     };
     if (!t.has_text_lm) return "This model cannot serve text generation (no language model resident).";
     return null;
@@ -6279,6 +6303,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_audio_engine = lm.audio_engine != null,
         .has_video_engine = lm.video_engine != null,
         .has_mesh_engine = lm.mesh_engine != null,
+        .has_decision_engine = lm.decision_engine != null,
         .has_text_lm = lm.state != .ready or lm.transformer != null or
             lm.ds4_engine != null or lm.llama_engine != null,
     };
@@ -6352,6 +6377,7 @@ fn renderModelEntry(
             } else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
+            .has_decision_engine = entry.decision_engine != null,
         });
         defer caps.deinit(allocator);
 
@@ -6840,6 +6866,8 @@ const GenJob = struct {
     body: []const u8,
     lm: *model_registry_mod.LoadedModel,
     route: media_mod.GenRoute,
+    /// `.decisions`: the body, parsed and validated before queueing.
+    decision: ?*const media_mod.DecisionRequest = null,
 };
 
 /// Inference-thread entry point for a gen job. Dispatches on the engine slot
@@ -6852,10 +6880,27 @@ fn genJobRun(ctx: *anyopaque) void {
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .decisions => {
+            genJobRunMany(&.{ctx});
+            return;
+        },
     };
     result catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
     };
+}
+
+/// Inference-thread entry point for decision jobs queued back to back for one
+/// model (`GenRequest.merge`): they are answered in one pass.
+fn genJobRunMany(ctxs: []const *anyopaque) void {
+    const first: *GenJob = @ptrCast(@alignCast(ctxs[0]));
+    const e = first.lm.decision_engine orelse return;
+    var buf: [scheduler_mod.MAX_MERGED_WEIGHT]media_mod.DecisionJob = undefined;
+    for (ctxs, buf[0..ctxs.len]) |c, *d| {
+        const job: *GenJob = @ptrCast(@alignCast(c));
+        d.* = .{ .allocator = job.allocator, .conn = job.conn, .req = job.decision.? };
+    }
+    media_mod.handleDecisions(e, first.lm.id, buf[0..ctxs.len]);
 }
 
 /// Dispatch a media-generation request to the inference thread. `lm` is the
@@ -6872,13 +6917,24 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .audio => lm.audio_engine != null,
         .video => lm.video_engine != null,
         .mesh => lm.mesh_engine != null,
+        .decision => lm.decision_engine != null,
     };
     if (!ok) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video/3D model and target it by id.", 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);
         return;
     }
-    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
-    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
+    var decision: ?media_mod.DecisionRequest = null;
+    defer if (decision) |*d| d.deinit(allocator);
+    if (route == .decisions) {
+        decision = try media_mod.prepareDecisions(allocator, stream, body, lm.decision_engine.?) orelse return;
+    }
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
+    if (decision) |*d| req.merge = .{
+        .run_many = genJobRunMany,
+        .weight = @max(1, d.questions.qs.len),
+        .window_us = lm.decision_engine.?.batch_window_us,
+    };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
@@ -22962,6 +23018,8 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
     }) |p| try std.testing.expectEqual(max_media_request_bytes, maxRequestBytesFor(p));
     for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/api/chat", "/", "" }) |p|
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
+    try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
+    try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
 }
 
 test "the 413 names both counts it compared" {

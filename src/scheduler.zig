@@ -1272,10 +1272,48 @@ pub const GenRequest = struct {
     /// The media model. `gen_busy` is set/cleared around the run for
     /// visibility; the conn thread's refcount already pins it against eviction.
     model: *model_registry_mod.LoadedModel,
+    /// A decision job: its buffers are reused by the next request (`shouldClearCache`).
+    decision: bool = false,
+    /// Set on jobs that can share one pass (decision requests): jobs queued
+    /// back to back for the same model and `run_many` run as one call.
+    merge: ?Merge = null,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 };
+
+pub const Merge = struct {
+    run_many: *const fn (ctxs: []const *anyopaque) void,
+    /// This job's share of `MAX_MERGED_WEIGHT` (its question count, at least 1).
+    weight: usize,
+    /// How long the inference thread waits for more jobs to merge; 0 merges
+    /// only the jobs already queued.
+    window_us: u32 = 0,
+};
+
+/// Bound on the work merged into one pass, so one tick cannot hold the
+/// inference thread for long; the first job always runs.
+pub const MAX_MERGED_WEIGHT: usize = 256;
+
+/// Move the jobs at the head of `queue` that can run with `batch[0]` (same
+/// model, same `run_many`) into `batch[n..]` while the merged weight fits.
+/// Only a contiguous run merges: other gen jobs keep their place in the queue.
+/// Returns the new count.
+fn takeMergeable(queue: *std.ArrayList(*GenRequest), batch: []*GenRequest, n: usize) usize {
+    const m = batch[0].merge orelse return n;
+    var weight: usize = 0;
+    for (batch[0..n]) |r| weight += r.merge.?.weight;
+    var count = n;
+    while (count < batch.len and queue.items.len > 0) {
+        const next = queue.items[0];
+        const nm = next.merge orelse break;
+        if (next.model != batch[0].model or nm.run_many != m.run_many or weight + nm.weight > MAX_MERGED_WEIGHT) break;
+        weight += nm.weight;
+        batch[count] = queue.orderedRemove(0);
+        count += 1;
+    }
+    return count;
+}
 
 /// Model-unload work item. Posted by `unloadModel` after the conn thread
 /// marked the entry `.evicting` and drained its refcount. The inference thread
@@ -3143,6 +3181,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         .audio => entry.audio_engine = try gen_mod.AudioEngine.load(sch.io, sch.allocator, params.model_dir),
         .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
         .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
+        .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
@@ -4521,8 +4560,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         var load_req: ?*LoadRequest = null;
         // Media-gen + unload work items (one per tick, like load — both are
         // heavy and we re-check the loop between them). Gen runs to completion
-        // synchronously, blocking decode for its duration.
-        var gen_req: ?*GenRequest = null;
+        // synchronously, blocking decode for its duration. Decision jobs queued
+        // back to back for one model run as one pass (`takeMergeable`).
+        var gen_batch: [MAX_MERGED_WEIGHT]*GenRequest = undefined;
+        var gen_n: usize = 0;
         var unload_req: ?*UnloadRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
@@ -4546,7 +4587,20 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 unload_req = sch.unload_queue.orderedRemove(0);
             }
             if (sch.gen_queue.items.len > 0) {
-                gen_req = sch.gen_queue.orderedRemove(0);
+                gen_batch[0] = sch.gen_queue.orderedRemove(0);
+                gen_n = takeMergeable(&sch.gen_queue, &gen_batch, 1);
+                const window_us = if (gen_batch[0].merge) |m| m.window_us else 0;
+                if (window_us > 0 and gen_n < gen_batch.len) {
+                    const deadline = (std.Io.Timeout{ .duration = .{
+                        .raw = .fromMicroseconds(window_us),
+                        .clock = .awake,
+                    } }).toDeadline(sch.io);
+                    while (!sch.shutdown.load(.acquire)) {
+                        sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, deadline) catch break;
+                        gen_n = takeMergeable(&sch.gen_queue, &gen_batch, gen_n);
+                    }
+                    gen_n = takeMergeable(&sch.gen_queue, &gen_batch, gen_n);
+                }
             }
         }
         for (cleanup_batch[0..cleanup_n]) |s| {
@@ -4581,7 +4635,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (unload_req) |req| runUnloadRequest(sch, req);
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
-        if (gen_req) |req| runGenRequest(sch, req);
+        if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
         //    run prefills outside the lock.
@@ -5053,8 +5107,10 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
 /// Run one media-generation job on the inference thread. The job body
 /// (`req.run`) does all mlx work + writes the HTTP/SSE response to the parked
 /// connection. We bracket it with the model's `gen_busy` flag for visibility
-/// and signal `done` so the conn thread in `runGeneration` wakes.
-fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
+/// and signal `done` so the conn thread in `runGeneration` wakes. Several
+/// merged jobs (`takeMergeable`) run as one `run_many` call.
+fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
+    const req = reqs[0];
     req.model.gen_busy = true;
     // On small-RAM machines (≤16 GB — mini class; also the phone), bound
     // MLX's buffer-cache growth DURING the generation: the post-request
@@ -5075,7 +5131,11 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
             _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
         }
     }
-    req.run(req.ctx);
+    if (reqs.len == 1) req.run(req.ctx) else {
+        var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
+        for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
+        req.merge.?.run_many(ctxs[0..reqs.len]);
+    }
     if (small_ram) {
         var tmp: usize = 0;
         _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
@@ -5086,11 +5146,21 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     // clears every 256 steps in generate.zig) a media gen frees tens of GB
     // of denoise/VAE/encoder buffers in one burst — without this, each
     // generation ratchets process RSS upward (observed ~100 GB by gen 2).
-    _ = mlx.mlx_clear_cache();
-    req.done_mu.lockUncancelable(sch.io);
-    req.done = true;
-    req.done_cond.broadcast(sch.io);
-    req.done_mu.unlock(sch.io);
+    var cached: usize = 0;
+    if (req.decision) _ = mlx.mlx_get_cache_memory(&cached);
+    if (shouldClearCache(req.decision, cached)) _ = mlx.mlx_clear_cache();
+    for (reqs) |r| {
+        r.done_mu.lockUncancelable(sch.io);
+        r.done = true;
+        r.done_cond.broadcast(sch.io);
+        r.done_mu.unlock(sch.io);
+    }
+}
+
+/// Clear MLX's allocator cache after a job holding `cached` bytes: always for
+/// media, from 256 MiB for decision jobs.
+fn shouldClearCache(decision: bool, cached: usize) bool {
+    return !decision or cached >= 256 << 20;
 }
 
 /// Free a model's resident mlx state on the inference thread (stream-bound,
@@ -10174,4 +10244,67 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
     const text_only = [_]u32{ 7, 8, image_id, 9 };
     try testing.expectEqual(@as(?usize, null), firstMediaPlaceholder(false, &text_only, image_id, 0, 0));
     try testing.expectEqual(@as(?usize, 2), firstMediaPlaceholder(true, &text_only, image_id, 0, 0));
+}
+
+test "a media job always clears the allocator cache, a decision job only from 256 MiB" {
+    try testing.expect(shouldClearCache(false, 0));
+    try testing.expect(!shouldClearCache(true, (256 << 20) - 1));
+    try testing.expect(shouldClearCache(true, 256 << 20));
+}
+
+test "takeMergeable: merges the contiguous run of same-model decision jobs within the weight cap" {
+    const a = testing.allocator;
+    const noop = struct {
+        fn run(_: *anyopaque) void {}
+        // Distinct bodies: identical ones may be folded into one address.
+        var calls: usize = 0;
+        fn many(_: []const *anyopaque) void {
+            calls += 1;
+        }
+        fn other(_: []const *anyopaque) void {
+            calls += 2;
+        }
+    };
+    var dummy: u8 = 0;
+    const m1: *model_registry_mod.LoadedModel = @ptrFromInt(0x1000);
+    const m2: *model_registry_mod.LoadedModel = @ptrFromInt(0x2000);
+    const dec = struct {
+        fn req(ctx: *anyopaque, model: *model_registry_mod.LoadedModel, weight: usize, many: *const fn ([]const *anyopaque) void) GenRequest {
+            return .{ .ctx = ctx, .run = noop.run, .model = model, .merge = .{ .run_many = many, .weight = weight } };
+        }
+    };
+    var r = [_]GenRequest{
+        dec.req(&dummy, m1, 3, noop.many),
+        dec.req(&dummy, m1, 3, noop.many),
+        dec.req(&dummy, m1, 200, noop.many),
+        dec.req(&dummy, m1, 60, noop.many), // over 256 with the three before
+        dec.req(&dummy, m2, 3, noop.many),
+    };
+    var media: GenRequest = .{ .ctx = &dummy, .run = noop.run, .model = m1 };
+    var q: std.ArrayList(*GenRequest) = .empty;
+    defer q.deinit(a);
+    for (r[1..]) |*x| try q.append(a, x);
+    var batch: [MAX_MERGED_WEIGHT]*GenRequest = undefined;
+    batch[0] = &r[0];
+    try testing.expectEqual(@as(usize, 3), takeMergeable(&q, &batch, 1));
+    try testing.expectEqual(&r[2], batch[2]);
+    try testing.expectEqual(&r[3], q.items[0]); // stays queued for the next tick
+
+    // A media job ahead of a decision job keeps its place; nothing jumps it.
+    q.clearRetainingCapacity();
+    try q.append(a, &media);
+    try q.append(a, &r[1]);
+    try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
+    try testing.expectEqual(@as(usize, 2), q.items.len);
+    // Another model or another runner does not merge; a media job merges nothing.
+    q.clearRetainingCapacity();
+    try q.append(a, &r[4]);
+    try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
+    var foreign = dec.req(&dummy, m1, 1, noop.other);
+    q.clearRetainingCapacity();
+    try q.append(a, &foreign);
+    try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
+    batch[0] = &media;
+    try q.append(a, &r[1]);
+    try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }

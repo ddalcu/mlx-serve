@@ -135,6 +135,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         liveTokensBySession[sessionId] ?? 0
     }
 
+    /// Per-session notes typed while a turn runs; read after each tool round
+    /// and at turn end, where a note ends the turn and starts the next
+    /// (`resumeWithSteeringNote`).
+    @Published private(set) var steering = SteeringNotes()
+
+    func setSteeringNote(_ text: String, for sessionId: UUID) {
+        steering.append(text, for: sessionId)
+    }
+
+    func clearSteeringNote(for sessionId: UUID) {
+        steering.clear(for: sessionId)
+    }
+
+    /// Only the turn that still owns the slot hands its note on; a stopped or
+    /// superseded one, or a chat that can no longer run, leaves it for the
+    /// composer.
+    private func resumeWithSteeringNote(sessionId: UUID, token: UUID, config: TurnConfig,
+                                        approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard endTurn(sessionId: sessionId, token: token),
+              session(sessionId) != nil,
+              Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
+              let note = steering.take(for: sessionId) else { return }
+        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+                config: config, approval: approval)
+    }
+
     /// The turn table: token-identified turn per session (see `TurnLedger`)
     /// plus the driving Task, cancelled by `stop(sessionId:)`.
     private var ledger = TurnLedger()
@@ -196,6 +222,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         let existing = Set(appState.chatSessions.map(\.id))
         for sid in ledger.orphaned(existingSessions: existing) {
             stop(sessionId: sid)
+            steering.clear(for: sid)
         }
     }
 
@@ -431,8 +458,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     /// End a turn from its own task's unwind. Token-gated: a superseded task
     /// presents a stale token and touches NOTHING (its successor owns the slot).
-    private func endTurn(sessionId: UUID, token: UUID) {
-        guard ledger.end(session: sessionId, token: token) else { return }
+    @discardableResult
+    private func endTurn(sessionId: UUID, token: UUID) -> Bool {
+        guard ledger.end(session: sessionId, token: token) else { return false }
         tasks[sessionId] = nil
         liveTokensBySession.removeValue(forKey: sessionId)
         if mediaProgressSessionId == sessionId {
@@ -446,6 +474,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         appState.finishRevisions(in: sessionId)
         appState.saveChatHistory()
         publishTurnState()
+        return true
     }
 
     /// Apple's on-device model answers with no mlx-serve process, so the
@@ -641,6 +670,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig,
                                      token: UUID, continuing: Bool = false) async {
+        var failed = false
         do {
             let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
             let stream: AsyncThrowingStream<SSEEvent, Error>
@@ -711,10 +741,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             print("[ChatTurnEngine] Chat error: \(error)")
             try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
             appendErrorNotice(error, to: sessionId)
+            failed = true
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
         appState.saveChatHistory()
-        endTurn(sessionId: sessionId, token: token)
+        if failed {
+            endTurn(sessionId: sessionId, token: token)
+            return
+        }
+        // Plain chat never asks for tool approval, and the note runs with this
+        // same config, so the closure is never called.
+        resumeWithSteeringNote(sessionId: sessionId, token: token, config: config, approval: { _ in false })
     }
 
     // MARK: - Agent mode (native tool calling)
@@ -780,9 +817,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 print("[ChatTurnEngine] Agent error: \(error)")
                 try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 self.appendErrorNotice(error, to: sessionId)
+                self.appState.saveChatHistory()
+                self.endTurn(sessionId: sessionId, token: token)
+                return
             }
             self.appState.saveChatHistory()
-            self.endTurn(sessionId: sessionId, token: token)
+            self.resumeWithSteeringNote(sessionId: sessionId, token: token, config: config, approval: approval)
         }
     }
 
@@ -935,12 +975,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     hasPersona: !config.systemPromptPrefix.isEmpty)
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
-            // a user message. Add a nudge so the model knows to synthesize a response —
-            // asks explicitly for a short plain-text summary when finished so the user
-            // never sees a conversation that ends on a bare tool-call echo.
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."])
+                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
             }
             messages.append(contentsOf: history)
 
@@ -1361,6 +1397,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 appState.appendMessage(to: sessionId, message: msg)
                 return
             }
+
+            // A note ends the turn after the tool results;
+            // `resumeWithSteeringNote` starts the next one with it.
+            try Task.checkCancellation()
+            if steering.note(for: sessionId) != nil { return }
         }
 
         // Max iterations reached

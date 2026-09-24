@@ -54,7 +54,8 @@ final class ComposerInputTests: XCTestCase {
 
     func testBareReturnSwallowedWhileGenerating() {
         // While a turn is generating a bare Return must NOT insert a stray
-        // newline and must NOT start a second send — it is swallowed.
+        // newline and must NOT start a second send — it is swallowed, unless
+        // the field can steer (`SteeringNotesTests`).
         XCTAssertEqual(ComposerKey.onReturn(shift: false, isIdle: false), .ignore)
     }
 

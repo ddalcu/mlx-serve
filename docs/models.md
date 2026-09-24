@@ -18,6 +18,7 @@
 | **LFM2 / LFM2.5** | `lfm2`, `lfm2_vl` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4), LFM2.5-VL 3B / 1.6B | ChatML, Pythonic tool calls | SigLIP2, big images tiled |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
+| **Laya** (typed decisions) | `laya` | `aac6fef/laya-multilingual-mlx` (mmBERT-base encoder + decision head; `POST /v1/decisions`) | n/a | -- |
 | **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, mxbai, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 

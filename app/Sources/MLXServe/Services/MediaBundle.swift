@@ -171,6 +171,24 @@ extension MediaBundle {
         )
     }
 
+    /// Laya typed decisions (`POST /v1/decisions`): one small repo, no root
+    /// config.json. Markers are the two configs discovery keys on plus the
+    /// weights and the tokenizer the encoder cannot run without.
+    static func laya(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "laya:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["rl_agent_config.json", "encoder/config.json", "model.safetensors", "tokenizer/tokenizer.json"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// LTX-Video: pull ONLY the safetensors the engine reads (allowlist) plus
     /// the small json configs — the repo also carries ~50 GB of LoRAs /
     /// upscalers / alternate transformers we never touch. Depends on the

@@ -2657,6 +2657,12 @@ struct ChatDetailView: View {
                 // Renders nothing while voice is off.
                 VoiceOrbView(controller: appState.voice, sessionId: sessionId)
 
+                // The note waiting for the agent's next step, where the user
+                // is looking during a long run.
+                if let note = steeringNote {
+                    SteeringNoteRow(note: note, onPause: { pauseSteeringNote() })
+                }
+
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.
@@ -2843,6 +2849,7 @@ struct ChatDetailView: View {
             inputFocused = true
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            recoverSteeringNoteIfIdle()
             applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
@@ -2919,7 +2926,12 @@ struct ChatDetailView: View {
             appState.chatSessions[idx].useMCP = newValue
         }
         .onChange(of: composerState) { _, state in
-            if state == .idle { inputFocused = true }
+            if state == .idle {
+                // A turn that ended without reaching a step (Stop, an error)
+                // leaves its note nowhere to go: back into the composer.
+                pauseSteeringNote()
+                inputFocused = true
+            }
         }
         // The keyboard arriving in the composer collapses the sidebar selection
         // to this chat. Keyed on the focus MIRROR rather than on the click, so
@@ -2948,6 +2960,7 @@ struct ChatDetailView: View {
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            recoverSteeringNoteIfIdle()
             // Scroll state is per-view, and the view is reused across tabs — so
             // without this, leaving one chat scrolled up opened the next one
             // unpinned at whatever offset the previous conversation's content
@@ -2981,13 +2994,18 @@ struct ChatDetailView: View {
     /// The input field. No background or border of its own — the composer
     /// container draws those around both rows. NSTextView-backed so a big paste
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
-    private var composerPlaceholder: String { "Ask me anything…" }
+    /// While this chat answers, the field takes a steering note: Return hands
+    /// it to the agent at its next step instead of sending a second turn.
+    private var composerPlaceholder: String {
+        composerState == .generatingHere ? "Type a note; Return sends it at the next step" : "Ask me anything…"
+    }
 
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
                           isFocused: $inputFocused,
                           measuredHeight: $composerHeight,
                           isIdle: composerState == .idle,
+                          canSteer: true,
                           onSend: { sendMessage() },
                           // Escape stops the reply being written. Handled here
                           // rather than as a hidden `.cancelAction` button so
@@ -3679,11 +3697,19 @@ struct ChatDetailView: View {
         // this is belt-and-suspenders for any other trigger path).
         if session?.isExternalBridge == true { return }
 
+        // A busy chat takes the text as a steering note for the agent's next
+        // step (`SteeringNotes`); the row above the composer shows it until
+        // it fires.
+        if composerState == .generatingHere {
+            queueSteeringNote()
+            return
+        }
+
         // Pre-send nudge: if the message looks like it needs a mode that's off,
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if composerState != .generatingHere, canAnswer, !trimmed.isEmpty,
+        if canAnswer, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -3693,6 +3719,34 @@ struct ChatDetailView: View {
         // wherever the last one left off rather than from what was just sent.
         composerWalk = .idle
         proceedSend()
+    }
+
+    // MARK: - Steering notes
+
+    private var steeringNote: String? { chatEngine.steering.note(for: sessionId) }
+
+    private func queueSteeringNote() {
+        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        chatEngine.setSteeringNote(text, for: sessionId)
+        inputText = ""
+        composerWalk = .idle
+    }
+
+    /// Pausing takes the note back into the composer, ahead of whatever is
+    /// typed there, so nothing fires while it is being rewritten; Return
+    /// queues it again.
+    private func pauseSteeringNote() {
+        guard let note = steeringNote else { return }
+        chatEngine.clearSteeringNote(for: sessionId)
+        inputText = SteeringNotes.joined(note, inputText)
+        inputFocused = true
+    }
+
+    /// A note whose turn ended while this chat was in another tab: nobody
+    /// watched the state flip, so it is recovered on the way in.
+    private func recoverSteeringNoteIfIdle() {
+        if composerState == .idle { pauseSteeringNote() }
     }
 
     /// Names of MCP servers the user currently has enabled (disabled != true).
@@ -3816,6 +3870,13 @@ struct ChatDetailView: View {
     /// caret inside a draft.
     private func recallHistory(_ direction: ComposerHistory.Direction,
                                caretAtStart: Bool, caretAtEnd: Bool) -> Bool {
+        // A waiting steering note is the newest thing said and not yet sent:
+        // ↑ on an empty draft takes it back first, exactly as Pause does.
+        if direction == .up, steeringNote != nil,
+           inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pauseSteeringNote()
+            return true
+        }
         let entries = ComposerHistory.entries(session?.messages ?? [])
         let action = direction == .up
             ? ComposerHistory.up(draft: inputText, caretAtStart: caretAtStart,
@@ -6522,7 +6583,9 @@ enum ComposerLayout {
 /// What a Return keypress does in the composer. Mirrors the prior `.onKeyPress`
 /// contract: Shift+Return is always a newline; a bare Return sends only when
 /// idle, and is otherwise swallowed (never a stray newline mid-generation).
-enum ComposerReturnAction: Equatable { case send, newline, ignore }
+/// `.steer`: the chat is generating, so the text becomes a note for the
+/// agent's next step rather than a second send.
+enum ComposerReturnAction: Equatable { case send, steer, newline, ignore }
 
 /// What an Escape keypress does in the composer. `.pass` hands the key back to
 /// AppKit rather than swallowing it — with no turn to stop, Escape still has
@@ -6533,9 +6596,13 @@ enum ComposerEscapeAction: Equatable { case stop, pass }
 enum ComposerKeyCommand { case up, down, accept, cancel }
 
 enum ComposerKey {
-    static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
+    /// `canSteer`: a busy chat takes the text as a steering note (the main
+    /// composer); the edit bubble leaves it false, so a blank draft's Return
+    /// is still swallowed.
+    static func onReturn(shift: Bool, isIdle: Bool, canSteer: Bool = false) -> ComposerReturnAction {
         if shift { return .newline }
-        return isIdle ? .send : .ignore
+        if isIdle { return .send }
+        return canSteer ? .steer : .ignore
     }
 
     /// Escape stops the reply being written, and does nothing otherwise.
@@ -6573,6 +6640,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var minLines: Int = 1
     var maxLines: Int = 15
     var isIdle: Bool
+    var canSteer: Bool = false
     var onSend: () -> Void
     /// Escape, from the responder chain. Defaults to nothing so a field that
     /// has no use for the key leaves it to AppKit.
@@ -6727,11 +6795,13 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
             // it must not send a half-typed "/mus".
             if parent.onKeyCommand(.accept) { return true }
             let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {
+            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle, canSteer: parent.canSteer) {
             case .newline:
                 textView.insertNewlineIgnoringFieldEditor(self)
                 return true
-            case .send:
+            case .send, .steer:
+                // `onSend` reads the composer state itself and queues a
+                // steering note while the chat generates.
                 parent.onSend()
                 return true
             case .ignore:

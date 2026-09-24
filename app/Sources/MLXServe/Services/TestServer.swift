@@ -512,7 +512,7 @@ class TestServer {
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is done, summarize the result. If not, take the next step."])
+                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
             }
             messages.append(contentsOf: history)
 

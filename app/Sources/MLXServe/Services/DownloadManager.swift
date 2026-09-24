@@ -326,6 +326,7 @@ class DownloadManager: ObservableObject {
         for marker in ["config.json", "model_index.json"] {
             if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) { return true }
         }
+        if configlessModelType(inDir: dir) != nil { return true }
         // A `transformer/` holding real weights. Deliberately not "has the
         // subdir": a download that got as far as creating the folder must still
         // read as incomplete, and an in-flight transfer's `.partial` is not a
@@ -333,6 +334,20 @@ class DownloadManager: ObservableObject {
         let dit = (dir as NSString).appendingPathComponent("transformer")
         let shards = (try? fm.contentsOfDirectory(atPath: dit)) ?? []
         return shards.contains { $0.hasSuffix(".safetensors") }
+    }
+
+    /// Laya typed-decision checkpoints ship no root config.json; these two
+    /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
+    nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
+
+    /// The model_type of a checkpoint that has no root config.json to read
+    /// it from, or nil when the dir is not one of those shapes.
+    nonisolated static func configlessModelType(inDir dir: String) -> String? {
+        let fm = FileManager.default
+        if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
+            return "laya"
+        }
+        return nil
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots
@@ -1615,7 +1630,8 @@ class DownloadManager: ObservableObject {
         }
 
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configPath) else { return [] }
+        let configless = configlessModelType(inDir: resolved)
+        guard FileManager.default.fileExists(atPath: configPath) || configless != nil else { return [] }
 
         // A defect does NOT drop the directory. Dropping it is how two junk
         // folders stayed invisible in the app while the server registered them
@@ -1623,7 +1639,8 @@ class DownloadManager: ObservableObject {
         // cannot see. It is listed, unpickable, and deletable instead.
         let defect = weightDefect(inDir: resolved, entries: entries)
 
-        let meta = parseConfigMetadata(atPath: configPath)
+        var meta = parseConfigMetadata(atPath: configPath)
+        if let configless { meta.modelType = configless }
         let modelType = meta.modelType
 
         let size = directorySize(resolved)

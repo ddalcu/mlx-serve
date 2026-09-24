@@ -81,6 +81,7 @@ enum CustomMediaModels {
     /// with, and what its tree is verified against beforehand. nil for archs
     /// no pane serves.
     static func bundle(arch: String, repoId: String) -> MediaBundle? {
+        if arch == "laya" { return .laya(repo: repoId, displayName: repoId, sizeGB: 0.35) }
         if let p = imageFamily(arch: arch, id: repoId) { return p.asCustom(id: repoId).bundle }
         if let p = videoFamily(arch: arch) { return p.asCustom(id: repoId).bundle }
         if let p = audioFamily(arch: arch) { return p.asCustom(id: repoId).bundle }

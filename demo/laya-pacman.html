@@ -1,0 +1,341 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Laya Pac-Man Duel</title>
+<style>
+  :root { --bg:#0b0d17; --panel:#151a2e; --fg:#e6e8f2; --dim:#8a90a8; --wall:#2740c9; --p1:#ffd23f; --p2:#3fe0ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:var(--dim); margin-bottom:12px; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+  input, select, button { background:var(--panel); color:var(--fg); border:1px solid #2a3150; border-radius:6px; padding:6px 10px; font:inherit; }
+  button { cursor:pointer; } button:hover { border-color:#4a5690; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  canvas { background:#000; border-radius:8px; max-width:100%; height:auto; image-rendering:pixelated; }
+  .side { display:flex; flex-direction:column; gap:12px; min-width:260px; flex:1; max-width:360px; }
+  .card { background:var(--panel); border-radius:8px; padding:12px; }
+  .card h2 { font-size:15px; margin:0 0 6px; display:flex; justify-content:space-between; }
+  .p1 h2 { color:var(--p1); } .p2 h2 { color:var(--p2); }
+  .row { display:grid; grid-template-columns:48px 1fr 44px; gap:6px; align-items:center; margin:3px 0; font-size:12px; }
+  .track { background:#0b0d17; height:10px; border-radius:5px; overflow:hidden; }
+  .fill { height:100%; transition:width .08s; }
+  .p1 .fill { background:var(--p1); } .p2 .fill { background:var(--p2); }
+  .row.pick { font-weight:bold; }
+  .row.na { opacity:.3; }
+  .meta { color:var(--dim); font-size:12px; margin-top:6px; }
+  #msg { font-size:16px; min-height:22px; }
+  .err { color:#ff6b6b; }
+</style>
+
+<h1>MLX-Serve 26.9.6-dev - Laya Pac-Man Duel</h1>
+<div class="sub">Two Pac-Men and no humans. Laya scores every open direction (typed <code>score</code>, 0 to 3) and each Pac-Man takes the best one via <code>POST /v1/decisions</code>.</div>
+
+<div class="bar">
+  <input id="api" size="24" title="mlx-serve base URL">
+  <select id="model"></select>
+  <button id="go">Start</button>
+  <button id="reset">Reset</button>
+  <label><input id="shield" type="checkbox" checked> safety shield</label>
+  <label>tick <input id="speed" type="range" min="0" max="400" value="120"> <span id="speedv"></span></label>
+</div>
+<div id="msg"></div>
+
+<div class="wrap">
+  <canvas id="c"></canvas>
+  <div class="side">
+    <div class="card p1"><h2><span>P1 yellow</span><span id="s0"></span></h2><div id="d0"></div><div class="meta" id="m0"></div></div>
+    <div class="card p2"><h2><span>P2 cyan</span><span id="s1"></span></h2><div id="d1"></div><div class="meta" id="m1"></div></div>
+  </div>
+</div>
+
+<script>
+const MAP = [
+  "###################",
+  "#o.......#.......o#",
+  "#.##.###.#.###.##.#",
+  "#.................#",
+  "#.##.#.#####.#.##.#",
+  "#....#...#...#....#",
+  "####.### # ###.####",
+  "   #.#   G   #.#   ",
+  "####.# ## ## #.####",
+  "    .  #G  #  .    ",
+  "####.# ##### #.####",
+  "#........#........#",
+  "#.##.###.#.###.##.#",
+  "#o.#.....1.2....#o#",
+  "##.#.#.#####.#.#.##",
+  "#....#...#...#....#",
+  "#.######.#.######.#",
+  "#.................#",
+  "###################",
+];
+const H = MAP.length, W = MAP[0].length, T = 28;
+const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
+const OPP = { up:"down", down:"up", left:"right", right:"left" };
+const COLORS = ["#ffd23f", "#3fe0ff"], GHOST_COLORS = ["#ff4d6d", "#ff9f1c"];
+const $ = id => document.getElementById(id);
+const cv = $("c"), ctx = cv.getContext("2d");
+cv.width = W*T; cv.height = H*T;
+
+let G, running = false;
+
+const wrap = x => (x + W) % W;
+const wall = (x, y) => y < 0 || y >= H || MAP[y][wrap(x)] === "#";
+const step = (p, d) => ({ x: wrap(p.x + DIRS[d][0]), y: p.y + DIRS[d][1] });
+const legal = p => Object.keys(DIRS).filter(d => !wall(p.x + DIRS[d][0], p.y + DIRS[d][1]));
+const key = p => p.x + "," + p.y;
+
+function reset() {
+  const pel = new Map(), spawns = {}, ghosts = [];
+  MAP.forEach((r, y) => [...r].forEach((c, x) => {
+    if (c === "." || c === "o") pel.set(x + "," + y, c === "o" ? "power" : "dot");
+    if (c === "1" || c === "2") spawns[c] = { x, y };
+    if (c === "G") ghosts.push({ x, y, home:{x,y}, dir:"up", color:GHOST_COLORS[ghosts.length] });
+  }));
+  G = { pel, ghosts, tick:0, fright:0, over:false,
+    players: ["1","2"].map((k, i) => ({ ...spawns[k], home:spawns[k], dir:i ? "right" : "left", score:0, lives:3, color:COLORS[i], last:null, ms:0, trail:[], moves:[], streak:0 })) };
+  $("msg").textContent = ""; draw(); panels();
+}
+
+// BFS distance from `from` to the nearest cell satisfying `hit`, never stepping onto `block`.
+function bfs(from, hit, block = new Set()) {
+  const seen = new Set([key(from)]); let q = [from], d = 0;
+  while (q.length && d < 60) {
+    const nq = [];
+    for (const p of q) {
+      if (hit(p)) return d;
+      for (const dir of legal(p)) {
+        const n = step(p, dir), k = key(n);
+        if (!seen.has(k) && !block.has(k)) { seen.add(k); nq.push(n); }
+      }
+    }
+    q = nq; d++;
+  }
+  return null;
+}
+
+// Pellets within `radius` steps down one branch (the cell we stand on is blocked).
+function pelletsAhead(from, blocked, radius = 6) {
+  const seen = new Set([key(from), blocked]); let q = [from], n = 0;
+  for (let d = 0; d <= radius && q.length; d++) {
+    const nq = [];
+    for (const p of q) {
+      if (G.pel.has(key(p))) n++;
+      for (const dir of legal(p)) { const c = step(p, dir), k = key(c); if (!seen.has(k)) { seen.add(k); nq.push(c); } }
+    }
+    q = nq;
+  }
+  return n;
+}
+
+// 11x11 ASCII window centered on the player, one string per row.
+function localMap(pl, i, r = 5) {
+  const rows = [];
+  for (let y = pl.y - r; y <= pl.y + r; y++) {
+    let row = "";
+    for (let x = pl.x - r; x <= pl.x + r; x++) {
+      const c = { x: wrap(x), y }, at = o => o.x === c.x && o.y === c.y;
+      const rival = G.players[1 - i];
+      row += at(pl) ? "P"
+        : G.ghosts.some(at) ? (G.fright > 0 ? "E" : "G")
+        : rival.lives > 0 && at(rival) ? "R"
+        : wall(x, y) ? "#"
+        : G.pel.get(key(c)) === "power" ? "o" : G.pel.has(key(c)) ? "." : " ";
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function describe(pl, deadly) {
+  const moves = {};
+  for (const d of legal(pl)) {
+    const n = step(pl, d);
+    const here = G.pel.get(key(n));
+    let food;
+    if (here === "power") food = "power pellet here";
+    else if (here) food = "pellet here";
+    else {
+      const pd = bfs(n, p => G.pel.has(key(p)), new Set([key(pl)]));
+      food = pd == null ? "no pellets" : `nearest pellet ${pd + 1} steps`;
+    }
+    const gd = Math.min(...G.ghosts.map(g => bfs(n, p => p.x === g.x && p.y === g.y) ?? 99));
+    const ghost = gd > 4 ? "no ghost nearby"
+      : G.fright > 0 ? `edible ghost ${gd + 1} steps away`
+      : gd <= 1 ? "ghost right there" : `ghost ${gd} steps away`;
+    const ahead = pelletsAhead(n, key(pl));
+    const branch = ahead ? `${ahead} pellets within 6 steps that way` : "that way is already cleared";
+    const visits = pl.trail.filter(k => k === key(n)).length;
+    const memory = visits ? `, you were just there ${visits}x (no point going back)` : ", new ground";
+    const heading = d === pl.dir ? ", keeps going straight" : d === OPP[pl.dir] ? ", turns back the way you came" : ", turns a corner";
+    moves[d] = `${food}; ${branch}; ${ghost}${heading}${memory}`;
+    if (gd <= 1 && G.fright === 0) deadly.add(d);
+  }
+  return moves;
+}
+
+const CRIT = ["terrible, Pac-Man dies", "poor", "okay", "good, eats a pellet safely"];
+
+// One score question per legal direction; the move is the argmax.
+// The shield only vetoes moves onto a hunting ghost; Laya still ranks the rest.
+async function decide(pl, i) {
+  const deadly = new Set();
+  const moves = describe(pl, deadly);
+  // No U-turn until 3 moves in one direction, unless it is the only safe way out.
+  const back = OPP[pl.dir];
+  if (pl.streak < 3 && moves[back] && Object.keys(moves).some(d => d !== back && !deadly.has(d))) delete moves[back];
+  const questions = Object.fromEntries(Object.keys(moves).map(d =>
+    [d, { type:"score", instructions:`How good is it for Pac-Man to move ${d}?`, criteria:CRIT }]));
+  const t0 = performance.now();
+  const r = await fetch(api() + "/v1/decisions", { method:"POST", headers:{ "content-type":"application/json" },
+    body:JSON.stringify({ model:$("model").value, state:{
+      goal: "eat every pellet, keep moving toward areas with many pellets, avoid ghosts, do not wander back and forth",
+      map_around_you: localMap(pl, i),
+      map_legend: "P = you (center), R = rival, G = hunting ghost, E = edible ghost, . = pellet, o = power pellet, # = wall, blank = empty; up is the row above P",
+      heading: pl.dir, recent_moves: pl.moves.slice(-6).join(" "),
+      pellets_left: G.pel.size, ghosts: G.fright > 0 ? "edible" : "hunting", moves }, questions }) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error?.message || r.status);
+  pl.ms = performance.now() - t0;
+  const scores = Object.fromEntries(Object.entries(j.answers).map(([d, a]) => [d, a.score]));
+  const best = ds => ds.reduce((a, b) => scores[b] > scores[a] ? b : a);
+  const safe = Object.keys(scores).filter(d => !deadly.has(d));
+  const raw = best(Object.keys(scores));
+  const choice = $("shield").checked && safe.length ? best(safe) : raw;
+  pl.last = { choice, scores, moves, vetoed: choice !== raw ? raw : null };
+  return choice;
+}
+
+function ghostMove(g) {
+  const opts = legal(g).filter(d => d !== OPP[g.dir]);
+  const cand = opts.length ? opts : legal(g);
+  const targets = G.players.filter(p => p.lives > 0);
+  let pick;
+  if (Math.random() < 0.25 || !targets.length) pick = cand[Math.random() * cand.length | 0];
+  else {
+    const score = d => Math.min(...targets.map(t => bfs(step(g, d), p => p.x === t.x && p.y === t.y) ?? 99));
+    pick = cand.reduce((a, b) => (G.fright > 0 ? score(b) > score(a) : score(b) < score(a)) ? b : a);
+  }
+  g.dir = pick; Object.assign(g, step(g, pick));
+}
+
+function collide() {
+  for (const pl of G.players) {
+    if (pl.lives <= 0) continue;
+    for (const g of G.ghosts) {
+      if (g.x !== pl.x || g.y !== pl.y) continue;
+      if (G.fright > 0) { pl.score += 200; Object.assign(g, g.home); }
+      else { pl.lives--; Object.assign(pl, pl.home); }
+    }
+  }
+}
+
+async function tick() {
+  const alive = G.players.map((p, i) => [p, i]).filter(([p]) => p.lives > 0);
+  const moves = await Promise.all(alive.map(([p, i]) => decide(p, i)));
+  alive.forEach(([pl], k) => {
+    const d = moves[k];
+    if (!legal(pl).includes(d)) return;
+    pl.trail = [...pl.trail, key(pl)].slice(-8); pl.moves.push(d);
+    pl.streak = d === pl.dir ? pl.streak + 1 : 1;
+    pl.dir = d; Object.assign(pl, step(pl, d));
+    const got = G.pel.get(key(pl));
+    if (got) { G.pel.delete(key(pl)); pl.score += got === "power" ? 50 : 10; if (got === "power") G.fright = 30; }
+  });
+  collide();
+  if (G.tick % 5 !== 4) G.ghosts.forEach(ghostMove);
+  collide();
+  if (G.fright > 0) G.fright--;
+  G.tick++;
+  if (!G.pel.size || G.players.every(p => p.lives <= 0)) {
+    G.over = true;
+    const [a, b] = G.players;
+    $("msg").textContent = a.score === b.score ? `Draw at ${a.score}` : `${a.score > b.score ? "P1 yellow" : "P2 cyan"} wins ${Math.max(a.score, b.score)} to ${Math.min(a.score, b.score)}`;
+  }
+}
+
+function draw() {
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+  MAP.forEach((r, y) => [...r].forEach((c, x) => {
+    if (c === "#") { ctx.fillStyle = "#2740c9"; ctx.fillRect(x*T + 2, y*T + 2, T - 4, T - 4); }
+  }));
+  for (const [k, v] of G.pel) {
+    const [x, y] = k.split(",").map(Number);
+    ctx.fillStyle = "#ffe8c2"; ctx.beginPath();
+    ctx.arc(x*T + T/2, y*T + T/2, v === "power" ? 7 : 3, 0, 7); ctx.fill();
+  }
+  for (const g of G.ghosts) {
+    const cx = g.x*T + T/2, cy = g.y*T + T/2, r = T/2 - 3;
+    ctx.fillStyle = G.fright > 0 ? (G.fright < 8 && G.tick % 2 ? "#fff" : "#2233ff") : g.color;
+    ctx.beginPath(); ctx.arc(cx, cy - 2, r, Math.PI, 0); ctx.lineTo(cx + r, cy + r); ctx.lineTo(cx - r, cy + r); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillRect(cx - 7, cy - 6, 5, 6); ctx.fillRect(cx + 2, cy - 6, 5, 6);
+  }
+  const ang = { right:0, down:Math.PI/2, left:Math.PI, up:-Math.PI/2 };
+  for (const pl of G.players) {
+    if (pl.lives <= 0) continue;
+    const cx = pl.x*T + T/2, cy = pl.y*T + T/2, m = G.tick % 2 ? 0.25 : 0.05, a = ang[pl.dir];
+    ctx.fillStyle = pl.color; ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, T/2 - 3, a + m*Math.PI, a - m*Math.PI + 2*Math.PI); ctx.fill();
+  }
+}
+
+function panels() {
+  G.players.forEach((pl, i) => {
+    $("s" + i).textContent = `${pl.score} pts  ${"♥".repeat(Math.max(pl.lives, 0))}`;
+    const l = pl.last;
+    $("d" + i).innerHTML = Object.keys(DIRS).map(d => {
+      const v = l?.scores?.[d];
+      return `<div class="row ${l?.choice === d ? "pick" : ""} ${v == null ? "na" : ""}" title="${l?.moves?.[d] ?? "wall"}">
+        <span>${d}</span><div class="track"><div class="fill" style="width:${(v ?? 0) / 3 * 100}%"></div></div><span>${v == null ? "wall" : v.toFixed(2)}</span></div>`;
+    }).join("");
+    $("m" + i).textContent = pl.lives <= 0 ? "out" : l ? `${l.moves[l.choice]}  ·  ${pl.ms.toFixed(0)} ms${l.vetoed ? `  ·  shield vetoed ${l.vetoed}` : ""}` : "";
+  });
+}
+
+const api = () => $("api").value.replace(/\/$/, "");
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function loop() {
+  while (running && !G.over) {
+    const t0 = performance.now();
+    try { await tick(); }
+    catch (e) { $("msg").innerHTML = `<span class="err">${e.message}</span>`; running = false; break; }
+    draw(); panels();
+    await sleep(Math.max(0, +$("speed").value - (performance.now() - t0)));
+  }
+  running = false; $("go").textContent = "Start";
+}
+
+async function loadModels() {
+  $("model").innerHTML = "";
+  try {
+    const j = await (await fetch(api() + "/v1/models")).json();
+    const ids = j.data.filter(m => (m.capabilities || []).includes("decisions")).map(m => m.id);
+    ids.sort((a, b) => b.endsWith("/laya-mlx") - a.endsWith("/laya-mlx"));
+    $("model").innerHTML = ids.map(id => `<option>${id}</option>`).join("");
+    $("msg").textContent = ids.length ? "" : "No Laya model found on this server.";
+  } catch (e) { $("msg").innerHTML = `<span class="err">Cannot reach ${api()}: ${e.message}</span>`; }
+}
+
+const qs = new URLSearchParams(location.search);
+$("api").onchange = loadModels;
+$("speed").oninput = () => $("speedv").textContent = $("speed").value + " ms";
+$("speed").oninput();
+$("go").onclick = () => {
+  running = !running; $("go").textContent = running ? "Pause" : "Start";
+  if (G.over) reset();
+  if (running) loop();
+};
+$("reset").onclick = () => { running = false; reset(); };
+// First candidate that answers /v1/models as JSON wins: ?api=, same origin, then the default ports.
+async function pickApi() {
+  const cands = [qs.get("api"), location.protocol.startsWith("http") && location.origin, "http://localhost:11234", "http://localhost:11442"].filter(Boolean);
+  for (const c of cands) {
+    try { await (await fetch(c + "/v1/models")).json(); return c; } catch {}
+  }
+  return cands[0];
+}
+reset();
+pickApi().then(a => { $("api").value = a; loadModels(); });
+</script>

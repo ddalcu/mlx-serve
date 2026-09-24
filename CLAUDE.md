@@ -40,7 +40,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
 | `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
-| `qwen_image.zig` | Qwen-Image-2.1 (`qwen_image21`, quantized packs only): block-causal single-stream DiT (two sdpa calls, shared t=0/t modulation), 64-ch /16 VAE, `mage_flow.TextEncoder` at 8B width; 40 steps, real CFG, img2img; text encoder STAGED per request where the pack crowds the GPU (`gen.qwenImageStagesTextEncoder`) |
+| `qwen_image.zig` | Qwen-Image-2.1 (`qwen_image21`; converter emits quantized packs only, bf16 preset owed): block-causal single-stream DiT (two sdpa calls, shared t=0/t modulation), 64-ch /16 VAE, `mage_flow.TextEncoder` at 8B width; 40 steps, real CFG, img2img; text encoder STAGED per request where the pack crowds the GPU (`gen.qwenImageStagesTextEncoder`) |
 | `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (only non-JSON shape: `POST /v1/images/edits`) |
 | `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
@@ -51,6 +51,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `minimax_h3*.zig` | MiniMax-H3 text-to-audio-video: joint video+audio DiT, staged residency, fast recipe, Turbo LoRA, chained windows — detail in `docs/reference.md` |
 | `tts.zig` | Qwen3-TTS incl. ECAPA-TDNN voice clone |
 | `kokoro.zig` / `kokoro_g2p.zig` | Kokoro-82M TTS + text→IPA G2P (no espeak — GPLv3) |
+| `laya.zig` | Laya typed decisions (`POST /v1/decisions`): mmBERT/ModernBERT encoder + decision head, prompt layout and output JSON mirror `laya_mlx`; `.decision` modality slot |
 | `marching_cubes.zig` / `glb.zig` / `uvwrap.zig` / `rasterize.zig` / `texinpaint.zig` | Pure-Zig mesh/GLB/xatlas/rasterizer/inpaint (zero MLX, hermetic tests) |
 | `preview.zig` / `latent_rgb.zig` / `jpeg.zig` | Opt-in per-step video previews (#208): published latent→RGB map per backend (GENERATED — `tests/dump_latent_rgb_factors.py`), temporal pick + filmstrip, bilinear resize, baseline JPEG. Zero MLX; `zig build preview-test` is the Linux-runnable graph |
 | `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
@@ -142,6 +143,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
 | `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`); ~0 net on 0731 |
 | `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on |
+| `laya` | Laya typed-decision checkpoints (no root config.json — classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, `gen.peekModelType` delegates; app twin `DownloadManager.configlessModelType` + `MediaBundle.laya`): ModernBERT encoder (RoPE, GeGLU, global/sliding bool masks) + 2 head layers + marker scorer + act head, fp16; tokenizer.json `Metaspace` pre-tokenizer implemented in `tokenizer.zig` |
 | media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*`/`qwen3_tts`/`acestep`/`minimax_music3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` has NO root config.json — classified from `model_index.json` by `gen.peekModelType` + `model_discovery.peekMageFlowIndex`, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
@@ -424,6 +426,7 @@ Weights, quant, loading:
 - **Quant resolves PER WEIGHT** (`computeQuantParams`; scales dtype decides fp8 vs affine; overrides can hide inside the fp family, `fpParamsFromGeometry`); affine bits outside {2,3,4,5,6,8} rejected at PARSE; no engine hardcodes a width (`affineParamsFromGeometry`, scan-pinned).
 - **Dense checkpoints**: scales absence PER-TENSOR (`getLayerScaleOpt`); dense contracted weights owe `maybeTransposeForBf16` — never depthwise conv or SSM state.
 - **A pack that declares its activation dtype is served in it** (`actDtype`, `LoadOpts.keep_f16`; Bonsai 2 f16 + f32 GDN state); every constant takes the activation dtype. Guard: `tests/test_hadamard_fidelity.sh`.
+- **Every new LM or media port supports a bf16 pack AND the quantized ones**: loader, converter presets and app catalog carry both; quantized is the default download, bf16 the quality reference.
 - **A gather-read table is quantized only where the READER has a quantized-gather path** (media `NEVER_QUANTIZE`; LM `embed_tokens` via `gatherQuantizedRows`).
 - **Calibrated quant**: weights per-input-channel and per-expert; bit width beats group granularity ≤3 bits; round (s,b) to the STORED dtype first; an imatrix is valid only for the WEIGHTS it was collected on; uniform ≤2-bit experts to the LAST layer cause agent loops (4-bit tail fixes it).
 - **Publish MTP head norms FOLDED** (`--fold-mtp-norms`).

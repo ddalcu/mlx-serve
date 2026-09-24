@@ -65,6 +65,16 @@ that mlx-serve does not use. Those notices are omitted here as permitted by
 Apache-2.0 section 4(d).
 
 --------------------------------------------------------------------------------
+laya-mlx
+https://github.com/mizorewww/laya-mlx
+Copyright laya-mlx contributors
+Licensed under the Apache License, Version 2.0.
+
+src/laya.zig is an op-for-op port of the laya_mlx runtime: prompt and sequence
+construction, the ModernBERT encoder, decision head, marker scorer, action head
+and calibration, so /v1/decisions answers match the reference.
+
+--------------------------------------------------------------------------------
 Inco Splash
 https://github.com/incoai/splash
 Licensed under the Apache License, Version 2.0.
