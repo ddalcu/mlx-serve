@@ -9,6 +9,16 @@ protocol AppActivating: AnyObject {
     func activate()
 }
 
+/// What the modal picker path asks of its panel, so a test can pin the order.
+@MainActor
+protocol ModalPanel: AnyObject {
+    func center()
+    func makeKeyAndOrderFront(_ sender: Any?)
+    func runModal() -> NSApplication.ModalResponse
+}
+
+extension NSSavePanel: ModalPanel {}
+
 /// Brings this `LSUIElement` app properly forward before it presents UI.
 @MainActor
 enum AppActivation {
@@ -18,6 +28,10 @@ enum AppActivation {
     enum Step: Equatable {
         case setPolicy(NSApplication.ActivationPolicy)
         case activate
+    }
+
+    enum PanelStep: Equatable {
+        case center, orderFront, runModal
     }
 
     /// The live app.
@@ -96,14 +110,20 @@ enum AppActivation {
     static func runModal(_ panel: NSSavePanel) -> NSApplication.ModalResponse {
         focus()
         panel.level = .modalPanel
-        // A modal panel opened while another app is frontmost can come up
-        // behind it (macOS ≥14 may ignore the ignoringOtherApps hint). Order
-        // it front ourselves before the modal loop takes over.
-        panel.makeKeyAndOrderFront(nil)
-        let response = panel.runModal()
+        let response = runModalLoop(panel)
         // The picker may have been the only thing keeping us .regular.
         ActivationPolicyManager.shared.reapply()
         return response
+    }
+
+    /// Centre first: a panel that was never positioned sits at the screen's
+    /// bottom left, and ordering it front pins it there before the modal loop
+    /// can place it. The order-front stays: a modal panel opened while another
+    /// app is frontmost can otherwise come up behind it (macOS 14+).
+    static func runModalLoop(_ panel: ModalPanel) -> NSApplication.ModalResponse {
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        return panel.runModal()
     }
 
     /// Non-modal (`begin`) variant, for pickers presented from a callback.
