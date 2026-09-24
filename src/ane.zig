@@ -158,7 +158,7 @@ pub fn chipBrand() []const u8 {
     return chip_brand_buf[0..chip_brand_len];
 }
 
-fn chipBrandString(buf: []u8) []const u8 {
+pub fn chipBrandString(buf: []u8) []const u8 {
     // machdep.cpu.brand_string is an Apple-Silicon sysctl; the ANE offload is
     // macOS-only, so non-Darwin gets the empty brand (defaults downstream).
     if (comptime !builtin.os.tag.isDarwin()) return "";

@@ -3826,6 +3826,26 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 _ = mlx.mlx_array_eval(lg);
                 _ = mlx.mlx_array_free(lg);
             }
+            // DIAGNOSTIC (MLX_SERVE_DECODE_GRAPH_DUMP=<path>): print the lazy
+            // graph of ONE forward (every primitive with its shape) before it
+            // is evaluated, to map which ops a decode step dispatches.
+            if (std.c.getenv("MLX_SERVE_DECODE_GRAPH_DUMP")) |path| {
+                const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                if (xfm_ptr.forwardWith(&ctx, ti)) |lg| {
+                    defer _ = mlx.mlx_array_free(lg);
+                    if (std.c.fopen(path, "w")) |f| {
+                        const outs = mlx.mlx_vector_array_new_value(lg);
+                        defer _ = mlx.mlx_vector_array_free(outs);
+                        const namer = mlx.mlx_node_namer_new();
+                        defer _ = mlx.mlx_node_namer_free(namer);
+                        _ = mlx.mlx_print_graph(f, namer, outs);
+                        _ = std.c.fclose(f);
+                        log.info("[fwd-ubench] graph dumped to {s}\n", .{std.mem.sliceTo(path, 0)});
+                    }
+                    _ = mlx.mlx_array_eval(lg);
+                } else |_| {}
+            }
             // Split CPU graph CONSTRUCTION from GPU execution. MLX is lazy, so
             // `forwardWith` only issues ops — if that half dominates, the token
             // is bounded by op count / FFI overhead, not by memory bandwidth,

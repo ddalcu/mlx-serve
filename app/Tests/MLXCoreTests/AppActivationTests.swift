@@ -57,6 +57,24 @@ final class AppActivationTests: XCTestCase {
         XCTAssertEqual(app.steps, [.setPolicy(.regular), .activate, .activate])
     }
 
+    // MARK: - Modal panel order
+
+    /// Records what the modal path asks of the panel, in order.
+    private final class FakePanel: ModalPanel {
+        var steps: [AppActivation.PanelStep] = []
+        func center() { steps.append(.center) }
+        func makeKeyAndOrderFront(_ sender: Any?) { steps.append(.orderFront) }
+        func runModal() -> NSApplication.ModalResponse { steps.append(.runModal); return .OK }
+    }
+
+    /// A never-positioned panel sits at the screen's bottom left, and ordering
+    /// it front pins it there before the modal loop can place it (#444).
+    func testModalPanelIsCentredBeforeItIsOrderedFront() {
+        let panel = FakePanel()
+        XCTAssertEqual(AppActivation.runModalLoop(panel), .OK)
+        XCTAssertEqual(panel.steps, [.center, .orderFront, .runModal])
+    }
+
     // MARK: - Window titles
 
     /// `openAndFocus` raises the newly-opened window by TITLE. The map lived

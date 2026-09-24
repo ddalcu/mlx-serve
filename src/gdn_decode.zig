@@ -139,6 +139,104 @@ const K2_SOURCE =
     \\}
 ;
 
+// K1 over TL tokens (verify widths): the same per-token prework and recurrence,
+// token after token, plus the per-step state capture MTP rollback reads
+// (state_seq[TL-1] is never written, as in the stock capture kernel).
+const K1S_SOURCE =
+    \\constexpr int NSG = NT / 32;
+    \\constexpr int RB = DV / SPLIT;
+    \\constexpr int R = RB / NSG;
+    \\constexpr int GRP = HV / HK;
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint hv = threadgroup_position_in_grid.x / SPLIT;
+    \\uint part = threadgroup_position_in_grid.x % SPLIT;
+    \\uint hk = hv / GRP;
+    \\threadgroup float qs[TL][DK], ks[TL][DK], vs[TL][DV];
+    \\threadgroup float gb[TL][2];
+    \\uint row0 = part * RB + sg * R;
+    \\float st[R][4];
+    \\for (int j = 0; j < R; ++j) {
+    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
+    \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
+    \\}
+    \\if (sg < 3) {
+    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
+    \\  for (int t = 0; t < TL; ++t) {
+    \\    T act[4];
+    \\    float sumsq = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      float acc = 0.0f;
+    \\      for (int tap = 0; tap < 4; ++tap) {
+    \\        int w = t + tap;
+    \\        const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\        acc += float(xv) * float(conv_w[ch * 4 + tap]);
+    \\      }
+    \\      const T conv = T(acc);
+    \\      T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
+    \\      act[i] = conv * sig;
+    \\      float v = float(act[i]);
+    \\      sumsq += v * v;
+    \\    }
+    \\    if (sg < 2) {
+    \\      sumsq = simd_sum(sumsq);
+    \\      float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
+    \\      const T scale = sg == 0 ? q_scale : k_scale;
+    \\      threadgroup float* dst = sg == 0 ? qs[t] : ks[t];
+    \\      for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
+    \\    } else {
+    \\      for (int i = 0; i < 4; ++i) vs[t][lane * 4 + i] = float(act[i]);
+    \\    }
+    \\  }
+    \\  if (part == 0 && (sg == 2 || hv % GRP == 0)) {
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      for (int j = 0; j < 3; ++j) {
+    \\        int w = TL + j;
+    \\        conv_out[j * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\      }
+    \\    }
+    \\  }
+    \\}
+    \\if (sg == (NSG > 3 ? 3 : 0) && lane == 31) {
+    \\  float ea = metal::precise::exp(float(A_log[hv]));
+    \\  for (int t = 0; t < TL; ++t) {
+    \\    const T bv = b_in[t * HV + hv];
+    \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
+    \\    gb[t][1] = float(bsig);
+    \\    const T apd = T(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
+    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
+    \\    gb[t][0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\for (int t = 0; t < TL; ++t) {
+    \\  float kk[4], qq[4];
+    \\  for (int i = 0; i < 4; ++i) { kk[i] = ks[t][lane * 4 + i]; qq[i] = qs[t][lane * 4 + i]; }
+    \\  const float g = gb[t][0], beta = gb[t][1];
+    \\  for (int j = 0; j < R; ++j) {
+    \\    uint dv = row0 + j;
+    \\    float kv_mem = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
+    \\    kv_mem = simd_sum(kv_mem);
+    \\    float delta = (vs[t][dv] - kv_mem) * beta;
+    \\    float out = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
+    \\    out = simd_sum(out);
+    \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
+    \\    if (t + 1 < TL) {
+    \\      uint sbase = t * (HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
+    \\      for (int i = 0; i < 4; ++i) state_seq[sbase + i] = static_cast<StT>(st[j][i]);
+    \\    }
+    \\  }
+    \\}
+    \\for (int j = 0; j < R; ++j) {
+    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
+    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
+    \\}
+;
+
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup
 
@@ -213,30 +311,30 @@ fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     cfg_key = .{ .g = g, .dt = dt, .st = st };
 }
 
-/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
-pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+pub const Recur = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
+
+/// K1 alone: prework + recurrence, y as [1,1,Hv,Dv]; z, norm_w, eps and signs
+/// are not read. Null when the geometry or dtypes are outside the kernel.
+pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;
-    for ([_]mlx.mlx_array{ in.z, in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.norm_w, in.q_scale, in.k_scale }) |arr|
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |arr|
         if (mlx.mlx_array_dtype(arr) != dt) return null;
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
     if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
-    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
     const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (cfg_key == null or !std.meta.eql(cfg_key.?, key)) try buildConfigs(g, dt, st);
-    const c1 = cfg1;
-    const c2 = cfg2;
 
     const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
     defer _ = mlx.mlx_vector_array_free(v1);
     var o1 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1_cache.?, v1, c1, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1_cache.?, v1, cfg1, s));
     var y = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y);
+    errdefer _ = mlx.mlx_array_free(y);
     var conv_out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(conv_out);
     var state_out = mlx.mlx_array_new();
@@ -244,14 +342,89 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     try mlx.check(mlx.mlx_vector_array_get(&y, o1, 0));
     try mlx.check(mlx.mlx_vector_array_get(&conv_out, o1, 1));
     try mlx.check(mlx.mlx_vector_array_get(&state_out, o1, 2));
+    return .{ .y = y, .conv_state = conv_out, .ssm_state = state_out };
+}
 
-    const in2 = [_]mlx.mlx_array{ y, in.z, in.norm_w, in.eps, in.signs };
+/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
+pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+    for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
+    const r = (try recur(g, in, s)) orelse return null;
+    defer _ = mlx.mlx_array_free(r.y);
+    errdefer _ = mlx.mlx_array_free(r.conv_state);
+    errdefer _ = mlx.mlx_array_free(r.ssm_state);
+    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
+
+    const in2 = [_]mlx.mlx_array{ r.y, in.z, in.norm_w, in.eps, in.signs };
     const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
     defer _ = mlx.mlx_vector_array_free(v2);
     var o2 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o2);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, c2, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, cfg2, s));
     var rot = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&rot, o2, 0));
-    return .{ .rot = rot, .conv_state = conv_out, .ssm_state = state_out };
+    return .{ .rot = rot, .conv_state = r.conv_state, .ssm_state = r.ssm_state };
+}
+
+pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array };
+
+pub const MAX_SEQ: c_int = 8;
+var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
+var seq_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var seq_cfg_key: ?CfgKey = null;
+
+fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv, g.dv }, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
+    return cfg;
+}
+
+/// K1 over t_len tokens (2..MAX_SEQ) with per-step state capture: y as
+/// [1,T,Hv,Dv], the next conv state, the final state and state_seq
+/// ([T,1,Hv,Dv,Dk], row T-1 unwritten). Null outside the kernel's geometry.
+pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?RecurSeq {
+    if (t_len < 2 or t_len > MAX_SEQ) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (k1s_cache == null) k1s_cache = try makeKernel("msv_gdn_decode_recur_seq", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE, HEADER);
+    const key = CfgKey{ .g = g, .dt = dt, .st = st };
+    if (seq_cfg_key == null or !std.meta.eql(seq_cfg_key.?, key)) {
+        for (&seq_cfgs) |*slot| if (slot.*) |c| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            slot.* = null;
+        };
+        seq_cfg_key = key;
+    }
+    const idx: usize = @intCast(t_len);
+    if (seq_cfgs[idx] == null) seq_cfgs[idx] = try buildSeqConfig(g, t_len, dt, st);
+
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1s_cache.?, v1, seq_cfgs[idx].?, s));
+    var out: [4]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3] };
 }
