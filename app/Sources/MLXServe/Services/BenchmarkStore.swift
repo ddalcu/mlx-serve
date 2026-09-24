@@ -292,7 +292,7 @@ actor BenchmarkCommunityClient {
     }
 
     /// Publish rows one at a time. Opt-in only — never called without an
-    /// explicit press of Share.
+    /// explicit press of Share, or `--share` on `MLXCore bench`.
     func submit(_ rows: [BenchmarkResult]) async -> Outcome {
         var outcome = Outcome()
         guard let url = BenchmarkStore.communitySubmitURL() else { return outcome }
