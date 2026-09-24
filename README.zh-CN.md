@@ -81,6 +81,7 @@ brew bundle install --file=Brewfile   # cmake + webp
 | 带自动下载 + REPL 的 `run <model>` CLI | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | 🟡 部分² | ❌ | ❌ |
 | DeepSeek V4 Flash（284B） | ✅ 经 ds4 | ❌ | ❌ | ❌ |
+| 类型化决策（Laya，`POST /v1/decisions`） | ✅ | ❌ | ❌ | ❌ |
 | 投机解码（PLD + 草稿模型 + 原生 MTP） | ✅ | ❌ | 部分 | 仅草稿模型 |
 | 解码速度（相对 LM Studio 的几何均值，相同权重） | **+26%**（MLX，默认设置） | 基线 | 约 −15%（GGUF，估算¹） | +11%（MLX） |
 | KV cache 量化（4/8-bit） | ✅ | ❌ | 部分 | ✅ |
@@ -145,7 +146,7 @@ brew bundle install --file=Brewfile   # cmake + webp
 
 ## 支持的模型
 
-原生 MLX 调度支持 Gemma 3/4、DiffusionGemma、Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next、Meta 的 Muse-Glimmer-30B、inclusionAI Ling 3.0、DeepSeek V4 Flash（284B）、腾讯 Hunyuan 3（295B）、Thinking Machines Inkling Small（276B）、poolside Laguna、Llama 3.x、Mistral、Nemotron-H、LFM2/2.5（含 VL 视觉版本），以及嵌入模型（BERT、EmbeddingGemma、Qwen3-Embedding）。其他任何模型都以 GGUF 形式跑在内置 llama.cpp 上，按格式自动路由。含 `model_type`、聊天格式与视觉支持的完整表格见 [docs/models.md](docs/zh-CN/models.md)。
+原生 MLX 调度支持 Gemma 3/4、DiffusionGemma、Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next、Meta 的 Muse-Glimmer-30B、inclusionAI Ling 3.0、DeepSeek V4 Flash（284B）、腾讯 Hunyuan 3（295B）、Thinking Machines Inkling Small（276B）、poolside Laguna、Llama 3.x、Mistral、Nemotron-H、LFM2/2.5（含 VL 视觉版本），以及嵌入模型（BERT、EmbeddingGemma、Qwen3-Embedding）和 Laya 类型化决策模型（`POST /v1/decisions`）。其他任何模型都以 GGUF 形式跑在内置 llama.cpp 上，按格式自动路由。含 `model_type`、聊天格式与视觉支持的完整表格见 [docs/models.md](docs/zh-CN/models.md)。
 
 ## 性能
 
