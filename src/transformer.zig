@@ -27291,6 +27291,61 @@ pub const Transformer = struct {
             return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
         }
 
+        // MTP verify rows (spec capture, 2 <= S <= 8): the same kernel over S
+        // tokens with the per-step state capture rollback reads, then the norm-gate.
+        if (self.rht == null and batch == 1 and seq_len >= 2 and seq_len <= gdn_decode.MAX_SEQ and projected == null and
+            self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
+            !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
+        fast: {
+            if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+            const r = (try gdn_decode.recurSeq(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, seq_len, .{
+                .qkv = qkv,
+                .z = z_proj,
+                .a = a_proj,
+                .b = b_proj,
+                .conv_state = ssm.conv_state,
+                .ssm_state = ssm.ssm_state,
+                .conv_w = la.conv1d_w,
+                .A_log = la.A_log,
+                .dt_bias = la.dt_bias,
+                .q_scale = inv_scale_sq,
+                .k_scale = inv_sqrt_sc,
+                .norm_w = la.norm_w,
+                .eps = self.gdn_eps.?,
+                .signs = .{ .ctx = null },
+            }, self.s)) orelse break :fast;
+            defer _ = mlx.mlx_array_free(r.y);
+            const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse {
+                inline for (.{ r.conv_state, r.ssm_state, r.state_seq }) |a| _ = mlx.mlx_array_free(a);
+                break :fast;
+            };
+            defer _ = mlx.mlx_array_free(flat);
+            // Rollback slices the conv INPUT, as the composed path stashes it.
+            var conv_input = mlx.mlx_array_new();
+            {
+                const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
+                const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s)) catch |e| {
+                    inline for (.{ conv_input, r.conv_state, r.ssm_state, r.state_seq }) |a| _ = mlx.mlx_array_free(a);
+                    return e;
+                };
+            }
+            if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+            ssm.spec_conv_input = conv_input;
+            if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+            ssm.spec_state_seq = r.state_seq;
+            _ = mlx.mlx_array_free(ssm.conv_state);
+            ssm.conv_state = r.conv_state;
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = r.ssm_state;
+            if (!gdn_verify_recur_engaged) {
+                gdn_verify_recur_engaged = true;
+                log.info("[gdn] verify recur engaged: S={d} Hk={d} Hv={d}\n", .{ seq_len, num_k_heads, num_v_heads });
+            }
+            return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+        }
+
         var q_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_scaled);
         var k_scaled = mlx.mlx_array_new();
@@ -33808,6 +33863,7 @@ pub fn gdnDecodeFusedEnabled() bool {
 
 var gdn_decode_recur_env: ?bool = null;
 var gdn_decode_recur_engaged: bool = false;
+var gdn_verify_recur_engaged: bool = false;
 
 /// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the
 /// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
@@ -54848,6 +54904,154 @@ test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-
     defer gdn_decode_fused_override = null;
     // bf16 everywhere, and a Hadamard pack's f16 activations over an f32 state.
     for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts| try gdnDecodeParityCase(s, dts[0], dts[1]);
+}
+
+test "gdn_decode.recurSeq: bit-identical to prework -> capture recurrence at verify widths" {
+    const s = mlx.gpuStream();
+    gdn_decode_fused_override = true;
+    defer gdn_decode_fused_override = null;
+    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts| {
+        var t: c_int = 2;
+        while (t <= 8) : (t += 1) try gdnDecodeSeqParityCase(s, dts[0], dts[1], t);
+    }
+}
+
+fn gdnDecodeSeqParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_len: c_int) !void {
+    var prng = std.Random.DefaultPrng.init(0x5EC0 + @as(u64, @intCast(t_len)));
+    const rnd = prng.random();
+    const hk: c_int = 2;
+    const hv: c_int = 8;
+    const dk: c_int = 128;
+    const dv: c_int = 128;
+    const c_dim: c_int = hk * dk * 2 + hv * dv;
+    const value_dim: c_int = hv * dv;
+
+    const q_scale = try scalarOf(1.0 / 128.0, dt, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = try scalarOf(@sqrt(1.0 / 128.0), dt, s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    const A_log = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(A_log);
+    const dt_bias = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    const z = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, value_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(z);
+    const b_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(b_in);
+    const a_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(a_in);
+    const conv_state = try gdnParityRand(rnd, &[_]c_int{ 1, 3, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_state);
+    const ssm_state = try gdnParityRand(rnd, &[_]c_int{ 1, hv, dv, dk }, 1.0, st, s);
+    defer _ = mlx.mlx_array_free(ssm_state);
+    const conv_w = try gdnParityRand(rnd, &[_]c_int{ c_dim, 4, 1 }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_w);
+    const norm_w = try gdnParityRand(rnd, &[_]c_int{dv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps_arr);
+
+    // Composed chain: fused prework at seq = T, then the capture recurrence.
+    const pre = (try gdnPreworkFused(s, .{
+        .qkv = qkv,
+        .qkv_off = 0,
+        .qkv_stride = c_dim,
+        .b = b_in,
+        .b_off = 0,
+        .b_stride = hv,
+        .a = a_in,
+        .a_off = 0,
+        .a_stride = hv,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .conv_state = conv_state,
+        .conv_w = conv_w,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .hk = hk,
+        .hv = hv,
+        .dk = dk,
+        .dv = dv,
+        .seq = t_len,
+    })) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(pre.q);
+    defer _ = mlx.mlx_array_free(pre.k);
+    defer _ = mlx.mlx_array_free(pre.v);
+    defer _ = mlx.mlx_array_free(pre.conv_state);
+    defer _ = mlx.mlx_array_free(pre.g);
+    defer _ = mlx.mlx_array_free(pre.beta);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, t_len, hv, dv }, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ t_len, 1, hv, dv, dk }, 5, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ 1, hv, dv, dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", hk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", hv));
+    const T_scalar = mlx.mlx_array_new_int(t_len);
+    defer _ = mlx.mlx_array_free(T_scalar);
+    const seq_stride = mlx.mlx_array_new_int(hv * dv * dk);
+    defer _ = mlx.mlx_array_free(seq_stride);
+    const inputs_arr = [_]mlx.mlx_array{ pre.q, pre.k, pre.v, pre.g, pre.beta, ssm_state, T_scalar, seq_stride };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, try getGdnKernelSeq(false), inputs_vec, config, s));
+    var y_ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_ref);
+    var seq_ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seq_ref);
+    var state_ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(state_ref);
+    try mlx.check(mlx.mlx_vector_array_get(&y_ref, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&seq_ref, outputs_vec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&state_ref, outputs_vec, 2));
+
+    const got = (try gdn_decode.recurSeq(.{ .hk = hk, .hv = hv, .dk = dk, .dv = dv }, t_len, .{
+        .qkv = qkv,
+        .z = z,
+        .a = a_in,
+        .b = b_in,
+        .conv_state = conv_state,
+        .ssm_state = ssm_state,
+        .conv_w = conv_w,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .norm_w = norm_w,
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
+    }, s)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(got.y);
+    defer _ = mlx.mlx_array_free(got.conv_state);
+    defer _ = mlx.mlx_array_free(got.ssm_state);
+    defer _ = mlx.mlx_array_free(got.state_seq);
+
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(y_ref, got.y, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, got.conv_state, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(state_ref, got.ssm_state, s));
+    // state_seq[T-1] is never written (capture-tail trim); compare the rest.
+    var seq_ref_head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seq_ref_head);
+    var seq_got_head = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seq_got_head);
+    const start = [_]c_int{ 0, 0, 0, 0, 0 };
+    const stop = [_]c_int{ t_len - 1, 1, hv, dv, dk };
+    const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+    try mlx.check(mlx.mlx_slice(&seq_ref_head, seq_ref, &start, 5, &stop, 5, &strides, 5, s));
+    try mlx.check(mlx.mlx_slice(&seq_got_head, got.state_seq, &start, 5, &stop, 5, &strides, 5, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(seq_ref_head, seq_got_head, s));
 }
 
 fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
