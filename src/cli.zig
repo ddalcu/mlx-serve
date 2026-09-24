@@ -265,7 +265,6 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 pub fn shouldDownload(path: []const u8) bool {
     if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        // Subdirs an engine reads: MTP head, Kokoro G2P tables, Qwen3-TTS codec.
         const sidecar_dirs = [_][]const u8{ "mtp/", "g2p/", "speech_tokenizer/" };
         for (sidecar_dirs) |d| {
             if (std.mem.startsWith(u8, path, d)) break;
