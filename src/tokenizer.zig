@@ -86,9 +86,10 @@ pub const Tokenizer = struct {
     pretok_style: PretokStyle = .gpt2,
     /// HF `Metaspace` pre-tokenizer (mmBERT / Gemma-2 class tokenizer.json):
     /// a leading ▁ is prepended when the text does not already start with
-    /// one (`prepend_scheme` != never), and the text is split at every ▁
-    /// (kept with the following piece) before BPE (`split: true`).
-    metaspace_prepend: bool = false,
+    /// one (`prepend_scheme`; `first` = only text at offset 0, never after a
+    /// special token), and the text is split at every ▁ (kept with the
+    /// following piece) before BPE (`split: true`).
+    metaspace_prepend: MetaspacePrepend = .never,
     metaspace_split: bool = false,
     /// HF BPE `byte_fallback`: a character with no vocab entry becomes its
     /// UTF-8 bytes as `<0xNN>` tokens (all must exist, else `unk_token`);
@@ -299,7 +300,7 @@ pub const Tokenizer = struct {
             }
             if (matched) |m| {
                 if (pos > seg_start) {
-                    const ids = try self.encodeSegment(allocator, text[seg_start..pos]);
+                    const ids = try self.encodeSegment(allocator, text[seg_start..pos], seg_start == 0);
                     defer allocator.free(ids);
                     try result.appendSlice(allocator, ids);
                 }
@@ -311,7 +312,7 @@ pub const Tokenizer = struct {
             }
         }
         if (seg_start < text.len) {
-            const ids = try self.encodeSegment(allocator, text[seg_start..]);
+            const ids = try self.encodeSegment(allocator, text[seg_start..], seg_start == 0);
             defer allocator.free(ids);
             try result.appendSlice(allocator, ids);
         }
@@ -320,9 +321,9 @@ pub const Tokenizer = struct {
     }
 
     /// Encode a text segment (no special tokens) using the appropriate method.
-    fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+    fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, at_start: bool) ![]u32 {
         return switch (self.tok_type) {
-            .sentencepiece_bpe => self.encodeSentencePiece(allocator, text),
+            .sentencepiece_bpe => self.encodeSentencePiece(allocator, text, at_start),
             .byte_level_bpe => self.encodeByteLevel(allocator, text),
             .wordpiece => self.encodeWordPiece(allocator, text),
         };
@@ -411,13 +412,18 @@ pub const Tokenizer = struct {
 
     // ── SentencePiece BPE (Gemma-style) ──
 
-    fn encodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+    fn encodeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, at_start: bool) ![]u32 {
         // Normalize: replace spaces with ▁ (U+2581)
         var normalized: std.ArrayList(u8) = .empty;
         defer normalized.deinit(allocator);
 
         const sep = "\xe2\x96\x81";
-        if (self.metaspace_prepend and !std.mem.startsWith(u8, text, " ") and !std.mem.startsWith(u8, text, sep)) {
+        const prepend = switch (self.metaspace_prepend) {
+            .never => false,
+            .first => at_start,
+            .always => true,
+        };
+        if (prepend and !std.mem.startsWith(u8, text, " ") and !std.mem.startsWith(u8, text, sep)) {
             try normalized.appendSlice(allocator, sep);
         }
         for (text) |c| {
@@ -1486,7 +1492,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
-        .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else false,
+        .metaspace_prepend = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).prepend else .never,
         .metaspace_split = if (root.get("pre_tokenizer")) |pt| metaspaceFromPreTokenizer(pt).split else false,
         .byte_fallback = if (model_obj.get("byte_fallback")) |v| v == .bool and v.bool else false,
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
@@ -1606,7 +1612,8 @@ fn parseMergePair(merge_val: std.json.Value) ?Tokenizer.MergePair {
 }
 
 /// Check if a pre_tokenizer JSON value contains a ByteLevel type.
-const MetaspaceOpts = struct { prepend: bool = false, split: bool = false };
+const MetaspacePrepend = enum { never, first, always };
+const MetaspaceOpts = struct { prepend: MetaspacePrepend = .never, split: bool = false };
 
 /// `Metaspace` pre-tokenizer options from tokenizer.json (top-level or inside
 /// a `Sequence`). Absent → both false, which is the pre-existing behaviour
@@ -1649,15 +1656,15 @@ fn metaspaceFromPreTokenizer(pt: std.json.Value) MetaspaceOpts {
         if (pt.object.get("pretokenizers")) |pts| {
             if (pts == .array) for (pts.array.items) |sub| {
                 const o = metaspaceFromPreTokenizer(sub);
-                if (o.prepend or o.split) return o;
+                if (o.prepend != .never or o.split) return o;
             };
         }
         return .{};
     }
     if (!std.mem.eql(u8, t.string, "Metaspace")) return .{};
-    var opts = MetaspaceOpts{ .prepend = true, .split = true };
+    var opts = MetaspaceOpts{ .prepend = .always, .split = true };
     if (pt.object.get("prepend_scheme")) |ps| {
-        if (ps == .string and std.mem.eql(u8, ps.string, "never")) opts.prepend = false;
+        if (ps == .string) opts.prepend = std.meta.stringToEnum(MetaspacePrepend, ps.string) orelse .always;
     }
     if (pt.object.get("split")) |sp| {
         if (sp == .bool) opts.split = sp.bool;
@@ -1670,7 +1677,7 @@ test "metaspaceFromPreTokenizer: Metaspace sets prepend+split, Split/ByteLevel d
         \\{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"always","split":true}
     , .{});
     defer p1.deinit();
-    try testing.expectEqual(MetaspaceOpts{ .prepend = true, .split = true }, metaspaceFromPreTokenizer(p1.value));
+    try testing.expectEqual(MetaspaceOpts{ .prepend = .always, .split = true }, metaspaceFromPreTokenizer(p1.value));
     var p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator,
         \\{"type":"Split","pattern":{"String":" "},"behavior":"MergedWithPrevious","invert":false}
     , .{});
@@ -1702,28 +1709,41 @@ test "encodeSentencePiece: Metaspace prepends ▁ once and splits pieces at ▁ 
     defer id_to_token.deinit();
     var special_tokens = std.StringHashMap(u32).init(allocator);
     defer special_tokens.deinit();
+    try special_tokens.put("[I]", 9);
     var tok = makeBpeTestTokenizer(allocator, &vocab, &merge_ranks, &id_to_token, &special_tokens);
     defer tok.unicode_to_byte.deinit();
 
     // Legacy path (no Metaspace): no prefix.
-    const legacy = try tok.encodeSentencePiece(allocator, "a b");
+    const legacy = try tok.encodeSentencePiece(allocator, "a b", true);
     defer allocator.free(legacy);
     try testing.expectEqualSlices(u32, &[_]u32{ 4, 3 }, legacy);
 
     // Prefix without split: BPE merges straight across the ▁ boundary.
-    tok.metaspace_prepend = true;
-    const unsplit = try tok.encodeSentencePiece(allocator, "a b");
+    tok.metaspace_prepend = .always;
+    const unsplit = try tok.encodeSentencePiece(allocator, "a b", true);
     defer allocator.free(unsplit);
     try testing.expectEqualSlices(u32, &[_]u32{6}, unsplit);
 
     tok.metaspace_split = true;
-    const split = try tok.encodeSentencePiece(allocator, "a b");
+    const split = try tok.encodeSentencePiece(allocator, "a b", true);
     defer allocator.free(split);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 3 }, split);
     // A leading space already IS the prefix; a double space yields a lone ▁ (HF: 'a  b' -> ▁a ▁ ▁b).
-    const lead = try tok.encodeSentencePiece(allocator, " a  b");
+    const lead = try tok.encodeSentencePiece(allocator, " a  b", true);
     defer allocator.free(lead);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 2, 3 }, lead);
+
+    // prepend_scheme "first" (Mistral v0.3): only text at offset 0 gets the ▁; HF `[INST]Use` -> `Use`.
+    var first = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"Metaspace","replacement":"\u2581","prepend_scheme":"first","split":false}
+    , .{});
+    defer first.deinit();
+    const opts = metaspaceFromPreTokenizer(first.value);
+    tok.metaspace_prepend = opts.prepend;
+    tok.metaspace_split = opts.split;
+    const after_special = try tok.encode(allocator, "a[I]a");
+    defer allocator.free(after_special);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 9, 4 }, after_special);
 }
 
 fn hasByteLevel(pt: std.json.Value) bool {

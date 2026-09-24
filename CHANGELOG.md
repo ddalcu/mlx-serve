@@ -1,15 +1,27 @@
 # Changelog
 
-## v26.9.6-dev
+## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
+
+### Highlights
+- **Every image in a conversation reaches the model.** Earlier turns and images returned by tools (pi, Claude Code's Read) are seen where they were sent; before, only the latest turn's images were, so an agent that read three pages saw only the last one. An image already seen is not re-encoded on later turns.
+
+- **Qwen3.8 agents stop going in circles.** Earlier turns' thinking is no longer replayed into the prompt, so long agent sessions use about half the context. The cost is a short pause when you send a new instruction; tool rounds are unaffected. `chat_template_kwargs: {"preserve_thinking": true}` in Model Settings restores the old behaviour.
+
+- **Laya typed decisions.** `POST /v1/decisions` answers score, yes/no and choice questions about a game or app state with Laya checkpoints (`aac6fef/laya-multilingual-mlx`), and concurrent requests are answered in one pass.
+
+- **Steer a running agent.** Press Return while an agent chat works to queue a note; the agent picks it up at its next tool round as your next message.
+
+- **The app is now MLX-Serve.app** and the download is MLX-Serve.dmg. Settings carry over; an app updated in place from 26.9.5 keeps its old folder name until the next update renames it.
 
 ### Changes
-- "Reasoning replay loop": Qwen3.8 no longer carries every earlier turn's thinking in the prompt. Long agent sessions stop going in circles and use about half the context. The cost is a short pause each time you send a new instruction (a few seconds early on, ~15s around 100k tokens) while the model re-reads the last task without its old thinking; tool rounds in between are unaffected. Set chat_template_kwargs: {"preserve_thinking": true} in Model Settings to get the old behaviour back.
-- `/v1/chat/completions` reads a request's `chat_template_kwargs` (vLLM style): `{"enable_thinking": false}` there now turns thinking off.
-- Every image in a conversation reaches the model where it was sent, including earlier turns and images returned by tools (pi, Claude Code's Read). Before, only the latest turn's images were seen, so an agent that read three pages saw only the last one. An image already seen is not re-encoded on later turns. LFM2-VL models loaded from the app get their image markers back too, and LFM2-VL 1.6B no longer drops agent tool turns to a generic prompt format.
-- The app's chats and agents send earlier images again on every turn (Qwen, LFM2-VL, Muse). Gemma still sends only the latest message's images.
+- Claude Code on `/v1/messages` streams thinking as it is generated when tools are on, instead of showing nothing and then one block.
+- A long prompt that does not fit in memory frees prefix cache from other chats to make room instead of being refused. Before, only Qwen3.8 Flash Next did this.
+- A short chat that starts like a long one (same system prompt, e.g. a "hi" in omp) no longer pushes the long session out of the prefix cache and forces it to re-read its whole context.
+- `/v1/chat/completions` reads a request's `chat_template_kwargs` (vLLM style): `{"enable_thinking": false}` there turns thinking off.
+- Mistral 7B v0.3 and other SentencePiece models with byte fallback tokenize like Hugging Face: newlines and tabs were dropped from the prompt, and no stray space is added after special tokens.
+- The app's chats and agents send earlier images again on every turn (Qwen, LFM2-VL, Muse); Gemma still sends only the latest message's images. LFM2-VL models loaded from the app get their image markers back, and LFM2-VL 1.6B no longer drops agent tool turns to a generic prompt format.
 - Models without vision tell an agent when its tool returned an image they cannot see, instead of dropping it silently.
-- opencode and opencode2 launchers now turn thinking on (medium by default, with none/low/medium/high variants).
-- The app is now MLX-Serve.app and the download is MLX-Serve.dmg. Settings carry over; an app updated in place from 26.9.5 keeps its old folder name until the next update renames it.
+- opencode and opencode2 launchers turn thinking on (medium by default, with none/low/medium/high variants); Claude Code launched from the app skips permission prompts.
 
 ## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 

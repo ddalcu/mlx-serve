@@ -16,6 +16,12 @@ The nucleus is the mass STRICTLY above each rank (exclusive scan, rank 0 sees ze
 
 Guard: the shortlist route and the full-row route produce byte-identical filtered logits and draw the same token under the same key over `[m, V]` and `[B, L, V]` blocks at V 8192 and 248,320, six `(top_p, top_k)` settings, a 0.25-quantized row and an all-equal row; `applyTopK` keeps exactly k; the f64 nucleus reference may differ by one boundary column (its probability ~1e-5 against ~1e-7 of f32 scan error).
 
+### A short restore kept the long donor's KV capacity (#492)
+A restored cache SHARES the donor entry's buffer; the first append copied the WHOLE buffer, so a "hi" chat that matched only the system prompt of an 80k omp session kept 80k of capacity (27B: 1.9 GB). The byte budget then evicted the long session to hold the short one, and its next turn re-read the whole context.
+- Fix (`KVCache.restoredOversized`): when the donor's `shared_rows` exceed what `nextCapacityReserved` would give the restored prefix, regrow from the prefix instead of copying. The SSD-first move path keeps its in-place donation.
+- Same issue: evict-to-admit was gated on `longCtxGated()` (qwen4 only), so every other arch refused a long prompt it could fit by dropping cache. Both gates removed.
+- Guard: `KVCache: an append after a short restore sizes its copy from the prefix` unit test; live `~/claude-tmp/issue492/hi_size.sh` (resident MB of the hi entry).
+
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 

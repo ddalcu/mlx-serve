@@ -2,6 +2,11 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
+The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
+- Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.
+- Fix: `MetaspacePrepend` enum, `encode` passes `at_start` per segment. Guard: the `"first"` case in the `encodeSentencePiece: Metaspace` test; live `/tokenize` == HF on a prompt with specials.
+
 ### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
 
 Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).

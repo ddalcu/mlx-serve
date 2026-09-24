@@ -8,10 +8,10 @@
 
 ## Decode tok/s by release
 
-| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | speedup |
-|---|---|---|---|---|---|---|---|
-| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | +1% |
-| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | -1% |
-| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | +25% |
-| Qwen3.8 27B 4b (ddalcu MTP) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 0% |
-| Qwen3.8 Flash-Next mixed 4-8b (MTP) | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | +19% |
+| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | 26.9.6 | speedup |
+|---|---|---|---|---|---|---|---|---|
+| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | 121 pld | +5% |
+| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | 118 pld | +2% |
+| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | 252 mtp | +32% |
+| Qwen3.8 27B 4b (ddalcu MTP) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 73 mtp | +4% |
+| Qwen3.8 Flash-Next mixed 4-8b (MTP) | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | 80 mtp | +14% |

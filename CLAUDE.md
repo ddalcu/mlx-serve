@@ -299,6 +299,7 @@ Memory bills + admission:
 Prefix cache (RAM + SSD):
 - **The hot-cache budget is CLAMPED at load, a HARD cap, and FOLLOWS residency** (#364, `clampedPrefixCacheMem`, `reviseHotCacheBudgets`). Guard: `tests/test_prefix_cache_budget_revisit.sh`.
 - **An oversized candidate is TRIMMED to the longest restorable prefix** (#330, `trimLenForBudget`, `trimmedCopy` a real copy; QSA bank priced via `trimmedCheckpointBytes`); the replace path sheds inherited checkpoints first; commit owns `ssm_cps` on EVERY outcome.
+- **A restored cache shares its donor's buffer; a SHORT restore regrows from the prefix** (`KVCache.restoredOversized`, #492): copying the donor's capacity let a "hi" chat hold 1.9 GB and evict the long session it matched.
 - **Checkpoint retention thins the INTERIOR, dense newest quarter** (`spanPreservingDropIndex`, `ThinPolicy`); a decline is observable (`CommitStatus`, `TrimDecline`).
 - **Eviction is WORKLOAD-fair** (#378, `cache_key` via `requestCacheKey`, `lruIndexExcluding`). Guard: `tests/test_prefix_cache_workloads.sh`.
 - **State AT/AFTER media is keyed per ITEM on its PIXELS** (`Entry.media: []MediaSpan`; a match stops at the first item differing in position or pixels, `mediaSharedBound`; an entry keeps only the items it covers); inheritance + thinning obey the first item (`bestCheckpointDonor`, `boundaryCheckpointIndex`). Guard: `tests/test_vision_prefix_cache.sh`.
@@ -421,6 +422,7 @@ Configs, templates, tokenizers:
 - **Config reads**: when the reference IGNORES a field, the field is not the truth (laguna YaRN mscale); a field HF allows in two SHAPES is read as both (`chat_template`); `text_config` FIRST, then root, PER FIELD; a default only ONE family wants is pinned PER LAYER TYPE (muse `rope_local_base_freq`, `tests/test_muse_repetition.sh`).
 - **`*_text` siblings**: accept the tag, collapse to base type, prefix by `text_config` presence, force `tie_word_embeddings` for Gemma, add to BOTH visibility allowlists.
 - **A sampler never draws a RESERVED special or a PADDING row** (`reservedOutputIds` + `definedVocabSize` → `installSuppressMask`, `MLX_SERVE_SUPPRESS_RESERVED=0`; `unpadded_vocab_size` = ONE trim); logprobs stay RAW.
+- **Metaspace `prepend_scheme` is THREE-valued** (`MetaspacePrepend`): `first` prepends ▁ only at offset 0, never after a special token (Mistral `[INST]Use`); `always` prepends per segment (laya). Diff `/tokenize` vs HF on a prompt WITH specials.
 - **Digit GROUPING is per-model** (`Tokenizer.digit_group`; a COMBINED Split regex hides it, `pretok_style = .llama3`); cross-check `/tokenize` vs HF at bring-up. The degenerate-tail guard has a LONG-period tier (`isDegenerateTailLoopRange`).
 
 Weights, quant, loading:
