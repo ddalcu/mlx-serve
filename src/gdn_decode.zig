@@ -213,30 +213,30 @@ fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
     cfg_key = .{ .g = g, .dt = dt, .st = st };
 }
 
-/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
-pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+pub const Recur = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
+
+/// K1 alone: prework + recurrence, y as [1,1,Hv,Dv]; z, norm_w, eps and signs
+/// are not read. Null when the geometry or dtypes are outside the kernel.
+pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
     if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
     const dt = mlx.mlx_array_dtype(in.qkv);
     if (dt != .bfloat16 and dt != .float16) return null;
-    for ([_]mlx.mlx_array{ in.z, in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.norm_w, in.q_scale, in.k_scale }) |arr|
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |arr|
         if (mlx.mlx_array_dtype(arr) != dt) return null;
     const st = mlx.mlx_array_dtype(in.ssm_state);
     if (st != dt and st != .float32) return null;
     if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
-    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
     const key = CfgKey{ .g = g, .dt = dt, .st = st };
     if (cfg_key == null or !std.meta.eql(cfg_key.?, key)) try buildConfigs(g, dt, st);
-    const c1 = cfg1;
-    const c2 = cfg2;
 
     const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
     const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
     defer _ = mlx.mlx_vector_array_free(v1);
     var o1 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1_cache.?, v1, c1, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1_cache.?, v1, cfg1, s));
     var y = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y);
+    errdefer _ = mlx.mlx_array_free(y);
     var conv_out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(conv_out);
     var state_out = mlx.mlx_array_new();
@@ -244,14 +244,26 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     try mlx.check(mlx.mlx_vector_array_get(&y, o1, 0));
     try mlx.check(mlx.mlx_vector_array_get(&conv_out, o1, 1));
     try mlx.check(mlx.mlx_vector_array_get(&state_out, o1, 2));
+    return .{ .y = y, .conv_state = conv_out, .ssm_state = state_out };
+}
 
-    const in2 = [_]mlx.mlx_array{ y, in.z, in.norm_w, in.eps, in.signs };
+/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
+pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+    for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
+    const r = (try recur(g, in, s)) orelse return null;
+    defer _ = mlx.mlx_array_free(r.y);
+    errdefer _ = mlx.mlx_array_free(r.conv_state);
+    errdefer _ = mlx.mlx_array_free(r.ssm_state);
+    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
+
+    const in2 = [_]mlx.mlx_array{ r.y, in.z, in.norm_w, in.eps, in.signs };
     const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
     defer _ = mlx.mlx_vector_array_free(v2);
     var o2 = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(o2);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, c2, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, cfg2, s));
     var rot = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&rot, o2, 0));
-    return .{ .rot = rot, .conv_state = conv_out, .ssm_state = state_out };
+    return .{ .rot = rot, .conv_state = r.conv_state, .ssm_state = r.ssm_state };
 }

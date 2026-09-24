@@ -27250,6 +27250,47 @@ pub const Transformer = struct {
             return self.qmatmul(r.rot, la.out_w, la.out_s, la.out_b);
         }
 
+        // Other packs, plain decode: prework + recurrence in one dispatch, then
+        // the norm-gate epilogue.
+        if (self.rht == null and batch == 1 and seq_len == 1 and projected == null and
+            !self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
+            !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
+        fast: {
+            if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+            const r = (try gdn_decode.recur(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, .{
+                .qkv = qkv,
+                .z = z_proj,
+                .a = a_proj,
+                .b = b_proj,
+                .conv_state = ssm.conv_state,
+                .ssm_state = ssm.ssm_state,
+                .conv_w = la.conv1d_w,
+                .A_log = la.A_log,
+                .dt_bias = la.dt_bias,
+                .q_scale = inv_scale_sq,
+                .k_scale = inv_sqrt_sc,
+                .norm_w = la.norm_w,
+                .eps = self.gdn_eps.?,
+                .signs = .{ .ctx = null },
+            }, self.s)) orelse break :fast;
+            defer _ = mlx.mlx_array_free(r.y);
+            const flat = (try gdnNormGateFused(self.s, r.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, 1)) orelse {
+                _ = mlx.mlx_array_free(r.conv_state);
+                _ = mlx.mlx_array_free(r.ssm_state);
+                break :fast;
+            };
+            defer _ = mlx.mlx_array_free(flat);
+            _ = mlx.mlx_array_free(ssm.conv_state);
+            ssm.conv_state = r.conv_state;
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = r.ssm_state;
+            if (!gdn_decode_recur_engaged) {
+                gdn_decode_recur_engaged = true;
+                log.info("[gdn] decode recur engaged: Hk={d} Hv={d} gate={s}\n", .{ num_k_heads, num_v_heads, if (cfg.kda_sigmoid_out_gate) "sigmoid" else "swish" });
+            }
+            return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+        }
+
         var q_scaled = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_scaled);
         var k_scaled = mlx.mlx_array_new();
@@ -33763,6 +33804,21 @@ pub fn gdnDecodeFusedEnabled() bool {
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_decode_fused_env = enabled;
     return enabled;
+}
+
+var gdn_decode_recur_env: ?bool = null;
+var gdn_decode_recur_engaged: bool = false;
+
+/// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the
+/// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
+fn gdnDecodeRecurEnabled() bool {
+    const on = gdn_decode_recur_env orelse blk: {
+        const raw = std.c.getenv("MLX_SERVE_GDN_DECODE_RECUR");
+        const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        gdn_decode_recur_env = enabled;
+        break :blk enabled;
+    };
+    return on and gdnDecodeFusedEnabled();
 }
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
@@ -54786,7 +54842,7 @@ test "gdn packed prework: fused at production Hk/Hv serves B=6,8,16 S=1 per row"
     }
 }
 
-test "gdn_decode.step: bit-identical to prework -> recurrence -> norm-gate -> rotation, states included" {
+test "gdn_decode.step and recur: bit-identical to prework -> recurrence -> norm-gate -> rotation, states included" {
     const s = mlx.gpuStream();
     gdn_decode_fused_override = true;
     defer gdn_decode_fused_override = null;
@@ -54897,7 +54953,8 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     const rot_ref = try rht.transform(flat_ref, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(rot_ref);
 
-    const got = (try gdn_decode.step(.{ .hk = hk, .hv = hv, .dk = dk, .dv = dv }, .{
+    const geo = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
+    const in = gdn_decode.Inputs{
         .qkv = qkv,
         .z = z,
         .a = a_in,
@@ -54912,7 +54969,8 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
         .norm_w = norm_w,
         .eps = eps_arr,
         .signs = signs,
-    }, s)) orelse return error.FusedDeclined;
+    };
+    const got = (try gdn_decode.step(geo, in, s)) orelse return error.FusedDeclined;
     defer _ = mlx.mlx_array_free(got.rot);
     defer _ = mlx.mlx_array_free(got.conv_state);
     defer _ = mlx.mlx_array_free(got.ssm_state);
@@ -54921,6 +54979,15 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) 
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, got.conv_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(state_ref, got.ssm_state, s));
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(rot_ref, got.rot, s));
+
+    // Packs without the rotation run the first kernel alone, then the norm-gate.
+    const rec = (try gdn_decode.recur(geo, in, s)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(rec.y);
+    defer _ = mlx.mlx_array_free(rec.conv_state);
+    defer _ = mlx.mlx_array_free(rec.ssm_state);
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(y_ref, rec.y, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(pre.conv_state, rec.conv_state, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(state_ref, rec.ssm_state, s));
 }
 
 fn gdnParityRand(rnd: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
