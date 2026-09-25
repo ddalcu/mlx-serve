@@ -4,7 +4,8 @@
 //! ulp). Products and sums are f32 from exact inputs, so the error is stock's.
 //! `qmv`: one row, any affine bias. `msv_qmv2_rows`: 1..8 rows over ternary
 //! weights (bias == -scale), each word decoded once for every row; `planFor`
-//! picks its geometry per GPU generation.
+//! picks its geometry per GPU generation. Decoding once for every row follows
+//! @sudoingX's CUDA small-batch PTQ1_0 kernels (PrismML-Eng/llama.cpp#218).
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");

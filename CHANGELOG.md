@@ -3,7 +3,7 @@
 ## v26.9.6 — unreleased
 
 ### Changes
-- Prism Bonsai packs decode faster with a 2-bit ternary kernel tuned per Apple GPU generation: Bonsai 1 ternary (27B, 8B, 4B, 1.7B) 1.05x-1.38x on M1 Ultra and M4 Pro and up to 1.18x with concurrent requests on M5 Max; Bonsai 2 with MTP 1.16x-1.29x at two requests.
+- Prism Bonsai packs decode faster with a 2-bit ternary kernel tuned per Apple GPU generation: Bonsai 1 ternary (27B, 8B, 4B, 1.7B) 1.05x-1.38x on M1 Ultra and M4 Pro and up to 1.18x with concurrent requests on M5 Max; Bonsai 2 with MTP 1.16x-1.29x at two requests. The approach follows @sudoingX's CUDA small-batch kernels (PrismML-Eng/llama.cpp#218); thanks @sudoingX.
 
 ## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 
