@@ -1796,15 +1796,55 @@ class DownloadManager: ObservableObject {
         return meta
     }
 
+    /// Everything a library scan reads, captured so the walk can run off the main
+    /// actor: it is a pure function of these.
+    struct LocalScanInputs: Sendable, Equatable {
+        let ownedRoots: [String]
+        let lmStudioRoot: String?
+        let huggingFaceRoot: String?
+        let customRoot: String?
+        /// Other tools' canonical folders; detected by the caller.
+        let toolRoots: [ToolRoot]
+        /// Standardized dirs of transfers in flight, so a half-written dir is not
+        /// reported as a defect.
+        let inFlightDirs: Set<String>
+
+        struct ToolRoot: Sendable, Equatable {
+            let path: String
+            let source: LocalModelSource
+        }
+    }
+
+    /// Capture what a scan would read right now — the configured destination and
+    /// the transfer table are main-actor state.
+    func scanInputs() -> LocalScanInputs {
+        LocalScanInputs(
+            ownedRoots: ownedRoots,
+            lmStudioRoot: lmStudioRoot,
+            huggingFaceRoot: huggingFaceRoot,
+            customRoot: resolvedCustomRoot(),
+            toolRoots: ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
+                .map { LocalScanInputs.ToolRoot(path: $0.path, source: $0.source) },
+            inFlightDirs: Set(downloads.filter { $0.value.status == .downloading }
+                .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
+        )
+    }
+
     func discoverLocalModels() -> [LocalModel] {
+        Self.discoverLocalModels(scanInputs())
+    }
+
+    /// The walk itself, for callers that run it off the main actor
+    /// (`ModelLibraryRefresher`).
+    nonisolated static func discoverLocalModels(_ inputs: LocalScanInputs) -> [LocalModel] {
         var out: [LocalModel] = []
 
         // The owned roots — download destination + `~/.mlx-serve/models` after
         // the destination moves — so the pre-move library stays in the picker.
-        out.append(contentsOf: Self.mlxServeModels(inRoots: ownedRoots))
+        out.append(contentsOf: Self.mlxServeModels(inRoots: inputs.ownedRoots))
 
         // LM Studio — two levels deep: <root>/<publisher>/<repo>/
-        if let root = lmStudioRoot,
+        if let root = inputs.lmStudioRoot,
            let pubs = try? FileManager.default.contentsOfDirectory(atPath: root) {
             for pub in pubs where !pub.hasPrefix(".") {
                 let pubPath = (root as NSString).appendingPathComponent(pub)
@@ -1819,7 +1859,7 @@ class DownloadManager: ObservableObject {
 
         // Hugging Face hub cache — `models--<org>--<repo>/snapshots/<commit>/`
         // with the active snapshot named by `refs/main`. Read-only.
-        if let root = huggingFaceRoot {
+        if let root = inputs.huggingFaceRoot {
             out.append(contentsOf: Self.discoverHuggingFaceModels(in: root))
         }
 
@@ -1829,8 +1869,8 @@ class DownloadManager: ObservableObject {
         // enumeration exists only because the picker walks folders separately
         // from `ModelRoots.scanRoots`, and a root added to one and not the
         // other is served but unselectable. Read-only: another tool's tree.
-        for tool in ToolModelRoots.detected(lmStudioRoot: lmStudioRoot).orderedWithSource
-        where tool.path != lmStudioRoot {
+        for tool in inputs.toolRoots
+        where tool.path != inputs.lmStudioRoot {
             out.append(contentsOf: Self.dualLayoutModels(
                 atRoot: tool.path, idPrefix: "tool:", source: tool.source))
         }
@@ -1839,13 +1879,11 @@ class DownloadManager: ObservableObject {
         // roots. resolvedCustomRoot() handles tilde expansion, existence check,
         // and dedup against the default roots so a user pointing it at
         // `~/.mlx-serve/models` doesn't produce duplicate picker entries.
-        if let root = resolvedCustomRoot() {
+        if let root = inputs.customRoot {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        let inFlight = Set(downloads.filter { $0.value.status == .downloading }
-            .map { (newLayoutDir(for: $0.key) as NSString).standardizingPath })
-        return Self.clearingInFlightDefects(out, activeDirs: inFlight)
+        return Self.clearingInFlightDefects(out, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
