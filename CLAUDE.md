@@ -20,7 +20,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 
 | File | Role |
 |---|---|
-| `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
+| `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch/steer`) |
 | `cli.zig` | Ollama-grade CLI: alias → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
 | `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider): reads `/v1/models` (models + ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, starts the app if the server is down. Swift `CLILauncher`+`AgentConfigs` is the twin (omp `PI_CODING_AGENT_DIR`, codex Responses-only `CODEX_HOME`, hermes `HERMES_HOME`; opencode2 `XDG_CONFIG_HOME` + monitor plugin) |
 | `mlx.zig` | mlx-c FFI |
@@ -71,10 +71,11 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `ane.zig` + `lib/ane/` | ANE prefill offload (`--ane-prefill`, opt-in, LOSSY int8/fp16, M4-and-below): SwiGLU-MLP + fused GDN in-proj MIL programs on the private AppleNeuralEngine framework (`msv_ane_*`, attribution in NOTICE), `/props` `"ane"` + `mlx_serve:ane_*`. Rules: `docs/reference.md` "ANE prefill rules" |
 | `rht.zig` / `qmv2.zig` / `gdn_decode.zig` / `mtp_graft.zig` | Prism Hadamard packs (`prism_hadamard_qwen35`): `<linear>.signs` bound to weight handles, `qmatmul` reads `H_block(signs*x)`, the embedding gather gets the inverse; exact 2-bit GEMV (decode + verify M 2..3); 2-dispatch GDN decode step; MTP head grafted from the Qwen3.8-27B pack |
 | `lora.zig` | Runtime unfused STACKED LoRA (8 max, summed never merged) across QLinear/MixedLinear/MfLinear |
+| `steering.zig` | Directional steering (qwen4_exp): `Setting` (inherit/off/configured), bank registry `~/.mlx-serve/steering/<name>.f32` (raw f32 `[n_layers][hidden]`, 8 LRU, conn-thread `Reservation` pins), the projection kernel. Seams in `transformer.zig`; `tests/build_steering_bank.py` builds a bank, none ships |
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --dir-steering-file --dir-steering-ffn --dir-steering-attn --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --no-ds4-mtp --model-dir --log-level --log-file --version --help`
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
@@ -177,6 +178,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 - **Providers**: `<model>@<name>` from `~/.mlx-serve/providers.json` proxies `/v1/chat/completions` ONLY (other surfaces = named 400) through curl with the provider's key; rows ride `/v1/models` with a `provider` badge while the probe answers, a non-empty `models` list FILTERS the provider's list (and IS the list when it has none), none when unreachable. App: "Pick…" fetches the list into a checklist. Never shared to the LAN. Design: `docs/reference.md`.
 - **LAN sharing**: proxy is a TRANSPORT; keyless gate = `routeClass` × `SharedSet`; `<id>@<peer>` mirroring; loops impossible by construction (self-token + tunnel marker, one hop). Design: `docs/reference.md`.
 - **Observability** (`--metrics`): zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick. `--api-key`: loopback exempt; `/health`+OPTIONS open; `constTimeEql`. No admin surface.
+- **Directional steering** (qwen4_exp): per-request `steering: {name|file, ffn, attn}`, else the model's active default from `--dir-steering-*`, `model-settings.json` `steering` (absent = flags, `null` = off) or `POST /v1/steering` / `mlx-serve steer`. `steering_capture` + `MLX_SERVE_STEERING_DUMP_DIR` dumps rows for bank building. Design: `docs/reference.md`.
 
 ## Tool calling (server pipeline)
 

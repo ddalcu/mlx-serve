@@ -6,6 +6,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
+const steering_mod = @import("steering.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
@@ -447,6 +448,8 @@ pub const ModelConfig = struct {
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
+    /// `.inherit` = the process `--dir-steering-*` flags.
+    steering_override: steering_mod.Setting = .{},
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the

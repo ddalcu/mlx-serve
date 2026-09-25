@@ -53,6 +53,7 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
+const steering_mod = @import("steering.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
@@ -131,6 +132,9 @@ pub const LoadParams = struct {
     /// perf-plan-aug-17 P5). Opt-in, lossy by design; every refusal is a
     /// named `[ane]` line and the model serves GPU-only.
     ane_prefill: bool = false,
+    /// `--dir-steering-*` as one setting (`.inherit` = no flags); a model's
+    /// own `steering` setting outranks it at load.
+    steering_flags: steering_mod.Setting = .{},
     /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
     /// pointer because the scheduler deliberately has no server.zig import.
     /// The ANE build compiles fixed-shape tiles against THIS width — resolving
@@ -296,6 +300,9 @@ pub const SubmitParams = struct {
     /// single model and let clients trade accuracy for context length on a
     /// per-call basis (`{"kv_quant": "off"|4|8}` body field).
     kv_quant_config: ?transformer_mod.KVQuantConfig = null,
+    /// Directional steering pinned by the conn thread; `submit` disarms it
+    /// once the slot is queued, so the pin then belongs to the slot.
+    steering: ?*steering_mod.Reservation = null,
     /// Plan 05 Phase D: the target model for this request. The conn thread
     /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
     /// keeps a refcount on it for the slot's lifetime, so the model can't
@@ -534,6 +541,11 @@ pub const Slot = struct {
     pld_key_len: u32,
     /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
     kv_attn_fused: bool,
+    /// This slot holds a bank pin (`ctx.steering.bank`), released exactly once
+    /// in the inference thread's cleanup drain.
+    steering_pinned: bool,
+    /// Steering capture dump directory (owned); forces a cold prefill.
+    steering_capture_dir: ?[]u8 = null,
     cached_tokens: u32,
     logprobs_n: u32,
     serial_reason_logged: bool = false,
@@ -748,6 +760,7 @@ pub const Slot = struct {
             .pld_draft_len = params.pld_draft_len,
             .pld_key_len = params.pld_key_len,
             .kv_attn_fused = params.kv_attn_fused,
+            .steering_pinned = if (params.steering) |r| r.armed else false,
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
@@ -792,6 +805,12 @@ pub const Slot = struct {
             .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
             .kv_attn_fused = params.kv_attn_fused,
+            .steering = if (params.steering) |r| r.req else .{},
+        };
+        if (params.steering) |r| if (r.capture_dir) |d| {
+            slot.steering_capture_dir = try allocator.dupe(u8, d);
+            // No restored KV/SSM/PLE state may leak into a direction sample.
+            slot.skip_prefix_cache = true;
         };
 
         return slot;
@@ -816,6 +835,7 @@ pub const Slot = struct {
             self.diffusion = null;
         }
         if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
+        if (self.steering_capture_dir) |d| self.allocator.free(d);
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -1194,6 +1214,8 @@ pub const LoadRequest = struct {
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
     ane_prefill: bool = false,
+    /// `--dir-steering-*` survives cold loads.
+    steering_flags: steering_mod.Setting = .{},
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32 = null,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64 = null,
 
@@ -1327,6 +1349,13 @@ pub const UnloadRequest = struct {
     done_cond: std.Io.Condition = .init,
 };
 
+/// Releases a slot's steering bank pin exactly once, whichever slot-end path ran.
+fn releaseSteeringPin(slot: *Slot) void {
+    if (!slot.steering_pinned) return;
+    slot.steering_pinned = false;
+    slot.model.transformer.?.steering.?.releaseBank(slot.ctx.steering.bank);
+}
+
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
 /// state — Transformer + weights + vision encoder + drafter all live here,
@@ -1391,6 +1420,7 @@ pub const Scheduler = struct {
     ds4_ssd_streaming: bool,
     /// `--ane-prefill`, retained for cold loads (same class as `mtp_enabled`).
     ane_prefill: bool,
+    steering_flags: steering_mod.Setting,
     ane_chunk_resolver: ?*const fn (*model_mod.ModelConfig) u32,
     ane_headroom_resolver: ?*const fn (*const model_mod.ModelConfig, u32) u64,
     /// Launch-flag drafter settings, retained for cold loads. `--no-drafter`
@@ -1584,6 +1614,7 @@ pub const Scheduler = struct {
             .ds4_dspark = params.ds4_dspark,
             .ds4_ssd_streaming = params.ds4_ssd_streaming,
             .ane_prefill = params.ane_prefill,
+            .steering_flags = params.steering_flags,
             .ane_chunk_resolver = params.ane_chunk_resolver,
             .ane_headroom_resolver = params.ane_headroom_resolver,
             .no_drafter = params.no_drafter,
@@ -1819,6 +1850,8 @@ pub const Scheduler = struct {
             }
             return err;
         };
+        // Queued: the bank pin now belongs to the slot (released in the cleanup drain).
+        if (params.steering) |r| r.disarm();
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
         return slot;
@@ -1884,6 +1917,8 @@ pub const Scheduler = struct {
             // races on mlx but is strictly better than the leak; the slot
             // is no longer referenced from pending/decoding above.
             self.queue_mu.unlock(self.io);
+            // The drain is the usual owner of the pin; this path never reaches it.
+            releaseSteeringPin(slot);
             slot.deinit();
             self.queue_mu.lockUncancelable(self.io);
         };
@@ -2098,6 +2133,7 @@ pub const Scheduler = struct {
             .ds4_dspark = self.ds4_dspark,
             .ds4_ssd_streaming = self.ds4_ssd_streaming,
             .ane_prefill = self.ane_prefill,
+            .steering_flags = self.steering_flags,
             .ane_chunk_resolver = self.ane_chunk_resolver,
             .ane_headroom_resolver = self.ane_headroom_resolver,
             .evict_entries = victims_buf[0..n_victims],
@@ -2700,6 +2736,36 @@ const GgufRoute = struct {
     engine: gguf_meta.Engine,
 };
 
+pub const SteeringSource = enum { flags, settings };
+
+/// Arms a configured setting as the model's active default. A bank error fails the
+/// load only when `fatal`; otherwise it warns and serves unsteered, so a saved setting
+/// never leaves a model that will not load. Nothing armed = no `[steering]` line.
+fn armSteering(xfm: *Transformer, setting: steering_mod.Setting, source: SteeringSource, fatal: bool) !void {
+    const cfg = setting.configuredOrNull() orelse return;
+    if (!xfm.steeringSupported()) {
+        // Never fatal: a multi-model server still loads a Gemma beside a qwen4 bank flag.
+        log.warn("[steering] {s}: skipped ({s}), this model_type has no steering seams\n", .{ cfg.name(), @tagName(source) });
+        return;
+    }
+    const banks = xfm.steering.?;
+    var res = banks.reserve(cfg.name(), cfg.ffn, cfg.attn) catch |err| {
+        if (fatal) {
+            log.err("[steering] {s}: {s}\n", .{ cfg.name(), @errorName(err) });
+            return err;
+        }
+        log.warn("[steering] {s}: skipped ({s}), {s}\n", .{ cfg.name(), @tagName(source), @errorName(err) });
+        return;
+    };
+    const bank = res.req.bank;
+    const armed = res.armed;
+    banks.swapDefault(&res);
+    if (!armed) return; // both scales 0: configured but off
+    log.info("[steering] armed: {s} layers={d} hidden={d} ffn={d} attn={d} (source={s})\n", .{
+        std.fs.path.basename(banks.pathOf(bank)), banks.n_layers, banks.hidden, cfg.ffn, cfg.attn, @tagName(source),
+    });
+}
+
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
@@ -2707,6 +2773,7 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    config.steering_override = o.steering;
 }
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
@@ -3385,7 +3452,7 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "ds4_mtp",                   "ds4_dspark",            "ds4_ssd_streaming",
         "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
         "ane_prefill",               "ane_chunk_resolver",    "ane_headroom_resolver",
-        "prefix_cache_mem_resolver",
+        "prefix_cache_mem_resolver", "steering_flags",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -3752,6 +3819,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
     try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
+    // The registry exists from load on any arch with the seams, so conn threads
+    // only ever read a stable pointer.
+    if (xfm_ptr.steeringSupported()) _ = try xfm_ptr.ensureSteeringBanks(sch.io);
+    const inherits = params.config.steering_override.state == .inherit;
+    // Only the startup load may fail on a bad bank: the user just typed the flag.
+    const fatal = @TypeOf(params) == LoadParams and inherits;
+    try armSteering(xfm_ptr, if (inherits) params.steering_flags else params.config.steering_override, if (inherits) .flags else .settings, fatal);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -4644,7 +4718,13 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
             if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-            if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+            if (s.model.transformer) |xfm| {
+                xfm.resetQsaPooledRope();
+                if (xfm.steering) |b| {
+                    releaseSteeringPin(s);
+                    b.drainFreeLater();
+                }
+            }
             s.deinit();
         }
         if (vision_n > 0 or embed_n > 0) {
@@ -6615,6 +6695,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .model_has_mtp = slot.mtp != null,
             .mtp_depth = slot.mtp_depth,
             .lookup_prompt = slot.full_prompt,
+            .steering_capture_dir = slot.steering_capture_dir,
             .ctx = slot.ctx,
             // Regular path: skip the lazy preforward so cache.step lands at
             // exactly prompt_len with t1 NOT in cache. Generator.next's

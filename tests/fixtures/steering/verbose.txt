@@ -1,0 +1,16 @@
+Explain in detail, with examples and caveats, what a database index is.
+Give a thorough, multi-paragraph explanation of why compilers optimize.
+Walk me through everything DNS does, step by step, with background and edge cases.
+Explain race conditions at length, covering causes, examples and mitigations.
+Write a comprehensive explanation of why teams use version control, with history.
+Describe hash tables in depth: internals, collisions, resizing and trade-offs.
+Explain load balancers thoroughly, including algorithms, failure modes and examples.
+Give a detailed account of garbage collection, its strategies and their trade-offs.
+Explain REST APIs comprehensively, with constraints, examples and common mistakes.
+Discuss deadlocks at length: the conditions that cause them, detection and prevention.
+Describe in detail what an operating system kernel does, subsystem by subsystem.
+Write a thorough explanation of caching, covering layers, eviction and invalidation.
+Explain in depth why binary search is fast, with the analysis and its assumptions.
+Give a complete explanation of foreign keys, constraints and referential integrity.
+Explain what a parser produces in detail, covering grammars, trees and error recovery.
+Write a comprehensive guide to unit testing, its principles, patterns and pitfalls.

@@ -571,3 +571,57 @@ H3 864x480/22f, per denoise step, M4 Max: 0.25 1.09x | 0.35 1.14x | **0.45 1.22x
 Setting the share wrong costs speed AND memory (Krea on the Max: 0.75 is 1.08x for 6 GB against 1.30x for 3.6 GB at 0.45). Memory per share on ACE-Step: 0.45 1.0 GB int8, 0.60 1.35 GB, 0.75 1.7 GB — the GPU's `down`/`fc2` complement slices sit beside it.
 
 Fidelity (vs the GPU arm, every arm bit-exact across requests): image cos ≥ 0.9991 at every share, same fox, a ≤0.6% background tone shift at 0.75; audio +1.9%/+2.8% robust energy (0.45/0.75, 3 seeds), log-STFT cos ≥ 0.994. Raw RMS and crest factor are NOT valid measures for ACE-Step — peak-normalization trap, `docs/gotchas/models-media.md`.
+
+## Directional steering (`~/.mlx-serve/steering/`, `/v1/steering`)
+
+A per-request edit of the `qwen4_exp` trunk: one unit-norm `hidden`-wide direction `d` per
+layer and a signed scale, applied as `y -= scale * d * dot(d, y)`. The `attn` arm edits the
+attention output before its residual write; the `ffn` arm edits every hyper-connection
+branch after the MLP write. Scale 1 removes the component, negative scales amplify it.
+Every trunk forward is steered; the MTP head is not. A file with neither scale means
+`ffn 1, attn 0`; scales are finite in [-100, 100]; off is bit-identical to no steering.
+
+**Files.** `~/.mlx-serve/steering/<name>.f32`: raw little-endian f32 `[n_layers][hidden]`
+(491520 bytes for Flash Next), no header, validated by size against the loaded model. The
+layout is antirez/ds4's `dir-steering` format. A request may also name an absolute path. No
+bank ships in the repo.
+
+**Building one.** `tests/build_steering_bank.py` takes the per-layer normalized mean
+difference between two prompt sets, orthogonalized against the control mean (ds4's math).
+The example sets in `tests/fixtures/steering/` build a response-length bank:
+
+```sh
+MLX_SERVE_STEERING_DUMP_DIR=/tmp/caps zig-out/bin/mlx-serve --model <pack> --serve --max-concurrent 1
+python3 tests/build_steering_bank.py --dump-dir /tmp/caps \
+    --show tests/fixtures/steering/succinct.txt --control tests/fixtures/steering/verbose.txt --name verbosity
+mlx-serve steer verbosity --ffn 0.5     # longer answers
+mlx-serve steer off
+```
+
+**Three states per model** (`model-settings.json` key `steering`): absent = the launch flags
+(`--dir-steering-file/-ffn/-attn`), `null` = off, `{"name","ffn","attn"}` = configured. A
+flag or saved setting that cannot arm (no seams, missing or wrong-size file) is skipped with
+a warning, so no setting makes a model unloadable; only a bad launch flag fails the startup
+load. `POST /v1/steering` refuses by name.
+
+**Runtime.** `GET /v1/steering[?model=]` returns the active bank, the registry listing and
+capture state. `POST /v1/steering {model?, name|file?, ffn?, attn?, reset?, persist?}` sets
+the active default for requests with no `steering` field (`{"name":null}` = off,
+`{"reset":true}` = back to the flags) and persists it unless `persist:false`.
+`mlx-serve steer` wraps both. `/props` `settings.steering` names the active file and scales.
+
+**Per request.** `steering: {"name"|"file", "ffn", "attn"}` on chat, completions, messages
+and responses; scales without a name use the active default's bank; `{"ffn":0,"attn":0}`
+or `null` opts out. Failures are named 400s before any header (503 when all 8 bank slots
+are pinned). The prefix cache is not keyed on steering: a restored prefix keeps the steering
+it was computed under.
+
+**Cost.** At decode and verify widths the edit runs inside the fused hyper-connection read
+that already runs (`MLX_SERVE_STEER_FOLD=0` keeps it separate); elsewhere one projection
+kernel (`MLX_SERVE_STEER_FUSED=0` restores the op chain).
+
+**Capture.** Chat only, non-stream. Boot with `MLX_SERVE_STEERING_DUMP_DIR=<dir>`; a request
+with `steering_capture: "<id>"` and both arms off forces a cold prefill and writes, for the
+last prompt token, `<dir>/<id>/{ffn_out,attn_out}-<layer>_pos0.bin` plus `done.json` (id,
+token count, prompt sha256), echoed in the response as `steering_capture`. Guards: `steering.zig` tests, `qwen4 steering:` (tiny pack),
+`tests/test_qwen4_steering.sh`.

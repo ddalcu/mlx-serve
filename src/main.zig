@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
+const steering_mod = @import("steering.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -74,6 +75,8 @@ var ane_prefill: bool = false;
 // `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
 // offload, published as ONE value (`ane.media_offload`) after the parse.
 var ane_media: ane_mod.MediaOffload = .{};
+// `--dir-steering-*` as the model's launch default steering.
+var steering_flags: steering_mod.Setting = .{};
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
 
@@ -109,6 +112,9 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider); starts the MLX Core app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
+        \\  steer [<name>|off|reset] [--ffn F] [--attn F] [--model ID] [--port N]
+        \\                      Show or set a running server's active directional
+        \\                      steering (persisted per model; --no-persist to skip)
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -198,6 +204,15 @@ fn printUsage(io: std.Io) void {
         \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
+        \\  --dir-steering-file <name|path>
+        \\                      Directional steering (.f32 bank, one unit direction
+        \\                        per layer): a bare name reads
+        \\                        ~/.mlx-serve/steering/<name>.f32. Becomes the
+        \\                        model's active default; `steering` in a request
+        \\                        body or POST /v1/steering override it. qwen4_exp.
+        \\  --dir-steering-ffn <f>  Scale after the MLP write (default 1 with a file;
+        \\                        positive removes the direction, negative amplifies).
+        \\  --dir-steering-attn <f> Scale on the attention output (default 0).
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is
@@ -489,6 +504,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "serve")) {
             arg_start = 2;
             use_default_models_root = true;
+        } else if (std.mem.eql(u8, cmd, "steer")) {
+            try cli_mod.cmdSteer(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "launch")) {
             if (args.len < 3) {
                 log.err("usage: mlx-serve launch <agent> — supported: {s}\n", .{launch_mod.AgentKind.names});
@@ -509,7 +527,10 @@ pub fn main(init: std.process.Init) !void {
     // parser enforces beats an allocation the arg loop has to unwind.
     var extra_roots: [7][]const u8 = undefined;
     var extra_roots_n: usize = 0;
-    var port: u16 = 11234;
+    var port: u16 = cli_mod.DEFAULT_PORT;
+    var dir_steering_file: ?[]const u8 = null;
+    var dir_steering_ffn: ?f32 = null;
+    var dir_steering_attn: ?f32 = null;
     var host: []const u8 = "0.0.0.0";
     var host_explicit = false;
     // `--log-file <path|off>`. null = default (`~/.mlx-serve/logs/mlx-serve-<port>.log`).
@@ -752,6 +773,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             ane_media.share = v;
+        } else if (std.mem.eql(u8, args[i], "--dir-steering-file") and i + 1 < args.len) {
+            i += 1;
+            dir_steering_file = args[i];
+        } else if ((std.mem.eql(u8, args[i], "--dir-steering-ffn") or std.mem.eql(u8, args[i], "--dir-steering-attn")) and i + 1 < args.len) {
+            const flag = args[i];
+            i += 1;
+            const v = std.fmt.parseFloat(f32, args[i]) catch std.math.nan(f32);
+            steering_mod.validateScale(v) catch {
+                log.err("{s} must be a finite number in [-100, 100], got '{s}'\n", .{ flag, args[i] });
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, flag, "--dir-steering-ffn")) dir_steering_ffn = v else dir_steering_attn = v;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -981,6 +1014,11 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+
+    steering_flags = steering_mod.settingFromFlags(dir_steering_file, dir_steering_ffn, dir_steering_attn) catch |err| {
+        log.err("--dir-steering-*: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1436,6 +1474,7 @@ pub fn main(init: std.process.Init) !void {
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = mtp_depth,
             .ane_prefill = ane_prefill,
+            .steering_flags = steering_flags,
             .ane_chunk_resolver = server_mod.pinPrefillChunk,
             .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
@@ -1865,6 +1904,7 @@ fn runGenServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .steering_flags = steering_flags,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
@@ -1997,6 +2037,7 @@ fn runHeadlessServe(
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .ane_prefill = ane_prefill,
+        .steering_flags = steering_flags,
         .ane_chunk_resolver = server_mod.pinPrefillChunk,
         .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,

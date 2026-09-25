@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const steering_mod = @import("steering.zig");
+const model_settings_mod = @import("model_settings.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -782,6 +784,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/providers/reload",
     "/v1/responses",
     "/v1/responses/compact",
+    "/v1/steering",
     "/v1/unload-model",
     "/v1/video/generations",
 };
@@ -2235,6 +2238,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponsesCompact(allocator, stream, body);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/steering") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) {
+        try handleSteering(allocator, stream, method, raw_path, request_body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/load-model")) {
@@ -7146,6 +7153,10 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    /// The active steering default ("" = off / no seams).
+    steering_file: []const u8 = "",
+    steering_ffn: f32 = 0,
+    steering_attn: f32 = 0,
 };
 
 const PropsEngine = enum { mlx, llama, ds4 };
@@ -7166,15 +7177,18 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
     return out;
 }
 
-fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
+/// `steer_path_buf` backs `steering_file` in the result, so it must outlive it.
+fn propsSettingsFor(lm: *LoadedModel, steer_path_buf: []u8) PropsSettings {
     const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
     const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else false;
-    return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
+    return embeddedEngineSettings(mlxPropsSettings(lm, steer_path_buf), engine, engine_mtp);
 }
 
-fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
+fn mlxPropsSettings(lm: *LoadedModel, steer_path_buf: []u8) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
+    const steer_banks: ?*steering_mod.Banks = if (lm.transformer) |x| x.steering else null;
+    const steer: steering_mod.ActivePath = if (steer_banks) |b| b.defaultPathInto(steer_path_buf) else .{ .req = .{}, .path = "" };
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
@@ -7192,18 +7206,23 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = prefix_cache_mem_bytes,
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .steering_file = steer.path,
+        .steering_ffn = steer.req.ffn,
+        .steering_attn = steer.req.attn,
     };
 }
 
 /// The /props "settings" object: leading-comma fragment spliced before the props root close.
 fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
+    const steer_file_json = try jsonEscape(allocator, st.steering_file);
+    defer allocator.free(steer_file_json);
     var param_buf: [32]u8 = undefined;
     const param: []const u8 = switch (st.mtp_acceptance) {
         .exact => "null",
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}},\"steering\":{{\"file\":{s},\"ffn\":{d},\"attn\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
@@ -7214,6 +7233,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.pld.enable,                              st.pld.draft_len,
         st.pld.key_len,                             st.max_concurrent,
         st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        steer_file_json,                            st.steering_ffn,
+        st.steering_attn,
     });
 }
 
@@ -7316,7 +7337,8 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(ngram_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
     defer allocator.free(batching_json);
-    const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
+    var steer_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm, &steer_path_buf));
     defer allocator.free(settings_json);
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
     defer allocator.free(extra_json);
@@ -8546,6 +8568,16 @@ fn handleChatCompletions(
         }
     }
     const kv_attn_explicit = parseKvAttnExplicit(root);
+    var steer = resolveRequestSteering(root, lm, true) catch |err| {
+        try sendSteeringError(allocator, stream, err);
+        return;
+    };
+    defer steer.release();
+    parseSteeringCapture(allocator, stream.io, root, &steer, is_stream) catch |err| {
+        try sendSteeringError(allocator, stream, err);
+        return;
+    };
+    defer if (steer.capture_dir) |d| allocator.free(d);
 
     // Parse enable_pld: per-request override of the --pld default.
     //
@@ -8864,13 +8896,13 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, &steer, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, &steer, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9079,13 +9111,18 @@ fn handleCompletions(
         .seed = seed,
     };
 
+    var steer = resolveRequestSteering(root, lm, false) catch |err| {
+        try sendSteeringError(allocator, stream, err);
+        return;
+    };
+    defer steer.release();
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, &steer) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, &steer) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9109,6 +9146,7 @@ fn handleNonStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
+    steer: *steering_mod.Reservation,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
@@ -9121,7 +9159,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, steer, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -9201,6 +9239,7 @@ fn handleStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
+    steer: *steering_mod.Reservation,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
@@ -9217,6 +9256,7 @@ fn handleStreamingCompletion(
     const sch = global_scheduler.?;
     slot_handle = try sch.submit(.{
         .model = lm,
+        .steering = steer,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
         .cached_tokens = 0,
@@ -9459,6 +9499,7 @@ fn nonStreamingViaScheduler(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    steer: *steering_mod.Reservation,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -9495,6 +9536,7 @@ fn nonStreamingViaScheduler(
         .mrope_delta = mrope.delta,
         .logprobs_n = logprobs_n,
         .kv_quant_config = kv_quant_override,
+        .steering = steer,
     });
     defer sch.complete(slot);
 
@@ -9700,6 +9742,7 @@ fn handleNonStreamingGeneration(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    steer: *steering_mod.Reservation,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -9732,7 +9775,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, steer, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -9956,8 +9999,19 @@ fn handleNonStreamingGeneration(
     const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
     defer allocator.free(usage_obj);
 
+    // A capture answers with the manifest's identity so the builder can match
+    // the dump directory to THIS request.
+    const capture_field: []const u8 = if (steer.capture_dir) |d| blk: {
+        var hex: [64]u8 = undefined;
+        generate_mod.promptSha256Hex(prompt_ids, &hex);
+        const id_json = try jsonEscape(allocator, std.fs.path.basename(d));
+        defer allocator.free(id_json);
+        break :blk try std.fmt.allocPrint(allocator, ",\"steering_capture\":{{\"id\":{s},\"prompt_tokens\":{d},\"prompt_sha256\":\"{s}\"}}", .{ id_json, prompt_ids.len, &hex });
+    } else try allocator.alloc(u8, 0);
+    defer allocator.free(capture_field);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -9969,6 +10023,7 @@ fn handleNonStreamingGeneration(
         finishDetailsField(finish_reason, result.finish_details),
         usage_obj,
         timings_field,
+        capture_field,
     });
     defer allocator.free(response);
 
@@ -10384,6 +10439,7 @@ fn handleStreamingGeneration(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    steer: *steering_mod.Reservation,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as
@@ -10464,6 +10520,7 @@ fn handleStreamingGeneration(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
+        .steering = steer,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
@@ -13134,6 +13191,295 @@ fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig
     return transformer_mod.KVQuantConfig.fromJsonValue(v);
 }
 
+/// The steering a request runs under: its own `steering` field, else the
+/// model's active default — pinned HERE, before any header is sent, so every
+/// failure is a named status. A model without the seams refuses only an
+/// explicit field. Capture is chat-only (it needs the non-stream tail forward).
+fn resolveRequestSteering(root: std.json.ObjectMap, lm: *LoadedModel, capture_ok: bool) !steering_mod.Reservation {
+    if (!capture_ok and root.get("steering_capture") != null) return error.SteeringCaptureChatOnly;
+    const banks: ?*steering_mod.Banks = if (lm.transformer) |x| x.steering else null;
+    const field = root.get("steering");
+    const b = banks orelse {
+        if (field != null) return error.SteeringUnsupportedArch;
+        return steering_mod.Reservation.none(null);
+    };
+    const spec: steering_mod.Spec = if (field) |v| try steering_mod.Spec.fromJsonValue(v) else .{};
+    const res = try b.reserveSpec(spec);
+    if (res.armed) log.debug("[steering] request: bank={s} ffn={d} attn={d}\n", .{ std.fs.path.basename(b.pathOf(res.req.bank)), res.req.ffn, res.req.attn });
+    return res;
+}
+
+fn steeringErrorMessage(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.SteeringUnsupportedArch => "steering: this model has no steering seams",
+        error.BadSteeringName => "steering: name must be [A-Za-z0-9._-] (a file in ~/.mlx-serve/steering) or an absolute path",
+        error.BadSteeringPath => "steering: file not found",
+        error.SteeringFileSize => "steering: file size is not n_layers x hidden f32 for this model",
+        error.SteeringScaleRange => "steering: ffn/attn must be finite numbers in [-100, 100]",
+        error.BadSteeringRequest => "steering: must be null or an object with ONE of name|file, plus ffn, attn",
+        error.SteeringBanksBusy => "steering: every bank slot is pinned by an in-flight request, retry",
+        error.SteeringNeedsName => "steering: POST needs name (or file), name:null for off, or reset:true",
+        error.BadSteeringCaptureId => "steering_capture: id must be [A-Za-z0-9._-]{1,64}",
+        error.SteeringCaptureDisabled => "steering_capture: the server was not started with MLX_SERVE_STEERING_DUMP_DIR",
+        error.SteeringCaptureSteered => "steering_capture: send steering {\"ffn\":0,\"attn\":0} (both arms off)",
+        error.SteeringCaptureChatOnly => "steering_capture: only /v1/chat/completions can capture (it needs the non-stream tail forward)",
+        error.SteeringCaptureIdInUse => "steering_capture: that id's directory already exists",
+        error.SteeringCaptureDirFailed => "steering_capture: could not create the dump directory",
+        error.SteeringCaptureNeedsNonStream => "steering_capture: needs stream:false (the response carries the manifest)",
+        else => null,
+    };
+}
+
+/// `steering_capture: "<id>"`, a direction-building request: needs the boot
+/// env, both arms off, and a fresh `<dir>/<id>`, which it sets as the owned `capture_dir`.
+fn parseSteeringCapture(allocator: std.mem.Allocator, io: std.Io, root: std.json.ObjectMap, steer: *steering_mod.Reservation, is_stream: bool) !void {
+    const v = root.get("steering_capture") orelse return;
+    const id = switch (v) {
+        .string => |str| str,
+        else => return error.BadSteeringCaptureId,
+    };
+    if (!steering_mod.isCaptureId(id)) return error.BadSteeringCaptureId;
+    // No seams means the forward never writes rows; refuse before creating the directory.
+    if (steer.banks == null) return error.SteeringUnsupportedArch;
+    const base = steeringCaptureDir() orelse return error.SteeringCaptureDisabled;
+    // A row steered at an earlier layer is not a direction sample.
+    if (!steer.req.isOff()) return error.SteeringCaptureSteered;
+    // Every STEERING refusal is raised before the directory exists, so a corrected retry
+    // can reuse the id. A later refusal (context overflow, admission, a dropped client)
+    // still leaves an empty directory behind and burns that id — mint a fresh one.
+    if (is_stream) return error.SteeringCaptureNeedsNonStream;
+    const dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, id });
+    errdefer allocator.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, base) catch return error.SteeringCaptureDirFailed;
+    // createDir decides "already exists" atomically, so two requests with one id never
+    // share a directory.
+    std.Io.Dir.cwd().createDir(io, dir, .default_dir) catch |err| return switch (err) {
+        error.PathAlreadyExists => error.SteeringCaptureIdInUse,
+        else => error.SteeringCaptureDirFailed,
+    };
+    steer.capture_dir = dir;
+}
+
+/// 503 for a full registry, 400 for everything the client can fix, 500 for a server fault.
+fn sendSteeringError(allocator: std.mem.Allocator, stream: *Conn, err: anyerror) !void {
+    log.warn("[steering] request refused: {s}\n", .{@errorName(err)});
+    const msg = steeringErrorMessage(err) orelse
+        return sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "steering: request failed", 500);
+    if (err == error.SteeringBanksBusy) return sendErrorResponse(allocator, stream, "503 Service Unavailable", "overloaded", msg, 503);
+    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+}
+
+/// A JSON boolean field, `default` when absent; null when present but not a boolean.
+fn optBool(obj: std.json.ObjectMap, key: []const u8, default: bool) ?bool {
+    const v = obj.get(key) orelse return default;
+    return if (v == .bool) v.bool else null;
+}
+
+/// `GET /v1/steering[?model=<id>]`: the model's active steering, whether it
+/// has the seams, the registry dir listing, and whether capture is armed.
+/// `POST /v1/steering {model?, name|file?, ffn?, attn?, reset?, persist?}`
+/// swaps the ACTIVE default for requests that carry no `steering` field and
+/// (by default) persists it into model-settings.json. The KV cache is left
+/// alone: already-prefilled tokens keep the steering they were computed under.
+fn handleSteering(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, raw_path: []const u8, body: []const u8) !void {
+    const registry = global_registry orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+        return;
+    };
+    const sch = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        return;
+    };
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*p| p.deinit();
+    if (std.mem.eql(u8, method, "POST")) {
+        parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", 400);
+            return;
+        };
+        if (parsed.?.value != .object) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "steering: body must be a JSON object", 400);
+            return;
+        }
+    }
+    const root: ?std.json.ObjectMap = if (parsed) |p| p.value.object else null;
+    const id_field: ?[]const u8 = if (root) |r| switch (r.get("model") orelse .null) {
+        .string => |m| m,
+        else => null,
+    } else queryParamValue(raw_path, "model");
+    const entry = registry.resolveEntry(id_field orelse "") catch {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+        return;
+    };
+    // A refcount (`unloadResident` frees the Banks), taken only when READY: a status
+    // route never loads or waits.
+    const held: ?*LoadedModel = registry.holdIfReady(entry);
+    // `releaseStatus`, not `release`: a polling UI must not keep a model resident by
+    // refreshing its LRU stamp against `--idle-evict-secs`.
+    defer if (held) |h| registry.releaseStatus(h);
+    const lm = held orelse entry;
+    // Support is a property of the ARCH, not of residency. Read under the mutex: a reload
+    // frees `config` off-mutex while `.loading`, and such an entry with no arch hint cannot
+    // answer yet (a POST gets 409).
+    var arch_pending = false;
+    const supported = blk: {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        arch_pending = entry.state == .loading and entry.arch_hint.len == 0;
+        break :blk steering_mod.archSupported(entry.arch_hint) or
+            (entry.state != .loading and entry.config != null and steering_mod.archSupported(entry.config.?.model_type));
+    };
+    const banks: ?*steering_mod.Banks = if (held) |h| (if (h.transformer) |x| x.steering else null) else null;
+    if (root) |r| {
+        const b = banks orelse {
+            if (held == null and (supported or arch_pending)) {
+                try sendErrorResponse(allocator, stream, "409 Conflict", "model_not_loaded", "steering: load the model first", 409);
+                return;
+            }
+            try sendSteeringError(allocator, stream, error.SteeringUnsupportedArch);
+            return;
+        };
+        const persist_opt = optBool(r, "persist", true);
+        const reset_opt = optBool(r, "reset", false);
+        if (persist_opt == null or reset_opt == null) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "steering: persist and reset must be booleans", 400);
+            return;
+        }
+        const persist = persist_opt.?;
+        const reset = reset_opt.?;
+        // A reset returns to the flags, so a bank or scale beside it would be dropped.
+        if (reset and (r.get("name") != null or r.get("file") != null or r.get("ffn") != null or r.get("attn") != null)) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "steering: reset takes no name, file, ffn or attn", 400);
+            return;
+        }
+        var setting: steering_mod.Setting = .{};
+        var res = steering_mod.Reservation.none(b);
+        defer res.release(); // a no-op once `swapDefault` has consumed it
+        if (reset) {
+            // A flag bank that has gone missing serves unsteered, as a load does: a reset
+            // that refused would leave the saved setting impossible to clear this way.
+            if (sch.steering_flags.configuredOrNull()) |c| res = b.reserve(c.name(), c.ffn, c.attn) catch |err| blk: {
+                log.warn("[steering] reset: launch-flag bank {s} unusable ({s}); serving unsteered\n", .{ c.name(), @errorName(err) });
+                break :blk steering_mod.Reservation.none(b);
+            };
+        } else {
+            const spec = steering_mod.Spec.fromJsonValue(parsed.?.value) catch |err| {
+                try sendSteeringError(allocator, stream, err);
+                return;
+            };
+            if (spec.off) {
+                setting = steering_mod.Setting.off;
+            } else if (spec.name) |name| {
+                const sc = steering_mod.resolveScales(spec.ffn, spec.attn);
+                const cfg = steering_mod.Configured.init(name, sc.ffn, sc.attn) catch |err| {
+                    try sendSteeringError(allocator, stream, err);
+                    return;
+                };
+                res = b.reserve(name, sc.ffn, sc.attn) catch |err| {
+                    try sendSteeringError(allocator, stream, err);
+                    return;
+                };
+                setting = steering_mod.Setting.configured(cfg);
+            } else {
+                try sendSteeringError(allocator, stream, error.SteeringNeedsName);
+                return;
+            }
+        }
+        // Persist-then-swap as ONE unit per model, so disk and the active
+        // state never disagree across concurrent POSTs.
+        b.control_mu.lockUncancelable(stream.io);
+        defer b.control_mu.unlock(stream.io);
+        if (persist) {
+            var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+            model_settings_mod.writeSteering(allocator, stream.io, model_settings_mod.defaultPath(&pbuf), lm.path, setting) catch |err| {
+                log.err("[steering] persist failed: {s}\n", .{@errorName(err)});
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "steering: could not write model-settings.json", 500);
+                return;
+            };
+        }
+        const armed = res.armed;
+        const req = res.req;
+        b.swapDefault(&res);
+        if (armed) {
+            log.info("[steering] active: {s} ffn={d} attn={d} (persist={})\n", .{ std.fs.path.basename(b.pathOf(req.bank)), req.ffn, req.attn, persist });
+        } else {
+            log.info("[steering] active: off (persist={})\n", .{persist});
+        }
+    }
+    const json = try steeringStateJson(allocator, stream.io, lm, banks, supported);
+    defer allocator.free(json);
+    try sendResponse(stream, "200 OK", "application/json", json);
+}
+
+/// Capture is armed by a non-empty, non-"0" `MLX_SERVE_STEERING_DUMP_DIR`.
+fn steeringCaptureDir() ?[]const u8 {
+    const raw = std.c.getenv("MLX_SERVE_STEERING_DUMP_DIR") orelse return null;
+    const v = std.mem.span(raw);
+    return if (v.len == 0 or std.mem.eql(u8, v, "0")) null else v;
+}
+
+fn steeringStateJson(allocator: std.mem.Allocator, io: std.Io, lm: *LoadedModel, banks: ?*steering_mod.Banks, arch_supported: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    const id_json = try jsonEscape(allocator, lm.id);
+    defer allocator.free(id_json);
+    try w.print("{{\"model\":{s},\"supported\":{},\"steerable\":{},\"active\":", .{ id_json, arch_supported, banks != null });
+    if (banks) |b| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const active = b.defaultPathInto(&path_buf);
+        if (active.req.isOff()) {
+            try w.writeAll("null");
+        } else {
+            const path_json = try jsonEscape(allocator, active.path);
+            defer allocator.free(path_json);
+            const base = std.fs.path.basename(active.path);
+            const name = if (std.mem.endsWith(u8, base, ".f32")) base[0 .. base.len - 4] else base;
+            const name_json = try jsonEscape(allocator, name);
+            defer allocator.free(name_json);
+            try w.print("{{\"name\":{s},\"file\":{s},\"ffn\":{d},\"attn\":{d}}}", .{ name_json, path_json, active.req.ffn, active.req.attn });
+        }
+    } else try w.writeAll("null");
+    if (steeringCaptureDir()) |cd| {
+        const cd_json = try jsonEscape(allocator, cd);
+        defer allocator.free(cd_json);
+        try w.print(",\"capture\":true,\"capture_dir\":{s},\"registry\":[", .{cd_json});
+    } else try w.writeAll(",\"capture\":false,\"capture_dir\":null,\"registry\":[");
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Listed = struct { name: []const u8, bytes: u64 };
+    var listed: std.ArrayList(Listed) = .empty;
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (steering_mod.registryDir(&dbuf)) |dir_path| {
+        if (std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true })) |dir| {
+            var d = dir;
+            defer d.close(io);
+            var it = d.iterate();
+            while (it.next(io) catch null) |entry| {
+                if (!std.mem.endsWith(u8, entry.name, ".f32")) continue;
+                const name = entry.name[0 .. entry.name.len - 4];
+                // A name that cannot be requested is not a registry bank.
+                if (!steering_mod.isBareName(name)) continue;
+                const st = d.statFile(io, entry.name, .{}) catch continue;
+                if (st.kind != .file) continue;
+                try listed.append(arena, .{ .name = try arena.dupe(u8, name), .bytes = st.size });
+            }
+        } else |_| {}
+    } else |_| {}
+    std.mem.sort(Listed, listed.items, {}, struct {
+        fn lt(_: void, x: Listed, y: Listed) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    for (listed.items, 0..) |e, i| {
+        const name_json = try jsonEscape(arena, e.name);
+        try w.print("{s}{{\"name\":{s},\"bytes\":{d}}}", .{ if (i == 0) "" else ",", name_json, e.bytes });
+    }
+    try w.writeAll("]}");
+    return out.toOwnedSlice();
+}
+
 // ── Vision Processing ──
 
 /// The two chat wire formats describe the same turn graph with different
@@ -15406,6 +15752,11 @@ fn handleAnthropicMessages(
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
+    var steer = resolveRequestSteering(root, lm, false) catch |err| {
+        try sendSteeringError(allocator, stream, err);
+        return;
+    };
+    defer steer.release();
 
     // Per-request PLD override (mirror chat-completions behavior: tools and
     // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
@@ -15651,12 +16002,12 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, &steer, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, kv_quant_override, kv_attn_explicit, &steer, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -15694,6 +16045,7 @@ fn handleAnthropicNonStreaming(
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    steer: *steering_mod.Reservation,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -15727,7 +16079,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, steer, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -15953,6 +16305,7 @@ fn handleAnthropicStreaming(
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    steer: *steering_mod.Reservation,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with
@@ -16011,6 +16364,7 @@ fn handleAnthropicStreaming(
         .vision_key = vision_key,
         .cache_key = cache_key,
         .kv_quant_config = kv_quant_override,
+        .steering = steer,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
@@ -17332,6 +17686,11 @@ fn handleResponsesInner(
     }
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
+    var steer = resolveRequestSteering(root, lm, false) catch |err| {
+        try sendSteeringError(allocator, stream, err);
+        return;
+    };
+    defer steer.release();
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom, and an
     // omitted max_tokens is the maxInt(u32)/4 sentinel.
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -17573,6 +17932,7 @@ fn handleResponsesInner(
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
+            .steering = &steer,
         });
         var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_slice);
         defer ts.deinit(allocator);
@@ -17885,7 +18245,7 @@ fn handleResponsesInner(
             break :blk v;
         };
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, &steer, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

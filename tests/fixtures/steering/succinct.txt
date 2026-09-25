@@ -1,0 +1,16 @@
+In one sentence, what is a database index?
+Briefly: why do compilers optimize?
+Answer in a single line: what does DNS do?
+One sentence only: what is a race condition?
+Short answer: why use version control?
+In a few words, what is a hash table?
+Concisely: what does a load balancer do?
+One line: what is garbage collection?
+Very briefly, what is a REST API?
+Summarize in one sentence: what is a deadlock?
+Quick answer: what does an operating system kernel do?
+In under ten words, what is caching?
+One sentence: why is binary search fast?
+Briefly, what is a foreign key?
+Short: what does a compiler's parser produce?
+In a single sentence, what is unit testing?

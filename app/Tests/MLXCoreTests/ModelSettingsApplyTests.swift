@@ -2,18 +2,83 @@ import XCTest
 @testable import MLXCore
 
 /// Bar: the startup model restarts the server (a hot reload re-bills it under
-/// `--max-resident-mem` and 503s); other resident models hot-reload; nothing
-/// resident = save only.
+/// `--max-resident-mem` and 503s); other resident models hot-reload; a
+/// steering-only edit applies live; nothing resident = save only.
 final class ModelSettingsApplyTests: XCTestCase {
     func testStartupModelRestarts() {
-        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: true), .restart)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: true, changed: [.ctxSize]), .restart)
     }
     func testOtherResidentModelReloads() {
-        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: false), .reload)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: false, changed: [.kvQuant]), .reload)
     }
     func testNotResidentSavesOnly() {
-        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: false, isStartupModel: true), .saveOnly)
-        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: false, loaded: true, isStartupModel: true), .saveOnly)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: false, isStartupModel: true, changed: [.ctxSize]), .saveOnly)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: false, loaded: true, isStartupModel: true, changed: [.steering]), .saveOnly)
+    }
+    /// A steering-only edit applies live; any reload field keeps its reload/restart; nothing changed = save only.
+    func testSteeringOnlyAppliesLiveButNeverBesideAReloadField() {
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: true, changed: [.steering]), .live)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: false, changed: [.steering]), .live)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: true, changed: [.steering, .ctxSize]), .restart)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: false, changed: [.steering, .mtp]), .reload)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: true, isStartupModel: false, changed: []), .saveOnly)
+        XCTAssertEqual(ModelSettingsApply.plan(serverRunning: true, loaded: false, isStartupModel: false, changed: [.steering]), .saveOnly)
+    }
+    func testChangedFieldsNamesExactlyWhatMoved() {
+        let a = ModelOverride(ctxSize: 4096, steering: .configured(name: "terse", ffn: -1, attn: 0))
+        XCTAssertEqual(ModelSettingsApply.changedFields(from: a, to: a), [])
+        XCTAssertEqual(ModelSettingsApply.changedFields(from: a, to: ModelOverride(ctxSize: 4096, steering: .off)), [.steering])
+        XCTAssertEqual(ModelSettingsApply.changedFields(from: a, to: ModelOverride(ctxSize: 8192, steering: .configured(name: "terse", ffn: -1, attn: 0))), [.ctxSize])
+        XCTAssertEqual(ModelSettingsApply.changedFields(from: a, to: ModelOverride()), [.ctxSize, .steering])
+    }
+}
+
+/// The picker round-trips the three states and keeps entered scales across a re-pick.
+final class ModelSettingsSteeringPickerTests: XCTestCase {
+    func testTagRoundTrip() {
+        XCTAssertEqual(ModelSettingsApply.steeringTag(nil), "")
+        XCTAssertEqual(ModelSettingsApply.steeringTag(.off), "off")
+        XCTAssertEqual(ModelSettingsApply.steeringTag(.configured(name: "terse", ffn: 1, attn: 0)), "name:terse")
+        XCTAssertNil(ModelSettingsApply.steering(fromTag: "", current: .off))
+        XCTAssertEqual(ModelSettingsApply.steering(fromTag: "off", current: nil), .off)
+        XCTAssertEqual(ModelSettingsApply.steering(fromTag: "name:terse", current: nil), .configured(name: "terse", ffn: 1, attn: 0))
+        XCTAssertEqual(ModelSettingsApply.steering(fromTag: "name:formal", current: .configured(name: "terse", ffn: -1, attn: 0.5)),
+                       .configured(name: "formal", ffn: -1, attn: 0.5))
+    }
+    func testChoicesKeepAConfiguredNameTheRegistryLacks() {
+        XCTAssertEqual(ModelSettingsApply.steeringChoices(registry: ["a", "b"], current: nil), ["a", "b"])
+        XCTAssertEqual(ModelSettingsApply.steeringChoices(registry: ["a", "b"], current: .configured(name: "b", ffn: 1, attn: 0)), ["a", "b"])
+        XCTAssertEqual(ModelSettingsApply.steeringChoices(registry: ["a"], current: .configured(name: "/x/y.f32", ffn: 1, attn: 0)), ["a", "/x/y.f32"])
+    }
+    func testRegistryListsOnlyBanks() throws {
+        let dir = NSTemporaryDirectory() + "steering-reg-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // "my bank" is a file no request can name: listing it saves a choice that never loads.
+        for f in ["terse.f32", "formal.f32", "terse.json", "notes.txt", "my bank.f32"] {
+            FileManager.default.createFile(atPath: dir + "/" + f, contents: Data([0]))
+        }
+        XCTAssertEqual(SteeringRegistry.names(in: dir), ["formal", "terse"])
+        XCTAssertEqual(SteeringRegistry.names(in: dir + "/missing"), [])
+    }
+    func testSteeringBodyShapes() {
+        let off = APIClient.steeringBody(model: "m", override: .off)
+        XCTAssertTrue(off["name"] is NSNull)
+        XCTAssertEqual(off["persist"] as? Bool, false)
+        let reset = APIClient.steeringBody(model: "m", override: nil)
+        XCTAssertEqual(reset["reset"] as? Bool, true)
+        XCTAssertNil(reset["name"])
+        let cfg = APIClient.steeringBody(model: "m", override: .configured(name: "terse", ffn: -1, attn: 0.5))
+        XCTAssertEqual(cfg["name"] as? String, "terse")
+        XCTAssertEqual(cfg["ffn"] as? Double, -1)
+        XCTAssertEqual(cfg["attn"] as? Double, 0.5)
+        XCTAssertEqual(cfg["persist"] as? Bool, false)
+        XCTAssertEqual(cfg["model"] as? String, "m")
+    }
+    func testPropsSteeringParsesTheActiveBank() {
+        let json: [String: Any] = ["settings": ["steering": ["file": "/Users/x/.mlx-serve/steering/terse.f32", "ffn": -1, "attn": 0]]]
+        XCTAssertEqual(APIClient.SteeringInfo.parse(json), APIClient.SteeringInfo(name: "terse", file: "/Users/x/.mlx-serve/steering/terse.f32", ffn: -1, attn: 0))
+        XCTAssertNil(APIClient.SteeringInfo.parse(["settings": ["steering": ["file": "", "ffn": 0, "attn": 0]]]))
+        XCTAssertNil(APIClient.SteeringInfo.parse([:]))
     }
 }
 

@@ -2016,6 +2016,9 @@ pub const Generator = struct {
         /// (no-match) steps. The prompt-time gate disables PLD on novel content
         /// where cold-path dominates.
         pld_enabled: bool = false,
+        /// Steering capture: the tail forward dumps its last row per layer
+        /// into this directory and a manifest names the prompt it came from.
+        steering_capture_dir: ?[]const u8 = null,
         /// The machine-sized prefill chunk frozen at load
         /// (`ModelConfig.pinned_prefill_chunk`, resolved by
         /// `server.resolvePrefillChunk`). 0 = unpinned, keep the launch width.
@@ -2966,6 +2969,9 @@ pub const Generator = struct {
         errdefer if (dflash_active) {
             for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
         };
+        // The tail forward holds the last prompt token, the one a capture reads. Disarm right
+        // after it (`ctx` is copied into the Generator), or every decode step overwrites the dump.
+        ctx.steering_dump = options.steering_capture_dir;
         const raw_logits = if (tail_mtp_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -2973,6 +2979,8 @@ pub const Generator = struct {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        ctx.steering_dump = null;
+        if (options.steering_capture_dir) |d| try writeCaptureManifest(allocator, io, d, prompt_ids);
         // History entries for the held-back span: (hidden[j], token[j+1]) for
         // j in [final_start, prefix_len) — same pairing as the chunk loop.
         // The last row's pair (hidden[last], t1) is appended by the first
@@ -20050,4 +20058,55 @@ fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usiz
     const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
     defer allocator.free(ids);
     for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
+}
+
+/// Hex SHA-256 over the prompt ids (little-endian u32), the identity a
+/// capture manifest and its response share.
+pub fn promptSha256Hex(ids: []const u32, out: *[64]u8) void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(ids), &digest, .{});
+    out.* = std.fmt.bytesToHex(digest, .lower);
+}
+
+/// `<dir>/done.json`: which prompt the per-layer rows in `dir` came from.
+fn writeCaptureManifest(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, prompt_ids: []const u32) !void {
+    var hex: [64]u8 = undefined;
+    promptSha256Hex(prompt_ids, &hex);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.print("{{\"capture_id\":\"{s}\",\"prompt_tokens\":{d},\"prompt_sha256\":\"{s}\",\"components\":[\"ffn_out\",\"attn_out\"]}}\n", .{ std.fs.path.basename(dir), prompt_ids.len, &hex });
+    const body = out.written();
+    const path = try std.fmt.allocPrint(allocator, "{s}/done.json", .{dir});
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = body });
+}
+
+test "steering capture: the manifest names the id, the token count and the prompt digest" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    const dir = try std.fmt.allocPrint(a, "{s}/cap-1", .{pbuf[0..root_len]});
+    defer a.free(dir);
+    try tmp.dir.createDirPath(io, "cap-1");
+    const ids = [_]u32{ 5, 17, 42, 9 };
+    var hex_a: [64]u8 = undefined;
+    promptSha256Hex(&ids, &hex_a);
+    var hex_b: [64]u8 = undefined;
+    promptSha256Hex(&[_]u32{ 5, 17, 42, 10 }, &hex_b);
+    try std.testing.expect(!std.mem.eql(u8, &hex_a, &hex_b));
+    for (hex_a) |c| try std.testing.expect(std.ascii.isHex(c));
+    try writeCaptureManifest(a, io, dir, &ids);
+    const raw = try tmp.dir.readFileAlloc(io, "cap-1/done.json", a, .limited(1 << 16));
+    defer a.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("cap-1", o.get("capture_id").?.string);
+    try std.testing.expectEqual(@as(i64, 4), o.get("prompt_tokens").?.integer);
+    try std.testing.expectEqualStrings(&hex_a, o.get("prompt_sha256").?.string);
+    try std.testing.expectEqual(@as(usize, 2), o.get("components").?.array.items.len);
 }

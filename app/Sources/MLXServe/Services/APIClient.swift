@@ -390,20 +390,70 @@ class APIClient {
         }
     }
 
+    /// `settings.steering` of `/props`: the model's active direction bank.
+    struct SteeringInfo: Equatable {
+        let name: String
+        /// The bank's full path. Writers post this back as `file:`: a basename resolves into
+        /// the registry dir, a 400 or a different file for a bank armed by absolute path.
+        let file: String
+        let ffn: Double
+        let attn: Double
+
+        static func parse(_ json: [String: Any]) -> SteeringInfo? {
+            guard let settings = json["settings"] as? [String: Any],
+                  let st = settings["steering"] as? [String: Any],
+                  let file = st["file"] as? String, !file.isEmpty else { return nil }
+            var name = (file as NSString).lastPathComponent
+            if name.hasSuffix(".f32") { name = String(name.dropLast(4)) }
+            return SteeringInfo(name: name, file: file,
+                                ffn: (st["ffn"] as? NSNumber)?.doubleValue ?? 0,
+                                attn: (st["attn"] as? NSNumber)?.doubleValue ?? 0)
+        }
+    }
+
     struct PropsSnapshot {
         let memory: MemoryInfo
         /// nil when the server published no measured curve (the per-silicon
         /// tables applied), which the UI reads as "nothing to show".
         let specCost: SpecCostInfo?
         let batching: BatchingInfo?
+        let directionalSteering: SteeringInfo?
     }
 
-    func fetchProps(port: UInt16) async throws -> PropsSnapshot? {
-        let url = serverURL(port: port, path: "/props")
-        let (data, _) = try await session.data(from: url)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mem = json["memory"] as? [String: Any] else { return nil }
-        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json))
+    /// `model` names the model the per-model fields describe; nil = the registry default.
+    func fetchProps(port: UInt16, model: String? = nil) async throws -> PropsSnapshot? {
+        let json = try await fetchPropsRaw(port: port, model: model)
+        guard let mem = json["memory"] as? [String: Any] else { return nil }
+        return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json), directionalSteering: SteeringInfo.parse(json))
+    }
+
+    /// `persist: false` always: the sheet writes the file itself; the tray never persists.
+    static func steeringBody(model: String, override: SteeringOverride?, file: String? = nil) -> [String: Any] {
+        var body: [String: Any] = ["model": model, "persist": false]
+        switch override {
+        case nil: body["reset"] = true
+        case .off?: body["name"] = NSNull()
+        case .configured(let name, let ffn, let attn)?:
+            if let f = file, !f.isEmpty { body["file"] = f } else { body["name"] = name }
+            body["ffn"] = ffn
+            body["attn"] = attn
+        }
+        return body
+    }
+
+    func setSteering(port: UInt16, model: String, override: SteeringOverride?, file: String? = nil) async throws {
+        let url = serverURL(port: port, path: "/v1/steering")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        request.httpBody = try JSONSerialization.data(withJSONObject: Self.steeringBody(model: model, override: override, file: file), options: [.withoutEscapingSlashes])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            throw APIError.badStatus(code: code, detail: String(snippet))
+        }
     }
 
     /// The whole `/props` document. Settings are per MODEL and the bare

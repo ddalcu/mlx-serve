@@ -29,6 +29,35 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertNil(back.override(for: "/m/b"))
     }
 
+    /// `steering` has three states on disk: absent (inherit), `null` (off), object (configured).
+    func testSteeringRoundTripsThreeStates() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(steering: .off), for: "/m/off")
+        file.set(ModelOverride(ctxSize: 4096, steering: .configured(name: "terse", ffn: -1.5, attn: 0.25)), for: "/m/cfg")
+        file.set(ModelOverride(ctxSize: 4096), for: "/m/inherit")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"steering\" : null"), text)
+        XCTAssertTrue(text.contains("\"name\" : \"terse\""), text)
+        let back = ModelSettingsFile.load(path: path)
+        XCTAssertEqual(back.override(for: "/m/off")?.steering, .off)
+        XCTAssertEqual(back.override(for: "/m/cfg")?.steering, .configured(name: "terse", ffn: -1.5, attn: 0.25))
+        XCTAssertEqual(back.override(for: "/m/cfg")?.ctxSize, 4096)
+        XCTAssertNil(back.override(for: "/m/inherit")?.steering)
+        // A bank alone steers the ffn arm at 1; a malformed object reads as inherit.
+        XCTAssertEqual(ModelOverride(json: ["steering": ["name": "x"]]).steering, .configured(name: "x", ffn: 1, attn: 0))
+        XCTAssertNil(ModelOverride(json: ["steering": ["ffn": 1]]).steering)
+        // What the server ignores, the sheet must not show as saved.
+        XCTAssertNil(ModelOverride(json: ["steering": ["name": "x", "ffn": true]]).steering)
+        XCTAssertNil(ModelOverride(json: ["steering": ["name": "x", "ffn": 101]]).steering)
+        XCTAssertNil(ModelOverride(json: ["steering": ["name": "a b"]]).steering)
+        XCTAssertNil(ModelOverride(json: ["steering": ["name": "rel/x.f32"]]).steering)
+        XCTAssertNil(ModelOverride(json: ["steering": ["name": String(repeating: "a", count: 65)]]).steering)
+        XCTAssertEqual(ModelOverride(json: ["steering": ["name": "/abs/x.f32", "attn": 0.5]]).steering,
+                       .configured(name: "/abs/x.f32", ffn: 0, attn: 0.5))
+    }
+
     func testMtpAcceptanceRoundTripsByName() throws {
         let path = tempPath()
         var file = ModelSettingsFile()

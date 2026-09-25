@@ -146,6 +146,9 @@ struct StatusMenuView: View {
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
     @State private var showDownloads = false
+    /// `ModelSettingsFile.load()` is a disk read plus a JSON parse and this body re-runs on
+    /// every `/props` poll, so it is refreshed on selection change, not per render.
+    @State private var configuredBankCached: String?
     /// Slot ids with an unload in flight (the eject button becomes a spinner —
     /// an unload can take seconds while the server drains a running request).
     @State private var unloadingIds: Set<String> = []
@@ -204,7 +207,11 @@ struct StatusMenuView: View {
         // (.window style) fires onAppear when the popover shows and
         // onDisappear when it dismisses — perfect hook for "user is or isn't
         // looking at the GPU-memory bar".
-        .onAppear { server.setMenuVisible(true) }
+        .onAppear {
+            server.setMenuVisible(true)
+            refreshConfiguredBank()
+        }
+        .onChange(of: appState.selectedModelPath) { _, _ in refreshConfiguredBank() }
         .onDisappear { server.setMenuVisible(false) }
     }
 
@@ -265,6 +272,19 @@ struct StatusMenuView: View {
                         .controlSize(.regular)
                         .disabled(appState.selectedModelPath.isEmpty || server.lanChatModelId != nil || appState.useAppleModel)
                         .help("Model Settings for the selected model (context, KV cache, MTP)")
+                    }
+                    // A bank saved for the selected model, before anything is resident.
+                    if let bank = SteeringQuickSet.loadBadge(
+                        configured: configuredBankCached,
+                        boxDrawn: selectedModelBoxDrawn) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch").font(.caption2)
+                            Text(L10n.format("steer %@ on load", bank)).font(.caption2)
+                        }
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help("Directional steering is configured for this model and applies "
+                              + "when it loads. The scales become editable here once it is resident.")
                     }
                     serverControls
                     serverFooterRow
@@ -690,6 +710,21 @@ struct StatusMenuView: View {
         return "\(label) + assist"
     }
 
+    /// Whether the In Memory card is drawing the steering box for the SELECTED model.
+    /// `selectedModelPath` is a path and `ModelInfo.name` a registry id, so resolve first.
+    private var selectedModelBoxDrawn: Bool {
+        guard let id = appState.localModels.first(where: { $0.path == appState.selectedModelPath })?.name,
+              SteeringQuickSet.ownsLiveSteering(row: id, liveChatModel: server.residentChatModel?.name)
+        else { return false }
+        return SteeringQuickSet.visibleBank(live: server.directionalSteering?.name,
+                                            remembered: server.rememberedSteeringBanks[id]?.name) != nil
+    }
+
+    private func refreshConfiguredBank() {
+        configuredBankCached = SteeringQuickSet.configuredBank(path: appState.selectedModelPath,
+                                                              file: ModelSettingsFile.load())
+    }
+
     /// One resident-model slot: modality icon, name, badges (chat quant /
     /// spec-decode), resident size, and an eject button that unloads it.
     @ViewBuilder
@@ -727,6 +762,11 @@ struct StatusMenuView: View {
                     .help(info.mtpLoaded
                           ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
                           : "Assistant drafter loaded — faster decode via speculative decoding")
+            }
+            // Only the row /props describes (`ownsLiveSteering`).
+            if info.slotKind == .chat,
+               SteeringQuickSet.ownsLiveSteering(row: info.name, liveChatModel: server.residentChatModel?.name) {
+                SteeringQuickBox(modelId: info.name, live: server.directionalSteering)
             }
             Spacer()
             if info.bytesResident > 0 {
@@ -1350,3 +1390,130 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
+/// The menu bar's steering control: the active bank's name and number boxes for its ffn
+/// and attn scales. Typed values rather than sliders — the useful range is narrow and
+/// differs per bank, and the point past it produces garbage, which a drag reaches by accident.
+///
+/// Applies to the RUNNING server only (`persist: false`). Model Settings owns the value
+/// that survives a restart, so an experiment cannot outlive the session that ran it.
+struct SteeringQuickBox: View {
+    let modelId: String
+    let live: APIClient.SteeringInfo?
+    @EnvironmentObject var server: ServerManager
+    @State private var ffnText: String = ""
+    @State private var attnText: String = ""
+    @State private var applying = false
+    /// An edit that landed while a POST was in flight; sent when it returns, so the
+    /// server ends on the value the box shows.
+    @State private var resend = false
+    @State private var failure: String?
+    @FocusState private var ffnFocused: Bool
+    @FocusState private var attnFocused: Bool
+
+    /// Remembered on `ServerManager`: this popover's @State dies when the menu closes.
+    private var bank: String? {
+        SteeringQuickSet.visibleBank(live: live?.name,
+                                     remembered: server.rememberedSteeringBanks[modelId]?.name)
+    }
+
+    var body: some View {
+        if let name = bank {
+            HStack(spacing: 4) {
+                Text(L10n.format("steer %@", name))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .fixedSize()
+                arm("ffn", text: $ffnText, focused: $ffnFocused, step: { step($ffnText, fallback: live?.ffn, $0) })
+                arm("attn", text: $attnText, focused: $attnFocused, step: { step($attnText, fallback: live?.attn, $0) })
+                if applying { ProgressView().controlSize(.mini).scaleEffect(0.5) }
+                if let failure {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .help(failure)
+                }
+            }
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Color.orange.opacity(0.15))
+            .clipShape(Capsule())
+            .help("Steering scales for \(name): ffn is the residual after the MLP, attn the "
+                  + "attention output. Enter applies to the running server; 0 in both turns it "
+                  + "off. Model Settings holds the saved value.")
+            .onAppear { seed() }
+            // The server is the truth: a reload or a Model Settings save moves it under us.
+            // A focused field is the user's, so it is never re-seeded mid-edit.
+            .onChange(of: live?.ffn) { _, v in if !ffnFocused { ffnText = format(v ?? 0) } }
+            .onChange(of: live?.attn) { _, v in if !attnFocused { attnText = format(v ?? 0) } }
+            .onChange(of: live?.name) { _, v in remember(v) }
+        }
+    }
+
+    private func remember(_ name: String?) {
+        if let name, !name.isEmpty {
+            server.rememberedSteeringBanks[modelId] = .init(name: name, file: live?.file ?? "")
+        }
+    }
+
+    private func seed() {
+        remember(live?.name)
+        ffnText = format(live?.ffn ?? 0)
+        attnText = format(live?.attn ?? 0)
+    }
+
+    @ViewBuilder
+    private func arm(_ label: String, text: Binding<String>,
+                     focused: FocusState<Bool>.Binding, step: @escaping (Int) -> Void) -> some View {
+        Text(label)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize()
+        TextField("", text: text)
+            .font(.caption2.monospaced())
+            .textFieldStyle(.plain)
+            .multilineTextAlignment(.trailing)
+            .frame(width: 30)
+            .focused(focused)
+            .onSubmit { send() }
+            // A value the server would refuse is said before it is sent.
+            .foregroundStyle(SteeringQuickSet.parse(text.wrappedValue) == nil ? Color.red : Color.primary)
+        Stepper("", onIncrement: { step(+1) }, onDecrement: { step(-1) })
+            .labelsHidden()
+            .controlSize(.mini)
+    }
+
+    private func format(_ v: Double) -> String {
+        v == v.rounded() ? String(Int(v)) : String(format: "%g", v)
+    }
+
+    private func step(_ text: Binding<String>, fallback: Double?, _ n: Int) {
+        text.wrappedValue = format(SteeringQuickSet.stepped(
+            SteeringQuickSet.parse(text.wrappedValue) ?? fallback ?? 0, by: n))
+        send()
+    }
+
+    /// Both arms go in one request: the active default carries the pair, so sending one
+    /// alone would write the other back from a stale read.
+    private func send() {
+        guard let name = bank,
+              let ffn = SteeringQuickSet.parse(ffnText),
+              let attn = SteeringQuickSet.parse(attnText) else { return }
+        if applying { resend = true; return }
+        applying = true
+        Task {
+            defer {
+                applying = false
+                if resend { resend = false; send() }
+            }
+            do {
+                failure = nil
+                try await server.setSteering(
+                    id: modelId,
+                    SteeringQuickSet.override(name: name, ffn: ffn, attn: attn),
+                    file: live?.file ?? server.rememberedSteeringBanks[modelId]?.file)
+            } catch {
+                failure = error.localizedDescription
+            }
+        }
+    }
+}

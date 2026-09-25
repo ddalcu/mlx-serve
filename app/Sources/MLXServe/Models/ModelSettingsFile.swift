@@ -31,6 +31,44 @@ enum MtpAcceptanceChoice: String, CaseIterable {
     }
 }
 
+/// The server's `steering` key: absent = follow the launch flags, `null` = off
+/// even with flags, object = this bank at these scales.
+enum SteeringOverride: Equatable {
+    case off
+    case configured(name: String, ffn: Double, attn: Double)
+
+    /// nil = malformed, by the rules the server's `Setting.fromJsonValue` applies (it
+    /// ignores such an entry, so the sheet must not show it as saved).
+    init?(json: Any) {
+        if json is NSNull { self = .off; return }
+        guard let o = json as? [String: Any], let name = o["name"] as? String,
+              name.hasPrefix("/") || SteeringRegistry.isBareName(name)
+        else { return nil }
+        // A JSON bool bridges to NSNumber too; the server reads it as no number.
+        func scale(_ key: String) -> Double?? {
+            guard let v = o[key] else { return .some(nil) }
+            guard let n = v as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(),
+                  n.doubleValue.isFinite, abs(n.doubleValue) <= SteeringQuickSet.limit else { return nil }
+            return .some(n.doubleValue)
+        }
+        guard let ffn = scale("ffn"), let attn = scale("attn") else { return nil }
+        // A file with neither scale steers the ffn arm at 1 (the server's default).
+        self = .configured(name: name, ffn: ffn ?? (attn == nil ? 1 : 0), attn: attn ?? 0)
+    }
+
+    var json: Any {
+        switch self {
+        case .off: return NSNull()
+        case .configured(let name, let ffn, let attn): return ["name": name, "ffn": ffn, "attn": attn]
+        }
+    }
+
+    var name: String? {
+        if case .configured(let name, _, _) = self { return name }
+        return nil
+    }
+}
+
 /// One model's entry in `~/.mlx-serve/model-settings.json` — the file the
 /// SERVER reads (`src/model_settings.zig`) at every load of that model, so the
 /// keys are its keys. nil = the process default. Unknown keys are kept in
@@ -40,14 +78,16 @@ struct ModelOverride: Equatable {
     var kvQuant: KvQuantChoice?
     var mtp: Bool?
     var mtpAcceptance: MtpAcceptanceChoice?
+    var steering: SteeringOverride?
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
-         mtpAcceptance: MtpAcceptanceChoice? = nil) {
+         mtpAcceptance: MtpAcceptanceChoice? = nil, steering: SteeringOverride? = nil) {
         self.ctxSize = ctxSize
         self.kvQuant = kvQuant
         self.mtp = mtp
         self.mtpAcceptance = mtpAcceptance
+        self.steering = steering
     }
 
     init(json: [String: Any]) {
@@ -65,12 +105,15 @@ struct ModelOverride: Equatable {
         if let a = rest.removeValue(forKey: "mtp_acceptance") {
             if let s = a as? String { mtpAcceptance = MtpAcceptanceChoice(rawValue: s) }
         }
+        if let s = rest.removeValue(forKey: "steering") {
+            steering = SteeringOverride(json: s)
+        }
         extra = rest
     }
 
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
-    var hasSettings: Bool { ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil }
+    var hasSettings: Bool { ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || steering != nil }
 
     var json: [String: Any] {
         var out = extra
@@ -78,12 +121,13 @@ struct ModelOverride: Equatable {
         if let kvQuant { out["kv_quant"] = kvQuant.rawValue }
         if let mtp { out["mtp"] = mtp }
         if let mtpAcceptance { out["mtp_acceptance"] = mtpAcceptance.rawValue }
+        if let steering { out["steering"] = steering.json }
         return out
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance
-            && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
+            && a.steering == b.steering && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
 }
 
@@ -143,5 +187,23 @@ enum ContextIncreaseTarget: Equatable {
 
     static func resolve(hasOverride: Bool) -> ContextIncreaseTarget {
         hasOverride ? .modelSettings : .appSettings
+    }
+}
+
+/// The direction banks a request can name: `~/.mlx-serve/steering/<name>.f32`.
+enum SteeringRegistry {
+    static let defaultDir = NSString(string: "~/.mlx-serve/steering").expandingTildeInPath
+
+    static func names(in dir: String = defaultDir) -> [String] {
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        return entries.filter { $0.hasSuffix(".f32") }.map { String($0.dropLast(4)) }
+            .filter(isBareName).sorted()
+    }
+
+    /// The server's `isBareName`: only such a name resolves into the registry dir, so a
+    /// file named any other way can be listed but never loaded by name.
+    static func isBareName(_ name: String) -> Bool {
+        !name.isEmpty && name.count <= 64
+            && name.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }
     }
 }

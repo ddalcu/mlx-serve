@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
+const steering = @import("steering.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
 // so has no head-shaped state of its own. mtp.zig imports this file back for
@@ -3935,6 +3936,8 @@ pub fn qsaSelectTopBlocks(
     const nb = ssh[2];
     if (rows <= 0 or nb <= 0 or bsh[0] != rows) return null;
     if (kb <= 0 or kb > nb) return null;
+    // Under 8 elements mlx binds an input in `constant`; the row walk wants `device`.
+    if (@as(i64, rows) * nb < 8) return null;
 
     qsa_select_used_split = false;
     if (qsaSelectSplitEnabled() and qsaSelectSplitServes(rows, nb, kb)) {
@@ -13588,6 +13591,14 @@ pub const ForwardCtx = struct {
     /// the cache scheme is .affine (.off has no quant triple to consume).
     /// Default false → unchanged dense SDPA path.
     kv_attn_fused: bool = false,
+    /// Directional steering for this forward (a snapshot the slot pinned;
+    /// `bank` is meaningless when both scales are 0). Batched forwards read
+    /// every `batch_slots[i].steering` instead.
+    steering: steering.Req = .{},
+    /// Steering capture: dump the last row of every layer's attention output and
+    /// post-MLP residual (hc-meaned) here. Ignored unless the batch is one and steering
+    /// is off: a steered row is not a direction sample, and batched rows share no prompt.
+    steering_dump: ?[]const u8 = null,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
     /// by the BERT encoder forward so padded positions never attend. Null
     /// (the default) keeps the unmasked single-sequence path.
@@ -15120,6 +15131,9 @@ pub const Transformer = struct {
     qwen4_mtp: ?Qwen4Mtp = null,
     /// Whose per-request state the head currently holds (`qwen4MtpActivate`).
     qwen4_mtp_owner: ?*Qwen4MtpState = null,
+    /// Directional steering banks, created on first use and freed in `deinit` (MLX rows
+    /// live on the inference thread). Null = no steering.
+    steering: ?*steering.Banks = null,
 
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
@@ -16710,6 +16724,11 @@ pub const Transformer = struct {
             st.deinit();
             self.allocator.destroy(st);
             self.qwen4 = null;
+        }
+        if (self.steering) |b| {
+            b.deinit();
+            self.allocator.destroy(b);
+            self.steering = null;
         }
         // Hybrid layers own no arrays of their own — their weights are tracked
         // by `moe_owned_bf16`/`ssm_entries` above — but the slice itself is ours.
@@ -20638,7 +20657,7 @@ pub const Transformer = struct {
                 h.* = o.stream;
                 return .{ .mixed = o.mixed, .inj = o.inj };
             }
-            h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+            try self.hcApplyWrite(h, pd.out, pd.inj, batch, seq_len, pd.steer);
         }
         return self.hcRead(h.*, w, batch, seq_len);
     }
@@ -20729,13 +20748,14 @@ pub const Transformer = struct {
         return result;
     }
 
-    /// Defer `stream += out * inj` to the next read when the fused read will
-    /// take it (decode/verify/batched widths); otherwise write now.
-    fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
+    /// Defer `stream += out * inj` (and the steer riding it) to the next read
+    /// when the fused read will take it (decode/verify/batched widths);
+    /// otherwise write now.
+    fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending, steer: ?HcSteer) !void {
         std.debug.assert(pending.* == null);
         const prefill = @import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, inject_flat, mlx.mlx_array_dtype(h.*)) and mlx.mlx_array_dtype(inj) == .bfloat16;
         if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled())) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
-            var pd: HcPending = undefined;
+            var pd: HcPending = .{ .out = undefined, .inj = undefined, .steer = steer };
             pd.out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(pd.out);
             try mlx.check(mlx.mlx_array_set(&pd.out, out));
@@ -20745,15 +20765,220 @@ pub const Transformer = struct {
             pending.* = pd;
             return;
         }
-        h.* = try self.hcWrite(h.*, out, inj, batch, seq_len);
+        try self.hcApplyWrite(h, out, inj, batch, seq_len, steer);
+    }
+
+    /// The write with its steer applied by the standalone projection: the
+    /// `.out` arm edits `out` before the write, the `.stream` arm the stream after.
+    fn hcApplyWrite(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, steer: ?HcSteer) !void {
+        var o = out;
+        var owned = false;
+        if (steer) |sw| if (sw.arm == .out) {
+            o = try steering.projectRow(out, sw.dir, sw.scale, self.s);
+            owned = true;
+        };
+        defer if (owned) {
+            _ = mlx.mlx_array_free(o);
+        };
+        h.* = try self.hcWrite(h.*, o, inj, batch, seq_len);
+        if (steer) |sw| if (sw.arm == .stream) {
+            const p = try steering.projectStream(h.*, sw.dir, sw.scale, @intCast(self.config.hc_count), self.s);
+            _ = mlx.mlx_array_free(h.*);
+            h.* = p;
+        };
     }
 
     fn hcFlush(self: *Transformer, h: *mlx.mlx_array, batch: c_int, seq_len: c_int, pending: *?HcPending) !void {
         if (pending.*) |*pd| {
             defer pending.* = null;
             defer pd.deinit();
-            h.* = try self.hcWrite(h.*, pd.out, pd.inj, batch, seq_len);
+            try self.hcApplyWrite(h, pd.out, pd.inj, batch, seq_len, pd.steer);
         }
+    }
+
+    /// Archs whose layer loops call the two steering seams.
+    pub fn steeringSupported(self: *const Transformer) bool {
+        return self.qwen4 != null;
+    }
+
+    /// The model's bank registry, created on first use at the trunk's own
+    /// geometry (one direction per layer, `hidden` wide).
+    pub fn ensureSteeringBanks(self: *Transformer, io: std.Io) !*steering.Banks {
+        if (self.steering) |b| return b;
+        const b = try self.allocator.create(steering.Banks);
+        b.* = steering.Banks.init(self.allocator, io, self.config.num_hidden_layers, self.config.hidden_size);
+        self.steering = b;
+        return b;
+    }
+
+    var steering_engaged_logged = false;
+
+    /// One forward's steering, resolved once at entry. The seams are `steerAttnOut`
+    /// (attention output), `steerResidual` (after the MLP write) and `steerPending`
+    /// (riding a deferred hyper-connection write).
+    const SteerPlan = struct {
+        shape: enum { off, uniform, mixed } = .off,
+        req: steering.Req = .{},
+        ffn_any: bool = false,
+        attn_any: bool = false,
+        dt: mlx.mlx_dtype = .bfloat16,
+        banks: []u8 = &.{},
+        ffn_v: []f32 = &.{},
+        attn_v: []f32 = &.{},
+        ffn_scale: mlx.mlx_array = .{},
+        attn_scale: mlx.mlx_array = .{},
+
+        fn deinit(self: *SteerPlan, allocator: std.mem.Allocator) void {
+            if (self.ffn_scale.ctx != null) _ = mlx.mlx_array_free(self.ffn_scale);
+            if (self.attn_scale.ctx != null) _ = mlx.mlx_array_free(self.attn_scale);
+            if (self.banks.len > 0) allocator.free(self.banks);
+            if (self.ffn_v.len > 0) allocator.free(self.ffn_v);
+            if (self.attn_v.len > 0) allocator.free(self.attn_v);
+            self.* = .{};
+        }
+
+        /// The scale operand, built on first use: a `[1]` scalar (uniform) or a
+        /// per-row column (mixed) in the activation dtype, never a bare f32.
+        fn scale(self: *SteerPlan, arm: enum { ffn, attn }, ndim: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+            const slot = if (arm == .ffn) &self.ffn_scale else &self.attn_scale;
+            if (slot.ctx == null) {
+                slot.* = switch (self.shape) {
+                    .uniform => try steering.scalarAs(if (arm == .ffn) self.req.ffn else self.req.attn, self.dt, s),
+                    .mixed => try steering.columnAs(if (arm == .ffn) self.ffn_v else self.attn_v, ndim, self.dt, s),
+                    .off => unreachable,
+                };
+            }
+            return slot.*;
+        }
+    };
+
+    /// The group's plan: off, one scale for every row (uniform), or a per-row scale
+    /// column and a per-row direction gather (mixed, when rows carry different banks or
+    /// different scales). Built once per forward.
+    fn steerPlan(self: *Transformer, ctx: *const ForwardCtx, batch: c_int, dt: mlx.mlx_dtype) !SteerPlan {
+        if (self.steering == null) return .{};
+        var plan: SteerPlan = .{ .dt = dt };
+        if (ctx.batch_slots) |slots| {
+            std.debug.assert(slots.len == @as(usize, @intCast(batch)));
+            var uniform = true;
+            var first: ?steering.Req = null;
+            for (slots) |sc| {
+                if (sc.steering.isOff()) {
+                    uniform = false;
+                    continue;
+                }
+                if (first == null) first = sc.steering else if (!std.meta.eql(sc.steering, first.?)) uniform = false;
+            }
+            if (first == null) return .{};
+            if (uniform) {
+                plan.shape = .uniform;
+                plan.req = first.?;
+            } else {
+                plan.shape = .mixed;
+                plan.banks = try self.allocator.alloc(u8, slots.len);
+                errdefer self.allocator.free(plan.banks);
+                plan.ffn_v = try self.allocator.alloc(f32, slots.len);
+                errdefer self.allocator.free(plan.ffn_v);
+                plan.attn_v = try self.allocator.alloc(f32, slots.len);
+                errdefer self.allocator.free(plan.attn_v);
+                for (slots, 0..) |sc, i| {
+                    // An off row gathers SOME pinned bank; its scale of 0 is exact.
+                    plan.banks[i] = if (sc.steering.isOff()) first.?.bank else sc.steering.bank;
+                    plan.ffn_v[i] = sc.steering.ffn;
+                    plan.attn_v[i] = sc.steering.attn;
+                    plan.ffn_any = plan.ffn_any or sc.steering.ffn != 0;
+                    plan.attn_any = plan.attn_any or sc.steering.attn != 0;
+                }
+                return plan;
+            }
+        } else {
+            if (ctx.steering.isOff()) return .{};
+            plan.shape = .uniform;
+            plan.req = ctx.steering;
+        }
+        plan.ffn_any = plan.req.ffn != 0;
+        plan.attn_any = plan.req.attn != 0;
+        return plan;
+    }
+
+    /// The uniform plan's edit for one seam, to ride the deferred write (the
+    /// fused read applies it in its N kernel; a flush applies it around the write).
+    fn steerPending(self: *Transformer, plan: *SteerPlan, arm: HcSteer.Arm, layer: usize) !?HcSteer {
+        std.debug.assert(plan.shape == .uniform);
+        if (if (arm == .out) !plan.attn_any else !plan.ffn_any) return null;
+        const dir = (try self.steering.?.rowsFor(plan.req.bank, plan.dt, self.s))[layer];
+        return .{ .dir = dir, .scale = try plan.scale(if (arm == .out) .attn else .ffn, 1, self.s), .arm = arm };
+    }
+
+    fn steerDirection(self: *Transformer, plan: *SteerPlan, layer: usize, ndim: usize) !struct { d: mlx.mlx_array, owned: bool } {
+        const banks = self.steering.?;
+        return switch (plan.shape) {
+            .uniform => .{ .d = (try banks.rowsFor(plan.req.bank, plan.dt, self.s))[layer], .owned = false },
+            .mixed => .{ .d = try banks.gatherRows(plan.banks, layer, ndim, plan.dt, self.s), .owned = true },
+            .off => unreachable,
+        };
+    }
+
+    /// One capture row: the LAST position of `x` `[B,S,hc*hidden]`, averaged over
+    /// the `hc` branches, as `<dir>/<component>-<layer>_pos0.bin` f32.
+    fn steeringDumpRow(self: *Transformer, dir: []const u8, component: []const u8, layer: usize, x: mlx.mlx_array, hc: c_int) !void {
+        const shape = mlx.getShape(x);
+        std.debug.assert(shape.len == 3);
+        const width = shape[2];
+        const start = [_]c_int{ 0, shape[1] - 1, 0 };
+        const stop = [_]c_int{ 1, shape[1], width };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var last = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(last);
+        try mlx.check(mlx.mlx_slice(&last, x, &start, 3, &stop, 3, &strides, 3, self.s));
+        const shape2 = [_]c_int{ hc, @divExact(width, hc) };
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_reshape(&rows, last, &shape2, 2, self.s));
+        var rows32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows32);
+        try mlx.check(mlx.mlx_astype(&rows32, rows, .float32, self.s));
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_mean_axis(&mean, rows32, 0, false, self.s));
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, mean, false, self.s));
+        try mlx.check(mlx.mlx_array_eval(c));
+        const n = mlx.mlx_array_size(c);
+        const data = mlx.mlx_array_data_float32(c) orelse return error.Unreadable;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}-{d}_pos0.bin", .{ dir, component, layer });
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(data[0..n]) });
+    }
+
+    /// The attn arm on a `[B,S,hidden]` block output. Consumes `y` when it
+    /// steers; hands it back untouched otherwise.
+    fn steerAttnOut(self: *Transformer, plan: *SteerPlan, y: mlx.mlx_array, layer: usize) !mlx.mlx_array {
+        if (!plan.attn_any) return y;
+        const dir = try self.steerDirection(plan, layer, 3);
+        defer if (dir.owned) {
+            _ = mlx.mlx_array_free(dir.d);
+        };
+        const scale = try plan.scale(.attn, 3, self.s);
+        const out = try steering.projectRow(y, dir.d, scale, self.s);
+        _ = mlx.mlx_array_free(y);
+        return out;
+    }
+
+    /// The ffn arm on the flat `[B,S,hc*hidden]` residual after the MLP write
+    /// (the caller flushes any deferred write first). Consumes `h` when it steers.
+    fn steerResidual(self: *Transformer, plan: *SteerPlan, h: mlx.mlx_array, layer: usize, hc: c_int) !mlx.mlx_array {
+        if (!plan.ffn_any) return h;
+        const dir = try self.steerDirection(plan, layer, 4);
+        defer if (dir.owned) {
+            _ = mlx.mlx_array_free(dir.d);
+        };
+        const scale = try plan.scale(.ffn, 4, self.s);
+        const out = try steering.projectStream(h, dir.d, scale, hc, self.s);
+        _ = mlx.mlx_array_free(h);
+        return out;
     }
 
     /// Grouped RMS norm over the last `hidden` of each of the `hc` streams:
@@ -23127,6 +23352,9 @@ pub const Transformer = struct {
         };
         var rows: [MAX_BATCH_ROWS]Row = undefined;
         var initialized: usize = 0;
+        var plans: [MAX_BATCH_ROWS]SteerPlan = undefined;
+        var any_ffn = false;
+        defer for (plans[0..initialized]) |*plan| plan.deinit(self.allocator);
         defer for (rows[0..initialized]) |*row| {
             if (row.pending) |*pending| pending.deinit();
             if (row.h.ctx != null) _ = mlx.mlx_array_free(row.h);
@@ -23156,6 +23384,8 @@ pub const Transformer = struct {
                 .generation = generation,
                 .h = h,
             };
+            plans[i] = try self.steerPlan(ctx, 1, mlx.mlx_array_dtype(h));
+            any_ffn = any_ffn or plans[i].ffn_any;
             initialized += 1;
         }
 
@@ -23202,12 +23432,13 @@ pub const Transformer = struct {
                     generations[i] = row.generation;
                 } else {
                     defer read.deinit();
-                    const attn = switch (layer.attn) {
+                    var attn = switch (layer.attn) {
                         .linear => |la| try self.gatedDeltaNet(read.mixed, &la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
                         .full => |fa| try self.qwen4AttnWith(row.ctx, read.mixed, &fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                     };
                     defer _ = mlx.mlx_array_free(attn);
-                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                    attn = try self.steerAttnOut(&plans[i], attn, layer_idx);
+                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, null);
                 }
             }
             if (group_projection) {
@@ -23221,12 +23452,13 @@ pub const Transformer = struct {
                 };
                 for (rows[0..initialized], attn_reads[0..initialized], 0..) |*row, read, i| {
                     self.fwd_gen = row.generation;
-                    const attn = if (projected) |values| try standinRef(values[i]) else switch (layer.attn) {
+                    var attn = if (projected) |values| try standinRef(values[i]) else switch (layer.attn) {
                         .linear => |*la| try self.gatedDeltaNet(read.mixed, la, &row.entries[layer_idx], layer_idx, 1, row.seq, true),
                         .full => |*fa| try self.qwen4AttnWith(row.ctx, read.mixed, fa, &row.entries[layer_idx], @intCast(layer_idx), @intCast(row.offset), 0, 1, row.seq, true),
                     };
                     defer _ = mlx.mlx_array_free(attn);
-                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                    attn = try self.steerAttnOut(&plans[i], attn, layer_idx);
+                    try self.hcWriteOrDefer(&row.h, attn, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, null);
                 }
             }
 
@@ -23260,8 +23492,14 @@ pub const Transformer = struct {
             }
             for (rows[0..initialized], mlp, reads[0..initialized]) |*row, value, read| {
                 self.fwd_gen = row.generation;
-                try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending);
+                try self.hcWriteOrDefer(&row.h, value, read.inj, 1, row.seq, .{ .ctx = null }, &row.pending, null);
             }
+            // A joined read wants every row on the same footing, so one steered
+            // row flushes them all.
+            if (any_ffn) for (rows[0..initialized], 0..) |*row, i| {
+                try self.hcFlush(&row.h, 1, row.seq, &row.pending);
+                if (plans[i].ffn_any) row.h = try self.steerResidual(&plans[i], row.h, layer_idx, hc);
+            };
         }
 
         var join_lmhead = !self.embedding_mode;
@@ -23385,6 +23623,22 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(h);
             h = h32;
         }
+        var steer = try self.steerPlan(ctx, batch, mlx.mlx_array_dtype(h));
+        defer steer.deinit(self.allocator);
+        if (steer.shape != .off and !steering_engaged_logged) {
+            steering_engaged_logged = true;
+            log.info("[steering] engaged: {s} ffn={} attn={} rows={d}\n", .{
+                @tagName(steer.shape), steer.ffn_any, steer.attn_any, batch * seq_len,
+            });
+        }
+        const dump_dir: ?[]const u8 = if (ctx.steering_dump) |d| blk: {
+            if (steer.shape == .off and batch == 1) break :blk d;
+            log.warn("[steering] capture skipped: steering active or batched forward\n", .{});
+            break :blk null;
+        } else null;
+        // A uniform plan at fused-read widths rides the deferred write: no extra dispatch,
+        // no flush.
+        const steer_fold = steer.shape == .uniform and batch * seq_len <= HC_FUSED_MAX_ROWS and dump_dir == null and !qwen4Standin().hc and steering.foldEnabled();
         // M-RoPE chunk tables: read by every full-attn layer AND the QSA
         // indexer's queries (its pooled block keys take a strided build).
         try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), mlx.mlx_array_dtype(h));
@@ -23428,7 +23682,7 @@ pub const Transformer = struct {
             var pre: HcRead = if (si.hc) try self.hcReadStandin(h, batch, seq_len) else try self.hcReadPending(&h, &lw.hc_attn.?, batch, seq_len, &pending);
             defer pre.deinit();
             try prof.lap(pre.mixed, .hc_read);
-            const attn_out = switch (lw.attn) {
+            var attn_out = switch (lw.attn) {
                 .linear => |la| if (si.gdn) try standinRef(pre.mixed) else try self.gatedDeltaNet(pre.mixed, &la, entry, layer_idx, batch, seq_len, is_prefill),
                 .full => |fa| if (si.attn) try standinRef(pre.mixed) else try self.qwen4AttnWith(ctx, pre.mixed, &fa, entry, li, @intCast(offset), 0, batch, seq_len, is_prefill),
             };
@@ -23440,7 +23694,9 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_attn, pre.inj);
                 Qwen4Trace.set(&tr.attn_out, attn_out);
             };
-            if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending);
+            if (dump_dir) |d| try self.steeringDumpRow(d, "attn_out", layer_idx, attn_out, 1);
+            if (!steer_fold) attn_out = try self.steerAttnOut(&steer, attn_out, layer_idx);
+            if (si.hc) h = try self.hcWrite(h, attn_out, pre.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, attn_out, pre.inj, batch, seq_len, lw.hc_mlp.?.inject_flat, &pending, if (steer_fold) try self.steerPending(&steer, .out, layer_idx) else null);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
 
@@ -23458,10 +23714,15 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
                 Qwen4Trace.set(&tr.mlp_out, mlp_out);
             };
-            if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending);
+            if (si.hc) h = try self.hcWrite(h, mlp_out, pre2.inj, batch, seq_len) else try self.hcWriteOrDefer(&h, mlp_out, pre2.inj, batch, seq_len, if (layer_idx + 1 < layerCap(cfg.num_hidden_layers)) ml[layer_idx + 1].hc_attn.?.inject_flat else .{ .ctx = null }, &pending, if (steer_fold) try self.steerPending(&steer, .stream, layer_idx) else null);
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
+            if ((steer.ffn_any and !steer_fold) or dump_dir != null) {
+                try self.hcFlush(&h, batch, seq_len, &pending);
+                if (dump_dir) |d| try self.steeringDumpRow(d, "ffn_out", layer_idx, h, hc);
+                h = try self.steerResidual(&steer, h, layer_idx, hc);
+            }
 
             if (ctx.capture_layers) |cl| {
                 for (cl.ids, cl.out) |cid, *slot| {
@@ -35848,11 +36109,45 @@ const HC_FUSED_N_SOURCE =
     \\  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
     \\  // (`wi_in` can be < 8 elements and land in `constant`: no pointer rebind.)
     \\  float g = float(wi_in[(size_t)row * (size_t)HC + h]);
+    \\  float co = 0.0f;
+    \\  if (ST == 1) {
+    \\    // Steer the block output before it is written: out' = T(out - sc*d*dot(d,out)),
+    \\    // the standalone projection kernel's order (each stream's threadgroup redoes it).
+    \\    float ao = 0.0f;
+    \\    for (int i = 0; i < PER; ++i) { int k = int(tid) + 256 * i; ao += float(wo[k]) * float(sd_in[k]); }
+    \\    ao = simd_sum(ao);
+    \\    if (lane == 0) tgs[sg] = ao;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float to = 0.0f;
+    \\    for (int g2 = 0; g2 < 8; ++g2) to += tgs[g2];
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    co = to * float(ssc_in[0]);
+    \\  }
     \\  for (int i = 0; i < PER; ++i) {
     \\    int k = base + int(tid) + 256 * i;
-    \\    T v = T(float(x[k]) + float(T(float(wo[k - base]) * g)));
-    \\    xs[k] = v;
+    \\    float o = float(wo[k - base]);
+    \\    if (ST == 1) o = float(T(o - co * float(sd_in[k - base])));
+    \\    T v = T(float(x[k]) + float(T(o * g)));
+    \\    if (ST != 2) xs[k] = v;
     \\    xv[i] = float(v);
+    \\  }
+    \\  if (ST == 2) {
+    \\    // Steer the written stream: every branch loses its component along d.
+    \\    float as = 0.0f;
+    \\    for (int i = 0; i < PER; ++i) as += xv[i] * float(sd_in[int(tid) + 256 * i]);
+    \\    as = simd_sum(as);
+    \\    if (lane == 0) tgs[sg] = as;
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float ts = 0.0f;
+    \\    for (int g2 = 0; g2 < 8; ++g2) ts += tgs[g2];
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    float cs = ts * float(ssc_in[0]);
+    \\    for (int i = 0; i < PER; ++i) {
+    \\      int k = base + int(tid) + 256 * i;
+    \\      T v = T(xv[i] - cs * float(sd_in[k - base]));
+    \\      xs[k] = v;
+    \\      xv[i] = float(v);
+    \\    }
     \\  }
     \\} else {
     \\  for (int i = 0; i < PER; ++i) xv[i] = float(x[base + int(tid) + 256 * i]);
@@ -35990,13 +36285,19 @@ const HC_FUSED_U_SOURCE =
     \\if (lane == 0) mixed[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
 ;
 
-const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
+const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, st: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int };
 var hc_fused_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 var hc_fused_cfgs: [3]?mlx.mlx_fast_metal_kernel_config = .{ null, null, null };
-var hc_fused_key: HcFusedKey = std.mem.zeroes(HcFusedKey);
+/// Configs per key, LRU: a decode forward alternates keys between consecutive
+/// reads (inject-less mixer, post-flush, the two steer arms), and a rebuild per
+/// read is CPU tax.
+const HcCfgEntry = struct { key: HcFusedKey = std.mem.zeroes(HcFusedKey), cfgs: [3]?mlx.mlx_fast_metal_kernel_config = .{ null, null, null }, stamp: u64 = 0 };
+var hc_cfg_cache: [8]HcCfgEntry = @splat(.{});
+var hc_cfg_clock: u64 = 0;
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
 var hc_fused_engaged = false;
+var steer_fold_logged = false;
 var hc_fused_env: ?bool = null;
 pub var hc_fused_override: ?bool = null;
 
@@ -36011,7 +36312,7 @@ fn hcFusedEnabled() bool {
 
 fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     if (hc_fused_kernels[which]) |k| return k;
-    const n_inputs = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in" };
+    const n_inputs = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "sd_in", "ssc_in" };
     const n_outputs = [_][*:0]const u8{ "xn_out", "ipart_out", "xs_out" };
     const d_inputs = [_][*:0]const u8{ "xn_in", "dw_q", "dw_s", "dw_b", "ipart_in" };
     const d_outputs = [_][*:0]const u8{ "act_out", "inj_out" };
@@ -36055,11 +36356,23 @@ fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
 
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
 
+/// A steering edit riding a deferred write: `.out` projects the written block
+/// output first (the attn arm), `.stream` projects every written branch after
+/// (the ffn arm). Handles are BORROWED (a pinned bank row, the plan's scale): safe only
+/// because a pending never outlives its forward.
+pub const HcSteer = struct {
+    pub const Arm = enum(u8) { out = 1, stream = 2 };
+    dir: mlx.mlx_array, // [hidden]
+    scale: mlx.mlx_array, // [1]
+    arm: Arm,
+};
+
 /// A deferred `hcWrite`: the next read's N kernel applies `stream + out*inj`
 /// itself (one dispatch fewer per block). Handles are retained copies.
 pub const HcPending = struct {
     out: mlx.mlx_array, // [B,S,hidden]
     inj: mlx.mlx_array, // [B,S,hc,1]
+    steer: ?HcSteer = null,
     fn deinit(self: *HcPending) void {
         _ = mlx.mlx_array_free(self.out);
         _ = mlx.mlx_array_free(self.inj);
@@ -36078,8 +36391,8 @@ pub const HcPending = struct {
 pub const HC_FUSED_MAX_ROWS: c_int = 16;
 const HcPrepared = struct {
     // Mutable tensors stay explicit inputs so the cached graph can outlive a model.
-    const Key = struct { width: c_int, eps: f32, pending: bool };
-    key: Key = .{ .width = 0, .eps = 0, .pending = false },
+    const Key = struct { width: c_int, eps: f32, pending: bool, steer: u8 };
+    key: Key = .{ .width = 0, .eps = 0, .pending = false, .steer = 0 },
     stream: mlx.mlx_stream = .{},
     closure: mlx.mlx_closure = .{},
     traces: usize = 0,
@@ -36088,16 +36401,17 @@ const HcPrepared = struct {
     fn callback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
         const self: *HcPrepared = @ptrCast(@alignCast(payload.?));
         self.traces += 1;
-        var arrays: [11]mlx.mlx_array = @splat(.{});
+        var arrays: [13]mlx.mlx_array = @splat(.{});
         defer for (arrays) |v| {
             if (v.ctx != null) _ = mlx.mlx_array_free(v);
         };
-        const n: usize = if (self.key.pending) 11 else 9;
+        const n: usize = if (self.key.steer != 0) 13 else if (self.key.pending) 11 else 9;
         for (arrays[0..n], 0..) |*v, i| {
             v.* = mlx.mlx_array_new();
             if (mlx.mlx_vector_array_get(v, input, i) != 0) return -1;
         }
-        const pd: ?HcPending = if (self.key.pending) .{ .out = arrays[9], .inj = arrays[10] } else null;
+        const steer: ?HcSteer = if (self.key.steer != 0) .{ .dir = arrays[11], .scale = arrays[12], .arm = @fromBackingInt(@intCast(self.key.steer)) } else null;
+        const pd: ?HcPending = if (self.key.pending) .{ .out = arrays[9], .inj = arrays[10], .steer = steer } else null;
         const result = (hcReadFused(self.stream, arrays[0], 1, self.key.width, arrays[1], arrays[2], arrays[3], arrays[4], arrays[5], arrays[6], arrays[7], arrays[8], self.key.eps, 4, 2560, 8, 64, pd) catch return -1) orelse return -1;
         defer {
             _ = mlx.mlx_array_free(result.mixed);
@@ -36109,7 +36423,9 @@ const HcPrepared = struct {
         return 0;
     }
 };
-var hc_prepared_entries: [8]HcPrepared = @splat(.{});
+/// Up to four closures per verify width (no pending, pending unsteered, each arm), so
+/// every width 2..6 under mixed steered traffic fits.
+var hc_prepared_entries: [20]HcPrepared = @splat(.{});
 var hc_prepared_clock: u64 = 0;
 
 fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending) !?HcFusedOut {
@@ -36119,7 +36435,8 @@ fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_in
 fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
     if (!hcFusedEnabled() or !mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
     if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
-    const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
+    const steer: ?HcSteer = if (pending) |pd| pd.steer else null;
+    const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x, if (steer) |v| v.dir else x, if (steer) |v| v.scale else x };
     const shapes = .{ &[_]c_int{ 4, 2560 }, &[_]c_int{ 320, 2560 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 10240, 80 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 4 } };
     inline for (shapes, 1..) |shape, i| {
         if (arrays[i].ctx == null or !std.mem.eql(c_int, mlx.getShape(arrays[i]), shape)) return null;
@@ -36128,8 +36445,12 @@ fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width:
     if (pending) |pd| {
         if (pd.out.ctx == null or pd.inj.ctx == null or mlx.mlx_array_dtype(pd.out) != .bfloat16 or mlx.mlx_array_dtype(pd.inj) != .bfloat16 or
             !std.mem.eql(c_int, mlx.getShape(pd.out), &.{ 1, width, 2560 }) or !std.mem.eql(c_int, mlx.getShape(pd.inj), &.{ 1, width, 4, 1 })) return null;
+        if (pd.steer) |v| {
+            if (mlx.mlx_array_dtype(v.dir) != .bfloat16 or mlx.mlx_array_dtype(v.scale) != .bfloat16 or
+                !std.mem.eql(c_int, mlx.getShape(v.dir), &.{2560}) or !std.mem.eql(c_int, mlx.getShape(v.scale), &.{1})) return null;
+        }
     }
-    const key = HcPrepared.Key{ .width = width, .eps = eps, .pending = pending != null };
+    const key = HcPrepared.Key{ .width = width, .eps = eps, .pending = pending != null, .steer = if (steer) |v| @backingInt(v.arm) else 0 };
     var chosen: ?*HcPrepared = null;
     var victim = &hc_prepared_entries[0];
     for (&hc_prepared_entries) |*entry| {
@@ -36151,7 +36472,7 @@ fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width:
     };
     hc_prepared_clock +%= 1;
     entry.stamp = hc_prepared_clock;
-    const input = mlx.mlx_vector_array_new_data(&arrays, if (pending != null) 11 else 9);
+    const input = mlx.mlx_vector_array_new_data(&arrays, if (steer != null) 13 else if (pending != null) 11 else 9);
     defer _ = mlx.mlx_vector_array_free(input);
     var output = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(output);
@@ -36179,6 +36500,7 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
     if (pending) |values| {
         if (values.len != inputs.len) return null;
         for (values) |p| {
+            if (p.steer != null) return null;
             if (p.out.ctx == null or p.inj.ctx == null or mlx.mlx_array_dtype(p.out) != .bfloat16 or mlx.mlx_array_dtype(p.inj) != .bfloat16 or
                 !std.mem.eql(c_int, mlx.getShape(p.out), &.{ 1, width, 2560 }) or !std.mem.eql(c_int, mlx.getShape(p.inj), &.{ 1, width, 4, 1 })) return null;
         }
@@ -36285,9 +36607,15 @@ pub fn hcReadFused(
     if (@rem(hidden, 256) != 0 or @rem(dsh[1], 256) != 0 or @rem(R, vpw) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
     const wr: c_int = @intFromBool(pend != null);
+    var steer_arm: c_int = 0;
     if (pend) |pd| {
         if (mlx.mlx_array_dtype(pd.out) != xd or mlx.mlx_array_dtype(pd.inj) != xd) return null;
         if (mlx.mlx_array_size(pd.out) != @as(usize, @intCast(rows * hidden)) or mlx.mlx_array_size(pd.inj) != @as(usize, @intCast(rows * hc))) return null;
+        if (pd.steer) |sw| {
+            if (mlx.mlx_array_dtype(sw.dir) != xd or mlx.mlx_array_size(sw.dir) != @as(usize, @intCast(hidden))) return null;
+            if (mlx.mlx_array_dtype(sw.scale) != xd or mlx.mlx_array_size(sw.scale) != 1 or mlx.mlx_array_ndim(sw.scale) != 1) return null;
+            steer_arm = @backingInt(sw.arm);
+        }
     }
     if (inj == 1) {
         if (mlx.mlx_array_dtype(iw) != xd) return null;
@@ -36295,13 +36623,30 @@ pub fn hcReadFused(
         if (ish.len != 2 or ish[0] != K or ish[1] != hc) return null;
     }
 
-    const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows };
-    if (hc_fused_cfgs[0] == null or !std.meta.eql(hc_fused_key, key)) {
-        for (&hc_fused_cfgs) |*c| if (c.*) |cfg| {
+    const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .st = steer_arm, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows };
+    hc_cfg_clock +%= 1;
+    var hit: ?*HcCfgEntry = null;
+    var victim = &hc_cfg_cache[0];
+    for (&hc_cfg_cache) |*entry| {
+        if (entry.cfgs[0] != null and std.meta.eql(entry.key, key)) {
+            hit = entry;
+            break;
+        }
+        if (entry.stamp < victim.stamp) victim = entry;
+    }
+    if (hit) |entry| {
+        entry.stamp = hc_cfg_clock;
+        hc_fused_cfgs = entry.cfgs;
+    } else {
+        // Evict only after the build succeeds: a failed build must not leave the victim's
+        // key over freed configs.
+        hc_fused_cfgs = .{ null, null, null };
+        errdefer for (&hc_fused_cfgs) |*c| if (c.*) |cfg| {
             _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
             c.* = null;
         };
-        const cn = mlx.mlx_fast_metal_kernel_config_new();
+        hc_fused_cfgs[0] = mlx.mlx_fast_metal_kernel_config_new();
+        const cn = hc_fused_cfgs[0].?;
         const k_shape = [_]c_int{rows * K};
         const hc_shape = [_]c_int{rows * hc};
         const hchc_shape = [_]c_int{rows * hc * hc};
@@ -36316,8 +36661,9 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "INJ", inj));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "WR", wr));
-        hc_fused_cfgs[0] = cn;
-        const cd = mlx.mlx_fast_metal_kernel_config_new();
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "ST", steer_arm));
+        hc_fused_cfgs[1] = mlx.mlx_fast_metal_kernel_config_new();
+        const cd = hc_fused_cfgs[1].?;
         const act_shape = [_]c_int{rows * R};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &act_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &hc_shape, 1, xd));
@@ -36329,8 +36675,8 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "HC", hc));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "R", R));
-        hc_fused_cfgs[1] = cd;
-        const cu = mlx.mlx_fast_metal_kernel_config_new();
+        hc_fused_cfgs[2] = mlx.mlx_fast_metal_kernel_config_new();
+        const cu = hc_fused_cfgs[2].?;
         const mixed_shape = [_]c_int{rows * hidden};
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cu, &mixed_shape, 1, xd));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cu, 32, hidden, rows));
@@ -36341,8 +36687,11 @@ pub fn hcReadFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "HC", hc));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "H", hidden));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "R", R));
-        hc_fused_cfgs[2] = cu;
-        hc_fused_key = key;
+        for (&victim.cfgs) |*c| if (c.*) |cfg| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            c.* = null;
+        };
+        victim.* = .{ .key = key, .cfgs = hc_fused_cfgs, .stamp = hc_cfg_clock };
     }
     if (hc_fused_eps == null or hc_fused_eps_val != eps) {
         if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
@@ -36375,7 +36724,8 @@ pub fn hcReadFused(
     var n_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
+    const sw: ?HcSteer = if (pend) |pd| pd.steer else null;
+    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi, if (sw) |v| v.dir else nw, if (sw) |v| v.scale else hc_fused_eps.? }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
@@ -36419,6 +36769,12 @@ pub fn hcReadFused(
     if (!hc_fused_engaged) {
         hc_fused_engaged = true;
         log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_FUSED=0 restores the chain)\n", .{ hc, hidden, R, bits, group_size });
+    }
+    // Logged from the kernel that ran it: `hcReadFused` can still decline after the
+    // plan chose to fold, and a line at the decision would claim a fold that never ran.
+    if (steer_arm != 0 and !steer_fold_logged) {
+        steer_fold_logged = true;
+        log.info("[steering] folded into the hyper-connection read (arm={s})\n", .{if (pend.?.steer.?.arm == .out) "attn" else "ffn"});
     }
     return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }
@@ -56745,9 +57101,15 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     const b_s = try Qwen4TestSlot.init(allocator, n_layers);
     defer b_s.deinit(allocator);
     const a_b = try Qwen4TestSlot.init(allocator, n_layers);
-    defer a_b.deinit(allocator);
+    defer {
+        xfm.ssmGroupDrop(a_b.entries);
+        a_b.deinit(allocator);
+    }
     const b_b = try Qwen4TestSlot.init(allocator, n_layers);
-    defer b_b.deinit(allocator);
+    defer {
+        xfm.ssmGroupDrop(b_b.entries);
+        b_b.deinit(allocator);
+    }
     _ = mlx.mlx_array_free(try a_s.forward(&xfm, a_ids[0..pa]));
     _ = mlx.mlx_array_free(try b_s.forward(&xfm, b_ids[0..pb]));
     _ = mlx.mlx_array_free(try a_b.forward(&xfm, a_ids[0..pa]));
@@ -60992,6 +61354,269 @@ fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.mlx_ar
     return Transformer.concatAxis0(s, &.{ prefix, final });
 }
 
+/// A random unit-norm bank at the pack's own geometry, written where the
+/// registry can stat it.
+fn steeringTestBank(alloc: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir, n_layers: u32, hidden: u32) ![]u8 {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const rows = try alloc.alloc(f32, @as(usize, n_layers) * hidden);
+    defer alloc.free(rows);
+    for (0..n_layers) |l| {
+        const row = rows[l * hidden .. (l + 1) * hidden];
+        var n2: f64 = 0;
+        for (row) |*x| {
+            x.* = rnd.float(f32) - 0.5;
+            n2 += @as(f64, x.*) * x.*;
+        }
+        const inv: f32 = @floatCast(1.0 / @sqrt(n2));
+        for (row) |*x| x.* *= inv;
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "bank.f32", .data = std.mem.sliceAsBytes(rows) });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    return std.fmt.allocPrint(alloc, "{s}/bank.f32", .{pbuf[0..root_len]});
+}
+
+/// Prefill + `steps` decode tokens on a fresh slot under one steering request;
+/// the last-row logits of every forward, concatenated.
+fn steeringRunSeq(alloc: std.mem.Allocator, xfm: *Transformer, s: mlx.mlx_stream, n_layers: u32, req: steering.Req, prompt: []const i32, steps: []const i32) ![]f32 {
+    const sl = try Qwen4TestSlot.init(alloc, n_layers);
+    defer sl.deinit(alloc);
+    sl.ctx.steering = req;
+    var out: std.ArrayList(f32) = .empty;
+    errdefer out.deinit(alloc);
+    const pl = try sl.forward(xfm, prompt);
+    defer _ = mlx.mlx_array_free(pl);
+    const v = try qwen4ReadF32(alloc, pl, s);
+    defer alloc.free(v);
+    const vocab: usize = @intCast(mlx.getShape(pl)[2]);
+    try out.appendSlice(alloc, v[v.len - vocab ..]);
+    for (steps) |t| {
+        const dl = try sl.forward(xfm, &.{t});
+        defer _ = mlx.mlx_array_free(dl);
+        const dv = try qwen4ReadF32(alloc, dl, s);
+        defer alloc.free(dv);
+        try out.appendSlice(alloc, dv);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "qwen4 steering: off is bit-identical, both arms move logits, batched rows and verify rows agree with solo (QWEN4_TEST_MODEL)" {
+    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    defer if (config.ngram_table_path) |p| allocator.free(p);
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.steeringSupported());
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    const n_layers = config.num_hidden_layers;
+    const hidden = config.hidden_size;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bank_path = try steeringTestBank(allocator, io, &tmp, n_layers, hidden);
+    defer allocator.free(bank_path);
+    const banks = try xfm.ensureSteeringBanks(io); // owned by the Transformer, freed in its deinit
+    var res = try banks.reserve(bank_path, 0.1, 0);
+    defer res.release();
+    const bank = res.req.bank;
+    const off_req: steering.Req = .{ .bank = bank, .ffn = 0, .attn = 0 };
+    const ffn_req: steering.Req = .{ .bank = bank, .ffn = 0.1, .attn = 0 };
+    const attn_req: steering.Req = .{ .bank = bank, .ffn = 0, .attn = 0.1 };
+
+    const prompt = [_]i32{ 5, 17, 42, 9, 23, 8, 31, 2, 14, 27, 3, 19 };
+    const steps = [_]i32{ 11, 4 };
+    mlx.resetDtypeTraceForTest();
+    const base = try steeringRunSeq(allocator, &xfm, s, n_layers, .{}, &prompt, &steps);
+    defer allocator.free(base);
+    const off = try steeringRunSeq(allocator, &xfm, s, n_layers, off_req, &prompt, &steps);
+    defer allocator.free(off);
+    // A configured bank at scale 0 is byte-identical to no steering.
+    try testing.expectEqualSlices(f32, base, off);
+    const ffn = try steeringRunSeq(allocator, &xfm, s, n_layers, ffn_req, &prompt, &steps);
+    defer allocator.free(ffn);
+    try testing.expect(maxAbsDiff(base, ffn) > 0);
+    const attn = try steeringRunSeq(allocator, &xfm, s, n_layers, attn_req, &prompt, &steps);
+    defer allocator.free(attn);
+    try testing.expect(maxAbsDiff(base, attn) > 0);
+    try testing.expect(maxAbsDiff(ffn, attn) > 0);
+
+    // Batched tick: slot A steered beside an off slot B. B's row is exactly what
+    // it is beside an off A; A's row moves.
+    const pa = prompt[0..9];
+    const pb = prompt[2..8];
+    var slots: [4]*Qwen4TestSlot = undefined;
+    for (&slots) |*sl| sl.* = try Qwen4TestSlot.init(allocator, n_layers);
+    defer for (slots) |sl| {
+        xfm.ssmGroupDrop(sl.entries); // what Slot.deinit does before the entries die
+        sl.deinit(allocator);
+    };
+    _ = mlx.mlx_array_free(try slots[0].forward(&xfm, pa));
+    _ = mlx.mlx_array_free(try slots[1].forward(&xfm, pb));
+    _ = mlx.mlx_array_free(try slots[2].forward(&xfm, pa));
+    _ = mlx.mlx_array_free(try slots[3].forward(&xfm, pb));
+    slots[2].ctx.steering = ffn_req;
+    const tick = [_]u32{ 11, 4 };
+    var keep = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (keep) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for ([_][2]usize{ .{ 0, 1 }, .{ 2, 3 } }, 0..) |pair, k| {
+        const ctxs = [_]*ForwardCtx{ &slots[pair[0]].ctx, &slots[pair[1]].ctx };
+        const offs = [_]u32{ @intCast(slots[pair[0]].off), @intCast(slots[pair[1]].off) };
+        const out = try xfm.forwardMoeBatchedDecode(&tick, &ctxs, &offs, null);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        if (k == 0) {
+            try mlx.check(mlx.mlx_array_eval(out[0]));
+            try mlx.check(mlx.mlx_array_eval(out[1]));
+            try mlx.check(mlx.mlx_array_set(&keep[0], out[0]));
+            try mlx.check(mlx.mlx_array_set(&keep[1], out[1]));
+        } else {
+            try expectRowsByteEqual(allocator, s, keep[1], out[1], "batched off row beside a steered row");
+            const ha = try qwen4ReadF32(allocator, keep[0], s);
+            defer allocator.free(ha);
+            const hb = try qwen4ReadF32(allocator, out[0], s);
+            defer allocator.free(hb);
+            try testing.expect(maxAbsDiff(ha, hb) > 0);
+        }
+    }
+
+    // Verify rows: a steered row in a group verify is byte-identical to its solo
+    // verify (the MTP-invariance bar), and an off row beside it is untouched.
+    const prompts = [2][]const i32{ prompt[0..10], prompt[1..7] };
+    var vs = try L10VerifySlots.init(allocator, &xfm, n_layers, prompts);
+    defer vs.deinit(allocator);
+    vs.solo[0].ctx.steering = ffn_req;
+    vs.group[0].ctx.steering = ffn_req;
+    const row_ids = [_]i32{ 11, 4, 8 };
+    var rows: [2]mlx.mlx_array = undefined;
+    defer for (rows) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    for (0..2) |i| {
+        const shape = [_]c_int{ 1, 3 };
+        rows[i] = mlx.mlx_array_new_data(@ptrCast(&row_ids), &shape, 2, .int32);
+    }
+    var solo_logits: [2]mlx.mlx_array = undefined;
+    var solo_last: [2]mlx.mlx_array = undefined;
+    var solo_all: [2]mlx.mlx_array = undefined;
+    defer for (0..2) |i| {
+        _ = mlx.mlx_array_free(solo_logits[i]);
+        _ = mlx.mlx_array_free(solo_last[i]);
+        _ = mlx.mlx_array_free(solo_all[i]);
+    };
+    for (0..2) |i| {
+        const one_row = [_]mlx.mlx_array{rows[i]};
+        const one_ctx = [_]*ForwardCtx{&vs.solo[i].ctx};
+        try xfm.forwardRowAxisVerify(&one_row, &one_ctx, solo_logits[i .. i + 1], solo_last[i .. i + 1], solo_all[i .. i + 1], null, null);
+    }
+    var grp_logits: [2]mlx.mlx_array = undefined;
+    var grp_last: [2]mlx.mlx_array = undefined;
+    var grp_all: [2]mlx.mlx_array = undefined;
+    defer for (0..2) |i| {
+        _ = mlx.mlx_array_free(grp_logits[i]);
+        _ = mlx.mlx_array_free(grp_last[i]);
+        _ = mlx.mlx_array_free(grp_all[i]);
+    };
+    const grp_ctxs = [_]*ForwardCtx{ &vs.group[0].ctx, &vs.group[1].ctx };
+    try xfm.forwardRowAxisVerify(&rows, &grp_ctxs, &grp_logits, &grp_last, &grp_all, null, null);
+    for (0..2) |i| try expectRowsByteEqual(allocator, s, solo_logits[i], grp_logits[i], "steered verify row vs solo");
+    // The steered row differs from an unsteered solo verify of the same row.
+    var plain = try L10VerifySlots.init(allocator, &xfm, n_layers, prompts);
+    defer plain.deinit(allocator);
+    var plain_logits: [1]mlx.mlx_array = undefined;
+    var plain_last: [1]mlx.mlx_array = undefined;
+    var plain_all: [1]mlx.mlx_array = undefined;
+    const one_row = [_]mlx.mlx_array{rows[0]};
+    const one_ctx = [_]*ForwardCtx{&plain.solo[0].ctx};
+    try xfm.forwardRowAxisVerify(&one_row, &one_ctx, &plain_logits, &plain_last, &plain_all, null, null);
+    defer {
+        _ = mlx.mlx_array_free(plain_logits[0]);
+        _ = mlx.mlx_array_free(plain_last[0]);
+        _ = mlx.mlx_array_free(plain_all[0]);
+    }
+    const pv = try qwen4ReadF32(allocator, plain_logits[0], s);
+    defer allocator.free(pv);
+    const sv = try qwen4ReadF32(allocator, grp_logits[0], s);
+    defer allocator.free(sv);
+    try testing.expect(maxAbsDiff(pv, sv) > 0);
+
+    // Capture: refused while steered (no files), and when off the ffn_out row of
+    // every layer is the hc-mean of the layer output `capture_layers` publishes.
+    var cap_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cap_root_len = try tmp.dir.realPath(io, &cap_buf);
+    try tmp.dir.createDirPath(io, "cap");
+    const cap_dir = try std.fmt.allocPrint(allocator, "{s}/cap", .{cap_buf[0..cap_root_len]});
+    defer allocator.free(cap_dir);
+    {
+        const sl = try Qwen4TestSlot.init(allocator, n_layers);
+        defer sl.deinit(allocator);
+        sl.ctx.steering = ffn_req;
+        sl.ctx.steering_dump = cap_dir;
+        _ = mlx.mlx_array_free(try sl.forward(&xfm, &prompt));
+        try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "cap/ffn_out-0_pos0.bin", .{}));
+    }
+    var cap_slot = try Qwen4TestSlot.init(allocator, n_layers);
+    defer cap_slot.deinit(allocator);
+    cap_slot.ctx.steering_dump = cap_dir;
+    _ = mlx.mlx_array_free(try cap_slot.forward(&xfm, &prompt));
+    var ref_slot = try Qwen4TestSlot.init(allocator, n_layers);
+    defer ref_slot.deinit(allocator);
+    const ids_buf = try allocator.alloc(u32, n_layers);
+    defer allocator.free(ids_buf);
+    const outs = try allocator.alloc(mlx.mlx_array, n_layers);
+    defer allocator.free(outs);
+    for (ids_buf, outs, 0..) |*id, *o, l| {
+        id.* = @intCast(l);
+        o.* = mlx.mlx_array_new();
+    }
+    defer for (outs) |o| {
+        _ = mlx.mlx_array_free(o);
+    };
+    var cl = CaptureLayers{ .ids = ids_buf, .out = outs };
+    ref_slot.ctx.capture_layers = &cl;
+    _ = mlx.mlx_array_free(try ref_slot.forward(&xfm, &prompt));
+    const hc: usize = @intCast(config.hc_count);
+    for (0..n_layers) |l| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "cap/ffn_out-{d}_pos0.bin", .{l});
+        const raw = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1 << 20));
+        defer allocator.free(raw);
+        try testing.expectEqual(@as(usize, hidden * 4), raw.len);
+        const got = std.mem.bytesAsSlice(f32, @as([]align(4) u8, @alignCast(raw)));
+        const full = try qwen4ReadF32(allocator, outs[l], s);
+        defer allocator.free(full);
+        const last = full[full.len - hc * hidden ..];
+        var nonzero = false;
+        for (0..hidden) |i| {
+            var mean: f32 = 0;
+            for (0..hc) |b| mean += last[b * hidden + i];
+            mean /= @floatFromInt(hc);
+            try testing.expect(std.math.isFinite(got[i]));
+            try testing.expectApproxEqAbs(mean, got[i], 1e-5 + @abs(mean) * 1e-3);
+            if (got[i] != 0) nonzero = true;
+        }
+        try testing.expect(nonzero);
+        const aname = try std.fmt.bufPrint(&name_buf, "cap/attn_out-{d}_pos0.bin", .{l});
+        const araw = try tmp.dir.readFileAlloc(io, aname, allocator, .limited(1 << 20));
+        defer allocator.free(araw);
+        try testing.expectEqual(@as(usize, hidden * 4), araw.len);
+    }
+}
+
 test "row-axis verify: every row of a group verify is byte-identical to its solo verify" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -62620,7 +63245,7 @@ test "hc prefill: incompatible read writes immediately" {
             defer _ = mlx.mlx_array_free(h);
             var pending: ?HcPending = null;
             defer if (pending) |*p| p.deinit();
-            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
+            try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending, null);
             const can_defer = hp.enabled() and dtype == .bfloat16 and inject_dtype == .bfloat16;
             try testing.expectEqual(can_defer, pending != null);
             try xfm.hcFlush(&h, 1, 17, &pending);
@@ -62664,4 +63289,159 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
     defer inkling.deinit();
     try put(&inkling, "model.layers.0.attn.wo_ud.weight", .bfloat16, s);
     try std.testing.expect(weightsHaveDenseAttnProj(&inkling));
+}
+
+test "qsa select declines a scores array under 8 elements (mlx binds it in constant space)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const scores_v = [_]f32{ 0.5, 0.1, 0.9, 0.2 };
+    const scores = mlx.mlx_array_new_data(&scores_v, &.{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const bound_v = [_]i32{4};
+    const bounds = mlx.mlx_array_new_data(&bound_v, &.{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(bounds);
+    try testing.expect((try qsaSelectTopBlocks(s, scores, bounds, 2)) == null);
+    const wide_v = [_]f32{ 0.5, 0.1, 0.9, 0.2, 0.3, 0.8, 0.7, 0.4 };
+    const wide = mlx.mlx_array_new_data(&wide_v, &.{ 1, 1, 8 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(wide);
+    const wb_v = [_]i32{8};
+    const wb = mlx.mlx_array_new_data(&wb_v, &.{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(wb);
+    const picks = (try qsaSelectTopBlocks(s, wide, wb, 2)) orelse return error.TestUnexpectedResult;
+    defer _ = mlx.mlx_array_free(picks);
+    try mlx.check(mlx.mlx_array_eval(picks));
+    const ids = mlx.mlx_array_data_int32(picks) orelse return error.Unreadable;
+    try testing.expectEqual(@as(i32, 2), ids[0]);
+    try testing.expectEqual(@as(i32, 5), ids[1]);
+}
+
+test "fused hyper-connection read with a pending steer is byte-identical to its write + the standalone projection" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Bar: bit identity with write-then-standalone-projection on both arms.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x57EE12);
+    const rnd = prng.random();
+    hc_fused_override = true;
+    defer hc_fused_override = null;
+    steering.fused_override = true;
+    defer steering.fused_override = null;
+
+    const HC: c_int = 4;
+    const H: c_int = 512;
+    const K: c_int = HC * H;
+    const R: c_int = 64;
+    const bits: u32 = 4;
+    const gs: u32 = 64;
+    const eps: f32 = 1e-6;
+    const Q = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
+    const quantRandom = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int) !Q {
+            const buf = try a.alloc(f32, @intCast(rows * cols));
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * 0.2;
+            const sh = [_]c_int{ rows, cols };
+            const w32 = mlx.mlx_array_new_data(buf.ptr, &sh, 2, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, st));
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, st));
+            var q: Q = undefined;
+            q.w = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
+            q.sc = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.sc, triple, 1));
+            q.bi = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&q.bi, triple, 2));
+            return q;
+        }
+    }.f;
+    const bf16Random = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32, offset: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale + offset;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+
+    const down = try quantRandom(allocator, rnd, s, R, K);
+    defer inline for (.{ "w", "sc", "bi" }) |n| {
+        _ = mlx.mlx_array_free(@field(down, n));
+    };
+    const up = try quantRandom(allocator, rnd, s, K, R);
+    defer inline for (.{ "w", "sc", "bi" }) |n| {
+        _ = mlx.mlx_array_free(@field(up, n));
+    };
+    const nw = try bf16Random(allocator, rnd, s, &.{ HC, H }, 1.0, 1.0);
+    defer _ = mlx.mlx_array_free(nw);
+    const iw = try bf16Random(allocator, rnd, s, &.{ K, HC }, 0.1, 0.0);
+    defer _ = mlx.mlx_array_free(iw);
+    // Not unit (norm ~0.6); only the reduction order is under test, and the edit
+    // must sit far above an ulp.
+    const dir = try bf16Random(allocator, rnd, s, &.{H}, 2.0 / @sqrt(@as(f32, @floatFromInt(H))), 0.0);
+    defer _ = mlx.mlx_array_free(dir);
+    const sc = try steering.scalarAs(0.8, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sc);
+
+    for ([_]c_int{ 1, 3 }) |S| {
+        const x = try bf16Random(allocator, rnd, s, &.{ 1, S, K }, 4.0, 0.0);
+        defer _ = mlx.mlx_array_free(x);
+        const wo = try bf16Random(allocator, rnd, s, &.{ 1, S, H }, 2.0, 0.0);
+        defer _ = mlx.mlx_array_free(wo);
+        const wi = try bf16Random(allocator, rnd, s, &.{ 1, S, HC, 1 }, 1.0, 1.0);
+        defer _ = mlx.mlx_array_free(wi);
+        inline for (.{ HcSteer.Arm.out, HcSteer.Arm.stream }) |arm| {
+            // Reference: the kernel's own unsteered write, projected by the standalone kernel.
+            const out_ref = if (arm == .out) try steering.projectRow(wo, dir, sc, s) else wo;
+            defer if (arm == .out) {
+                _ = mlx.mlx_array_free(out_ref);
+            };
+            const written = (try hcReadFused(s, x, 1, S, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = out_ref, .inj = wi })) orelse return error.HcFusedDeclined;
+            defer {
+                _ = mlx.mlx_array_free(written.mixed);
+                _ = mlx.mlx_array_free(written.inj);
+                _ = mlx.mlx_array_free(written.stream);
+            }
+            const stream_ref = if (arm == .stream) try steering.projectStream(written.stream, dir, sc, HC, s) else written.stream;
+            defer if (arm == .stream) {
+                _ = mlx.mlx_array_free(stream_ref);
+            };
+            const plain = (try hcReadFused(s, stream_ref, 1, S, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) orelse return error.HcFusedDeclined;
+            defer {
+                _ = mlx.mlx_array_free(plain.mixed);
+                _ = mlx.mlx_array_free(plain.inj);
+            }
+            const steered = (try hcReadFused(s, x, 1, S, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo, .inj = wi, .steer = .{ .dir = dir, .scale = sc, .arm = arm } })) orelse return error.HcFusedSteerDeclined;
+            defer {
+                _ = mlx.mlx_array_free(steered.mixed);
+                _ = mlx.mlx_array_free(steered.inj);
+                _ = mlx.mlx_array_free(steered.stream);
+            }
+            try expectRowsByteEqual(allocator, s, steered.stream, stream_ref, "fold stream");
+            try expectRowsByteEqual(allocator, s, steered.mixed, plain.mixed, "fold mixed");
+            try expectRowsByteEqual(allocator, s, steered.inj, plain.inj, "fold inj");
+            // The steer changed something, on either arm: an unsteered pending read differs.
+            const unsteered = (try hcReadFused(s, x, 1, S, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, .{ .out = wo, .inj = wi })) orelse return error.HcFusedDeclined;
+            defer {
+                _ = mlx.mlx_array_free(unsteered.mixed);
+                _ = mlx.mlx_array_free(unsteered.inj);
+                _ = mlx.mlx_array_free(unsteered.stream);
+            }
+            const got = try qwen4ReadF32(allocator, steered.stream, s);
+            defer allocator.free(got);
+            const unmoved = try qwen4ReadF32(allocator, unsteered.stream, s);
+            defer allocator.free(unmoved);
+            try testing.expect(maxAbsDiff(got, unmoved) > 0);
+        }
+    }
 }

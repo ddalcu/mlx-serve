@@ -1096,6 +1096,8 @@ test "lan: routeClass allows exactly the shared inference surface" {
     try t.expectEqual(RouteClass.denied, routeClass("GET", "/api/tags"));
     try t.expectEqual(RouteClass.denied, routeClass("POST", "/api/pull"));
     try t.expectEqual(RouteClass.denied, routeClass("GET", "/props"));
+    try t.expectEqual(RouteClass.denied, routeClass("GET", "/v1/steering"));
+    try t.expectEqual(RouteClass.denied, routeClass("POST", "/v1/steering"));
 }
 
 test "lan: SharedSet parses all|csv and matches basename-tolerantly" {

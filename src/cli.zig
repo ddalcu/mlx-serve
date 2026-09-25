@@ -23,6 +23,7 @@ const build_options = @import("build_options");
 const ollama = @import("ollama.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
+const steering = @import("steering.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -863,6 +864,128 @@ fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body
     return full.toOwnedSlice(allocator);
 }
 
+// ── `mlx-serve steer` ───────────────────────────────────────────────────
+
+/// The port the server binds when `--port` is omitted; `main.zig` and `steer` both read it.
+pub const DEFAULT_PORT: u16 = 11234;
+const DEFAULT_PORT_STR = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT});
+
+/// `steer [--port N] [--model ID] [<name|off|reset> [--ffn F] [--attn F] [--no-persist]]`.
+/// No target prints the model's state (GET); a target POSTs it.
+const SteerArgs = struct {
+    port: []const u8 = DEFAULT_PORT_STR,
+    model: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    ffn: ?f32 = null,
+    attn: ?f32 = null,
+    persist: bool = true,
+
+    fn parse(args: []const []const u8) !SteerArgs {
+        var a: SteerArgs = .{};
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--no-persist")) {
+                a.persist = false;
+            } else if (!std.mem.startsWith(u8, arg, "--")) {
+                if (a.target != null) return error.BadSteerArgs;
+                a.target = arg;
+            } else {
+                if (i + 1 >= args.len) return error.BadSteerArgs;
+                i += 1;
+                const v = args[i];
+                if (std.mem.eql(u8, arg, "--port")) {
+                    a.port = v;
+                } else if (std.mem.eql(u8, arg, "--model")) {
+                    a.model = v;
+                } else if (std.mem.eql(u8, arg, "--ffn")) {
+                    a.ffn = try scale(v);
+                } else if (std.mem.eql(u8, arg, "--attn")) {
+                    a.attn = try scale(v);
+                } else return error.BadSteerArgs;
+            }
+        }
+        const t = a.target orelse {
+            if (a.ffn != null or a.attn != null or !a.persist) return error.BadSteerArgs;
+            // The server reads the query raw, so an id is sent only if URL-safe.
+            if (a.model) |m| for (m) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "._-/", c) == null) return error.BadSteerArgs;
+            return a;
+        };
+        if ((std.mem.eql(u8, t, "off") or std.mem.eql(u8, t, "reset")) and (a.ffn != null or a.attn != null)) return error.BadSteerArgs;
+        return a;
+    }
+
+    fn scale(v: []const u8) !f32 {
+        const f = std.fmt.parseFloat(f32, v) catch return error.BadSteerArgs;
+        steering.validateScale(f) catch return error.BadSteerArgs;
+        return f;
+    }
+
+    fn url(self: SteerArgs, allocator: std.mem.Allocator) ![]u8 {
+        if (self.target == null) if (self.model) |m| return std.fmt.allocPrint(allocator, "http://127.0.0.1:{s}/v1/steering?model={s}", .{ self.port, m });
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{s}/v1/steering", .{self.port});
+    }
+
+    /// The `POST /v1/steering` body; null = print the state.
+    fn body(self: SteerArgs, allocator: std.mem.Allocator) !?[]u8 {
+        const t = self.target orelse return null;
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("{");
+        if (self.model) |m| {
+            try w.writeAll("\"model\":");
+            try std.json.Stringify.encodeJsonString(m, .{}, w);
+            try w.writeAll(",");
+        }
+        if (std.mem.eql(u8, t, "reset")) {
+            try w.writeAll("\"reset\":true");
+        } else if (std.mem.eql(u8, t, "off")) {
+            try w.writeAll("\"name\":null");
+        } else {
+            try w.writeAll("\"name\":");
+            try std.json.Stringify.encodeJsonString(t, .{}, w);
+            if (self.ffn) |v| try w.print(",\"ffn\":{d}", .{v});
+            if (self.attn) |v| try w.print(",\"attn\":{d}", .{v});
+        }
+        try w.print(",\"persist\":{}}}", .{self.persist});
+        return try out.toOwnedSlice();
+    }
+};
+
+/// `mlx-serve steer` alone prints the active state; with a target it POSTs.
+pub fn cmdSteer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    const sa = SteerArgs.parse(args) catch |e| {
+        log.err("usage: mlx-serve steer [--port N] [--model ID] [<name|off|reset> [--ffn F] [--attn F] [--no-persist]]\n", .{});
+        return e;
+    };
+    const url = try sa.url(allocator);
+    defer allocator.free(url);
+    const body = try sa.body(allocator);
+    defer if (body) |b| allocator.free(b);
+    // --fail-with-body: a 400/503 prints the server's reason AND exits non-zero.
+    const post_argv = [_][]const u8{ "curl", "-sS", "--fail-with-body", "-m", "60", "-X", "POST", "-H", "content-type: application/json", "-d", body orelse "", url };
+    const get_argv = [_][]const u8{ "curl", "-sS", "--fail-with-body", "-m", "10", url };
+    const result = std.process.run(allocator, io, .{
+        .argv = if (body != null) &post_argv else &get_argv,
+        .stdout_limit = .limited(1 << 20),
+    }) catch return error.FetchFailed;
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    var out_buf: [4096]u8 = undefined;
+    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    try stdout_w.interface.writeAll(result.stdout);
+    if (result.stdout.len == 0 or result.stdout[result.stdout.len - 1] != '\n') try stdout_w.interface.writeAll("\n");
+    try stdout_w.interface.flush();
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            log.err("steer: {s}\n", .{std.mem.trim(u8, result.stderr, " \n")});
+            return error.FetchFailed;
+        },
+        else => return error.FetchFailed,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1214,4 +1337,33 @@ test "cli: list tree walk descends into symlinked model dirs" {
     }
     // 1 definition + 3 in this test + at least 2 call sites in the walk.
     try testing.expect(found >= 6);
+}
+
+test "steer: the request body names the target and carries only the scales given" {
+    const a = std.testing.allocator;
+    const named = (try (try SteerArgs.parse(&.{ "terse", "--ffn", "-1" })).body(a)).?;
+    defer a.free(named);
+    try std.testing.expectEqualStrings("{\"name\":\"terse\",\"ffn\":-1,\"persist\":true}", named);
+    const off = (try (try SteerArgs.parse(&.{ "off", "--model", "m1", "--no-persist" })).body(a)).?;
+    defer a.free(off);
+    try std.testing.expectEqualStrings("{\"model\":\"m1\",\"name\":null,\"persist\":false}", off);
+    const reset = (try (try SteerArgs.parse(&.{"reset"})).body(a)).?;
+    defer a.free(reset);
+    try std.testing.expectEqualStrings("{\"reset\":true,\"persist\":true}", reset);
+    inline for (.{
+        &.{ "terse", "--ffn" },        &.{ "--ffn", "1" },             &.{ "x", "--bogus", "1" },    &.{ "off", "--ffn", "1" },
+        &.{ "terse", "--ffn", "nan" }, &.{ "--port", "9", "--model" }, &.{ "--model", "m#q4.gguf" },
+    }) |bad| try std.testing.expectError(error.BadSteerArgs, SteerArgs.parse(bad));
+}
+
+test "steer: no target shows the state, on the server's own default port" {
+    const a = std.testing.allocator;
+    const one = try SteerArgs.parse(&.{ "--model", "org/m-1.5" });
+    try std.testing.expect(try one.body(a) == null);
+    const one_url = try one.url(a);
+    defer a.free(one_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:" ++ DEFAULT_PORT_STR ++ "/v1/steering?model=org/m-1.5", one_url);
+    const all_url = try (try SteerArgs.parse(&.{ "--port", "9" })).url(a);
+    defer a.free(all_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9/v1/steering", all_url);
 }
