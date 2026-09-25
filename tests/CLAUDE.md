@@ -28,6 +28,10 @@ Existing tools:
 - After big features: build `mlx-serve` + the app bundle, run `.app` with `TestServer.swift` enabled, run the agentic harness.
 - Always run `zig build test` and `bash app/test.sh` (or `swift build`) before submitting.
 
+The three complete-history media scripts use a caller-owned Qwen vision server, for example:
+`./zig-out/bin/mlx-serve --model /path/to/qwen-vision --serve --host 127.0.0.1 --port 11439 --ctx-size 32768 --max-concurrent 2 --prefill-chunk 1024 --prefix-cache-mem 4GB --prefix-cache-entries 8 --prefix-cache-disk 0 --ssm-checkpoint-max 8 --mtp --metrics`.
+Use a checkpoint with an MTP head for the MTP arm; leave vision enabled. Output directories must be fresh. The scripts do not start, stop or reconfigure that server.
+
 | Command | Purpose |
 |---|---|
 | `zig build test` | Zig unit tests |

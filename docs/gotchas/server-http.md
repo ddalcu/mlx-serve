@@ -2280,6 +2280,17 @@ append, so the claim is in live memory by then), and a sibling keeps 2 GB of sla
 ceiling because a group's verify transients grow with its lanes. The failing cell now serves
 4/4 together after short holds (TTFT 3.6 / 7.6 s), peak 35.6 -> 33.2 GB, no Metal error.
 
+## Appended images must retain compatible post-image RAM state
+
+A whole-request pixel key invalidates earlier images whenever a later image is appended;
+reconstructing only the active turn instead loses historical pixels. Complete Qwen history
+uses ordered `(start, end, pixel digest)` spans for RAM reuse and checkpoint inheritance,
+capped at the first divergence. Token equality alone cannot validate image placeholders.
+Legacy entries retain their old media boundary. SSD remains text-only and may restore
+only the prefix strictly before the first media span. Guards: `sharedLimit`,
+`appended media retains post-image hybrid checkpoints`, the pre-media SSD restore test,
+and `tests/test_media_history.py` append/edit/reorder/removal cases.
+
 ## Quoted Qwen markers poisoned subsequent agent turns (2026-09-23)
 
 A `web_fetch` result quoting `Picture {}: <|vision_start|><|image_pad|><|vision_end|>`
