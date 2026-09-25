@@ -38827,9 +38827,10 @@ test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it sta
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_astype(&sc, sc32, .bfloat16, s));
+    // bias = +scale: the ternary kernel never reads biases, so it disagrees with stock by construction.
     var bi = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(bi);
-    try mlx.check(mlx.mlx_negative(&bi, sc, s));
+    try mlx.check(mlx.mlx_copy(&bi, sc, s));
     const x32 = mlx.mlx_array_new_data(&xv, &[_]c_int{ 1, 2, k }, 3, .float32);
     defer _ = mlx.mlx_array_free(x32);
     var x = mlx.mlx_array_new();
