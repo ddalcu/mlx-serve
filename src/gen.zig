@@ -487,10 +487,19 @@ const ImageBackend = union(enum) {
     qwen_image: *qwen_image.Engine,
 };
 
-/// Most reference images an edit request may carry (the primary 'image' plus
-/// extra 'ref_images'). Each ~1MP reference adds ~4096 DiT tokens, so the cap
-/// bounds attention memory; the official sampler tops out around 10.
-pub const MAX_EDIT_IMAGES = 4;
+/// Most reference images one edit may carry (the primary 'image' plus
+/// `ref_images`). Qwen-Image-2.1 accepts 10. FLUX and Mage-Flow stay at 4;
+/// `editRefCap` applies that split. Each ~1MP reference adds ~4096 DiT tokens.
+pub const MAX_EDIT_IMAGES = 10;
+pub const MAX_EDIT_IMAGES_OTHER = 4;
+
+/// Reference cap for one backend. Qwen-Image accepts 10; FLUX and Mage-Flow stay at 4.
+pub fn editRefCap(backend: ImageBackend) usize {
+    return switch (backend) {
+        .qwen_image => MAX_EDIT_IMAGES,
+        .flux, .krea, .mage_flow => MAX_EDIT_IMAGES_OTHER,
+    };
+}
 
 /// Ceiling on one video response's raw RGB volume. The whole `frames.rgb`
 /// buffer is base64'd into ONE JSON body and the app decodes it in memory;
@@ -626,7 +635,7 @@ pub const ImageEngine = struct {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
             .mage_flow => |m| m.supportsEdit(), // Mage-Flow-Edit-Turbo checkpoint
-            .qwen_image => false, // text-to-image checkpoint
+            .qwen_image => true,
         };
     }
 
@@ -634,7 +643,7 @@ pub const ImageEngine = struct {
     /// and does its own resizing, rather than pre-decoded `edit_images`. MageFlow
     /// needs a target-size VAE resize AND a separate VLM resize per reference.
     pub fn editUsesRawBytes(self: *const ImageEngine) bool {
-        return self.backend == .mage_flow;
+        return self.backend == .mage_flow or self.backend == .qwen_image;
     }
 
     /// True when real classifier-free guidance (`guidance_scale`/`negative_prompt`)
@@ -736,15 +745,13 @@ pub const ImageEngine = struct {
                 m.editImage(allocator, prompt, opts.edit_image_bytes, width, height, seed, steps, progress)
             else
                 m.generateImage(allocator, prompt, width, height, seed, steps, progress),
-            .qwen_image => |q| blk: {
-                if (opts.edit_images.len != 0 or opts.edit_image_bytes.len != 0) break :blk error.EditUnsupported;
-                break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
-                    .init_image = opts.init_image,
-                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
-                    .guidance_scale = opts.guidance_scale,
-                    .negative_prompt = opts.negative_prompt,
-                }, progress);
-            },
+            .qwen_image => |q| q.generateImage(allocator, prompt, width, height, seed, steps, .{
+                .init_image = opts.init_image,
+                .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                .guidance_scale = opts.guidance_scale,
+                .negative_prompt = opts.negative_prompt,
+                .refs = opts.edit_image_bytes,
+            }, progress),
         };
     }
 
@@ -1574,7 +1581,7 @@ pub fn editFormErrorMessage(err: EditFormError) []const u8 {
         error.NotMultipart => "/v1/images/edits expects multipart/form-data with a 'boundary' parameter",
         error.MissingPrompt => "missing required form field 'prompt'",
         error.MissingImage => "missing required form field 'image' (the picture to edit)",
-        error.TooManyImages => "too many 'image' parts (at most 4: the edited source plus 3 references)",
+        error.TooManyImages => "too many 'image' parts (at most 10, including the edited source)",
         error.MaskUnsupported => "'mask' is not supported: this server's editors are maskless in-context models (describe the change in the prompt instead)",
         error.MultipleChoicesUnsupported => "'n' must be 1 — this engine generates a single image per request",
         error.UrlResponseUnsupported => "'response_format' must be 'b64_json' — this server does not host generated files",
@@ -2040,7 +2047,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
     if (extractJsonString(body, "image")) |raw_img| {
         if (edit_mode and !engine.supportsEdit())
-            return sendError(conn, 400, "instruction editing (mode:\"edit\") requires a FLUX.2 or Mage-Flow-Edit model");
+            return sendError(conn, 400, "instruction editing (mode:\"edit\") requires a FLUX.2, Mage-Flow-Edit, or Qwen-Image model");
         if (!edit_mode and !engine.supportsImg2Img())
             return sendError(conn, 400, "image-to-image (mode:\"variation\") isn't available for this model — either its VAE encoder failed to load, or this backend has no variation path");
         if (extractJsonFloat(body, "strength")) |sv| {
@@ -2063,17 +2070,21 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             // An explicit size keeps the PRIMARY reference's aspect ratio and
             // treats the request as the pixel budget to fit it into.
             if (imageNativeSize(img_bytes)) |nat| {
-                // No size given => the reference IS the budget, which `fitAspect`
-                // resolves to the source's own dimensions (/16).
-                const fit = if (size_given)
-                    resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
-                else
-                    resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
-                const nz = engine.normalizeSize(fit.w, fit.h);
-                if (nz.w != width or nz.h != height)
-                    log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
-                width = nz.w;
-                height = nz.h;
+                // Qwen-Image honors an explicit size literally (the official
+                // pipeline does). A missing size still matches the source.
+                if (!(engine.backend == .qwen_image and size_given)) {
+                    // No size given => the reference IS the budget, which `fitAspect`
+                    // resolves to the source's own dimensions (/16).
+                    const fit = if (size_given)
+                        resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
+                    else
+                        resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
+                    const nz = engine.normalizeSize(fit.w, fit.h);
+                    if (nz.w != width or nz.h != height)
+                        log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
+                    width = nz.w;
+                    height = nz.h;
+                }
             }
             log.info("[image] edit: reference {d} bytes (byte-based backend)\n", .{img_bytes.len});
         } else if (edit_mode) {
@@ -2128,8 +2139,11 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
         while (it.next()) |raw_ref| {
             const cur_n = if (engine.editUsesRawBytes()) edit_byte_n else edit_imgs_n;
-            if (cur_n >= MAX_EDIT_IMAGES)
-                return sendError(conn, 400, "too many reference images ('ref_images' takes at most 3 beside 'image')");
+            if (cur_n >= editRefCap(engine.backend))
+                return sendError(conn, 400, if (engine.backend == .qwen_image)
+                    "too many reference images (at most 10 total, including 'image')"
+                else
+                    "too many reference images ('ref_images' takes at most 3 beside 'image')");
             const ref_bytes = base64DecodeAlloc(allocator, raw_ref) catch
                 return sendError(conn, 400, "invalid base64 in 'ref_images'");
             defer allocator.free(ref_bytes);
@@ -4867,6 +4881,12 @@ test "maxDim matches what normalizeSize actually clamps to (drift guard)" {
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.krea));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.mage_flow));
     try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.qwen_image));
+}
+
+test "editRefCap is 10 for Qwen-Image and 4 for the other editors" {
+    try testing.expectEqual(MAX_EDIT_IMAGES, editRefCap(.{ .qwen_image = undefined }));
+    try testing.expectEqual(MAX_EDIT_IMAGES_OTHER, editRefCap(.{ .flux = undefined }));
+    try testing.expectEqual(MAX_EDIT_IMAGES_OTHER, editRefCap(.{ .mage_flow = undefined }));
 }
 
 test "Modality.mesh advertises the 3d capability" {
