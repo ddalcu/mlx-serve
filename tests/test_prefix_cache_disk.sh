@@ -62,8 +62,10 @@ start_server() { # extra args...
     # The SSD tier is OPT-IN since the off-by-default flip (ad3fd24) — the
     # suite must enable it explicitly. Callers' "$@" comes later, so section
     # 5's `--prefix-cache-disk off` still wins (last flag parses last).
-    HOME="$SCRATCH_HOME" "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-        --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" > "$LOGFILE" 2>&1 &
+    # SERVER_ULIMIT_N lowers the server's soft open-file limit.
+    ( [ -n "$SERVER_ULIMIT_N" ] && ulimit -n "$SERVER_ULIMIT_N"
+      HOME="$SCRATCH_HOME" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
+        --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" ) > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 90); do
         if curl -s -f "$BASE/health" > /dev/null 2>&1; then return 0; fi
@@ -265,6 +267,59 @@ else
     fi
     stop_server
 fi
+
+echo
+echo "== 7. a restore wider than the fd limit, and a failed restore's fallback =="
+# A restore reads one chunk file per 1024 tokens. It must fit under a soft
+# RLIMIT_NOFILE smaller than its chunk count, and an unreadable chunk must
+# fall back to a cold prefill that answers 200.
+MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+FD_HOME=$(mktemp -d)
+SCRATCH_HOME="$FD_HOME"
+KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
+LONG_PROMPT=$(python3 -c "
+lines = ['You are reviewing a project log. Read it fully, then answer.']
+for i in range(1, 1201):
+    lines.append(f'Log entry {i}: subsystem {i%17} reported state change {i*31%997} with latency {i*7%131} ms and checksum {i*i%9973}.')
+lines.append('Question: which subsystem appears in log entry 42? Answer with one short sentence.')
+print('\n'.join(lines))")
+start_server --ctx-size 65536 || { echo -e "${RED}FAIL${NC} fd server failed to start"; exit 1; }
+# One commit flushes at most 512 MB; each repeat extends the entry.
+for _ in 1 2 3 4 5 6; do
+    fire_long > /dev/null
+    sleep 1
+    [ "$(find "$KV_DIR" -name 'c*.safetensors' 2>/dev/null | wc -l)" -ge 30 ] && break
+done
+TOP_FD=$(lsof -a -p "$SERVER_PID" -d '0-65535' -F f 2>/dev/null | sed -n 's/^f//p' | sort -n | tail -1)
+stop_server
+FD_CHUNKS=$(find "$KV_DIR" -name 'c*.safetensors' 2>/dev/null | wc -l | tr -d ' ')
+FD_LIMIT=$((TOP_FD + 16))
+echo "  persisted $FD_CHUNKS chunks; serving top fd $TOP_FD; restoring under ulimit -n $FD_LIMIT"
+if [ "$FD_CHUNKS" -lt 30 ]; then
+    echo -e "${RED}FAIL${NC} need 30+ chunks to exceed the fd headroom, got $FD_CHUNKS"
+    FAIL=1
+else
+    SERVER_ULIMIT_N="$FD_LIMIT" start_server --ctx-size 65536 || { echo -e "${RED}FAIL${NC} fd server 2 failed to start"; exit 1; }
+    if fire_long > /dev/null && grep -q '\[disk-cache\] restored .* tokens from SSD' "$LOGFILE"; then
+        echo -e "${GREEN}PASS${NC} restore under the fd limit: $(grep -oE '\[disk-cache\] restored .* in [0-9]+ms' "$LOGFILE" | head -1)"
+    else
+        echo -e "${RED}FAIL${NC} restore under ulimit -n $FD_LIMIT did not engage"
+        grep -E 'Failed to open|restore failed|prefill failed' "$LOGFILE" | head -5; FAIL=1
+    fi
+    stop_server
+
+    # After boot: the startup scan salvages an entry whose chunk is already unreadable.
+    start_server --ctx-size 65536 || { echo -e "${RED}FAIL${NC} fd server 3 failed to start"; exit 1; }
+    chmod 000 "$(find "$KV_DIR" -name 'c000002.safetensors' | head -1)"
+    if fire_long > /dev/null && grep -q 'restore failed: .* falling back' "$LOGFILE" && ! grep -q 'prefill failed' "$LOGFILE"; then
+        echo -e "${GREEN}PASS${NC} unreadable chunk: restore failed, cold prefill answered"
+    else
+        echo -e "${RED}FAIL${NC} unreadable chunk did not fall back to a working cold prefill"
+        grep -E 'disk-cache|hot-cache|prefill failed|GenerationFailed' "$LOGFILE" | head -8; FAIL=1
+    fi
+    stop_server
+fi
+chmod -R u+rw "$FD_HOME" 2>/dev/null; rm -rf "$FD_HOME"
 
 echo
 if [ "$FAIL" = "0" ]; then

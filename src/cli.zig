@@ -265,7 +265,10 @@ pub fn isTorchShadowBin(path: []const u8) bool {
 pub fn shouldDownload(path: []const u8) bool {
     if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        return std.mem.startsWith(u8, path, "mtp/");
+        const sidecar_dirs = [_][]const u8{ "mtp/", "g2p/", "speech_tokenizer/" };
+        for (sidecar_dirs) |d| {
+            if (std.mem.startsWith(u8, path, d)) break;
+        } else return false;
     }
     const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
     for (skip_exact) |s| {
@@ -905,6 +908,10 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("assets/demo.png"));
     try testing.expect(!shouldDownload("banner.png"));
     try testing.expect(!shouldDownload("vae/weights.safetensors")); // media subdirs are app-bundle territory
+    try testing.expect(shouldDownload("g2p/us_gold.json"));
+    try testing.expect(shouldDownload("speech_tokenizer/model.safetensors"));
+    try testing.expect(shouldDownload("speech_tokenizer/config.json"));
+    try testing.expect(!shouldDownload("g2p/README.md"));
     // A `.bin` the engine READS (qwen4_exp ngram_table) is needed; torch-format
     // shadow weights are a second copy of the same model. Same rule as the app's
     // `DownloadManager.selectNeededFiles` — keep them in sync.

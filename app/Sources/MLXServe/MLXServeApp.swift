@@ -7,10 +7,13 @@ import AppKit
 /// a way to prove the sandbox path end-to-end from a properly-entitled binary
 /// (VZ needs the virtualization entitlement on the *process*, which the signed
 /// MLXCore binary has but the `xctest` host does not). No effect on normal
-/// launches. `CONTAIN_SMOKE=1` is honored as a legacy alias.
+/// launches. `CONTAIN_SMOKE=1` is honored as a legacy alias. `MLXCore bench`
+/// runs the Benchmarks ladder headless (`BenchmarkCLI`) and exits.
 @main
 struct MLXCoreEntryPoint {
     static func main() {
+        let args = CommandLine.arguments.dropFirst()
+        if args.first == "bench" { BenchmarkCLI.main(Array(args.dropFirst())) }
         let env = ProcessInfo.processInfo.environment
         if env["SANDBOX_SMOKE"] == "1" || env["CONTAIN_SMOKE"] == "1" {
             SandboxSmoke.run()

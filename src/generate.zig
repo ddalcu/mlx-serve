@@ -11,6 +11,7 @@ const token_mask = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
+const mtp_lookup = @import("mtp_lookup.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -1457,6 +1458,21 @@ pub const Generator = struct {
     /// per round, so `attempts x depth` no longer measures proposals — this
     /// is the honest per_draft_pct denominator.
     mtp_drafted_tokens: u64 = 0,
+    /// Prompt-lookup rounds (`MLX_SERVE_MTP_LOOKUP`), kept apart from the MTP
+    /// counters so the head's acceptance stats stay the head's.
+    mtp_lookup_rounds: u64 = 0,
+    mtp_lookup_drafted: u64 = 0,
+    mtp_lookup_accepted: u64 = 0,
+    /// Prompt + committed output, indexed up to `mtp_lookup_gen` generated tokens.
+    mtp_lookup_idx: ?mtp_lookup.Index = null,
+    mtp_lookup_gen: usize = 0,
+    /// Landed drafts per round, smoothed, for lookup and MTP rounds (`mtp_lookup.gate`).
+    mtp_lookup_ema: f32 = @floatFromInt(mtp_lookup.MAX_DRAFT),
+    mtp_round_ema: f32 = 0,
+    /// The previous round was a lookup round.
+    mtp_after_lookup: bool = false,
+    /// The last lookup round landed every draft (`mtp_lookup.gate` streak).
+    mtp_lookup_streak: bool = false,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
     /// Speculative rounds that rolled recurrent state back on a partial accept.
@@ -1806,6 +1822,7 @@ pub const Generator = struct {
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
+        var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.dspark_enabled and self.dspark_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
@@ -1816,9 +1833,9 @@ pub const Generator = struct {
             );
             return;
         }
-        if (self.mtp != null and self.mtp_attempted > 0) {
+        if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.mtp_attempted));
+                @as(f64, @floatFromInt(@max(self.mtp_attempted, 1)));
             // Depth varies per round under the EV controller — the honest
             // denominator is the DRAFTED count, not attempts x cap.
             const drafts_proposed: u64 = if (self.mtp_drafted_tokens > 0)
@@ -1831,7 +1848,7 @@ pub const Generator = struct {
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} serial_drops=t{d}/c{d}/b{d} depth_policy={s}\n",
+                "  [spec-stats] mode=mtp attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% depth={d} drafted={d} ext_rounds={d} partial_rounds={d} runtime_disabled={s} reason={s} adaptive={s} serial_cell={d:.2} sync_ms={d:.2} round_ms={d:.2} two_ms_tok={d:.2} one_ms_tok={d:.2} verdict_round={d} trials={d} width_trials={d} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} serial_drops=t{d}/c{d}/b{d} depth_policy={s} lookup={d}/{d}/{d}\n",
                 .{
                     self.mtp_attempted,
                     self.mtp_accepted_tokens,
@@ -1862,8 +1879,15 @@ pub const Generator = struct {
                     self.xfm.round_cost.serial_dropped_contended,
                     self.xfm.round_cost.serial_dropped_bad,
                     @tagName(mtpDepthPolicyFor(mtpDepthPolicy(), self.mtpKvLen())),
+                    self.mtp_lookup_rounds,
+                    self.mtp_lookup_drafted,
+                    self.mtp_lookup_accepted,
                 },
             );
+            if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
+                round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
+                self.xfm.round_cost.formatLookupBucket(table_bucket, &lookup_buf),
+            });
             return;
         }
         if (self.dflash != null and self.dflash_attempted > 0) {
@@ -3487,6 +3511,10 @@ pub const Generator = struct {
         if (self.mtp_pre_draft) |*pd| {
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
+        }
+        if (self.mtp_lookup_idx) |*idx| {
+            idx.deinit();
+            self.mtp_lookup_idx = null;
         }
         // Publish the EV surface for the next request when the experimental
         // cross-request seed is explicitly enabled.
@@ -5545,6 +5573,9 @@ pub const Generator = struct {
         /// Tokens actually drafted this round; starts at m_lo, grows to
         /// m_hi iff the confidence gate clears at the chunk boundary.
         m: u32,
+        /// Drafts are a context continuation (`mtpLookupChain`): nothing to
+        /// build, and no MTP statistics are fed.
+        lookup: bool = false,
 
         pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
             _ = mlx.mlx_array_free(self.t1_arr);
@@ -5591,6 +5622,124 @@ pub const Generator = struct {
             .n_qp = 0,
             .h_chain = null,
             .m = plan.m_lo,
+        };
+    }
+
+    /// `MLX_SERVE_MTP_LOOKUP=1`: prompt lookup may stand in for the MTP chain.
+    fn mtpLookupEnabled() bool {
+        const Cache = struct {
+            var v: ?bool = null;
+        };
+        if (Cache.v) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_MTP_LOOKUP");
+        Cache.v = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
+        return Cache.v.?;
+    }
+
+    /// End a round that stays out of the cost table. The regime clock runs from
+    /// the last observed round, so an unobserved round must end the interval too.
+    fn mtpRoundUntimed(self: *Generator) void {
+        if (self.mtp_regime_clock) |*c| c.reset();
+        self.mtp_serial_clock = null;
+        self.mtp_serial_warm = 0;
+    }
+
+    /// Price a lookup round into the table's lookup row: the wall since the previous round
+    /// ended, the quantity the width grid stores. No sample before the regime clock runs.
+    fn mtpLookupObserve(self: *Generator, drafts: u32, tokens: u32) void {
+        const c = if (self.mtp_regime_clock) |*c| c else return;
+        const ms = @as(f32, @floatFromInt(c.read())) / @as(f32, std.time.ns_per_ms);
+        _ = self.xfm.round_cost.observeLookup(drafts, self.mtpKvLen(), ms, @floatFromInt(tokens), self.spec_cost_solo);
+    }
+
+    /// What this machine measured for an MTP round at `width` and for each lookup size.
+    fn mtpLookupCosts(self: *const Generator, width: u32) mtp_lookup.Costs {
+        const t = &self.xfm.round_cost;
+        const kv = self.mtpKvLen();
+        var costs = mtp_lookup.Costs{ .mtp_ms = if (t.bucketToRead(kv)) |b| t.roundMs(width, b) else null };
+        const bucket = t.bucketOf(kv);
+        for (&costs.lookup_ms, 0..) |*ms, k| ms.* = t.lookupMs(@intCast(k), bucket);
+        return costs;
+    }
+
+    /// Count a round's accepted drafts toward its kind and that kind's EMA.
+    fn mtpRoundAcceptObserve(self: *Generator, lookup: bool, drafted: u32, accepted: u32) void {
+        if (lookup) {
+            self.mtp_lookup_streak = accepted == drafted;
+            self.mtp_lookup_accepted += accepted;
+            self.mtp_lookup_ema = mtp_lookup.emaStep(self.mtp_lookup_ema, accepted);
+        } else {
+            self.mtp_accepted_tokens += accepted;
+            self.mtp_round_ema = mtp_lookup.emaStep(self.mtp_round_ema, accepted);
+            self.mtp_lookup_ema = mtp_lookup.driftStep(self.mtp_lookup_ema);
+        }
+    }
+
+    /// The committed-token index, synced to `generated_ids`.
+    fn mtpLookupIndex(self: *Generator, allocator: std.mem.Allocator) !*mtp_lookup.Index {
+        if (self.mtp_lookup_idx == null) {
+            var idx = mtp_lookup.Index.init(allocator);
+            errdefer idx.deinit();
+            try idx.extend(self.prompt_ids_owned);
+            self.mtp_lookup_idx = idx;
+            self.mtp_lookup_gen = 0;
+        }
+        const gen = self.generated_ids.items;
+        try self.mtp_lookup_idx.?.extend(gen[self.mtp_lookup_gen..]);
+        self.mtp_lookup_gen = gen.len;
+        return &self.mtp_lookup_idx.?;
+    }
+
+    /// A chain of the context's continuation after `t1`, or null when the gate
+    /// prefers the MTP head. Single-stream rounds only.
+    fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
+        if (!mtpLookupEnabled() or self.mtp_batch_head) return null;
+        if (group_planner.enabled() and self.mtp_planner_owned) return null;
+        const idx = try self.mtpLookupIndex(allocator);
+        const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
+        const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
+        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
+        if (k == 0) return null;
+        const Once = struct {
+            var logged = false;
+        };
+        if (!Once.logged) {
+            Once.logged = true;
+            log.info("[mtp] prompt-lookup drafts engaged: k={d} suffix={d}\n", .{ k, got.?.suffix });
+        }
+        // No MTP chain consumes the stash this round; left pending, it would grow
+        // across lookup rounds into one oversized head forward.
+        try self.mtpApplyStash();
+        const drafts = try allocator.alloc(u32, k);
+        errdefer allocator.free(drafts);
+        @memcpy(drafts, got.?.draft[0..k]);
+        const draft_arrs = try allocator.alloc(mlx.mlx_array, k);
+        errdefer allocator.free(draft_arrs);
+        const one = [_]c_int{1};
+        for (drafts, draft_arrs) |d, *arr| {
+            const v: i32 = @intCast(d);
+            arr.* = mlx.mlx_array_new_data(&v, &one, 1, .int32);
+        }
+        const t1_i32: i32 = @intCast(t1);
+        var lplan = plan;
+        lplan.m_lo = k;
+        lplan.m_hi = k;
+        lplan.width_trial = false;
+        return .{
+            .plan = lplan,
+            .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step()),
+            .t1 = t1,
+            .t1_arr = mlx.mlx_array_new_data(&t1_i32, &one, 1, .int32),
+            .drafts = drafts,
+            .draft_arrs = draft_arrs,
+            .n_drafted = k,
+            .conf_arrs = null,
+            .n_conf = 0,
+            .q_probs = null,
+            .n_qp = 0,
+            .h_chain = null,
+            .m = k,
+            .lookup = true,
         };
     }
 
@@ -6566,21 +6715,27 @@ pub const Generator = struct {
     /// round's entry would compute.
     fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
         if (self.mtp_batch_head) return;
-        var chain = (try self.mtpPreDraftOpen(allocator)) orelse return;
+        var chain = (try self.mtpPreDraftOpen(allocator, true)) orelse return;
         errdefer chain.deinit(allocator);
+        if (chain.lookup) {
+            self.mtp_pre_draft = chain;
+            return;
+        }
         try self.mtpChainBuild(&chain, 0, chain.plan.m_lo);
         try mtpChainDispatch(&chain, 0, chain.plan.m_lo);
         self.mtp_pre_draft = chain;
     }
 
     /// The next round's empty chain, or null when this request must not pre-draft.
-    fn mtpPreDraftOpen(self: *Generator, allocator: std.mem.Allocator) !?MtpPreDraft {
+    /// `allow_lookup`: false for group pre-drafts, which build every chain batched.
+    fn mtpPreDraftOpen(self: *Generator, allocator: std.mem.Allocator, allow_lookup: bool) !?MtpPreDraft {
         if (self.mtp_planner_owned and (self.completion_tokens >= self.max_tokens or isEosId(self.next_token_id, self.eos_token_ids))) return null;
         if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_planner_pending) return null;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
         // The plan itself can end speculation or park the request on a serial probe.
         if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return null;
+        if (allow_lookup) if (try self.mtpLookupChain(allocator, plan, self.next_token_id)) |chain| return chain;
         return try self.mtpChainInit(allocator, plan, self.next_token_id);
     }
 
@@ -6594,7 +6749,7 @@ pub const Generator = struct {
         const lap = SubLap.start(mtpTraceEnabled(), gens[0].timer.io);
         var depth: u32 = 0;
         for (gens) |g| {
-            chains[n] = (try g.mtpPreDraftOpen(allocator)) orelse continue;
+            chains[n] = (try g.mtpPreDraftOpen(allocator, false)) orelse continue;
             rows[n] = g;
             depth = @max(depth, chains[n].m);
             n += 1;
@@ -6630,7 +6785,12 @@ pub const Generator = struct {
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
         }
-        if (!apply_stash) return;
+        if (apply_stash) try self.mtpApplyStash();
+    }
+
+    /// Append the deferred history stash to the head cache now, as a
+    /// history-only head forward (lazy; the next head forward realizes it).
+    fn mtpApplyStash(self: *Generator) !void {
         var st = self.mtp_hist_stash orelse return;
         self.mtp_hist_stash = null;
         defer st.deinit();
@@ -7049,6 +7209,7 @@ pub const Generator = struct {
             break :blk pd;
         } else blk: {
             const plan_now = self.mtpRoundPlan();
+            if (try self.mtpLookupChain(allocator, plan_now, self.next_token_id)) |lc| break :blk lc;
             var c = try self.mtpChainInit(allocator, plan_now, self.next_token_id);
             errdefer c.deinit(allocator);
             if (self.mtp_batch_head) {
@@ -7099,7 +7260,8 @@ pub const Generator = struct {
         // A chain pre-drafted before this slot joined a group may be wider than the
         // cap: use its first `cap` drafts (the head's tail past them is truncated at
         // the next consume, like any rejected draft).
-        const cap: u32 = if (self.mtp_group_cap > 0) self.mtp_group_cap else mtp_mod.MAX_DEPTH;
+        // A lookup chain was sized by its own gate.
+        const cap: u32 = if (self.mtp_group_cap > 0) self.mtp_group_cap else if (chain.lookup) chain.m else mtp_mod.MAX_DEPTH;
         const m_lo: u32 = @min(plan.m_lo, cap);
         const m_max: u32 = @min(plan.m_hi, cap);
         chain.m = @min(chain.m, cap);
@@ -7484,8 +7646,17 @@ pub const Generator = struct {
         defer if (self.ctx.ssm_entries) |entries| {
             for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
         };
-        self.mtp_attempted += 1;
-        self.mtp_drafted_tokens += m;
+        // A lookup round is no MTP width sample, nor is the MTP round after one:
+        // its first head step consumes a wider history stash than MTP makes.
+        const times_round = !chain.lookup and !self.mtp_after_lookup;
+        self.mtp_after_lookup = chain.lookup;
+        if (chain.lookup) {
+            self.mtp_lookup_rounds += 1;
+            self.mtp_lookup_drafted += m;
+        } else {
+            self.mtp_attempted += 1;
+            self.mtp_drafted_tokens += m;
+        }
 
         // ── Phase 4: decide longest accepted prefix ──
         // Stochastic path is fully BATCHED: accept probabilities for every
@@ -7864,13 +8035,15 @@ pub const Generator = struct {
             self.has_last_hidden = true;
             new_hidden = .{ .ctx = null };
 
-            self.mtp_accepted_tokens += m;
+            self.mtpRoundAcceptObserve(chain.lookup, m, m);
             self.next_token_id = next_pending;
             self.advanceStep(1 + m);
 
-            self.mtpPlannerObserve(observed_limit, m);
-            if (!group_planner.enabled() or self.mtp_planner_width == null) {
-                if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
+            if (!chain.lookup) {
+                self.mtpPlannerObserve(observed_limit, m);
+                if (!group_planner.enabled() or self.mtp_planner_width == null) {
+                    if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
+                }
             }
             if (tracing) {
                 self.mtp_trace.add(.commit, ph.read());
@@ -7882,8 +8055,13 @@ pub const Generator = struct {
                 self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
             }
             self.mtpTraceRoundEnd(m, m, m_lo);
-            self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-            if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+            if (times_round) {
+                self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+                if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+            } else {
+                if (chain.lookup) self.mtpLookupObserve(m, m + 1);
+                self.mtpRoundUntimed();
+            }
             return DrafterStepResult{
                 .tokens = tokens,
                 .accepted_tokens = m,
@@ -7963,13 +8141,15 @@ pub const Generator = struct {
         self.has_last_hidden = true;
         re_new_hidden = .{ .ctx = null };
 
-        self.mtp_accepted_tokens += accepted;
+        self.mtpRoundAcceptObserve(chain.lookup, m, accepted);
         self.next_token_id = next_pending;
         self.advanceStep(1 + accepted);
 
-        self.mtpPlannerObserve(if (stop_prefix.stop != null) accepted else observed_limit, accepted);
-        if (!group_planner.enabled() or self.mtp_planner_width == null) {
-            if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
+        if (!chain.lookup) {
+            self.mtpPlannerObserve(if (stop_prefix.stop != null) accepted else observed_limit, accepted);
+            if (!group_planner.enabled() or self.mtp_planner_width == null) {
+                if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
+            }
         }
         if (tracing) {
             self.mtp_trace.add(.commit, ph.read());
@@ -7981,8 +8161,13 @@ pub const Generator = struct {
             self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
         }
         self.mtpTraceRoundEnd(m, accepted, m_lo);
-        self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-        if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+        if (times_round) {
+            self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
+            if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+        } else {
+            if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
+            self.mtpRoundUntimed();
+        }
         return DrafterStepResult{
             .tokens = tokens,
             .accepted_tokens = accepted,

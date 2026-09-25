@@ -2321,3 +2321,23 @@ headless start + load) had copied main's EOS merge but not these, so the marker 
 the image sat after the latest tool result on every turn.
 Fix: `ModelConfig.applyTokenizer` holds all tokenizer-derived setup and both paths call it.
 The marker itself is gone since 2026-09-23: placement comes from the template's placeholders.
+
+## An SSD restore held one file open per chunk, and its failure failed the fallback (#495)
+
+Defect: on Qwen3.8-Flash-Next, a 319k-token session restored from the SSD tier failed at chunk
+242 (`Failed to open file … c000242.safetensors`). The cold-prefill fallback then failed too
+(`prefill failed for slot: MlxFailure`), so the client got an error instead of a slow answer.
+
+Cause: `restoreKvInto` appended each chunk's lazy `mlx_load_safetensors` arrays and evaluated
+nothing until the final concat. A lazy load keeps its file open until it is evaluated, so a
+restore needed one descriptor per 1024 tokens, and macOS's default soft limit is 256. The
+restore paths swallow their error in `prefix_cache`, but they never dropped the MLX latch the
+failed load had set, so the fallback prefill's `checkError` picked it up.
+
+Fix: evaluate each chunk's arrays before loading the next one (one file open at a time; costs
+about 0.25 ms per chunk). `restorePrefixInto` and `restoreIntoHybrid` drop the latch they raised
+(`dropLatchedErrorUnless`), the same as the persist funnel does.
+Guards: `DiskTier: a restore wider than the fd limit closes each chunk as it goes`,
+`DiskTier: a failed restore drops the latch it raised and keeps a foreign one`, and
+`tests/test_prefix_cache_disk.sh` [7] (a restore under a lowered `ulimit -n`, plus a chunk
+made unreadable after boot).

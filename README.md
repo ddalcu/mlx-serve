@@ -79,6 +79,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
+| Typed decisions (Laya, `POST /v1/decisions`) | ✅ | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit) | ✅ | ❌ | partial | ✅ |
@@ -143,7 +144,7 @@ The full feature list is in [docs/app.md](docs/app.md).
 
 ## Supported models
 
-Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
+Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, DeepSeek V4 Flash (284B), Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna, Llama 3.x, Mistral, Nemotron-H, LFM2/2.5 (including the VL vision builds), plus embedding models (BERT, EmbeddingGemma, Qwen3-Embedding) and Laya typed-decision models (`POST /v1/decisions`). Anything else runs as GGUF through the embedded llama.cpp, auto-routed by format. The full table with `model_type`s, chat formats and vision support is in [docs/models.md](docs/models.md).
 
 ## Performance
 

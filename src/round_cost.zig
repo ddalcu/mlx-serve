@@ -142,6 +142,15 @@ pub const Table = struct {
     cells: [MAX_WIDTH + 1][N_BUCKETS]Cell = @splat(@splat(.{})),
     /// Measured ms per plain serial decode token, per bucket (`tok` is 1 per sample).
     serial: [N_BUCKETS]Cell = @splat(.{}),
+    /// Measured ms of a prompt-lookup round (`mtp_lookup`) per draft count and bucket. Its
+    /// own row so lookup rounds never reach the width grid, and runtime only: a stored row
+    /// would bump STORE_VERSION and boot every existing table cold.
+    lookup: [MAX_WIDTH + 1][N_BUCKETS]Cell = @splat(@splat(.{})),
+    /// The lookup row's reseed clock.
+    lookup_seq: u32 = 0,
+    /// A draft count whose verify shape has run once this process. Spec-warmup compiles MTP
+    /// widths only, so the first lookup round at a count pays its kernel compile.
+    lookup_compiled: [MAX_WIDTH + 1]bool = @splat(false),
     /// Serial probes attempted per bucket this process. A count, not a flag: an interrupted
     /// probe must not burn the bucket's only chance. Runtime only, never serialized.
     serial_probes: [N_BUCKETS]u8 = @splat(0),
@@ -302,6 +311,44 @@ pub const Table = struct {
         }
         self.serial_folded += 1;
         return foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
+    }
+
+    /// Feed one prompt-lookup round of `drafts` drafts into the lookup row. Same drops as
+    /// `observe`, except that a transition is the first round at a draft count (its kernel
+    /// compile): a lookup's draft count moves every round, so a changed count is no signal.
+    pub fn observeLookup(self: *Table, drafts: u32, kv_len: u32, ms: f32, tokens: f32, solo: bool) Verdict {
+        self.lookup_seq +%= 1;
+        if (drafts > MAX_WIDTH) return .out_of_range;
+        if (!self.lookup_compiled[drafts]) {
+            self.lookup_compiled[drafts] = true;
+            return .transition;
+        }
+        if (!std.math.isFinite(ms) or ms <= 0 or !(tokens > 0)) return .bad_sample;
+        if (!solo) return .contended;
+        const cell = &self.lookup[drafts][self.bucketOf(kv_len)];
+        if (selfSpike(cell.*, ms, self.lookup_seq)) return .implausible;
+        return foldInto(cell, ms, tokens, self.lookup_seq);
+    }
+
+    /// Lookup round ms at `drafts`: measured, else linear between the nearest measured draft
+    /// counts in the bucket, else null (outside the span the caller's prior applies).
+    pub fn lookupMs(self: *const Table, drafts: u32, bucket: usize) ?f32 {
+        if (drafts > MAX_WIDTH or bucket >= N_BUCKETS) return null;
+        if (self.lookup[drafts][bucket].n >= MIN_SAMPLES) return self.lookup[drafts][bucket].ms;
+        var lo: ?u32 = null;
+        var hi: ?u32 = null;
+        for (0..MAX_WIDTH + 1) |wi| {
+            const w: u32 = @intCast(wi);
+            if (self.lookup[w][bucket].n < MIN_SAMPLES) continue;
+            if (w < drafts) {
+                lo = w;
+            } else if (hi == null) {
+                hi = w;
+            }
+        }
+        const l = lo orelse return null;
+        const h = hi orelse return null;
+        return lerp(l, self.lookup[l][bucket].ms, h, self.lookup[h][bucket].ms, drafts);
     }
 
     fn selfSpike(cell: Cell, ms: f32, clock: u32) bool {
@@ -498,6 +545,20 @@ pub const Table = struct {
             if (!first) w.writeAll(",") catch break;
             first = false;
             w.print("w{d}:{d:.2}/{d}", .{ wi, mpt, c.n }) catch break;
+        }
+        return w.buffered();
+    }
+
+    /// The lookup row in `bucket` as `k<drafts>:<round ms>/<samples>`, for the spec-stats line.
+    pub fn formatLookupBucket(self: *const Table, bucket: usize, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        var first = true;
+        for (0..MAX_WIDTH + 1) |k| {
+            const c = self.lookup[k][bucket];
+            if (c.n == 0) continue;
+            if (!first) w.writeAll(",") catch break;
+            first = false;
+            w.print("k{d}:{d:.1}/{d}", .{ k, c.ms, c.n }) catch break;
         }
         return w.buffered();
     }
@@ -1716,4 +1777,80 @@ test "round_cost: persist write is a no-op when a diagnostic that adds barriers 
     try testing.expect(persistDiagArmedFrom(&.{ "0", "0", "0" }) == false);
     try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
     try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
+}
+
+/// Past the compile sample, then MIN_SAMPLES folds.
+fn feedLookup(t: *Table, drafts: u32, kv: u32, ms: f32, tok: f32) void {
+    if (!t.lookup_compiled[drafts]) _ = t.observeLookup(drafts, kv, 500.0, tok, true);
+    var i: u32 = 0;
+    while (i < MIN_SAMPLES) : (i += 1) _ = t.observeLookup(drafts, kv, ms, tok, true);
+}
+
+test "round_cost: the first lookup round at a draft count is its kernel compile, not a price" {
+    var t = Table{};
+    try testing.expectEqual(Verdict.transition, t.observeLookup(12, 1000, 900.0, 13.0, true));
+    try testing.expectEqual(Verdict.reseeded, t.observeLookup(12, 1000, 45.0, 13.0, true));
+    _ = t.observeLookup(12, 1000, 45.0, 13.0, true);
+    _ = t.observeLookup(12, 1000, 45.0, 13.0, true);
+    try testing.expectApproxEqAbs(@as(f32, 45.0), t.lookupMs(12, 0).?, 0.01);
+    // The compile is per shape, not per context bucket.
+    try testing.expectEqual(Verdict.reseeded, t.observeLookup(12, 20000, 60.0, 13.0, true));
+}
+
+test "round_cost: lookup row drops contended, bad and out-of-range samples" {
+    var t = Table{};
+    try testing.expectEqual(Verdict.transition, t.observeLookup(7, 1000, 500.0, 8.0, false));
+    try testing.expectEqual(Verdict.contended, t.observeLookup(7, 1000, 30.0, 8.0, false));
+    try testing.expectEqual(Verdict.bad_sample, t.observeLookup(7, 1000, 0.0, 8.0, true));
+    try testing.expectEqual(Verdict.bad_sample, t.observeLookup(7, 1000, std.math.nan(f32), 8.0, true));
+    try testing.expectEqual(Verdict.bad_sample, t.observeLookup(7, 1000, 30.0, 0.0, true));
+    try testing.expectEqual(Verdict.out_of_range, t.observeLookup(MAX_WIDTH + 1, 1000, 30.0, 8.0, true));
+    try testing.expect(t.lookupMs(7, 0) == null);
+}
+
+test "round_cost: lookup samples never reach the width grid, the serial row or the store" {
+    var t = Table{ .layout = .long };
+    feed(&t, 4, 1000, 25.0, 4.0);
+    _ = t.observeSerial(1000, 16.0, true, false);
+    var before_buf: [4096]u8 = undefined;
+    const before = try serialize(&before_buf, &t);
+    const cells = t.cells;
+    const serial = t.serial;
+    const folded = totalFolded(&t);
+    feedLookup(&t, 7, 1000, 30.0, 8.0);
+    feedLookup(&t, 4, 1000, 22.0, 5.0);
+    try testing.expectEqual(cells, t.cells);
+    try testing.expectEqual(serial, t.serial);
+    try testing.expectEqual(folded, totalFolded(&t));
+    var after_buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings(before, try serialize(&after_buf, &t));
+}
+
+test "round_cost: lookup ms is measured, linear between measured draft counts, null outside them" {
+    var t = Table{};
+    try testing.expect(t.lookupMs(7, 0) == null);
+    _ = t.observeLookup(7, 1000, 500.0, 8.0, true);
+    _ = t.observeLookup(7, 1000, 30.0, 8.0, true);
+    try testing.expect(t.lookupMs(7, 0) == null); // one sample is not a price
+    feedLookup(&t, 7, 1000, 30.0, 8.0);
+    try testing.expectApproxEqAbs(@as(f32, 30.0), t.lookupMs(7, 0).?, 0.01);
+    feedLookup(&t, 11, 1000, 42.0, 12.0);
+    try testing.expectApproxEqAbs(@as(f32, 36.0), t.lookupMs(9, 0).?, 0.01);
+    try testing.expect(t.lookupMs(5, 0) == null);
+    try testing.expect(t.lookupMs(14, 0) == null);
+    try testing.expect(t.lookupMs(7, 3) == null); // another bucket is another price
+}
+
+test "round_cost: a lookup spike is dropped, a stale lookup cell reseeds on its own clock" {
+    var t = Table{};
+    feedLookup(&t, 7, 1000, 30.0, 8.0);
+    try testing.expectEqual(Verdict.implausible, t.observeLookup(7, 1000, 30.0 * SELF_SPIKE + 1, 8.0, true));
+    try testing.expectApproxEqAbs(@as(f32, 30.0), t.lookupMs(7, 0).?, 0.01);
+    // Width-grid traffic does not age the lookup row.
+    var i: u32 = 0;
+    while (i <= RESEED_GAP * 2) : (i += 1) _ = t.observe(4, 1000, 25.0, 4.0, true, false);
+    try testing.expectEqual(Verdict.folded, t.observeLookup(7, 1000, 31.0, 8.0, true));
+    i = 0;
+    while (i <= RESEED_GAP) : (i += 1) _ = t.observeLookup(9, 1000, 33.0, 10.0, true);
+    try testing.expectEqual(Verdict.reseeded, t.observeLookup(7, 1000, 60.0, 8.0, true));
 }
