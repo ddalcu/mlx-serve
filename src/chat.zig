@@ -129,6 +129,8 @@ pub const Message = struct {
     images: ?[]const ImageData = null, // Preprocessed image data for vision
     videos: ?[]const VideoData = null, // Preprocessed video data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
+    /// Byte offsets in joined content, one per image/video; borrowed from the request.
+    media_text_offsets: ?[]const usize = null,
     /// Reasoning the client round-trips on assistant HISTORY messages
     /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
     /// blocks on /v1/messages). Templates that persist reasoning across
@@ -136,6 +138,36 @@ pub const Message = struct {
     /// (Qwen, Gemma) never reference the field and render unchanged.
     reasoning_content: ?[]const u8 = null,
 };
+
+pub const MediaPartFormat = enum { openai, anthropic, responses };
+
+/// Offsets match the parser's newline-joined nonempty text, not JSON byte offsets.
+pub fn mediaTextOffsets(allocator: std.mem.Allocator, parts: []const std.json.Value, format: MediaPartFormat) ![]usize {
+    var offsets = std.ArrayList(usize).empty;
+    errdefer offsets.deinit(allocator);
+    var text_len: usize = 0;
+    for (parts) |part| {
+        if (part != .object) continue;
+        const kind = part.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        const is_text = std.mem.eql(u8, kind.string, "text") or (format == .responses and
+            (std.mem.eql(u8, kind.string, "input_text") or std.mem.eql(u8, kind.string, "output_text")));
+        if (is_text) {
+            const text = part.object.get("text") orelse continue;
+            if (text != .string or text.string.len == 0) continue;
+            if (text_len > 0) text_len += 1;
+            text_len += text.string.len;
+        } else {
+            const is_media = switch (format) {
+                .openai => std.mem.eql(u8, kind.string, "image_url") or std.mem.eql(u8, kind.string, "video_url"),
+                .anthropic => std.mem.eql(u8, kind.string, "image"),
+                .responses => std.mem.eql(u8, kind.string, "input_image"),
+            };
+            if (is_media) try offsets.append(allocator, text_len);
+        }
+    }
+    return offsets.toOwnedSlice(allocator);
+}
 
 /// Chat template configuration loaded from tokenizer_config.json.
 pub const ChatConfig = struct {
@@ -370,6 +402,21 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
+    return formatChatWithSpecialAliases(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final, &.{});
+}
+
+pub fn formatChatWithSpecialAliases(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    continue_final: bool,
+    aliases: []const Tokenizer.SpecialAlias,
+) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
@@ -383,7 +430,7 @@ pub fn formatChat(
         }
     }
 
-    try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
+    try encodeWithSpecialTokens(allocator, tok, rendered, &ids, aliases);
     log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
@@ -1255,6 +1302,7 @@ fn encodeWithSpecialTokens(
     tok: *const Tokenizer,
     text: []const u8,
     ids: *std.ArrayList(u32),
+    aliases: []const Tokenizer.SpecialAlias,
 ) !void {
     // `Tokenizer.encode` already splits around special tokens (earliest
     // occurrence, longest at a position) with an O(text) first-byte-bucketed
@@ -1263,7 +1311,7 @@ fn encodeWithSpecialTokens(
     // prompt on gemma-3's 6415-special vocabulary (the tokenizer-side twin
     // of the same class was fixed in tokenizer.zig; keep both on the shared
     // fast path so they can't drift apart again).
-    const segment_ids = try tok.encode(allocator, text);
+    const segment_ids = try tok.encodeWithSpecialAliases(allocator, text, aliases);
     defer allocator.free(segment_ids);
     try ids.appendSlice(allocator, segment_ids);
 }

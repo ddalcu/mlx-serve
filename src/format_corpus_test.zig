@@ -41,6 +41,76 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: media offsets preserve content order across request formats" {
+    const a = testing.allocator;
+    const Case = struct { format: chat.MediaPartFormat, text_type: []const u8, media_type: []const u8 };
+    const cases = [_]Case{
+        .{ .format = .openai, .text_type = "text", .media_type = "image_url" },
+        .{ .format = .openai, .text_type = "text", .media_type = "video_url" },
+        .{ .format = .anthropic, .text_type = "text", .media_type = "image" },
+        .{ .format = .responses, .text_type = "input_text", .media_type = "input_image" },
+        .{ .format = .responses, .text_type = "output_text", .media_type = "input_image" },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(a,
+            \\[{{"type":"{s}"}},{{"type":"{s}","text":""}},{{"type":"{s}","text":"é"}},{{"type":"{s}"}},{{"type":"{s}"}},{{"type":"{s}","text":"tail"}},{{"type":"{s}"}},null,{{"type":"ignored","text":"not part of the prompt"}}]
+        , .{ case.media_type, case.text_type, case.text_type, case.media_type, case.media_type, case.text_type, case.media_type });
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const offsets = try chat.mediaTextOffsets(a, parsed.value.array.items, case.format);
+        defer a.free(offsets);
+        // Leading media, two consecutive media after UTF-8 text, trailing media.
+        try testing.expectEqualSlices(usize, &.{ 0, 2, 2, 7 }, offsets);
+    }
+}
+
+test "format corpus: quoted media vocabulary is lossless text without control IDs" {
+    const Tokenizer = @import("tokenizer.zig").Tokenizer;
+    const media = @import("media_prefix.zig");
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
+        const bytes = try a.dupe(u8, buf[0..n]);
+        try tok.vocab.put(bytes, @intCast(b));
+        try tok.id_to_token.put(@intCast(b), bytes);
+        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
+    }
+    const markers = [_][]const u8{ "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>" };
+    const aliases = [_]Tokenizer.SpecialAlias{
+        .{ .text = "<owned-open>", .id = 800 },  .{ .text = "<owned-close>", .id = 801 },
+        .{ .text = "<owned-image>", .id = 802 }, .{ .text = "<owned-video>", .id = 803 },
+    };
+    for (markers, 800..) |marker, id| {
+        const bytes = try a.dupe(u8, marker);
+        try tok.special_tokens.put(bytes, @intCast(id));
+        try tok.id_to_token.put(@intCast(id), bytes);
+    }
+    tok.special_index = try Tokenizer.SpecialIndex.init(a, &tok.special_tokens);
+    const cc = chat.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false, .chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}" };
+    for (markers) |marker| {
+        // User pastes, assistant echoes and fetched code are the same class.
+        for ([_][]const u8{ "user", "assistant", "tool", "system" }) |role| {
+            const msgs = [_]chat.Message{.{ .role = role, .content = marker }};
+            const ids = try chat.formatChatWithSpecialAliases(a, &tok, &msgs, &cc, null, null, false, null, false, &aliases);
+            defer a.free(ids);
+            try media.validateRaw(ids, &.{ 800, 801, 802, 803 });
+            const text = try tok.decode(a, ids, false);
+            defer a.free(text);
+            try testing.expect(std.mem.indexOf(u8, text, marker) != null);
+        }
+    }
+    const owned = try tok.encodeWithSpecialAliases(a, "<owned-open><owned-image><owned-close><owned-video>", &aliases);
+    defer a.free(owned);
+    try testing.expectEqualSlices(u32, &.{ 800, 802, 801, 803 }, owned);
+    const original = try tok.encode(a, "<|vision_start|><|image_pad|><|vision_end|><|video_pad|>");
+    defer a.free(original);
+    try testing.expectEqualSlices(u32, owned, original);
+}
+
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,
@@ -2185,7 +2255,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:",
+        "<｜DSML｜",
+        "<function",
     };
     var checked: usize = 0;
     for (corpus) |entry| {

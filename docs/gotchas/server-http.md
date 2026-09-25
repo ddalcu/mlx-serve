@@ -2280,6 +2280,31 @@ append, so the claim is in live memory by then), and a sibling keeps 2 GB of sla
 ceiling because a group's verify transients grow with its lanes. The failing cell now serves
 4/4 together after short holds (TTFT 3.6 / 7.6 s), peak 35.6 -> 33.2 GB, no Metal error.
 
+## Appended images must retain compatible post-image RAM state
+
+A whole-request pixel key invalidates earlier images whenever a later image is appended;
+reconstructing only the active turn instead loses historical pixels. Complete Qwen history
+uses ordered `(start, end, pixel digest)` spans for RAM reuse and checkpoint inheritance,
+capped at the first divergence. Token equality alone cannot validate image placeholders.
+Legacy entries retain their old media boundary. SSD remains text-only and may restore
+only the prefix strictly before the first media span. Guards: `sharedLimit`,
+`appended media retains post-image hybrid checkpoints`, the pre-media SSD restore test,
+and `tests/test_media_history.py` append/edit/reorder/removal cases.
+
+## Quoted Qwen markers poisoned subsequent agent turns (2026-09-23)
+
+A `web_fetch` result quoting `Picture {}: <|vision_start|><|image_pad|><|vision_end|>`
+made complete-media preparation return `UntrackedMediaToken` on every retry.
+Rejecting literal spellings confused ordinary code with owned image placeholders.
+Qwen formatting now inserts request-scoped aliases for actual media, then encodes
+quoted spellings with ordinary BPE. Final IDs and media spans stay stable across
+requests; the tokenizer is never mutated. JSON-decoded source is included in
+namespace collision checks. Keep `expandInline` validation: dropping this guard
+would let unmatched control IDs steal another image's embedding rows.
+The `media:` tests cover source, escaped tool JSON, mixed history and cache reuse;
+`MLX_TEST_MEDIA_MODEL=/path/to/checkpoint zig build test -Doptimize=ReleaseFast
+-Dtest-filter='media:'` also checks the checkpoint's real tokenizer/template on CPU.
+
 ## The load preflight compared weights with free RAM, never the GPU limit (2026-09-20)
 
 Defect: with `iogpu.wired_limit_mb` lowered to 36 GB on a 128 GB Mac, the 70 GB Flash-Next pack

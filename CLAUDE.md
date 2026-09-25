@@ -58,6 +58,7 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `ws.zig` | RFC 6455 framing (server-side) |
 | `pld_index.zig` | PLD n-gram index (`findMatch`, `ngramRepeatScore`) |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp) + its background writer thread |
+| `media_prefix.zig` / `media_cache.zig` | Ordered Qwen media spans and shared-prefix limits; bounded, owned pixel/embedding LRUs |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `dflash.zig` | DFlash block-drafter: config-contract detection (root OR nested `dflash_config`), per-request context cache, block forward; DFlash2 adds `selectPath` + 2-tap grouped convs; trunk seam = `ForwardCtx.capture_layers` + `rawEmbedding` |
 | `mtp.zig` | Qwen 3.5/3.6/3.8 native MTP head (sidecar OR in-checkpoint `mtp.*` via `resolveMtpSource`; per-weight quant re-solve; committed-history cache) |
@@ -245,6 +246,7 @@ Reasoning, budgets, agents:
 - **Schema-mask surfaces share one policy** (`schemaMasksThinking`, #331): defer only across bare `<think>` + atomic closer with no finite budget; tools present = no mask. Guard: `tests/test_json_schema_thinking.sh`.
 
 Request parsing + media:
+- **Quoted media markers are TEXT, not attachments**: Qwen's `MarkedMediaHistory` uses request-owned aliases through Jinja; `encodeWithSpecialAliases` encodes the original spellings as ordinary BPE. Keep `expandInline` span/count validation; never reject an entire fetched source file merely for spelling `<|image_pad|>`. Guards: `media: quoted`, `format corpus: quoted media`, `tests/test_media_surfaces.py`.
 - **`messages.deinit` frees the Message array and NOTHING it points at**: media is owned by ONE `server.RequestMedia`; `Message` BORROWS; slots are INDICES.
 - **Undecodable active-turn media is a NAMED 400** (`IMAGE_DECODE_REJECT`; remote URLs never fetched); `stop: ""` skipped; schema-less `json_schema` 400; empty embedding input 400; Ollama promptless generate = load handshake. Guard: `tests/test_api_edges.sh`.
 - **Media on a tower-less model is refused by NAME** (`mediaRejectReason`); non-text model on a text surface 400s BEFORE prefill (`textGenRejectReason`; new surface → `isTextGenRoute`, new modality → `modalityFromType`).
@@ -299,7 +301,8 @@ Prefix cache (RAM + SSD):
 - **An oversized candidate is TRIMMED to the longest restorable prefix** (#330, `trimLenForBudget`, `trimmedCopy` a real copy; QSA bank priced via `trimmedCheckpointBytes`); the replace path sheds inherited checkpoints first; commit owns `ssm_cps` on EVERY outcome.
 - **Checkpoint retention thins the INTERIOR, dense newest quarter** (`spanPreservingDropIndex`, `ThinPolicy`); a decline is observable (`CommitStatus`, `TrimDecline`).
 - **Eviction is WORKLOAD-fair** (#378, `cache_key` via `requestCacheKey`, `lruIndexExcluding`). Guard: `tests/test_prefix_cache_workloads.sh`.
-- **State AT/AFTER media is keyed on the PIXELS** (`vision_key` + `media_start`; an entry's key covers only its rows, `eff_vision_key`); checkpoint inheritance + thinning obey the media boundary (`bestCheckpointDonor`, `boundaryCheckpointIndex`). Guard: `tests/test_vision_prefix_cache.sh`.
+- **Qwen RAM state AT/AFTER media matches ordered `(start,end,pixel digest)` spans** (`media_prefix.sharedLimit`); edits/removal/reordering cap reuse at the first divergence, including checkpoint donors. Legacy entries retain `vision_key`/`media_start`; SSD remains text strictly before media. Guards: `tests/test_media_history.py`, `tests/test_vision_prefix_cache.sh`.
+- **Preserve media's position between content parts.** Qwen's joined-text offsets must follow each surface's nonempty text/newline rules; never prepend all image markers. Guard: `format corpus: media offsets` plus `media: interleaved`.
 - **SSD tier**: serves the pre-media text prefix (capped at `media_start`); checkpoints come off the TOP of the flush budget; hybrid arm ranks by restorable checkpoint (`bestHybridMatch`); a RAM decline spills (`spillDeclinedToDisk`, 4 GB floor).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
 - **SSD-first** (qwen4 + disk tier, `ssdFirstActive`): RAM floors at one session; spill and EVICT are two decisions (`PersistOutcome`); writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until the append DONATES (`donateCheckout`/`releaseCheckout`).
