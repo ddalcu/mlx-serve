@@ -5195,6 +5195,20 @@ group-padded verify block`.
   stock's RMS and max error, bf16 + f16, both bias layouts). A tolerance vs
   stock's OUTPUT (the old test) passed the half2 kernel.
 
+## 2-bit GEMV tuned on one chip lost to stock on two others (2026-09-25)
+
+- Defect: `qmv2.qmv`, measured 1.45x stock on M4 Max, ran 0.85-0.9x stock on
+  M1 Ultra and ~0.9x on M5 Max; Bonsai 2 plain decode on M1 Ultra was 43.5
+  tok/s against stock MLX's 45.3.
+- Cause: the kernel geometry was a single-chip measurement applied to every
+  GPU, and it read the bias term that a ternary pack stores as -scale.
+- Fix: `msv_qmv2_rows` drops the bias and serves M = 1..8; `planFor` picks
+  its geometry per GPU generation from sweeps on M1 Ultra, M4 Pro and M5 Max
+  (narrow outputs and M5's non-MLP single rows go to stock), and an
+  unmeasured generation keeps the old dispatch.
+- Guard: `qmv2.planFor` and `qmv2.qmm: routing per generation` tests. A new
+  geometry needs a sweep on each generation it claims, not one.
+
 ## DFlash beside company decoded serial
 
 Defect: with a DFlash sidecar loaded, four concurrent streams aggregated BELOW one stream
