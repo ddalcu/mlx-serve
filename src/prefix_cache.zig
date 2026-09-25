@@ -3512,7 +3512,7 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
     // Session 2 (RAM empty): an image-bearing request over the same text —
     // the disk tier must serve the shared text prefix, capped at the
     // request's media boundary (400), reading only the covering chunks.
-    {
+    for ([_]bool{ false, true }) |ordered_history| {
         var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
         hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-vision-disk", 0, 128);
         defer hc2.deinit();
@@ -3520,7 +3520,12 @@ test "HotPrefixCache: media request restores the pre-media text prefix from SSD"
         var cache2 = try KVCache.init(testing.allocator, 2);
         defer cache2.deinit();
         var moe: usize = 0;
-        const res = try hc2.lookupAndRestoreWithMedia(&cache2, &moe, null, s, &tokens, false, 0xDEAD, 400, null, null, null, false);
+        const spans = [_]media_prefix.Span{.{ .start = 400, .end = 420, .digest = @splat(1) }};
+        const res = try hc2.lookupAndRestoreMediaHistory(&cache2, &moe, null, s, &tokens, false, .{
+            .key = 0xDEAD,
+            .start = 400,
+            .spans = if (ordered_history) &spans else null,
+        }, null, null, null, false);
         try testing.expect(!res.full_match);
         try testing.expectEqual(@as(usize, 400), res.matched);
         try testing.expectEqual(@as(usize, 400), cache2.step);

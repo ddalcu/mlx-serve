@@ -2,6 +2,14 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Joining text must not move images across instructions
+
+Separately collecting text and media changed `[text, image, text]` into `[image, text, text]`.
+Qwen media markers now use byte offsets in the parser's newline-joined, nonempty text;
+OpenAI image/video, Anthropic image, and Responses input-image parts retain their position.
+The cross-format corpus covers leading, consecutive, trailing, empty-text and UTF-8 cases;
+server regressions check actual marker insertion and Responses parsing through the pixel cache.
+
 ### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
 
 Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).

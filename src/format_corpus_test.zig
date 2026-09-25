@@ -41,6 +41,30 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: media offsets preserve content order across request formats" {
+    const a = testing.allocator;
+    const Case = struct { format: chat.MediaPartFormat, text_type: []const u8, media_type: []const u8 };
+    const cases = [_]Case{
+        .{ .format = .openai, .text_type = "text", .media_type = "image_url" },
+        .{ .format = .openai, .text_type = "text", .media_type = "video_url" },
+        .{ .format = .anthropic, .text_type = "text", .media_type = "image" },
+        .{ .format = .responses, .text_type = "input_text", .media_type = "input_image" },
+        .{ .format = .responses, .text_type = "output_text", .media_type = "input_image" },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(a,
+            \\[{{"type":"{s}"}},{{"type":"{s}","text":""}},{{"type":"{s}","text":"é"}},{{"type":"{s}"}},{{"type":"{s}"}},{{"type":"{s}","text":"tail"}},{{"type":"{s}"}},null,{{"type":"ignored","text":"not part of the prompt"}}]
+        , .{ case.media_type, case.text_type, case.text_type, case.media_type, case.media_type, case.text_type, case.media_type });
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const offsets = try chat.mediaTextOffsets(a, parsed.value.array.items, case.format);
+        defer a.free(offsets);
+        // Leading media, two consecutive media after UTF-8 text, trailing media.
+        try testing.expectEqualSlices(usize, &.{ 0, 2, 2, 7 }, offsets);
+    }
+}
+
 test "format corpus: quoted media vocabulary is lossless text without control IDs" {
     const Tokenizer = @import("tokenizer.zig").Tokenizer;
     const media = @import("media_prefix.zig");

@@ -431,6 +431,16 @@ One model, two workloads: an agent conversation and a batch sweep of documents s
 
 When an entry must go (count cap, byte budget, `evictLruToAdmit`), `lruIndexExcluding` counts eligible entries per key (the incoming request's key counts as one more on the append path), keeps only the key(s) with the most, and takes the LRU among them; a tie between groups is plain LRU. A sweep therefore evicts its own documents, an unkeyed sweep is one anonymous group that evicts itself, and one workload alone is byte-identical to before. Matching is still by token prefix, the SSD tier's schema and the SSD-first idle spill (`oldestIdleIndex`) are untouched; a disk restore re-enters RAM under the restoring request's key. `[hot-cache] evicted LRU entry (...; key=<hex>; ...)` names the victim's key.
 
+### Qwen media-history prefix cache
+
+Qwen vision requests retain supported historical images/videos in their source messages and content-part order. Request-owned aliases pass through the chat template; ordinary text spelling image/video tokens remains text. `media_prefix.expandInline` checks block counts and records ordered `(start, end, pixel digest)` spans; M-RoPE uses the same expanded layout.
+
+`media_prefix.sharedLimit` caps RAM reuse and checkpoint inheritance at the first changed span. Appending media can reuse state after earlier images; editing, removing or reordering media invalidates the divergent suffix. Legacy entries still use `vision_key` and `media_start`. Media-bearing state is RAM-only: disk lookup is capped strictly before the first media span and media state is not persisted to SSD. Restart, eviction, earlier edits and short hybrid checkpoint tails can still require replay.
+
+`media_cache.zig` supplies independent per-model preprocessing and projected-image LRUs, each bounded at 256 MiB and 64 entries. Preprocessing keys include the data URL and processor settings; projected-image keys include pixels, geometry and modality. Hits own their buffers/handles. Pixel access is mutex-protected; embedding evaluation, sharing and freeing occur only on the inference thread. Video embeddings are not cached.
+
+Mixed images/videos within one message and unsupported Qwen audio are rejected; separate image/video turns are supported. Stored Responses histories omit pixels, so image-bearing `previous_response_id` continuations (HTTP, WebSocket and compact) must resend full history. The live checks and required server flags are in `tests/CLAUDE.md` (`test_media_history.py`, `test_media_surfaces.py`, `test_media_cancellation.py`).
+
 ### SSD-first prefix cache (qwen4_exp)
 
 At 1M context on a 128 GB M5 Max the budget is weights ~70 GB + one session's

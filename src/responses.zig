@@ -552,10 +552,13 @@ pub const ParsedInput = struct {
     owned_strings: std.ArrayList([]const u8),
     owned_tool_calls: std.ArrayList([]chat_mod.ToolCall),
     owned_images: std.ArrayList([]chat_mod.ImageData),
+    owned_media_offsets: std.ArrayList([]usize) = .empty,
     allocator: std.mem.Allocator,
     image_decode_failed: bool = false,
 
     pub fn deinit(self: *ParsedInput) void {
+        for (self.owned_media_offsets.items) |offsets| self.allocator.free(offsets);
+        self.owned_media_offsets.deinit(self.allocator);
         for (self.owned_strings.items) |s| self.allocator.free(s);
         for (self.owned_tool_calls.items) |tcs| self.allocator.free(tcs);
         for (self.owned_images.items) |imgs| {
@@ -576,12 +579,16 @@ pub const ParsedInput = struct {
 /// Appends one entry per tower call an `image_url` expands into — usually one,
 /// but LFM2-VL splits a large source into tiles plus a thumbnail. Appending
 /// rather than returning is what lets a single URL produce several.
-pub const ImageUrlDecoder = *const fn (
-    allocator: std.mem.Allocator,
-    list: *std.ArrayList(chat_mod.ImageData),
-    url: []const u8,
-    vp: chat_mod.VisionPreproc,
-) bool;
+pub const ImageUrlDecoder = struct {
+    context: ?*anyopaque = null,
+    decode: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        list: *std.ArrayList(chat_mod.ImageData),
+        url: []const u8,
+        vp: chat_mod.VisionPreproc,
+    ) anyerror!bool,
+};
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
@@ -709,6 +716,7 @@ fn appendMessageItem(
     const content_val = obj.get("content") orelse return;
     var content: []const u8 = "";
     var images: ?[]chat_mod.ImageData = null;
+    var media_offsets: ?[]const usize = null;
 
     switch (content_val) {
         .string => |s| content = s,
@@ -734,11 +742,19 @@ fn appendMessageItem(
                     .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
                     else => continue,
                 };
-                if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
+                if (image_decoder) |dec| if (!(try dec.decode(dec.context, allocator, &image_list, url, vp))) {
                     pi.image_decode_failed = true;
                 };
             }
             if (vp.mode == .qwen and declared_images != image_list.items.len) return error.InvalidImage;
+            if (vp.mode == .qwen) {
+                const offsets = try chat_mod.mediaTextOffsets(allocator, arr.items, .responses);
+                pi.owned_media_offsets.append(allocator, offsets) catch |err| {
+                    allocator.free(offsets);
+                    return err;
+                };
+                media_offsets = offsets;
+            }
             if (text_parts.items.len > 0) {
                 const owned = try allocator.dupe(u8, text_parts.items);
                 try pi.owned_strings.append(allocator, owned);
@@ -760,6 +776,7 @@ fn appendMessageItem(
         .role = role,
         .content = content,
         .images = if (images) |im| im else null,
+        .media_text_offsets = media_offsets,
     });
 }
 
@@ -1500,7 +1517,7 @@ test "parseInput reads a developer item as the system turn" {
     try testing.expectEqualStrings("You are S.", pi.messages.items[0].content);
 }
 
-fn testRejectingDecoder(_: std.mem.Allocator, _: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) bool {
+fn testRejectingDecoder(_: ?*anyopaque, _: std.mem.Allocator, _: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) anyerror!bool {
     return false;
 }
 
@@ -1510,7 +1527,7 @@ test "parseInput records an input_image the decoder could not read" {
         \\[{"role":"user","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"http://example.invalid/x.png"}]}]
     , .{});
     defer parsed.deinit();
-    var pi = try parseInput(allocator, parsed.value, null, null, null, testRejectingDecoder, .{});
+    var pi = try parseInput(allocator, parsed.value, null, null, null, .{ .decode = testRejectingDecoder }, .{});
     defer pi.deinit();
     try std.testing.expect(pi.image_decode_failed);
     try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);

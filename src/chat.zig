@@ -129,6 +129,8 @@ pub const Message = struct {
     images: ?[]const ImageData = null, // Preprocessed image data for vision
     videos: ?[]const VideoData = null, // Preprocessed video data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
+    /// Byte offsets in joined content, one per image/video; borrowed from the request.
+    media_text_offsets: ?[]const usize = null,
     /// Reasoning the client round-trips on assistant HISTORY messages
     /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
     /// blocks on /v1/messages). Templates that persist reasoning across
@@ -136,6 +138,36 @@ pub const Message = struct {
     /// (Qwen, Gemma) never reference the field and render unchanged.
     reasoning_content: ?[]const u8 = null,
 };
+
+pub const MediaPartFormat = enum { openai, anthropic, responses };
+
+/// Offsets match the parser's newline-joined nonempty text, not JSON byte offsets.
+pub fn mediaTextOffsets(allocator: std.mem.Allocator, parts: []const std.json.Value, format: MediaPartFormat) ![]usize {
+    var offsets = std.ArrayList(usize).empty;
+    errdefer offsets.deinit(allocator);
+    var text_len: usize = 0;
+    for (parts) |part| {
+        if (part != .object) continue;
+        const kind = part.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        const is_text = std.mem.eql(u8, kind.string, "text") or (format == .responses and
+            (std.mem.eql(u8, kind.string, "input_text") or std.mem.eql(u8, kind.string, "output_text")));
+        if (is_text) {
+            const text = part.object.get("text") orelse continue;
+            if (text != .string or text.string.len == 0) continue;
+            if (text_len > 0) text_len += 1;
+            text_len += text.string.len;
+        } else {
+            const is_media = switch (format) {
+                .openai => std.mem.eql(u8, kind.string, "image_url") or std.mem.eql(u8, kind.string, "video_url"),
+                .anthropic => std.mem.eql(u8, kind.string, "image"),
+                .responses => std.mem.eql(u8, kind.string, "input_image"),
+            };
+            if (is_media) try offsets.append(allocator, text_len);
+        }
+    }
+    return offsets.toOwnedSlice(allocator);
+}
 
 /// Chat template configuration loaded from tokenizer_config.json.
 pub const ChatConfig = struct {

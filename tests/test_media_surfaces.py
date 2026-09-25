@@ -10,6 +10,10 @@ import urllib.request
 from test_media_history import image, media_turn
 
 
+INCOMPLETE_MEDIA_MESSAGE = ("Stored media cannot be reconstructed. Resend the complete image "
+                            "history without previous_response_id.")
+
+
 def websocket_media_result(url, content, expected="error"):
     # Observe the actual terminal event, not merely an HTTP-shaped error body.
     script = """
@@ -48,9 +52,16 @@ def main():
     model = "mlx-serve"
     common = {"model": model, "max_tokens": 24, "temperature": 0, "enable_thinking": False}
     with (args.output / "surfaces.jsonl").open("x") as log:
-        def record(name, status, expected, value, word=None):
+        def record(name, status, expected, value, word=None, error_type=None, error_message=None, websocket=False):
             text = json.dumps(value)
             ok = status == expected and (word is None or bool(re.search(r"\b" + word + r"\b", text, re.I)))
+            if error_type is not None:
+                error = value.get("error", {})
+                ok = ok and error.get("message") == error_message
+                if websocket:
+                    ok = ok and value.get("type") == "error" and error.get("code") == error_type
+                else:
+                    ok = ok and error.get("type") == error_type and error.get("code") == expected
             result = {"case": name, "status": status, "ok": ok, "response": value}
             log.write(json.dumps(result) + "\n")
             log.flush()
@@ -59,14 +70,15 @@ def main():
                 failures.append(name)
             return value
 
-        def post(name, route, body, expected=200, word=None):
+        def post(name, route, body, expected=200, word=None, error_type=None, error_message=None):
             req = urllib.request.Request(args.url + route, json.dumps(body).encode(), {"Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=180) as response:
                     status, value = response.status, json.load(response)
             except urllib.error.HTTPError as err:
-                status, value = err.code, json.load(err)
-            return record(name, status, expected, value, word)
+                with err:
+                    status, value = err.code, json.load(err)
+            return record(name, status, expected, value, word, error_type, error_message)
 
         for name, frames in (("empty-video", []), ("invalid-video", ["data:image/png;base64,bad"]),
                              ("partial-video", [red, "data:image/png;base64,bad"]), ("nonstring-frame", [red, 42])):
@@ -99,10 +111,12 @@ def main():
             post(name, "/v1/responses", {**common, "max_output_tokens": 24, "input": [
                 {"role": "user", "content": [{"type": "input_text", "text": "Describe."}, part]}]}, 400)
         events = websocket_media_result(args.url, [{"type": "input_image", "image_url": "bad"}])
-        record("websocket-invalid-image", 400, 400, events)
+        record("websocket-invalid-image", events[-1].get("status"), 400, events[-1],
+               error_type="invalid_request_error", error_message="Cannot prepare the complete media history: InvalidImage", websocket=True)
         events = websocket_media_result(args.url, [{"type": "input_image", "image_url": red},
             {"type": "input_text", "text": source + " What color is the actual image? One word."}], "completed")
-        record("websocket-quoted-media", 200, 200, events, word="red")
+        status = 200 if events[-1].get("response", {}).get("status") == "completed" else None
+        record("websocket-quoted-media", status, 200, events, word="red")
         anthropic = [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
             {"type": "text", "text": "Inspect this image."}]}, {"role": "assistant", "content": "Received."},
@@ -119,13 +133,15 @@ def main():
         quoted_inputs = inputs[:-1] + [{"role": "user", "content": source + " What color was the actual image? One word."}]
         post("responses-quoted-media", "/v1/responses",
              {**common, "max_output_tokens": 24, "input": quoted_inputs}, word="red")
-        if stored.get("id"):
-            continuation = {**common, "max_output_tokens": 24, "previous_response_id": stored["id"], "input": "What color was the image?"}
-            post("responses-incomplete-continuation", "/v1/responses", continuation, 400)
-            post("compact-incomplete-continuation", "/v1/responses/compact", continuation, 400)
-            # Node's built-in WebSocket avoids adding a Python dependency. The
-            # global stored-history path must reject the same way over WS.
-            script = """
+        assert isinstance(stored.get("id"), str) and stored["id"].strip(), "Stored response must have an id; continuation checks cannot be skipped"
+        continuation = {**common, "max_output_tokens": 24, "previous_response_id": stored["id"], "input": "What color was the image?"}
+        post("responses-incomplete-continuation", "/v1/responses", continuation, 400,
+             error_type="incomplete_media_history", error_message=INCOMPLETE_MEDIA_MESSAGE)
+        post("compact-incomplete-continuation", "/v1/responses/compact", continuation, 400,
+             error_type="incomplete_media_history", error_message=INCOMPLETE_MEDIA_MESSAGE)
+        # Node's built-in WebSocket avoids adding a Python dependency. The
+        # global stored-history path must reject the same way over WS.
+        script = """
 const ws = new WebSocket(process.argv[1]);
 let continued = false;
 const timer = setTimeout(() => { console.error('WS timeout'); process.exit(2); }, 20000);
@@ -144,19 +160,21 @@ ws.onmessage = (event) => {
 };
 ws.onerror = () => { clearTimeout(timer); process.exit(3); };
 """
-            ws_body = {**continuation, "type": "response.create"}
-            result = subprocess.run(["node", "-e", script, args.url.replace("http", "ws", 1) + "/v1/responses",
-                                     json.dumps(ws_body)], capture_output=True, text=True, timeout=30)
-            value = json.loads(result.stdout.splitlines()[0]) if result.stdout else {"error": result.stderr}
-            is_rejection = result.returncode == 0 and "incomplete_media_history" in json.dumps(value)
-            record("websocket-incomplete-continuation", 400 if is_rejection else 200, 400, value)
-            local_body = {**common, "type": "response.create", "max_output_tokens": 24, "input": inputs, "store": False}
-            local_next = {**common, "type": "response.create", "max_output_tokens": 24, "input": "What color was the image?", "store": False}
-            result = subprocess.run(["node", "-e", script, args.url.replace("http", "ws", 1) + "/v1/responses",
-                                     json.dumps(local_body), json.dumps(local_next)], capture_output=True, text=True, timeout=30)
-            value = json.loads(result.stdout.splitlines()[0]) if result.stdout else {"error": result.stderr}
-            is_rejection = result.returncode == 0 and "incomplete_media_history" in json.dumps(value)
-            record("websocket-local-incomplete-continuation", 400 if is_rejection else 200, 400, value)
+        ws_body = {**continuation, "type": "response.create"}
+        result = subprocess.run(["node", "-e", script, args.url.replace("http", "ws", 1) + "/v1/responses",
+                                 json.dumps(ws_body)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and result.stdout, result.stderr
+        value = json.loads(result.stdout.splitlines()[0])
+        record("websocket-incomplete-continuation", value.get("status"), 400, value,
+               error_type="incomplete_media_history", error_message=INCOMPLETE_MEDIA_MESSAGE, websocket=True)
+        local_body = {**common, "type": "response.create", "max_output_tokens": 24, "input": inputs, "store": False}
+        local_next = {**common, "type": "response.create", "max_output_tokens": 24, "input": "What color was the image?", "store": False}
+        result = subprocess.run(["node", "-e", script, args.url.replace("http", "ws", 1) + "/v1/responses",
+                                 json.dumps(local_body), json.dumps(local_next)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0 and result.stdout, result.stderr
+        value = json.loads(result.stdout.splitlines()[0])
+        record("websocket-local-incomplete-continuation", value.get("status"), 400, value,
+               error_type="incomplete_media_history", error_message=INCOMPLETE_MEDIA_MESSAGE, websocket=True)
     assert not failures, "Failed: " + ", ".join(failures)
 
 

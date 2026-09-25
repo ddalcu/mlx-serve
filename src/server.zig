@@ -5434,7 +5434,14 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "invalid_request_error",
             .message = PREFILL_NOFIT_MSG,
         },
-        error.InvalidImage, error.InvalidVideo, error.InvalidMediaLayout, error.UntrackedMediaToken, error.UnsupportedMedia, error.UnsupportedMixedMedia, error.UnsupportedMediaRole, error.MediaTurnNotFound, error.ContextOverflow => .{
+        error.ContextOverflow => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "Prompt exceeds maximum context length",
+        },
+        error.InvalidImage, error.InvalidVideo, error.InvalidMediaLayout, error.UntrackedMediaToken, error.UnsupportedMedia, error.UnsupportedMixedMedia, error.UnsupportedMediaRole, error.MediaTurnNotFound => .{
             .status_line = "400 Bad Request",
             .code = 400,
             .openai_type = "invalid_request_error",
@@ -8200,6 +8207,7 @@ fn handleChatCompletions(
         var msg_images: ?[]const chat_mod.ImageData = null;
         var msg_videos: ?[]const chat_mod.VideoData = null;
         var msg_audio: ?[]const chat_mod.AudioData = null;
+        var msg_media_offsets: ?[]const usize = null;
         const decode_this_message = config.qwen_vision or (active_wire_media != null and active_wire_media.? == raw_msg_index);
         const wire_presence = wireMediaPresence(msg_val, .openai);
         const content: []const u8 = if (content_val) |cv| switch (cv) {
@@ -8276,6 +8284,7 @@ fn handleChatCompletions(
                         try sendGenerationError(allocator, stream, error.UnsupportedMedia, .openai);
                         return;
                     }
+                    msg_media_offsets = try media.retainOffsets(arr.items, .openai);
                 }
                 const joined = try joinedTextParts(allocator, arr.items);
                 if (joined.owned) try content_allocs.append(allocator, joined.text);
@@ -8337,6 +8346,7 @@ fn handleChatCompletions(
             .images = msg_images,
             .videos = msg_videos,
             .audio = msg_audio,
+            .media_text_offsets = msg_media_offsets,
             .reasoning_content = msg_reasoning,
         });
     }
@@ -14012,12 +14022,18 @@ const MarkedMediaHistory = struct {
             if (images + videos == 0) continue;
             var content = std.ArrayList(u8).empty;
             defer content.deinit(allocator);
+            if (msg.media_text_offsets) |offsets| if (offsets.len != images + videos) return error.InvalidMediaLayout;
+            var read: usize = 0;
             for (0..images + videos) |i| {
+                const offset = if (msg.media_text_offsets) |offsets| offsets[i] else 0;
+                if (offset < read or offset > msg.content.len) return error.InvalidMediaLayout;
+                try content.appendSlice(allocator, msg.content[read..offset]);
+                read = offset;
                 const pad = if (i < images) config.image_token_id else config.video_token_id;
                 for ([_]u32{ config.vision_start_token_id, pad, config.vision_end_token_id }) |id|
                     try content.appendSlice(allocator, try result.aliasFor(id));
             }
-            try content.appendSlice(allocator, msg.content);
+            try content.appendSlice(allocator, msg.content[read..]);
             const owned = try content.toOwnedSlice(allocator);
             result.contents.append(allocator, owned) catch |err| {
                 allocator.free(owned);
@@ -14075,8 +14091,53 @@ test "media: rendered provenance belongs to source content and leaves caller unt
     try testing.expectEqualStrings("first", msgs[0].content);
 }
 
+test "media: interleaved text stays on both sides of image and video blocks" {
+    const a = testing.allocator;
+    const config = model_mod.ModelConfig{ .vision_start_token_id = 800, .vision_end_token_id = 801, .image_token_id = 802, .video_token_id = 803 };
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const videos = [_]chat_mod.VideoData{.{ .pixels = &.{}, .grid_t = 1, .grid_h = 2, .grid_w = 2 }};
+    for ([_]bool{ false, true }) |video| {
+        const msgs = [_]chat_mod.Message{.{ .role = "user", .content = "before\nafter", .images = if (video) null else &images, .videos = if (video) &videos else null, .media_text_offsets = &.{6} }};
+        var marked = try MarkedMediaHistory.init(a, testing.io, &config, &msgs, .{});
+        defer marked.deinit(a);
+        const expected = try std.fmt.allocPrint(a, "before{s}{s}{s}\nafter", .{ try marked.aliasFor(800), try marked.aliasFor(if (video) 803 else 802), try marked.aliasFor(801) });
+        defer a.free(expected);
+        try testing.expectEqualStrings(expected, marked.messages[0].content);
+    }
+}
+
+test "media: oversized text retains token counts for the normal context error" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{ .qwen_vision = true, .max_position_embeddings = 2, .ctx_override = 2 };
+    var lm = std.mem.zeroInit(LoadedModel, .{ .allocator = a, .config = &config });
+    const prepared = try prepareQwenHistory(a, &lm, &.{ 1, 2, 3 }, &.{}, null, null);
+    defer a.free(prepared.ids);
+    defer a.free(prepared.mrope.media_spans.?);
+    try testing.expectEqual(@as(usize, 3), prepared.ids.len);
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("Prompt exceeds maximum context length: 3 tokens requested, 2 available", contextOverflowMessage(&buf, prepared.ids.len, getEffectiveContextLength(&config)));
+}
+
 fn validateMediaLiteralText(text: []const u8, marker: []const u8) !void {
     if (marker.len == 0 or std.mem.indexOf(u8, text, marker) != null) return error.UntrackedMediaToken;
+}
+
+test "media: expanded image overflow reports counts without entering the vision encoder" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{ .qwen_vision = true, .ctx_override = 4, .qv_merge = 2, .vision_start_token_id = 800, .vision_end_token_id = 801, .image_token_id = 802, .video_token_id = 803 };
+    var lm = std.mem.zeroInit(LoadedModel, .{ .allocator = a, .config = &config });
+    const images = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 4, .height = 4, .grid_h = 4, .grid_w = 4 }};
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "", .images = &images }};
+    const prepared = try prepareQwenHistory(a, &lm, &.{ 800, 802, 801 }, &messages, null, null);
+    defer a.free(prepared.ids);
+    defer a.free(prepared.mrope.media_spans.?);
+    try testing.expectEqual(@as(usize, 6), prepared.ids.len);
+    try testing.expect(prepared.embedding == null and prepared.mrope.pos == null);
+    var buf: [160]u8 = undefined;
+    try testing.expectEqualStrings("Prompt exceeds maximum context length: 6 tokens requested, 4 available", contextOverflowMessage(&buf, prepared.ids.len, getEffectiveContextLength(&config)));
+    const fallback = mapGenerationError(error.ContextOverflow, &buf);
+    try testing.expectEqual(@as(u16, 400), fallback.code);
+    try testing.expectEqualStrings("Prompt exceeds maximum context length", fallback.message);
 }
 
 fn validateMediaLiteralJsonValue(value: std.json.Value, marker: []const u8) anyerror!void {
@@ -14205,7 +14266,8 @@ fn checkQuotedMediaHistory(tok: *const Tokenizer, cc: *const chat_mod.ChatConfig
     };
     const more_raw = try cachedFormatChat(a, testing.io, &lm, tok, cc, &extended, null, null, false, null, false);
     defer a.free(more_raw);
-    const more = try media_prefix.expandInline(a, more_raw, &.{ spec,
+    const more = try media_prefix.expandInline(a, more_raw, &.{
+        spec,
         .{ .insert_at = 0, .rows = 3, .token = video_id, .digest = @splat(2) },
         .{ .insert_at = 0, .rows = 1, .token = image_id, .digest = @splat(3) },
     }, open, close, image_id, video_id);
@@ -14241,8 +14303,7 @@ test "media: literal markers in rendered fields and escaped JSON remain ordinary
     defer tok.deinit();
     var config = model_mod.ModelConfig{ .qwen_vision = true, .vision_start_token_id = 800, .vision_end_token_id = 801, .image_token_id = 802, .video_token_id = 803 };
     const literal = "<|vision_start|><|image_pad|><|vision_end|><|video_pad|>";
-    const cc = chat_mod.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false,
-        .chat_template = "{{ tools[0].function.description }}{% for m in messages %}{{ m.role }}{{ m.content }}{{ m.reasoning_content }}{{ m.tool_call_id }}{% for c in m.tool_calls %}{{ c.function.name }}{{ c.function.arguments.text }}{% endfor %}{% endfor %}" };
+    const cc = chat_mod.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false, .chat_template = "{{ tools[0].function.description }}{% for m in messages %}{{ m.role }}{{ m.content }}{{ m.reasoning_content }}{{ m.tool_call_id }}{% for c in m.tool_calls %}{{ c.function.name }}{{ c.function.arguments.text }}{% endfor %}{% endfor %}" };
     const calls = [_]chat_mod.ToolCall{.{ .id = literal, .name = literal, .arguments = "{\"text\":\"\\u003c|image_pad|>\"}" }};
     const msgs = [_]chat_mod.Message{.{ .role = "assistant", .content = literal, .reasoning_content = literal, .tool_call_id = literal, .tool_calls = &calls }};
     const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"example\",\"description\":\"\\u003c|video_pad|>\",\"parameters\":{\"type\":\"object\"}}}]";
@@ -14343,7 +14404,13 @@ fn prepareQwenHistory(allocator: std.mem.Allocator, lm: *LoadedModel, raw: []con
     }
     const layout = try media_prefix.expandInline(allocator, raw, blocks.items, config.vision_start_token_id, config.vision_end_token_id, config.image_token_id, config.video_token_id);
     errdefer layout.deinit(allocator);
-    if (layout.tokens.len > getEffectiveContextLength(config)) return error.ContextOverflow;
+    // Let the surface report the expanded token counts, without encoding pixels.
+    if (layout.tokens.len > getEffectiveContextLength(config)) return .{
+        .ids = layout.tokens,
+        .embedding = null,
+        .key = 0,
+        .mrope = .{ .media_spans = layout.spans },
+    };
     var mrope = MropeData{ .media_spans = layout.spans };
     errdefer if (mrope.pos) |p| allocator.free(p);
     var key: u64 = 0;
@@ -14747,15 +14814,25 @@ const RequestMedia = struct {
     image_bag: MediaBag(chat_mod.ImageData) = .{},
     video_bag: MediaBag(chat_mod.VideoData) = .{},
     audio_bag: MediaBag(chat_mod.AudioData) = .{},
+    offsets: std.ArrayList([]usize) = .empty,
 
     fn init(allocator: std.mem.Allocator) RequestMedia {
         return .{ .allocator = allocator };
     }
 
     fn deinit(self: *RequestMedia) void {
+        for (self.offsets.items) |offsets| self.allocator.free(offsets);
+        self.offsets.deinit(self.allocator);
         self.image_bag.deinit(self.allocator);
         self.video_bag.deinit(self.allocator);
         self.audio_bag.deinit(self.allocator);
+    }
+
+    fn retainOffsets(self: *RequestMedia, parts: []const std.json.Value, format: chat_mod.MediaPartFormat) ![]const usize {
+        const offsets = try chat_mod.mediaTextOffsets(self.allocator, parts, format);
+        errdefer self.allocator.free(offsets);
+        try self.offsets.append(self.allocator, offsets);
+        return offsets;
     }
 
     fn openImages(self: *RequestMedia) !usize {
@@ -14817,19 +14894,74 @@ pub fn appendImageUrlContent(
 
 const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp;base64,...) with a readable payload; remote URLs are not fetched";
 
-fn appendCachedImage(allocator: std.mem.Allocator, io: std.Io, lm: *LoadedModel, list: *std.ArrayList(chat_mod.ImageData), url: []const u8) !void {
-    const vp = visionPreprocFromConfig(lm.config.?);
-    if (vp.mode != .qwen) {
-        if (!appendImageUrlContent(allocator, list, url, vp)) return error.InvalidImage;
-        return;
-    }
+fn imagePreprocessKey(vp: chat_mod.VisionPreproc, url: []const u8) media_cache.Key {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     inline for (@typeInfo(chat_mod.VisionPreproc).@"struct".field_names) |field| {
         const value = @field(vp, field);
         hash.update(std.mem.asBytes(&value));
     }
     hash.update(url);
-    const key = hash.finalResult();
+    return hash.finalResult();
+}
+
+fn decodeResponsesImage(context: ?*anyopaque, allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), url: []const u8, vp: chat_mod.VisionPreproc) anyerror!bool {
+    if (context) |ptr| {
+        const ctx: *ResponsesImageContext = @ptrCast(@alignCast(ptr));
+        appendCachedImage(allocator, ctx.io, ctx.model, list, url) catch |err| switch (err) {
+            error.InvalidImage => return false,
+            else => return err,
+        };
+        return true;
+    }
+    return appendImageUrlContent(allocator, list, url, vp);
+}
+
+const ResponsesImageContext = struct {
+    io: std.Io,
+    model: *LoadedModel,
+
+    fn decoder(self: *ResponsesImageContext) responses_mod.ImageUrlDecoder {
+        return .{ .context = self, .decode = decodeResponsesImage };
+    }
+};
+
+test "media: Responses parsing reuses independently owned cached pixels and preserves part order" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{ .qwen_vision = true };
+    var lm = std.mem.zeroInit(LoadedModel, .{ .allocator = a, .config = &config });
+    lm.media_pixels = .{};
+    lm.media_pixels_mu = .init;
+    defer lm.media_pixels.deinit(a);
+    const vp = visionPreprocFromConfig(&config);
+    // A cached source need not be decoded again; invalid bytes make a miss observable.
+    const url = "data:image/png;base64,cache-only-source";
+    try lm.media_pixels.put(a, imagePreprocessKey(vp, url), .{ .image = .{ .pixels = @constCast("cached-pixels"), .width = 1, .height = 1 } });
+    var context = ResponsesImageContext{ .io = testing.io, .model = &lm };
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":[{"type":"input_text","text":"before"},{"type":"input_image","image_url":"data:image/png;base64,cache-only-source"},{"type":"input_text","text":"after"}]}]
+    , .{});
+    defer parsed.deinit();
+    var first = try responses_mod.parseInput(a, parsed.value, null, null, null, context.decoder(), vp);
+    defer first.deinit();
+    var second = try responses_mod.parseInput(a, parsed.value, null, null, null, context.decoder(), vp);
+    defer second.deinit();
+    try testing.expectEqualStrings("before\nafter", first.messages.items[0].content);
+    try testing.expectEqualSlices(usize, &.{6}, first.messages.items[0].media_text_offsets.?);
+    const first_pixels = first.messages.items[0].images.?[0].pixels;
+    const second_pixels = second.messages.items[0].images.?[0].pixels;
+    try testing.expectEqualStrings("cached-pixels", first_pixels);
+    try testing.expectEqualStrings("cached-pixels", second_pixels);
+    try testing.expect(first_pixels.ptr != second_pixels.ptr);
+    try testing.expectEqual(@as(usize, 1), lm.media_pixels.entries.items.len);
+}
+
+fn appendCachedImage(allocator: std.mem.Allocator, io: std.Io, lm: *LoadedModel, list: *std.ArrayList(chat_mod.ImageData), url: []const u8) !void {
+    const vp = visionPreprocFromConfig(lm.config.?);
+    if (vp.mode != .qwen) {
+        if (!appendImageUrlContent(allocator, list, url, vp)) return error.InvalidImage;
+        return;
+    }
+    const key = imagePreprocessKey(vp, url);
     lm.media_pixels_mu.lockUncancelable(io);
     const cached = lm.media_pixels.get(allocator, key) catch null;
     lm.media_pixels_mu.unlock(io);
@@ -15715,6 +15847,7 @@ fn handleAnthropicMessages(
                             .tool_calls = null,
                             .tool_call_id = null,
                             .images = media.imagesSlice(img_slot),
+                            .media_text_offsets = if (config.qwen_vision) try media.retainOffsets(arr.items, .anthropic) else null,
                         });
                     }
                 },
@@ -17486,7 +17619,7 @@ fn handleResponsesCompact(
     // ── parse → resolved message history ──
     // Compaction drops images, so the preprocessing selector is irrelevant here.
     // No tool aliases are built: an echoed call keeps the name it was declared with.
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, null, appendImageUrlContent, .{}) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, null, .{ .decode = decodeResponsesImage }, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -17768,7 +17901,8 @@ fn handleResponsesInner(
     }
 
     // ── parse input → messages ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
+    var image_context = ResponsesImageContext{ .io = stream.io, .model = lm };
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, image_context.decoder(), visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         if (stream.ws_mode != null) return err;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
