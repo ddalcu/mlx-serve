@@ -1565,6 +1565,7 @@
 "~84 GB, needs 128 GB RAM" = "~84 GB，需要 128 GB 内存";
 "· %lld on disk" = "· 磁盘上 %lld 个";
 "—" = "——";
+"… %lld more characters" = "… 还有 %lld 个字符";
 "↑↓ move · ↩ switch · esc close" = "↑↓ 移动 · ↩ 切换 · esc 关闭";
 "↩ ask · esc close" = "↩ 提问 · esc 关闭";
 "✓ On disk" = "✓ 已在本地";

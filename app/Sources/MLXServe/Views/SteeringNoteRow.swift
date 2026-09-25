@@ -28,6 +28,17 @@ struct SteeringNoteRow: View {
     private var viewportHeight: CGFloat { min(contentHeight, Self.maxHeight) }
     private var overflows: Bool { contentHeight > Self.maxHeight + 1 }
 
+    /// Characters the row lays out. `Text` is not virtualized: a pasted
+    /// document laid out whole hung the main thread. The note itself is sent
+    /// in full.
+    static let previewLimit = 4_000
+
+    /// The note's leading `limit` characters and how many follow.
+    static func preview(_ note: String, limit: Int = previewLimit) -> (text: String, omitted: Int) {
+        guard note.count > limit else { return (note, 0) }
+        return (String(note.prefix(limit)), note.count - limit)
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
             VStack(alignment: .leading, spacing: 3) {
@@ -39,9 +50,17 @@ struct SteeringNoteRow: View {
                 }
                 .font(.caption2)
                 .opacity(0.7)
+                let preview = Self.preview(note)
                 ScrollView(.vertical, showsIndicators: false) {
-                    Text(note)
-                        .font(.body)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(preview.text)
+                            .font(.body)
+                        if preview.omitted > 0 {
+                            Text(L10n.format("… %lld more characters", preview.omitted))
+                                .font(.caption2)
+                                .opacity(0.7)
+                        }
+                    }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.trailing, overflows ? 10 : 0)
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
