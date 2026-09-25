@@ -20,6 +20,9 @@ class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
+    var mediaPickerModels: [ModelInfo] {
+        CustomMediaModels.pickerModels(server: server.allModels, local: localModels)
+    }
     /// Chat is answered by Apple's on-device model rather than the server.
     /// Persisted like `selectedModelPath`; the local pick stays set underneath
     /// so turning it off lands back on the model that was chosen before.

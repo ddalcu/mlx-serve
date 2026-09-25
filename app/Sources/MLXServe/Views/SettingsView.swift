@@ -406,15 +406,9 @@ private struct RestartBanner: View {
             }
             Spacer()
             Button("Restart Now") {
-                let opts = appState.serverOptions
-                let model = appState.selectedModelPath
-                server.stop()
-                if !model.isEmpty {
-                    server.start(modelPath: model, options: opts)
-                }
+                server.restart(modelPath: appState.selectedModelPath, options: appState.serverOptions)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(appState.selectedModelPath.isEmpty)
 
             Button("Discard") {
                 if let last = server.lastLaunchedOptions {
@@ -503,7 +497,7 @@ private struct EngineAwareSections: View {
         // are not the text engine the gates above key on.
         SettingsSection(
             category: .neuralEngine,
-            subtitle: "Run part of the work on the Apple Neural Engine beside the GPU. Each switch keeps its own copy of part of the model, so it costs extra memory and disk — the estimate is under each switch. A Max or Ultra lands near the low end; smaller GPUs hand the Neural Engine more of the work and land near the high end. Compiled copies are cached on disk, up to 40 GB (less when the disk is nearly full). Opt-in and lossy by design; the server declines by name where the copy does not fit. Server-launch flags — restart to apply."
+            subtitle: "Acceleration on the M5 GPU's neural accelerators (NAX) or the Apple Neural Engine. Each control names the models and hardware it supports. Restart the server to apply changes; active generations will stop."
         ) {
             NeuralEngineSectionContent()
         }
@@ -1920,6 +1914,8 @@ private struct PerformanceSectionContent: View {
 private struct NeuralEngineSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @State private var engineVersions: [EngineVersion] = []
+    @State private var checkedNax = false
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
@@ -1929,6 +1925,34 @@ private struct NeuralEngineSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
 
+        if let m = meta["qwenImageW8A8"] {
+            SettingsRow(title: m.title, explainer: m.explainer,
+                        isDirty: dirty.dirty(\.qwenImageW8A8)) {
+                VStack(alignment: .trailing, spacing: 4) {
+                    Toggle("", isOn: Binding(
+                        get: { appState.serverOptions.effectiveW8A8(naxAvailable: EngineVersions.naxAvailable(in: engineVersions)) },
+                        set: { opts.qwenImageW8A8.wrappedValue = $0 }))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .accessibilityLabel(L10n.text(m.title))
+                        .disabled(!EngineVersions.naxAvailable(in: engineVersions))
+                    if !checkedNax {
+                        Text(L10n.text("Checking M5 NAX support…"))
+                            .font(.caption2).foregroundStyle(.secondary)
+                    } else if !EngineVersions.naxAvailable(in: engineVersions) {
+                        Text(L10n.text("M5 NAX is unavailable. w8a8 requires an M5-class GPU and macOS 26.2 or later."))
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .task {
+                guard !checkedNax else { return }
+                engineVersions = await EngineVersions.probe(binaryPath: ServerManager.resolveBinaryPath())
+                checkedNax = true
+            }
+        }
         if let m = meta["anePrefill"] {
             SettingsRow(
                 title: m.title,

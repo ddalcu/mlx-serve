@@ -143,11 +143,11 @@ struct Model3DGenView: View {
     private var modelSection: some View {
         MediaModelChooser.pane(
             all: Model3DModelPreset.all,
-            onThisMac: CustomMediaModels.meshPresets(from: server.allModels),
+            onThisMac: CustomMediaModels.meshPresets(from: appState.mediaPickerModels),
             capability: "3d",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            resolveCustom: { [models = server.allModels] in
+            resolveCustom: { [models = appState.mediaPickerModels] in
                 CustomMediaModels.meshPreset(for: $0, from: models)
             },
             bundleOf: { $0.bundle },
@@ -344,7 +344,7 @@ struct Model3DGenView: View {
 
     private func hydrate() {
         let s = Model3DGenSettings.load()
-        model = s.resolvedModel(models: server.allModels)
+        model = s.resolvedModel(models: appState.mediaPickerModels)
         lanModel = LanPick.lanId(s.modelId)
         steps = s.steps
         guidance = s.guidance

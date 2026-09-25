@@ -36,6 +36,11 @@ enum EngineVersions {
         parse(text).filter { $0.name != "mlx-serve" }
     }
 
+    static func naxAvailable(in versions: [EngineVersion]) -> Bool {
+        versions.first { $0.name == "nax" }?.version
+            .split(whereSeparator: \.isWhitespace).first == "on"
+    }
+
     /// Human label for a `--version` component name (Settings row title).
     /// Unknown names fall back to the raw token so a new Zig line still
     /// renders (ugly beats invisible).

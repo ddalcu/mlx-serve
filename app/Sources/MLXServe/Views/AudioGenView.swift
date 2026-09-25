@@ -329,13 +329,13 @@ struct VoiceGenView: View {
     private var modelSection: some View {
         MediaModelChooser.pane(
             all: AudioModelPreset.all,
-            onThisMac: CustomMediaModels.audioPresets(from: server.allModels),
+            onThisMac: CustomMediaModels.audioPresets(from: appState.mediaPickerModels),
             // "speech", not "audio": see ModelInfo.lanAdvertises — a peer's
             // music model advertises "audio" too.
             capability: "speech",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            resolveCustom: { [models = server.allModels] in
+            resolveCustom: { [models = appState.mediaPickerModels] in
                 CustomMediaModels.audioPreset(for: $0, from: models)
             },
             bundleOf: { $0.bundle },
@@ -619,7 +619,7 @@ struct VoiceGenView: View {
 
     private func hydrate() {
         let s = AudioGenSettings.load()
-        model = s.resolvedModel(models: server.allModels)
+        model = s.resolvedModel(models: appState.mediaPickerModels)
         lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature

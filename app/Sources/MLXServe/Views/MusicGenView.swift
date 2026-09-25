@@ -540,11 +540,11 @@ struct MusicGenView: View {
     private var modelSection: some View {
         MediaModelChooser.pane(
             all: MusicModelPreset.all,
-            onThisMac: CustomMediaModels.musicPresets(from: server.allModels),
+            onThisMac: CustomMediaModels.musicPresets(from: appState.mediaPickerModels),
             capability: "music",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            resolveCustom: { [models = server.allModels] in
+            resolveCustom: { [models = appState.mediaPickerModels] in
                 CustomMediaModels.musicPreset(for: $0, from: models)
             },
             bundleOf: { $0.bundle },
@@ -856,7 +856,7 @@ struct MusicGenView: View {
 
     private func hydrate() {
         let s = MusicGenSettings.load()
-        model = s.resolvedModel(models: server.allModels)
+        model = s.resolvedModel(models: appState.mediaPickerModels)
         lanModel = LanPick.lanId(s.modelId)
         durationSeconds = Double(s.durationSeconds)
         vocalLanguage = s.vocalLanguage

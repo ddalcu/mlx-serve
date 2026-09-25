@@ -108,6 +108,46 @@ final class MediaBundleTests: XCTestCase {
 
     // MARK: - Readiness
 
+    func testComponentReadyFollowsLinkedComponentDirectories() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let models = root.appendingPathComponent("models")
+        let model = models.appendingPathComponent("local/qwen")
+        let source = root.appendingPathComponent("source")
+        try fm.createDirectory(at: model, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try Data("{}".utf8).write(to: model.appendingPathComponent("config.json"))
+        let components = ["transformer", "text_encoder", "vae", "processor"]
+        for name in components {
+            let target = source.appendingPathComponent(name)
+            try fm.createDirectory(at: target, withIntermediateDirectories: true)
+            try fm.createSymbolicLink(at: model.appendingPathComponent(name), withDestinationURL: target)
+        }
+        let comp = MediaComponent(repo: "local/qwen", selection: .chatDefault,
+                                  readyMarkers: ["config.json"] + components)
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: models.path))
+        let blob = source.appendingPathComponent("transformer/blob")
+        try Data([0, 1, 2]).write(to: blob)
+        try fm.createSymbolicLink(at: source.appendingPathComponent("transformer/model.safetensors"),
+                                 withDestinationURL: blob)
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: models.path))
+    }
+
+    func testWeightReadinessHandlesCyclesDanglingLinksAndDirectoryNames() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try fm.createSymbolicLink(at: root.appendingPathComponent("cycle"), withDestinationURL: root)
+        try fm.createSymbolicLink(at: root.appendingPathComponent("missing.safetensors"),
+                                 withDestinationURL: root.appendingPathComponent("missing"))
+        try fm.createDirectory(at: root.appendingPathComponent("not-a-file.safetensors"),
+                               withIntermediateDirectories: true)
+        XCTAssertFalse(DownloadManager.hasSafetensorsRecursive(root.path))
+        try Data([1]).write(to: root.appendingPathComponent("actual.safetensors"))
+        XCTAssertTrue(DownloadManager.hasSafetensorsRecursive(root.path))
+    }
+
     func testComponentReadyNeedsMarkersAndSafetensors() throws {
         let fm = FileManager.default
         let root = NSTemporaryDirectory() + "mediatest-\(UUID().uuidString)"

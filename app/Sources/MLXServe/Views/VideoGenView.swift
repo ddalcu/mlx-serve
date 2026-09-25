@@ -305,11 +305,11 @@ struct VideoGenView: View {
     private var modelSection: some View {
         MediaModelChooser.pane(
             all: VideoModelPreset.all,
-            onThisMac: CustomMediaModels.videoPresets(from: server.allModels),
+            onThisMac: CustomMediaModels.videoPresets(from: appState.mediaPickerModels),
             capability: "video",
             selected: $model, lanModel: $lanModel,
             capabilityOf: { $0.capabilityLabel },
-            resolveCustom: { [models = server.allModels] in
+            resolveCustom: { [models = appState.mediaPickerModels] in
                 CustomMediaModels.videoPreset(for: $0, from: models)
             },
             bundleOf: { $0.bundle },
@@ -1426,7 +1426,7 @@ struct VideoGenView: View {
 
     private func hydrate() {
         let s = VideoGenSettings.load()
-        model = s.resolvedModel(models: server.allModels)
+        model = s.resolvedModel(models: appState.mediaPickerModels)
         lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)

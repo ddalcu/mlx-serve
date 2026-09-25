@@ -18,12 +18,12 @@ MODEL="${QWEN_IMAGE_MODEL:-$(ls -d /Users/Shared/mlx-serve/ddalcu/Qwen-Image-2.1
 
 OUT="$(mktemp -d)"
 LOG="$OUT/server.log"
-"$BIN" --serve --model-dir "$OUT" --port "$PORT" >"$LOG" 2>&1 &
+"$BIN" --serve --no-w8a8 --model-dir "$OUT" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 for _ in $(seq 1 60); do
   curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
+  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; cat "$LOG"; exit 1; }
   sleep 1
 done
 FAILS=0
@@ -52,6 +52,7 @@ grep -q "\[image\] Qwen-Image-2.1 ready" "$LOG" && pass "qwen_image backend enga
 
 [ "$(gen "$OUT/a.json" '"prompt":"a red fox in the snow"')" = 200 ] && png_check "$OUT/a.json" \
   && pass "txt2img -> 512x512 PNG" || fail "txt2img"
+if grep -q "\[w8a8\] engaged" "$LOG"; then fail "--no-w8a8 still engaged w8a8"; else pass "--no-w8a8 stays off w8a8"; fi
 grep -q "one forward per step" "$LOG" && pass "guidance 1.0 runs one forward per step" || fail "no one-forward log line"
 
 [ "$(gen "$OUT/b.json" '"prompt":"a red fox in the snow","guidance_scale":4,"negative_prompt":"blurry"')" = 200 ] && png_check "$OUT/b.json" \
@@ -71,6 +72,46 @@ grep -q "img2img" "$LOG" && pass "img2img engaged" || fail "no img2img log line"
   && pass "edit mode is a 400" || fail "edit mode was not refused"
 [ "$(gen "$OUT/e.json" '"prompt":"x","cond_weights":"1 1 1"')" = 400 ] \
   && pass "cond_weights is a 400" || fail "cond_weights was not refused"
+
+kill $SRV 2>/dev/null
+wait $SRV 2>/dev/null
+LOG="$OUT/server_w8.log"
+"$BIN" --serve --w8a8 --model-dir "$OUT" --port "$PORT" >"$LOG" 2>&1 &
+SRV=$!
+for _ in $(seq 1 60); do
+  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+  kill -0 $SRV 2>/dev/null || { echo "FAIL: w8a8 server did not start"; cat "$LOG"; exit 1; }
+  sleep 1
+done
+curl -s "http://127.0.0.1:$PORT/v1/load-model" -H 'Content-Type: application/json' -d "{\"model\":\"$MODEL\"}" >/dev/null
+[ "$(gen "$OUT/w8.json" '"prompt":"a red fox in the snow"')" = 200 ] && png_check "$OUT/w8.json" \
+  && pass "w8a8: txt2img -> 512x512 PNG" || fail "w8a8 txt2img"
+NAX=0
+"$BIN" --version 2>/dev/null | grep -q '^nax on ' && NAX=1
+DENSE=0
+python3 - "$MODEL/config.json" <<'PY'
+import json, sys
+q = (json.load(open(sys.argv[1])).get("quantization") or {})
+raise SystemExit(0 if int(q.get("dit_bits") or 16) >= 16 else 1)
+PY
+[ $? -eq 0 ] && DENSE=1
+if [ "$NAX" = 1 ] && [ "$DENSE" = 1 ]; then
+  grep -q "\[w8a8\] engaged" "$LOG" && pass "w8a8 kernel engaged" || fail "w8a8 kernel never engaged"
+elif [ "$NAX" = 1 ]; then
+  if grep -q "\[w8a8\] engaged" "$LOG"; then fail "w8a8 engaged on an affine pack"; else pass "affine pack did not engage w8a8"; fi
+  grep -q "\[w8a8\] idle" "$LOG" && pass "w8a8 idle on an affine pack" || fail "no idle line on an affine pack"
+else
+  if grep -q "\[w8a8\] engaged" "$LOG"; then fail "w8a8 engaged without NAX"; else pass "non-NAX generation stayed on the dense path"; fi
+  grep -q "NAX or shape is ineligible" "$LOG" && pass "non-NAX load disarmed w8a8" || fail "no ineligible fallback line"
+fi
+grep -q "parity probe FAILED" "$LOG" && fail "w8a8 parity probe failed a shape" || pass "w8a8 load did not die on a parity probe"
+python3 - "$OUT/w8.json" <<'FLAT'
+import sys, json, base64
+b = base64.b64decode(json.load(open(sys.argv[1]))["data"][0]["b64_json"])
+# A flat output compresses to almost nothing; a real 512x512 render does not.
+assert len(b) > 20000, f"render looks flat ({len(b)} bytes)"
+FLAT
+[ $? -eq 0 ] && pass "w8a8 render is not a flat colour" || fail "w8a8 render is flat"
 
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && pass "server alive" || fail "server died"
 grep -q "\[mlx\]" "$LOG" && fail "MLX error in the log"

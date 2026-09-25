@@ -962,7 +962,7 @@ fn sumComponentWeights(io: std.Io, parent: std.Io.Dir, name: []const u8, bytes: 
     var found_any = false;
     var it = top.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var comp = top.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer comp.close(io);
@@ -1376,6 +1376,46 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
     try testing.expectEqual(@as(usize, 1), result.models.len);
     try testing.expectEqualStrings("org/snap-model", result.models[0].id);
     try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
+}
+
+test "discovery measures symlinked component directories without recursive traversal" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const transformer_bytes: [13]u8 = @splat('t');
+    const vae_bytes: [17]u8 = @splat('v');
+    // Keep the real component tree outside discovery's two-level model scan.
+    try tmp.dir.createDirPath(io, ".components/transformer/nested");
+    try tmp.dir.createDirPath(io, ".components/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/transformer/model.safetensors", .data = &transformer_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/vae/model.safetensors", .data = &vae_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/transformer/nested/ignored.safetensors", .data = "ignored" });
+
+    try tmp.dir.createDirPath(io, "org/real-model/transformer");
+    try tmp.dir.createDirPath(io, "org/real-model/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/real-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/real-model/transformer/model.safetensors", .data = &transformer_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/real-model/vae/model.safetensors", .data = &vae_bytes });
+
+    try tmp.dir.createDirPath(io, "org/symlink-model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/symlink-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.symLink(io, "../../.components/transformer", "org/symlink-model/transformer", .{});
+    try tmp.dir.symLink(io, "../../.components/vae", "org/symlink-model/vae", .{});
+    // These malformed links cannot be opened as directories; both must be
+    // skipped without changing the bounded one-level component scan.
+    try tmp.dir.symLink(io, "../../.components/missing", "org/symlink-model/dangling", .{});
+    try tmp.dir.symLink(io, "loop", "org/symlink-model/loop", .{});
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    for (result.models) |model| {
+        try testing.expect(model.bytes_on_disk != null);
+        try testing.expectEqual(@as(u64, transformer_bytes.len + vae_bytes.len), model.bytes_on_disk.?);
+    }
 }
 
 test "discoverModels finds GGUF dirs without config.json (issue #59)" {

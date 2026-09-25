@@ -837,6 +837,12 @@
 "Negative prompt" = "负面提示词";
 "Network + port mapping" = "网络 + 端口映射";
 "Neural Engine" = "神经引擎";
+"Hardware Acceleration" = "硬件加速";
+"Qwen-Image w8a8 (M5 NAX)" = "Qwen-Image w8a8（M5 NAX）";
+"Accelerates Qwen-Image-2.1 with 8-bit weights and activations on the M5 GPU's neural accelerators. On by default when NAX is available. Other models are unchanged. Restart the server to apply changes." = "使用 M5 GPU 的神经加速器，以 8 位权重和激活值加速 Qwen-Image-2.1。NAX 可用时默认开启。其他模型不受影响。重启服务器以应用更改。";
+"Checking M5 NAX support…" = "正在检查 M5 NAX 支持…";
+"M5 NAX is unavailable. w8a8 requires an M5-class GPU and macOS 26.2 or later." = "M5 NAX 不可用。w8a8 需要 M5 级别的 GPU 和 macOS 26.2 或更高版本。";
+"Acceleration on the M5 GPU's neural accelerators (NAX) or the Apple Neural Engine. Each control names the models and hardware it supports. Restart the server to apply changes; active generations will stop." = "使用 M5 GPU 神经加速器（NAX）或 Apple 神经引擎加速。每个选项均注明支持的模型和硬件。重启服务器以应用更改；正在进行的生成将停止。";
 "Neural Engine image boost" = "神经引擎图像加速";
 "Neural Engine music boost" = "神经引擎音乐加速";
 "Neural Engine prefill boost" = "神经引擎预填充加速";

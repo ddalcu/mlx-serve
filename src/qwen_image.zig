@@ -27,12 +27,113 @@ const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
+const w8a8 = @import("w8a8.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 const MfLinear = mage_flow.MfLinear;
 const TextEncoder = mage_flow.TextEncoder;
+
+var w8_fallback_logged = false;
+var w8_fallback_logs: u32 = 0;
+var w8_idle_logged = false;
+var w8_idle_logs: u32 = 0;
+
+fn keepsFullPrecision(prefix: []const u8) bool {
+    return std.mem.eql(u8, prefix, "img_in") or
+        std.mem.eql(u8, prefix, "proj_out") or
+        std.mem.eql(u8, prefix, "modulation.1") or
+        std.mem.eql(u8, prefix, "time_text_embed.timestep_embedder.linear_1") or
+        std.mem.eql(u8, prefix, "time_text_embed.timestep_embedder.linear_2") or
+        std.mem.startsWith(u8, prefix, "txt_in.") or
+        std.mem.startsWith(u8, prefix, "norm_out.");
+}
+
+fn w8FallbackReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.W8a8AffineSource => "affine pack keeps its quantized matmul",
+        error.W8a8Ineligible => "NAX or shape is ineligible",
+        error.W8a8ParityFailed => "parity probe failed",
+        error.MetalKernelCompileFailed => "kernel compile failed",
+        error.SkipProbe => "probe skipped",
+        else => "w8a8 load failed",
+    };
+}
+
+fn noteW8Fallback(prefix: []const u8, err: anyerror) void {
+    if (w8_fallback_logged) return;
+    w8_fallback_logged = true;
+    w8_fallback_logs += 1;
+    log.info("[w8a8] {s} keeps the dense or packed path ({s}); later fallbacks are not logged\n", .{ prefix, w8FallbackReason(err) });
+}
+
+fn noteW8Idle(any_w8: bool) void {
+    if (any_w8 or w8_idle_logged) return;
+    if (!w8a8.enabled()) return;
+    if (!@import("transformer.zig").verifyQmmNaxAvailable()) return;
+    w8_idle_logged = true;
+    w8_idle_logs += 1;
+    log.info("[w8a8] idle: no eligible dense DiT linear\n", .{});
+}
+
+fn ditAnyW8(self: *const Dit) bool {
+    inline for (.{ &self.img_in, &self.txt_in, &self.txt_out, &self.t1, &self.t2, &self.modulation, &self.norm_out, &self.proj_out }) |l| {
+        if (l.usesW8()) return true;
+    }
+    for (self.blocks) |*b| {
+        inline for (.{ &b.q, &b.k, &b.v, &b.o, &b.proj, &b.gate, &b.out }) |l| {
+            if (l.usesW8()) return true;
+        }
+    }
+    return false;
+}
+
+/// A DiT linear: the shared dense-or-affine `MfLinear`, or the w8a8 NAX
+/// arm. ONE type at every call site, so the two paths cannot drift apart.
+const Lin = union(enum) {
+    mf: MfLinear,
+    w8: w8a8.Lin,
+
+    fn load(w: *const Weights, a: std.mem.Allocator, in_features: u32, dtype: mlx.mlx_dtype, s: S, comptime fmt: []const u8, args: anytype) !Lin {
+        const prefix = try std.fmt.allocPrint(a, fmt, args);
+        defer a.free(prefix);
+        if (w8a8.enabled() and !keepsFullPrecision(prefix)) {
+            if (w8a8.Lin.load(w, a, prefix, dtype, s)) |l| {
+                return .{ .w8 = l };
+            } else |err| noteW8Fallback(prefix, err);
+        }
+        return .{ .mf = try MfLinear.load(w, a, prefix, in_features, dtype, s) };
+    }
+
+    fn forward(self: *const Lin, x: A, bias: ?A, s: S) !A {
+        return switch (self.*) {
+            .mf => |*l| l.forward(x, bias, s),
+            .w8 => |*l| l.forward(x, bias, s),
+        };
+    }
+
+    fn usesW8(self: *const Lin) bool {
+        return switch (self.*) {
+            .mf => false,
+            .w8 => true,
+        };
+    }
+
+    fn forwardPrepared(self: *const Lin, x: A, prepared: ?*const w8a8.Prepared, bias: ?A, s: S) !A {
+        return switch (self.*) {
+            .mf => |*l| l.forward(x, bias, s),
+            .w8 => |*l| l.forwardQuantized(prepared orelse return error.W8a8MissingPrepared, bias, s),
+        };
+    }
+
+    fn deinit(self: *Lin) void {
+        switch (self.*) {
+            .mf => |*l| l.deinit(),
+            .w8 => |*l| l.deinit(),
+        }
+    }
+};
 
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
@@ -397,15 +498,15 @@ pub const Geometry = struct {
 };
 
 const Block = struct {
-    q: MfLinear,
-    k: MfLinear,
-    v: MfLinear,
-    o: MfLinear,
+    q: Lin,
+    k: Lin,
+    v: Lin,
+    o: Lin,
     norm_q: A, // f32
     norm_k: A,
-    proj: MfLinear,
-    gate: MfLinear,
-    out: MfLinear,
+    proj: Lin,
+    gate: Lin,
+    out: Lin,
 
     fn deinit(self: *Block) void {
         inline for (.{ &self.q, &self.k, &self.v, &self.o, &self.proj, &self.gate, &self.out }) |l| l.deinit();
@@ -437,10 +538,8 @@ fn loadVecF32(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8,
     return astype(raw, .float32, s);
 }
 
-fn loadLinear(w: *const Weights, a: std.mem.Allocator, in_features: u32, dtype: mlx.mlx_dtype, s: S, comptime fmt: []const u8, args: anytype) !MfLinear {
-    const prefix = try std.fmt.allocPrint(a, fmt, args);
-    defer a.free(prefix);
-    return MfLinear.load(w, a, prefix, in_features, dtype, s);
+fn loadLinear(w: *const Weights, a: std.mem.Allocator, in_features: u32, dtype: mlx.mlx_dtype, s: S, comptime fmt: []const u8, args: anytype) !Lin {
+    return Lin.load(w, a, in_features, dtype, s, fmt, args);
 }
 
 pub const Dit = struct {
@@ -448,16 +547,16 @@ pub const Dit = struct {
     s: S,
     cfg: DitConfig,
     dtype: mlx.mlx_dtype,
-    img_in: MfLinear,
+    img_in: Lin,
     txt_norm: A, // f32, stored zero-centred: holds weight + 1
-    txt_in: MfLinear,
-    txt_out: MfLinear,
-    t1: MfLinear,
-    t2: MfLinear,
-    modulation: MfLinear,
+    txt_in: Lin,
+    txt_out: Lin,
+    t1: Lin,
+    t2: Lin,
+    modulation: Lin,
     blocks: []Block,
-    norm_out: MfLinear,
-    proj_out: MfLinear,
+    norm_out: Lin,
+    proj_out: Lin,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, cfg: DitConfig, dtype: mlx.mlx_dtype) !Dit {
         const dir = try std.fmt.allocPrint(allocator, "{s}/transformer", .{model_dir});
@@ -499,6 +598,7 @@ pub const Dit = struct {
                 .out = try loadLinear(&w, a, H * cfg.mlp_ratio, dtype, s, p ++ "img_mlp.out", .{i}),
             };
         }
+        if (w8a8.enabled()) noteW8Idle(ditAnyW8(&self));
         return self;
     }
 
@@ -591,10 +691,10 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd].
-    fn headsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn headsOf(self: *const Dit, lin: *const Lin, norm: ?A, x: A, geo: *const Geometry, prepared: ?*const w8a8.Prepared) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const y = try lin.forward(x, null, s);
+        const y = try lin.forwardPrepared(x, prepared, null, s);
         defer free(y);
         const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
         defer free(y4);
@@ -613,11 +713,16 @@ pub const Dit = struct {
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
-        const q = try self.headsOf(&b.q, b.norm_q, x, geo);
+        var prepared: ?w8a8.Prepared = null;
+        if (b.q.usesW8() or b.k.usesW8() or b.v.usesW8())
+            prepared = try w8a8.prepare(x, s);
+        defer if (prepared) |*p| p.deinit();
+        const prepared_ptr: ?*const w8a8.Prepared = if (prepared) |*p| p else null;
+        const q = try self.headsOf(&b.q, b.norm_q, x, geo, prepared_ptr);
         defer free(q);
-        const k = try self.headsOf(&b.k, b.norm_k, x, geo);
+        const k = try self.headsOf(&b.k, b.norm_k, x, geo, prepared_ptr);
         defer free(k);
-        const v = try self.headsOf(&b.v, null, x, geo);
+        const v = try self.headsOf(&b.v, null, x, geo, prepared_ptr);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -661,11 +766,16 @@ pub const Dit = struct {
         defer free(n2);
         const m_in = try mulA(n2, mod.scale2, s);
         defer free(m_in);
-        const g = try b.gate.forward(m_in, null, s);
+        var prepared: ?w8a8.Prepared = null;
+        if (b.gate.usesW8() or b.proj.usesW8())
+            prepared = try w8a8.prepare(m_in, s);
+        defer if (prepared) |*p| p.deinit();
+        const prepared_ptr: ?*const w8a8.Prepared = if (prepared) |*p| p else null;
+        const g = try b.gate.forwardPrepared(m_in, prepared_ptr, null, s);
         defer free(g);
         const sg = try silu(g, s);
         defer free(sg);
-        const p = try b.proj.forward(m_in, null, s);
+        const p = try b.proj.forwardPrepared(m_in, prepared_ptr, null, s);
         defer free(p);
         const gp = try mulA(sg, p, s);
         defer free(gp);
@@ -1485,6 +1595,7 @@ pub const Engine = struct {
         try mlx.check(mlx.mlx_random_normal(&noise, &nsh, 3, .float32, 0.0, 1.0, key, s));
         var img = if (opts.init_image) |pix| try self.noisedSource(pix, noise, sigmas[start]) else try astype(noise, COMPUTE, s);
         defer free(img);
+        if (latentDumpDir()) |dir| try dumpF32Tensor(self.io, dir, "noise", img, s);
 
         const run = n_steps - start;
         for (start..n_steps) |i| {
@@ -1509,6 +1620,12 @@ pub const Engine = struct {
             free(img);
             img = next;
             try mlx.check(mlx.mlx_array_eval(img));
+            if (i == start) {
+                if (latentDumpDir()) |dir| {
+                    try dumpF32Tensor(self.io, dir, "dit_step0", v, s);
+                    try dumpF32Tensor(self.io, dir, "latent_step0", img, s);
+                }
+            }
             if (progress) |p| p.emit("Generating", @intCast(i + 1 - start), run);
         }
 
@@ -1518,6 +1635,7 @@ pub const Engine = struct {
         defer free(grid);
         const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
         defer free(latent);
+        if (latentDumpDir()) |dir| try dumpF32Tensor(self.io, dir, "latent_final", latent, s);
         const decoded = try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
@@ -1549,6 +1667,46 @@ pub const Engine = struct {
     }
 };
 
+fn latentDumpDir() ?[]const u8 {
+    const raw = std.c.getenv("MLX_SERVE_QWEN_LATENT_DIR") orelse return null;
+    const dir = std.mem.span(raw);
+    if (dir.len == 0) return null;
+    return dir;
+}
+
+fn dumpF32Tensor(io: std.Io, dir: []const u8, name: []const u8, arr: A, s: S) !void {
+    const f32a = try astype(arr, .float32, s);
+    defer free(f32a);
+    try mlx.check(mlx.mlx_array_eval(f32a));
+    const data = mlx.mlx_array_data_float32(f32a) orelse return error.NoData;
+    const n = mlx.mlx_array_size(f32a);
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    var nbuf: [64]u8 = undefined;
+    const fname = try std.fmt.bufPrint(&nbuf, "{s}.f32", .{name});
+    var fh = try d.createFile(io, fname, .{});
+    defer fh.close(io);
+    var wbuf: [8192]u8 = undefined;
+    var w = fh.writer(io, &wbuf);
+    try w.interface.writeAll(std.mem.sliceAsBytes(data[0..n]));
+    try w.interface.flush();
+    var sbuf: [80]u8 = undefined;
+    const sname = try std.fmt.bufPrint(&sbuf, "{s}.shape", .{name});
+    var shf = try d.createFile(io, sname, .{});
+    defer shf.close(io);
+    var sw = shf.writer(io, &wbuf);
+    const shape = mlx.getShape(f32a);
+    var line: [64]u8 = undefined;
+    var lw: std.Io.Writer = .fixed(&line);
+    for (shape, 0..) |dim, i| {
+        if (i != 0) try lw.writeAll(" ");
+        try lw.print("{d}", .{dim});
+    }
+    try lw.writeAll("\n");
+    try sw.interface.writeAll(lw.buffered());
+    try sw.interface.flush();
+}
+
 /// [-1,1] → clip(x·0.5 + 0.5, 0, 1).
 fn denormImage(decoded: A, s: S) !A {
     const half = try mulScalar(decoded, 0.5, s);
@@ -1570,6 +1728,125 @@ fn denormImage(decoded: A, s: S) !A {
 // ── Tests ──
 
 const testing = std.testing;
+
+fn putBf16Weight(w: *Weights, s: S, key_name: []const u8, n: usize, k: usize) !void {
+    const vals = try testing.allocator.alloc(f32, n * k);
+    defer testing.allocator.free(vals);
+    for (vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 3) % 11)) * 0.05 - 0.2;
+    const host = mlx.mlx_array_new_data(vals.ptr, &[_]c_int{ @intCast(n), @intCast(k) }, 2, .float32);
+    defer free(host);
+    var wb = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&wb, host, .bfloat16, s));
+    const key = try testing.allocator.dupe(u8, key_name);
+    var handle = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&handle, wb));
+    free(wb);
+    try w.map.put(key, handle);
+}
+
+test "QwenImage w8a8 probe failure loads the dense linear" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try putBf16Weight(&weights, s, "attn.to_q.weight", 8, 32);
+    try putBf16Weight(&weights, s, "attn.to_k.weight", 8, 32);
+    const saved_override = w8a8.override;
+    const saved_fault = w8a8.test_load_fault;
+    const saved_logged = w8_fallback_logged;
+    const saved_logs = w8_fallback_logs;
+    defer {
+        w8a8.override = saved_override;
+        w8a8.test_load_fault = saved_fault;
+        w8_fallback_logged = saved_logged;
+        w8_fallback_logs = saved_logs;
+    }
+    w8a8.override = true;
+    const faults = [_]w8a8.LoadFault{ .parity, .skip_probe, .compile };
+    for (faults) |fault| {
+        w8a8.test_load_fault = fault;
+        w8_fallback_logged = false;
+        w8_fallback_logs = 0;
+        var first = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "attn.to_q", .{});
+        defer first.deinit();
+        var second = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "attn.to_k", .{});
+        defer second.deinit();
+        try testing.expect(!first.usesW8());
+        try testing.expect(!second.usesW8());
+        try testing.expectEqual(@as(u32, 1), w8_fallback_logs);
+    }
+}
+
+test "QwenImage w8a8 keeps timestep, modulation, img_in and proj_out at full precision" {
+    try testing.expect(keepsFullPrecision("img_in"));
+    try testing.expect(keepsFullPrecision("proj_out"));
+    try testing.expect(keepsFullPrecision("modulation.1"));
+    try testing.expect(keepsFullPrecision("time_text_embed.timestep_embedder.linear_1"));
+    try testing.expect(keepsFullPrecision("time_text_embed.timestep_embedder.linear_2"));
+    try testing.expect(keepsFullPrecision("txt_in.in_layer"));
+    try testing.expect(keepsFullPrecision("txt_in.out_layer"));
+    try testing.expect(keepsFullPrecision("norm_out.linear"));
+    try testing.expect(!keepsFullPrecision("transformer_blocks.0.attn.to_q"));
+    try testing.expect(!keepsFullPrecision("transformer_blocks.0.img_mlp.proj"));
+    try testing.expect(!keepsFullPrecision("transformer_blocks.0.img_mlp.gate_layer"));
+    try testing.expect(!keepsFullPrecision("transformer_blocks.0.img_mlp.out"));
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try putBf16Weight(&weights, s, "img_in.weight", 8, 32);
+    try putBf16Weight(&weights, s, "txt_in.in_layer.weight", 8, 32);
+    try putBf16Weight(&weights, s, "txt_in.out_layer.weight", 8, 32);
+    try putBf16Weight(&weights, s, "norm_out.linear.weight", 8, 32);
+    try putBf16Weight(&weights, s, "attn.to_q.weight", 8, 32);
+    const saved_override = w8a8.override;
+    const saved_fault = w8a8.test_load_fault;
+    defer {
+        w8a8.override = saved_override;
+        w8a8.test_load_fault = saved_fault;
+    }
+    w8a8.override = true;
+    w8a8.test_load_fault = .none;
+    var img = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "img_in", .{});
+    defer img.deinit();
+    var tin = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "txt_in.in_layer", .{});
+    defer tin.deinit();
+    var tout = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "txt_in.out_layer", .{});
+    defer tout.deinit();
+    var nout = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "norm_out.linear", .{});
+    defer nout.deinit();
+    var q = try Lin.load(&weights, testing.allocator, 32, .bfloat16, s, "attn.to_q", .{});
+    defer q.deinit();
+    try testing.expect(!img.usesW8());
+    try testing.expect(!tin.usesW8());
+    try testing.expect(!tout.usesW8());
+    try testing.expect(!nout.usesW8());
+    const nax = @import("transformer.zig").verifyQmmNaxAvailable();
+    try testing.expectEqual(nax, q.usesW8());
+}
+
+test "QwenImage w8a8 is idle when no linear is eligible" {
+    const saved_override = w8a8.override;
+    const saved_idle = w8_idle_logged;
+    const saved_logs = w8_idle_logs;
+    const saved_nax = @import("transformer.zig").vqmm_nax_probe_override;
+    defer {
+        w8a8.override = saved_override;
+        w8_idle_logged = saved_idle;
+        w8_idle_logs = saved_logs;
+        @import("transformer.zig").vqmm_nax_probe_override = saved_nax;
+    }
+    w8a8.override = true;
+    @import("transformer.zig").vqmm_nax_probe_override = true;
+    w8_idle_logged = false;
+    w8_idle_logs = 0;
+    noteW8Idle(true);
+    try testing.expectEqual(@as(u32, 0), w8_idle_logs);
+    noteW8Idle(false);
+    try testing.expectEqual(@as(u32, 1), w8_idle_logs);
+    noteW8Idle(false);
+    try testing.expectEqual(@as(u32, 1), w8_idle_logs);
+}
 
 test "QwenImage sigmas match the reference schedule" {
     // mflux LinearScheduler, 512x320 (seq 640), 8 steps.

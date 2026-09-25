@@ -4,8 +4,8 @@ import XCTest
 /// Custom (user-added) media models: any checkpoint the server discovers in a
 /// model root with a supported media arch shows up in its pane's picker as an
 /// "On This Mac" row, synthesized from the matching family preset — same knobs
-/// and capability declarations, its own id/repo. The source of truth is
-/// `/v1/models` (`ServerManager.allModels`), the same list the LAN rows read.
+/// and capability declarations, its own id/repo. Registry metadata wins;
+/// disk discovery supplies usable model-root entries while the server is down.
 final class CustomMediaModelsTests: XCTestCase {
 
     private func info(_ name: String, arch: String, caps: [String],
@@ -82,6 +82,78 @@ final class CustomMediaModelsTests: XCTestCase {
     }
 
     // MARK: - What gets a row
+
+    func testOfflineLocalPacksResolveWithoutARegisteredServerModel() {
+        let families = [
+            ("qwen", "qwen_image21"), ("video", "AudioVideo"),
+            ("tts", "qwen3_tts"), ("music", "acestep"), ("mesh", "hunyuan3d_2_1")
+        ]
+        let local = families.map { name, arch in
+            LocalModel(id: name, name: "local/\(name)", path: "/models/local/\(name)",
+                       sizeFormatted: "1 GB", modelType: arch, source: .mlxServe, kind: .base)
+        }
+        let models = CustomMediaModels.pickerModels(server: [], local: local)
+        XCTAssertTrue(models.allSatisfy { !$0.loaded })
+        XCTAssertEqual(CustomMediaModels.imagePresets(from: models).map(\.id), ["local/qwen"])
+        XCTAssertEqual(CustomMediaModels.videoPresets(from: models).map(\.id), ["local/video"])
+        XCTAssertEqual(CustomMediaModels.audioPresets(from: models).map(\.id), ["local/tts"])
+        XCTAssertEqual(CustomMediaModels.musicPresets(from: models).map(\.id), ["local/music"])
+        XCTAssertEqual(CustomMediaModels.meshPresets(from: models).map(\.id), ["local/mesh"])
+        var settings = ImageGenSettings()
+        settings.modelId = "local/qwen"
+        XCTAssertEqual(settings.resolvedModel(models: models).repo, "local/qwen")
+    }
+
+    func testOfflineMergeKeepsServerMetadataAndOmitsBrokenPacks() {
+        let local = LocalModel(id: "qwen", name: "local/qwen", path: "/models/local/qwen",
+                               sizeFormatted: "1 GB", modelType: "qwen_image21",
+                               source: .mlxServe, kind: .base)
+        var broken = LocalModel(id: "broken", name: "local/broken", path: "/models/local/broken",
+                                sizeFormatted: "0 GB", modelType: "qwen_image21",
+                                source: .mlxServe, kind: .base)
+        broken.defect = .missingWeights
+        let server = info("local/qwen", arch: "qwen_image21", caps: ["image"])
+        let merged = CustomMediaModels.pickerModels(server: [server], local: [local, local, broken])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged[0].quantBits, server.quantBits)
+        XCTAssertEqual(merged[0].capabilities, ["image"])
+    }
+
+    func testInstalledQwenImagePackIsSelectableOfflineWhenProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["W8A8_APP_TEST_MODEL"] else {
+            throw XCTSkip("Set W8A8_APP_TEST_MODEL to an existing org/repo model directory")
+        }
+        let url = URL(fileURLWithPath: path)
+        let id = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
+        let local = DownloadManager.makeLocalModels(atDir: path, displayName: id,
+                                                    idKey: id, source: .mlxServe)
+        XCTAssertFalse(local.isEmpty)
+        XCTAssertTrue(local.allSatisfy { $0.defect == nil })
+        let rows = CustomMediaModels.pickerModels(server: [], local: local)
+        let preset = try XCTUnwrap(CustomMediaModels.imagePreset(for: id, from: rows))
+        XCTAssertEqual(preset.repo, id)
+        let root = url.deletingLastPathComponent().deletingLastPathComponent().path
+        XCTAssertTrue(preset.bundle.components.allSatisfy {
+            DownloadManager.componentReady($0, modelsRoot: root)
+        })
+    }
+
+    func testOfflinePickerDoesNotOfferUnresolvableHubSnapshots() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let snapshot = root.appendingPathComponent("models--org--qwen/snapshots/revision")
+        try fm.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try Data("{}".utf8).write(to: snapshot.appendingPathComponent("config.json"))
+        try Data([1]).write(to: snapshot.appendingPathComponent("model.safetensors"))
+        let cached = LocalModel(id: "cached", name: "org/qwen", path: snapshot.path,
+                                sizeFormatted: "1 GB", modelType: "qwen_image21",
+                                source: .huggingFace, kind: .base)
+        let component = MediaComponent(repo: cached.name, selection: .chatDefault,
+                                       readyMarkers: ["config.json"])
+        XCTAssertFalse(DownloadManager.componentReady(component, modelsRoot: root.path))
+        XCTAssertTrue(CustomMediaModels.pickerModels(server: [], local: [cached]).isEmpty)
+    }
 
     /// Catalog repos never duplicate into custom rows (they're already preset
     /// rows), LAN entries never show under "On This Mac" (they have their own

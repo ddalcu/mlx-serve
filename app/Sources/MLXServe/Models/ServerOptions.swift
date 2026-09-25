@@ -155,6 +155,13 @@ struct ServerOptions: Codable, Equatable {
     var aneImage: Bool = false
     var aneVideo: Bool = false
     var aneAudio: Bool = false
+    /// Qwen-Image-2.1 int8 weights/activations on M5 GPU NAX; applied at load.
+    static let qwenImageW8A8Default = false
+    var qwenImageW8A8: Bool = qwenImageW8A8Default
+
+    func effectiveW8A8(naxAvailable: Bool) -> Bool {
+        qwenImageW8A8 && naxAvailable
+    }
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -522,6 +529,7 @@ struct ServerOptions: Codable, Equatable {
         aneImage == other.aneImage &&
         aneVideo == other.aneVideo &&
         aneAudio == other.aneAudio &&
+        qwenImageW8A8 == other.qwenImageW8A8 &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -696,6 +704,9 @@ struct ServerOptions: Codable, Equatable {
         if aneImage { args += ["--ane-image"] }
         if aneVideo { args += ["--ane-video"] }
         if aneAudio { args += ["--ane-audio"] }
+        if qwenImageW8A8 != Self.qwenImageW8A8Default {
+            args += [qwenImageW8A8 ? "--w8a8" : "--no-w8a8"]
+        }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
         // explicit choice emits its flag, and the positive form is what opts
@@ -892,6 +903,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .qwenImageW8A8) { qwenImageW8A8 = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -1097,6 +1109,10 @@ extension ServerOptions {
             explainer: "Runs part of music generation on the Neural Engine alongside the GPU. Measured 1.33x on an M4 Max, 1.58x on an M4 base — smaller Macs gain more, since every Mac has the same 16-core Neural Engine and only the GPU scales. Off by default; the server declines by name when this Mac cannot hold it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
+        "qwenImageW8A8": .init(
+            title: "Qwen-Image w8a8 (M5 NAX)",
+            explainer: "Runs Qwen-Image-2.1 DiT linears as int8 weights and activations on an M5 GPU. Off by default. Dense bf16 or f16 weights only; an affine pack keeps its quantized matmul. Other models are unchanged. Restart the server to apply changes.",
+            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",

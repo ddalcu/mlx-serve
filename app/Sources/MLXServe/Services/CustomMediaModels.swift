@@ -12,10 +12,32 @@ import SwiftUI
 /// picker id and the on-disk repo. An arch the engine can't serve never gets a
 /// row, because discovery never lists it.
 ///
-/// Source of truth is `ServerManager.allModels` — the list the LAN rows
-/// already read — so custom rows share its one limitation: nothing renders
-/// while the server is down.
+/// Registry metadata wins when available; local disk discovery fills the
+/// picker while the server is stopped.
 enum CustomMediaModels {
+
+    static func pickerModels(server: [ModelInfo], local: [LocalModel]) -> [ModelInfo] {
+        var models = server
+        var seen = Set(server.map(\.name))
+        for model in local where model.defect == nil && model.kind == .base && model.isSupportedArchitecture {
+            // Media bundles resolve org/repo under model roots, not HF snapshot paths.
+            guard model.source != .huggingFace else { continue }
+            let arch = model.modelType
+            let capability: String
+            if imageFamily(arch: arch, id: model.name) != nil { capability = "image" }
+            else if videoFamily(arch: arch) != nil { capability = "video" }
+            else if audioFamily(arch: arch) != nil { capability = "audio" }
+            else if musicFamily(arch: arch) != nil { capability = "music" }
+            else if meshFamily(arch: arch) != nil { capability = "3d" }
+            else { continue }
+            guard seen.insert(model.name).inserted else { continue }
+            models.append(ModelInfo(
+                name: model.name, quantBits: model.quantBits ?? 0, layers: 0,
+                hiddenSize: 0, vocabSize: 0, contextLength: 0, modelMaxTokens: 0,
+                architecture: arch, capabilities: [capability], loaded: false, state: "unloaded"))
+        }
+        return models
+    }
 
     /// Everything a synthesized preset needs from a registry entry.
     private static func entry(for id: String, in models: [ModelInfo]) -> ModelInfo? {

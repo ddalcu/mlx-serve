@@ -49,7 +49,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .lanSharing:        return "LAN Sharing"
         case .providers:         return "Providers"
         case .performance:       return "Performance"
-        case .neuralEngine:      return "Neural Engine"
+        case .neuralEngine:      return "Hardware Acceleration"
         case .specDecode:        return "Speculative Decoding (MLX only)"
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
         case .ds4:               return "DeepSeek-V4 (ds4 engine)"

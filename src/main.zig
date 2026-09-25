@@ -28,6 +28,7 @@ const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("ane.zig");
+const w8a8_mod = @import("w8a8.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -198,6 +199,9 @@ fn printUsage(io: std.Io) void {
         \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
+        \\  --w8a8 / --no-w8a8  Enable/disable Qwen-Image-2.1 int8 weights and
+        \\                        activations on M5 NAX. Off unless --w8a8.
+        \\                        Dense bf16/f16 DiT weights only.
         \\  --mtp               Force the MTP head ON for MoE targets too.
         \\                        Requests default to MTP only on DENSE models;
         \\                        a MoE checkpoint that ships a sidecar is
@@ -744,6 +748,8 @@ pub fn main(init: std.process.Init) !void {
             ane_media.video = true;
         } else if (std.mem.eql(u8, args[i], "--ane-audio")) {
             ane_media.audio = true;
+        } else if (w8a8_mod.optionValue(args[i])) |value| {
+            w8a8_mod.override = value;
         } else if (std.mem.eql(u8, args[i], "--ane-split") and i + 1 < args.len) {
             i += 1;
             const v = std.fmt.parseFloat(f32, args[i]) catch 0;

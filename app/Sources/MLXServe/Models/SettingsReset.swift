@@ -104,6 +104,7 @@ enum SettingsReset {
                 f("aneImage") { $0.aneImage = $1.aneImage },
                 f("aneVideo") { $0.aneVideo = $1.aneVideo },
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
+                f("qwenImageW8A8") { $0.qwenImageW8A8 = $1.qwenImageW8A8 },
             ]
 
         case .ggufPerformance:

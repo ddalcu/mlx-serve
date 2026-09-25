@@ -115,6 +115,15 @@ class ServerManager: ObservableObject {
         return !last.serverLaunchEquals(current)
     }
 
+    func restart(modelPath: String, options: ServerOptions) {
+        stop()
+        if modelPath.isEmpty {
+            startHeadless(modelsDir: Self.modelsRoot, options: options)
+        } else {
+            start(modelPath: modelPath, options: options)
+        }
+    }
+
     func start(modelPath: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
 
@@ -728,11 +737,11 @@ class ServerManager: ObservableObject {
     /// `loadModel(id:)`s the media model by path. `dir` is accepted for symmetry
     /// / future per-model routing; the headless `--model-dir` is the models root
     /// so chat models stay discoverable.
-    func ensureRunning(forGenModelDir dir: String) async throws -> UInt16 {
+    func ensureRunning(forGenModelDir dir: String, options: ServerOptions = ServerOptions.load()) async throws -> UInt16 {
         _ = dir
         if status == .running { return port }
         if status != .starting {
-            startHeadless(modelsDir: Self.modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
+            startHeadless(modelsDir: Self.modelsRoot, options: options)
         }
         try await waitUntilRunning(timeout: 240)
         return port

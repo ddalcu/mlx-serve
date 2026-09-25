@@ -3999,7 +3999,7 @@ fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
             const st = dir.statFile(io, entry.name, .{}) catch continue;
             if (st.kind != .file) continue;
             total += @intCast(st.size);
-        } else if (entry.kind == .directory) {
+        } else if (entry.kind == .directory or entry.kind == .sym_link) {
             var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
             defer sub.close(io);
             var sit = sub.iterate();
@@ -4910,6 +4910,46 @@ test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR workin
     var empty = std.testing.tmpDir(.{ .iterate = true });
     defer empty.cleanup();
     try std.testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, empty.dir, "minimax_music3"));
+}
+
+test "estimateResidentBytes follows symlinked component directories once" {
+    const allocator = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const transformer_bytes: [13]u8 = @splat('t');
+    const vae_bytes: [17]u8 = @splat('v');
+    try tmp.dir.createDirPath(io, ".components/transformer/nested");
+    try tmp.dir.createDirPath(io, ".components/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/transformer/model.safetensors", .data = &transformer_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/vae/model.safetensors", .data = &vae_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".components/transformer/nested/ignored.safetensors", .data = "ignored" });
+
+    try tmp.dir.createDirPath(io, "real/transformer");
+    try tmp.dir.createDirPath(io, "real/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/transformer/model.safetensors", .data = &transformer_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/vae/model.safetensors", .data = &vae_bytes });
+
+    try tmp.dir.createDirPath(io, "symlinked");
+    try tmp.dir.symLink(io, "../.components/transformer", "symlinked/transformer", .{});
+    try tmp.dir.symLink(io, "../.components/vae", "symlinked/vae", .{});
+    // Dangling and self-referential component links must fail closed without
+    // turning this one-level scan into recursive symlink traversal.
+    try tmp.dir.symLink(io, "../.components/missing", "symlinked/dangling", .{});
+    try tmp.dir.symLink(io, "loop", "symlinked/loop", .{});
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const real_path = try std.fs.path.join(allocator, &.{ root, "real" });
+    defer allocator.free(real_path);
+    const symlinked_path = try std.fs.path.join(allocator, &.{ root, "symlinked" });
+    defer allocator.free(symlinked_path);
+
+    const expected = @as(u64, transformer_bytes.len + vae_bytes.len);
+    try testing.expectEqual(expected, estimateResidentBytes(io, real_path));
+    try testing.expectEqual(expected, estimateResidentBytes(io, symlinked_path));
 }
 
 test "parseSize parses WxH and rejects garbage" {

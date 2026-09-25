@@ -1074,9 +1074,24 @@ class DownloadManager: ObservableObject {
     }
 
     nonisolated static func hasSafetensorsRecursive(_ dir: String) -> Bool {
-        guard let en = FileManager.default.enumerator(atPath: dir) else { return false }
-        while let f = en.nextObject() as? String {
-            if (f as NSString).lastPathComponent.hasSuffix(".safetensors") { return true }
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey]
+        var pending = [URL(fileURLWithPath: dir)]
+        var visited = Set<String>()
+        while let directory = pending.popLast() {
+            let resolved = directory.resolvingSymlinksInPath()
+            guard visited.insert(resolved.path).inserted,
+                  let children = try? fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: Array(keys))
+            else { continue }
+            for child in children {
+                let target = child.resolvingSymlinksInPath()
+                guard let info = try? target.resourceValues(forKeys: keys) else { continue }
+                if info.isDirectory == true {
+                    pending.append(target)
+                } else if info.isRegularFile == true && child.pathExtension == "safetensors" {
+                    return true
+                }
+            }
         }
         return false
     }
