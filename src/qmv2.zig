@@ -201,20 +201,23 @@ pub const Plan = union(enum) {
 
 /// Per GPU generation (`applegpu_gNN`), from kernel sweeps over the Bonsai 27B
 /// shapes against stock at M = 1..8; a generation nobody measured keeps `legacy`.
-pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, k: c_int) Plan {
+/// Below 2048 output rows too few threadgroups stream K and stock wins.
+pub fn planFor(gen: u32, phone: bool, dt: mlx.mlx_dtype, m: c_int, n: c_int, k: c_int) Plan {
     if (m < 1 or m > MAX_ROWS) return .stock;
     if (phone) return .legacy;
+    const measured = gen == 13 or gen == 16 or gen == 17;
+    if (!measured) return .legacy;
+    if (n < 2048) return .stock;
     return switch (gen) {
         13 => .{ .rows = R4G2 },
         16 => .{ .rows = if (@rem(m, 2) == 1) R4G2 else R2G8 },
-        // Stock wins at M = 5 and at bf16 M = 1 here.
-        17 => if (m == 5 or (m == 1 and dt == .bfloat16))
+        // Stock wins at M = 5, and at M = 1 on anything narrower than the MLP.
+        else => if (m == 5 or (m == 1 and (dt == .bfloat16 or n < 16384)))
             .stock
         else if (m == 1)
             .{ .rows = R4G2 }
         else
             .{ .rows = if (m == 3 or k >= 16384) R4G8 else R2G8 },
-        else => .legacy,
     };
 }
 
@@ -229,7 +232,7 @@ fn deviceGen() struct { gen: u32, phone: bool } {
     var buf: [128]u8 = undefined;
     const parsed = xfm.naxArchGeneration(xfm.gpuArchitecture(&buf) orelse "");
     gen_cache = .{ .gen = parsed.gen, .phone = parsed.phone };
-    log.info("[qmv2] 2-bit dispatch for GPU generation {d}{s}: {s}\n", .{ parsed.gen, if (parsed.phone) " (phone)" else "", switch (planFor(parsed.gen, parsed.phone, .float16, 2, 5120)) {
+    log.info("[qmv2] 2-bit dispatch for GPU generation {d}{s}: {s}\n", .{ parsed.gen, if (parsed.phone) " (phone)" else "", switch (planFor(parsed.gen, parsed.phone, .float16, 2, 17408, 5120)) {
         .legacy => "legacy (unmeasured generation)",
         else => "measured plan",
     } });
@@ -309,8 +312,10 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     if (xs.len == 0) return null;
     var m: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| m *= d;
+    const ws = mlx.getShape(w);
+    if (ws.len != 2) return null;
     const g = deviceGen();
-    switch (planFor(g.gen, g.phone, mlx.mlx_array_dtype(x), m, xs[xs.len - 1])) {
+    switch (planFor(g.gen, g.phone, mlx.mlx_array_dtype(x), m, ws[0], xs[xs.len - 1])) {
         .stock => return null,
         .rows => |geom| {
             if (bneg) return qmvRowsAt(x, w, sc, bi, bits, group_size, true, geom, s);
@@ -459,25 +464,31 @@ test "qmv2: no worse than stock quantized_matmul against f32 truth (bf16 + f16, 
 
 test "qmv2.planFor: measured generations get their geometry, everything else keeps legacy" {
     // M1 (g13): R4 G2 at every width.
-    for (1..MAX_ROWS + 1) |m| try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(13, false, .bfloat16, @intCast(m), 5120));
+    for (1..MAX_ROWS + 1) |m| try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(13, false, .bfloat16, @intCast(m), 17408, 5120));
     // M4 (g16): R4 G2 odd, R2 G8 even.
-    try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(16, false, .float16, 3, 5120));
-    try std.testing.expectEqual(Plan{ .rows = R2G8 }, planFor(16, false, .float16, 4, 5120));
-    // M5 (g17): stock at M = 5 and bf16 M = 1; R4 G8 at M = 3 or a wide K.
-    try std.testing.expectEqual(Plan.stock, planFor(17, false, .float16, 5, 5120));
-    try std.testing.expectEqual(Plan.stock, planFor(17, false, .bfloat16, 1, 5120));
-    try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(17, false, .float16, 1, 5120));
-    try std.testing.expectEqual(Plan{ .rows = R4G8 }, planFor(17, false, .bfloat16, 2, 17408));
-    try std.testing.expectEqual(Plan{ .rows = R2G8 }, planFor(17, false, .bfloat16, 2, 5120));
-    // Unmeasured: M2/M3 and phones. Past the kernel's width: stock.
-    for ([_]u32{ 0, 14, 15, 18 }) |gen| try std.testing.expectEqual(Plan.legacy, planFor(gen, false, .float16, 2, 5120));
-    try std.testing.expectEqual(Plan.legacy, planFor(13, true, .float16, 2, 5120));
-    try std.testing.expectEqual(Plan.stock, planFor(13, false, .float16, MAX_ROWS + 1, 5120));
+    try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(16, false, .float16, 3, 17408, 5120));
+    try std.testing.expectEqual(Plan{ .rows = R2G8 }, planFor(16, false, .float16, 4, 17408, 5120));
+    // M5 (g17): stock at M = 5 and at M = 1 below the MLP width or in bf16.
+    try std.testing.expectEqual(Plan.stock, planFor(17, false, .float16, 5, 17408, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(17, false, .bfloat16, 1, 17408, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(17, false, .float16, 1, 12288, 5120));
+    try std.testing.expectEqual(Plan{ .rows = R4G2 }, planFor(17, false, .float16, 1, 17408, 5120));
+    try std.testing.expectEqual(Plan{ .rows = R4G8 }, planFor(17, false, .bfloat16, 2, 5120, 17408));
+    try std.testing.expectEqual(Plan{ .rows = R2G8 }, planFor(17, false, .bfloat16, 2, 17408, 5120));
+    // Narrow outputs (GDN a/b, k/v) go to stock on every measured generation.
+    for ([_]u32{ 13, 16, 17 }) |gen| try std.testing.expectEqual(Plan.stock, planFor(gen, false, .float16, 2, 1024, 5120));
+    // Unmeasured: M2/M3 and phones, at every width. Past the kernel's rows: stock.
+    for ([_]u32{ 0, 14, 15, 18 }) |gen| {
+        try std.testing.expectEqual(Plan.legacy, planFor(gen, false, .float16, 2, 17408, 5120));
+        try std.testing.expectEqual(Plan.legacy, planFor(gen, false, .float16, 2, 1024, 5120));
+    }
+    try std.testing.expectEqual(Plan.legacy, planFor(13, true, .float16, 2, 17408, 5120));
+    try std.testing.expectEqual(Plan.stock, planFor(13, false, .float16, MAX_ROWS + 1, 17408, 5120));
 }
 
 test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte" {
     const s = mlx.gpuStream();
-    const n: c_int = 256;
+    const n: c_int = 2048;
     const k: c_int = 1024;
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();

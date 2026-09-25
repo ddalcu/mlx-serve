@@ -38808,19 +38808,21 @@ test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embed
 
 test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
     const s = mlx.gpuStream();
-    const n: c_int = 64;
+    const n: c_int = 2048;
     const k: c_int = 512;
     var prng = std.Random.DefaultPrng.init(11);
     const rnd = prng.random();
-    var codes: [@divExact(64 * 512, 16)]u32 = undefined;
-    for (&codes) |*wd| wd.* = rnd.int(u32);
-    var scv: [@divExact(64 * 512, 128)]f32 = undefined;
-    for (&scv) |*e| e.* = 0.01 + 0.01 * rnd.float(f32);
+    const codes = try std.testing.allocator.alloc(u32, @divExact(2048 * 512, 16));
+    defer std.testing.allocator.free(codes);
+    for (codes) |*wd| wd.* = rnd.int(u32);
+    const scv = try std.testing.allocator.alloc(f32, @divExact(2048 * 512, 128));
+    defer std.testing.allocator.free(scv);
+    for (scv) |*e| e.* = 0.01 + 0.01 * rnd.float(f32);
     var xv: [2 * 512]f32 = undefined;
     for (&xv) |*e| e.* = rnd.floatNorm(f32);
-    const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32);
+    const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32);
     defer _ = mlx.mlx_array_free(w);
-    const sc32 = mlx.mlx_array_new_data(&scv, &[_]c_int{ n, @divExact(k, 128) }, 2, .float32);
+    const sc32 = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{ n, @divExact(k, 128) }, 2, .float32);
     defer _ = mlx.mlx_array_free(sc32);
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
