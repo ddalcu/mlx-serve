@@ -413,6 +413,11 @@ private struct MenuBarLabel: View {
             .onChange(of: appState.pendingChatOpenTick) { _, _ in
                 open("chat")
             }
+            // The launch plan can bump the tick before this label mounts (a fast
+            // library scan), and onChange never sees a change from before it.
+            .onAppear {
+                if appState.pendingChatOpenTick > 0 { open("chat") }
+            }
             // browse{show} bumps this on the manager and the scene opens the window.
             .onChange(of: browser.showRequestTick) { _, _ in
                 open("browser")

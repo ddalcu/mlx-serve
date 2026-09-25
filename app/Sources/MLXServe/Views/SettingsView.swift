@@ -25,7 +25,7 @@ struct SettingsView: View {
     @State private var visibleRows = 0
 
     /// What the sections below the containers edit — see `SettingsFormState`.
-    @State private var formState = SettingsFormState()
+    @StateObject private var formState = SettingsFormState()
 
     private var filtering: Bool { !SettingsSearch.tokens(searchQuery).isEmpty }
 
