@@ -9,13 +9,51 @@ struct ModelSettingsRequest: Identifiable {
 /// Per-model context / KV quant / MTP (issue #269). Writes the server's
 /// `model-settings.json`, then applies it per `ModelSettingsApply.plan`.
 enum ModelSettingsApply {
-    enum Plan { case saveOnly, reload, restart }
+    enum Plan { case saveOnly, reload, restart, live }
+    enum Field: Hashable { case ctxSize, kvQuant, mtp, mtpAcceptance, steering }
 
     /// The startup model restarts the server: a hot unload + load re-bills
-    /// it under `--max-resident-mem`, which the launch load never paid.
-    static func plan(serverRunning: Bool, loaded: Bool, isStartupModel: Bool) -> Plan {
+    /// it under `--max-resident-mem`, which the launch load never paid. A
+    /// steering-only edit needs neither: `POST /v1/steering` applies it live.
+    static func plan(serverRunning: Bool, loaded: Bool, isStartupModel: Bool, changed: Set<Field>) -> Plan {
         guard serverRunning, loaded else { return .saveOnly }
+        if changed.isEmpty { return .saveOnly }
+        if changed == [.steering] { return .live }
         return isStartupModel ? .restart : .reload
+    }
+
+    static func changedFields(from a: ModelOverride, to b: ModelOverride) -> Set<Field> {
+        var out: Set<Field> = []
+        if a.ctxSize != b.ctxSize { out.insert(.ctxSize) }
+        if a.kvQuant != b.kvQuant { out.insert(.kvQuant) }
+        if a.mtp != b.mtp { out.insert(.mtp) }
+        if a.mtpAcceptance != b.mtpAcceptance { out.insert(.mtpAcceptance) }
+        if a.steering != b.steering { out.insert(.steering) }
+        return out
+    }
+
+    /// The picker's tag for a steering state ("" = inherit, "off", "name:<bank>").
+    static func steeringTag(_ s: SteeringOverride?) -> String {
+        switch s {
+        case nil: return ""
+        case .off?: return "off"
+        case .configured(let name, _, _)?: return "name:" + name
+        }
+    }
+
+    /// Picking a bank keeps the scales already entered; a fresh pick starts at ffn 1.
+    static func steering(fromTag tag: String, current: SteeringOverride?) -> SteeringOverride? {
+        if tag.isEmpty { return nil }
+        if tag == "off" { return .off }
+        let name = String(tag.dropFirst("name:".count))
+        if case .configured(_, let ffn, let attn)? = current { return .configured(name: name, ffn: ffn, attn: attn) }
+        return .configured(name: name, ffn: 1, attn: 0)
+    }
+
+    /// Picker rows: every registry bank plus the configured name when it is a path or gone.
+    static func steeringChoices(registry: [String], current: SteeringOverride?) -> [String] {
+        guard let name = current?.name, !registry.contains(name) else { return registry }
+        return registry + [name]
     }
 
     /// MTP rows only where a head exists (unknown = older server, show);
@@ -33,6 +71,8 @@ struct ModelSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var override = ModelOverride()
+    @State private var original = ModelOverride()
+    @State private var registry: [String] = []
     @State private var busy = false
     @State private var error: String?
 
@@ -43,13 +83,21 @@ struct ModelSettingsSheet: View {
     private var plan: ModelSettingsApply.Plan {
         ModelSettingsApply.plan(serverRunning: server.status == .running,
                                 loaded: live?.loaded ?? false,
-                                isStartupModel: server.currentModelPath == request.path)
+                                isStartupModel: server.currentModelPath == request.path,
+                                changed: ModelSettingsApply.changedFields(from: original, to: override))
     }
 
     /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
     private var mtpAvailable: Bool? {
         if let a = live?.mtpAvailable { return a }
         return appState.localModels.first { $0.path == request.path }?.hasMtpHead
+    }
+
+    /// A running server answers from `/v1/models`; otherwise the app's own disk probe.
+    private var steeringAvailable: Bool {
+        if let a = live?.architecture, !a.isEmpty { return SteeringQuickSet.archSupportsSteering(a) }
+        let probed = appState.localModels.first { $0.path == request.path }?.modelType ?? ""
+        return SteeringQuickSet.archSupportsSteering(probed)
     }
 
     /// ds4 and llama.cpp read only the context size from model-settings.json.
@@ -64,8 +112,10 @@ struct ModelSettingsSheet: View {
 
     private var formHeight: CGFloat {
         var n = isGguf ? 1 : 2
+        if !isGguf, steeringAvailable { n += 1 }
         if rows.mtp { n += 1 }
         if rows.acceptance { n += 1 }
+        if case .configured? = override.steering { n += 2 }
         if live?.loaded == true { n += 1 }
         return CGFloat(44 * n + 50)
     }
@@ -75,6 +125,7 @@ struct ModelSettingsSheet: View {
         case .saveOnly: return "Applied when the model loads."
         case .reload: return "Applied when the model loads; the resident model is reloaded now."
         case .restart: return "Applied when the model loads; the server is restarted now."
+        case .live: return "Steering applies to the resident model now, without a reload."
         }
     }
 
@@ -123,6 +174,28 @@ struct ModelSettingsSheet: View {
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
                 }
                 }
+                if !isGguf, steeringAvailable {
+                Picker("Steering", selection: Binding(
+                    get: { ModelSettingsApply.steeringTag(override.steering) },
+                    set: { override.steering = ModelSettingsApply.steering(fromTag: $0, current: override.steering) })) {
+                    Text("Default (launch flags)").tag("")
+                    Text("Off").tag("off")
+                    ForEach(ModelSettingsApply.steeringChoices(registry: registry, current: override.steering), id: \.self) { name in
+                        Text(name).tag("name:" + name)
+                    }
+                }
+                .help("Direction banks in ~/.mlx-serve/steering (<name>.f32, one unit-norm row per layer)")
+                if case .configured(let name, let ffn, let attn)? = override.steering {
+                    // Clamped: the server drops the whole key on an out-of-range scale.
+                    TextField("FFN scale", value: Binding(
+                        get: { ffn },
+                        set: { override.steering = .configured(name: name, ffn: SteeringQuickSet.clamped($0), attn: attn) }), format: .number)
+                        .help("Positive removes the direction, negative amplifies it (-100…100)")
+                    TextField("Attention scale", value: Binding(
+                        get: { attn },
+                        set: { override.steering = .configured(name: name, ffn: ffn, attn: SteeringQuickSet.clamped($0)) }), format: .number)
+                }
+                }
                 if let live, live.loaded {
                     LabeledContent("Live") {
                         Text(isGguf ? "\(ContextSizeDisplay.formatTokens(live.contextLength)) context"
@@ -151,7 +224,11 @@ struct ModelSettingsSheet: View {
             .padding(16)
         }
         .frame(width: 440)
-        .onAppear { override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride() }
+        .onAppear {
+            override = ModelSettingsFile.load().override(for: request.path) ?? ModelOverride()
+            original = override
+            registry = SteeringRegistry.names()
+        }
     }
 
     private func save() async {
@@ -168,6 +245,13 @@ struct ModelSettingsSheet: View {
         switch plan {
         case .saveOnly:
             break
+        case .live:
+            do {
+                try await server.setSteering(id: live!.name, override.steering)
+            } catch {
+                self.error = "Saved, but the live apply failed: \(error.localizedDescription)"
+                return
+            }
         case .restart:
             server.stop()
             server.start(modelPath: appState.selectedModelPath, options: appState.serverOptions)

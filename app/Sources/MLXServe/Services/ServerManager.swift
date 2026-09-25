@@ -54,6 +54,16 @@ class ServerManager: ObservableObject {
     /// resident model. nil = the per-silicon tables applied.
     @Published var specCost: SpecCostInfo?
     @Published var batching: BatchingInfo?
+    /// The resident chat model's active steering bank (`/props?model=`), nil when off.
+    @Published var directionalSteering: APIClient.SteeringInfo?
+    /// The bank each model was last seen steering with, by model id, for this session: the
+    /// server reports nothing at scale 0, and the tray popover's @State dies on close.
+    @Published var rememberedSteeringBanks: [String: RememberedBank] = [:]
+
+    struct RememberedBank: Equatable {
+        let name: String
+        let file: String
+    }
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -606,10 +616,13 @@ class ServerManager: ObservableObject {
     }
 
     private func refreshStatus() async {
-        if let props = try? await api.fetchProps(port: port) {
+        // Asked for the resident chat model by id: the tray draws the steering box on
+        // that model's row, and the bare route answers for the registry default.
+        if let props = try? await api.fetchProps(port: port, model: residentChatModel?.name) {
             memoryInfo = props.memory
             specCost = props.specCost
             batching = props.batching
+            directionalSteering = props.directionalSteering
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
@@ -679,6 +692,12 @@ class ServerManager: ObservableObject {
         }
         await refreshModels()
         return info
+    }
+
+    /// Apply a steering setting to a resident model without a reload.
+    func setSteering(id: String, _ override: SteeringOverride?, file: String? = nil) async throws {
+        try await api.setSteering(port: port, model: id, override: override, file: file)
+        if let props = try? await api.fetchProps(port: port, model: residentChatModel?.name) { directionalSteering = props.directionalSteering }
     }
 
     /// Free a model's resident GPU state (registry keeps the stub). Used by the

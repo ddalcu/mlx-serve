@@ -1035,6 +1035,16 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// A ref on `entry` if it is `.ready`, else null without waiting: for status
+    /// routes, which must neither trigger a load nor block on one.
+    pub fn holdIfReady(self: *ModelRegistry, entry: *LoadedModel) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (entry.state != .ready) return null;
+        _ = entry.refcount.fetchAdd(1, .acq_rel);
+        return entry;
+    }
+
     /// Phase D: claim the right to perform a cold load for `entry`. Caller
     /// MUST already hold `mutex`. Transitions `.unloaded` → `.loading` and
     /// broadcasts so any other ensureLoaded callers join the wait. Returns
@@ -2168,4 +2178,20 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: holdIfReady refs a ready entry and never waits on a loading one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, 900);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 1024);
+    try testing.expect(reg.holdIfReady(a) == a);
+    try testing.expectEqual(@as(u32, 1), a.refcount.load(.acquire));
+    reg.releaseStatus(a);
+    // Single-threaded: a wait here would never return.
+    a.state = .loading;
+    try testing.expect(reg.holdIfReady(a) == null);
+    a.state = .unloaded;
+    try testing.expect(reg.holdIfReady(a) == null);
+    try testing.expectEqual(@as(u32, 0), a.refcount.load(.acquire));
+    a.state = .ready;
 }

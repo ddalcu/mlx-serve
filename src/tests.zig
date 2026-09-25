@@ -64,6 +64,7 @@ test {
     _ = @import("mage_flow.zig");
     _ = @import("qwen_image.zig");
     _ = @import("lora.zig");
+    _ = @import("steering.zig");
     _ = @import("ane.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_diffvae.zig");
