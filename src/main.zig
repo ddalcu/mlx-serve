@@ -1663,10 +1663,11 @@ fn chooseGgufEngine(
     defer info.deinit(allocator);
 
     const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={})\n", .{
         @tagName(e),
         info.architecture orelse "?",
         info.has_ds4_lora_rank,
+        info.ds4_unloadable,
     });
     return e;
 }
