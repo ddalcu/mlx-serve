@@ -509,9 +509,10 @@ pub fn videoRgbTransportReason(delivered_frames: u32, width: u32, height: u32) ?
     return std.fmt.bufPrint(&S.buf, "{d} frames at {d}x{d} is {d} MB of raw RGB; one response carries at most {d} MB — fewer frames or windows, or a smaller canvas", .{ delivered_frames, width, height, bytes / (1024 * 1024), MAX_VIDEO_RGB_BYTES / (1024 * 1024) }) catch "video too large for one response";
 }
 
-
-/// Per-request image-generation options shared by both backends.
+/// Per-request image-generation options shared by image backends.
 pub const ImageGenOpts = struct {
+    /// Preserve native alpha on Qwen-Image; other backends reject this option.
+    transparent: bool = false,
     /// img2img source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
     /// size (VAE-encoded by the backend).
     init_image: ?mlx.mlx_array = null,
@@ -743,6 +744,7 @@ pub const ImageEngine = struct {
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
                     .guidance_scale = opts.guidance_scale,
                     .negative_prompt = opts.negative_prompt,
+                    .transparent = opts.transparent,
                 }, progress);
             },
         };
@@ -1983,6 +1985,9 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const transparent = sse.bodyWantsTrue(body, "transparent");
+    if (transparent and engine.backend != .qwen_image)
+        return sendError(conn, 400, "'transparent' requires a Qwen-Image model");
 
     // Requested size (default 1024²); the backend resolves it (FLUX is fixed
     // 1024², Krea accepts any multiple of 16 in [256,2048]).
@@ -2228,6 +2233,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
+        .transparent = transparent,
         .init_image = init_img, // null in edit mode
         .strength = strength,
         .edit_images = edit_imgs[0..edit_imgs_n],

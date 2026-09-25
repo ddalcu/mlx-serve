@@ -2,6 +2,7 @@
    Keys are the English source strings; anything not listed here
    falls back to English. */
 
+" (Turbo)" = " （Turbo）";
 " (our estimate)" = " （我们的估算）";
 " (with its built-in draft head)" = " （自带草稿头）";
 " The running server keeps its current flags until you hit Restart Now." = " 正在运行的服务器会保留当前启动参数，直到你点击“立即重启”。";
@@ -26,6 +27,7 @@
 "%@ — no longer installed" = "%@ —— 已不再安装";
 "%@ — not in %@'s capabilities" = "%@ —— 不在 %@ 的能力范围内";
 "%@ — use" = "%@ —— 使用";
+"%@, %lld steps%@, %lld frames (~%.1fs)" = "%@，%lld 步%@，%lld 帧（~%.1fs）";
 "%@, %lld steps, %lld frames (~%.1fs)" = "%@，%lld 步，%lld 帧（~%.1fs）";
 "%@: browse and search only — its %@-token window has no room for the rest." = "%@：仅能浏览和搜索 —— 它的 %@ Token 上下文窗口容不下其余工具。";
 "%lld WEB SOURCE%@" = "%lld 个网页来源";
@@ -36,6 +38,7 @@
 "%lld source%@" = "%lld 个来源";
 "%lld steps" = "%lld 步";
 "%lld tool%@" = "%lld 个工具";
+"%lld windows joined end to end — %lld frames, and roughly %lldx the time of a single window." = "%lld 个窗口首尾相接 —— %lld 帧，耗时约为单个窗口的 %lld 倍。";
 "%lld windows joined end to end — about %lld frames, and roughly %lldx the time of a single window." = "%lld 个窗口首尾相接 —— 约 %lld 帧，耗时约为单个窗口的 %lld 倍。";
 "(missing command or url)" = "（缺少 command 或 url）";
 "(no arguments)" = "（无参数）";
@@ -43,6 +46,7 @@
 "+%lld other tool%@" = "+%lld 个其他工具";
 "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic. Applies to the app's chats immediately; also becomes the server default for external clients that omit temperature (Claude Code) after a restart." = "0 = 确定性贪心。0.6–1.0 适合典型聊天。高于 1.0 会变得不稳定。对本应用的聊天立即生效；重启后也会成为未指定 temperature 的外部客户端（Claude Code）的服务器默认值。";
 "0 starts from pure noise (the default). Higher starts closer to the original audio, so more of it comes through." = "0 表示从纯噪声开始（默认）。数值越高，起点越接近原始音频，保留的原音频成分也越多。";
+"1-stage" = "单阶段";
 "1. In Telegram, open @BotFather and send /newbot." = "1. 在 Telegram 中打开 @BotFather，并发送 /newbot。";
 "10 seconds to 10 minutes. The new track is exactly as long as this clip." = "10 秒到 10 分钟。新曲目的长度与这段音频片段完全一致。";
 "1024 × 1024 (square)" = "1024 × 1024（方形）";
@@ -62,6 +66,7 @@
 "1536 × 672 (21:9 cinematic) — 2.9x slower" = "1536 × 672（21:9 电影宽幅）—— 慢 2.9 倍";
 "1600 × 896 (landscape 16:9) — recommended" = "1600 × 896（横版 16:9）—— 推荐";
 "1920 × 1088 (landscape 16:9) — LTX's own canvas, slowest" = "1920 × 1088（横版 16:9）—— LTX 原生画布，最慢";
+"2-stage" = "两阶段";
 "2-stage HQ" = "两阶段 HQ";
 "2. Copy the token it gives you and paste it above." = "2. 复制它给出的令牌，粘贴到上方。";
 "2048 × 1152 (16:9, large)" = "2048 × 1152（16:9，大尺寸）";
@@ -251,6 +256,7 @@
 "Capabilities" = "能力";
 "Capabilities, model, workspace and sampling. Most agents need none of these." = "能力、模型、工作区与采样。多数 Agent 都不需要这些。";
 "Capability" = "能力";
+"Chained windows" = "链式窗口";
 "Chained windows: %lld" = "链式窗口：%lld";
 "Change Directory" = "切换目录";
 "Change Model" = "更换模型";
@@ -301,7 +307,9 @@
 "Clear the haze" = "去除雾霾";
 "Clear the in-memory log buffer (does not affect the running server)" = "清除内存中的日志缓冲区（不影响正在运行的服务器）";
 "Click Restart Now to apply, or Discard to revert the unsaved server-launch fields." = "点击“立即重启”以应用，或点击“放弃”以还原未保存的服务器启动项。";
+"Clip height" = "片段高度";
 "Clip length. LTX only generates %lld–%lld frames on its 8N+1 ladder; the slider snaps to valid counts." = "片段长度。LTX 在其 8N+1 阶梯上只生成 %lld–%lld 帧；滑块会自动吸附到有效帧数。";
+"Clip width" = "片段宽度";
 "Clips" = "片段";
 "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed." = "克隆一次你的声音 —— 免提语音模式会通过本地 TTS 模型用它来回答。未设置片段时：使用 macOS 系统语音回答。从下一句语音开始生效 —— 无需重启。";
 "Close" = "关闭";
@@ -598,6 +606,7 @@
 "Give this style a name to reuse it from the Examples menu." = "给这个风格起个名字，即可从“示例”菜单中重复使用。";
 "Global gain" = "全局增益";
 "Go ahead…" = "请说吧…";
+"Guidance" = "引导";
 "Guidance (%@)" = "引导（%@）";
 "Guidance scale" = "引导强度";
 "Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0." = "引导强度 —— 视频跟随提示词的紧密程度。1.0 = 关闭：最快，画面也最自然。数值越高，贴合提示词越严格，但速度更慢，画面可能过饱和。LTX 默认为 3.0。";
@@ -1156,6 +1165,7 @@
 "Save style prompt" = "保存风格提示词";
 "Save the log to a .log file" = "把日志保存为 .log 文件";
 "Saved" = "已保存";
+"Saved agents couldn't be read" = "无法读取已保存的智能体";
 "Save…" = "保存…";
 "Say this to hand the conversation to %@. Blank uses the app's own phrase." = "说出这句话即可把对话交给 %@。留空则使用应用自带的短语。";
 "Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off." = "缩放每个已接入的文本编码器层的贡献（1 = 中性）。留空 = 关闭。";
@@ -1344,6 +1354,7 @@
 "The document index is still being prepared (resolving the embedding model). Wait a moment and search again." = "文档索引仍在准备中（正在解析嵌入模型）。请稍候片刻再搜索。";
 "The downloaded disk image contains no app bundle" = "下载的磁盘映像中不包含应用包";
 "The edit comes back at the source image's own size." = "编辑结果会按源图自身的尺寸返回。";
+"The file is kept at %@." = "文件已保留在 %@。";
 "The fastest model here" = "这里最快的模型";
 "The first chat that messages the bot is adopted as the owner; everyone else is refused. Reset to hand the bot to a different chat." = "第一个给机器人发消息的会话会被设为主人；其他所有会话都会被拒绝。重置后可把机器人交给另一个会话。";
 "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare." = "这里保真度最高的全精度语音模型 —— 内存充足时最适合富有表现力的长篇朗读。";
@@ -1535,6 +1546,9 @@
 "optional — audio-to-video" = "可选 —— 音频生视频";
 "optional — ends here" = "可选 —— 在此结束";
 "optional — the generation follows them" = "可选 —— 生成会跟随它们";
+"optional, I2V" = "可选，I2V";
+"optional, ends here" = "可选，在此结束";
+"optional, starts here" = "可选，在此开始";
 "or drag one here" = "或把文件拖到这里";
 "or env var, e.g. OPENAI_API_KEY" = "或环境变量，例如 OPENAI_API_KEY";
 "prefill tok/s" = "预填充 tok/s";

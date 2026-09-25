@@ -70,6 +70,70 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(decoded, s)
     }
 
+    /// EVERY field off its default, because the decoder lists keys by hand and
+    /// a key it forgets comes back as the default on every launch — four knobs
+    /// (refine steps, audio guidance, chained windows, the DiffVAE toggle)
+    /// did exactly that, and a round trip on defaults could not see it.
+    func testVideoEveryFieldRoundTrips() throws {
+        var s = VideoGenSettings()
+        s.modelId = VideoModelPreset.minimaxH3.id
+        s.quality = .fast
+        s.resolutionId = ResolutionOption.custom.id
+        s.numFrames = 141
+        s.fps = 30
+        s.mode = .twoStageHQ
+        s.steps = 21
+        s.cfgScale = 2.5
+        s.stgScale = 1.5
+        s.seed = 7
+        s.keepResident = true
+        s.bestQuality = true
+        s.diffusionDecoder = true
+        s.turbo = true
+        s.stage2Steps = 4
+        s.cfgAudioScale = 5.5
+        s.chainWindows = 3
+        s.loras = [LoraAdapter(path: "/tmp/style.safetensors", scale: 0.8)]
+        s.livePreview = true
+        s.promptHeight = 200
+        s.customWidth = 960
+        s.customHeight = 544
+        s.prompt = "a cat on <Picture 1>"
+        s.firstFramePath = "/tmp/first.png"
+        s.lastFramePath = "/tmp/last.png"
+        s.audioSource = .speech
+        s.audioPath = "/tmp/line.wav"
+        s.speechText = "Good morning."
+        s.refImagePaths = ["/tmp/a.png", "/tmp/b.png"]
+        s.refVideoPaths = ["/tmp/c.mov"]
+        s.refAudioPaths = ["/tmp/d.wav"]
+        s.refImageSize = .max
+        s.showMediaInputs = false
+        s.showAdvanced = true
+        var decoded = try JSONDecoder().decode(VideoGenSettings.self, from: try JSONEncoder().encode(s))
+        // A row's id is not persisted (by design), so the stack is compared by
+        // what it carries and then set aside for the whole-blob comparison.
+        XCTAssertEqual(decoded.loras.map(\.path), s.loras.map(\.path))
+        XCTAssertEqual(decoded.loras.map(\.scale), s.loras.map(\.scale))
+        decoded.loras = s.loras
+        XCTAssertEqual(decoded, s)
+    }
+
+    /// A blob from before the draft was persisted decodes to the defaults for
+    /// the new keys — an empty draft, the media block open, Advanced closed.
+    func testVideoBlobWithoutTheDraftKeysStillDecodes() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(VideoGenSettings())) as! [String: Any]
+        for key in ["prompt", "firstFramePath", "lastFramePath", "audioSource", "audioPath",
+                    "speechText", "refImagePaths", "refVideoPaths", "refAudioPaths",
+                    "refImageSize", "showMediaInputs", "showAdvanced"] {
+            obj.removeValue(forKey: key)
+        }
+        let decoded = try JSONDecoder().decode(
+            VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded, VideoGenSettings())
+    }
+
     /// A persisted LAN pick ("lan:<model>@<peer>") whose base id matches a
     /// local preset resolves to THAT preset, not the LTX fallback — the pane
     /// gates ladders, resolutions and request fields on `resolvedModel`, so
@@ -189,8 +253,22 @@ final class MediaGenSettingsTests: XCTestCase {
         s.resolution = 128
         s.keepResident = true
         s.turntable = false
+        s.texture = true
+        s.photoPath = "/tmp/object.png"
+        s.showAdvanced = true
         let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
+    }
+
+    /// A blob from before the draft was persisted decodes to the defaults for
+    /// the new keys: no photo, Advanced closed.
+    func testModel3DBlobWithoutTheDraftKeysStillDecodes() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(Model3DGenSettings())) as! [String: Any]
+        for key in ["photoPath", "showAdvanced"] { obj.removeValue(forKey: key) }
+        let decoded = try JSONDecoder().decode(
+            Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded, Model3DGenSettings())
     }
 
     func testModel3DLegacy380ResolutionMigratesTo384() throws {
@@ -258,5 +336,19 @@ final class MediaGenSettingsTests: XCTestCase {
         let old = try JSONDecoder().decode(
             VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
         XCTAssertEqual(old.promptHeight, PromptEditorHeight.defaultHeight)
+    }
+
+    func testMusicSettingsClampAStaleLyricsHeightOnDecode() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(MusicGenSettings())) as! [String: Any]
+        obj["lyricsHeight"] = 9999.0
+        let decoded = try JSONDecoder().decode(
+            MusicGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.lyricsHeight, PromptEditorHeight.maxHeight)
+        // Absent key = an older build's blob → the default, not zero.
+        obj.removeValue(forKey: "lyricsHeight")
+        let old = try JSONDecoder().decode(
+            MusicGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.lyricsHeight, PromptEditorHeight.defaultHeight)
     }
 }

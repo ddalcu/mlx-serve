@@ -1,5 +1,18 @@
 import SwiftUI
 
+/// Whether a change to the bound value has to be painted into the box.
+enum NumberFieldRepaint {
+    /// The box owns its text while it is being typed into: repainting from the
+    /// value mid-edit moves the caret, which is why the focused case used to
+    /// decline outright. But a value that does NOT match what the box says was
+    /// not produced by the box — it came from a menu, a slider, a dice roll —
+    /// and a choice that does not show up reads as a choice that did not land.
+    static func shouldRepaint(text: String, value: Int?, range: ClosedRange<Int>, focused: Bool) -> Bool {
+        guard focused else { return true }
+        return SeedText.parse(text, in: range) != value
+    }
+}
+
 /// A small typed number box, clamped to a range.
 ///
 /// Sliders are fine for exploring and terrible for landing on a value: the
@@ -25,7 +38,9 @@ struct NumberField: View {
     var body: some View {
         TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
-            .font(.caption.monospacedDigit())
+            // Body, not caption: a bezeled field is as tall as its font, and a
+            // caption-sized box sat visibly below the pickers beside it.
+            .font(.body.monospacedDigit())
             .frame(width: width)
             .focused($focused)
             .multilineTextAlignment(.trailing)
@@ -40,7 +55,8 @@ struct NumberField: View {
             // A value changed from OUTSIDE (a slider drag, hydration, a model
             // switch that re-clamped the range) has to show up in the box.
             .onChange(of: value) { _, v in
-                guard !focused else { return }
+                guard NumberFieldRepaint.shouldRepaint(text: text, value: clamped(v),
+                                                       range: range, focused: focused) else { return }
                 text = String(clamped(v))
             }
             .onAppear { text = String(clamped(value)) }
@@ -69,7 +85,9 @@ struct OptionalNumberField: View {
     var body: some View {
         TextField(L10n.text(placeholder), text: $text)
             .textFieldStyle(.roundedBorder)
-            .font(.caption.monospacedDigit())
+            // Body, not caption: a bezeled field is as tall as its font, and a
+            // caption-sized box sat visibly below the pickers beside it.
+            .font(.body.monospacedDigit())
             .frame(width: width)
             .focused($focused)
             .multilineTextAlignment(.trailing)
@@ -86,7 +104,8 @@ struct OptionalNumberField: View {
                 if !isFocused { text = value.map(String.init) ?? "" }
             }
             .onChange(of: value) { _, v in
-                guard !focused else { return }
+                guard NumberFieldRepaint.shouldRepaint(text: text, value: v,
+                                                       range: range, focused: focused) else { return }
                 text = v.map(String.init) ?? ""
             }
             .onAppear { text = value.map(String.init) ?? "" }

@@ -71,3 +71,15 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
 
 Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked.
+
+### Qwen-Image transparent PNG output
+
+`POST /v1/images/generations` accepts `"transparent": true` for Qwen-Image-2.1.
+It preserves the VAE's native fourth (alpha) channel in the returned PNG, including
+SSE `complete` responses. Omitted or `false` keeps the existing RGB output; other
+image backends return HTTP 400 when `transparent` is true.
+
+Use the [official RGBA prompt convention](https://github.com/QwenLM/Qwen-Image-2.1#transparent-image-generation-rgba), for example:
+`This is an RGBA image with transparency. A red apple. The image has alpha channel and the background is transparent.`
+The option preserves generated alpha; it does not remove a background or rewrite
+the prompt. This is output support only: input images still follow the RGB path.

@@ -4909,39 +4909,19 @@ private struct TurnEndFooter: View {
     }
 }
 
-/// Short at rest, full value floating over the pointer on hover. Floating
-/// rather than growing in place, so the buttons beside it never move.
+/// Short at rest, full value floating over the pointer on hover.
 private struct StatPill: View {
     let text: String
     let expanded: String
 
-    @State private var pointer: CGPoint?
-
     var body: some View {
         label(text)
-            // Continuous, not `onHover`: the position is the point of it.
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location): pointer = location
-                case .ended: pointer = nil
-                }
+            .hoverReveal {
+                label(expanded)
+                    .background(Color(nsColor: .textBackgroundColor), in: Capsule())
+                    .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+                    .fixedSize()
             }
-            .overlay(alignment: .topLeading) {
-                if let pointer {
-                    label(expanded)
-                        .background(Color(nsColor: .textBackgroundColor), in: Capsule())
-                        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
-                        .fixedSize()
-                        // Above the pointer and slightly left of it, so the
-                        // cursor never sits on top of the text it revealed.
-                        .offset(x: pointer.x - 10, y: -24)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-            }
-            // Later siblings draw over earlier ones, so without this the
-            // buttons paint on top of the pill that just opened.
-            .zIndex(pointer == nil ? 0 : 1)
     }
 
     private func label(_ string: String) -> some View {

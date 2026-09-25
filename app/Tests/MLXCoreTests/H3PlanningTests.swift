@@ -212,12 +212,13 @@ final class H3PlanningTests: XCTestCase {
         XCTAssertEqual(H3RefLimits.remaining(perType: H3RefLimits.images, current: 9, totalAttached: 15), 0)
     }
 
-    /// The user needs to be told WHY the add button vanished from an empty list.
-    func testTheCombinedLimitExplainsItselfOnlyWhenItBinds() {
-        XCTAssertNil(H3RefLimits.totalNote(attached: 4))
-        let atCap = H3RefLimits.totalNote(attached: 12)
-        XCTAssertNotNil(atCap)
-        XCTAssertTrue(atCap!.contains("12"), atCap!)
+    /// The user needs to be told WHY a way in can vanish from a list that is
+    /// not full, and the sentence has to carry every number it is about.
+    func testTheCombinedLimitNamesAllFourNumbers() {
+        let note = H3RefLimits.combinedCapNote
+        for n in [H3RefLimits.images, H3RefLimits.videos, H3RefLimits.audios, H3RefLimits.total] {
+            XCTAssertTrue(note.contains("\(n)"), "\(n) missing from: \(note)")
+        }
     }
 
     // MARK: - Time

@@ -142,7 +142,7 @@ struct ImageGenView: View {
                 // Same idiom as the Video pane. For an EDIT model this menu is
                 // the feature discovery surface: the repertoire is prompts, so
                 // an unlisted capability may as well not exist.
-                Menu("Examples") {
+                Menu("Templates") {
                     ForEach(model.promptExamples(editing: isEditing), id: \.name) { group in
                         Menu(group.name) {
                             ForEach(group.examples, id: \.title) { ex in

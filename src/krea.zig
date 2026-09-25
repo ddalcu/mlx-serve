@@ -2636,26 +2636,28 @@ pub const Engine = struct {
     }
 };
 
-/// [1,3,H,W] f32 [0,1] → RGB8 PNG bytes (caller frees).
+/// [1,3/4,H,W] f32 [0,1] → RGB/RGBA8 PNG bytes (caller frees).
 pub fn imageToPng(allocator: std.mem.Allocator, img: mlx.mlx_array, s: S) ![]u8 {
     const cf = try contig(img, s);
     defer _ = mlx.mlx_array_free(cf);
     _ = mlx.mlx_array_eval(cf);
-    const sh = mlx.getShape(cf); // [1,3,H,W]
+    const sh = mlx.getShape(cf); // [1,C,H,W]
+    if (sh.len != 4 or sh[0] != 1 or (sh[1] != 3 and sh[1] != 4)) return error.InvalidImageShape;
+    const channels: usize = @intCast(sh[1]);
     const H: usize = @intCast(sh[2]);
     const W: usize = @intCast(sh[3]);
     const d = mlx.mlx_array_data_float32(cf) orelse return error.NoData;
-    const rgb = try allocator.alloc(u8, W * H * 3);
-    defer allocator.free(rgb);
+    const pixels = try allocator.alloc(u8, W * H * channels);
+    defer allocator.free(pixels);
     const plane = W * H;
     for (0..H) |y| for (0..W) |x| {
-        const o = (y * W + x) * 3;
-        for (0..3) |c| {
+        const o = (y * W + x) * channels;
+        for (0..channels) |c| {
             const v = d[c * plane + y * W + x];
-            rgb[o + c] = @intFromFloat(std.math.clamp(v * 255.0, 0, 255));
+            pixels[o + c] = @intFromFloat(std.math.clamp(v * 255.0, 0, 255));
         }
     };
-    return png.encodeRgb(allocator, rgb, @intCast(W), @intCast(H));
+    return if (channels == 4) png.encodeRgba(allocator, pixels, @intCast(W), @intCast(H)) else png.encodeRgb(allocator, pixels, @intCast(W), @intCast(H));
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -3123,4 +3125,44 @@ test "aneBlockEligible: fp16 plane grid, quantized only, never under a LoRA" {
     try testing.expect(!aneBlockEligible(4608, false, 0)); // bf16 pack
     try testing.expect(!aneBlockEligible(4600, true, 0)); // off the 32-row pitch
     try testing.expect(!aneBlockEligible(128, true, 0)); // under the engagement floor
+}
+
+test "RGBA tensor PNG roundtrip preserves transparent and half-transparent pixels" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const planes = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 1 };
+    const shape = [_]c_int{ 1, 4, 1, 3 };
+    const img = mlx.mlx_array_new_data(&planes, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+    const bytes = try imageToPng(a, img, s);
+    defer a.free(bytes);
+    try testing.expectEqual(@as(u8, 6), bytes[25]); // PNG RGBA color type.
+    const stb = @import("stb");
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const decoded = stb.stbi_load_from_memory(bytes.ptr, @intCast(bytes.len), &width, &height, &channels, 4);
+    try testing.expect(decoded != null);
+    defer stb.stbi_image_free(decoded);
+    try testing.expectEqual(@as(c_int, 4), channels);
+    try testing.expectEqual(@as(c_int, 3), width);
+    try testing.expectEqual(@as(c_int, 1), height);
+    try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 0, 255, 0, 127, 0, 0, 255, 255 }, decoded[0..12]);
+}
+
+test "RGB tensor PNG roundtrip keeps the default three-channel output" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const planes = [_]f32{ 1, 0, 0, 1, 0.5, 0 };
+    const shape = [_]c_int{ 1, 3, 1, 2 };
+    const img = mlx.mlx_array_new_data(&planes, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+    const bytes = try imageToPng(a, img, s);
+    defer a.free(bytes);
+    try testing.expectEqual(@as(u8, 2), bytes[25]);
+    const expected = try png.encodeRgb(a, &.{ 255, 0, 127, 0, 255, 0 }, 2, 1);
+    defer a.free(expected);
+    try testing.expectEqualSlices(u8, expected, bytes);
 }

@@ -144,6 +144,17 @@ enum ImageDropPlacement {
 /// target — three separate ones would make attaching a clip a game of hitting
 /// the right 20pt row — so the file's own type picks its list, under both that
 /// type's cap and the combined budget the Add buttons already respect.
+extension MediaDrop {
+    /// What a drop hands its caller. A typed slot spends its room here (nothing
+    /// downstream knows the cap). The mixed slot must NOT: `H3RefDrop` spends
+    /// the caps and refuses duplicates, so a prefix taken here is spent on
+    /// files it will refuse.
+    static func deliverable(_ resolved: [URL?], kind: MediaDropKind?, limit: Int) -> [URL] {
+        guard let kind else { return resolved.compactMap { $0 } }
+        return accepted(resolved, as: kind, limit: limit)
+    }
+}
+
 enum H3RefDrop {
     static func route(_ urls: [URL], images: [URL], videos: [URL],
                       audios: [URL]) -> (images: [URL], videos: [URL], audios: [URL]) {
@@ -153,13 +164,16 @@ enum H3RefDrop {
             let attached = images.count + videos.count + audios.count
             switch kind {
             case .image:
-                if H3RefLimits.remaining(perType: H3RefLimits.images, current: images.count,
+                if !images.contains(url),
+                   H3RefLimits.remaining(perType: H3RefLimits.images, current: images.count,
                                          totalAttached: attached) > 0 { images.append(url) }
             case .video:
-                if H3RefLimits.remaining(perType: H3RefLimits.videos, current: videos.count,
+                if !videos.contains(url),
+                   H3RefLimits.remaining(perType: H3RefLimits.videos, current: videos.count,
                                          totalAttached: attached) > 0 { videos.append(url) }
             case .audio:
-                if H3RefLimits.remaining(perType: H3RefLimits.audios, current: audios.count,
+                if !audios.contains(url),
+                   H3RefLimits.remaining(perType: H3RefLimits.audios, current: audios.count,
                                          totalAttached: attached) > 0 { audios.append(url) }
             }
         }
@@ -201,11 +215,9 @@ private enum MediaDropLoader {
             }
         }
         group.notify(queue: .main) {
-            // A nil kind means the caller sorts the types itself (the H3
-            // references section); it still wants the drop order and the cap.
-            let resolved = slots.all.compactMap { $0 }
-            let urls = kind.map { MediaDrop.accepted(slots.all, as: $0, limit: limit) }
-                ?? Array(resolved.prefix(limit))
+            // A nil kind means the caller sorts the types and spends the caps
+            // itself (the H3 references section); it wants the drop order.
+            let urls = MediaDrop.deliverable(slots.all, kind: kind, limit: limit)
             guard !urls.isEmpty else { return }
             completion(urls)
         }
@@ -287,12 +299,14 @@ extension View {
     }
 }
 
-/// The empty state's target: something to see and aim at, rather than a bare
-/// button inside an invisible drop region.
-struct MediaDropWell: View {
+/// One way into a slot: what it is, the control that does it, and the line
+/// underneath saying what else would work. The BUTTON is the click target, not
+/// the column around it — a tap gesture wrapping a button is the swallowed
+/// click.
+struct MediaDropWellOption: View {
     let title: String
     let systemImage: String
-    let isTargeted: Bool
+    let caption: String
     let action: () -> Void
 
     var body: some View {
@@ -303,14 +317,137 @@ struct MediaDropWell: View {
             Button(L10n.text(title), action: action)
                 .buttonStyle(.link)
                 .font(.caption)
-            Text("or drag one here")
+            Text(L10n.text(caption))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                // A caption long enough to wrap centres every line, not just
+                // the block: a left-aligned second line under a centred first
+                // one reads as two different columns.
+                .multilineTextAlignment(.center)
+        }
+    }
+}
+
+/// The compact sibling of `MediaDropWellOption`: icon BESIDE the title rather
+/// than above it, for a well that is a row a couple of lines tall instead of a
+/// panel. The enclosing rectangle is the button, so the title is spelled in
+/// `linkColor` — the colour `.buttonStyle(.link)` gives the tall wells, which
+/// is the system LINK colour and stays blue whatever accent the user picked —
+/// rather than wrapped in a Button inside a Button.
+struct MediaWellAction: View {
+    /// `beside` for a well that is a row; `stacked` where several sit in one
+    /// row and the title has no width to spare, which is the same shape
+    /// `MediaDropWellOption` draws.
+    enum Layout { case beside, stacked }
+
+    let title: String
+    let systemImage: String
+    var caption: String = "or drag one here"
+    var layout: Layout = .beside
+
+    var body: some View {
+        VStack(spacing: layout == .stacked ? 6 : 2) {
+            if layout == .stacked {
+                Image(systemName: systemImage)
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                linkTitle(centred: true)
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(.secondary)
+                    linkTitle(centred: false)
+                }
+            }
+            Text(L10n.text(caption))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                // Centres every LINE, for the reason `MediaDropWellOption`
+                // gives: in a narrow column this wraps.
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private func linkTitle(centred: Bool) -> some View {
+        Text(L10n.text(title))
+            .font(.caption)
+            .foregroundStyle(Color(nsColor: .linkColor))
+            .multilineTextAlignment(centred ? .center : .leading)
+    }
+}
+
+/// The empty state's target: something to see and aim at, rather than a bare
+/// button inside an invisible drop region.
+struct MediaDropWell: View {
+    let title: String
+    let systemImage: String
+    /// The line under the control. Defaults to what a drop target has to say;
+    /// a pane with something more useful to put there passes its own.
+    var caption: String = "or drag one here"
+    let isTargeted: Bool
+    let action: () -> Void
+
+    var body: some View {
+        MediaDropWellOption(title: title, systemImage: systemImage,
+                            caption: caption, action: action)
+            .frame(maxWidth: .infinity, minHeight: 84)
+            .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// Two ways into ONE slot, in one well. The drop region is still the whole
+/// rectangle — the halves are aim points for the two things a click can do,
+/// not two targets.
+struct MediaDropWellPair: View {
+    let isTargeted: Bool
+    let leading: MediaDropWellOption
+    let trailing: MediaDropWellOption
+
+    var body: some View {
+        HStack(spacing: 0) {
+            leading.frame(maxWidth: .infinity)
+            Divider().frame(height: 52)
+            trailing.frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, minHeight: 84)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.secondary.opacity(isTargeted ? 0.12 : 0.06))
-        )
+        .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// The well once the slot HOLDS something: same surface, same floor height,
+/// whatever the pane wants inside it. The block is how you keep your place in
+/// a long form, so it must not disappear the moment you use it — it may grow
+/// past the floor, never shrink below it.
+struct MediaDropWellFilled<Content: View>: View {
+    let isTargeted: Bool
+    /// The floor. A well whose contents come and go (a composer whose result
+    /// row appears later) states a taller one, so it does not shrink under
+    /// the user between states.
+    var minHeight: CGFloat = 84
+    /// `.leading` centres a one-line row vertically; a well holding a form
+    /// wants `.topLeading`, or the form floats down as the well grows.
+    var alignment: Alignment = .leading
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            // `alignment:` is load-bearing — a bare `maxWidth: .infinity`
+            // CENTRES, so a row without a trailing Spacer (a converting
+            // spinner) would sit in the middle while every other state hugs
+            // the left.
+            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: alignment)
+            .background(MediaDropWellBackground(isTargeted: isTargeted))
+    }
+}
+
+/// The well's own surface, so the shapes cannot drift apart.
+struct MediaDropWellBackground: View {
+    let isTargeted: Bool
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(Color.secondary.opacity(isTargeted ? 0.12 : 0.06))
     }
 }

@@ -251,6 +251,9 @@ struct MusicGenSettings: Codable, Equatable {
     /// The draft (see `AudioGenSettings.text`).
     var prompt: String = ""
     var lyrics: String = ""
+    /// Height of the lyrics editor, dragged by its handle (see the video
+    /// pane's prompt box).
+    var lyricsHeight: Double = PromptEditorHeight.defaultHeight
     var refAudioPath: String? = nil
     /// Source-audio task state (ACE-Step cover / complete), part of the draft.
     var task: MusicTask = .text2music
@@ -305,6 +308,9 @@ extension MusicGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lyrics) { lyrics = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .lyricsHeight) {
+            lyricsHeight = PromptEditorHeight.clamp(v)
+        }
         refAudioPath = try c.decodeIfPresent(String.self, forKey: .refAudioPath)
         if let v = try c.decodeIfPresent(MusicTask.self, forKey: .task) { task = v }
         srcAudioPath = try c.decodeIfPresent(String.self, forKey: .srcAudioPath)
@@ -353,6 +359,20 @@ struct VideoGenSettings: Codable, Equatable {
     /// like the image pane's.
     var customWidth: Int = 704
     var customHeight: Int = 448
+    // The DRAFT (see `MusicGenSettings`): the pane unmounts on navigation, so
+    // what is not here is lost. Files ride as paths, checked on hydrate.
+    var prompt: String = ""
+    var firstFramePath: String? = nil
+    var lastFramePath: String? = nil
+    var audioSource: VideoAudioSource = .none
+    var audioPath: String? = nil
+    var speechText: String = ""
+    var refImagePaths: [String] = []
+    var refVideoPaths: [String] = []
+    var refAudioPaths: [String] = []
+    var refImageSize: RefImageSizing = .match
+    var showMediaInputs: Bool = true
+    var showAdvanced: Bool = false
 
     private static let storageKey = "videoGenSettings"
 
@@ -440,6 +460,10 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .bestQuality) { bestQuality = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turbo) { turbo = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .diffusionDecoder) { diffusionDecoder = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .stage2Steps) { stage2Steps = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .cfgAudioScale) { cfgAudioScale = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .chainWindows) { chainWindows = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .livePreview) { livePreview = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
             promptHeight = PromptEditorHeight.clamp(v)
@@ -454,7 +478,26 @@ extension VideoGenSettings {
             let ls = try legacy.decodeIfPresent(Double.self, forKey: .loraScale) ?? 1.0
             if !lp.isEmpty { loras = [LoraAdapter(path: lp, scale: ls)] }
         }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
+        firstFramePath = try c.decodeIfPresent(String.self, forKey: .firstFramePath)
+        lastFramePath = try c.decodeIfPresent(String.self, forKey: .lastFramePath)
+        if let v = try c.decodeIfPresent(VideoAudioSource.self, forKey: .audioSource) { audioSource = v }
+        audioPath = try c.decodeIfPresent(String.self, forKey: .audioPath)
+        if let v = try c.decodeIfPresent(String.self, forKey: .speechText) { speechText = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .refImagePaths) { refImagePaths = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .refVideoPaths) { refVideoPaths = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .refAudioPaths) { refAudioPaths = v }
+        if let v = try c.decodeIfPresent(RefImageSizing.self, forKey: .refImageSize) { refImageSize = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showMediaInputs) { showMediaInputs = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }
+}
+
+/// Which way into the video pane's clip slot the user took. `.none` → the
+/// model invents a soundtrack from the prompt; `.file`/`.speech` freeze a
+/// real clip. Persisted with the draft, so it lives beside the settings.
+enum VideoAudioSource: String, Codable {
+    case none, file, speech
 }
 
 // MARK: - 3D
@@ -471,6 +514,10 @@ struct Model3DGenSettings: Codable, Equatable {
     var turntable: Bool = true
     /// P2 paint stage (full PBR texture). Off until validated end to end.
     var texture: Bool = false
+    /// The draft: the pane unmounts on navigation, so the photo and the
+    /// disclosure state live here or are lost on the way to Chat and back.
+    var photoPath: String? = nil
+    var showAdvanced: Bool = false
 
     private static let storageKey = "model3dGenSettings"
 
@@ -508,5 +555,7 @@ extension Model3DGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .photoPath) { photoPath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
     }
 }

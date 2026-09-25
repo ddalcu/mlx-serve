@@ -1207,8 +1207,14 @@ pub const VaeDecoder = struct {
     }
 
     /// Normalized latent [1, z, h, w] → pixels [1, 3, 16h, 16w] f32 in [-1, 1].
-    /// The 4th output channel carries edit masks, not image content.
     pub fn decode(self: *const VaeDecoder, latent: A) !A {
+        const rgba = try self.decodeRgba(latent);
+        defer free(rgba);
+        return sliceAxis(rgba, 1, 0, 3, self.h.s);
+    }
+
+    /// The fourth channel is native alpha; preserve it for transparent PNG output.
+    pub fn decodeRgba(self: *const VaeDecoder, latent: A) !A {
         const s = self.h.s;
         const lf = try astype(latent, .float32, s);
         defer free(lf);
@@ -1233,9 +1239,7 @@ pub const VaeDecoder = struct {
         defer free(x);
         const out = try self.h.head(x);
         defer free(out);
-        const rgb = try sliceAxis(out, 3, 0, 3, s);
-        defer free(rgb);
-        return transpose(rgb, &[_]c_int{ 0, 3, 1, 2 }, s);
+        return transpose(out, &[_]c_int{ 0, 3, 1, 2 }, s);
     }
 };
 
@@ -1320,6 +1324,7 @@ fn logMemory(stage: []const u8) void {
 }
 
 pub const GenOpts = struct {
+    transparent: bool = false,
     /// img2img source [1,3,H,W] f32 [0,1], already at the target size.
     init_image: ?A = null,
     start_step: u32 = 0,
@@ -1518,7 +1523,7 @@ pub const Engine = struct {
         defer free(grid);
         const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
         defer free(latent);
-        const decoded = try self.vae.decode(latent);
+        const decoded = if (opts.transparent) try self.vae.decodeRgba(latent) else try self.vae.decode(latent);
         defer free(decoded);
         try mlx.check(mlx.mlx_array_eval(decoded));
         logMemory("vae decode");

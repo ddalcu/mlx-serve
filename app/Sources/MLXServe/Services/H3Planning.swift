@@ -140,12 +140,12 @@ enum H3RefLimits {
         max(0, min(perType - current, total - totalAttached))
     }
 
-    /// Shown only once the combined cap actually binds — before that it is
-    /// noise, and after it an empty list with no Add button is unexplained.
-    static func totalNote(attached: Int) -> String? {
-        guard attached >= total else { return nil }
-        return "\(total) of \(total) reference files — the model takes at most \(total) across images, clips and audio."
-    }
+    /// Why a slot can vanish while its own type is not full. Read on hover
+    /// from the counter beside the References heading, so it is there before
+    /// the cap binds and not only after an empty list has lost its way in.
+    static let combinedCapNote =
+        "The model takes up to \(images) image, \(videos) video and \(audios) audio references. "
+        + "The total, however, cannot exceed \(total)."
 }
 
 // MARK: - Hardware

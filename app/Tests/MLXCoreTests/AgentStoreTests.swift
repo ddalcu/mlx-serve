@@ -20,6 +20,54 @@ final class AgentStoreTests: XCTestCase {
         try json.data(using: .utf8)!.write(to: root.appendingPathComponent("index.json"))
     }
 
+    /// An index that will not decode has to stop being the file the next save
+    /// writes: its agents are invisible to this build, and rewriting it from the
+    /// empty list it loaded as is the one outcome nothing can undo.
+    func testAnIndexThatWillNotDecodeIsKeptAside() throws {
+        // Two triggers: a shape this build does not read, and a truncated write.
+        for original in [#"{"agents":[{"name":"Chef"}]}"#, #"[{"name":"Chef""#] {
+            let root = try tempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try write(original, to: root)
+
+            let store = AgentStore(rootDir: root)
+            XCTAssertTrue(store.agents.isEmpty)
+
+            let kept = try XCTUnwrap(store.undecodableIndexURL, "kept nothing for \(original)")
+            XCTAssertEqual(try String(contentsOf: kept, encoding: .utf8), original)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("index.json").path),
+                           "the unreadable file is still where the next save writes")
+
+            store.add(Agent(name: "Chef", brief: "cooking help", systemPrompt: "You are a chef."))
+            XCTAssertEqual(store.agents.count, 1)
+            XCTAssertEqual(try String(contentsOf: kept, encoding: .utf8), original,
+                           "the kept file must survive the save that follows")
+        }
+    }
+
+    /// The kept name is second-resolution, and a name already taken refuses both
+    /// the move and the copy: two quarantines in one second must not collide.
+    func testTwoQuarantinesInTheSameSecondKeepBothFiles() throws {
+        let root = try tempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = #"{"agents":[{"name":"Chef"}]}"#
+
+        try write(original, to: root)
+        let first = try XCTUnwrap(AgentStore(rootDir: root).undecodableIndexURL)
+
+        // The index is back (a save, or the copy path that cannot remove it) and
+        // still unreadable: the same second must not reuse the first name.
+        try write(original, to: root)
+        let second = try XCTUnwrap(AgentStore(rootDir: root).undecodableIndexURL,
+                                   "the second quarantine kept nothing")
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(try String(contentsOf: first, encoding: .utf8), original)
+        XCTAssertEqual(try String(contentsOf: second, encoding: .utf8), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("index.json").path),
+                       "the unreadable file is still where the next save writes")
+    }
+
     func testRoundTripsEveryField() throws {
         let root = try tempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

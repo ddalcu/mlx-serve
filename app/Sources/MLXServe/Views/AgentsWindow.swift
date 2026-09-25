@@ -140,6 +140,9 @@ struct AgentListPane: View {
     private var list: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
+                if let kept = store.undecodableIndexURL {
+                    unreadableIndexNotice(kept)
+                }
                 sectionLabel("Your agents")
                 createRow
                 ForEach(store.sortedAgents) { agent in
@@ -154,6 +157,21 @@ struct AgentListPane: View {
             .padding(.horizontal, 10)
             .padding(.bottom, 12)
         }
+    }
+
+    /// An empty column has two very different causes; this one names the file the
+    /// agents are still in, rather than leaving the list unexplained.
+    private func unreadableIndexNotice(_ url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(L10n.text("Saved agents couldn't be read"), systemImage: "exclamationmark.triangle")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+            Text(L10n.format("The file is kept at %@.", url.lastPathComponent))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+        .padding(.vertical, 6)
     }
 
     private func sectionLabel(_ title: String) -> some View {

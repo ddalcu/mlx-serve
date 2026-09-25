@@ -26,6 +26,14 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
     let onDownload: (P) -> Void
     /// The LAN rows, if this pane has any peers offering the modality.
     let lanCapability: String
+    /// What the pane wants said about the model, immediately after the
+    /// switcher: live residency, where a pane has it. Reads as part of the
+    /// sentence the row makes, which is why it is not in the trailing slot.
+    var status: AnyView? = nil
+    /// Anything the PANE wants on the switcher's row, trailing edge. What
+    /// belongs there is the pane's own business (residency, for the ones that
+    /// unload after generating), so it is handed in rather than built here.
+    var accessory: AnyView? = nil
 
     @EnvironmentObject var server: ServerManager
 
@@ -46,7 +54,12 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                 )
 
-            switcherMenu
+            HStack(spacing: 8) {
+                switcherMenu
+                status
+                Spacer(minLength: 8)
+                accessory
+            }
         }
     }
 
@@ -221,7 +234,9 @@ extension MediaModelChooser {
                      bundleOf: @escaping (P) -> MediaBundle,
                      downloads: DownloadManager,
                      onDownloadFinished: @escaping () -> Void,
-                     persist: @escaping () -> Void) -> MediaModelChooser<P> {
+                     persist: @escaping () -> Void,
+                     status: AnyView? = nil,
+                     accessory: AnyView? = nil) -> MediaModelChooser<P> {
         let featured = MediaModelPicks.featured(
             all,
             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
@@ -252,6 +267,8 @@ extension MediaModelChooser {
                 downloads.startBundle(bundleOf(preset)) { onDownloadFinished() }
             },
             lanCapability: capability,
+            status: status,
+            accessory: accessory,
             onSelectLan: { id in
                 lanModel.wrappedValue = id
                 // Adopt the preset the request will be SHAPED by: catalogue

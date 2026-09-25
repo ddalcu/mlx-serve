@@ -34,11 +34,20 @@ gen() { # gen <out.json> <json fields> -> http code
   curl -s -m 3600 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
     -d "{\"model\":\"$ID\",\"size\":\"512x512\",\"steps\":6,\"seed\":3,$2}" -o "$1" -w '%{http_code}'
 }
-png_check() { python3 - "$1" <<'PY'
+png_check() { python3 - "$1" "${2:-2}" <<'PY'
 import sys, json, base64, struct
-b = base64.b64decode(json.load(open(sys.argv[1]))["data"][0]["b64_json"])
+raw = open(sys.argv[1]).read()
+if raw.startswith("data:"):
+    events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+    replies = [event for event in events if event.get("type") == "complete"]
+    assert len(replies) == 1, "missing or duplicate completion"
+    reply = replies[0]
+else:
+    reply = json.loads(raw)
+b = base64.b64decode(reply["data"][0]["b64_json"])
 assert b[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG"
 assert struct.unpack(">II", b[16:24]) == (512, 512), "wrong size"
+assert b[25] == int(sys.argv[2]), "wrong PNG color type (2=RGB, 6=RGBA)"
 PY
 }
 
@@ -71,6 +80,13 @@ grep -q "img2img" "$LOG" && pass "img2img engaged" || fail "no img2img log line"
   && pass "edit mode is a 400" || fail "edit mode was not refused"
 [ "$(gen "$OUT/e.json" '"prompt":"x","cond_weights":"1 1 1"')" = 400 ] \
   && pass "cond_weights is a 400" || fail "cond_weights was not refused"
+
+for stream in false true; do
+  [ "$(gen "$OUT/rgba-$stream.json" "\"prompt\":\"This is an RGBA image with transparency. A red apple. The image has alpha channel and the background is transparent.\",\"transparent\":true,\"stream\":$stream")" = 200 ] && png_check "$OUT/rgba-$stream.json" 6 \
+    && pass "transparent -> RGBA PNG (stream=$stream)" || fail "transparent (stream=$stream)"
+done
+[ "$(gen "$OUT/rgb.json" '"prompt":"a red fox in the snow","transparent":false')" = 200 ] && png_check "$OUT/rgb.json" \
+  && pass "transparent=false restores RGB after RGBA" || fail "explicit RGB after RGBA"
 
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && pass "server alive" || fail "server died"
 grep -q "\[mlx\]" "$LOG" && fail "MLX error in the log"

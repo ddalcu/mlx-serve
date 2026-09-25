@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 
 /// 3D generation window — single photo → textured mesh, run natively by the
 /// embedded mlx-serve server (Hunyuan3D 2.1 shape stage). Same shell as
-/// ImageGen/VideoGen/AudioGen: a model picker, a photo chip, an Advanced
+/// ImageGen/VideoGen/AudioGen: a model picker, a photo well, an Advanced
 /// disclosure (steps / guidance / mesh resolution), and a SceneKit preview of
 /// the result with a turntable "Animate" toggle.
 struct Model3DGenView: View {
@@ -56,25 +56,27 @@ struct Model3DGenView: View {
             // the picker (discovery lands seconds after the server boots).
             if server.status == .running { Task { await server.refreshModels() } }
         }
-        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: turntable) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: texture) { _, _ in guard !hydrating else { return }; persist() }
+        // ONE observation of the whole blob (the Music pane's mechanism):
+        // anything in `stickySnapshot` is sticky by construction.
+        .onChange(of: stickySnapshot) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var readyView: some View {
         HSplitView {
             ScrollView {
+                // The model decides whether the weights are on this Mac at
+                // all, so it is read before the photo it acts on.
                 VStack(alignment: .leading, spacing: 14) {
-                    photoSection
                     modelSection
-                    if showAdvanced { advancedSection } else { advancedToggle }
-                    actionRow
+                    photoSection
+                    advancedSection
+                    // Generate stands apart from the settings it acts on.
+                    actionRow.padding(.top, 14)
                 }
+                // Full-width, leading-aligned frame OUTSIDE the padding — see
+                // AudioGenView.
                 .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minWidth: 340, idealWidth: 380)
 
@@ -100,47 +102,36 @@ struct Model3DGenView: View {
 
     // MARK: - Sections
 
-    private var photoSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Photo").font(.subheadline.weight(.semibold))
-            if let url = photoURL {
-                HStack(spacing: 8) {
-                    if let img = NSImage(contentsOf: url) {
-                        Image(nsImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 40, height: 40)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                    Text(url.lastPathComponent)
-                        .font(.caption).lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Button { photoURL = nil } label: {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                    .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove photo")
-                }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-            } else {
-                MediaDropWell(title: "Choose photo…",
-                              systemImage: "photo.badge.plus",
-                              isTargeted: isDropTargeted) { choosePhoto() }
-                Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
-                    .font(.caption2).foregroundStyle(.secondary)
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`. The transfer
+    /// bar (or the conversion hint for weights with no download) and residency
+    /// belong to the model, not to the output, so they sit with it rather than
+    /// beside Generate.
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            modelChooser
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
+                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle, showsStartButton: false) }
             }
-        }
-        // One photo slot, so a drop replaces what's there — see
-        // `MediaDropTarget`. The target covers the whole section, which once a
-        // photo is set is the thumbnail row you'd aim a replacement at.
-        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
-            if let url = urls.first { photoURL = url }
         }
     }
 
-    /// Best-per-capability up front, everything else behind "Other Models", and
-    /// the Download button ON the model — see `MediaModelChooser`.
-    private var modelSection: some View {
+    /// Residency rides the switcher's row: it is a property of the model, and
+    /// the only thing about it the pane still has to say once it is picked.
+    private var keepResidentToggle: AnyView {
+        AnyView(
+            Toggle(isOn: $keepResident) {
+                Text("Keep model loaded after generating")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+                .font(.caption)
+                .controlSize(.small)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+        )
+    }
+
+    private var modelChooser: some View {
         MediaModelChooser.pane(
             all: Model3DModelPreset.all,
             onThisMac: CustomMediaModels.meshPresets(from: server.allModels),
@@ -153,77 +144,131 @@ struct Model3DGenView: View {
             bundleOf: { $0.bundle },
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },
-            persist: persist)
-        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+            persist: persist,
+            accessory: keepResidentToggle)
     }
 
-    private var advancedToggle: some View {
-        Button {
-            withAnimation { showAdvanced = true }
-        } label: {
-            Label("Advanced options", systemImage: "chevron.right").font(.caption)
+    private var photoSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Photo").font(.subheadline.weight(.semibold))
+            if let url = photoURL {
+                // Same surface and same floor height as the empty well.
+                MediaDropWellFilled(isTargeted: isDropTargeted) {
+                    HStack(spacing: 8) {
+                        if let img = NSImage(contentsOf: url) {
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: 64, height: 48)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                        Text(url.lastPathComponent)
+                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Button { photoURL = nil } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Remove photo")
+                    }
+                }
+            } else {
+                MediaDropWell(title: "Choose photo…",
+                              systemImage: "photo.badge.plus",
+                              isTargeted: isDropTargeted) { choosePhoto() }
+                // The well says how to add a photo; what is left to say is
+                // which photo works.
+                Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        // One photo slot, so a drop replaces what's there — see
+        // `MediaDropTarget`. The target covers the whole section, which once a
+        // photo is set is the filled well you'd aim a replacement at.
+        .mediaDrop(.image, isTargeted: $isDropTargeted) { urls in
+            if let url = urls.first { photoURL = url }
+        }
     }
 
     private var advancedSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Advanced").font(.caption.weight(.semibold))
-                Spacer()
-                Button { withAnimation { showAdvanced = false } } label: { Image(systemName: "chevron.down") }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Steps (\(steps))").font(.caption)
-                Slider(value: Binding(get: { Double(steps) }, set: { steps = Int($0) }), in: 10...50, step: 1)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Guidance (\(String(format: "%.1f", guidance)))").font(.caption)
-                Slider(value: $guidance, in: 1...10, step: 0.5)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Mesh resolution").font(.caption)
-                Picker("", selection: $resolution) {
-                    Text("128 (fast)").tag(128)
-                    Text("256 (balanced)").tag(256)
-                    Text("384 (fine)").tag(384)
+            FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
+            if showAdvanced {
+                intSliderRow("Steps", value: $steps, range: 10...50)
+                sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Mesh resolution").font(.caption)
+                    Picker("", selection: $resolution) {
+                        Text("128 (fast)").tag(128)
+                        Text("256 (balanced)").tag(256)
+                        Text("384 (fine)").tag(384)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    Text("Higher = finer mesh, more memory and time.").font(.caption2).foregroundStyle(.secondary)
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                Text("Higher = finer mesh, more memory and time.").font(.caption2).foregroundStyle(.secondary)
+                Toggle("Texture (PBR)", isOn: $texture)
+                    .font(.caption)
+                    .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
             }
-            Toggle("Texture (PBR)", isOn: $texture)
-                .font(.caption)
-                .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
-                .font(.caption)
-                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
-    private var actionRow: some View {
-        VStack(spacing: 8) {
-            if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                // Local-only models have no HF download yet — steer the user to
-                // the on-device conversion instead of a Download button.
-                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle, showsStartButton: false) }
-            }
+    /// Labeled slider for a `Double` setting, the value read out on the right.
+    private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>,
+                           step: Double) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
             HStack {
-                if service.isRunning {
-                    Button(role: .destructive) { service.cancel() } label: {
-                        Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                } else {
-                    Button { tryGenerate() } label: {
-                        Label("Generate", systemImage: "cube.transparent").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(photoURL == nil || (lanModel == nil && !downloads.bundleReady(model.bundle)))
+                Text(L10n.text(label)).font(.caption)
+                Spacer()
+                Text(String(format: "%.1f", value.wrappedValue))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range, step: step)
+                .padding(.top, Self.steppedSliderTrackDrop)
+        }
+    }
+
+    /// Labeled slider for an `Int` setting (bridges to a `Double` slider).
+    private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(L10n.text(label)).font(.caption)
+                Spacer()
+                Text("\(value.wrappedValue)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { Double(value.wrappedValue) },
+                    set: { value.wrappedValue = Int($0.rounded()) }
+                ),
+                in: Double(range.lowerBound)...Double(range.upperBound),
+                step: 1
+            )
+            .padding(.top, Self.steppedSliderTrackDrop)
+        }
+    }
+
+    /// A stepped slider reserves a tick row under its track, so the track sits
+    /// glued to the caption above; 3pt, the Video pane's value.
+    private static let steppedSliderTrackDrop: CGFloat = 3
+
+    private var actionRow: some View {
+        HStack {
+            if service.isRunning {
+                Button(role: .destructive) { service.cancel() } label: {
+                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
+            } else {
+                Button { tryGenerate() } label: {
+                    Label("Generate", systemImage: "cube.transparent").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(photoURL == nil || (lanModel == nil && !downloads.bundleReady(model.bundle)))
             }
         }
     }
@@ -352,9 +397,14 @@ struct Model3DGenView: View {
         keepResident = s.keepResident
         turntable = s.turntable
         texture = s.texture
+        showAdvanced = s.showAdvanced
+        // A photo that has gone since is dropped, as the other panes do.
+        photoURL = s.photoPath.flatMap { FileManager.default.fileExists(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
     }
 
-    private func persist() {
+    /// Everything the pane persists, as one value: the body's single
+    /// `onChange` watches this rather than each field.
+    private var stickySnapshot: Model3DGenSettings {
         var s = Model3DGenSettings()
         s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.steps = steps
@@ -363,8 +413,12 @@ struct Model3DGenView: View {
         s.keepResident = keepResident
         s.turntable = turntable
         s.texture = texture
-        s.save()
+        s.photoPath = photoURL?.path
+        s.showAdvanced = showAdvanced
+        return s
     }
+
+    private func persist() { stickySnapshot.save() }
 
     // MARK: - Generate
 
