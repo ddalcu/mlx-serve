@@ -248,6 +248,79 @@ else
 fi
 echo ""
 
+# ── Test 5b: namespace tool group (Codex MCP shape) reaches the model and splits back ──
+echo "--- Test 5b: namespace tool group returns (namespace, name) ---"
+RESULT_NS=$(curl -sf "$BASE/v1/responses" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"mlx-serve",
+    "input":"What is the weather in Paris? Use the get_weather tool.",
+    "tools":[{"type":"namespace","name":"mcp__demo__","description":"Demo MCP server","tools":[{"type":"function","name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}],
+    "tool_choice":"required",
+    "max_output_tokens":128,
+    "temperature":0
+  }')
+
+OK_NS=$(echo "$RESULT_NS" | python3 -c "
+import sys, json
+try:
+    r = json.loads(sys.stdin.read())
+    fc = next((it for it in r['output'] if it['type'] == 'function_call'), None)
+    assert fc is not None, 'no function_call output item'
+    # The expanded wire name must split back to (namespace, child name).
+    assert fc.get('name') == 'get_weather', f'unexpected fn: {fc.get(\"name\")}'
+    assert fc.get('namespace') == 'mcp__demo__', f'namespace not restored: {fc.get(\"namespace\")!r}'
+    args = json.loads(fc['arguments'])
+    assert isinstance(args.get('city'), str), 'city arg missing'
+    print('ok')
+except Exception as e:
+    print(f'fail:{e}')
+" 2>/dev/null)
+run_test "namespace tool group round-trip" "$( [ "$OK_NS" = ok ] && echo PASS || echo FAIL )" "$OK_NS"
+echo ""
+
+# ── Test 5c: streaming namespace group — both function_call item events carry the split namespace ──
+echo "--- Test 5c: streaming namespace group emits namespace ---"
+EVENTS_NS=$(curl -sf -N "$BASE/v1/responses" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model":"mlx-serve",
+    "input":"What is the weather in Paris? Use the get_weather tool.",
+    "tools":[{"type":"namespace","name":"mcp__demo__","description":"Demo MCP server","tools":[{"type":"function","name":"get_weather","description":"Get the weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]}],
+    "tool_choice":"required",
+    "stream":true,
+    "max_output_tokens":128,
+    "temperature":0
+  }' 2>/dev/null)
+
+OK_NS_S=$(echo "$EVENTS_NS" | python3 -c "
+import sys, json
+try:
+    items, delta, args_done, completed = {}, False, False, False
+    for line in sys.stdin:
+        if not line.startswith('data: '): continue
+        try: ev = json.loads(line[6:])
+        except Exception: continue
+        t = ev.get('type','')
+        if t in ('response.output_item.added','response.output_item.done') and ev.get('item',{}).get('type')=='function_call':
+            items['added' if t.endswith('added') else 'done'] = ev['item']
+        elif t == 'response.function_call_arguments.delta': delta = True
+        elif t == 'response.function_call_arguments.done': args_done = True
+        elif t == 'response.completed': completed = True
+    for k in ('added','done'):
+        it = items.get(k)
+        assert it is not None, 'missing output_item.' + k
+        assert it.get('name') == 'get_weather', k + ': unexpected name ' + repr(it.get('name'))
+        assert it.get('namespace') == 'mcp__demo__', k + ': namespace not split into event: ' + repr(it.get('namespace'))
+    assert delta and args_done, 'arguments delta/done missing'
+    assert completed, 'no response.completed'
+    print('ok')
+except Exception as e:
+    print(f'fail:{e}')
+" 2>/dev/null)
+run_test "streaming namespace group events carry namespace" "$( [ "$OK_NS_S" = ok ] && echo PASS || echo FAIL )" "$OK_NS_S"
+echo ""
+
 # ── Test 6: text.format.json_schema enforces structure ──
 echo "--- Test 6: text.format.json_schema strict ---"
 RESULT=$(curl -sf "$BASE/v1/responses" \

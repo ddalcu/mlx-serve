@@ -200,43 +200,275 @@ pub fn inputContainsFunctionCallOutput(input_val: std.json.Value) bool {
 
 // ─── tools: Responses (flat) → OpenAI (nested) ───────────────────────────
 
+/// The `(namespace, name)` pair a client resolves a namespaced call by;
+/// both borrow from the parsed request (alive for the handler). The keys of
+/// `aliases` are the names a model may spell the call with.
+pub const NamespaceEntry = struct {
+    namespace: []const u8,
+    name: []const u8,
+};
+
+/// A group whose bare join was already held at declaration, so its declared
+/// wire name took a `_N` suffix. `namespace`/`child` borrow the request and
+/// `wire` borrows the alias-map key; nothing here is freed. Collisions are
+/// rare, so this stays a small linear list rather than a hashed map.
+const CollisionEntry = struct { namespace: []const u8, child: []const u8, wire: []const u8 };
+const CollisionList = std.ArrayList(CollisionEntry);
+
+/// `call_name -> (namespace, name)` plus the declaration-time collisions needed
+/// to resolve a namespaced echo back to the name the current turn declared.
+pub const NamespaceAliases = struct {
+    aliases: std.StringHashMap(NamespaceEntry),
+    collisions: CollisionList,
+
+    pub fn init(allocator: std.mem.Allocator) NamespaceAliases {
+        return .{
+            .aliases = std.StringHashMap(NamespaceEntry).init(allocator),
+            .collisions = .empty,
+        };
+    }
+};
+
+/// Free the owned wire-name keys, then the map and the (borrowed) collisions.
+pub fn freeNamespaceAliases(allocator: std.mem.Allocator, aliases: *NamespaceAliases) void {
+    var it = aliases.aliases.iterator();
+    while (it.next()) |e| allocator.free(e.key_ptr.*);
+    aliases.aliases.deinit();
+    aliases.collisions.deinit(allocator);
+}
+
+/// The wire name for (namespace, child): the measured Codex join, suffixed
+/// `_N` if a flat tool (or an earlier member) already holds the name. Returns
+/// the owned wire name, registers it in `taken`, and reports whether a suffix
+/// was needed (so the caller can record the collision for echo resolution).
+fn namespaceWireName(
+    allocator: std.mem.Allocator,
+    namespace: []const u8,
+    child: []const u8,
+    taken: *std.StringHashMap(void),
+) !struct { wire: []u8, collided: bool } {
+    const joined = try joinNsChild(allocator, namespace, child);
+    defer allocator.free(joined);
+    var wire = try allocator.dupe(u8, joined);
+    errdefer allocator.free(wire);
+    var collided = false;
+    var suffix: usize = 2;
+    while (taken.contains(wire)) {
+        collided = true;
+        // Allocate the next candidate BEFORE freeing the current one: a
+        // failure here unwinds the still-owned `wire`, never a freed one.
+        const next = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ joined, suffix });
+        allocator.free(wire);
+        wire = next;
+        suffix += 1;
+    }
+    _ = try taken.put(wire, {});
+    return .{ .wire = wire, .collided = collided };
+}
+
+/// The measured Codex join rule: trailing `_` off the namespace, leading `_`
+/// off the child, joined by `__`.
+fn joinNsChild(allocator: std.mem.Allocator, namespace: []const u8, child: []const u8) ![]u8 {
+    var ns = namespace;
+    while (ns.len > 0 and ns[ns.len - 1] == '_') ns = ns[0 .. ns.len - 1];
+    var ch = child;
+    while (ch.len > 0 and ch[0] == '_') ch = ch[1..ch.len];
+    return std.fmt.allocPrint(allocator, "{s}__{s}", .{ ns, ch });
+}
+
+/// Write one tool as the nested OpenAI form under `name` (which may differ from
+/// the tool's own name when a namespace member is expanded to a wire name).
+fn appendNestedFunctionTool(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    tool: std.json.ObjectMap,
+    name: []const u8,
+) !void {
+    const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
+    const esc_n = try jsonEscape(allocator, name);
+    defer allocator.free(esc_n);
+    const esc_d = try jsonEscape(allocator, desc);
+    defer allocator.free(esc_d);
+    try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+    try buf.appendSlice(allocator, esc_n);
+    try buf.appendSlice(allocator, ",\"description\":");
+    try buf.appendSlice(allocator, esc_d);
+    try buf.appendSlice(allocator, ",\"parameters\":");
+    if (tool.get("parameters")) |params_val| {
+        try serializeJsonValue(allocator, buf, params_val);
+    } else {
+        try buf.appendSlice(allocator, "{}");
+    }
+    try buf.appendSlice(allocator, "}}");
+}
+
 /// Re-shape Responses tools (`{type:"function", name, parameters, description}`)
 /// into the nested OpenAI form (`{type:"function", function:{name, parameters,
 /// description}}`) that `chat_mod.formatChat` expects. Returns owned JSON.
-pub fn buildToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
+///
+/// A `namespace` tool is a container of ordinary client-executed function tools
+/// (the shape Codex uses to wrap each MCP server), so its members are expanded
+/// under a joined wire name instead of being skipped whole. When `aliases` is
+/// given it is filled with `call_name -> (namespace, name)` so a resulting call
+/// can be returned with its namespace intact. A model that drops the namespace
+/// prefix (the history echoes the bare child name back at it) is answered too:
+/// we register a unique bare child name as an alias next to its wire name.
+pub fn buildToolsJson(
+    allocator: std.mem.Allocator,
+    tools_array: std.json.Array,
+    aliases: ?*NamespaceAliases,
+) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
+
+    // A null `aliases` still gets a map so every expanded wire name is owned and
+    // freed exactly once here; `taken` borrows those keys, so they are freed only
+    // after `taken` is deinited (defer LIFO).
+    var owned_aliases = NamespaceAliases.init(allocator);
+    const aliases_ref: *NamespaceAliases = if (aliases) |a| a else &owned_aliases;
+    defer freeNamespaceAliases(allocator, &owned_aliases);
+
+    // Flat function names are reserved first so an expanded member never
+    // shadows a tool the client already resolves by its bare name.
+    var taken = std.StringHashMap(void).init(allocator);
+    defer taken.deinit();
+    var child_counts = std.StringHashMap(u32).init(allocator);
+    defer child_counts.deinit();
+    for (tools_array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const tool = tool_val.object;
+        const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+        if (std.mem.eql(u8, t, "namespace")) {
+            const members = if (tool.get("tools")) |tv| (if (tv == .array) tv.array.items else null) else null;
+            for (members orelse continue) |member_val| {
+                if (member_val != .object) continue;
+                const member = member_val.object;
+                const mt = if (member.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+                if (!std.mem.eql(u8, mt, "function")) continue;
+                const child = if (member.get("name")) |v| (if (v == .string) v.string else "") else "";
+                if (child.len == 0) continue;
+                const n = child_counts.get(child) orelse 0;
+                try child_counts.put(child, n + 1);
+            }
+            continue;
+        }
+        if (!std.mem.eql(u8, t, "function")) continue;
+        if (tool.get("name")) |v| if (v == .string and v.string.len > 0) {
+            _ = try taken.put(v.string, {});
+        };
+    }
+
     try buf.append(allocator, '[');
     var emitted: usize = 0;
     for (tools_array.items) |tool_val| {
         if (tool_val != .object) continue;
         const tool = tool_val.object;
-        // Only function tools are supported locally (web_search/file_search/computer_use are not)
         const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+
+        if (std.mem.eql(u8, t, "namespace")) {
+            const ns_name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
+            if (ns_name.len == 0) continue;
+            const members = if (tool.get("tools")) |tv| (if (tv == .array) tv.array.items else null) else null;
+            const members_items = members orelse continue;
+            for (members_items) |member_val| {
+                if (member_val != .object) continue;
+                const member = member_val.object;
+                const mt = if (member.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+                if (!std.mem.eql(u8, mt, "function")) continue;
+                const child = if (member.get("name")) |v| (if (v == .string) v.string else "") else "";
+                if (child.len == 0) continue;
+                const ns_wire = try namespaceWireName(allocator, ns_name, child, &taken);
+                const wire = ns_wire.wire;
+                // `wire` is in `taken` (borrowed) and handed to the alias map below,
+                // which frees it after `taken` is gone; on a handoff error it is still
+                // ours, so free it here. (Same shape as the `bare` registration.)
+                var wire_owned = true;
+                defer if (wire_owned) allocator.free(wire);
+                if (emitted > 0) try buf.append(allocator, ',');
+                emitted += 1;
+                try appendNestedFunctionTool(allocator, &buf, member, wire);
+                {
+                    const al = aliases_ref;
+                    // Put before any later fallible step; the map owns the key
+                    // on success, so error paths free it (never a live key).
+                    try al.aliases.put(wire, .{ .namespace = ns_name, .name = child });
+                    wire_owned = false;
+                    // Record a group whose bare join was already held so an
+                    // echo of that join resolves to the declared name. Keep the
+                    // first declaration; the wire name borrows the map key.
+                    if (ns_wire.collided) {
+                        var declared = false;
+                        for (al.collisions.items) |c| {
+                            if (std.mem.eql(u8, c.namespace, ns_name) and std.mem.eql(u8, c.child, child)) {
+                                declared = true;
+                                break;
+                            }
+                        }
+                        if (!declared) try al.collisions.append(allocator, .{
+                            .namespace = ns_name,
+                            .child = child,
+                            .wire = wire,
+                        });
+                    }
+                    // A bare child name seen in one namespace only is how the
+                    // model often spells the call; register it too. If a flat
+                    // tool holds it already, or two namespaces share it, leave
+                    // it to the flat/client resolution.
+                    const unique = (child_counts.get(child) orelse 0) == 1;
+                    if (unique and !taken.contains(child)) {
+                        const bare = try allocator.dupe(u8, child);
+                        var bare_owned = true;
+                        defer if (bare_owned) allocator.free(bare);
+                        try taken.put(bare, {});
+                        try al.aliases.put(bare, .{ .namespace = ns_name, .name = child });
+                        bare_owned = false;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Only function tools are supported locally (web_search/file_search/computer_use are not)
         if (!std.mem.eql(u8, t, "function")) continue;
+        const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
 
         if (emitted > 0) try buf.append(allocator, ',');
         emitted += 1;
-        const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
-        const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
-        const esc_n = try jsonEscape(allocator, name);
-        defer allocator.free(esc_n);
-        const esc_d = try jsonEscape(allocator, desc);
-        defer allocator.free(esc_d);
-        try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
-        try buf.appendSlice(allocator, esc_n);
-        try buf.appendSlice(allocator, ",\"description\":");
-        try buf.appendSlice(allocator, esc_d);
-        try buf.appendSlice(allocator, ",\"parameters\":");
-        if (tool.get("parameters")) |params_val| {
-            try serializeJsonValue(allocator, &buf, params_val);
-        } else {
-            try buf.appendSlice(allocator, "{}");
-        }
-        try buf.appendSlice(allocator, "}}");
+        try appendNestedFunctionTool(allocator, &buf, tool, name);
     }
     try buf.append(allocator, ']');
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Restore `(namespace, name)` for a call made by wire name or by a uniquely
+/// registered bare child name. Flat tools and names the model invented return
+/// `null` (emit a bare name, no namespace).
+pub fn splitNamespaceToolName(aliases: ?*const NamespaceAliases, name: []const u8) ?NamespaceEntry {
+    const al = aliases orelse return null;
+    return al.aliases.get(name);
+}
+
+/// The name the current turn declared for (namespace, child), or null when the
+/// group is not declared. Returns a slice borrowed from a live alias/collision
+/// entry (alive for the handler): the bare join when it was free, else the `_N`
+/// suffix recorded at declaration. One join is built only for the lookup.
+fn declaredWireName(
+    allocator: std.mem.Allocator,
+    aliases: *const NamespaceAliases,
+    namespace: []const u8,
+    child: []const u8,
+) ?[]const u8 {
+    const joined = joinNsChild(allocator, namespace, child) catch return null;
+    defer allocator.free(joined);
+    if (aliases.aliases.get(joined)) |e| {
+        if (std.mem.eql(u8, e.namespace, namespace) and std.mem.eql(u8, e.name, child))
+            return aliases.aliases.getKeyPtr(joined).?.*;
+    }
+    for (aliases.collisions.items) |c| {
+        if (std.mem.eql(u8, c.namespace, namespace) and std.mem.eql(u8, c.child, child))
+            return c.wire;
+    }
+    return null;
 }
 
 // ─── output-item JSON builders ────────────────────────────────────────────
@@ -282,6 +514,7 @@ pub fn appendFunctionCallItem(
     call_id: []const u8,
     name: []const u8,
     arguments_json: []const u8,
+    namespace: ?[]const u8,
 ) !void {
     const esc_id = try jsonEscape(allocator, item_id);
     defer allocator.free(esc_id);
@@ -297,6 +530,12 @@ pub fn appendFunctionCallItem(
     try buf.appendSlice(allocator, esc_call);
     try buf.appendSlice(allocator, ",\"name\":");
     try buf.appendSlice(allocator, esc_name);
+    if (namespace) |ns| {
+        const esc_ns = try jsonEscape(allocator, ns);
+        defer allocator.free(esc_ns);
+        try buf.appendSlice(allocator, ",\"namespace\":");
+        try buf.appendSlice(allocator, esc_ns);
+    }
     try buf.appendSlice(allocator, ",\"arguments\":");
     try buf.appendSlice(allocator, esc_args);
     try buf.appendSlice(allocator, ",\"status\":\"completed\"}");
@@ -351,11 +590,15 @@ pub const ImageUrlDecoder = *const fn (
 /// templates like Qwen's never see a non-leading/duplicate system message.
 /// `previous_messages` are deep-referenced (not copied) into the result if
 /// non-null — caller must keep them alive.
+/// `namespace_aliases` (from `buildToolsJson`) rewrites echoed `function_call`
+/// items — which carry the namespace Codex declared, not the wire name — so
+/// the history shows the same name the current turn declares.
 pub fn parseInput(
     allocator: std.mem.Allocator,
     input_val: std.json.Value,
     instructions: ?[]const u8,
     previous_messages: ?[]const chat_mod.Message,
+    namespace_aliases: ?*const NamespaceAliases,
     image_decoder: ?ImageUrlDecoder,
     vp: chat_mod.VisionPreproc,
 ) !ParsedInput {
@@ -403,7 +646,7 @@ pub fn parseInput(
                 if (std.mem.eql(u8, t, "message")) {
                     try appendMessageItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "function_call")) {
-                    try appendFunctionCallInputItem(allocator, &pi, obj);
+                    try appendFunctionCallInputItem(allocator, &pi, obj, namespace_aliases);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
                     try appendFunctionCallOutputItem(allocator, &pi, obj);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
@@ -431,6 +674,27 @@ pub fn parseInput(
     return pi;
 }
 
+/// Join the text parts (`input_text`/`text`/`output_text`) of a Responses
+/// content array into `dest` in order, newline-separated; empty parts are
+/// skipped, matching the `joinedTextParts` convention in server.zig.
+fn appendTextParts(
+    allocator: std.mem.Allocator,
+    dest: *std.ArrayList(u8),
+    parts: []const std.json.Value,
+) !void {
+    for (parts) |part| {
+        if (part != .object) continue;
+        const pt_val = part.object.get("type") orelse continue;
+        if (pt_val != .string) continue;
+        const pt = pt_val.string;
+        if (!std.mem.eql(u8, pt, "input_text") and !std.mem.eql(u8, pt, "text") and !std.mem.eql(u8, pt, "output_text")) continue;
+        const tx = part.object.get("text") orelse continue;
+        if (tx != .string or tx.string.len == 0) continue;
+        if (dest.items.len > 0) try dest.append(allocator, '\n');
+        try dest.appendSlice(allocator, tx.string);
+    }
+}
+
 fn appendMessageItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
@@ -456,28 +720,21 @@ fn appendMessageItem(
                 for (image_list.items) |img| allocator.free(img.pixels);
                 image_list.deinit(allocator);
             }
+            try appendTextParts(allocator, &text_parts, arr.items);
             for (arr.items) |part| {
                 if (part != .object) continue;
                 const pt_val = part.object.get("type") orelse continue;
                 if (pt_val != .string) continue;
-                const pt = pt_val.string;
-                if (std.mem.eql(u8, pt, "input_text") or std.mem.eql(u8, pt, "text") or std.mem.eql(u8, pt, "output_text")) {
-                    const tx = part.object.get("text") orelse continue;
-                    if (tx == .string) {
-                        if (text_parts.items.len > 0) try text_parts.append(allocator, '\n');
-                        try text_parts.appendSlice(allocator, tx.string);
-                    }
-                } else if (std.mem.eql(u8, pt, "input_image")) {
-                    const url_val = part.object.get("image_url") orelse continue;
-                    const url = switch (url_val) {
-                        .string => |s| s,
-                        .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
-                        else => continue,
-                    };
-                    if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
-                        pi.image_decode_failed = true;
-                    };
-                }
+                if (!std.mem.eql(u8, pt_val.string, "input_image")) continue;
+                const url_val = part.object.get("image_url") orelse continue;
+                const url = switch (url_val) {
+                    .string => |s| s,
+                    .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
+                    else => continue,
+                };
+                if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
+                    pi.image_decode_failed = true;
+                };
             }
             if (text_parts.items.len > 0) {
                 const owned = try allocator.dupe(u8, text_parts.items);
@@ -507,10 +764,20 @@ fn appendFunctionCallInputItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
     obj: std.json.ObjectMap,
+    namespace_aliases: ?*const NamespaceAliases,
 ) !void {
     const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
-    const name = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
+    var name: []const u8 = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
     const args = if (obj.get("arguments")) |v| (if (v == .string) v.string else "{}") else "{}";
+
+    // A namespaced echo (`name`=child + `namespace`=declared namespace) is
+    // rendered as the name the current turn declares. The declared name is
+    // borrowed from a live alias entry, so it is not owned here.
+    if (namespace_aliases) |al| {
+        if (obj.get("namespace")) |nv| if (nv == .string and nv.string.len > 0 and name.len > 0) {
+            if (declaredWireName(allocator, al, nv.string, name)) |declared| name = declared;
+        };
+    }
 
     const tcs = try allocator.alloc(chat_mod.ToolCall, 1);
     errdefer allocator.free(tcs);
@@ -529,7 +796,26 @@ fn appendFunctionCallOutputItem(
     obj: std.json.ObjectMap,
 ) !void {
     const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
-    const output = if (obj.get("output")) |v| (if (v == .string) v.string else "") else "";
+    const output_val = obj.get("output");
+    var output: []const u8 = "";
+    if (output_val) |v| {
+        switch (v) {
+            .string => |s| output = s,
+            // Codex echoes `output` as an array of content parts; join its text
+            // parts in order the same way message content is joined.
+            .array => |arr| {
+                var parts = std.ArrayList(u8).empty;
+                defer parts.deinit(allocator);
+                try appendTextParts(allocator, &parts, arr.items);
+                if (parts.items.len > 0) {
+                    const owned = try allocator.dupe(u8, parts.items);
+                    try pi.owned_strings.append(allocator, owned);
+                    output = owned;
+                }
+            },
+            else => {},
+        }
+    }
     try pi.messages.append(allocator, .{
         .role = "tool",
         .content = output,
@@ -861,7 +1147,7 @@ test "buildToolsJson nests Responses-shape into OpenAI-shape" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    const out = try buildToolsJson(testing.allocator, parsed.value.array);
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, null);
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "\"function\":{\"name\":\"get_weather\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"parameters\":{") != null);
@@ -875,16 +1161,316 @@ test "buildToolsJson skips non-function tools" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    const out = try buildToolsJson(testing.allocator, parsed.value.array);
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, null);
     defer testing.allocator.free(out);
     // Only the function tool should be emitted, no leading comma
     try testing.expect(std.mem.startsWith(u8, out, "[{"));
     try testing.expect(std.mem.indexOf(u8, out, "web_search") == null);
 }
 
+test "buildToolsJson expands namespace groups under wire names" {
+    const json =
+        \\[{"type":"namespace","name":"mcp__demo__","description":"Demo","tools":[{"type":"function","name":"get_weather","description":"W","parameters":{"type":"object","required":["city"]}},{"type":"function","name":"get_time"}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, &aliases);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"function\":{\"name\":\"mcp__demo__get_weather\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"function\":{\"name\":\"mcp__demo__get_time\"") != null);
+    // Wire name joins namespace + child (the measured Codex join); the
+    // returned namespace keeps the client's original spelling, trailing '_'
+    // included.
+    try testing.expectEqualStrings("mcp__demo__", splitNamespaceToolName(&aliases, "mcp__demo__get_weather").?.namespace);
+    try testing.expectEqualStrings("get_weather", splitNamespaceToolName(&aliases, "mcp__demo__get_weather").?.name);
+}
+
+test "buildToolsJson wire name survives a flat collision" {
+    const json =
+        \\[{"type":"function","name":"mcp__demo__get_weather"},{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"get_weather"}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, &aliases);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"mcp__demo__get_weather_2\"") != null);
+    try testing.expect(splitNamespaceToolName(&aliases, "mcp__demo__get_weather") == null);
+    try testing.expectEqualStrings("get_weather", splitNamespaceToolName(&aliases, "mcp__demo__get_weather_2").?.name);
+}
+
+test "splitNamespaceToolName passes flat and invented names through" {
+    try testing.expect(splitNamespaceToolName(null, "get_weather") == null);
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    try testing.expect(splitNamespaceToolName(&aliases, "get_weather") == null);
+}
+
+test "buildToolsJson registers a unique bare child name as alias" {
+    const json =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"search"}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, &aliases);
+    defer testing.allocator.free(out);
+    // The model often drops the namespace prefix; the bare call still returns namespaced.
+    const e = splitNamespaceToolName(&aliases, "search").?;
+    try testing.expectEqualStrings("mcp__demo__", e.namespace);
+    try testing.expectEqualStrings("search", e.name);
+}
+
+test "buildToolsJson skips the bare alias on ambiguity or flat collision" {
+    const ambiguous =
+        \\[{"type":"namespace","name":"a","tools":[{"type":"function","name":"go"}]},{"type":"namespace","name":"b","tools":[{"type":"function","name":"go"}]}]
+    ;
+    const parsed_a = try std.json.parseFromSlice(std.json.Value, testing.allocator, ambiguous, .{});
+    defer parsed_a.deinit();
+    var aliases_a = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases_a);
+    const out_a = try buildToolsJson(testing.allocator, parsed_a.value.array, &aliases_a);
+    defer testing.allocator.free(out_a);
+    try testing.expect(splitNamespaceToolName(&aliases_a, "go") == null);
+    try testing.expect(splitNamespaceToolName(&aliases_a, "a__go") != null);
+    try testing.expect(splitNamespaceToolName(&aliases_a, "b__go") != null);
+
+    const colliding =
+        \\[{"type":"function","name":"go"},{"type":"namespace","name":"ns","tools":[{"type":"function","name":"go"}]}]
+    ;
+    const parsed_c = try std.json.parseFromSlice(std.json.Value, testing.allocator, colliding, .{});
+    defer parsed_c.deinit();
+    var aliases_c = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases_c);
+    const out_c = try buildToolsJson(testing.allocator, parsed_c.value.array, &aliases_c);
+    defer testing.allocator.free(out_c);
+    // The flat tool owns the bare name; only the wire form is namespaced.
+    try testing.expect(splitNamespaceToolName(&aliases_c, "go") == null);
+    try testing.expect(splitNamespaceToolName(&aliases_c, "ns__go") != null);
+}
+
+// Fixed-pool, LIFO free-list allocator: a freed <=64B slot is reused by the next
+// same-size alloc. SafeAllocator never reuses a just-freed slot, so only this
+// reproduces the `taken` use-after-free.
+const SlotAllocator = struct {
+    const Self = @This();
+    const SLOT = 64;
+    const NSLOT = 1024;
+    const NFREE = 1024;
+    pool: [SLOT * NSLOT]u8,
+    bump: usize,
+    free_stack: [NFREE]usize,
+    free_top: usize,
+    const Allocator = std.mem.Allocator;
+    const Alignment = std.mem.Alignment;
+    fn init() Self {
+        return .{ .pool = undefined, .bump = 0, .free_stack = undefined, .free_top = 0 };
+    }
+    fn selfOf(ctx: *anyopaque) *Self {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn basePtr(self: *Self) [*]u8 {
+        return @ptrCast(&self.pool[0]);
+    }
+    fn rawAlloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+        const self = selfOf(ctx);
+        if (len <= SLOT and alignment.toByteUnits() <= SLOT) {
+            if (self.free_top > 0) {
+                self.free_top -= 1;
+                return self.basePtr() + (self.free_stack[self.free_top] * SLOT);
+            }
+            if (self.bump + SLOT > self.pool.len) return null;
+            const idx = self.bump / SLOT;
+            self.bump += SLOT;
+            return self.basePtr() + (idx * SLOT);
+        }
+        return std.heap.page_allocator.rawAlloc(len, alignment, ra);
+    }
+    fn rawFree(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+        const self = selfOf(ctx);
+        const b = @intFromPtr(self.basePtr());
+        const p = @intFromPtr(memory.ptr);
+        if (p >= b and (p - b) < self.pool.len) {
+            self.free_stack[self.free_top] = (p - b) / SLOT;
+            self.free_top += 1;
+        } else {
+            std.heap.page_allocator.rawFree(memory, alignment, ra);
+        }
+    }
+    fn rawResize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return false;
+    }
+    fn rawRemap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ra;
+        return null;
+    }
+    const VTable = Allocator.VTable;
+    const vtable = VTable{ .alloc = rawAlloc, .resize = rawResize, .remap = rawRemap, .free = rawFree };
+    fn allocator(self: *Self) Allocator {
+        return Allocator{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "buildToolsJson namespaced output is independent of the aliases map" {
+    // The two children's joined names share a length and a Wyhash fingerprint, so
+    // a dangling `taken` key (freed wire, slot reused) reads the second as a false
+    // collision and suffixes it. Bar: both emit unsuffixed, the `_2` form absent.
+    var slot_alloc: SlotAllocator = .init();
+    const alloc = slot_alloc.allocator();
+    const json =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"00000000","parameters":{}},{"type":"function","name":"00000623","parameters":{}}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    const out_null = try buildToolsJson(alloc, parsed.value.array, null);
+    defer alloc.free(out_null);
+
+    try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000000\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out_null, "\"name\":\"mcp__demo__00000623\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out_null, "mcp__demo__00000623_2") == null);
+}
+
+test "parseInput rewrites a namespaced function_call echo to its declared wire name" {
+    const tools =
+        \\[{"type":"namespace","name":"mcp__demo__","description":"D","tools":[{"type":"function","name":"get_weather","parameters":{}},{"type":"function","name":"get_time"}]}]
+    ;
+    const tp = try std.json.parseFromSlice(std.json.Value, testing.allocator, tools, .{});
+    defer tp.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, tp.value.array, &aliases);
+    defer testing.allocator.free(out);
+
+    const input =
+        \\[
+        \\  {"type":"function_call","call_id":"call_1","name":"get_weather","namespace":"mcp__demo__","arguments":"{\"city\":\"sf\"}"},
+        \\  {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+        \\]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, &aliases, null, .{});
+    defer pi.deinit();
+    // History must echo the name the model was shown this turn (the wire name),
+    // so the next call spells the declared name — not the bare child name.
+    try testing.expectEqualStrings("mcp__demo__get_weather", pi.messages.items[0].tool_calls.?[0].name);
+}
+
+test "parseInput rewrites a colliding echo to its suffixed declared name" {
+    const tools =
+        \\[{"type":"function","name":"mcp__demo__get_weather","parameters":{}},{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"get_weather","parameters":{}}]}]
+    ;
+    const tp = try std.json.parseFromSlice(std.json.Value, testing.allocator, tools, .{});
+    defer tp.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, tp.value.array, &aliases);
+    defer testing.allocator.free(out);
+
+    const input =
+        \\[{"type":"function_call","call_id":"call_1","name":"get_weather","namespace":"mcp__demo__","arguments":"{}"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, &aliases, null, .{});
+    defer pi.deinit();
+    // The bare join belongs to the FLAT tool; the member's declared name is
+    // the suffixed one, so the echo must carry `..._2`.
+    try testing.expectEqualStrings("mcp__demo__get_weather_2", pi.messages.items[0].tool_calls.?[0].name);
+}
+
+test "parseInput resolves an echo declared past a multi-suffix collision" {
+    const tools =
+        \\[{"type":"function","name":"mcp__demo__get_weather","parameters":{}},{"type":"function","name":"mcp__demo__get_weather_2","parameters":{}},{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"get_weather","parameters":{}}]}]
+    ;
+    const tp = try std.json.parseFromSlice(std.json.Value, testing.allocator, tools, .{});
+    defer tp.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, tp.value.array, &aliases);
+    defer testing.allocator.free(out);
+
+    const input =
+        \\[{"type":"function_call","call_id":"call_1","name":"get_weather","namespace":"mcp__demo__","arguments":"{}"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, &aliases, null, .{});
+    defer pi.deinit();
+    // Flat holds base and _2, so the member's declared name is the _3 suffix;
+    // the echo must resolve to it, not stop at the absent _2.
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"mcp__demo__get_weather_3\"") != null);
+    try testing.expectEqualStrings("mcp__demo__get_weather_3", pi.messages.items[0].tool_calls.?[0].name);
+}
+
+test "parseInput resolves echoes of two groups that share one join" {
+    const tools =
+        \\[{"type":"namespace","name":"a__b","tools":[{"type":"function","name":"c","parameters":{}}]},{"type":"namespace","name":"a","tools":[{"type":"function","name":"b__c","parameters":{}}]}]
+    ;
+    const tp = try std.json.parseFromSlice(std.json.Value, testing.allocator, tools, .{});
+    defer tp.deinit();
+    var aliases = NamespaceAliases.init(testing.allocator);
+    defer freeNamespaceAliases(testing.allocator, &aliases);
+    const out = try buildToolsJson(testing.allocator, tp.value.array, &aliases);
+    defer testing.allocator.free(out);
+
+    // (a__b,c) keeps the bare join; (a,b__c) collides onto it and is suffixed.
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"a__b__c\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"a__b__c_2\"") != null);
+
+    const input =
+        \\[{"type":"function_call","call_id":"call_1","name":"c","namespace":"a__b","arguments":"{}"},{"type":"function_call","call_id":"call_2","name":"b__c","namespace":"a","arguments":"{}"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, &aliases, null, .{});
+    defer pi.deinit();
+    try testing.expectEqualStrings("a__b__c", pi.messages.items[0].tool_calls.?[0].name);
+    try testing.expectEqualStrings("a__b__c_2", pi.messages.items[1].tool_calls.?[0].name);
+}
+
+test "buildToolsJson with null aliases still emits wire names and leaks nothing" {
+    const json =
+        \\[{"type":"namespace","name":"mcp__demo__","tools":[{"type":"function","name":"get_weather"},{"type":"function","name":"get_time"}]},{"type":"function","name":"mcp__demo__get_time"}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    // std.testing.allocator fails the test on any wire name not freed here.
+    const out = try buildToolsJson(testing.allocator, parsed.value.array, null);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"mcp__demo__get_weather\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"name\":\"mcp__demo__get_time_2\"") != null);
+}
+
+test "appendFunctionCallItem serializes namespace only when set" {
+    var set_buf = std.ArrayList(u8).empty;
+    defer set_buf.deinit(testing.allocator);
+    try appendFunctionCallItem(testing.allocator, &set_buf, "fc_1", "call_1", "get_weather", "{}", "mcp__demo__");
+    try testing.expect(std.mem.indexOf(u8, set_buf.items, "\"name\":\"get_weather\",\"namespace\":\"mcp__demo__\"") != null);
+
+    var flat_buf = std.ArrayList(u8).empty;
+    defer flat_buf.deinit(testing.allocator);
+    try appendFunctionCallItem(testing.allocator, &flat_buf, "fc_2", "call_2", "get_weather", "{}", null);
+    try testing.expect(std.mem.indexOf(u8, flat_buf.items, "namespace") == null);
+}
+
 test "parseInput string becomes single user message" {
     const v: std.json.Value = .{ .string = "hello" };
-    var pi = try parseInput(testing.allocator, v, null, null, null, .{});
+    var pi = try parseInput(testing.allocator, v, null, null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
@@ -896,7 +1482,7 @@ test "parseInput reads a developer item as the system turn" {
         \\[{"role":"developer","content":"You are S."},{"role":"user","content":"hi"}]
     , .{});
     defer parsed.deinit();
-    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
     try testing.expectEqualStrings("system", pi.messages.items[0].role);
@@ -913,7 +1499,7 @@ test "parseInput records an input_image the decoder could not read" {
         \\[{"role":"user","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"http://example.invalid/x.png"}]}]
     , .{});
     defer parsed.deinit();
-    var pi = try parseInput(allocator, parsed.value, null, null, testRejectingDecoder, .{});
+    var pi = try parseInput(allocator, parsed.value, null, null, null, testRejectingDecoder, .{});
     defer pi.deinit();
     try std.testing.expect(pi.image_decode_failed);
     try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);
@@ -921,7 +1507,7 @@ test "parseInput records an input_image the decoder could not read" {
 
 test "parseInput with instructions prepends system" {
     const v: std.json.Value = .{ .string = "hi" };
-    var pi = try parseInput(testing.allocator, v, "You are a pirate", null, null, .{});
+    var pi = try parseInput(testing.allocator, v, "You are a pirate", null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
     try testing.expectEqualStrings("system", pi.messages.items[0].role);
@@ -935,7 +1521,7 @@ test "parseInput replaces stored system when fresh instructions are provided" {
         .{ .role = "user", .content = "first" },
         .{ .role = "assistant", .content = "answer" },
     };
-    var pi = try parseInput(testing.allocator, v, "new instructions", &prev, null, .{});
+    var pi = try parseInput(testing.allocator, v, "new instructions", &prev, null, null, .{});
     defer pi.deinit();
 
     try testing.expectEqual(@as(usize, 4), pi.messages.items.len);
@@ -955,7 +1541,7 @@ test "parseInput folds a non-leading system into the leading one" {
         \\[{"role":"system","content":"mid"},{"role":"user","content":"hi"}]
     , .{});
     defer parsed.deinit();
-    var pi = try parseInput(allocator, parsed.value, "You are S.", null, null, .{});
+    var pi = try parseInput(allocator, parsed.value, "You are S.", null, null, null, .{});
     defer pi.deinit();
     // Qwen's own template raises on a system that is not first, so a second
     // system must fold into the leading one instead of reaching the render.
@@ -978,7 +1564,7 @@ test "parseInput function_call + function_call_output round-trip" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 3), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
@@ -987,6 +1573,22 @@ test "parseInput function_call + function_call_output round-trip" {
     try testing.expectEqualStrings("call_1", pi.messages.items[1].tool_calls.?[0].id);
     try testing.expectEqualStrings("tool", pi.messages.items[2].role);
     try testing.expectEqualStrings("call_1", pi.messages.items[2].tool_call_id.?);
+}
+
+test "parseInput joins content-parts function_call_output in order" {
+    // Codex's echo sends `output` as an array of content parts, never a string.
+    const json =
+        \\[
+        \\  {"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"Wall time: 1.0 seconds"},{"type":"input_text","text":""},{"type":"input_text","text":"Title: HELLO"}]}
+        \\]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("tool", pi.messages.items[0].role);
+    try testing.expectEqualStrings("Wall time: 1.0 seconds\nTitle: HELLO", pi.messages.items[0].content);
 }
 
 test "compaction blob round-trips through encode + parseInput" {
@@ -1006,7 +1608,7 @@ test "compaction blob round-trips through encode + parseInput" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input_json, .{});
     defer parsed.deinit();
 
-    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, null, .{});
     defer pi.deinit();
 
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
@@ -1027,7 +1629,7 @@ test "compaction with malformed envelope is silently skipped" {
     for (inputs) |body| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
         defer parsed.deinit();
-        var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
+        var pi = try parseInput(testing.allocator, parsed.value, null, null, null, null, .{});
         defer pi.deinit();
         try testing.expectEqual(@as(usize, 0), pi.messages.items.len);
     }

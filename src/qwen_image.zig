@@ -27,6 +27,7 @@ const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
+const qwen_kernels = @import("qwen_image_kernels.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -37,8 +38,18 @@ const TextEncoder = mage_flow.TextEncoder;
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
 const VAE_DOWNSAMPLE: u32 = 16;
-/// The DiT + text encoder run in bf16 like the checkpoint; the VAE stays f32.
+/// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
+/// Experimental DiT-only dtype override. Unrecognized values preserve the
+/// checkpoint's default; text encoding and VAE decoding keep their own dtypes.
+fn ditDtype(value: ?[*:0]const u8) mlx.mlx_dtype {
+    return if (value) |v| if (std.mem.eql(u8, std.mem.span(v), "fp16")) .float16 else COMPUTE else COMPUTE;
+}
+
+fn fusedRopeEnabled(value: ?[*:0]const u8) bool {
+    return if (value) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+}
+
 const MAX_PROMPT_TOKENS: usize = 2048;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
@@ -389,12 +400,90 @@ pub const Geometry = struct {
         };
     }
 
+    /// Keep the original image positions; rebuilding with text_len=0 would
+    /// change the frame-axis RoPE and therefore the model's output.
+    fn imageOnly(self: *const Geometry, s: S) !Geometry {
+        const L = mlx.getShape(self.cos)[1];
+        const cos = try sliceAxis(self.cos, 1, self.text_len, L, s);
+        errdefer free(cos);
+        const sin = try sliceAxis(self.sin, 1, self.text_len, L, s);
+        errdefer free(sin);
+        return .{
+            .text_len = 0,
+            .cos = cos,
+            .sin = sin,
+            .mod_row = try sliceAxis(self.mod_row, 0, self.text_len, L, s),
+        };
+    }
+
     pub fn deinit(self: *Geometry) void {
         free(self.cos);
         free(self.sin);
         free(self.mod_row);
     }
 };
+
+/// Text is causal and always modulated at t=0, so its per-layer K/V is
+/// invariant across denoising steps. This cache belongs to ONE conditioning
+/// branch of ONE request; positive and negative CFG branches never share it.
+const PrefixKV = struct {
+    k: A,
+    v: A,
+
+    fn deinit(self: *PrefixKV) void {
+        free(self.k);
+        free(self.v);
+    }
+
+    fn capture(k: A, v: A, text_len: c_int, s: S) !PrefixKV {
+        // sliceAxis requests row-contiguous storage. The pinned MLX runtime
+        // also copies contiguous views when their backing allocation exceeds
+        // the slice by 16 KiB, so image-sized buffers cannot stay pinned.
+        // mlx_copy is intentionally not used: it shares the backing buffer.
+        const kt = try sliceAxis(k, 2, 0, text_len, s);
+        errdefer free(kt);
+        return .{ .k = kt, .v = try sliceAxis(v, 2, 0, text_len, s) };
+    }
+};
+
+const PrefixCache = struct {
+    allocator: std.mem.Allocator,
+    layers: []?PrefixKV,
+    image_geo: Geometry,
+    ready: bool = false,
+
+    fn init(a: std.mem.Allocator, n_layers: usize, geo: *const Geometry, s: S) !PrefixCache {
+        const layers = try a.alloc(?PrefixKV, n_layers);
+        errdefer a.free(layers);
+        @memset(layers, null);
+        return .{ .allocator = a, .layers = layers, .image_geo = try geo.imageOnly(s) };
+    }
+
+    fn deinit(self: *PrefixCache) void {
+        for (self.layers) |*kv| if (kv.*) |*pair| pair.deinit();
+        self.allocator.free(self.layers);
+        self.image_geo.deinit();
+    }
+
+    fn materialize(self: *PrefixCache, output: A) !void {
+        const arrays = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(arrays);
+        try mlx.check(mlx.mlx_vector_array_append_value(arrays, output));
+        for (self.layers) |kv| {
+            const pair = kv orelse return error.IncompletePrefixCache;
+            try mlx.check(mlx.mlx_vector_array_append_value(arrays, pair.k));
+            try mlx.check(mlx.mlx_vector_array_append_value(arrays, pair.v));
+        }
+        // Evaluate together to share first-step computation and detach the
+        // cache from the full lazy graph before the next denoising step.
+        try mlx.check(mlx.mlx_eval(arrays));
+        self.ready = true;
+    }
+};
+
+fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
+    return if (value) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+}
 
 const Block = struct {
     q: MfLinear,
@@ -448,6 +537,7 @@ pub const Dit = struct {
     s: S,
     cfg: DitConfig,
     dtype: mlx.mlx_dtype,
+    fused_rope: bool = false,
     img_in: MfLinear,
     txt_norm: A, // f32, stored zero-centred: holds weight + 1
     txt_in: MfLinear,
@@ -472,6 +562,7 @@ pub const Dit = struct {
         self.s = s;
         self.cfg = cfg;
         self.dtype = dtype;
+        self.fused_rope = fusedRopeEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_FUSED_ROPE"));
         self.img_in = try loadLinear(&w, a, cfg.in_ch, dtype, s, "img_in", .{});
         const tn = try loadVecF32(&w, a, "txt_in.text_norm.weight", .{}, s);
         defer free(tn);
@@ -561,6 +652,7 @@ pub const Dit = struct {
     /// Rotate interleaved pairs (2k, 2k+1) of x [1, L, heads, hd] in f32.
     fn applyRope(self: *const Dit, x: A, geo: *const Geometry) !A {
         const s = self.s;
+        if (self.fused_rope) return qwen_kernels.applyRope(x, geo.cos, geo.sin, self.dtype, s);
         const sh = mlx.getShape(x);
         const half = @divExact(sh[3], 2);
         const xf = try astype(x, .float32, s);
@@ -609,7 +701,7 @@ pub const Dit = struct {
 
     /// Block-causal attention as the reference segments it: causal over the
     /// text prefix, then the image block against the whole sequence.
-    fn attention(self: *const Dit, b: *const Block, x: A, geo: *const Geometry) !A {
+    fn attention(self: *const Dit, b: *const Block, x: A, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const T = geo.text_len;
@@ -621,9 +713,18 @@ pub const Dit = struct {
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
+        if (cache) |slot| if (!cached) {
+            if (slot.*) |*old| old.deinit();
+            slot.* = null;
+            slot.* = try PrefixKV.capture(k, v, T, s);
+        };
+        const full_k = if (cached) try concat(&.{ cache.?.*.?.k, k }, 2, s) else null;
+        defer if (full_k) |a| free(a);
+        const full_v = if (cached) try concat(&.{ cache.?.*.?.v, v }, 2, s) else null;
+        defer if (full_v) |a| free(a);
         const qi = try sliceAxis(q, 2, T, sh[1], s);
         defer free(qi);
-        const img_out = try sdpa(qi, k, v, scale, "", s);
+        const img_out = try sdpa(qi, full_k orelse k, full_v orelse v, scale, "", s);
         defer free(img_out);
         const joined = if (T == 0) try contig(img_out, s) else blk: {
             const qt = try sliceAxis(q, 2, 0, T, s);
@@ -644,13 +745,13 @@ pub const Dit = struct {
         return b.o.forward(flat, null, s);
     }
 
-    fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry) !A {
+    fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const n1 = try layerNorm(x, self.cfg.eps, s);
         defer free(n1);
         const a_in = try mulA(n1, mod.scale1, s);
         defer free(a_in);
-        const attn = try self.attention(b, a_in, geo);
+        const attn = try self.attention(b, a_in, geo, cache, cached);
         defer free(attn);
         const ga = try mulA(attn, mod.gate1, s);
         defer free(ga);
@@ -692,7 +793,13 @@ pub const Dit = struct {
     /// Velocity for one flow step. img [1, N, in_ch], txt [1, T, context] →
     /// [1, N, out_ch] in the compute dtype. Caller owns the result.
     pub fn forward(self: *const Dit, img: A, txt: A, t: f32, geo: *const Geometry) !A {
+        return self.forwardCached(img, txt, t, geo, null);
+    }
+
+    fn forwardCached(self: *const Dit, img: A, txt: A, t: f32, joint_geo: *const Geometry, cache: ?*PrefixCache) !A {
         const s = self.s;
+        const cached = if (cache) |c| c.ready else false;
+        const geo = if (cached) &cache.?.image_geo else joint_geo;
         const temb = try self.timeEmbed(t);
         defer free(temb);
         const temb_act = try silu(temb, s);
@@ -700,18 +807,20 @@ pub const Dit = struct {
         var mod = try self.stepMod(temb_act, geo);
         defer mod.deinit();
 
-        const th = try self.textIn(txt);
-        defer free(th);
         const ih = try self.img_in.forward(img, null, s);
         defer free(ih);
-        var x = try concat(&.{ th, ih }, 1, s);
-        errdefer free(x);
-        for (self.blocks) |*b| {
-            const nx = try self.blockForward(b, x, &mod, geo);
+        var x = if (cached) try contig(ih, s) else blk: {
+            const th = try self.textIn(txt);
+            defer free(th);
+            break :blk try concat(&.{ th, ih }, 1, s);
+        };
+        defer free(x);
+        for (self.blocks, 0..) |*b, i| {
+            const slot = if (cache) |c| &c.layers[i] else null;
+            const nx = try self.blockForward(b, x, &mod, geo, slot, cached);
             free(x);
             x = nx;
         }
-        defer free(x);
 
         // Only image tokens leave the model, and LayerNorm is per token, so the
         // final norm reads the image rows and the sampled-t scale alone.
@@ -728,7 +837,10 @@ pub const Dit = struct {
         defer free(opsc);
         const scaled = try mulA(n, opsc, s);
         defer free(scaled);
-        return self.proj_out.forward(scaled, null, s);
+        const output = try self.proj_out.forward(scaled, null, s);
+        errdefer free(output);
+        if (cache) |c| if (!cached) try c.materialize(output);
+        return output;
     }
 };
 
@@ -1338,6 +1450,11 @@ pub fn cfgActive(opts: GenOpts) bool {
     return opts.guidance_scale != 1.0;
 }
 
+fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
+    const q = first orelse return null;
+    return if (!explicit_env and q.quantized and q.bits == 4) 1024 else null;
+}
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1387,16 +1504,16 @@ pub const Engine = struct {
         self.drop_tokens = prefix_ids.len;
         allocator.free(prefix_ids);
 
-        self.dit = try Dit.load(io, allocator, self.s, model_dir, self.dit_cfg, COMPUTE);
+        self.dit = try Dit.load(io, allocator, self.s, model_dir, self.dit_cfg, ditDtype(std.c.getenv("MLX_SERVE_QWEN_IMAGE_DTYPE")));
         errdefer self.dit.deinit();
         self.vae = try VaeDecoder.load(io, allocator, self.s, model_dir, self.vae_cfg);
         errdefer self.vae.deinit();
         if (!staged) self.te = try TextEncoder.load(io, allocator, self.s, model_dir, COMPUTE);
         logMemory("load");
 
-        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d}, VAE {d}ch /{d}, text encoder {s})\n", .{
-            self.dit_cfg.layers,                                        self.dit_cfg.hidden(), self.vae_cfg.z_dim, VAE_DOWNSAMPLE,
-            if (staged) "staged per request" else "resident",
+        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s})\n", .{
+            self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),                         self.dit.fused_rope,
+            self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
         });
         return self;
     }
@@ -1462,9 +1579,8 @@ pub const Engine = struct {
         const z: c_int = @intCast(self.dit_cfg.in_ch);
 
         log.info("[qwen-image] {d}x{d} steps={d} guidance={d:.1} ({s}){s}\n", .{
-            width,                                                           height, n_steps, opts.guidance_scale,
-            if (cfgActive(opts)) "two forwards per step" else "one forward per step",
-            if (opts.init_image != null) " img2img" else "",
+            width,                                                                    height,                                          n_steps, opts.guidance_scale,
+            if (cfgActive(opts)) "two forwards per step" else "one forward per step", if (opts.init_image != null) " img2img" else "",
         });
         if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
         const cond = try self.encodeConditioning(allocator, prompt, opts);
@@ -1488,33 +1604,48 @@ pub const Engine = struct {
         var noise = mlx.mlx_array_new();
         defer free(noise);
         try mlx.check(mlx.mlx_random_normal(&noise, &nsh, 3, .float32, 0.0, 1.0, key, s));
-        var img = if (opts.init_image) |pix| try self.noisedSource(pix, noise, sigmas[start]) else try astype(noise, COMPUTE, s);
+        var img = if (opts.init_image) |pix| try self.noisedSource(pix, noise, sigmas[start]) else try astype(noise, self.dit.dtype, s);
         defer free(img);
 
+        // The Q4 DiT's wide image rows favor dequantized GEMM over quantized matmul.
+        const dq_override_prev = mage_flow.mf_dq_gemm_override;
+        const first: ?*const MfLinear = if (self.dit.blocks.len != 0) &self.dit.blocks[0].q else null;
+        if (defaultDqGemmFloor(first, std.c.getenv("MLX_SERVE_MF_DQ_GEMM") != null)) |floor|
+            mage_flow.mf_dq_gemm_override = @as(?usize, floor);
+        defer mage_flow.mf_dq_gemm_override = dq_override_prev;
+
         const run = n_steps - start;
-        for (start..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
-            var v = try self.dit.forward(img, cond.pos, sigmas[i], &geo);
-            defer free(v);
-            if (cond.neg) |neg| {
-                // uncond + scale·(cond − uncond)
-                const vn = try self.dit.forward(img, neg, sigmas[i], &neg_geo.?);
-                defer free(vn);
-                const diff = try subA(v, vn, s);
-                defer free(diff);
-                const scaled = try mulScalar(diff, opts.guidance_scale, s);
-                defer free(scaled);
-                const blended = try addA(vn, scaled, s);
-                free(v);
-                v = blended;
+        {
+            // Request-local lifetime also covers cancellation and failed forwards.
+            const use_prefix_cache = run > 1 and prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+            var pos_cache: ?PrefixCache = if (use_prefix_cache) try PrefixCache.init(allocator, self.dit.blocks.len, &geo, s) else null;
+            defer if (pos_cache) |*c| c.deinit();
+            var neg_cache: ?PrefixCache = if (use_prefix_cache and neg_geo != null) try PrefixCache.init(allocator, self.dit.blocks.len, &neg_geo.?, s) else null;
+            defer if (neg_cache) |*c| c.deinit();
+            for (start..n_steps) |i| {
+                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                var v = try self.dit.forwardCached(img, cond.pos, sigmas[i], &geo, if (pos_cache) |*c| c else null);
+                defer free(v);
+                if (cond.neg) |neg| {
+                    // uncond + scale·(cond − uncond)
+                    const vn = try self.dit.forwardCached(img, neg, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
+                    defer free(vn);
+                    const diff = try subA(v, vn, s);
+                    defer free(diff);
+                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
+                    defer free(scaled);
+                    const blended = try addA(vn, scaled, s);
+                    free(v);
+                    v = blended;
+                }
+                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
+                defer free(dv);
+                const next = try addA(img, dv, s);
+                free(img);
+                img = next;
+                try mlx.check(mlx.mlx_array_eval(img));
+                if (progress) |p| p.emit("Generating", @intCast(i + 1 - start), run);
             }
-            const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
-            defer free(dv);
-            const next = try addA(img, dv, s);
-            free(img);
-            img = next;
-            try mlx.check(mlx.mlx_array_eval(img));
-            if (progress) |p| p.emit("Generating", @intCast(i + 1 - start), run);
         }
 
         logMemory("denoise");
@@ -1550,7 +1681,7 @@ pub const Engine = struct {
         defer free(added);
         const mixed = try addA(kept, added, s);
         defer free(mixed);
-        return astype(mixed, COMPUTE, s);
+        return astype(mixed, self.dit.dtype, s);
     }
 };
 
@@ -1575,6 +1706,17 @@ fn denormImage(decoded: A, s: S) !A {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "QwenImage enables wide GEMM for Q4 unless explicitly overridden" {
+    const q4 = MfLinear{ .quantized = true, .w = .{ .ctx = null }, .dtype = .bfloat16, .bits = 4 };
+    const q8 = MfLinear{ .quantized = true, .w = .{ .ctx = null }, .dtype = .bfloat16, .bits = 8 };
+    const dense = MfLinear{ .quantized = false, .w = .{ .ctx = null }, .dtype = .bfloat16 };
+    try testing.expectEqual(@as(?usize, 1024), defaultDqGemmFloor(&q4, false));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&q4, true));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&q8, false));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&dense, false));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(null, false));
+}
 
 test "QwenImage sigmas match the reference schedule" {
     // mflux LinearScheduler, 512x320 (seq 640), 8 steps.
@@ -1684,6 +1826,139 @@ const Fixture = struct {
         return self.fx.get(key) orelse error.MissingFixtureTensor;
     }
 };
+
+test "QwenImage experimental dtype and fused RoPE defaults are conservative" {
+    try testing.expectEqual(COMPUTE, ditDtype(null));
+    try testing.expectEqual(COMPUTE, ditDtype("bf16"));
+    try testing.expectEqual(COMPUTE, ditDtype("unknown"));
+    try testing.expectEqual(mlx.mlx_dtype.float16, ditDtype("fp16"));
+    try testing.expect(!fusedRopeEnabled(null));
+    try testing.expect(!fusedRopeEnabled("0"));
+    try testing.expect(!fusedRopeEnabled("invalid"));
+    try testing.expect(fusedRopeEnabled("1"));
+}
+
+test "QwenImage prefix cache is enabled unless explicitly disabled" {
+    try testing.expect(prefixCacheEnabled(null));
+    try testing.expect(prefixCacheEnabled("1"));
+    try testing.expect(!prefixCacheEnabled("0"));
+}
+
+// Small deterministic nonzero weights exercise the actual full DiT without a
+// downloaded fixture, including time modulation, causal attention and RoPE.
+const TinyPrefixModel = struct {
+    fn tensor(shape: []const c_int, phase: f32, scale: f32) !A {
+        var n: usize = 1;
+        for (shape) |d| n *= @intCast(d);
+        const data = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.173 + phase) * scale;
+        return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    }
+
+    fn linear(in: u32, out: u32, phase: f32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
+        const raw = try tensor(&.{ @intCast(in), @intCast(out) }, phase, 0.4 / @sqrt(@as(f32, @floatFromInt(in))));
+        defer free(raw);
+        return .{ .quantized = false, .w = try astype(raw, dtype, s), .dtype = dtype };
+    }
+
+    fn init(dtype: mlx.mlx_dtype, s: S) !Dit {
+        const cfg: DitConfig = .{ .layers = 2, .heads = 2, .head_dim = 16, .in_ch = 8, .out_ch = 8, .context = 24, .axes = .{ 4, 6, 6 } };
+        const h = cfg.hidden();
+        const blocks = try testing.allocator.alloc(Block, cfg.layers);
+        for (blocks, 0..) |*b, i| {
+            const phase: f32 = @floatFromInt(i);
+            b.* = .{
+                .q = try linear(h, h, phase + 0.1, dtype, s),
+                .k = try linear(h, h, phase + 0.2, dtype, s),
+                .v = try linear(h, h, phase + 0.3, dtype, s),
+                .o = try linear(h, h, phase + 0.4, dtype, s),
+                .norm_q = try tensor(&.{@intCast(cfg.head_dim)}, 1.3, 1),
+                .norm_k = try tensor(&.{@intCast(cfg.head_dim)}, 1.7, 1),
+                .proj = try linear(h, h * cfg.mlp_ratio, phase + 0.5, dtype, s),
+                .gate = try linear(h, h * cfg.mlp_ratio, phase + 0.6, dtype, s),
+                .out = try linear(h * cfg.mlp_ratio, h, phase + 0.7, dtype, s),
+            };
+        }
+        return .{
+            .allocator = testing.allocator,
+            .s = s,
+            .cfg = cfg,
+            .dtype = dtype,
+            .img_in = try linear(cfg.in_ch, h, 0.3, dtype, s),
+            .txt_norm = try tensor(&.{@intCast(cfg.context)}, 1.1, 1),
+            .txt_in = try linear(cfg.context, h, 0.7, dtype, s),
+            .txt_out = try linear(h, h, 1.1, dtype, s),
+            .t1 = try linear(256, h, 1.5, dtype, s),
+            .t2 = try linear(h, h, 1.9, dtype, s),
+            .modulation = try linear(h, 4 * h, 2.3, dtype, s),
+            .blocks = blocks,
+            .norm_out = try linear(h, h, 2.7, dtype, s),
+            .proj_out = try linear(h, cfg.out_ch, 3.1, dtype, s),
+        };
+    }
+};
+
+test "QwenImage prefix cache matches full forwards across timesteps and conditioning branches" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dtype| {
+        var dit = try TinyPrefixModel.init(dtype, s);
+        defer dit.deinit();
+        // Different prompt lengths/content model independent CFG branches or
+        // successive requests; caches never survive beyond their owner.
+        for ([_]c_int{ 1, 7 }) |text_len| {
+            const txt = try TinyPrefixModel.tensor(&.{ 1, text_len, 24 }, @floatFromInt(text_len), 1);
+            defer free(txt);
+            var geo = try Geometry.init(testing.allocator, dit.cfg, @intCast(text_len), 2, 3);
+            defer geo.deinit();
+            var cache = try PrefixCache.init(testing.allocator, dit.blocks.len, &geo, s);
+            defer cache.deinit();
+            const head_input = try TinyPrefixModel.tensor(&.{ 1, text_len + 6, @intCast(dit.cfg.hidden()) }, 0.7, 1);
+            defer free(head_input);
+            // Per-head norm's f32 weights promote the intermediate to f32.
+            // Both RoPE implementations must cast Q/K back to compute dtype.
+            for ([_]bool{ false, true }) |fused| {
+                dit.fused_rope = fused;
+                const heads = try dit.headsOf(&dit.blocks[0].q, dit.blocks[0].norm_q, head_input, &geo);
+                defer free(heads);
+                try testing.expectEqual(dtype, mlx.mlx_array_dtype(heads));
+            }
+            dit.fused_rope = false;
+            for ([_]f32{ 0.9, 0.5, 0.02 }, 0..) |t, step| {
+                const img = try TinyPrefixModel.tensor(&.{ 1, 6, 8 }, t + 0.2, 1);
+                defer free(img);
+                const want = try dit.forward(img, txt, t, &geo);
+                defer free(want);
+                const want32 = try astype(want, .float32, s);
+                defer free(want32);
+                // Compare the primitive reference against fused RoPE with
+                // both full first-step and cached later-step attention.
+                dit.fused_rope = true;
+                const got = try dit.forwardCached(img, txt, t, &geo, &cache);
+                defer free(got);
+                dit.fused_rope = false;
+                const got32 = try astype(got, .float32, s);
+                defer free(got32);
+                try mlx.check(mlx.mlx_array_eval(got32));
+                var elements: usize = 1;
+                for (mlx.getShape(got32)) |d| elements *= @intCast(d);
+                for (mlx.mlx_array_data_float32(got32).?[0..elements]) |v|
+                    try testing.expect(std.math.isFinite(v));
+                try testing.expect(cache.ready);
+                try testing.expectEqual(dtype, mlx.mlx_array_dtype(got));
+                try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+                const p = try parity(got, want32, s);
+                std.debug.print("[qwen-image] prefix cache {s} T={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), text_len, step, p.cos, p.rms_ratio });
+                try testing.expect(p.cos > 0.99999);
+                try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, @as(f32, if (dtype == .float32) 1e-5 else 0.002));
+                for (cache.layers) |kv| {
+                    try testing.expectEqual(text_len, mlx.getShape(kv.?.k)[2]);
+                    try testing.expectEqual(text_len, mlx.getShape(kv.?.v)[2]);
+                }
+            }
+        }
+    }
+}
 
 test "QwenImage DiT parity (env-gated)" {
     var f = try Fixture.open();

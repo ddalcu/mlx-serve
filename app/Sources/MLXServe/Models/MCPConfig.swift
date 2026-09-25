@@ -9,9 +9,13 @@ import OrderedCollections
 /// would alphabetize them on every save).
 struct MCPConfig: Codable, Equatable {
     var mcpServers: OrderedDictionary<String, MCPServerEntry>
+    /// Keys beside `mcpServers` that this build does not model.
+    var extra: [String: JSONValue] = [:]
 
-    init(mcpServers: OrderedDictionary<String, MCPServerEntry> = [:]) {
+    init(mcpServers: OrderedDictionary<String, MCPServerEntry> = [:],
+         extra: [String: JSONValue] = [:]) {
         self.mcpServers = mcpServers
+        self.extra = extra
     }
 
     // MARK: - Codable (preserves JSON key order via dynamic keyed containers)
@@ -21,7 +25,7 @@ struct MCPConfig: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let outer = try decoder.container(keyedBy: TopKeys.self)
         if outer.contains(.mcpServers) {
-            let inner = try outer.nestedContainer(keyedBy: DynamicKey.self, forKey: .mcpServers)
+            let inner = try outer.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .mcpServers)
             // Decode the values into a regular dict first — `allKeys` order is implementation-defined
             // and Foundation's JSONDecoder shuffles them via an internal hash. We re-order in load().
             var byKey: [String: MCPServerEntry] = [:]
@@ -34,24 +38,19 @@ struct MCPConfig: Codable, Equatable {
         } else {
             self.mcpServers = [:]
         }
+        extra = try decoder.container(keyedBy: DynamicCodingKey.self)
+            .unmodelled(known: [TopKeys.mcpServers.rawValue])
     }
 
     func encode(to encoder: Encoder) throws {
         var outer = encoder.container(keyedBy: TopKeys.self)
-        var inner = outer.nestedContainer(keyedBy: DynamicKey.self, forKey: .mcpServers)
+        var inner = outer.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .mcpServers)
         for (id, entry) in mcpServers {
-            try inner.encode(entry, forKey: DynamicKey(stringValue: id)!)
+            try inner.encode(entry, forKey: DynamicCodingKey(stringValue: id)!)
         }
+        var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
+        try dynamic.encodeUnmodelled(extra, known: [TopKeys.mcpServers.rawValue])
     }
-}
-
-/// Stand-in for "any string can be a key". Used to drive JSON object encode/decode without an
-/// enum of fixed key names — server ids are user-defined.
-private struct DynamicKey: CodingKey {
-    var stringValue: String
-    var intValue: Int? { nil }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
 }
 
 struct MCPServerEntry: Codable, Equatable {
@@ -78,6 +77,9 @@ struct MCPServerEntry: Codable, Equatable {
     /// When omitted, MCPManager defaults to `~/.mlx-serve/workspace` so filesystem/shell servers
     /// land in a sane location by default rather than wherever macOS launched the .app from.
     var cwd: String?
+    /// Keys inside this entry that this build does not model: another MCP host's
+    /// fields, or ones a newer release added. save() rewrites the file whole.
+    var extra: [String: JSONValue] = [:]
 
     init(command: String? = nil, args: [String]? = nil, url: String? = nil,
          headers: [String: String]? = nil, type: String? = nil,
@@ -90,6 +92,38 @@ struct MCPServerEntry: Codable, Equatable {
         self.env = env
         self.disabled = disabled
         self.cwd = cwd
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case command, args, url, headers, type, env, disabled, cwd
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        command = try c.decodeIfPresent(String.self, forKey: .command)
+        args = try c.decodeIfPresent([String].self, forKey: .args)
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        headers = try c.decodeIfPresent([String: String].self, forKey: .headers)
+        type = try c.decodeIfPresent(String.self, forKey: .type)
+        env = try c.decodeIfPresent([String: String].self, forKey: .env)
+        disabled = try c.decodeIfPresent(Bool.self, forKey: .disabled)
+        cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
+        extra = try decoder.container(keyedBy: DynamicCodingKey.self)
+            .unmodelled(known: Set(CodingKeys.allCases.map(\.stringValue)))
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(command, forKey: .command)
+        try c.encodeIfPresent(args, forKey: .args)
+        try c.encodeIfPresent(url, forKey: .url)
+        try c.encodeIfPresent(headers, forKey: .headers)
+        try c.encodeIfPresent(type, forKey: .type)
+        try c.encodeIfPresent(env, forKey: .env)
+        try c.encodeIfPresent(disabled, forKey: .disabled)
+        try c.encodeIfPresent(cwd, forKey: .cwd)
+        var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
+        try dynamic.encodeUnmodelled(extra, known: Set(CodingKeys.allCases.map(\.stringValue)))
     }
 
     var isEnabled: Bool { !(disabled ?? false) }
@@ -124,7 +158,7 @@ enum MCPConfigStore {
         // store. We re-derive the user's hand-edited order by scanning the raw text and
         // reordering the OrderedDictionary to match.
         let order = extractMcpServersKeyOrder(from: data)
-        return MCPConfig(mcpServers: reorder(cfg.mcpServers, by: order))
+        return MCPConfig(mcpServers: reorder(cfg.mcpServers, by: order), extra: cfg.extra)
     }
 
     /// Reorder an OrderedDictionary so its keys appear in the given source-order list. Keys present
@@ -244,14 +278,23 @@ enum MCPConfigStore {
 
         var out = "{\n  \"mcpServers\" : {"
         if entryJSON.isEmpty {
-            out += "\n\n  }\n}\n"
+            out += "\n\n  }"
         } else {
             for (i, e) in entryJSON.enumerated() {
                 out += "\n    \"\(e.id)\" : \(e.body)"
                 if i < entryJSON.count - 1 { out += "," }
             }
-            out += "\n  }\n}\n"
+            out += "\n  }"
         }
+        // Keys beside mcpServers that this build does not model: the file is
+        // rewritten whole, so leaving them out deletes them from the config.
+        for (key, value) in config.extra.sorted(by: { $0.key < $1.key })
+        where key != "mcpServers" && DynamicCodingKey(stringValue: key) != nil {
+            let keyJSON = String(data: try valueEncoder.encode(key), encoding: .utf8) ?? "\"\""
+            let valueJSON = String(data: try valueEncoder.encode(value), encoding: .utf8) ?? "null"
+            out += ",\n  \(keyJSON) : \(valueJSON)"
+        }
+        out += "\n}\n"
 
         let parent = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)

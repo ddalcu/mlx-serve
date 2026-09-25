@@ -24,6 +24,26 @@ final class ProvidersConfigTests: XCTestCase {
         XCTAssertTrue(back[0].enabled, "absent enabled reads as true")
     }
 
+    /// The app writes providers.json whole, so a key it does not model — one the
+    /// server gained, or a note the user left — must survive an edit-and-save.
+    func testKeysTheAppDoesNotModelSurviveASave() throws {
+        let tmp = NSTemporaryDirectory().appending("providers-extra-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let source = #"""
+        [{"name":"local","url":"http://127.0.0.1:1234/v1","timeout_seconds":30,"notes":"hand-written"}]
+        """#
+        try source.data(using: .utf8)!.write(to: URL(fileURLWithPath: tmp))
+
+        let entries = ProvidersFile.load(path: tmp)
+        try ProvidersFile.save(entries, path: tmp)
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: tmp))
+        let raw = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        XCTAssertEqual(raw.first?["name"] as? String, "local")
+        XCTAssertEqual(raw.first?["timeout_seconds"] as? Int, 30)
+        XCTAssertEqual(raw.first?["notes"] as? String, "hand-written")
+    }
+
     func testDecodeAcceptsTheWrapperFormAndToleratesMissingKeys() {
         let wrapped = Data("{\"providers\":[{\"name\":\"a\",\"url\":\"http://a/v1\"}]}".utf8)
         XCTAssertEqual(ProvidersFile.decode(wrapped).map(\.name), ["a"])

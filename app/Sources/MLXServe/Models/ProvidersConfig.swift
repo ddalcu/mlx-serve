@@ -15,8 +15,10 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
     /// Model ids to expose. Filters the provider's own `/v1/models` list;
     /// the whole list for a provider that has none. Empty = everything.
     var models: [String] = []
+    /// Keys the server reads or a hand-edit added that this build does not model.
+    var extra: [String: JSONValue] = [:]
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case name, url, enabled, models
         case apiKey = "api_key"
         case apiKeyEnv = "api_key_env"
@@ -41,6 +43,8 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
         apiKeyEnv = try c.decodeIfPresent(String.self, forKey: .apiKeyEnv) ?? ""
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         models = try c.decodeIfPresent([String].self, forKey: .models) ?? []
+        extra = try decoder.container(keyedBy: DynamicCodingKey.self)
+            .unmodelled(known: Set(CodingKeys.allCases.map(\.stringValue)))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -51,6 +55,8 @@ struct ProviderEntry: Codable, Identifiable, Equatable {
         if !apiKeyEnv.isEmpty { try c.encode(apiKeyEnv, forKey: .apiKeyEnv) }
         if !enabled { try c.encode(enabled, forKey: .enabled) }
         if !models.isEmpty { try c.encode(models, forKey: .models) }
+        var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
+        try dynamic.encodeUnmodelled(extra, known: Set(CodingKeys.allCases.map(\.stringValue)))
     }
 
     /// Why the server would skip this row, or nil. Mirrors `providers.zig`'s

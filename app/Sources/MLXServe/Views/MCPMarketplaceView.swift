@@ -267,12 +267,12 @@ struct MCPMarketplaceView: View {
             }
             if missing {
                 // Still persist the toggle so the form stays consistent, but skip spawn.
-                newConfig.mcpServers[entryID] = entry.materialize(values: values)
+                newConfig.mcpServers[entryID] = Self.materialized(entry, over: newConfig.mcpServers[entryID], values: values)
                 newConfig.mcpServers[entryID]?.disabled = true
                 try? mcpManager.saveConfig(newConfig)
                 return
             }
-            newConfig.mcpServers[entryID] = entry.materialize(values: values)
+            newConfig.mcpServers[entryID] = Self.materialized(entry, over: newConfig.mcpServers[entryID], values: values)
         } else if var existing = newConfig.mcpServers[entryID] {
             existing.disabled = true
             newConfig.mcpServers[entryID] = existing
@@ -283,6 +283,18 @@ struct MCPMarketplaceView: View {
         // ChatView last set (or nil if MCP was never used in chat yet). The marketplace is most often
         // opened from chat, so this is usually fine.
         Task { await mcpManager.startEnabled() }
+    }
+
+    /// Materialize a catalog row over whatever entry is already stored. The
+    /// memberwise init drops the keys this build does not model, and this screen
+    /// is a second writer of the same file: hand-added `alwaysAllow`/`timeout`
+    /// survive a re-install only if they are carried across explicitly.
+    static func materialized(_ entry: MCPCatalogEntry,
+                             over existing: MCPServerEntry?,
+                             values: [String: String]) -> MCPServerEntry {
+        var materialized = entry.materialize(values: values)
+        if let existing, !existing.extra.isEmpty { materialized.extra = existing.extra }
+        return materialized
     }
 
     // MARK: - State helpers
@@ -333,7 +345,7 @@ struct MCPMarketplaceView: View {
                     saveError = "\(entry.name): missing \(missing.map(\.label).joined(separator: ", "))"
                     return
                 }
-                newConfig.mcpServers[entry.id] = entry.materialize(values: values)
+                newConfig.mcpServers[entry.id] = Self.materialized(entry, over: newConfig.mcpServers[entry.id], values: values)
             } else {
                 // Toggle off: keep the entry but mark disabled (preserves user-entered tokens for next time).
                 if var existing = newConfig.mcpServers[entry.id] {

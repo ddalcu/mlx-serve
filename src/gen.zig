@@ -4047,14 +4047,30 @@ const QWEN_IMAGE_GEN_TRANSIENT_BYTES: u64 = 4 << 30;
 /// Qwen-Image-2.1's text encoder is half the pack and idle for the whole
 /// denoise, so a machine the full set would crowd (past 3/4 of the GPU working
 /// set) loads it per request and frees it before the first DiT forward. The
-/// engine and the residency bill read this ONE answer.
+/// engine and the residency bill read this ONE answer. Set
+/// MLX_SERVE_QWEN_IMAGE_LOW_MEMORY=1 to force staging even on larger machines;
+/// unset, 0, and other values retain the automatic policy.
 pub fn qwenImageStagesTextEncoder(weights: u64, working_set: u64) bool {
+    const low_memory: ?[]const u8 = if (std.c.getenv("MLX_SERVE_QWEN_IMAGE_LOW_MEMORY")) |v| std.mem.span(v) else null;
+    return qwenImageStagesTextEncoderFromInputs(weights, working_set, low_memory);
+}
+
+fn qwenImageStagesTextEncoderFromInputs(weights: u64, working_set: u64, low_memory: ?[]const u8) bool {
+    if (low_memory) |value| {
+        if (std.mem.eql(u8, value, "1")) return true;
+    }
     if (working_set == 0) return false;
     return (weights + QWEN_IMAGE_GEN_TRANSIENT_BYTES) / 3 > working_set / 4;
 }
 
 pub fn qwenImagePeakBytes(text_encoder: u64, rest: u64, working_set: u64) u64 {
-    if (qwenImageStagesTextEncoder(text_encoder + rest, working_set))
+    return qwenImagePeakBytesForStaging(text_encoder, rest, qwenImageStagesTextEncoder(text_encoder + rest, working_set));
+}
+
+fn qwenImagePeakBytesForStaging(text_encoder: u64, rest: u64, staged: bool) u64 {
+    // The DiT/VAE remain resident while encoding: staging only removes the
+    // encoder before denoising, so the full weight set still counts at peak.
+    if (staged)
         return stagedPeakBytes(rest, &.{ text_encoder, QWEN_IMAGE_GEN_TRANSIENT_BYTES });
     return text_encoder + rest + QWEN_IMAGE_GEN_TRANSIENT_BYTES;
 }
@@ -5511,16 +5527,31 @@ test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {
 test "Qwen-Image stages its text encoder only where the full set crowds the GPU" {
     const GB: u64 = 1024 * 1024 * 1024;
     // The 8-bit pack (TE 9 + DiT/VAE 9) on a 32 GB Mac's ~22 GB working set.
-    try std.testing.expect(qwenImageStagesTextEncoder(18 * GB, 22 * GB));
-    try std.testing.expectEqual(18 * GB, qwenImagePeakBytes(9 * GB, 9 * GB, 22 * GB));
+    try std.testing.expect(qwenImageStagesTextEncoderFromInputs(18 * GB, 22 * GB, null));
+    try std.testing.expectEqual(18 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, true));
     // Same pack with room to spare: resident, and the bill is everything.
-    try std.testing.expect(!qwenImageStagesTextEncoder(18 * GB, 48 * GB));
-    try std.testing.expectEqual(22 * GB, qwenImagePeakBytes(9 * GB, 9 * GB, 48 * GB));
+    try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 48 * GB, null));
+    try std.testing.expectEqual(22 * GB, qwenImagePeakBytesForStaging(9 * GB, 9 * GB, false));
     // The 4-bit pack on a 16 GB Mac; a small encoder still bills the denoise.
-    try std.testing.expect(qwenImageStagesTextEncoder(10 * GB, 11 * GB));
-    try std.testing.expectEqual(8 * GB, qwenImagePeakBytes(2 * GB, 4 * GB, 11 * GB));
+    try std.testing.expect(qwenImageStagesTextEncoderFromInputs(10 * GB, 11 * GB, null));
+    try std.testing.expectEqual(8 * GB, qwenImagePeakBytesForStaging(2 * GB, 4 * GB, true));
     // Unknown working set never stages.
-    try std.testing.expect(!qwenImageStagesTextEncoder(18 * GB, 0));
+    try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(18 * GB, 0, null));
+}
+
+test "Qwen-Image low-memory override forces staging without disabling automatic staging" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    for ([_]?[]const u8{ null, "0", "invalid" }) |value| {
+        try std.testing.expect(!qwenImageStagesTextEncoderFromInputs(10 * GB, 22 * GB, value));
+        try std.testing.expect(qwenImageStagesTextEncoderFromInputs(18 * GB, 22 * GB, value));
+    }
+    try std.testing.expect(qwenImageStagesTextEncoderFromInputs(10 * GB, 22 * GB, "1"));
+    try std.testing.expect(qwenImageStagesTextEncoderFromInputs(10 * GB, 0, "1"));
+    const staged = qwenImageStagesTextEncoderFromInputs(10 * GB, 22 * GB, "1");
+    // An encoder larger than the denoise allowance still coexists with the
+    // DiT/VAE while encoding; never bill only the smaller denoise residency.
+    try std.testing.expectEqual(10 * GB, qwenImagePeakBytesForStaging(5 * GB, 5 * GB, staged));
+    try std.testing.expectEqual(9 * GB, qwenImagePeakBytesForStaging(3 * GB, 5 * GB, staged));
 }
 
 test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
