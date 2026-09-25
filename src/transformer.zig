@@ -1643,7 +1643,7 @@ pub fn macosProductVersion(buf: []u8) ?[]const u8 {
 /// GPU architecture identifier off mlx device info ("applegpu_g16" on the
 /// M4 Max). The returned pointer from mlx is borrowed from the info object,
 /// so the string is copied into the caller's buffer before the info frees.
-fn gpuArchitecture(buf: []u8) ?[]const u8 {
+pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
     var dev = mlx.mlx_device{ .ctx = null };
     if (mlx.mlx_get_default_device(&dev) != 0) return null;
     var info = mlx.mlx_device_info_new();
@@ -15155,6 +15155,9 @@ pub const Transformer = struct {
     moe_owned_bf16: ?[]mlx.mlx_array = null,
     /// Prism Hadamard sign vectors keyed on weight handles; null on every other checkpoint.
     rht: ?*rht.Registry = null,
+    /// A 2-bit group-128 pack without rotations whose every matmul weight has
+    /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
+    ternary_2bit: bool = false,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -15826,6 +15829,17 @@ pub const Transformer = struct {
             rht_registry = reg;
             try registerRhtSigns(reg, weights, s);
         }
+        var ternary_2bit = false;
+        if (ternaryKernelCandidate(&config)) {
+            // An embedding that is not also the lm_head is only ever gathered.
+            const gather_only = if (lm_head_b.ctx == emb_b_arr.ctx) mlx.mlx_array{ .ctx = null } else emb_b_arr;
+            if (try firstNonTernaryBias(weights, gather_only, s)) |key| {
+                log.info("[qmv2] 2-bit pack is not ternary ({s}): stock qmm\n", .{key});
+            } else {
+                ternary_2bit = true;
+                log.info("[qmv2] ternary 2-bit pack (bias == -scale): ternary kernels armed\n", .{});
+            }
+        }
 
         const profile_head_shape = mlx.getShape(lm_head_w);
         const profile_head_n: c_int = if (profile_head_shape.len == 2) profile_head_shape[0] else 0;
@@ -15924,6 +15938,7 @@ pub const Transformer = struct {
             .moe_seq_offset = 0,
             .moe_owned_bf16 = moe_owned_bf16,
             .rht = rht_registry,
+            .ternary_2bit = ternary_2bit,
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -16759,17 +16774,19 @@ pub const Transformer = struct {
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
         // first touch — x's inner dim pins (bits, group_size) exactly.
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
-        // The 2-bit decode kernel (qmv2.zig) is measured on Hadamard packs
-        // only; every other 2-bit pack keeps stock qmm.
+        // The 2-bit kernels (qmv2.zig) serve Prism packs: Hadamard ones, and
+        // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {
             const signs = reg.get(w);
             const xr = if (signs) |sg| try reg.applyIn(x, sg, self.s) else x;
             defer if (signs != null) {
                 _ = mlx.mlx_array_free(xr);
             };
-            if (try qmv2.qmv(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
-            if (try qmv2.qmvRows(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, self.s)) |y| return y;
+            if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
+        }
+        if (self.ternary_2bit) {
+            if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
         }
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
     }
@@ -20042,6 +20059,9 @@ pub const Transformer = struct {
     ) !void {
         std.debug.assert(token_rows.len == ctxs.len);
         std.debug.assert(out_logits.len >= token_rows.len and out_last.len >= token_rows.len and out_all.len >= token_rows.len);
+        const outer_group_rows = verify_group_rows;
+        verify_group_rows = token_rows.len;
+        defer verify_group_rows = outer_group_rows;
         if (token_rows.len > 1 and !row_axis_verify_logged) {
             row_axis_verify_logged = true;
             log.info("[batched] row-axis mtp verify engaged (slots={d}, width={d})\n", .{ token_rows.len, mlx.getShape(token_rows[0])[1] });
@@ -37741,7 +37761,11 @@ pub fn prefillDqGemmEnabled() bool {
 /// Test seam: engagement is counted, never inferred from output equality.
 pub var prefill_dq_gemm_engaged: u64 = 0;
 
-var verify_shared_arch: ?bool = null;
+var verify_arch_buf: [128]u8 = undefined;
+var verify_arch: ?[]const u8 = null;
+var verify_arch_read = false;
+/// Streams in the batched verify running now (`forwardRowAxisVerify`); 0 outside one.
+pub var verify_group_rows: usize = 0;
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
 const VERIFY_EXPERT_REUSE_SOURCE =
@@ -37909,7 +37933,7 @@ fn pairedGateUpArrayMatches(arr: mlx.mlx_array, dtype: mlx.mlx_dtype, dims: [3]c
 fn validatePairedGateUpPack(config: *const ModelConfig, layers_opt: ?[]MoeLayerWeights) !void {
     if (!config.isQwen4() or config.hidden_size != 2560 or config.moe_intermediate_size != 640 or
         config.num_experts != 512 or config.num_experts_per_tok != 10 or config.hidden_act != .silu or
-        config.swiglu_limit != 0.0 or !verifySharedHardware() or !swigluFusedEnabled())
+        config.swiglu_limit != 0.0 or !verifySharedCapable() or !swigluFusedEnabled())
         return error.PairedGateUpUnsupportedModel;
     const layers = layers_opt orelse return error.PairedGateUpMissingLayers;
     if (layers.len != 48) return error.PairedGateUpWrongLayerCount;
@@ -38354,14 +38378,42 @@ fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.mlx_ar
     return view;
 }
 
+/// The fused verify kernels need an M5 GPU. A dual-die one (`...d`, the Ultra) gains from them
+/// only in a multi-stream group: they lift a batched verify and slow a solo one.
+pub fn verifySharedFor(arch: []const u8, group_rows: usize) bool {
+    if (!std.mem.startsWith(u8, arch, "applegpu_g17")) return false;
+    return !std.mem.endsWith(u8, arch, "d") or group_rows > 1;
+}
+
+fn verifyArch() ?[]const u8 {
+    if (!verify_arch_read) {
+        verify_arch_read = true;
+        verify_arch = gpuArchitecture(&verify_arch_buf);
+    }
+    return verify_arch;
+}
+
+/// Whether this GPU can run the fused verify kernels at all (load-time pack checks).
+pub fn verifySharedCapable() bool {
+    if (!verifyQmmNaxAvailable()) return false;
+    return std.mem.startsWith(u8, verifyArch() orelse return false, "applegpu_g17");
+}
+
+/// Whether the verify running now takes the fused kernels.
 pub fn verifySharedHardware() bool {
     if (!verifyQmmNaxAvailable()) return false;
-    if (verify_shared_arch) |value| return value;
-    var arch_buf: [128]u8 = undefined;
-    const arch = gpuArchitecture(&arch_buf) orelse return false;
-    const value = std.mem.startsWith(u8, arch, "applegpu_g17") and !std.mem.endsWith(u8, arch, "d");
-    verify_shared_arch = value;
-    return value;
+    return verifySharedFor(verifyArch() orelse return false, verify_group_rows);
+}
+
+test "verifySharedFor: dual-die M5 takes the fused verify kernels only for a multi-stream group" {
+    try std.testing.expect(verifySharedFor("applegpu_g17s", 0));
+    try std.testing.expect(verifySharedFor("applegpu_g17s", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g17d", 0));
+    try std.testing.expect(!verifySharedFor("applegpu_g17d", 1));
+    try std.testing.expect(verifySharedFor("applegpu_g17d", 2));
+    try std.testing.expect(verifySharedFor("applegpu_g17d", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g16d", 4));
+    try std.testing.expect(!verifySharedFor("applegpu_g16s", 0));
 }
 
 // Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
@@ -38721,6 +38773,165 @@ fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_stream
     var peak32 = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&peak32, peak, .float32, s));
     return peak32;
+}
+
+/// A pack qmv2's ternary kernel may serve once its biases check out: affine
+/// 2-bit group-128 without rotations (Hadamard packs bind per weight).
+fn ternaryKernelCandidate(config: *const ModelConfig) bool {
+    return config.hadamard_block == 0 and config.quant_mode == .affine and
+        config.quant_bits == 2 and config.quant_group_size == 128;
+}
+
+/// The first `<base>.biases` key whose biases are not exactly -scales, or null
+/// when every one is (ONE eval). `gather_only` (an embedding table no matmul
+/// reads) is skipped; a pack with no biases at all is not ternary.
+fn firstNonTernaryBias(weights: *const Weights, gather_only: mlx.mlx_array, s: mlx.mlx_stream) !?[]const u8 {
+    const peaks = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(peaks);
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(weights.allocator);
+    var it = weights.map.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        if (!std.mem.endsWith(u8, key, ".biases")) continue;
+        if (gather_only.ctx != null and kv.value_ptr.ctx == gather_only.ctx) continue;
+        const peak = (try biasNegScalePeak(weights, key[0 .. key.len - ".biases".len], s)) orelse return key;
+        defer _ = mlx.mlx_array_free(peak);
+        try mlx.check(mlx.mlx_vector_array_append_value(peaks, peak));
+        try keys.append(weights.allocator, key);
+    }
+    if (keys.items.len == 0) return "no quantized biases";
+    try mlx.check(mlx.mlx_eval(peaks));
+    for (keys.items, 0..) |key, i| {
+        var a = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a);
+        try mlx.check(mlx.mlx_vector_array_get(&a, peaks, i));
+        var v: f32 = 1;
+        try mlx.check(mlx.mlx_array_item_float32(&v, a));
+        if (v != 0) return key;
+    }
+    return null;
+}
+
+test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embedding is exempt" {
+    const s = mlx.gpuStream();
+    const Put = struct {
+        fn add(w: *Weights, name: []const u8, vals: []const f32) !mlx.mlx_array {
+            const a = mlx.mlx_array_new_data(vals.ptr, &[_]c_int{@intCast(vals.len)}, 1, .float32);
+            try w.map.put(try std.testing.allocator.dupe(u8, name), a);
+            return a;
+        }
+    };
+    const sc = [_]f32{ 0.5, 0.25 };
+    const neg = [_]f32{ -0.5, -0.25 };
+    const generic = [_]f32{ -0.5, 0.1 };
+    {
+        var w = Weights.init(std.testing.allocator);
+        defer w.deinit();
+        try std.testing.expectEqualStrings("no quantized biases", (try firstNonTernaryBias(&w, .{ .ctx = null }, s)).?);
+        _ = try Put.add(&w, "m.q.scales", &sc);
+        _ = try Put.add(&w, "m.q.biases", &neg);
+        _ = try Put.add(&w, "m.embed_tokens.scales", &sc);
+        const emb_b = try Put.add(&w, "m.embed_tokens.biases", &generic);
+        // Untied: the table is only gathered. Tied (or the lm_head's fallback): it is a matmul weight.
+        try std.testing.expectEqual(@as(?[]const u8, null), try firstNonTernaryBias(&w, emb_b, s));
+        try std.testing.expectEqualStrings("m.embed_tokens.biases", (try firstNonTernaryBias(&w, .{ .ctx = null }, s)).?);
+    }
+    {
+        var w = Weights.init(std.testing.allocator);
+        defer w.deinit();
+        _ = try Put.add(&w, "m.q.scales", &sc);
+        _ = try Put.add(&w, "m.q.biases", &neg);
+        _ = try Put.add(&w, "m.k.scales", &sc);
+        _ = try Put.add(&w, "m.k.biases", &generic);
+        _ = try Put.add(&w, "m.v.biases", &neg); // biases without scales
+        const bad = (try firstNonTernaryBias(&w, .{ .ctx = null }, s)).?;
+        try std.testing.expect(std.mem.eql(u8, bad, "m.k.biases") or std.mem.eql(u8, bad, "m.v.biases"));
+    }
+}
+
+test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
+    const s = mlx.gpuStream();
+    const n: c_int = 2048;
+    const k: c_int = 512;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const codes = try std.testing.allocator.alloc(u32, @divExact(2048 * 512, 16));
+    defer std.testing.allocator.free(codes);
+    for (codes) |*wd| wd.* = rnd.int(u32);
+    const scv = try std.testing.allocator.alloc(f32, @divExact(2048 * 512, 128));
+    defer std.testing.allocator.free(scv);
+    for (scv) |*e| e.* = 0.01 + 0.01 * rnd.float(f32);
+    var xv: [2 * 512]f32 = undefined;
+    for (&xv) |*e| e.* = rnd.floatNorm(f32);
+    const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc32 = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{ n, @divExact(k, 128) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(sc32);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, sc32, .bfloat16, s));
+    // bias = +scale: the ternary kernel never reads biases, so it disagrees with stock by construction.
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_copy(&bi, sc, s));
+    const x32 = mlx.mlx_array_new_data(&xv, &[_]c_int{ 1, 2, k }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+    qmv2.gen_override = .{ .gen = 13, .phone = false };
+    defer qmv2.gen_override = null;
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.rht = null;
+    xfm.bits_cache = .{};
+    xfm.config = std.mem.zeroes(ModelConfig);
+    xfm.config.quant_mode = .affine;
+    xfm.config.quant_bits = 2;
+    xfm.config.quant_group_size = 128;
+
+    const kernel = (try qmv2.qmm(x, w, sc, bi, 2, 128, true, false, s)).?;
+    defer _ = mlx.mlx_array_free(kernel);
+    const stock = try qmatmulBits(x, w, sc, bi, 2, 128, .affine, s);
+    defer _ = mlx.mlx_array_free(stock);
+    {
+        // The two paths must be tellable apart, or the routing check below is vacuous.
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, kernel, stock, false, s));
+        var same = true;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(!same);
+    }
+    for ([_]bool{ true, false }) |flag| {
+        xfm.ternary_2bit = flag;
+        const got = try xfm.qmatmul(x, w, sc, bi);
+        defer _ = mlx.mlx_array_free(got);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, got, if (flag) kernel else stock, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+    }
+}
+
+test "ternaryKernelCandidate: affine 2-bit group-128 packs without rotations" {
+    var c = std.mem.zeroes(ModelConfig);
+    c.quant_mode = .affine;
+    c.quant_bits = 2;
+    c.quant_group_size = 128;
+    try std.testing.expect(ternaryKernelCandidate(&c));
+    c.hadamard_block = 1024;
+    try std.testing.expect(!ternaryKernelCandidate(&c));
+    c.hadamard_block = 0;
+    c.quant_group_size = 64;
+    try std.testing.expect(!ternaryKernelCandidate(&c));
+    c.quant_group_size = 128;
+    c.quant_bits = 4;
+    try std.testing.expect(!ternaryKernelCandidate(&c));
 }
 
 /// Binds every `<base>.signs` to `<base>.weight`; ONE eval for every sign

@@ -5,6 +5,16 @@ import XCTest
 /// boundary as the next user message. One note per chat, fired once.
 final class SteeringNotesTests: XCTestCase {
 
+    /// The row lays out a bounded prefix; the rest is counted, not rendered.
+    func testRowPreviewIsBoundedAndCountsTheRest() {
+        let short = SteeringNoteRow.preview("short", limit: 10)
+        XCTAssertEqual(short.text, "short")
+        XCTAssertEqual(short.omitted, 0)
+        let long = SteeringNoteRow.preview(String(repeating: "x", count: 25), limit: 10)
+        XCTAssertEqual(long.text, String(repeating: "x", count: 10))
+        XCTAssertEqual(long.omitted, 15)
+    }
+
     func testSetStoresTrimmedTextPerSession() {
         var notes = SteeringNotes()
         let a = UUID(), b = UUID()

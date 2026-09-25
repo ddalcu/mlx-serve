@@ -862,6 +862,9 @@ struct ChatSidebar: View {
     @EnvironmentObject var terminals: TerminalSessionStore
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// Mirror of `ChatTurnEngine.activity`, received explicitly for the same
+    /// reason `downloads` is: AppState does not forward the engine's changes.
+    @State private var activity = SidebarActivity()
     /// The row being dragged to a new slot, nil outside a drag.
     @State private var draggingRowId: UUID?
     /// The rename dialog's text.
@@ -1037,6 +1040,9 @@ struct ChatSidebar: View {
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
         }
+        .onReceive(appState.chatEngine.$activity) { activity = $0; clearSeenActivity(in: $0) }
+        .onChange(of: appState.sidebarSelection) { _, _ in clearSeenActivity(in: activity) }
+        .onChange(of: appState.chatWorkspace) { _, _ in clearSeenActivity(in: activity) }
         .onAppear {
             // The rows READ the selection to decide their highlight, so it has
             // to be primed: `activeChatId` is usually set long before this panel
@@ -1269,6 +1275,51 @@ struct ChatSidebar: View {
             sessionId: active, activeChatId: active, workspace: appState.chatWorkspace)
     }
 
+    /// A finished mark on a selected, lit row has been seen. Deferred one
+    /// turn: this runs from the engine's own publisher.
+    private func clearSeenActivity(in activity: SidebarActivity) {
+        guard conversationsAreLit else { return }
+        let seen = activity.unseen.intersection(appState.sidebarSelection)
+        guard !seen.isEmpty else { return }
+        Task { @MainActor in
+            for id in seen { appState.chatEngine.markActivitySeen(id) }
+        }
+    }
+
+    /// The row's turn mark: green pulsing disc generating, blue spinning
+    /// dashed disc running tools; once a turn ended in a chat that was not
+    /// open, a grey check, or an orange mark when it ended on an error card.
+    /// Three separate views, not one image swapping symbols: a symbol effect
+    /// deactivated on a shared view finishes its cycle, so the grey check
+    /// would still make one turn.
+    @ViewBuilder
+    private func activityDot(for dot: SidebarActivity.Dot) -> some View {
+        switch dot {
+        case .generating:
+            Image(systemName: "inset.filled.circle")
+                .font(.system(size: 11))
+                .foregroundStyle(.green)
+                .symbolEffect(.pulse.byLayer, options: .repeat(.continuous))
+                .help("Generating")
+        case .tool:
+            Image(systemName: "inset.filled.circle.dashed")
+                .font(.system(size: 11))
+                .foregroundStyle(.blue)
+                .symbolEffect(.rotate.clockwise.byLayer, options: .repeat(.continuous))
+                .help("Running a tool")
+        case .finished:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
+                .help("Finished")
+        case .attention:
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .help("Stopped with an error")
+        }
+    }
+
     /// One click on a conversation row. The modifier maths is pure and lives in
     /// `SidebarMultiSelect`; this is only the wiring — read the flags off the
     /// event AppKit is currently dispatching (a SwiftUI Button action has no
@@ -1429,6 +1480,9 @@ struct ChatSidebar: View {
                         .font(.subheadline.weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
+                    if let dot = activity.dot(for: session.id, isSelected: isSelected) {
+                        activityDot(for: dot)
+                    }
                 }
                 // What this particular conversation is about, displaced from
                 // the title line by the agent's name. It is also the only

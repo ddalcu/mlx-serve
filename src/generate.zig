@@ -5625,14 +5625,14 @@ pub const Generator = struct {
         };
     }
 
-    /// `MLX_SERVE_MTP_LOOKUP=1`: prompt lookup may stand in for the MTP chain.
+    /// Prompt lookup may stand in for the MTP chain unless `MLX_SERVE_MTP_LOOKUP=0`.
     fn mtpLookupEnabled() bool {
         const Cache = struct {
             var v: ?bool = null;
         };
         if (Cache.v) |v| return v;
         const raw = std.c.getenv("MLX_SERVE_MTP_LOOKUP");
-        Cache.v = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
+        Cache.v = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
         return Cache.v.?;
     }
 
