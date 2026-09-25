@@ -57,7 +57,7 @@ test "format corpus: quoted media vocabulary is lossless text without control ID
     }
     const markers = [_][]const u8{ "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>" };
     const aliases = [_]Tokenizer.SpecialAlias{
-        .{ .text = "<owned-open>", .id = 800 }, .{ .text = "<owned-close>", .id = 801 },
+        .{ .text = "<owned-open>", .id = 800 },  .{ .text = "<owned-close>", .id = 801 },
         .{ .text = "<owned-image>", .id = 802 }, .{ .text = "<owned-video>", .id = 803 },
     };
     for (markers, 800..) |marker, id| {
@@ -65,8 +65,8 @@ test "format corpus: quoted media vocabulary is lossless text without control ID
         try tok.special_tokens.put(bytes, @intCast(id));
         try tok.id_to_token.put(@intCast(id), bytes);
     }
-    const cc = chat.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false,
-        .chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}" };
+    tok.special_index = try Tokenizer.SpecialIndex.init(a, &tok.special_tokens);
+    const cc = chat.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false, .chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}" };
     for (markers) |marker| {
         // User pastes, assistant echoes and fetched code are the same class.
         for ([_][]const u8{ "user", "assistant", "tool", "system" }) |role| {
@@ -2231,7 +2231,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:",
+        "<｜DSML｜",
+        "<function",
     };
     var checked: usize = 0;
     for (corpus) |entry| {

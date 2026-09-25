@@ -381,13 +381,13 @@ pub const Tokenizer = struct {
         var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
         errdefer map.deinit();
         const pairs = [_][2][]const u8{
-            .{ "<ifm|think>", "<think>" },              .{ "</ifm|think>", "</think>" },
-            .{ "<ifm|think_fast>", "<think>" },         .{ "</ifm|think_fast>", "</think>" },
-            .{ "<ifm|think_faster>", "<think>" },       .{ "</ifm|think_faster>", "</think>" },
-            .{ "<ifm|tool_calls>", "<tool_calls>" },    .{ "</ifm|tool_calls>", "</tool_calls>" },
-            .{ "<ifm|tool_call>", "<tool_call>" },      .{ "</ifm|tool_call>", "</tool_call>" },
-            .{ "<ifm|arg_key>", "<arg_key>" },          .{ "</ifm|arg_key>", "</arg_key>" },
-            .{ "<ifm|arg_value>", "<arg_value>" },      .{ "</ifm|arg_value>", "</arg_value>" },
+            .{ "<ifm|think>", "<think>" },           .{ "</ifm|think>", "</think>" },
+            .{ "<ifm|think_fast>", "<think>" },      .{ "</ifm|think_fast>", "</think>" },
+            .{ "<ifm|think_faster>", "<think>" },    .{ "</ifm|think_faster>", "</think>" },
+            .{ "<ifm|tool_calls>", "<tool_calls>" }, .{ "</ifm|tool_calls>", "</tool_calls>" },
+            .{ "<ifm|tool_call>", "<tool_call>" },   .{ "</ifm|tool_call>", "</tool_call>" },
+            .{ "<ifm|arg_key>", "<arg_key>" },       .{ "</ifm|arg_key>", "</arg_key>" },
+            .{ "<ifm|arg_value>", "<arg_value>" },   .{ "</ifm|arg_value>", "</arg_value>" },
         };
         for (pairs) |pair| {
             if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
@@ -2339,7 +2339,8 @@ test "gpt2PreTokenize: full Python snippet matches HF reference" {
     // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
     // the punct run. The byte-level encode + BPE merge stage downstream
     // turns this into exactly the same token-ids HF produces.
-    try expectPreTokens(testing.allocator,
+    try expectPreTokens(
+        testing.allocator,
         "def total(items):\n    total = 0",
         &.{ "def", " total", "(items", "):\n", "   ", " total", " =", " ", "0" },
     );
@@ -2784,7 +2785,7 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
     defer tok.deinit();
     const specials = [_][]const u8{
-        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>",   "</ifm|think_fast>",
+        "<ifm|think>",        "</ifm|think>",        "<ifm|think_fast>", "</ifm|think_fast>",
         "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|tool_calls>", "</ifm|tool_calls>",
     };
     for (specials, 0..) |t, i| {
