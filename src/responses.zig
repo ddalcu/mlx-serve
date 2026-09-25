@@ -1686,7 +1686,7 @@ test "media: Responses rejects every undecodable declared Qwen image" {
     for (bodies) |body| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
         defer parsed.deinit();
-        if (parseInput(testing.allocator, parsed.value, null, null, null, .{ .mode = .qwen })) |result| {
+        if (parseInput(testing.allocator, parsed.value, null, null, null, null, .{ .mode = .qwen })) |result| {
             var owned = result;
             owned.deinit();
             return error.MissingImageWasAccepted;
