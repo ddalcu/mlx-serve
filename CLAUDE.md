@@ -245,6 +245,7 @@ Reasoning, budgets, agents:
 - **Schema-mask surfaces share one policy** (`schemaMasksThinking`, #331): defer only across bare `<think>` + atomic closer with no finite budget; tools present = no mask. Guard: `tests/test_json_schema_thinking.sh`.
 
 Request parsing + media:
+- **Quoted media markers are TEXT, not attachments**: Qwen's `MarkedMediaHistory` uses request-owned aliases through Jinja; `encodeWithSpecialAliases` encodes the original spellings as ordinary BPE. Keep `expandInline` span/count validation; never reject an entire fetched source file merely for spelling `<|image_pad|>`. Guards: `media: quoted`, `format corpus: quoted media`, `tests/test_media_surfaces.py`.
 - **`messages.deinit` frees the Message array and NOTHING it points at**: media is owned by ONE `server.RequestMedia`; `Message` BORROWS; slots are INDICES.
 - **Undecodable active-turn media is a NAMED 400** (`IMAGE_DECODE_REJECT`; remote URLs never fetched); `stop: ""` skipped; schema-less `json_schema` 400; empty embedding input 400; Ollama promptless generate = load handshake. Guard: `tests/test_api_edges.sh`.
 - **Media on a tower-less model is refused by NAME** (`mediaRejectReason`); non-text model on a text surface 400s BEFORE prefill (`textGenRejectReason`; new surface → `isTextGenRoute`, new modality → `modalityFromType`).

@@ -139,14 +139,26 @@ pub const Tokenizer = struct {
         cands: []Cand,
         start: [257]u32,
 
-        pub const Cand = struct { bytes: []const u8, id: u32 };
+        pub const Cand = struct { bytes: []const u8, id: u32, literal: bool = false };
 
         pub fn init(allocator: std.mem.Allocator, specials: *const std.StringHashMap(u32)) !SpecialIndex {
-            const cands = try allocator.alloc(Cand, specials.count());
+            return initWithAliases(allocator, specials, &.{});
+        }
+
+        fn initWithAliases(allocator: std.mem.Allocator, specials: *const std.StringHashMap(u32), aliases: []const SpecialAlias) !SpecialIndex {
+            const cands = try allocator.alloc(Cand, specials.count() + aliases.len);
             var i: usize = 0;
             var sit = specials.iterator();
             while (sit.next()) |entry| : (i += 1) {
                 cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
+                for (aliases) |alias| if (alias.id == entry.value_ptr.*) {
+                    cands[i].literal = true;
+                    break;
+                };
+            }
+            for (aliases) |alias| {
+                cands[i] = .{ .bytes = alias.text, .id = alias.id };
+                i += 1;
             }
             std.mem.sort(Cand, cands, {}, struct {
                 fn lessThan(_: void, a: Cand, b: Cand) bool {
@@ -250,6 +262,14 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs (no BOS/EOS added, except WordPiece adds [CLS]/[SEP]).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.encodeWithSpecialAliases(allocator, text, &.{});
+    }
+
+    pub const SpecialAlias = struct { text: []const u8, id: u32 };
+
+    /// Request-owned spellings emit reserved IDs; their original spellings
+    /// become ordinary text. Never mutates the shared tokenizer vocabulary.
+    pub fn encodeWithSpecialAliases(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, aliases: []const SpecialAlias) ![]u32 {
         // Split text around special tokens, encode segments with BPE, insert special token IDs
         var result = std.ArrayList(u32).empty;
         errdefer result.deinit(allocator);
@@ -275,8 +295,8 @@ pub const Tokenizer = struct {
         // (buckets are sorted by descending length, so the first hit is the longest).
         var local_index: ?SpecialIndex = null;
         defer if (local_index) |*x| x.deinit(allocator);
-        const index = if (self.special_index) |*x| x else blk: {
-            local_index = try SpecialIndex.init(allocator, &self.special_tokens);
+        const index = if (aliases.len == 0 and self.special_index != null) &self.special_index.? else blk: {
+            local_index = try SpecialIndex.initWithAliases(allocator, &self.special_tokens, aliases);
             break :blk &local_index.?;
         };
         const cands = index.cands;
@@ -303,7 +323,16 @@ pub const Tokenizer = struct {
                     defer allocator.free(ids);
                     try result.appendSlice(allocator, ids);
                 }
-                try result.append(allocator, m.id);
+                if (m.literal) {
+                    const ids = try self.encodeSegment(allocator, m.bytes);
+                    defer allocator.free(ids);
+                    for (ids) |id| for (aliases) |alias| {
+                        if (id == alias.id) return error.UntrackedMediaToken;
+                    };
+                    try result.appendSlice(allocator, ids);
+                } else {
+                    try result.append(allocator, m.id);
+                }
                 pos += m.bytes.len;
                 seg_start = pos;
             } else {

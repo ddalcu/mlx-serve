@@ -41,6 +41,52 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: quoted media vocabulary is lossless text without control IDs" {
+    const Tokenizer = @import("tokenizer.zig").Tokenizer;
+    const media = @import("media_prefix.zig");
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &buf);
+        const bytes = try a.dupe(u8, buf[0..n]);
+        try tok.vocab.put(bytes, @intCast(b));
+        try tok.id_to_token.put(@intCast(b), bytes);
+        try tok.unicode_to_byte.put(tok.byte_to_unicode[b], @intCast(b));
+    }
+    const markers = [_][]const u8{ "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>" };
+    const aliases = [_]Tokenizer.SpecialAlias{
+        .{ .text = "<owned-open>", .id = 800 }, .{ .text = "<owned-close>", .id = 801 },
+        .{ .text = "<owned-image>", .id = 802 }, .{ .text = "<owned-video>", .id = 803 },
+    };
+    for (markers, 800..) |marker, id| {
+        const bytes = try a.dupe(u8, marker);
+        try tok.special_tokens.put(bytes, @intCast(id));
+        try tok.id_to_token.put(@intCast(id), bytes);
+    }
+    const cc = chat.ChatConfig{ .allocator = a, .bos_token = null, .eos_token = null, .add_bos_token = false,
+        .chat_template = "{% for m in messages %}{{ m.content }}{% endfor %}" };
+    for (markers) |marker| {
+        // User pastes, assistant echoes and fetched code are the same class.
+        for ([_][]const u8{ "user", "assistant", "tool", "system" }) |role| {
+            const msgs = [_]chat.Message{.{ .role = role, .content = marker }};
+            const ids = try chat.formatChatWithSpecialAliases(a, &tok, &msgs, &cc, null, null, false, null, false, &aliases);
+            defer a.free(ids);
+            try media.validateRaw(ids, &.{ 800, 801, 802, 803 });
+            const text = try tok.decode(a, ids, false);
+            defer a.free(text);
+            try testing.expect(std.mem.indexOf(u8, text, marker) != null);
+        }
+    }
+    const owned = try tok.encodeWithSpecialAliases(a, "<owned-open><owned-image><owned-close><owned-video>", &aliases);
+    defer a.free(owned);
+    try testing.expectEqualSlices(u32, &.{ 800, 802, 801, 803 }, owned);
+    const original = try tok.encode(a, "<|vision_start|><|image_pad|><|vision_end|><|video_pad|>");
+    defer a.free(original);
+    try testing.expectEqualSlices(u32, owned, original);
+}
+
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,

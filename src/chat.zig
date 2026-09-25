@@ -370,6 +370,21 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
+    return formatChatWithSpecialAliases(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final, &.{});
+}
+
+pub fn formatChatWithSpecialAliases(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    continue_final: bool,
+    aliases: []const Tokenizer.SpecialAlias,
+) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
@@ -383,7 +398,7 @@ pub fn formatChat(
         }
     }
 
-    try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
+    try encodeWithSpecialTokens(allocator, tok, rendered, &ids, aliases);
     log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
@@ -1255,6 +1270,7 @@ fn encodeWithSpecialTokens(
     tok: *const Tokenizer,
     text: []const u8,
     ids: *std.ArrayList(u32),
+    aliases: []const Tokenizer.SpecialAlias,
 ) !void {
     // `Tokenizer.encode` already splits around special tokens (earliest
     // occurrence, longest at a position) with an O(text) first-byte-bucketed
@@ -1263,7 +1279,7 @@ fn encodeWithSpecialTokens(
     // prompt on gemma-3's 6415-special vocabulary (the tokenizer-side twin
     // of the same class was fixed in tokenizer.zig; keep both on the shared
     // fast path so they can't drift apart again).
-    const segment_ids = try tok.encode(allocator, text);
+    const segment_ids = try tok.encodeWithSpecialAliases(allocator, text, aliases);
     defer allocator.free(segment_ids);
     try ids.appendSlice(allocator, segment_ids);
 }
