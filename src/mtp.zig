@@ -2595,6 +2595,12 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
 
 // ── Forward ──
 
+/// The head is the layer after the trunk's last; a NoPE arch (Nemotron-H)
+/// marks it like the trunk layers.
+inline fn headSkipsRope(cfg: *const model_mod.ModelConfig) bool {
+    return cfg.layerSkipsRope(cfg.num_hidden_layers);
+}
+
 /// A second owned handle to the same array (refcount share, no copy).
 inline fn shareArr(x: mlx.mlx_array) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
@@ -3141,7 +3147,9 @@ pub fn appendKvOnly(
         positions.absolutePosition(relative_offset) < positions.total
     else
         false;
-    if (needs_explicit_mrope) {
+    if (headSkipsRope(cfg)) {
+        try mlx.check(mlx.mlx_array_set(&k_rope, k_t));
+    } else if (needs_explicit_mrope) {
         const positions = mrope_ctx.?;
         const cs = try target.buildMropeCosSin(positions, relative_offset, @intCast(seq_len));
         defer _ = mlx.mlx_array_free(cs.cos);
@@ -3226,7 +3234,10 @@ pub fn forwardWithMrope(
         positions.absolutePosition(relative_offset) < positions.total
     else
         false;
-    if (needs_explicit_mrope) {
+    if (headSkipsRope(cfg)) {
+        try mlx.check(mlx.mlx_array_set(&q_rope, front.q_t));
+        try mlx.check(mlx.mlx_array_set(&k_rope, front.k_t));
+    } else if (needs_explicit_mrope) {
         const positions = mrope_ctx.?;
         const cs = try target.buildMropeCosSin(positions, relative_offset, @intCast(seq_len));
         defer _ = mlx.mlx_array_free(cs.cos);
@@ -3362,6 +3373,10 @@ pub fn forwardLanes(self: *const MtpModel, target: *Transformer, lanes: []const 
         var by_lane = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(by_lane);
         try mlx.check(mlx.mlx_transpose_axes(&by_lane, x, &lanes_first, 4, s));
+        if (headSkipsRope(cfg)) {
+            try mlx.check(mlx.mlx_array_set(out, by_lane));
+            continue;
+        }
         try mlx.check(mlx.mlx_fast_rope_dynamic(out, by_lane, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, off_arr, .{ .ctx = null }, s));
     }
 

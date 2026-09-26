@@ -1937,11 +1937,21 @@ Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `Nemo
 
 Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
 
+## Nemotron-H: attention ran with RoPE the model never had
+
+Symptom: the Lightning 30B-A3B answered short chats fluently, but a code hidden in a 3k-28k token log came back as a wrong code or a run of comma-separated numbers. The MTP head, whose attention has the same bug, accepted about 1.1 tokens per round and only broke even.
+
+Cause: `hybridAttnWith` serves LFM2 and Nemotron-H, and applied RoPE for both. Nemotron-H attention is NoPE (HF `NemotronHAttention`, mlx-lm): the config carries `rope_theta` and `partial_rotary_factor`, but nothing reads them. The Mamba2 layers carry position, so short text survives rotated keys; long-range lookup through the six attention layers does not.
+
+Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round.
+
+Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head).
+
 ## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
 
-Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded SLOWER than serial (121-191 vs 205 tok/s); a post-norm hidden input accepted 0.90 tokens per round against 1.20 for the pre-norm one.
+Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded slower than serial, and a post-norm hidden input accepted fewer tokens per round than the pre-norm one.
 
-Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m (6 → ~12 → ~35 of 128); on a 3B-active MoE the verify forward's weight traffic doubles by depth 2 and quadruples by depth 6, while the head's chained acceptance decays (0.72, then 0.47). Depth 1-2 breaks even with serial (within run-to-run noise on prose; the head is not free on a 3B-active trunk); the generic adaptive cap (6) loses.
+Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m; on a 3B-active MoE the verify forward's weight traffic doubles by depth 2, while the head's chained acceptance decays. Depth 2 is the peak (about 1.2x serial once the RoPE fix above landed); depth 1 and depth 3+ are slower.
 
 Fix: `forwardHybridWith` captures `h` before the final norm; `MtpModel.layout == .nemotron` (bare keys, dense `eh_proj`, no QK norms, `nemotronMoe` MLP); `ModelConfig.mtpDepth` returns 2 for `nemotron_h` when no depth is configured; verify windows up to 8 rows ride the in-place expert path (`nemotronMoeDecodeExperts` over (token, expert) pairs) instead of the sort machinery.
 

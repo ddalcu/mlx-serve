@@ -882,7 +882,7 @@ pub const ModelConfig = struct {
         if (configured == 0 and self.hadamard_block > 0) return 2;
         // Nemotron-H MoE: every verify row routes to more experts, so the
         // round cost climbs with depth while the head's acceptance decays;
-        // depths 1-2 pay, the adaptive default cap (6) loses to serial.
+        // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
         if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
         return configured;
     }
@@ -3362,6 +3362,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
         config.query_pre_attn_scalar = config.head_dim;
+        // NoPE: the reference attention never rotates q/k, whatever
+        // rope_theta the config carries. Covers the MTP head's layer too.
+        config.layer_no_rope = @splat(true);
         if (cfg_obj.get("rms_norm_eps")) |v| {
             config.rms_norm_eps = jsonFloat(v);
         } else if (cfg_obj.get("layer_norm_epsilon")) |v| {
@@ -6783,6 +6786,23 @@ test "nemotron_h: a layers_block_type LIST sets the per-layer blocks like hybrid
     const want = [_]LayerBlockType{ .mamba2, .moe, .mamba2, .attention, .mlp, .mamba2, .moe };
     for (want, 0..) |b, i| try testing.expectEqual(b, cfg.layer_block_types[i]);
     try testing.expectEqual(@as(u32, 1), cfg.attnCacheLayerCount());
+}
+
+test "nemotron_h: attention is NoPE in every trunk layer and the MTP head" {
+    // The config ships rope_theta/partial_rotary_factor, but the reference
+    // attention (HF NemotronHAttention, mlx-lm) never rotates q or k.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 4,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "rope_theta": 10000, "partial_rotary_factor": 1.0,
+        \\  "layers_block_type": ["mamba", "attention", "moe", "attention"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    // Index num_hidden_layers is the MTP head's attention layer.
+    for (0..cfg.num_hidden_layers + 1) |i| try testing.expect(cfg.layerSkipsRope(@intCast(i)));
 }
 
 test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {

@@ -10,6 +10,21 @@ const mlx = @import("mlx.zig");
 
 pub const MAX_ROWS: c_int = 16;
 const TGY: c_int = 8;
+/// Threadgroup memory is an occupancy decision: the step kernel keeps B/C for
+/// a row BUCKET, never the 16-row maximum on a one-row decode step.
+const TG_BYTES_MAX: usize = 16 * 1024;
+
+fn rowBucket(rows: c_int) c_int {
+    return if (rows <= 1) 1 else if (rows <= 4) 4 else MAX_ROWS;
+}
+
+fn stepThreadgroupBytes(rows: c_int, state: c_int) usize {
+    return @as(usize, @intCast(rowBucket(rows) * 2 * state)) * @sizeOf(f32);
+}
+
+fn stepFits(rows: c_int, state: c_int) bool {
+    return stepThreadgroupBytes(rows, state) <= TG_BYTES_MAX;
+}
 
 // grid (32, Dh, B*H), threadgroup (32, TGY, 1): one simdgroup per (b, h, d),
 // each lane owning Ds/32 state columns. B/C of the head's group are conv'd
@@ -185,7 +200,7 @@ fn buildStepConfig(g: Geometry, dt: mlx.mlx_dtype, all_rows: bool) !void {
     try tmplInt(c, "KC", g.conv_kernel);
     try tmplInt(c, "PROJ", g.proj);
     try tmplInt(c, "B", g.batch);
-    try tmplInt(c, "MAXR", MAX_ROWS);
+    try tmplInt(c, "MAXR", rowBucket(g.rows));
     try tmplInt(c, "TGY", TGY);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(c, "ALLROWS", all_rows));
     if (step_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(step_cfg);
@@ -198,6 +213,7 @@ fn buildStepConfig(g: Geometry, dt: mlx.mlx_dtype, all_rows: bool) !void {
 pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     if (!mlx.streamIsGpu(s)) return null;
     if (g.rows < 1 or g.rows > MAX_ROWS) return null;
+    if (!stepFits(g.rows, g.state)) return null;
     if (@rem(g.state, 32) != 0 or @rem(g.head_dim, TGY) != 0 or @rem(g.heads, g.groups) != 0 or g.conv_kernel < 2) return null;
     const xd = g.heads * g.head_dim;
     if (g.proj != 2 * xd + 2 * g.groups * g.state + g.heads) return null;
@@ -276,4 +292,17 @@ pub fn groupNorm(x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_array, groups:
     errdefer _ = mlx.mlx_array_free(y);
     try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
     return y;
+}
+
+// Bar: a one-row decode step reserves one row of B/C, and a state too wide
+// for the threadgroup budget declines instead of failing at dispatch.
+test "mamba2 step: threadgroup memory follows the row bucket and stays in budget" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1024), stepThreadgroupBytes(1, 128));
+    try t.expectEqual(@as(usize, 4096), stepThreadgroupBytes(3, 128));
+    try t.expectEqual(@as(usize, 16384), stepThreadgroupBytes(16, 128));
+    try t.expect(stepFits(16, 128));
+    try t.expect(stepFits(1, 512));
+    try t.expect(!stepFits(16, 256));
+    try t.expect(!stepFits(4, 1024));
 }

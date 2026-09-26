@@ -18190,17 +18190,76 @@ test "mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream" {
         var got = std.ArrayList(u32).empty;
         defer got.deinit(allocator);
         while (true) {
-            const attempts_before = gen.mtp_attempted;
+            const rounds_before = gen.mtp_attempted + gen.mtp_lookup_rounds;
             const res = (try gen.nextMtp(allocator)) orelse break;
             defer allocator.free(res.tokens);
             try got.appendSlice(allocator, res.tokens);
-            // Every emitted token passes through a real MTP round (no silent fallback).
-            try testing.expect(gen.mtp_attempted != attempts_before);
+            // Every emitted token passes through a real spec round, head or lookup (no silent fallback).
+            try testing.expect(gen.mtp_attempted + gen.mtp_lookup_rounds != rounds_before);
         }
         try testing.expect(gen.mtp_attempted > 0);
         try testing.expect(!gen.spec_disabled_runtime);
         try testing.expectEqual(want, got.items.len);
         for (serial, got.items) |a, b| try testing.expectEqual(a, b);
+    }
+
+    // Bar: the head's attention is NoPE like the trunk's, so a history row's
+    // cached key is the same at position 0 and position 1.
+    {
+        var xfm = try Transformer.init(io, allocator, config, &weights);
+        defer xfm.deinit();
+        var head = try mtp_mod.loadMtp(io, allocator, s, dir_path);
+        defer head.deinit();
+        try head.bind(&xfm);
+        var rows: [2 * H]f32 = undefined;
+        for (&rows, 0..) |*v, i| v.* = @sin(0.37 * @as(f32, @floatFromInt(i)) + 0.2);
+        const kv_w = AHD; // one kv head
+        const Keys = struct {
+            // Cached keys `[2, kv_w]` after appending rows in `order`.
+            fn run(hd: *const mtp_mod.MtpModel, x: *Transformer, all: *const [2 * H]f32, order: [2]usize, out: *[2 * kv_w]f32, st: mlx.mlx_stream) !void {
+                var hist: [2 * H]f32 = undefined;
+                for (order, 0..) |r, j| @memcpy(hist[j * H .. (j + 1) * H], all[r * H .. (r + 1) * H]);
+                const ids = [2]i32{ 5, 9 };
+                const hist_ids = [2]i32{ ids[order[0]], ids[order[1]] };
+                var cache = try KVCache.init(std.testing.allocator, 1);
+                defer cache.deinit();
+                const h_f = mlx.mlx_array_new_data(&hist, &[_]c_int{ 1, 2, @intCast(H) }, 3, .float32);
+                defer _ = mlx.mlx_array_free(h_f);
+                var h_bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(h_bf);
+                try mlx.check(mlx.mlx_astype(&h_bf, h_f, .bfloat16, st));
+                const id_h = mlx.mlx_array_new_data(&hist_ids, &[_]c_int{2}, 1, .int32);
+                defer _ = mlx.mlx_array_free(id_h);
+                try mtp_mod.appendKvOnly(hd, x, &cache, id_h, h_bf, 0, null);
+                var view = try cache.denseView(0, st);
+                defer view.deinit();
+                var kf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(kf);
+                try mlx.check(mlx.mlx_astype(&kf, view.k, .float32, st));
+                var kc = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(kc);
+                try mlx.check(mlx.mlx_contiguous(&kc, kf, false, st));
+                try mlx.check(mlx.mlx_array_eval(kc));
+                const p = mlx.mlx_array_data_float32(kc) orelse return error.NoData;
+                @memcpy(out, p[0 .. 2 * kv_w]);
+            }
+        };
+        var fwd: [2 * kv_w]f32 = undefined;
+        var rev: [2 * kv_w]f32 = undefined;
+        try Keys.run(&head, &xfm, &rows, .{ 0, 1 }, &fwd, s);
+        try Keys.run(&head, &xfm, &rows, .{ 1, 0 }, &rev, s);
+        // Row 0's key: position 0 in `fwd`, position 1 in `rev`.
+        var max_ref: f32 = 0;
+        var max_err: f32 = 0;
+        for (fwd[0..kv_w], rev[kv_w..]) |a, b| {
+            max_ref = @max(max_ref, @abs(a));
+            max_err = @max(max_err, @abs(a - b));
+        }
+        if (!(max_ref > 0.01)) return error.RefTooSmall;
+        if (max_err > 1e-2 * max_ref) {
+            std.debug.print("MTP head key moved with its position: max_err={d:.6} max_ref={d:.6}\n", .{ max_err, max_ref });
+            return error.HeadAttentionIsPositional;
+        }
     }
 }
 

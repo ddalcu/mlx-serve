@@ -13550,7 +13550,9 @@ pub const ForwardCtx = struct {
     /// Like `capture_hidden` but receives the FULL post-final-norm hidden
     /// `[B, L, H]` (all positions, refcount-shared) instead of the last
     /// position only. Used by the Qwen MTP head, whose committed-history
-    /// cache needs the trunk hidden at every verify/prefill position.
+    /// cache needs the trunk hidden at every verify/prefill position. The
+    /// hybrid path (both fields) hands over the residual BEFORE the final
+    /// norm: that is what the Nemotron-H head reads.
     capture_hidden_all: ?*mlx.mlx_array = null,
     /// qwen4_exp: receives the PRE-mixer hyper-connection stream `[B, L,
     /// hc*hidden]` (all positions) — what the MTP head consumes.
@@ -25048,8 +25050,10 @@ pub const Transformer = struct {
         // RoPE (applied after transpose to [B, n, S, hd])
         const rope_base = mlx.mlx_optional_float.some(cfg.rope_theta);
         const no_freqs = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_rope(&q_t, q_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_t, k_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
+        if (!cfg.layerSkipsRope(layer_idx)) {
+            try mlx.check(mlx.mlx_fast_rope(&q_t, q_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&k_t, k_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
+        }
 
         // KV cache: update and get full K/V (DenseKVView owns its arrays only
         // in quant mode; in dense mode it aliases the cache view, so the defer
@@ -42494,6 +42498,108 @@ test "hybrid decode: the fused add+norm path equals the unfused blocks (Nemotron
     if (max_err != 0) {
         std.debug.print("hybrid fused add+norm vs plain: max_err={d:.6} max_ref={d:.6}\n", .{ max_err, max_ref });
         return error.FusedPathMismatch;
+    }
+}
+
+// Bar: a NoPE attention layer's output for the last token does not move when
+// the earlier tokens are reordered; a rotated key would.
+test "hybrid attention: a NoPE layer ignores the order of earlier tokens (Nemotron-H)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const s = mlx.gpuStream();
+    const H: c_int = 64;
+    const heads: c_int = 2;
+    const hd: c_int = 32;
+
+    var prng = std.Random.DefaultPrng.init(0x6e6f7065);
+    const rnd = prng.random();
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const names = [_][]const u8{ "model.layers.0.mixer.q_proj.weight", "model.layers.0.mixer.k_proj.weight", "model.layers.0.mixer.v_proj.weight", "model.layers.0.mixer.o_proj.weight", "model.layers.0.norm.weight" };
+    const shapes = [_][2]c_int{ .{ heads * hd, H }, .{ hd, H }, .{ hd, H }, .{ H, heads * hd }, .{ H, 1 } };
+    for (names, shapes) |name, shp| {
+        const n: usize = @intCast(shp[0] * shp[1]);
+        const host = try allocator.alloc(f32, n);
+        defer allocator.free(host);
+        const is_norm = shp[1] == 1;
+        for (host) |*v| v.* = if (is_norm) 1.0 else (rnd.float(f32) - 0.5) * 0.6;
+        const f = if (is_norm) mlx.mlx_array_new_data(host.ptr, &[_]c_int{shp[0]}, 1, .float32) else mlx.mlx_array_new_data(host.ptr, &shp, 2, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        var arr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&arr, f, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(arr));
+        try w.map.put(try allocator.dupe(u8, name), arr);
+    }
+
+    var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "model" };
+    config.has_hybrid_layers = true;
+    config.num_hidden_layers = 1;
+    config.hidden_size = @intCast(H);
+    config.head_dim = @intCast(hd);
+    config.num_attention_heads = @intCast(heads);
+    config.num_key_value_heads = 1;
+    config.vocab_size = 8;
+    config.has_final_norm = false;
+    config.rope_theta = 10000;
+    config.layer_block_types[0] = .attention;
+    config.layer_no_rope = @splat(true);
+
+    var name_buf: [256]u8 = undefined;
+    const hl = try initHybridLayers(allocator, config, &w, &name_buf, s);
+    defer {
+        allocator.free(hl.hybrid_layers);
+        allocator.free(hl.ssm_entries);
+        for (hl.owned_bf16) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(hl.owned_bf16);
+    }
+    var emb_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb_w);
+    {
+        var host: [8 * 64]f32 = undefined;
+        for (&host, 0..) |*v, i| v.* = @sin(0.53 * @as(f32, @floatFromInt(i)));
+        const f = mlx.mlx_array_new_data(&host, &[_]c_int{ 8, H }, 2, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&emb_w, f, .bfloat16, s));
+    }
+    var cache = try KVCache.init(allocator, 1);
+    defer cache.deinit();
+    var xfm = testHybridXfm(allocator, config, cache, emb_w, hl.ssm_entries, hl.hybrid_layers, s);
+    defer deinitTestHybridXfm(&xfm);
+
+    const LastRow = struct {
+        fn f(x: *Transformer, ids: []const i32, out: *[64]f32, st: mlx.mlx_stream) !void {
+            try x.cache.truncate(0, st);
+            x.moe_seq_offset = 0;
+            for (ids) |tok| {
+                const id_arr = mlx.mlx_array_new_data(&[_]i32{tok}, &[_]c_int{ 1, 1 }, 2, .int32);
+                defer _ = mlx.mlx_array_free(id_arr);
+                const o = try x.forward(id_arr);
+                defer _ = mlx.mlx_array_free(o);
+                var f32a = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(f32a);
+                try mlx.check(mlx.mlx_astype(&f32a, o, .float32, st));
+                try mlx.check(mlx.mlx_array_eval(f32a));
+                const p = mlx.mlx_array_data_float32(f32a) orelse return error.NoData;
+                @memcpy(out, p[0..64]);
+            }
+        }
+    }.f;
+    var a: [64]f32 = undefined;
+    var b: [64]f32 = undefined;
+    try LastRow(&xfm, &.{ 1, 5, 2, 6, 3 }, &a, s);
+    try LastRow(&xfm, &.{ 6, 2, 5, 1, 3 }, &b, s);
+    var max_ref: f32 = 0;
+    var max_err: f32 = 0;
+    for (a, b) |x, y| {
+        try t.expect(std.math.isFinite(x) and std.math.isFinite(y));
+        max_ref = @max(max_ref, @abs(x));
+        max_err = @max(max_err, @abs(x - y));
+    }
+    if (!(max_ref > 0.01)) return error.RefTooSmall;
+    if (max_err > 1e-2 * max_ref) {
+        std.debug.print("NoPE attention moved with token order: max_err={d:.6} max_ref={d:.6}\n", .{ max_err, max_ref });
+        return error.AttentionIsPositional;
     }
 }
 
