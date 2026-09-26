@@ -2373,3 +2373,18 @@ token, then computes that token's entry from the raw logits, before the grammar 
 are the model's distribution, so the emitted token need not be rank 1 under a grammar.
 Guards: `constrained generation returns one logprob entry per token` (generate.zig, gated on
 `LOGPROBS_TEST_MODEL`) and `tests/test_logprobs.sh` [7].
+
+## Two servers listened on one port
+
+Defect: two `mlx-serve` processes on the same port both reached "Server listening". Clients
+reached whichever the kernel picked, so `/v1/models` and chat answers came from a server the
+app did not start or track.
+
+Cause: `main.portInUse` probes the port BEFORE the model load, and the bind happens AFTER it.
+A second instance started during that load passed the probe. std's `listen(.{ .reuse_address =
+true })` sets SO_REUSEPORT as well as SO_REUSEADDR, so both binds succeeded.
+
+Fix: `server.listenExclusive` clears SO_REUSEPORT on the bound socket. The kernel checks the
+flag on the socket already bound, so the later bind fails with `AddressInUse` and logs the
+same "Port N is already in use" line. SO_REUSEADDR stays for rebinding over TIME_WAIT.
+Guard: `listenExclusive: a second server cannot bind a port that is already listening`.

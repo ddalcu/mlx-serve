@@ -279,6 +279,7 @@ Loading + residency:
 - **Embedded engines**: ONE persistent session per model (`ds4_session` + `session_busy`); ds4 in-checkpoint MTP only when the GGUF declares `nextn_predict_layers` (`embedded_mtp`); the `Tokenizer` is a STUB — count via `server.encodeText`; embeddings refuse by NAME; a llama session trim is FALLIBLE (#286/#287, cold-prefill on refusal). Guard: `tests/test_ds4_serve.sh`.
 - **An embedding SUB-BATCH is its own forward** (cache reset per sub-batch). Guard: `tests/test_embeddings.sh` [4c].
 - **A READY model never advertises LESS than its stub** (`readyHasChat`). Default bind 0.0.0.0 WARNS (`shouldWarnOpenBind`).
+- **One port, one server** (`listenExclusive`): std's `reuse_address` also sets SO_REUSEPORT, so a second instance bound the port the first was still loading behind and took its connections; the flag is cleared after bind, a late bind fails `AddressInUse`.
 
 Memory bills + admission:
 - **KV is billed per CACHING LAYER at the arch's OWN K/V widths** (`kvBytesPerToken` ← `attnCacheLayerCount`; only `.attention` blocks of a `layer_block_types` hybrid); STORED and SCORED widths are two parameters (`prefillScoreHeadDim`).

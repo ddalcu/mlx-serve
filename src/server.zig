@@ -1606,6 +1606,17 @@ fn deinitGlobalResponseStore() void {
     }
 }
 
+/// Listen with SO_REUSEADDR (a restart can rebind over TIME_WAIT) but WITHOUT
+/// SO_REUSEPORT, which std sets beside it: with it a second instance binds the
+/// same port and silently takes the connections. The kernel checks the flag on
+/// the socket already bound, so clearing it after bind is enough.
+fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    errdefer server.deinit(io);
+    try std.posix.setsockopt(server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 0)));
+    return server;
+}
+
 /// Start the HTTP server on the given host and port.
 ///
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
@@ -1776,7 +1787,10 @@ pub fn serve(
     }
 
     const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
-    var server = try ip_addr.listen(io, .{ .reuse_address = true });
+    var server = listenExclusive(io, ip_addr) catch |err| {
+        if (err == error.AddressInUse) log.err("Port {d} is already in use — another mlx-serve instance may be running.\n", .{port});
+        return err;
+    };
     defer server.deinit(io);
 
     // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
@@ -18720,6 +18734,12 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     const closed = conn.peerClosed();
     _ = std.c.close(server_fd);
     try testing.expect(closed);
+}
+
+test "listenExclusive: a second server cannot bind a port that is already listening" {
+    var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
+    defer first.deinit(testing.io);
+    try testing.expectError(error.AddressInUse, listenExclusive(testing.io, first.socket.address));
 }
 
 test "findContentLength parses header" {
