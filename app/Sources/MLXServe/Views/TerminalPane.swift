@@ -21,7 +21,7 @@ struct TerminalPane: View {
                 Divider()
                 HStack(spacing: 8) {
                     Label(L10n.text(session.workspace), systemImage: "folder")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                     Spacer()
                     if session.kind == .sandbox { sshConnectRow }
@@ -39,9 +39,9 @@ struct TerminalPane: View {
         case .preparing:
             notice {
                 ProgressView()
-                Text("Starting \(session.displayName) session…").font(.headline)
+                Text("Starting \(session.displayName) session…").font(.app(.headline))
                 Text("Boots the guest and prepares configs. First-run installs stream into the terminal once it opens.")
-                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .font(.app(.caption)).foregroundStyle(.secondary).multilineTextAlignment(.center)
             }
         case .live:
             if let handle = terminals.handle(for: session.id) {
@@ -53,7 +53,7 @@ struct TerminalPane: View {
                 Divider()
                 HStack(spacing: 8) {
                     Text(terminals.sessions.exitNotice(session.id) ?? "session ended")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.app(.callout)).foregroundStyle(.secondary)
                     Spacer()
                     Button("Close") { appState.closeTerminal(session.id) }
                 }
@@ -62,17 +62,17 @@ struct TerminalPane: View {
             } else {
                 notice {
                     Text(terminals.sessions.exitNotice(session.id) ?? "session ended")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.app(.callout)).foregroundStyle(.secondary)
                     Button("Close") { appState.closeTerminal(session.id) }
                         .controlSize(.small)
                 }
             }
         case .failed(let message):
             notice {
-                Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
-                Text("The \(session.displayName) session could not start").font(.headline)
+                Image(systemName: "exclamationmark.triangle").font(.app(.largeTitle)).foregroundStyle(.orange)
+                Text("The \(session.displayName) session could not start").font(.app(.headline))
                 Text(message)
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.app(.callout)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 480)
                     .textSelection(.enabled)
@@ -130,9 +130,9 @@ struct TerminalPane: View {
         if let cmd = sandbox.sshDisplayCommand {
             HStack(spacing: 6) {
                 Text("Connect from your terminal:")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
                 Text(L10n.text(cmd))
-                    .font(.caption2.monospaced())
+                    .font(.app(.caption2).monospaced())
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)

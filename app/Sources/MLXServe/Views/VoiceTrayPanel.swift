@@ -83,13 +83,13 @@ struct VoiceTrayPanel: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.orange)
                 Text(L10n.text(VoicePreflight.shortMessage(for: issue)))
-                    .font(.caption.weight(.semibold))
+                    .font(.app(.caption).weight(.semibold))
             }
             Text(L10n.text(VoicePreflight.detail(for: issue)))
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button(L10n.text(VoicePreflight.actionLabel(for: issue))) {
@@ -120,11 +120,11 @@ struct VoiceTrayPanel: View {
                 .fill(dotColor)
                 .frame(width: 8, height: 8)
             Text(L10n.text(statusText))
-                .font(.caption.weight(.medium))
+                .font(.app(.caption).weight(.medium))
                 .foregroundStyle(isError ? .red : .secondary)
             if !voice.partialTranscript.isEmpty {
                 Text("“\(voice.partialTranscript)”")
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -142,7 +142,7 @@ struct VoiceTrayPanel: View {
     private var agentPicker: some View {
         HStack(spacing: 6) {
             Image(systemName: activeAgent?.symbol ?? "person.crop.circle")
-                .font(.system(size: 11, weight: .medium))
+                .font(.app(.subheadline, weight: .medium))
                 .foregroundStyle(.secondary)
             Picker("", selection: Binding(get: { appState.defaultAgentId },
                                           set: { appState.defaultAgentId = $0 })) {
@@ -157,7 +157,7 @@ struct VoiceTrayPanel: View {
             Spacer(minLength: 0)
             Button("Manage…") { openAgents() }
                 .buttonStyle(.link)
-                .font(.caption2)
+                .font(.app(.caption2))
         }
         .help("Who you're talking to. An agent brings its own prompt, voice, tools, workspace and model; “None” uses the app's own settings, exactly as before. Say another agent's wake phrase to hand the conversation over mid-session.")
     }
@@ -211,14 +211,14 @@ struct VoiceTrayPanel: View {
                 Image(systemName: "shield.lefthalf.filled")
                     .foregroundStyle(.orange)
                 Text("Allow this tool call?")
-                    .font(.caption.weight(.semibold))
+                    .font(.app(.caption).weight(.semibold))
             }
             Text(L10n.text(req.toolName))
-                .font(.caption2.monospaced())
+                .font(.app(.caption2).monospaced())
                 .foregroundStyle(.secondary)
             if !req.rawArguments.isEmpty {
                 Text(L10n.text(req.rawArguments))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.app(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
                     .truncationMode(.tail)
@@ -248,8 +248,8 @@ struct VoiceTrayPanel: View {
                                help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 4) {
-                Image(systemName: system).font(.system(size: 11, weight: .medium))
-                Text(L10n.text(label)).font(.caption2.weight(.medium))
+                Image(systemName: system).font(.app(.subheadline, weight: .medium))
+                Text(L10n.text(label)).font(.app(.caption2).weight(.medium))
             }
             .foregroundStyle(tint ?? .secondary)
         }

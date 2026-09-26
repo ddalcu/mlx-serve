@@ -90,16 +90,16 @@ if (typeof document !== 'undefined') (function () {
 <style>
 .mhead{display:flex;align-items:center;gap:10px;margin:24px 0 10px}
 .mhead h2{margin:0}
-#m-status{font-size:11px;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;background:#1a1e25;color:#7d8794}
+#m-status{font-size:0.6875rem;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;background:#1a1e25;color:#7d8794}
 #m-status.live{background:#0f2a17;color:#4ade80}
 #m-status.err{background:#2a0f14;color:#ff95a8}
 .mgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 @media(max-width:640px){.mgrid{grid-template-columns:repeat(2,1fr)}}
 .mtile{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:12px 14px}
-.mlbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;margin-bottom:7px}
-.mval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:26px;font-weight:700;line-height:1;color:#e6e9ee}
-.munit{font-size:12px;font-weight:400;color:#7d8794;margin-left:4px}
-.msub{font-size:11px;color:#5b6470;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mlbl{font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;margin-bottom:7px}
+.mval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.625rem;font-weight:700;line-height:1;color:#e6e9ee}
+.munit{font-size:0.75rem;font-weight:400;color:#7d8794;margin-left:4px}
+.msub{font-size:0.6875rem;color:#5b6470;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mbar{height:5px;background:#1f242c;border-radius:3px;margin-top:10px;overflow:hidden}
 .mfill{height:100%;width:0;border-radius:3px;background:#3b82f6;transition:width .5s}
 .mfill.warn{background:#f59e0b}.mfill.crit{background:#ef4444}
@@ -107,7 +107,7 @@ if (typeof document !== 'undefined') (function () {
 @media(max-width:640px){.mspark{grid-template-columns:1fr}}
 .msparkbox{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:10px 12px}
 .msparkhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
-.msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:15px;font-weight:700;color:#e6e9ee}
+.msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9375rem;font-weight:700;color:#e6e9ee}
 .msparkbox svg{width:100%;height:44px;display:block}
 </style>
 <div class=mhead><h2 style="margin:0">Live metrics</h2><span id=m-status>connecting…</span></div>

@@ -113,8 +113,8 @@ private struct ModelBrowserSectionBar: View {
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: item.systemImage)
-                    .font(.system(size: 11, weight: .medium))
-                Text(L10n.text(item.title)).font(.callout).lineLimit(1)
+                    .font(.app(.subheadline, weight: .medium))
+                Text(L10n.text(item.title)).font(.app(.callout)).lineLimit(1)
                 if item == .downloads, isDownloading {
                     ProgressView()
                         .controlSize(.small)
@@ -123,7 +123,7 @@ private struct ModelBrowserSectionBar: View {
                 }
                 if let badge = badges.badge(for: item) {
                     Text(L10n.text(badge))
-                        .font(.caption2.monospacedDigit())
+                        .font(.app(.caption2).monospacedDigit())
                         .foregroundStyle(isSelected ? .primary : .secondary)
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
@@ -184,14 +184,14 @@ private struct MemorySummaryCard: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
                 Image(systemName: "memorychip")
-                    .font(.title2)
+                    .font(.app(.title2))
                     .foregroundStyle(.tint)
                     .frame(width: 26)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Your Mac")
-                        .font(.headline)
+                        .font(.app(.headline))
                     Text("\(memory.totalLabel) of memory · about \(memory.usableLabel) usable for models")
-                        .font(.subheadline)
+                        .font(.app(.subheadline))
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
@@ -202,7 +202,7 @@ private struct MemorySummaryCard: View {
 
             HStack(spacing: 6) {
                 Image(systemName: "sparkles")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.tint)
                 Text("Recommended for your Mac:")
                     .foregroundStyle(.secondary)
@@ -210,7 +210,7 @@ private struct MemorySummaryCard: View {
                     .fontWeight(.semibold)
                 Spacer(minLength: 0)
             }
-            .font(.callout)
+            .font(.app(.callout))
         }
         .padding(16)
         .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
@@ -279,10 +279,10 @@ private struct RecommendedModelTable: View {
     private func familyHeader(_ family: Family) -> some View {
         HStack(spacing: 7) {
             Image(systemName: family.systemImage)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(family.tint)
             Text(L10n.text(family.title))
-                .font(.caption.weight(.semibold))
+                .font(.app(.caption).weight(.semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
         }
@@ -307,7 +307,7 @@ private struct RecommendedTableHeader: View {
             Color.clear
                 .frame(width: RecTableMetrics.action, height: 1)
         }
-        .font(.caption2.weight(.semibold))
+        .font(.app(.caption2).weight(.semibold))
         .foregroundStyle(.secondary)
         .textCase(.uppercase)
         .padding(.horizontal, RecTableMetrics.hPad)
@@ -343,7 +343,7 @@ private struct MiniCapability: View {
     private var tip: some View {
         VStack(alignment: .leading, spacing: 3) {
             ForEach(CapabilityTip.lines(for: pick), id: \.self) { line in
-                Text(L10n.text(line)).font(.caption)
+                Text(L10n.text(line)).font(.app(.caption))
             }
         }
         .padding(.horizontal, 8)
@@ -422,10 +422,10 @@ private struct RecommendedModelTableRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(pick.name)
-                            .font(.callout.weight(.medium))
+                            .font(.app(.callout).weight(.medium))
                         if isRecommended {
                             Text("Recommended")
-                                .font(.caption2.weight(.semibold))
+                                .font(.app(.caption2).weight(.semibold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 1)
                                 .background(Capsule().fill(Color.accentColor.opacity(0.18)))
@@ -433,7 +433,7 @@ private struct RecommendedModelTableRow: View {
                         }
                     }
                     Text(L10n.text(pick.tagline))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -451,11 +451,11 @@ private struct RecommendedModelTableRow: View {
             // Download size (on disk) and the quant it buys.
             VStack(alignment: .trailing, spacing: 2) {
                 Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
                 if let quant = pick.quantLabel {
                     Text(L10n.text(quant))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -480,12 +480,12 @@ private struct RecommendedModelTableRow: View {
     private var memoryCell: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB))
-                .font(.caption.monospacedDigit().weight(.medium))
+                .font(.app(.caption).monospacedDigit().weight(.medium))
             HStack(spacing: 3) {
                 Image(systemName: fitIcon)
-                    .font(.system(size: 9))
+                    .font(.app(.caption2))
                 Text(L10n.text(fit.label))
-                    .font(.caption2)
+                    .font(.app(.caption2))
             }
             .foregroundStyle(fitColor)
         }
@@ -527,7 +527,7 @@ private struct RecommendedModelTableRow: View {
                     UseMediaModelButton(modality: media.modality, name: media.model.name)
                 } else {
                     Text("✓ On disk")
-                        .font(.caption.weight(.medium))
+                        .font(.app(.caption).weight(.medium))
                         .foregroundStyle(.green)
                 }
                 Button {
@@ -555,7 +555,7 @@ private struct RecommendedModelTableRow: View {
                     ProgressView(value: state.progress)
                         .frame(width: 70)
                     Text("\(state.percentFormatted) \(state.speedFormatted)")
-                        .font(.system(size: 9).monospacedDigit())
+                        .font(.app(.caption2).monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 Button {
@@ -574,7 +574,7 @@ private struct RecommendedModelTableRow: View {
                     .controlSize(.small)
                 if let error = state.error {
                     Text(error)
-                        .font(.system(size: 9))
+                        .font(.app(.caption2))
                         .foregroundStyle(.red)
                         .lineLimit(1)
                 }
@@ -678,7 +678,7 @@ private struct DiscoverPane: View {
                     } else if let error = searchService.error {
                         Text(error)
                             .foregroundStyle(.red)
-                            .font(.caption)
+                            .font(.app(.caption))
                             .padding(20)
                     } else if searchService.models.isEmpty {
                         Text("No models found")
@@ -701,16 +701,16 @@ private struct DiscoverPane: View {
 
             HStack {
                 Text("Showing \(searchService.models.count) models")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 if onDiskCount > 0 {
                     Text("· \(onDiskCount) on disk")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.green)
                 }
                 Spacer()
                 Text("System RAM: \(MemoryInfo.format(Int64(searchService.systemRAM)))")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 12)
@@ -775,7 +775,7 @@ private struct MyModelsPane: View {
                 Text("")
                     .frame(width: 120)
             }
-            .font(.callout.weight(.semibold))
+            .font(.app(.callout).weight(.semibold))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -793,7 +793,7 @@ private struct MyModelsPane: View {
                             }
                         } header: {
                             Text(L10n.text(group.title))
-                                .font(.caption.weight(.semibold))
+                                .font(.app(.caption).weight(.semibold))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 12)
@@ -814,12 +814,12 @@ private struct MyModelsPane: View {
 
             HStack {
                 Text("\(total) model\(total == 1 ? "" : "s") on disk")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if !freeDiskSpace.isEmpty {
                     Text("\(freeDiskSpace) available")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -858,12 +858,12 @@ private struct DownloadsPane: View {
                 Spacer()
                 VStack(spacing: 8) {
                     Image(systemName: "arrow.down.circle")
-                        .font(.largeTitle)
+                        .font(.app(.largeTitle))
                         .foregroundStyle(.secondary)
                     Text("No downloads in progress")
                         .foregroundStyle(.secondary)
                     Text("Start one from Recommended or Discover.")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.tertiary)
                 }
                 Spacer()
@@ -953,8 +953,8 @@ private struct ModelGroupSection<Content: View>: View {
                     .foregroundStyle(tint)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(L10n.text(title)).font(.subheadline.weight(.semibold))
-                    Text(L10n.text(subtitle)).font(.caption2).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.app(.subheadline).weight(.semibold))
+                    Text(L10n.text(subtitle)).font(.app(.caption2)).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -1004,16 +1004,16 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
             Button { card = ModelCardRequest(repoId: bundle.primaryRepo, title: preset.name) } label: {
             VStack(alignment: .leading, spacing: 3) {
                 Text(L10n.text(preset.name))
-                    .font(.callout.weight(.medium))
+                    .font(.app(.callout).weight(.medium))
 
                 Text(L10n.text(preset.description))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
                 if bundle.components.count > 1 {
                     Text("Includes \(bundle.components.count) models (e.g. a text encoder)")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.tertiary)
                 }
 
@@ -1022,13 +1022,13 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                         "Needs about \(preset.approxRAMGB) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
                         systemImage: "exclamationmark.triangle"
                     )
-                    .font(.caption2.weight(.medium))
+                    .font(.app(.caption2).weight(.medium))
                     .foregroundStyle(.orange)
                 }
 
                 if let active, active.state.status == .failed, let error = active.state.error {
                     Text(error)
-                        .font(.system(size: 9))
+                        .font(.app(.caption2))
                         .foregroundStyle(.red)
                         .lineLimit(1)
                 }
@@ -1040,7 +1040,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
 
             VStack(alignment: .trailing, spacing: 4) {
                 Text(L10n.text(bundle.approxSizeLabel))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.tertiary)
                 actionControl
             }
@@ -1080,7 +1080,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                     ProgressView(value: active.state.progress)
                         .frame(width: 70)
                     Text("\(active.state.percentFormatted) \(active.state.speedFormatted)")
-                        .font(.system(size: 9).monospacedDigit())
+                        .font(.app(.caption2).monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 Button {
@@ -1221,7 +1221,7 @@ private struct ModelUseBadge: View {
                 EmptyView()
             }
             Text(L10n.text(state.label))
-                .font(.caption.weight(.medium))
+                .font(.app(.caption).weight(.medium))
                 .foregroundStyle(tint)
                 .lineLimit(1)
         }
@@ -1272,7 +1272,7 @@ private struct ColumnHeaderRow: View {
             Text("")
                 .frame(width: ModelBrowserMetrics.actionWidth)
         }
-        .font(.callout.weight(.semibold))
+        .font(.app(.callout).weight(.semibold))
         .foregroundStyle(.secondary)
     }
 }
@@ -1302,7 +1302,7 @@ private struct SortableHeader: View {
                     Text(L10n.text(title))
                     if isActive {
                         Image(systemName: searchService.sortDescending ? "chevron.down" : "chevron.up")
-                            .font(.system(size: 8))
+                            .font(.app(.caption2))
                     }
                 }
                 .contentShape(Rectangle())
@@ -1336,16 +1336,16 @@ private struct ModelBrowserRow: View {
             Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(model.modelName))
-                    .font(.callout.weight(.medium))
+                    .font(.app(.callout).weight(.medium))
                     .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(L10n.text(model.author))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                     if let reason = model.incompatibleReason {
                         Text(reason)
-                            .font(.system(size: 10))
+                            .font(.app(.caption2))
                             .foregroundStyle(.red.opacity(0.8))
                             .lineLimit(1)
                     }
@@ -1360,7 +1360,7 @@ private struct ModelBrowserRow: View {
             Group {
                 if let quant = model.quantization {
                     Text(L10n.text(quant))
-                        .font(.system(size: 10).weight(.medium))
+                        .font(.app(.caption2).weight(.medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(.quaternary)
@@ -1374,20 +1374,20 @@ private struct ModelBrowserRow: View {
 
             // Size (parsed from model name)
             Text(L10n.text(model.modelSize))
-                .font(.callout.monospacedDigit())
+                .font(.app(.callout).monospacedDigit())
                 .frame(width: ModelBrowserMetrics.sizeWidth, alignment: .trailing)
 
             // HF pull count
             if tier.showsPulls {
                 Text(formatCount(model.downloads ?? 0))
-                    .font(.callout.monospacedDigit())
+                    .font(.app(.callout).monospacedDigit())
                     .frame(width: ModelBrowserMetrics.pullsWidth, alignment: .trailing)
             }
 
             // Likes
             if tier.showsLikes {
                 Text(formatCount(model.likes ?? 0))
-                    .font(.callout.monospacedDigit())
+                    .font(.app(.callout).monospacedDigit())
                     .frame(width: ModelBrowserMetrics.likesWidth, alignment: .trailing)
             }
 
@@ -1400,7 +1400,7 @@ private struct ModelBrowserRow: View {
                     .fill(fitnessColor)
                     .frame(width: 8, height: 8)
                 Text(L10n.text(model.ramEstimate))
-                    .font(.callout.monospacedDigit())
+                    .font(.app(.callout).monospacedDigit())
                     .lineLimit(1)
             }
             .frame(width: ModelBrowserMetrics.ramWidth, alignment: .trailing)
@@ -1408,7 +1408,7 @@ private struct ModelBrowserRow: View {
             // Last updated
             if tier.showsUpdated {
                 Text(formatRelativeDate(model.lastModifiedDate))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(.secondary)
                     .frame(width: ModelBrowserMetrics.updatedWidth, alignment: .trailing)
             }
@@ -1520,7 +1520,7 @@ private struct ModelBrowserRow: View {
             case .unsupported:
                 Image(systemName: "nosign")
                     .foregroundStyle(.secondary)
-                    .font(.caption)
+                    .font(.app(.caption))
 
             case .onDisk:
                 HStack(spacing: 6) {
@@ -1538,7 +1538,7 @@ private struct ModelBrowserRow: View {
                         UseMediaModelButton(modality: media.modality, name: media.model.name)
                     } else {
                         Text("✓ On disk")
-                            .font(.caption.weight(.medium))
+                            .font(.app(.caption).weight(.medium))
                             .foregroundStyle(.green)
                     }
                     deleteButton
@@ -1551,14 +1551,14 @@ private struct ModelBrowserRow: View {
                 Button(L10n.text(resumable ? "Resume" : "Retry")) {
                     startDownload()
                 }
-                .font(.callout)
+                .font(.app(.callout))
                 .controlSize(.small)
 
             case .notDownloaded(let resumable):
                 Button(L10n.text(resumable ? "Resume" : "Download")) {
                     startDownload()
                 }
-                .font(.callout)
+                .font(.app(.callout))
                 .controlSize(.small)
             }
         }
@@ -1570,7 +1570,7 @@ private struct ModelBrowserRow: View {
                 ProgressView(value: progress)
                     .frame(width: 50)
                 Text(state?.percentFormatted ?? "")
-                    .font(.system(size: 9).monospacedDigit())
+                    .font(.app(.caption2).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Button {
@@ -1595,7 +1595,7 @@ private struct ModelBrowserRow: View {
                 .foregroundStyle(.red.opacity(0.7))
         }
         .buttonStyle(.plain)
-        .font(.callout)
+        .font(.app(.callout))
         .help("Delete model")
         .alert("Delete Model", isPresented: $confirmDelete) {
             Button("Cancel", role: .cancel) {}
@@ -1696,7 +1696,7 @@ private struct GgufQuantMenu: View {
             )
 ))
         }
-        .font(.callout)
+        .font(.app(.callout))
         .controlSize(.small)
         .fixedSize()
         .task {
@@ -1801,7 +1801,7 @@ private struct MlxVariantMenu: View {
             )
 ))
         }
-        .font(.callout)
+        .font(.app(.callout))
         .controlSize(.small)
         .fixedSize()
         .alert("Delete Quantization", isPresented: .init(
@@ -1881,7 +1881,7 @@ private struct LocalModelRow: View {
                     // quant suffix so two quants of one GGUF repo are two
                     // distinguishable rows) survives as the subtext below —
                     Text(L10n.text(ModelDisplayName.pretty(model.displayLabel)))
-                        .font(.callout.weight(.medium))
+                        .font(.app(.callout).weight(.medium))
                         .lineLimit(1)
                     // Drafter checkpoints are real, supported models — they
                     // just aren't loadable as a target on their own. Show a
@@ -1892,7 +1892,7 @@ private struct LocalModelRow: View {
                     // this library unnoticed while the server registered both.
                     if let defect = model.defect {
                         Text(L10n.text(defect.label))
-                            .font(.system(size: 10).weight(.medium))
+                            .font(.app(.caption2).weight(.medium))
                             .foregroundStyle(.orange)
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Color.orange.opacity(0.15), in: Capsule())
@@ -1900,7 +1900,7 @@ private struct LocalModelRow: View {
                     }
                     if model.kind == .drafter {
                         Text("Drafter")
-                            .font(.system(size: 10).weight(.medium))
+                            .font(.app(.caption2).weight(.medium))
                             .foregroundStyle(.purple)
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Color.purple.opacity(0.15), in: Capsule())
@@ -1909,7 +1909,7 @@ private struct LocalModelRow: View {
                 }
                 // The id itself, under the readable name.
                 Text(L10n.text(model.displayLabel))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -1921,20 +1921,20 @@ private struct LocalModelRow: View {
                     // For a broken folder the architecture summary is noise —
                     // what it IS matters less than why it cannot load.
                     Text(L10n.text(model.defect?.explanation ?? model.metadataSummary))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     // Capability icons mirror the search rows.
                     if model.hasVision {
                         Image(systemName: "eye")
-                            .font(.system(size: 9))
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                             .help("Vision (image input)")
                     }
                     if model.hasToolCalling {
                         Image(systemName: "wrench")
-                            .font(.system(size: 9))
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                             .help("Tool calling")
                     }
@@ -1943,7 +1943,7 @@ private struct LocalModelRow: View {
                     // intentionally — the badge above already explains them.
                     if model.kind != .drafter, !model.isSupportedArchitecture {
                         Text("Unsupported")
-                            .font(.system(size: 10).weight(.medium))
+                            .font(.app(.caption2).weight(.medium))
                             .foregroundStyle(.red.opacity(0.8))
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Color.red.opacity(0.12), in: Capsule())
@@ -1957,7 +1957,7 @@ private struct LocalModelRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(L10n.text(model.sizeFormatted))
-                .font(.callout.monospacedDigit())
+                .font(.app(.callout).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 90, alignment: .trailing)
 
@@ -1992,7 +1992,7 @@ private struct LocalModelRow: View {
                             .foregroundStyle(hasOverrides ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                     }
                     .buttonStyle(.plain)
-                    .font(.callout)
+                    .font(.app(.callout))
                     .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
                 }
                 if ModelRowActions.showsLock(model, unlocked: unlocked) {
@@ -2007,7 +2007,7 @@ private struct LocalModelRow: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .font(.callout)
+                    .font(.app(.callout))
                     .help(ModelRowActions.lockHelp(model))
                 } else {
                     Button {
@@ -2017,7 +2017,7 @@ private struct LocalModelRow: View {
                             .foregroundStyle(.red.opacity(0.7))
                     }
                     .buttonStyle(.plain)
-                    .font(.callout)
+                    .font(.app(.callout))
                     .help(model.defect != nil
                           ? "Delete this broken folder"
                           : (model.quantFile != nil ? "Delete this quant" : "Delete model"))
@@ -2032,7 +2032,7 @@ private struct LocalModelRow: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .font(.callout)
+                .font(.app(.callout))
                 .help(ModelRowActions.revealHelp(model))
             }
             .frame(width: 150, alignment: .trailing)
@@ -2101,18 +2101,18 @@ private struct ActiveDownloadRow: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(modelName))
-                    .font(.callout.weight(.medium))
+                    .font(.app(.callout).weight(.medium))
                     .lineLimit(1)
 
                 if state.status == .downloading, !state.statusText.isEmpty {
                     Text("[\(state.fileIndex)/\(state.fileCount)] \(state.statusText)")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 } else if state.status == .failed, let error = state.error {
                     Text(error)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.red)
                         .lineLimit(1)
                 }
@@ -2125,7 +2125,7 @@ private struct ActiveDownloadRow: View {
                         ProgressView(value: state.progress)
                             .frame(width: 80)
                         Text("\(state.percentFormatted) \(state.speedFormatted)")
-                            .font(.system(size: 9).monospacedDigit())
+                            .font(.app(.caption2).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                     Button {
@@ -2143,7 +2143,7 @@ private struct ActiveDownloadRow: View {
                 Button(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry")) {
                     downloads.start(repoId: repoId) { appState.refreshModels() }
                 }
-                .font(.callout)
+                .font(.app(.callout))
                 .controlSize(.small)
                 .frame(width: 90, alignment: .trailing)
             }

@@ -39,7 +39,7 @@ struct MemoryMeter: View {
                 Text("\(MemoryInfo.format(totalBytes)) total")
                     .foregroundStyle(.tertiary)
             }
-            .font(.caption2)
+            .font(.app(.caption2))
         }
     }
 

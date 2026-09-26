@@ -980,3 +980,27 @@ test('speechBody never sends both voice and ref_audio', () => {
   const plain = C.speechBody({ model: 'm', text: 'hi' });
   assert.deepEqual(plain, { model: 'm', input: 'hi' });
 });
+
+// ── Type is relative, so the reader's browser size applies ────────────────
+// A `px` font size ignores the browser's own default font size AND the page
+// zoom, which is the one text-size control a reader of the console actually
+// has. `rem` follows the root size, so the same value renders at whatever the
+// reader chose. The app's own ladder is the same idea in point sizes
+// (`app/Sources/MLXServe/Support/AppType.swift`); this is the web half of the
+// same rule, and the scan is what stops a later stylesheet from quietly
+// putting px back.
+
+test('no console stylesheet states a font size in px', () => {
+  const files = ['app.css', 'metrics.js', 'index.html', 'app.js'];
+  const offenders = [];
+  for (const name of files) {
+    const text = readFileSync(join(here, '..', 'src', 'html', name), 'utf8');
+    for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
+      const line = text.slice(0, m.index).split('\n').length;
+      offenders.push(`${name}:${line}: ${m[0].trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
+    'Use rem (px / 16): 13px is 0.8125rem.');
+});

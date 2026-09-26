@@ -65,13 +65,13 @@ struct ToolApprovalSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "shield.lefthalf.filled")
-                    .font(.title2)
+                    .font(.app(.title2))
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Allow this tool call?")
-                        .font(.headline)
+                        .font(.app(.headline))
                     Text(L10n.text(headline))
-                        .font(.subheadline)
+                        .font(.app(.subheadline))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -79,12 +79,12 @@ struct ToolApprovalSheet: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Tool: \(request.toolName)")
-                    .font(.caption.weight(.semibold))
+                    .font(.app(.caption).weight(.semibold))
                     .foregroundStyle(.secondary)
                 if argPairs.isEmpty && !request.rawArguments.isEmpty {
                     ScrollView {
                         Text(L10n.text(request.rawArguments))
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.app(.subheadline, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(8)
@@ -94,7 +94,7 @@ struct ToolApprovalSheet: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if argPairs.isEmpty {
                     Text("(no arguments)")
-                        .font(.caption.italic())
+                        .font(.app(.caption).italic())
                         .foregroundStyle(.tertiary)
                 } else {
                     ScrollView {
@@ -102,10 +102,10 @@ struct ToolApprovalSheet: View {
                             ForEach(argPairs, id: \.0) { (k, v) in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     Text(L10n.text(k))
-                                        .font(.system(size: 11, design: .monospaced).weight(.semibold))
+                                        .font(.app(.subheadline, design: .monospaced).weight(.semibold))
                                         .foregroundStyle(.secondary)
                                     Text(L10n.text(v))
-                                        .font(.system(size: 11, design: .monospaced))
+                                        .font(.app(.subheadline, design: .monospaced))
                                         .textSelection(.enabled)
                                         .lineLimit(8)
                                         .fixedSize(horizontal: false, vertical: true)
@@ -187,7 +187,7 @@ private struct AttachmentPreviewRow: View {
     private func removeButton(_ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 14))
+                .font(.app(.body))
                 .foregroundStyle(.white)
                 .background(Circle().fill(.black.opacity(0.5)))
         }
@@ -212,18 +212,18 @@ private struct AttachmentPreviewRow: View {
         ZStack(alignment: .topTrailing) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 18))
+                    .font(.app(.title2))
                     .foregroundStyle(.white)
                     .frame(width: 32, height: 32)
                     .background(tint.opacity(0.85))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 1) {
                     Text(name)
-                        .font(.caption.weight(.medium))
+                        .font(.app(.caption).weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Text(L10n.text(detail))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -247,18 +247,18 @@ private struct DocumentFolderChip: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: iconName)
-                .font(.system(size: 18))
+                .font(.app(.title2))
                 .foregroundStyle(.white)
                 .frame(width: 32, height: 32)
                 .background(tint.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(index.folderName))
-                    .font(.caption.weight(.medium))
+                    .font(.app(.caption).weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(L10n.text(statusText))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
             }
             if case .indexing(let done, let total) = index.state {
@@ -268,7 +268,7 @@ private struct DocumentFolderChip: View {
             }
             Button(action: onRemove) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 14))
+                    .font(.app(.body))
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
@@ -316,10 +316,10 @@ private struct MicButton: View {
         Button(action: toggle) {
             HStack(spacing: 4) {
                 Image(systemName: recorder.isRecording ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.app(.callout, weight: .medium))
                 if recorder.isRecording {
                     Text(timeString(recorder.duration))
-                        .font(.caption2.monospacedDigit().weight(.medium))
+                        .font(.app(.caption2).monospacedDigit().weight(.medium))
                 }
             }
             .foregroundStyle(recorder.isRecording ? Color.white : Color.secondary)
@@ -1297,24 +1297,24 @@ struct ChatSidebar: View {
         switch dot {
         case .generating:
             Image(systemName: "inset.filled.circle")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.green)
                 .symbolEffect(.pulse.byLayer, options: .repeat(.continuous))
                 .help("Generating")
         case .tool:
             Image(systemName: "inset.filled.circle.dashed")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.blue)
                 .symbolEffect(.rotate.clockwise.byLayer, options: .repeat(.continuous))
                 .help("Running a tool")
         case .finished:
             Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
                 .help("Finished")
         case .attention:
             Image(systemName: "exclamationmark.circle.fill")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.orange)
                 .help("Stopped with an error")
         }
@@ -1383,7 +1383,7 @@ struct ChatSidebar: View {
                                         @ViewBuilder trailing: () -> T) -> some View {
         HStack(spacing: 4) {
         Text(L10n.text(title))
-                .font(.caption.weight(.semibold))
+                .font(.app(.caption).weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             trailing()
@@ -1419,7 +1419,7 @@ struct ChatSidebar: View {
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.app(.headline, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
@@ -1459,25 +1459,25 @@ struct ChatSidebar: View {
                 HStack(spacing: 4) {
                     if session.isExternalBridge {
                         Image(systemName: "paperplane.fill")
-                            .font(.system(size: 9))
+                            .font(.app(.caption2))
                             .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
                             .help("Telegram conversation (view only)")
                     }
                     if let agent {
                         Image(systemName: agent.symbol)
-                            .font(.system(size: 10))
+                            .font(.app(.caption2))
                             .foregroundStyle(Color.accentColor)
                     } else if !session.isExternalBridge {
                         // Every row in this column carries a glyph saying what
                         // it is — a terminal, an agent, a plain conversation.
                         Image(systemName: "bubble.left")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.app(.subheadline, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
                     let displayTitle = ChatSessionTitle.display(title: session.title,
                                                                 agentName: agent?.name)
                     Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     if let dot = activity.dot(for: session.id, isSelected: isSelected) {
@@ -1493,7 +1493,7 @@ struct ChatSidebar: View {
                 if let subject = ChatSessionTitle.subject(title: session.title,
                                                           agentName: agent?.name) {
                     Text(L10n.text(subject))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .foregroundStyle(.secondary)
@@ -1548,7 +1548,7 @@ struct ChatSidebar: View {
                     requestDeleteChats([session.id], keyboard: false)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.app(.body))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
                 }
@@ -1588,15 +1588,15 @@ struct ChatSidebar: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: t.isInOwnWindow ? "macwindow" : "terminal")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.app(.subheadline, weight: .medium))
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(t.displayName))
-                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     Text((t.workspace as NSString).lastPathComponent)
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .foregroundStyle(.secondary)
@@ -1624,7 +1624,7 @@ struct ChatSidebar: View {
                     requestCloseTerminal(t.id)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.app(.body))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
                 }
@@ -1707,7 +1707,7 @@ struct ChatSidebar: View {
                                               numbering: numberedRows) else { return nil }
         return AnyView(
             Text("\(slot)")
-                .font(.caption2.weight(.semibold).monospacedDigit())
+                .font(.app(.caption2).weight(.semibold).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
@@ -1800,13 +1800,13 @@ struct ChatSidebar: View {
                                   badge: Int = 0) -> some View {
         HStack(spacing: 7) {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .medium))
+                .font(.app(.callout, weight: .medium))
                 .frame(width: 16)
-            Text(L10n.text(title)).font(.subheadline.weight(.medium))
+            Text(L10n.text(title)).font(.app(.subheadline).weight(.medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
-                    .font(.caption2.monospacedDigit())
+                    .font(.app(.caption2).monospacedDigit())
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(.quaternary, in: Capsule())
@@ -2056,10 +2056,10 @@ struct ChatDetailView: View {
                     if control == .starting {
                         ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 10, height: 10)
                     } else {
-                        Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
+                        Image(systemName: "play.fill").font(.app(.caption2, weight: .bold))
                     }
                     Text(L10n.text(control.title))
-                        .font(.caption.weight(.semibold))
+                        .font(.app(.caption).weight(.semibold))
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
                 .padding(.horizontal, 8)
@@ -2099,7 +2099,7 @@ struct ChatDetailView: View {
             }
         } label: {
             Image(systemName: "paperclip")
-                .font(.system(size: 13, weight: .medium))
+                .font(.app(.body, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
                 .background(Color.secondary.opacity(0.15))
@@ -2128,7 +2128,7 @@ struct ChatDetailView: View {
     private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
                           lockedBy: String? = nil) -> some View {
         Image(systemName: icon)
-            .font(.system(size: 13, weight: .medium))
+            .font(.app(.body, weight: .medium))
             .foregroundStyle(isOn ? onColor : Color.secondary)
             .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
             .background(isOn ? onColor.opacity(0.20) : Color.secondary.opacity(0.15))
@@ -2444,12 +2444,12 @@ struct ChatDetailView: View {
             // inversion the sidebar rows had). Under it, what the agent is
             // FOR, which is what tells you what to ask it.
             Text(ChatGreeting.heading(agentName: activeAgent?.name))
-                .font(.system(size: 30, weight: .semibold))
+                .font(.app(.largeTitle, weight: .semibold))
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
                                                     serverRunning: canAnswer) {
                 Text(L10n.text(subtitle))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
@@ -2678,7 +2678,7 @@ struct ChatDetailView: View {
                     Image(systemName: "paperplane.fill")
                         .foregroundStyle(.secondary)
                     Text("Telegram conversation — view only. Reply from your phone.")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -3091,7 +3091,7 @@ struct ChatDetailView: View {
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
                     Text(L10n.text(composerPlaceholder))
-                        .font(.body)
+                        .font(.app(.body))
                         .foregroundStyle(.secondary)
                         .padding(.leading, ComposerTextMetrics.placeholderLeading)
                         .padding(.top, ComposerTextMetrics.placeholderTop)
@@ -3554,7 +3554,7 @@ struct ChatDetailView: View {
                     Text("Show earlier messages")
                 }
             }
-            .font(.caption.weight(.medium))
+            .font(.app(.caption).weight(.medium))
             .foregroundStyle(.secondary)
             .frame(height: 22)
             .padding(.horizontal, 12)
@@ -3605,7 +3605,7 @@ struct ChatDetailView: View {
     private var jumpToLatestButton: some View {
         Button { applyScroll(.jumpTapped) } label: {
             Image(systemName: "arrow.down")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.app(.callout, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: 28, height: 28)
                 .background(.regularMaterial, in: Circle())
@@ -4061,7 +4061,7 @@ struct GeneratingIndicator: View {
                     .monospacedDigit()
             }
         }
-        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .font(.app(.caption2, weight: .medium, design: .monospaced))
         .onAppear {
             startDate = Date()
             pollMetrics()
@@ -4360,7 +4360,7 @@ struct MessageBubble: View {
                         Image(systemName: "chevron.right")
                             .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
                     }
-                    .font(.caption2.weight(.medium))
+                    .font(.app(.caption2).weight(.medium))
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
                 }
@@ -4383,7 +4383,7 @@ struct MessageBubble: View {
                             Text(verbatim: reasoning).textSelection(.enabled)
                         }
                     }
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4422,7 +4422,7 @@ struct MessageBubble: View {
                             // leave a hole where a picture was.
                             if img.data.isEmpty {
                                 Label("attachment no longer on disk", systemImage: "questionmark.folder")
-                                    .font(.caption)
+                                    .font(.app(.caption))
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 8)
@@ -4462,7 +4462,7 @@ struct MessageBubble: View {
                     ForEach(clips) { clip in
                         if clip.pcm.isEmpty {
                             Label("\(clip.name) · file no longer on disk", systemImage: "questionmark.folder")
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .foregroundStyle(.secondary)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 8)
@@ -4470,7 +4470,7 @@ struct MessageBubble: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                         } else {
                             Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
-                                .font(.caption.weight(.medium))
+                                .font(.app(.caption).weight(.medium))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(Color.purple.opacity(0.18))
@@ -4492,7 +4492,7 @@ struct MessageBubble: View {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
-                                .font(.caption2.weight(.medium))
+                                .font(.app(.caption2).weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
                         if message.role == .assistant {
@@ -4528,7 +4528,7 @@ struct MessageBubble: View {
                                     } else {
                                         Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
                                             .buttonStyle(.plain)
-                                            .font(.caption.weight(.medium))
+                                            .font(.app(.caption).weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
                                     }
                                 }
@@ -4576,7 +4576,7 @@ struct MessageBubble: View {
                 // back to the model as history.
                 if let notice = message.truncationNotice, !message.isStreaming {
                     Text(L10n.text(notice.text))
-                        .font(.callout)
+                        .font(.app(.callout))
                         .italic()
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -4673,7 +4673,7 @@ struct MessageBubble: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
-            .font(.caption)
+            .font(.app(.caption))
         }
         .padding(4)
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -4815,7 +4815,7 @@ struct MessageBubble: View {
                                                 MessageRevisions.label(index: message.activeRevision,
                                                 count: message.revisions.count)
 )
-                        .font(.caption2.monospacedDigit())
+                        .font(.app(.caption2).monospacedDigit())
                         .foregroundStyle(.tertiary)
                     footerButton("chevron.right", help: "Next version of this reply") {
                         onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
@@ -4925,7 +4925,7 @@ private struct FooterIconButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .scaleEffect(y: flipped ? -1 : 1)
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 18)
@@ -4980,7 +4980,7 @@ private struct StatPill: View {
 
     private func label(_ string: String) -> some View {
         Text(L10n.text(string))
-            .font(.caption2.monospacedDigit())
+            .font(.app(.caption2).monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)
             .padding(.horizontal, 6)
@@ -5227,7 +5227,7 @@ private struct ToolCallRow: View {
         HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
                 .symbolEffect(.pulse, isActive: isRunning)
-                .font(.caption2.weight(.medium))
+                .font(.app(.caption2).weight(.medium))
                 .foregroundStyle(Color.accentColor.opacity(0.7))
             if calls.count > 1 {
                 multiToolTitle
@@ -5245,7 +5245,7 @@ private struct ToolCallRow: View {
             }
             Image(systemName: "chevron.right")
                 .rotationEffect(.degrees(expanded ? 90 : 0))
-                .font(.caption2.weight(.medium))
+                .font(.app(.caption2).weight(.medium))
                 .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
@@ -5261,11 +5261,11 @@ private struct ToolCallRow: View {
     /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
     @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
         Text(L10n.text(ToolCallDisplay.displayName(name)))
-            .font(.caption.monospaced())
+            .font(.app(.caption).monospaced())
             .foregroundStyle(Color.accentColor.opacity(0.7))
         if let variant {
             Text(":" + variant)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .padding(.leading, -4)
         }
@@ -5278,7 +5278,7 @@ private struct ToolCallRow: View {
                   } ?? nil)
         if let headline {
             Text("· " + headline)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 // Keep a path's filename.
@@ -5286,7 +5286,7 @@ private struct ToolCallRow: View {
         }
         if let resultHeadline {
             Text("· " + resultHeadline)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .layoutPriority(1)
@@ -5306,7 +5306,7 @@ private struct ToolCallRow: View {
         if hidden > 0 {
             middot
             Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
@@ -5314,7 +5314,7 @@ private struct ToolCallRow: View {
 
     private var middot: some View {
         Text("·")
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.secondary)
     }
 
@@ -5359,12 +5359,12 @@ private struct ToolCallRow: View {
                 }
                 GridRow {
                     Text("result")
-                        .font(.caption.monospaced())
+                        .font(.app(.caption).monospaced())
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.leading)
                         .fixedSize(horizontal: true, vertical: false)
                     Text(verbatim: result)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5376,12 +5376,12 @@ private struct ToolCallRow: View {
     @ViewBuilder private func gridRow(name: String, value: String) -> some View {
         GridRow {
             Text(name)
-                .font(.caption.monospaced())
+                .font(.app(.caption).monospaced())
                 .foregroundStyle(.secondary)
                 .gridColumnAlignment(.leading)
                 .fixedSize(horizontal: true, vertical: false)
             Text(value)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -5414,7 +5414,7 @@ private struct RunningIndicator: View {
                 .accessibilityHidden(true)
 
             Text("running")
-                .font(.caption.weight(.bold))
+                .font(.app(.caption).weight(.bold))
                 .foregroundStyle(ink)
         }
         .padding(.horizontal, 8)
@@ -6013,7 +6013,7 @@ struct MarkdownText: View {
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                    .font: AppType.monospaced(.subheadline),
                     .foregroundColor: NSColor.systemPurple,
                     .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.10),
                     .paragraphStyle: p,

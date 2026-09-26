@@ -53,7 +53,7 @@ struct TaskListPane: View {
         List(selection: $appState.selectedTaskId) {
                 if scheduler.tasks.isEmpty {
                     Text("No tasks yet.\nTap + to create one.")
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity)
@@ -96,7 +96,7 @@ private struct TaskRow: View {
                     ProgressView().controlSize(.small)
                 }
                 Text(task.title)
-                    .font(.body.weight(.medium))
+                    .font(.app(.body).weight(.medium))
                     .lineLimit(1)
                 Spacer()
                 if !task.enabled {
@@ -104,9 +104,9 @@ private struct TaskRow: View {
                 }
             }
             HStack(spacing: 6) {
-                Image(systemName: "clock").font(.caption2)
+                Image(systemName: "clock").font(.app(.caption2))
                 Text(ScheduleParser.describe(task.trigger))
-                    .font(.caption)
+                    .font(.app(.caption))
                 AutonomyBadge(autonomy: task.autonomy)
             }
             .foregroundStyle(.secondary)
@@ -120,7 +120,7 @@ private struct AutonomyBadge: View {
     let autonomy: TaskAutonomy
     var body: some View {
         Text(L10n.text(autonomy.shortLabel))
-            .font(.caption2.weight(.semibold))
+            .font(.app(.caption2).weight(.semibold))
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(autonomy.tint.opacity(0.18), in: Capsule())
             .foregroundStyle(autonomy.tint)
@@ -144,9 +144,9 @@ private struct TaskDetailView: View {
             VStack(alignment: .leading, spacing: 16) {
                 // Header
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(task.title).font(.title2.weight(.semibold))
+                    Text(task.title).font(.app(.title2).weight(.semibold))
                     Text(task.goal)
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                     HStack(spacing: 10) {
@@ -156,7 +156,7 @@ private struct TaskDetailView: View {
                             Label("MCP", systemImage: "puzzlepiece.extension")
                         }
                     }
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 }
 
@@ -193,7 +193,7 @@ private struct TaskDetailView: View {
                 if server.status != .running {
                     Label("The server isn't running — the task will start it on its first run.",
                           systemImage: "info.circle")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                 }
 
@@ -201,18 +201,18 @@ private struct TaskDetailView: View {
 
                 // Run history
                 HStack {
-                    Text("Runs").font(.headline)
+                    Text("Runs").font(.app(.headline))
                     Spacer()
                     if runs.contains(where: { $0.status.isTerminal && scheduler.activeRun?.id != $0.id }) {
                         Button("Clear finished") { scheduler.clearFinishedRuns(taskId: task.id) }
                             .buttonStyle(.link)
-                            .font(.caption)
+                            .font(.app(.caption))
                             .help("Delete all completed, failed and cancelled runs")
                     }
                 }
                 if runs.isEmpty {
                     Text("No runs yet. Tap Run now to try it.")
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.app(.callout)).foregroundStyle(.secondary)
                 } else {
                     ForEach(runs) { run in
                         RunRow(task: task, run: run)
@@ -274,7 +274,7 @@ private struct RunRow: View {
                     .disabled(isLive)
                     .help(isLive ? "Stop the run before deleting it" : "Delete this run and its artifacts")
                 }
-                .font(.caption)
+                .font(.app(.caption))
             }
             .padding(.top, 6)
         } label: {
@@ -283,10 +283,10 @@ private struct RunRow: View {
                     .foregroundStyle(run.status.tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(verbatim: run.summary ?? L10n.text(run.status.label))
-                        .font(.callout)
+                        .font(.app(.callout))
                         .lineLimit(2)
                     Text("\(run.startedAt.formatted(date: .abbreviated, time: .shortened)) · \(run.triggerReason)")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -323,11 +323,11 @@ private struct ApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Wants to run “\(pending.toolName)”", systemImage: "hand.raised.fill")
-                .font(.subheadline.weight(.semibold))
-            Text(pending.reason).font(.caption).foregroundStyle(.secondary)
+                .font(.app(.subheadline).weight(.semibold))
+            Text(pending.reason).font(.app(.caption)).foregroundStyle(.secondary)
             if !pending.arguments.isEmpty {
                 Text(L10n.text(pending.arguments.map { "\($0.key): \($0.value)" }.sorted().joined(separator: "\n")))
-                    .font(.caption.monospaced())
+                    .font(.app(.caption).monospaced())
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))

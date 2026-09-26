@@ -75,15 +75,15 @@ struct LayaDecisionsPane: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Laya Decisions").font(.title2.bold())
-                    Text((modelPath as NSString).lastPathComponent).font(.caption).foregroundStyle(.secondary)
+                    Text("Laya Decisions").font(.app(.title2).bold())
+                    Text((modelPath as NSString).lastPathComponent).font(.app(.caption)).foregroundStyle(.secondary)
 
-                    Text("State").font(.headline)
-                    TextEditor(text: $state).font(.body).frame(minHeight: 80)
+                    Text("State").font(.app(.headline))
+                    TextEditor(text: $state).font(.app(.body)).frame(minHeight: 80)
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
 
                     HStack {
-                        Text("Questions").font(.headline)
+                        Text("Questions").font(.app(.headline))
                         Spacer()
                         Button { questions.append(Question(name: "q\(questions.count + 1)", type: .choice, instructions: "", criteria: "yes, no")) } label: { Image(systemName: "plus") }
                             .buttonStyle(.plain)
@@ -121,17 +121,17 @@ struct LayaDecisionsPane: View {
                     ForEach(answers, id: \.name) { a in
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
-                                Text(a.name).font(.headline)
+                                Text(a.name).font(.app(.headline))
                                 Text(a.summary).foregroundStyle(.secondary)
-                                if let c = a.confidence { Text(String(format: "confidence %.2f", c)).font(.caption).foregroundStyle(.tertiary) }
+                                if let c = a.confidence { Text(String(format: "confidence %.2f", c)).font(.app(.caption)).foregroundStyle(.tertiary) }
                             }
                             ForEach(a.bars, id: \.0) { label, p in
                                 HStack {
-                                    Text(label).frame(width: 110, alignment: .trailing).font(.caption)
+                                    Text(label).frame(width: 110, alignment: .trailing).font(.app(.caption))
                                     GeometryReader { g in
                                         RoundedRectangle(cornerRadius: 3).fill(.tint).frame(width: max(2, g.size.width * p))
                                     }.frame(height: 10)
-                                    Text(String(format: "%.1f%%", p * 100)).font(.caption.monospacedDigit()).frame(width: 50, alignment: .trailing)
+                                    Text(String(format: "%.1f%%", p * 100)).font(.app(.caption).monospacedDigit()).frame(width: 50, alignment: .trailing)
                                 }
                             }
                         }
@@ -140,10 +140,10 @@ struct LayaDecisionsPane: View {
                     }
 
                     if showRaw {
-                        Text("Request").font(.headline)
+                        Text("Request").font(.app(.headline))
                         codeBlock(requestJSON)
                         if !rawResponse.isEmpty {
-                            Text("Response").font(.headline)
+                            Text("Response").font(.app(.headline))
                             codeBlock(rawResponse)
                         }
                     }
@@ -167,26 +167,26 @@ struct LayaDecisionsPane: View {
     }
 
     private func codeBlock(_ s: String) -> some View {
-        Text(s).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+        Text(s).font(.app(.caption, design: .monospaced)).textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading).padding(8)
             .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.4)))
     }
 
     private var docs: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("What this is").font(.headline)
+            Text("What this is").font(.app(.headline))
             Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
-            Text("Question types").font(.headline)
+            Text("Question types").font(.app(.headline))
             Text("**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`")
             Text("**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`")
             Text("**score** is an ordinal over labelled rungs, low to high; the answer is the expected rung index plus per-rung probabilities.\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`")
             Text("Every question needs `instructions`. The state can be a string or a JSON object.")
-            Text("API").font(.headline)
+            Text("API").font(.app(.headline))
             Text("`POST /v1/decisions` with `model`, `state` and `questions`. Chat endpoints refuse this model and point here.")
             codeBlock("curl -X POST http://localhost:\(server.port)/v1/decisions \\\n  -H 'content-type: application/json' \\\n  -d '\(requestJSON.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "  ", with: ""))'")
             Text("Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right).")
         }
-        .font(.callout)
+        .font(.app(.callout))
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 

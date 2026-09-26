@@ -54,11 +54,11 @@ struct QuickLauncherView: View {
     private var inputRow: some View {
         HStack(spacing: 12) {
             Image(systemName: "bolt.fill")
-                .font(.system(size: 18, weight: .medium))
+                .font(.app(.title2, weight: .medium))
                 .foregroundStyle(Color.accentColor)
             TextField("Ask the local model anything…", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 20, weight: .regular))
+                .font(.app(.title, weight: .regular))
                 .focused($focused)
                 .onSubmit {
                     if controller.submit(query) { query = "" }
@@ -73,7 +73,7 @@ struct QuickLauncherView: View {
 
     private func noticeRow(_ message: String) -> some View {
         Label(message, systemImage: "exclamationmark.triangle.fill")
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 20)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -87,7 +87,7 @@ struct QuickLauncherView: View {
                 if let question = convo.messages.last(where: { $0.role == .user })?.content,
                    !question.isEmpty {
                     Text(verbatim: question)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
@@ -112,7 +112,7 @@ struct QuickLauncherView: View {
     private var footer: some View {
         HStack(spacing: 12) {
             Text("↩ ask · esc close")
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.tertiary)
             Spacer()
             if generatingHere {

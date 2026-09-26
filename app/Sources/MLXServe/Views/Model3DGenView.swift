@@ -125,7 +125,7 @@ struct Model3DGenView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-                .font(.caption)
+                .font(.app(.caption))
                 .controlSize(.small)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
@@ -150,7 +150,7 @@ struct Model3DGenView: View {
 
     private var photoSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Photo").font(.subheadline.weight(.semibold))
+            Text("Photo").font(.app(.subheadline).weight(.semibold))
             if let url = photoURL {
                 // Same surface and same floor height as the empty well.
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
@@ -163,7 +163,7 @@ struct Model3DGenView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                         Text(url.lastPathComponent)
-                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                            .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                         Spacer()
                         Button { photoURL = nil } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -178,7 +178,7 @@ struct Model3DGenView: View {
                 // The well says how to add a photo; what is left to say is
                 // which photo works.
                 Text("A single, well-lit photo of one object works best. The subject is auto-cut from its background.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
         // One photo slot, so a drop replaces what's there — see
@@ -196,7 +196,7 @@ struct Model3DGenView: View {
                 intSliderRow("Steps", value: $steps, range: 10...50)
                 sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Mesh resolution").font(.caption)
+                    Text("Mesh resolution").font(.app(.caption))
                     Picker("", selection: $resolution) {
                         Text("128 (fast)").tag(128)
                         Text("256 (balanced)").tag(256)
@@ -204,10 +204,10 @@ struct Model3DGenView: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    Text("Higher = finer mesh, more memory and time.").font(.caption2).foregroundStyle(.secondary)
+                    Text("Higher = finer mesh, more memory and time.").font(.app(.caption2)).foregroundStyle(.secondary)
                 }
                 Toggle("Texture (PBR)", isOn: $texture)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
             }
         }
@@ -218,10 +218,10 @@ struct Model3DGenView: View {
                            step: Double) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text(String(format: "%.1f", value.wrappedValue))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
@@ -233,10 +233,10 @@ struct Model3DGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text("\(value.wrappedValue)")
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(
@@ -276,9 +276,9 @@ struct Model3DGenView: View {
     private var convertHint: some View {
         VStack(alignment: .leading, spacing: 5) {
             Label("Weights not found", systemImage: "wrench.and.screwdriver")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                .font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
             Text("Hunyuan3D 2.1 has no download yet — convert the weights on-device with tests/convert_hunyuan3d_weights.py (see the repo README). They install to ~/.mlx-serve/models/local/.")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
@@ -296,7 +296,7 @@ struct Model3DGenView: View {
                     VStack(spacing: 12) {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear).frame(width: 240)
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -321,11 +321,11 @@ struct Model3DGenView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             HStack(spacing: 10) {
                 Toggle("Animate", isOn: $turntable)
-                    .toggleStyle(.switch).font(.caption)
+                    .toggleStyle(.switch).font(.app(.caption))
                     .help("Idle motion: the model turns on a turntable with a gentle breathing pulse.")
                 Spacer()
                 Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.app(.caption)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
@@ -340,7 +340,7 @@ struct Model3DGenView: View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.models3dRoot)])
         } label: {
-            Label("Open output folder in Finder", systemImage: "folder").font(.caption)
+            Label("Open output folder in Finder", systemImage: "folder").font(.app(.caption))
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
@@ -475,7 +475,7 @@ private struct Model3DHistoryThumb: View {
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else {
                     Image(systemName: "cube.transparent")
-                        .font(.title3)
+                        .font(.app(.title3))
                         .foregroundStyle(.secondary)
                 }
             }
