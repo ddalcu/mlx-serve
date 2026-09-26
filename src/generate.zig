@@ -331,6 +331,22 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// One draft row past a padded history append (`Transformer.HeadPlace`); qwen4 only.
+    pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Transformer.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
+        const t = switch (self) {
+            .qwen => return error.MtpPlacement,
+            .qwen4 => |t| t,
+        };
+        cache.activate();
+        const project: Transformer.Qwen4MtpProject = switch (want) {
+            .logits => .last_row,
+            .mixed => .mixed_last_row,
+            .none => .none,
+        };
+        const out = try t.qwen4MtpForwardPlaced(hidden, id_arr, place, project);
+        return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
+    }
+
     /// Append committed history without projecting logits.
     pub fn appendHistory(
         self: MtpHeadRef,
@@ -1568,6 +1584,9 @@ pub const Generator = struct {
     /// build consumes `mtp_hist_stash`, so the two are mutually exclusive
     /// (asserted at consume). Freed unconsumed in `deinit`.
     mtp_pre_draft: ?MtpPreDraft = null,
+    /// Lazy pre-drafts built from a round's GPU results, and how many the host read kept.
+    mtp_lazy_built: u32 = 0,
+    mtp_lazy_kept: u32 = 0,
 
     // ── Phase 1: SSM checkpoints captured during prefill ──
     /// Owned SSM-state snapshots taken at stride-aligned positions during
@@ -1884,6 +1903,7 @@ pub const Generator = struct {
                     self.mtp_lookup_accepted,
                 },
             );
+            log.info("  [spec-stats] lazy={d}/{d}\n", .{ self.mtp_lazy_built, self.mtp_lazy_kept });
             if (self.mtp_lookup_rounds > 0) log.info("  [spec-stats] lookup_table={s}:{s}\n", .{
                 round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
                 self.xfm.round_cost.formatLookupBucket(table_bucket, &lookup_buf),
@@ -5483,10 +5503,17 @@ pub const Generator = struct {
         /// mtp_off0). The consume-time truncate drops the producing round's
         /// stale draft tail past it.
         off0: usize,
+        /// The whole verify row `[t1, drafts[0..m]]` and its `[1, 1+m, H]` hiddens, for a
+        /// padded append (`mtpPaddedHistory`); `ids`/`hidden` are its first `n` rows.
+        pad: ?struct { ids: mlx.mlx_array, hidden: mlx.mlx_array, rows: usize } = null,
 
         pub fn deinit(self: *MtpHistStash) void {
             _ = mlx.mlx_array_free(self.ids);
             _ = mlx.mlx_array_free(self.hidden);
+            if (self.pad) |p| {
+                _ = mlx.mlx_array_free(p.ids);
+                _ = mlx.mlx_array_free(p.hidden);
+            }
         }
     };
 
@@ -5576,9 +5603,12 @@ pub const Generator = struct {
         /// Drafts are a context continuation (`mtpLookupChain`): nothing to
         /// build, and no MTP statistics are fed.
         lookup: bool = false,
+        /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
+        place: ?Transformer.HeadPlace = null,
 
         pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
             _ = mlx.mlx_array_free(self.t1_arr);
+            if (self.place) |p| _ = mlx.mlx_array_free(p.live_end);
             for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(self.draft_arrs);
             if (self.conf_arrs) |slots| {
@@ -5626,10 +5656,12 @@ pub const Generator = struct {
     }
 
     /// Prompt lookup may stand in for the MTP chain unless `MLX_SERVE_MTP_LOOKUP=0`.
+    pub var mtp_lookup_override: ?bool = null;
     fn mtpLookupEnabled() bool {
         const Cache = struct {
             var v: ?bool = null;
         };
+        if (mtp_lookup_override) |v| return v;
         if (Cache.v) |v| return v;
         const raw = std.c.getenv("MLX_SERVE_MTP_LOOKUP");
         Cache.v = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
@@ -5692,14 +5724,20 @@ pub const Generator = struct {
 
     /// A chain of the context's continuation after `t1`, or null when the gate
     /// prefers the MTP head. Single-stream rounds only.
-    fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
-        if (!mtpLookupEnabled() or self.mtp_batch_head) return null;
-        if (group_planner.enabled() and self.mtp_planner_owned) return null;
+    /// How many context-continuation drafts the lookup gate takes after `t1`; 0 = the MTP head.
+    fn mtpLookupDrafts(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !u32 {
+        if (!mtpLookupEnabled() or self.mtp_batch_head) return 0;
+        if (group_planner.enabled() and self.mtp_planner_owned) return 0;
         const idx = try self.mtpLookupIndex(allocator);
         const remaining: u32 = @intCast(self.max_tokens -| self.completion_tokens -| 1);
         const got = idx.match(t1, mtp_lookup.MAX_DRAFT_STRONG);
-        const k = mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
+        return mtp_lookup.gate(got, remaining, self.mtp_lookup_ema, self.mtp_round_ema, plan.m_lo, self.mtp_lookup_streak, self.mtpLookupCosts(plan.m_lo));
+    }
+
+    fn mtpLookupChain(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !?MtpPreDraft {
+        const k = try self.mtpLookupDrafts(allocator, plan, t1);
         if (k == 0) return null;
+        const got = (try self.mtpLookupIndex(allocator)).match(t1, mtp_lookup.MAX_DRAFT_STRONG);
         const Once = struct {
             var logged = false;
         };
@@ -5743,6 +5781,274 @@ pub const Generator = struct {
         };
     }
 
+    /// Round N's accept decision as lazy arrays: `a` (0-d int32) drafts accepted, the next
+    /// `t1` (`[1]` int32) and the next `h_prev` (`[1,1,H]`), all before any host read.
+    pub const MtpLazyVerdict = struct {
+        a: mlx.mlx_array,
+        t1: mlx.mlx_array,
+        h_prev: mlx.mlx_array,
+
+        pub fn deinit(self: *MtpLazyVerdict) void {
+            _ = mlx.mlx_array_free(self.a);
+            _ = mlx.mlx_array_free(self.t1);
+            _ = mlx.mlx_array_free(self.h_prev);
+        }
+    };
+
+    /// `am` `[1, 1+m]` (the verify argmax), `drafts` m `[1]` ids, `verify_hidden_all` `[1, >=1+m, H]`.
+    pub fn mtpLazyVerdict(s: mlx.mlx_stream, am: mlx.mlx_array, drafts: []const mlx.mlx_array, verify_hidden_all: mlx.mlx_array) !MtpLazyVerdict {
+        const m: c_int = @intCast(drafts.len);
+        var am_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(am_flat);
+        try mlx.check(mlx.mlx_reshape(&am_flat, am, &[_]c_int{-1}, 1, s));
+        var ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids);
+        try mlx.check(mlx.mlx_astype(&ids, am_flat, .int32, s));
+        // a = index of the first mismatch, with a mismatch appended at m: argmax takes the first max.
+        var a_u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a_u);
+        {
+            var head = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(head);
+            try mlx.check(mlx.mlx_slice(&head, ids, &[_]c_int{0}, 1, &[_]c_int{m}, 1, &[_]c_int{1}, 1, s));
+            var d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(d);
+            try concatIds(&d, drafts, s);
+            var eq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(eq);
+            try mlx.check(mlx.mlx_equal(&eq, head, d, s));
+            var miss = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(miss);
+            try mlx.check(mlx.mlx_logical_not(&miss, eq, s));
+            const tail = mlx.mlx_array_new_data(&[_]bool{true}, &[_]c_int{1}, 1, .bool_);
+            defer _ = mlx.mlx_array_free(tail);
+            var miss_ext = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(miss_ext);
+            const parts = [_]mlx.mlx_array{ miss, tail };
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&miss_ext, vec, 0, s));
+            var miss_i = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(miss_i);
+            try mlx.check(mlx.mlx_astype(&miss_i, miss_ext, .int32, s));
+            try mlx.check(mlx.mlx_argmax_axis(&a_u, miss_i, 0, false, s));
+        }
+        var a = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(a);
+        try mlx.check(mlx.mlx_astype(&a, a_u, .int32, s));
+        var a1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a1);
+        try mlx.check(mlx.mlx_reshape(&a1, a, &[_]c_int{1}, 1, s));
+        var t1 = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(t1);
+        try mlx.check(mlx.mlx_take(&t1, ids, a1, s));
+        var h_prev = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(&h_prev, verify_hidden_all, a1, 1, s));
+        return .{ .a = a, .t1 = t1, .h_prev = h_prev };
+    }
+
+    /// `[n]` int32 ids from n one-element lazy ids of any rank and integer dtype.
+    /// Draft producers disagree on rank ([1] from the head, [1,1] from a sampler).
+    fn concatIds(out: *mlx.mlx_array, ids: []const mlx.mlx_array, s: mlx.mlx_stream) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (ids) |id| {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_reshape(&flat, id, &[_]c_int{1}, 1, s));
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, flat));
+        }
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+        try mlx.check(mlx.mlx_astype(out, cat, .int32, s));
+    }
+
+    /// What decides whether round N+1's chain is built from round N's lazy results.
+    pub const LazyGate = struct {
+        enabled: bool,
+        greedy: bool,
+        solo: bool,
+        padded: bool,
+        lookup_round: bool,
+        planner_owned: bool,
+        spec_live: bool,
+        /// A full accept still leaves budget for another round. Without one the chain
+        /// would be dispatched and thrown away, and a head failure would fail a finished request.
+        successor: bool,
+    };
+
+    pub fn mtpLazyPredraftAllowedFor(g: LazyGate) bool {
+        if (!g.enabled or !g.greedy or !g.solo or !g.padded or !g.spec_live or !g.successor) return false;
+        return !g.lookup_round and !g.planner_owned;
+    }
+
+    /// `MLX_SERVE_MTP_LAZY_PREDRAFT=0` keeps the pre-draft at the round's tail, after the host read.
+    pub var mtp_lazy_predraft_override: ?bool = null;
+    var mtp_lazy_predraft_cache: ?bool = null;
+    fn mtpLazyPredraftEnabled() bool {
+        if (!mtpPredraftEnabled()) return false;
+        if (mtp_lazy_predraft_override) |v| return v;
+        if (mtp_lazy_predraft_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_MTP_LAZY_PREDRAFT");
+        mtp_lazy_predraft_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        return mtp_lazy_predraft_cache.?;
+    }
+
+    /// The gate for building round N+1's chain from round N's lazy results, read before any host read.
+    fn mtpLazyGate(self: *const Generator, st: *const MtpRoundState, greedy: bool, grouped: bool) LazyGate {
+        return .{
+            .enabled = mtpLazyPredraftEnabled(),
+            .greedy = greedy,
+            .solo = !grouped and !self.mtp_batch_head and self.mtp_group_cap == 0 and st.verify_len == 1 + st.chain.m,
+            .padded = self.mtpPaddedHistory(),
+            .lookup_round = st.chain.lookup,
+            .planner_owned = self.mtp_planner_owned,
+            .spec_live = !self.spec_disabled_runtime and self.mtp_serial_left == 0 and !self.mtp_planner_pending,
+            .successor = self.max_tokens -| self.completion_tokens > 1 + st.chain.m,
+        };
+    }
+
+    /// Round N+1's chunk-A chain from round N's lazy verdict, built and dispatched before the
+    /// host reads round N. Null when this round's plan ends speculation. `chain` is round N's.
+    /// The plan is drawn before round N updates acceptance, so an adaptive depth change lands
+    /// one round later than on the tail path. Drawing it again after the read would advance the
+    /// planner's probes and trials twice per round, so the lag is kept.
+    fn mtpLazyPreDraft(self: *Generator, allocator: std.mem.Allocator, chain: *const MtpPreDraft, am: mlx.mlx_array, verify_hidden_all: mlx.mlx_array) !?MtpPreDraft {
+        const s = self.xfm.s;
+        const m = chain.m;
+        const plan = self.mtpRoundPlan();
+        if (self.spec_disabled_runtime or self.mtp_serial_left > 0) return null;
+        var v = try mtpLazyVerdict(s, am, chain.draft_arrs[0..m], verify_hidden_all);
+        defer v.deinit();
+        var upcoming = try self.mtpChainInit(allocator, plan, 0);
+        errdefer upcoming.deinit(allocator);
+        try mlx.check(mlx.mlx_array_set(&upcoming.t1_arr, v.t1));
+        upcoming.h_chain = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&upcoming.h_chain.?, v.h_prev));
+
+        var ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids);
+        {
+            const parts = try allocator.alloc(mlx.mlx_array, 1 + m);
+            defer allocator.free(parts);
+            parts[0] = chain.t1_arr;
+            @memcpy(parts[1..], chain.draft_arrs[0..m]);
+            try concatIds(&ids, parts, s);
+        }
+        var hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hidden);
+        try self.mtpPaddedHidden(&hidden, m, verify_hidden_all);
+        const one = mlx.mlx_array_new_int(@intCast(chain.off0 + 1));
+        defer _ = mlx.mlx_array_free(one);
+        var live_end = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_add(&live_end, one, v.a, s)) catch |e| {
+            _ = mlx.mlx_array_free(live_end);
+            return e;
+        };
+        // Anything this appends past round N's origin is dropped if the round fails.
+        errdefer self.mtp_cache.?.truncate(chain.off0, s) catch {};
+        try self.mtpPaddedAppend(&upcoming, chain.off0, ids, hidden, 1 + m, live_end);
+        try self.mtpChainBuild(&upcoming, 0, plan.m_lo);
+        try mtpChainDispatch(&upcoming, 0, plan.m_lo);
+        self.mtp_lazy_built += 1;
+        const Once = struct {
+            var logged = false;
+        };
+        if (!Once.logged) {
+            Once.logged = true;
+            log.info("[mtp] lazy predraft engaged (MLX_SERVE_MTP_LAZY_PREDRAFT=0 restores the tail pre-draft)\n", .{});
+        }
+        return upcoming;
+    }
+
+    /// Whether the host read confirms a lazy chain for the next round.
+    fn mtpLazyKeeps(self: *const Generator, exact: bool) bool {
+        if (!exact or self.done or self.completion_tokens >= self.max_tokens) return false;
+        if (isEosId(self.next_token_id, self.eos_token_ids)) return false;
+        return !self.spec_disabled_runtime and self.mtp_serial_left == 0 and !self.mtp_planner_pending;
+    }
+
+    /// The round's tail: settle a lazy chain against the host read, or pre-draft as before.
+    /// A discarded chain leaves exactly the tail pre-draft's inputs: the head back at the
+    /// stash origin, the stash pending. `exact`: the host kept the raw greedy accept count.
+    /// `planned`: the lazy build already took this round's plan, so no second plan is drawn.
+    fn mtpPreDraftResolve(self: *Generator, allocator: std.mem.Allocator, lazy: *?MtpPreDraft, exact: bool, planned: bool) !void {
+        if (lazy.* == null and planned) return;
+        const plan = (lazy.* orelse return self.mtpMaybePreDraft(allocator)).plan;
+        const keeps = self.mtpLazyKeeps(exact);
+        // Before taking the chain: on error the round's errdefer still owns and rolls it back.
+        const lookup = keeps and try self.mtpLookupDrafts(allocator, plan, self.next_token_id) > 0;
+        const discard = !keeps or lookup or mtp_lazy_force_discard;
+        var chain = lazy.*.?;
+        lazy.* = null;
+        const st = &self.mtp_hist_stash.?;
+        if (discard) {
+            chain.deinit(allocator);
+            try self.mtp_cache.?.truncate(st.off0, self.xfm.s);
+            if (lookup) self.mtp_pre_draft = try self.mtpLookupChain(allocator, plan, self.next_token_id);
+            return;
+        }
+        chain.t1 = self.next_token_id;
+        chain.off0 = st.off0 + st.n;
+        st.deinit();
+        self.mtp_hist_stash = null;
+        self.mtp_pre_draft = chain;
+        self.mtp_lazy_kept += 1;
+    }
+    /// Test seam: discard every lazy chain, as a lookup pick does.
+    pub var mtp_lazy_force_discard: bool = false;
+    /// Test seam: fail the round right after its lazy chain is dispatched.
+    pub var mtp_lazy_fail_after_dispatch: bool = false;
+
+    /// `MLX_SERVE_MTP_PADDED_HEAD=0` keeps the merged `1 + accepted` history step.
+    pub var mtp_padded_head_override: ?bool = null;
+    var mtp_padded_head_cache: ?bool = null;
+    fn mtpPaddedHeadEnabled() bool {
+        if (mtp_padded_head_override) |v| return v;
+        if (mtp_padded_head_cache) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_MTP_PADDED_HEAD");
+        mtp_padded_head_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+        return mtp_padded_head_cache.?;
+    }
+
+    /// Does this request's head append the whole verify row as history and draft past its
+    /// dead rows (`Transformer.HeadPlace`)? The qwen4 head, solo, text-only.
+    fn mtpPaddedHistory(self: *const Generator) bool {
+        if (!mtpPaddedHeadEnabled() or self.mtp_batch_head) return false;
+        if (self.mtp.? != .qwen4) return false;
+        return self.mtpMropeContext() == null;
+    }
+
+    /// Consume the stash as a padded `1+m`-row history append and place `chain` past it.
+    fn mtpPaddedHistoryAppend(self: *Generator, chain: *MtpPreDraft) !void {
+        var st = self.mtp_hist_stash.?;
+        self.mtp_hist_stash = null;
+        defer st.deinit();
+        const pad = st.pad.?;
+        try self.mtpPaddedAppend(chain, st.off0, pad.ids, pad.hidden, pad.rows, mlx.mlx_array_new_int(@intCast(st.off0 + st.n)));
+    }
+
+    /// Truncate the head to `off0`, append `rows` history rows there, and place `chain` past
+    /// them with `live_end`, which this takes ownership of.
+    fn mtpPaddedAppend(self: *Generator, chain: *MtpPreDraft, off0: usize, ids: mlx.mlx_array, hidden: mlx.mlx_array, rows: usize, live_end: mlx.mlx_array) !void {
+        errdefer _ = mlx.mlx_array_free(live_end);
+        const mc = &self.mtp_cache.?;
+        try mc.truncate(off0, self.xfm.s);
+        const out = try self.mtp.?.forward(self.xfm, mc, ids, hidden, @intCast(off0), .none, null);
+        if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
+        if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
+        if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+        chain.place = .{ .live_end = live_end, .dead_end = @intCast(off0 + rows) };
+        const Once = struct {
+            var logged = false;
+        };
+        if (!Once.logged) {
+            Once.logged = true;
+            log.info("[mtp] padded head history engaged (MLX_SERVE_MTP_PADDED_HEAD=0 restores the merged step)\n", .{});
+        }
+    }
+
     /// Build draft steps [from..to) of `chain` — graph construction only, no
     /// sync; the caller dispatches. Each step's sampled token ([1] lazy
     /// array) feeds the next step's embedding lookup; the MTP post-norm
@@ -5775,7 +6081,12 @@ pub const Generator = struct {
             // append: both skip the vocab projection, but the draft still needs
             // the vector that projection would have consumed.
             const want: mtp_mod.StepWant = if (use_rerank) .mixed else .logits;
-            var step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
+            if (i == 0 and self.mtp_hist_stash != null and self.mtp_hist_stash.?.pad != null and self.mtpPaddedHistory()) {
+                try self.mtpPaddedHistoryAppend(chain);
+            }
+            var step_out = if (chain.place) |*place|
+                try head.forwardPlaced(mc, prev_tok_arr, h_prev_arg, place, want)
+            else if (i == 0 and self.mtp_hist_stash != null) blk: {
                 // Deferred history append (stashed at the END of the
                 // previous round, Phase 5a) merged into this chain's first
                 // draft: ONE (n+1)-row head forward appends the
@@ -6781,7 +7092,8 @@ pub const Generator = struct {
     /// stash so the head history is complete up to the block. Idempotent.
     pub fn mtpDetachHead(self: *Generator, allocator: std.mem.Allocator, apply_stash: bool) !void {
         if (self.mtp_pre_draft) |*pd| {
-            if (self.mtp_planner_owned) try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
+            // A placed chain left dead history rows past the committed end: never keep them.
+            if (self.mtp_planner_owned or pd.place != null) try self.mtp_cache.?.truncate(self.mtpCommittedHistoryLen(), self.xfm.s);
             pd.deinit(allocator);
             self.mtp_pre_draft = null;
         }
@@ -7040,10 +7352,15 @@ pub const Generator = struct {
     }
 
     pub fn mtpGreedyVerdict(am: []const i32, drafts: []const u32, completion: u32, max_tokens: u32) MtpRowVerdict {
+        const accepted = capAcceptedForTokenBudget(mtpGreedyPrefix(am, drafts), completion, max_tokens);
+        return .{ .accepted = accepted, .next_pending = @intCast(am[accepted]) };
+    }
+
+    /// Drafts matching the verify argmax, before any budget or stop cut.
+    pub fn mtpGreedyPrefix(am: []const i32, drafts: []const u32) u32 {
         var accepted: u32 = 0;
         while (accepted < drafts.len and @as(u32, @intCast(am[accepted])) == drafts[accepted]) accepted += 1;
-        accepted = capAcceptedForTokenBudget(accepted, completion, max_tokens);
-        return .{ .accepted = accepted, .next_pending = @intCast(am[accepted]) };
+        return accepted;
     }
 
     /// The committed increment of a verified row: its pending token plus the drafts it
@@ -7597,6 +7914,33 @@ pub const Generator = struct {
         }
     }
 
+    /// The whole verify row as head history: ids `[t1, drafts]`, hiddens `last_hidden ++ verify[0..m]`.
+    fn mtpPaddedStash(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []const u32, verify_hidden_all: mlx.mlx_array) !@FieldType(MtpHistStash, "pad") {
+        const rows = 1 + drafts.len;
+        const ids_buf = try allocator.alloc(i32, rows);
+        defer allocator.free(ids_buf);
+        ids_buf[0] = @intCast(t1);
+        for (drafts, ids_buf[1..]) |d, *v| v.* = @intCast(d);
+        const ids = mlx.mlx_array_new_data(ids_buf.ptr, &[_]c_int{@intCast(rows)}, 1, .int32);
+        errdefer _ = mlx.mlx_array_free(ids);
+        var hidden = mlx.mlx_array_new();
+        try self.mtpPaddedHidden(&hidden, drafts.len, verify_hidden_all);
+        return .{ .ids = ids, .hidden = hidden, .rows = rows };
+    }
+
+    /// `last_hidden ++ verify_hidden_all[0..m]`: the hiddens paired with `[t1, drafts]`.
+    fn mtpPaddedHidden(self: *Generator, out: *mlx.mlx_array, m: usize, verify_hidden_all: mlx.mlx_array) !void {
+        const s = self.xfm.s;
+        const vh_shape = mlx.getShape(verify_hidden_all);
+        var vh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vh);
+        try mlx.check(mlx.mlx_slice(&vh, verify_hidden_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, @intCast(m), vh_shape[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        const parts = [_]mlx.mlx_array{ self.last_hidden, vh };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(out, vec, 1, s));
+    }
+
     /// Phases 4–5 of a round: accept, stash the history, commit or roll back.
     /// `st.verify_len` may exceed `1 + m` when a batched group padded the row;
     /// then even a full accept takes the rollback arm (KV + SSM clamp to `1 + m`).
@@ -7887,6 +8231,20 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_async_eval(eval_vec));
         }
         dispatch_lap.stop(&self.mtp_trace, .dispatch);
+        // Round N+1's chain queues behind this round's verify; the host read below settles it.
+        var lazy: ?MtpPreDraft = null;
+        var lazy_planned = false;
+        errdefer if (lazy) |*c| {
+            c.deinit(allocator);
+            self.mtp_cache.?.truncate(mtp_off0, s) catch {};
+        };
+        if (mtpLazyPredraftAllowedFor(self.mtpLazyGate(st, !stochastic, group_argmax or prepared))) {
+            const lazy_lap = SubLap.start(tracing, self.timer.io);
+            lazy_planned = true;
+            lazy = try self.mtpLazyPreDraft(allocator, chain, verify_argmax.lazy(), verify_hidden_all);
+            lazy_lap.stop(&self.mtp_trace, .chain);
+            if (mtp_lazy_fail_after_dispatch and lazy != null) return error.MtpLazyInjected;
+        }
         const wait_lap = SubLap.start(tracing, self.timer.io);
         for (draft_arrs[0..m], 0..) |arr, idx| {
             try mlx.check(mlx.mlx_array_eval(arr));
@@ -7903,6 +8261,7 @@ pub const Generator = struct {
 
         var accepted: u32 = 0;
         var greedy_next_pending: u32 = 0;
+        var greedy_raw: u32 = 0;
         if (stochastic) {
             // Sharp drafts: full Leviathan ratio min(1, p/q) against the
             // proposal's own density. Greedy-forced drafts keep the exact
@@ -7935,6 +8294,7 @@ pub const Generator = struct {
             const verdict = try mtpAcceptRowGreedy(verify_argmax, st.verify_len, drafts[0..m], self.completion_tokens, self.max_tokens);
             accepted = verdict.accepted;
             greedy_next_pending = verdict.next_pending;
+            greedy_raw = mtpGreedyPrefix(try verify_argmax.ids(st.verify_len), drafts[0..m]);
         }
 
         const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned) self.eos_token_ids else &.{});
@@ -7989,6 +8349,11 @@ pub const Generator = struct {
             const id_shape = [_]c_int{@intCast(1 + n_commit)};
             const stash_ids = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
             errdefer _ = mlx.mlx_array_free(stash_ids);
+            const pad = if (self.mtpPaddedHistory()) try self.mtpPaddedStash(allocator, t1, drafts[0..m], verify_hidden_all) else null;
+            errdefer if (pad) |p| {
+                _ = mlx.mlx_array_free(p.ids);
+                _ = mlx.mlx_array_free(p.hidden);
+            };
 
             var hist_hidden = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(hist_hidden);
@@ -8013,6 +8378,7 @@ pub const Generator = struct {
                 .hidden = hist_hidden,
                 .n = 1 + n_commit,
                 .off0 = mtp_off0,
+                .pad = pad,
             };
         }
         if (tracing) {
@@ -8049,7 +8415,7 @@ pub const Generator = struct {
                 self.mtp_trace.add(.commit, ph.read());
                 ph.reset();
             }
-            try self.mtpMaybePreDraft(allocator);
+            try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
             if (tracing) {
                 self.mtp_trace.add(.predraft, ph.read());
                 self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
@@ -8155,7 +8521,7 @@ pub const Generator = struct {
             self.mtp_trace.add(.commit, ph.read());
             ph.reset();
         }
-        try self.mtpMaybePreDraft(allocator);
+        try self.mtpPreDraftResolve(allocator, &lazy, accepted == greedy_raw, lazy_planned);
         if (tracing) {
             self.mtp_trace.add(.predraft, ph.read());
             self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
@@ -18681,6 +19047,65 @@ test "a block decoder's entry token stops the round before it drafts" {
     try testing.expectEqual(@as(u32, 0), pad);
 }
 
+test "lazy predraft: the lazy verdict matches the host greedy verdict at zero, partial and full accepts" {
+    // Bar: a, t1 and h_prev read back equal to mtpGreedyVerdict and the verify hidden at row a.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const drafts_host = [_]i32{ 5, 6, 7 };
+    // Production draft ids come in mixed ranks ([1] from the head, [1,1] from a sampler).
+    var drafts: [3]mlx.mlx_array = undefined;
+    for (&drafts, drafts_host, 0..) |*d, v, i| {
+        d.* = if (i == 1) mlx.mlx_array_new_data(&v, &[_]c_int{ 1, 1 }, 2, .int32) else mlx.mlx_array_new_data(&v, &[_]c_int{1}, 1, .int32);
+    }
+    defer for (drafts) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+    var vh_host: [4 * 2]f32 = undefined;
+    for (&vh_host, 0..) |*v, i| v.* = @floatFromInt(10 + i);
+    const vh = mlx.mlx_array_new_data(&vh_host, &[_]c_int{ 1, 4, 2 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(vh);
+    const cases = [_][4]u32{ .{ 9, 6, 7, 1 }, .{ 5, 6, 8, 4 }, .{ 5, 6, 7, 11 } };
+    for (cases) |am_host| {
+        const am = mlx.mlx_array_new_data(&am_host, &[_]c_int{ 1, 4 }, 2, .uint32);
+        defer _ = mlx.mlx_array_free(am);
+        var am_i32: [4]i32 = undefined;
+        for (&am_i32, am_host) |*d, v| d.* = @intCast(v);
+        const want = Generator.mtpGreedyVerdict(&am_i32, &[_]u32{ 5, 6, 7 }, 0, 1 << 30);
+        var got = try Generator.mtpLazyVerdict(s, am, &drafts, vh);
+        defer got.deinit();
+        var a: i32 = -1;
+        try mlx.check(mlx.mlx_array_eval(got.a));
+        try mlx.check(mlx.mlx_array_item_int32(&a, got.a));
+        try testing.expectEqual(@as(i32, @intCast(want.accepted)), a);
+        try mlx.check(mlx.mlx_array_eval(got.t1));
+        try testing.expectEqualSlices(c_int, &[_]c_int{1}, mlx.getShape(got.t1));
+        try testing.expectEqual(@as(i32, @intCast(want.next_pending)), mlx.mlx_array_data_int32(got.t1).?[0]);
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        try mlx.check(mlx.mlx_contiguous(&h, got.h_prev, false, s));
+        try mlx.check(mlx.mlx_array_eval(h));
+        try testing.expectEqualSlices(c_int, &[_]c_int{ 1, 1, 2 }, mlx.getShape(h));
+        const row: usize = want.accepted;
+        try testing.expectEqualSlices(f32, vh_host[row * 2 .. row * 2 + 2], mlx.mlx_array_data_float32(h).?[0..2]);
+    }
+}
+
+test "lazy predraft: only solo greedy padded rounds with speculation live build a lazy chain" {
+    // Bar: every open gate allows it; closing any single gate (sampled, group, lookup round, ...) forbids it.
+    const open: Generator.LazyGate = .{ .enabled = true, .greedy = true, .solo = true, .padded = true, .lookup_round = false, .planner_owned = false, .spec_live = true, .successor = true };
+    try testing.expect(Generator.mtpLazyPredraftAllowedFor(open));
+    inline for (.{ "enabled", "greedy", "solo", "padded", "spec_live", "successor" }) |field| {
+        var g = open;
+        @field(g, field) = false;
+        try testing.expect(!Generator.mtpLazyPredraftAllowedFor(g));
+    }
+    inline for (.{ "lookup_round", "planner_owned" }) |field| {
+        var g = open;
+        @field(g, field) = true;
+        try testing.expect(!Generator.mtpLazyPredraftAllowedFor(g));
+    }
+}
+
 test "group acceptance: every row's verdict comes from its OWN am, at any accept position" {
     const accept = Generator.mtpGreedyVerdict;
     {
@@ -18941,9 +19366,143 @@ const MtpChainTestSlot = struct {
     }
 };
 
+/// A loaded qwen4_exp pack and a byte tokenizer for generator-level lazy pre-draft runs.
+const LazyRig = struct {
+    config: model_mod.ModelConfig,
+    weights: model_mod.Weights,
+    xfm: Transformer,
+    tok: Tokenizer,
+
+    fn load(a: std.mem.Allocator, io: std.Io) !*LazyRig {
+        const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+        if (mlx.noGpuBackend()) return error.SkipZigTest;
+        const rig = try a.create(LazyRig);
+        errdefer a.destroy(rig);
+        rig.config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
+        rig.weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
+        model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
+        rig.xfm = try Transformer.init(io, a, rig.config, &rig.weights);
+        rig.xfm.compileQwen4Hc();
+        rig.xfm.compileGdnGate();
+        rig.xfm.compileMoeRouting();
+        rig.tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+        return rig;
+    }
+
+    fn deinit(rig: *LazyRig, a: std.mem.Allocator) void {
+        rig.tok.deinit();
+        rig.xfm.deinit();
+        rig.weights.deinit();
+        if (rig.config.ngram_table_path) |p| a.free(p);
+        a.destroy(rig);
+    }
+
+    /// A prompt that repeats itself, so prompt lookup has a continuation to offer.
+    fn prompt(buf: []u32) []u32 {
+        for (buf, 0..) |*id, i| id.* = @intCast(1 + ((i % 24) * 7919) % 40000);
+        return buf;
+    }
+
+    const Run = struct { ids: []u32, built: u32, kept: u32, lookup_rounds: u64, completion: u32, residue: bool };
+
+    /// Greedy decode to `max_tokens` with the lazy pre-draft on or off.
+    fn run(rig: *LazyRig, a: std.mem.Allocator, io: std.Io, lazy: bool, max_tokens: u32) !Run {
+        Generator.mtp_lazy_predraft_override = lazy;
+        defer Generator.mtp_lazy_predraft_override = null;
+        var buf: [192]u32 = undefined;
+        const slot = try MtpChainTestSlot.init(a, io, &rig.xfm, &rig.tok, prompt(&buf), 3);
+        defer slot.deinit(a);
+        const g = &slot.gen.?;
+        g.max_tokens = max_tokens;
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(a);
+        while (!g.done and g.completion_tokens < max_tokens) {
+            const r = (try g.nextMtp(a)) orelse break;
+            defer a.free(r.tokens);
+            try ids.appendSlice(a, r.tokens);
+        }
+        // Whether a pre-draft outlives the last round (the eager tail builds one at max_tokens).
+        const residue = g.mtp_pre_draft != null;
+        return .{ .ids = try ids.toOwnedSlice(a), .built = g.mtp_lazy_built, .kept = g.mtp_lazy_kept, .lookup_rounds = g.mtp_lookup_rounds, .completion = g.completion_tokens, .residue = residue };
+    }
+};
+
+test "lazy predraft: greedy tokens equal the eager padded path, lookup off and on, to and short of max_tokens (QWEN4_TEST_MODEL)" {
+    // Bar: byte-identical ids; the lazy arm built and kept chains; the final rounds leave what the eager path leaves.
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const rig = try LazyRig.load(a, io);
+    defer rig.deinit(a);
+    const forced = Generator.mtp_force_depth_cache;
+    defer Generator.mtp_force_depth_cache = forced;
+    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    defer Generator.mtp_lookup_override = null;
+    for ([_]bool{ false, true }) |lookup| {
+        Generator.mtp_lookup_override = lookup;
+        for ([_]u32{ 120, 37 }) |max_tokens| {
+            const eager = try rig.run(a, io, false, max_tokens);
+            defer a.free(eager.ids);
+            const lazy = try rig.run(a, io, true, max_tokens);
+            defer a.free(lazy.ids);
+            std.debug.print("[lazy predraft] lookup={} max={d} tokens={d}/{d} built={d} kept={d} lookup_rounds={d}/{d}\n", .{ lookup, max_tokens, eager.ids.len, lazy.ids.len, lazy.built, lazy.kept, eager.lookup_rounds, lazy.lookup_rounds });
+            try testing.expectEqualSlices(u32, eager.ids, lazy.ids);
+            try testing.expectEqual(@as(u32, 0), eager.built);
+            try testing.expect(lazy.kept > 0);
+            try testing.expectEqual(max_tokens, lazy.completion);
+            try testing.expectEqual(eager.residue, lazy.residue);
+            if (lookup) try testing.expect(lazy.lookup_rounds > 0);
+        }
+    }
+    // A lookup pick discards the lazy chain; force that on every round so the discard path
+    // (head back at the stash origin, stash pending) runs whatever lookup decides.
+    Generator.mtp_lookup_override = false;
+    Generator.mtp_lazy_force_discard = true;
+    defer Generator.mtp_lazy_force_discard = false;
+    const eager = try rig.run(a, io, false, 120);
+    defer a.free(eager.ids);
+    const discarded = try rig.run(a, io, true, 120);
+    defer a.free(discarded.ids);
+    std.debug.print("[lazy predraft] forced discard tokens={d}/{d} built={d} kept={d}\n", .{ eager.ids.len, discarded.ids.len, discarded.built, discarded.kept });
+    try testing.expectEqualSlices(u32, eager.ids, discarded.ids);
+    try testing.expect(discarded.built > 0);
+    try testing.expectEqual(@as(u32, 0), discarded.kept);
+}
+
+test "lazy predraft: a failure after the lazy dispatch leaves the head committed-only (QWEN4_TEST_MODEL)" {
+    // Bar: the failing round returns the injected error and the head ends at the committed end, no chain, no stash.
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const rig = try LazyRig.load(a, io);
+    defer rig.deinit(a);
+    const forced = Generator.mtp_force_depth_cache;
+    defer Generator.mtp_force_depth_cache = forced;
+    Generator.mtp_force_depth_cache = @as(?u32, 3);
+    Generator.mtp_lazy_predraft_override = true;
+    defer Generator.mtp_lazy_predraft_override = null;
+    var buf: [192]u32 = undefined;
+    const slot = try MtpChainTestSlot.init(a, io, &rig.xfm, &rig.tok, LazyRig.prompt(&buf), 3);
+    defer slot.deinit(a);
+    const g = &slot.gen.?;
+    for (0..3) |_| {
+        const r = (try g.nextMtp(a)) orelse return error.MissingMtpRound;
+        a.free(r.tokens);
+    }
+    try testing.expect(g.mtp_lazy_kept > 0);
+    const committed = g.mtpCommittedHistoryLen();
+    Generator.mtp_lazy_fail_after_dispatch = true;
+    defer Generator.mtp_lazy_fail_after_dispatch = false;
+    try testing.expectError(error.MtpLazyInjected, g.nextMtp(a));
+    try testing.expect(g.mtp_pre_draft == null and g.mtp_hist_stash == null);
+    try testing.expectEqual(committed, g.mtp_cache.?.step());
+    try testing.expectEqual(committed, g.mtpCommittedHistoryLen());
+}
+
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Group builders keep the merged history step; the solo arm must draft the same way.
+    Generator.mtp_padded_head_override = false;
+    defer Generator.mtp_padded_head_override = null;
     const predraft = Generator.mtp_predraft_cache;
     const forced = Generator.mtp_force_depth_cache;
     const planner = group_planner.enabled_override;
@@ -19452,6 +20011,9 @@ test "cold grouped MTP head seeds the solo position and preserves valid origins"
 test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // Group builders keep the merged history step; the solo arm must draft the same way.
+    Generator.mtp_padded_head_override = false;
+    defer Generator.mtp_padded_head_override = null;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));

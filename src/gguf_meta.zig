@@ -10,7 +10,8 @@
 //!
 //! Routing rule (`preferredEngine`):
 //!   `general.architecture == "deepseek4"` AND lora-rank key present → ds4
-//!   a ds4-only arch (`deepseek41`, `qwen4exp`, `glm-dsa`, `glm5-next`) → ds4
+//!   a ds4-only arch (`deepseek41`, `qwen4exp`, `glm-dsa`, `glm5-next`) → ds4,
+//!     except a qwen4exp file with tensor types ds4 rejects → llama.cpp
 //!   otherwise → llama.cpp
 //!
 //! This replaces the basename-only heuristic in `model_discovery.zig`, which
@@ -37,6 +38,9 @@ pub const Info = struct {
     /// `<arch>.nextn_predict_layers` > 0: the checkpoint carries its own MTP
     /// head (ds4 arms it via `glm_mtp`; asking on a model without one refuses the open).
     embedded_mtp: bool = false,
+    /// qwen4exp only: a tensor type ds4 rejects, or a non-BF16 n-gram table
+    /// (llama.cpp quants such as GSQ-RCO's Q2_0 experts). ds4 would exit the process.
+    ds4_unloadable: bool = false,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -44,13 +48,19 @@ pub const Info = struct {
     }
 };
 
-// Arch names only the ds4 converters write; llama.cpp has no loader for them.
+// Arch names the ds4 converters write. llama.cpp loads qwen4exp too, so a
+// qwen4exp file ds4 cannot load goes there instead.
 const ds4_only_archs = [_][]const u8{ "deepseek41", "qwen4exp", "glm-dsa", "glm5-next" };
+
+// GGML types ds4 accepts for Qwen tensors: F32 F16 Q4_0 Q8_0 Q2_K Q4_K Q5_K Q6_K IQ2_XXS BF16 MXFP4.
+const ds4_qwen_tensor_types = [_]u32{ 0, 1, 2, 8, 10, 12, 13, 14, 16, 30, 39 };
+const GGML_TYPE_BF16: u32 = 30;
+const GGML_MAX_DIMS: u32 = 4;
 
 pub fn preferredEngine(info: Info) Engine {
     if (info.architecture) |a| {
         if (std.mem.eql(u8, a, "deepseek4") and info.has_ds4_lora_rank) return .ds4;
-        for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return .ds4;
+        for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return if (info.ds4_unloadable) .llama else .ds4;
     }
     return .llama;
 }
@@ -97,7 +107,7 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
     const version = takeIntT(r, u32) catch return error.Truncated;
     if (version < 2 or version > 3) return error.UnsupportedVersion;
-    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count, unused
+    const tensor_count = takeIntT(r, u64) catch return error.Truncated;
     const kv_count = takeIntT(r, u64) catch return error.Truncated;
 
     var seen_arch = false;
@@ -139,7 +149,29 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         if (seen_arch and info.has_ds4_lora_rank) break;
     }
 
+    if (info.architecture) |a| {
+        if (std.mem.eql(u8, a, "qwen4exp")) info.ds4_unloadable = try scanDs4Unloadable(r, tensor_count);
+    }
     return info;
+}
+
+/// Walk the tensor infos that follow the KVs; true at the first tensor ds4
+/// would reject for a qwen4exp model.
+fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
+    var i: u64 = 0;
+    while (i < tensor_count) : (i += 1) {
+        const name_len = takeIntT(r, u64) catch return error.Truncated;
+        if (name_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const is_ngrams = std.mem.eql(u8, takeBytes(r, @intCast(name_len)) catch return error.Truncated, "per_layer_token_embd.weight");
+        const n_dims = takeIntT(r, u32) catch return error.Truncated;
+        if (n_dims > GGML_MAX_DIMS) return error.Truncated;
+        r.discardAll64(@as(u64, n_dims) * 8) catch return error.Truncated;
+        const ty = takeIntT(r, u32) catch return error.Truncated;
+        _ = takeIntT(r, u64) catch return error.Truncated; // offset
+        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null) return true;
+        if (is_ngrams and ty != GGML_TYPE_BF16) return true;
+    }
+    return false;
 }
 
 /// Open the GGUF file and parse Info via the file's buffered reader.
@@ -264,14 +296,20 @@ fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u
     try buf.appendSlice(allocator, s);
 }
 
-/// Build a minimal but valid GGUF v3 header from a KV list. tensor_count
-/// is zero — we never read past the metadata section in parseInfo.
+const TensorInfo = struct { name: []const u8, ggml_type: u32 };
+
+/// Build a minimal but valid GGUF v3 header from a KV list, with no tensors.
 fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
+    return buildHeaderWithTensors(allocator, kvs, &.{});
+}
+
+/// GGUF v3 header followed by tensor infos (2-D, offset 0); no tensor data.
+fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors: []const TensorInfo) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "GGUF");
     try appendU32(&buf, allocator, 3); // version
-    try appendU64(&buf, allocator, 0); // tensor_count
+    try appendU64(&buf, allocator, @intCast(tensors.len)); // tensor_count
     try appendU64(&buf, allocator, @intCast(kvs.len)); // kv_count
     for (kvs) |kv| {
         try appendStr(&buf, allocator, kv.key);
@@ -295,6 +333,14 @@ fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
                 for (arr) |s| try appendStr(&buf, allocator, s);
             },
         }
+    }
+    for (tensors) |t| {
+        try appendStr(&buf, allocator, t.name);
+        try appendU32(&buf, allocator, 2); // n_dims
+        try appendU64(&buf, allocator, 640);
+        try appendU64(&buf, allocator, 2560);
+        try appendU32(&buf, allocator, t.ggml_type);
+        try appendU64(&buf, allocator, 0); // offset
     }
     return buf.toOwnedSlice(allocator);
 }
@@ -346,6 +392,38 @@ test "preferredEngine: ds4-only archs → ds4 without the lora key" {
         var info = try parseBytes(testing.allocator, bytes);
         defer info.deinit(testing.allocator);
         try testing.expectEqual(Engine.ds4, preferredEngine(info));
+    }
+}
+
+test "preferredEngine: qwen4exp routes by tensor types ds4 can load" {
+    const arch: []const KV = &.{.{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } }};
+    // ds4-converted: BF16 n-gram table, experts in a ds4 type.
+    const ds4_file = try buildHeaderWithTensors(testing.allocator, arch, &.{
+        .{ .name = "blk.0.ffn_down_exps.weight", .ggml_type = 12 }, // Q4_K
+        .{ .name = "per_layer_token_embd.weight", .ggml_type = 30 }, // BF16
+    });
+    defer testing.allocator.free(ds4_file);
+    // llama.cpp quant (e.g. GSQ-RCO IQ3_XXS): Q2_0 experts.
+    const q2_0_file = try buildHeaderWithTensors(testing.allocator, arch, &.{
+        .{ .name = "blk.0.ffn_down_exps.weight", .ggml_type = 42 }, // Q2_0
+    });
+    defer testing.allocator.free(q2_0_file);
+    // llama.cpp quant with a quantized n-gram table.
+    const iq4nl_ngrams = try buildHeaderWithTensors(testing.allocator, arch, &.{
+        .{ .name = "blk.0.ffn_down_exps.weight", .ggml_type = 8 }, // Q8_0
+        .{ .name = "per_layer_token_embd.weight", .ggml_type = 20 }, // IQ4_NL
+    });
+    defer testing.allocator.free(iq4nl_ngrams);
+
+    const cases = [_]struct { bytes: []const u8, want: Engine }{
+        .{ .bytes = ds4_file, .want = .ds4 },
+        .{ .bytes = q2_0_file, .want = .llama },
+        .{ .bytes = iq4nl_ngrams, .want = .llama },
+    };
+    for (cases) |c| {
+        var info = try parseBytes(testing.allocator, c.bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(c.want, preferredEngine(info));
     }
 }
 

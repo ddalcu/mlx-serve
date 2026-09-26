@@ -152,7 +152,7 @@ struct HotKeyRecorderControl: View {
             }
             if let refused = refusedCombo {
                 Text("\(refused) is taken by another app — kept \(display).")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.orange)
             }
         }

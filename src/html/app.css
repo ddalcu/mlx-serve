@@ -23,7 +23,7 @@ html, body { height: 100% }
 
 body {
   margin: 0;
-  font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "SF Pro Text", Inter, sans-serif;
+  font: 0.9375rem/1.6 ui-sans-serif, system-ui, -apple-system, "SF Pro Text", Inter, sans-serif;
   background: var(--bg);
   color: var(--fg);
   overflow: hidden;
@@ -49,11 +49,11 @@ pre {
   border-radius: 10px;
   padding: 12px 14px;
   overflow-x: auto;
-  font-size: 13px;
+  font-size: 0.8125rem;
   line-height: 1.5;
   color: #cfd6df;
 }
-pre code { background: none; padding: 0; color: inherit; font-size: 13px }
+pre code { background: none; padding: 0; color: inherit; font-size: 0.8125rem }
 
 /* ── Shell ───────────────────────────────────────────────────────────────── */
 
@@ -76,7 +76,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   gap: 9px;
   padding: 6px 8px 14px;
 }
-.wordmark { font-size: 16px; font-weight: 600; letter-spacing: -.01em; flex: 1 }
+.wordmark { font-size: 1rem; font-weight: 600; letter-spacing: -.01em; flex: 1 }
 /* The app icon, inlined as a data URI so the page stays one self-contained document. */
 .logo { width: 24px; height: 24px; flex: 0 0 24px; border-radius: 6px }
 
@@ -113,7 +113,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   padding: 9px 12px;
   border-radius: 999px;
   color: var(--fg);
-  font-size: 14px;
+  font-size: 0.875rem;
   text-align: left;
 }
 .nav-item:hover { background: #2a2b2d }
@@ -140,7 +140,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 .recents { flex: 1; overflow-y: auto; margin-top: 18px; min-height: 0 }
 .recents-h {
   color: var(--dim);
-  font-size: 13px;
+  font-size: 0.8125rem;
   padding: 4px 12px 6px;
 }
 .recent {
@@ -151,7 +151,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   padding: 8px 10px 8px 12px;
   border-radius: 999px;
   color: var(--fg);
-  font-size: 14px;
+  font-size: 0.875rem;
   text-align: left;
 }
 .recent:hover { background: #2a2b2d }
@@ -162,16 +162,16 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.recent .x { color: var(--faint); opacity: 0; padding: 0 2px; font-size: 15px; line-height: 1 }
+.recent .x { color: var(--faint); opacity: 0; padding: 0 2px; font-size: 0.9375rem; line-height: 1 }
 .recent:hover .x { opacity: 1 }
 .recent .x:hover { color: #f28b82 }
-.recents .empty { color: var(--faint); font-size: 13px; padding: 4px 12px }
+.recents .empty { color: var(--faint); font-size: 0.8125rem; padding: 4px 12px }
 
 .side-foot {
   border-top: 1px solid var(--line);
   padding: 10px 12px 4px;
   color: var(--faint);
-  font-size: 12px;
+  font-size: 0.75rem;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -201,7 +201,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 .chat { display: none; flex: 1; align-items: flex-end; justify-content: center; min-height: 0 }
 .panel.empty .chat { display: flex }
 .greeting {
-  font-size: 40px;
+  font-size: 2.5rem;
   font-weight: 400;
   letter-spacing: -.02em;
   text-align: center;
@@ -300,7 +300,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 }
 .send[stop]::after { display: none }
 
-.disclaimer { color: var(--faint); font-size: 12px; text-align: center; margin-top: 9px }
+.disclaimer { color: var(--faint); font-size: 0.75rem; text-align: center; margin-top: 9px }
 .disclaimer.busy { color: var(--accent) }
 .disclaimer.err { color: #f28b82; white-space: pre-wrap }
 
@@ -328,11 +328,11 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   text-align: left;
 }
 .menu-item:hover { background: #33363a }
-.menu-item .tick { width: 14px; flex: 0 0 14px; color: var(--accent); font-size: 13px; line-height: 1.5 }
-.menu-item .mt { font-size: 14px }
-.menu-item .ms { font-size: 12px; color: var(--dim); font-family: var(--mono) }
+.menu-item .tick { width: 14px; flex: 0 0 14px; color: var(--accent); font-size: 0.8125rem; line-height: 1.5 }
+.menu-item .mt { font-size: 0.875rem }
+.menu-item .ms { font-size: 0.75rem; color: var(--dim); font-family: var(--mono) }
 .menu-sep { border-top: 1px solid #35383b; margin: 8px 4px }
-.menu .empty { color: var(--faint); font-size: 13px; padding: 8px 12px }
+.menu .empty { color: var(--faint); font-size: 0.8125rem; padding: 8px 12px }
 
 /* ── Messages ────────────────────────────────────────────────────────────── */
 
@@ -352,9 +352,9 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
 .md > *:last-child { margin-bottom: 0 }
 .md p { margin: 0 0 14px }
 .md h1, .md h2, .md h3 { margin: 22px 0 10px; font-weight: 600; line-height: 1.35 }
-.md h1 { font-size: 21px }
-.md h2 { font-size: 18px }
-.md h3 { font-size: 16px }
+.md h1 { font-size: 1.3125rem }
+.md h2 { font-size: 1.125rem }
+.md h3 { font-size: 1rem }
 .md ul, .md ol { margin: 0 0 14px; padding-left: 24px }
 .md li { margin: 4px 0 }
 .md pre { margin: 0 0 14px }
@@ -378,7 +378,7 @@ pre code { background: none; padding: 0; color: inherit; font-size: 13px }
   gap: 11px;
   margin-bottom: 22px;
   color: var(--dim);
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 .dots { display: inline-flex; align-items: center; gap: 5px; height: 16px; flex: 0 0 auto }
 .dots i {
@@ -405,11 +405,11 @@ details.think {
   padding: 8px 12px;
   margin-bottom: 14px;
 }
-details.think summary { cursor: pointer; color: var(--dim); font-size: 13px }
+details.think summary { cursor: pointer; color: var(--dim); font-size: 0.8125rem }
 .think-body {
   white-space: pre-wrap;
   color: var(--dim);
-  font-size: 14px;
+  font-size: 0.875rem;
   margin-top: 10px;
   border-left: 2px solid var(--line);
   padding-left: 12px;
@@ -418,7 +418,7 @@ details.think summary { cursor: pointer; color: var(--dim); font-size: 13px }
 /* "What the assistant did", between its words and the result. */
 .tool {
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--accent);
   background: #1a2130;
   border: 1px solid #26344a;
@@ -432,12 +432,12 @@ details.think summary { cursor: pointer; color: var(--dim); font-size: 13px }
 .out { margin: 0 0 14px }
 .out img { max-width: 100%; border-radius: 12px; border: 1px solid var(--line); display: block }
 .out audio { width: 100%; margin-top: 4px }
-.out .dl { display: inline-block; margin-top: 8px; font-size: 12px }
+.out .dl { display: inline-block; margin-top: 8px; font-size: 0.75rem }
 
 .actions { display: flex; gap: 2px; margin-top: -4px }
 .act {
   color: var(--faint);
-  font-size: 12px;
+  font-size: 0.75rem;
   padding: 5px 9px;
   border-radius: 999px;
 }
@@ -449,7 +449,7 @@ details.think summary { cursor: pointer; color: var(--dim); font-size: 13px }
 .attached .chip .x {
   position: absolute; top: -6px; right: -6px;
   width: 18px; height: 18px;
-  line-height: 16px; font-size: 10px;
+  line-height: 16px; font-size: 0.625rem;
   border-radius: 50%;
   background: #3c4043;
   color: var(--fg);
@@ -458,7 +458,7 @@ details.think summary { cursor: pointer; color: var(--dim); font-size: 13px }
 /* ── Monitor + API ───────────────────────────────────────────────────────── */
 
 h2 {
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: .08em;
   text-transform: uppercase;
@@ -474,16 +474,16 @@ h2 {
   padding: 6px 16px;
   margin-bottom: 12px;
 }
-.hint { color: var(--faint); font-size: 13px; margin: 0 0 14px }
+.hint { color: var(--faint); font-size: 0.8125rem; margin: 0 0 14px }
 
 table.models { width: 100%; border-collapse: collapse }
 table.models td { padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: middle }
 table.models tr:last-child td { border-bottom: 0 }
 table.models tr.ready td { background: rgba(16, 185, 129, .05) }
-table.models .mono { font-family: var(--mono); font-size: 12.5px }
-table.models .num { text-align: right; color: var(--dim); white-space: nowrap; font-size: 13px }
+table.models .mono { font-family: var(--mono); font-size: 0.78125rem }
+table.models .num { text-align: right; color: var(--dim); white-space: nowrap; font-size: 0.8125rem }
 table.models .muted { color: var(--faint) }
-table.models .state { text-align: right; white-space: nowrap; font-size: 12.5px; color: var(--faint) }
+table.models .state { text-align: right; white-space: nowrap; font-size: 0.78125rem; color: var(--faint) }
 table.models .state.ready { color: #7ee2b8 }
 table.models .state.loading { color: var(--accent) }
 table.models .state.error { color: #f28b82 }
@@ -495,7 +495,7 @@ table.models .state.error { color: #f28b82 }
   border: 1px solid #26344a;
   border-radius: 999px;
   padding: 1px 8px;
-  font-size: 11px;
+  font-size: 0.6875rem;
   margin: 1px 3px 1px 0;
 }
 
@@ -510,7 +510,7 @@ table.models .state.error { color: #f28b82 }
 .ep:last-child { border-bottom: 0 }
 .ep .m {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 0.65625rem;
   font-weight: 600;
   letter-spacing: .04em;
   text-align: center;
@@ -521,12 +521,12 @@ table.models .state.error { color: #f28b82 }
 .m.post { background: #1c2e57; color: var(--accent) }
 .m.del { background: #3d1d23; color: #f28b82 }
 .m.ws { background: #3a2a4d; color: #caa6ff }
-.ep .p { font-family: var(--mono); font-size: 13px }
-.ep .d { color: var(--dim); font-size: 13px; margin-top: 2px }
+.ep .p { font-family: var(--mono); font-size: 0.8125rem }
+.ep .d { color: var(--dim); font-size: 0.8125rem; margin-top: 2px }
 
 @media (max-width: 820px) {
   .side { position: absolute; z-index: 30; height: 100%; box-shadow: 0 0 40px rgba(0, 0, 0, .5) }
-  .greeting { font-size: 30px }
+  .greeting { font-size: 1.875rem }
   .scroll, .log { padding-left: 16px; padding-right: 16px }
   .dock { padding-left: 12px; padding-right: 12px }
   .composer { gap: 4px }

@@ -15,16 +15,16 @@ struct ChatErrorCard: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.circle")
-                .font(.system(size: 15, weight: .medium))
+                .font(.app(.title3, weight: .medium))
                 .foregroundStyle(.red)
                 .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(L10n.text(notice.headline))
-                    .font(.callout.weight(.semibold))
+                    .font(.app(.callout).weight(.semibold))
                     .foregroundStyle(.red)
                 Text(L10n.text(notice.detail))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
@@ -33,9 +33,9 @@ struct ChatErrorCard: View {
                     Button(action: onIncreaseContext) {
                         HStack(spacing: 6) {
                             Image(systemName: "arrow.up.forward.square")
-                                .font(.system(size: 11, weight: .medium))
+                                .font(.app(.subheadline, weight: .medium))
                             Text("Increase Context Size")
-                                .font(.callout.weight(.medium))
+                                .font(.app(.callout).weight(.medium))
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 7)

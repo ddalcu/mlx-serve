@@ -118,9 +118,9 @@ struct WelcomeView: View {
             logoTile
             VStack(alignment: .leading, spacing: 2) {
                 Text("MLX-Serve")
-                    .font(.system(size: 22, weight: .semibold))
+                    .font(.app(.title, weight: .semibold))
                 Text("Local AI on Apple Silicon")
-                    .font(.subheadline)
+                    .font(.app(.subheadline))
                     .foregroundStyle(.secondary)
             }
 
@@ -134,11 +134,11 @@ struct WelcomeView: View {
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "star.fill")
-                        .font(.system(size: 11))
+                        .font(.app(.subheadline))
                         .foregroundStyle(.yellow)
                     Text("Star on GitHub")
                 }
-                .font(.subheadline)
+                .font(.app(.subheadline))
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
@@ -165,7 +165,7 @@ struct WelcomeView: View {
     private var featureCards: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("GET STARTED")
-                .font(.caption2.weight(.semibold))
+                .font(.app(.caption2).weight(.semibold))
                 .tracking(0.7)
                 .foregroundStyle(.tertiary)
                 .padding(.leading, 2)
@@ -255,14 +255,14 @@ struct WelcomeView: View {
     private func surfaceRow(_ surface: WelcomeSurface) -> some View {
         HStack(alignment: .center, spacing: 10) {
             Image(systemName: surface.icon)
-                .font(.system(size: 18))
+                .font(.app(.title2))
                 .foregroundColor(.accentColor)
                 .frame(width: 26, alignment: .center)
             VStack(alignment: .leading, spacing: 2) {
                 Text(L10n.text(surface.title))
-                    .font(.headline)
+                    .font(.app(.headline))
                 Text(L10n.text(caption(for: surface)))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(captionStyle(for: surface))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -292,7 +292,7 @@ struct WelcomeView: View {
     /// Stated, not offered: these two are the app itself.
     private var installedBadge: some View {
         Label("Installed", systemImage: "checkmark.circle.fill")
-            .font(.callout.weight(.semibold))
+            .font(.app(.callout).weight(.semibold))
             .foregroundStyle(.green)
             .labelStyle(.titleAndIcon)
     }
@@ -317,7 +317,7 @@ struct WelcomeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(
                     Text("Demo unavailable in this build.")
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.secondary))
         }
     }
@@ -356,9 +356,9 @@ struct WelcomeView: View {
                     HStack(spacing: 4) {
                         Text("Browse all models")
                         Image(systemName: "arrow.right")
-                            .font(.caption2.weight(.semibold))
+                            .font(.app(.caption2).weight(.semibold))
                     }
-                    .font(.callout)
+                    .font(.app(.callout))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(Color.accentColor)
@@ -371,7 +371,7 @@ struct WelcomeView: View {
     /// section headers, so the two surfaces read as one design.
     private func panelLabel(_ text: String) -> some View {
         Text(L10n.text(text))
-            .font(.caption2.weight(.semibold))
+            .font(.app(.caption2).weight(.semibold))
             .tracking(0.6)
             .foregroundStyle(.secondary)
     }
@@ -382,7 +382,7 @@ struct WelcomeView: View {
         HStack(spacing: 16) {
             Toggle("Don't show again", isOn: $suppressWelcome)
                 .toggleStyle(.checkbox)
-                .font(.subheadline)
+                .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
 
             Spacer(minLength: 0)
@@ -394,7 +394,7 @@ struct WelcomeView: View {
                 leave(.startChatting)
             } label: {
                 Text(L10n.text(hasChatModels ? "Start Chatting" : "Continue"))
-                    .font(.headline)
+                    .font(.app(.headline))
                     .frame(minWidth: 150)
                     .padding(.vertical, 4)
             }
@@ -425,7 +425,7 @@ struct WelcomeView: View {
             ProgressView().controlSize(.small)
         case .installed:
             Label("Installed", systemImage: "checkmark.circle.fill")
-                .font(.callout.weight(.semibold))
+                .font(.app(.callout).weight(.semibold))
                 .foregroundStyle(.green)
                 .labelStyle(.titleAndIcon)
         case .binaryMissing:
@@ -435,7 +435,7 @@ struct WelcomeView: View {
                 installCLI(target: target)
             } label: {
                 Text(L10n.text(cliInstalling ? "Installing…" : "Install"))
-                    .font(.callout.weight(.semibold))
+                    .font(.app(.callout).weight(.semibold))
             }
             .controlSize(.large)
             .disabled(cliInstalling)
@@ -516,16 +516,16 @@ private struct WelcomeFeatureCard: View {
         Button(action: onTap) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: feature.icon)
-                    .font(.system(size: 17))
+                    .font(.app(.title2))
                     .foregroundColor(isSelected ? .accentColor : .secondary)
                     .frame(width: 24, alignment: .center)
                     .padding(.top, 1)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(L10n.text(feature.title))
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.app(.headline, weight: .semibold))
                         .foregroundColor(.primary)
                     Text(L10n.text(feature.description))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
@@ -585,22 +585,22 @@ private struct WelcomeModelRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(L10n.text(entry.category))
-                        .font(.caption2.weight(.semibold))
+                        .font(.app(.caption2).weight(.semibold))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
                         .background(Capsule().fill(Color.secondary.opacity(0.15)))
                         .foregroundStyle(.secondary)
                     Text(pick.name)
-                        .font(.callout.weight(.medium))
+                        .font(.app(.callout).weight(.medium))
                     if isRecommended {
                         Image(systemName: "sparkles")
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.tint)
                             .help("Recommended for your Mac")
                     }
                 }
                 Text(L10n.text(entry.strength))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -619,7 +619,7 @@ private struct WelcomeModelRow: View {
             Button {
                 useAndChat()
             } label: {
-                Text("Use").font(.caption.weight(.semibold))
+                Text("Use").font(.app(.caption).weight(.semibold))
             }
             .controlSize(.small)
             .buttonStyle(.borderedProminent)
@@ -627,7 +627,7 @@ private struct WelcomeModelRow: View {
             VStack(spacing: 2) {
                 ProgressView(value: state.progress).frame(width: 58)
                 Text(state.percentFormatted)
-                    .font(.system(size: 9).monospacedDigit())
+                    .font(.app(.caption2).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         } else {
@@ -635,7 +635,7 @@ private struct WelcomeModelRow: View {
                 startDownload()
             } label: {
                 Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Get"))
-                    .font(.caption.weight(.semibold))
+                    .font(.app(.caption).weight(.semibold))
             }
             .controlSize(.small)
             .buttonStyle(.bordered)

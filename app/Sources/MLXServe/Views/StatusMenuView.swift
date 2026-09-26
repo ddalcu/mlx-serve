@@ -214,15 +214,15 @@ struct StatusMenuView: View {
     private var header: some View {
         HStack(spacing: 8) {
             Text("MLX-Serve")
-                .font(.headline)
+                .font(.app(.headline))
             Text(L10n.text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 6)
             TrayStatusChip(status: server.status)
             Button { openSettings() } label: {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.app(.body, weight: .medium))
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
                     .contentShape(Rectangle())
@@ -249,9 +249,9 @@ struct StatusMenuView: View {
                 if hasNoUsableModels {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("No models yet")
-                            .font(.subheadline.weight(.medium))
+                            .font(.app(.subheadline).weight(.medium))
                         Text("Download a model below to start chatting.")
-                            .font(.caption)
+                            .font(.app(.caption))
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -272,7 +272,7 @@ struct StatusMenuView: View {
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
                         Text(L10n.text(server.lastError))
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.red)
                             .lineLimit(4)
                             .textSelection(.enabled)
@@ -444,7 +444,7 @@ struct StatusMenuView: View {
                     .help("Engine the selected model runs on")
             }
         }
-        .font(.caption)
+        .font(.app(.caption))
         .foregroundStyle(.secondary)
     }
 
@@ -464,7 +464,7 @@ struct StatusMenuView: View {
             TrayCard {
                 if loadedModels.isEmpty {
                     Text("None loaded — models load on demand")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                 }
                 ForEach(loadedModels, id: \.name) { info in
@@ -509,7 +509,7 @@ struct StatusMenuView: View {
             Spacer()
             Text(value).monospacedDigit()
         }
-        .font(.caption2)
+        .font(.app(.caption2))
     }
 
     // MARK: - Media generation
@@ -696,12 +696,12 @@ struct StatusMenuView: View {
     private func modelSlotRow(_ info: ModelInfo) -> some View {
         HStack(spacing: 6) {
             Image(systemName: info.slotKind.icon)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
                 .help(info.slotKind.label)
             Text(info.name)
-                .font(.caption.monospaced())
+                .font(.app(.caption).monospaced())
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .help(info.slotKind == .chat
@@ -709,7 +709,7 @@ struct StatusMenuView: View {
                       : info.slotKind.label)
             if info.quantBits > 0 {
                 Text("\(info.quantBits)-bit")
-                    .font(.caption2.weight(.semibold))
+                    .font(.app(.caption2).weight(.semibold))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(.quaternary)
@@ -718,7 +718,7 @@ struct StatusMenuView: View {
             // Speculative-decoding speedup badge (MTP / drafter).
             if let badge = info.specDecodeBadge {
                 Text(L10n.text(badge))
-                    .font(.caption2.weight(.semibold))
+                    .font(.app(.caption2).weight(.semibold))
                     .foregroundStyle(.green)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -731,7 +731,7 @@ struct StatusMenuView: View {
             Spacer()
             if info.bytesResident > 0 {
                 Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
-                    .font(.caption2.monospaced())
+                    .font(.app(.caption2).monospaced())
                     .foregroundStyle(.tertiary)
             }
             // Copy the model's full name/id to the clipboard (paste into a curl,
@@ -746,7 +746,7 @@ struct StatusMenuView: View {
                 }
             } label: {
                 Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
-                    .font(.caption2)
+                    .font(.app(.caption2))
             }
             .buttonStyle(.borderless)
             .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
@@ -760,7 +760,7 @@ struct StatusMenuView: View {
                     unloadSlot(info.name)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.caption)
+                        .font(.app(.caption))
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
@@ -799,16 +799,16 @@ struct UpdateTrayRow: View {
                         .foregroundStyle(.blue)
                     VStack(alignment: .leading, spacing: 1) {
                         Text("MLX-Serve v\(update.version) is available")
-                            .font(.subheadline.weight(.medium))
+                            .font(.app(.subheadline).weight(.medium))
                         if case .failed(let message) = updates.phase {
                             Text(message)
-                                .font(.caption2)
+                                .font(.app(.caption2))
                                 .foregroundStyle(.red)
                                 .lineLimit(3)
                                 .textSelection(.enabled)
                         } else if let page = update.releasePageURL {
                             Link("Release notes", destination: page)
-                                .font(.caption2)
+                                .font(.app(.caption2))
                         }
                     }
                     Spacer()
@@ -831,7 +831,7 @@ struct UpdateTrayRow: View {
                 }
                 if case .installing = updates.phase {
                     Text("Installing — the app will relaunch")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1011,17 +1011,17 @@ struct EndpointsSection: View {
                 } label: {
                     HStack(spacing: 4) {
                         Text("GET")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.app(.caption2, weight: .bold, design: .monospaced))
                             .foregroundStyle(.green)
                             .frame(width: 30, alignment: .leading)
                         Text(L10n.text(baseURL + "/"))
-                            .font(.system(size: 10, design: .monospaced))
+                            .font(.app(.caption2, design: .monospaced))
                             .foregroundStyle(.blue)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         Spacer()
                         Image(systemName: "arrow.up.right.square")
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                     }
                     .contentShape(Rectangle())
@@ -1044,11 +1044,11 @@ struct EndpointsSection: View {
                          copyKey: String, copyString: String) -> some View {
         HStack(spacing: 4) {
             Text(L10n.text(method))
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(.app(.caption2, weight: .bold, design: .monospaced))
                 .foregroundStyle(method == "GET" ? .green : .blue)
                 .frame(width: 30, alignment: .leading)
             Text(L10n.text(display))
-                .font(.system(size: 10, design: .monospaced))
+                .font(.app(.caption2, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
@@ -1061,7 +1061,7 @@ struct EndpointsSection: View {
                 }
             } label: {
                 Image(systemName: copiedEndpoint == copyKey ? "checkmark" : "doc.on.doc")
-                    .font(.caption2)
+                    .font(.app(.caption2))
             }
             .buttonStyle(.plain)
             .foregroundStyle(copiedEndpoint == copyKey ? .green : .secondary)
@@ -1151,7 +1151,7 @@ struct ServerLogWindowView: View {
         HStack(spacing: 10) {
             StatusDot(status: server.status)
             Text(L10n.text(statusLabel))
-                .font(.caption.weight(.medium))
+                .font(.app(.caption).weight(.medium))
                 .foregroundStyle(.secondary)
             Text("·")
                 .foregroundStyle(.tertiary)
@@ -1159,7 +1159,7 @@ struct ServerLogWindowView: View {
             // shows, so the number matches what's on screen rather than
             // racing with the live buffer.
             Text("\(poller.characterCount) bytes")
-                .font(.caption.monospacedDigit())
+                .font(.app(.caption).monospacedDigit())
                 .foregroundStyle(.secondary)
 
             Spacer()
@@ -1216,7 +1216,7 @@ struct ServerLogWindowView: View {
             // only when the log transitions to/from empty.
             if poller.text.isEmpty {
                 Text("(server has produced no output yet)")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.app(.callout, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .padding(12)
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
@@ -1268,7 +1268,7 @@ struct TerminalLogTextView: NSViewRepresentable {
     let text: String
     let autoScroll: Bool
 
-    private static let textFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    private static let textFont = AppType.monospaced(.callout)
     private static let textColor = NSColor(red: 0.86, green: 0.95, blue: 0.88, alpha: 1.0)
     private static let bg = NSColor.black
 

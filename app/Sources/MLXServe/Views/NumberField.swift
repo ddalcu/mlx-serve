@@ -40,7 +40,7 @@ struct NumberField: View {
             .textFieldStyle(.roundedBorder)
             // Body, not caption: a bezeled field is as tall as its font, and a
             // caption-sized box sat visibly below the pickers beside it.
-            .font(.body.monospacedDigit())
+            .font(.app(.body).monospacedDigit())
             .frame(width: width)
             .focused($focused)
             .multilineTextAlignment(.trailing)
@@ -87,7 +87,7 @@ struct OptionalNumberField: View {
             .textFieldStyle(.roundedBorder)
             // Body, not caption: a bezeled field is as tall as its font, and a
             // caption-sized box sat visibly below the pickers beside it.
-            .font(.body.monospacedDigit())
+            .font(.app(.body).monospacedDigit())
             .frame(width: width)
             .focused($focused)
             .multilineTextAlignment(.trailing)

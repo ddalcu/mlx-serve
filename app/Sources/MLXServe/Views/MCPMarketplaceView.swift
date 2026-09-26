@@ -58,14 +58,14 @@ struct MCPMarketplaceView: View {
         switch entry.transport {
         case .http:
             Text("HTTP")
-                .font(.caption2.weight(.semibold))
+                .font(.app(.caption2).weight(.semibold))
                 .padding(.horizontal, 5).padding(.vertical, 1)
                 .background(Color.blue.opacity(0.18))
                 .foregroundStyle(.blue)
                 .clipShape(Capsule())
         case .malformed:
             Text("malformed")
-                .font(.caption2.weight(.semibold))
+                .font(.app(.caption2).weight(.semibold))
                 .padding(.horizontal, 5).padding(.vertical, 1)
                 .background(Color.red.opacity(0.18))
                 .foregroundStyle(.red)
@@ -101,12 +101,12 @@ struct MCPMarketplaceView: View {
     private var header: some View {
         HStack {
             Image(systemName: "puzzlepiece.extension.fill")
-                .font(.title2)
+                .font(.app(.title2))
                 .foregroundStyle(.purple)
             VStack(alignment: .leading, spacing: 2) {
-                Text("MCP Marketplace").font(.title3.weight(.semibold))
+                Text("MCP Marketplace").font(.app(.title3).weight(.semibold))
                 Text("Connect external tools via the Model Context Protocol")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -114,7 +114,7 @@ struct MCPMarketplaceView: View {
                 dismiss()
             } label: {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.title3)
+                    .font(.app(.title3))
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
@@ -126,9 +126,9 @@ struct MCPMarketplaceView: View {
     private var introSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Curated servers")
-                .font(.subheadline.weight(.semibold))
+                .font(.app(.subheadline).weight(.semibold))
             Text("Toggle a server on, fill in any required fields, then click Save. Servers spawn lazily the next time you send a message with MCP mode on.")
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
         }
         .padding(.bottom, 4)
@@ -149,7 +149,7 @@ struct MCPMarketplaceView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Divider().padding(.vertical, 8)
                 Text("Custom servers (from mcp.json)")
-                    .font(.subheadline.weight(.semibold))
+                    .font(.app(.subheadline).weight(.semibold))
                 // OrderedDictionary doesn't conform to RandomAccessCollection directly; .elements does.
                 ForEach(custom.elements, id: \.key) { id, entry in
                     HStack(spacing: 8) {
@@ -157,11 +157,11 @@ struct MCPMarketplaceView: View {
                             .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
-                                Text(id).font(.body.weight(.medium))
+                                Text(id).font(.app(.body).weight(.medium))
                                 transportBadge(for: entry)
                             }
                             Text(commandSummary(for: entry))
-                                .font(.caption.monospaced())
+                                .font(.app(.caption).monospaced())
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
@@ -170,13 +170,13 @@ struct MCPMarketplaceView: View {
                             HStack(spacing: 4) {
                                 Circle().fill(.green).frame(width: 8, height: 8)
                                 Text("\(session.tools.count) tool\(session.tools.count == 1 ? "" : "s")")
-                                    .font(.caption2.weight(.medium))
+                                    .font(.app(.caption2).weight(.medium))
                                     .foregroundStyle(.green)
                             }
                         } else if let err = mcpManager.startErrors[id] {
                             HStack(spacing: 4) {
                                 Circle().fill(.red).frame(width: 8, height: 8)
-                                Text("error").font(.caption2.weight(.medium)).foregroundStyle(.red)
+                                Text("error").font(.app(.caption2).weight(.medium)).foregroundStyle(.red)
                             }
                             .help(err)
                         }
@@ -210,7 +210,7 @@ struct MCPMarketplaceView: View {
 
             if let err = saveError {
                 Text(err)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.red)
                     .lineLimit(2)
             }
@@ -392,13 +392,13 @@ private struct MCPCatalogRow: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Image(systemName: entry.icon)
-                    .font(.title3)
+                    .font(.app(.title3))
                     .foregroundStyle(.purple)
                     .frame(width: 28)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(entry.name).font(.body.weight(.semibold))
+                    Text(entry.name).font(.app(.body).weight(.semibold))
                     Text(L10n.text(entry.description))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
@@ -410,7 +410,7 @@ private struct MCPCatalogRow: View {
             }
             if case .failed(let detail) = status {
                 Label(L10n.text(detail), systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.red)
                     .lineLimit(4)
             }
@@ -425,7 +425,7 @@ private struct MCPCatalogRow: View {
                 }
                 if let notes = entry.notes {
                     Text(L10n.text(notes))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .padding(.leading, 38)
                 }
@@ -446,7 +446,7 @@ private struct MCPCatalogRow: View {
             HStack(spacing: 4) {
                 ProgressView().controlSize(.small)
                 Text("starting")
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
             }
             .help("Spawning the MCP server and listing its tools…")
@@ -454,7 +454,7 @@ private struct MCPCatalogRow: View {
             HStack(spacing: 4) {
                 Circle().fill(.green).frame(width: 8, height: 8)
                 Text("\(count) tool\(count == 1 ? "" : "s")")
-                    .font(.caption2.weight(.medium))
+                    .font(.app(.caption2).weight(.medium))
                     .foregroundStyle(.green)
             }
             .help("Connected — \(count) tool\(count == 1 ? "" : "s") available")
@@ -462,7 +462,7 @@ private struct MCPCatalogRow: View {
             HStack(spacing: 4) {
                 Circle().fill(.red).frame(width: 8, height: 8)
                 Text("error")
-                    .font(.caption2.weight(.medium))
+                    .font(.app(.caption2).weight(.medium))
                     .foregroundStyle(.red)
             }
             .help(detail)
@@ -478,9 +478,9 @@ private struct MCPCatalogRow: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
                 Text(L10n.text(input.label))
-                    .font(.caption.weight(.medium))
+                    .font(.app(.caption).weight(.medium))
                 if input.required {
-                    Text("*").foregroundStyle(.red).font(.caption)
+                    Text("*").foregroundStyle(.red).font(.app(.caption))
                 }
             }
             if input.isSecret {
@@ -491,7 +491,7 @@ private struct MCPCatalogRow: View {
                     .textFieldStyle(.roundedBorder)
             }
             if let help = input.helpText {
-                Text(L10n.text(help)).font(.caption2).foregroundStyle(.secondary)
+                Text(L10n.text(help)).font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
     }
