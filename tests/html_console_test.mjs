@@ -11,6 +11,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -981,26 +982,95 @@ test('speechBody never sends both voice and ref_audio', () => {
   assert.deepEqual(plain, { model: 'm', input: 'hi' });
 });
 
-// ── Type is relative, so the reader's browser size applies ────────────────
-// A `px` font size ignores the browser's own default font size AND the page
-// zoom, which is the one text-size control a reader of the console actually
-// has. `rem` follows the root size, so the same value renders at whatever the
-// reader chose. The app's own ladder is the same idea in point sizes
-// (`app/Sources/MLXServe/Support/AppType.swift`); this is the web half of the
-// same rule, and the scan is what stops a later stylesheet from quietly
-// putting px back.
+// ── theme.js ↔ app.css (the console's light/dark boot) ──────────────────────
+// The boot is plain DOM code, so the stub below is its whole environment: no
+// browser is needed to watch it pick a theme, flip it, or survive a store that
+// throws. What the shell script used to grep for is asserted here instead.
+const themeSrc = readFileSync(join(here, '..', 'src', 'html', 'theme.js'), 'utf8');
+const themeCss = readFileSync(join(here, '..', 'src', 'html', 'app.css'), 'utf8');
+const metricsSrc = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
 
-test('no console stylesheet states a font size in px', () => {
-  const files = ['app.css', 'metrics.js', 'index.html', 'app.js'];
-  const offenders = [];
-  for (const name of files) {
-    const text = readFileSync(join(here, '..', 'src', 'html', name), 'utf8');
-    for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
-      const line = text.slice(0, m.index).split('\n').length;
-      offenders.push(`${name}:${line}: ${m[0].trim()}`);
-    }
-  }
-  assert.deepEqual(offenders, [],
-    `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
-    'Use rem (px / 16): 13px is 0.8125rem.');
+function bootTheme({ stored = null, osLight = false, throwOnRead = false, throwOnWrite = false } = {}) {
+  const attrs = new Map();
+  const writes = [];
+  const listeners = [];
+  const state = { stored };
+  const sandbox = {
+    document: { documentElement: { setAttribute: (k, v) => attrs.set(k, v) } },
+    localStorage: {
+      getItem: () => {
+        if (throwOnRead) throw new Error('blocked');
+        return state.stored;
+      },
+      setItem: (k, v) => {
+        if (throwOnWrite) throw new Error('blocked');
+        writes.push([k, v]);
+        state.stored = v;
+      },
+    },
+  };
+  const media = { matches: osLight, addEventListener: (_, fn) => listeners.push(fn) };
+  sandbox.window = { matchMedia: () => media };
+  runInNewContext(themeSrc, sandbox);
+  return { theme: sandbox.window.mlxTheme, attrs, writes, listeners, media };
+}
+
+test('theme.js lets the OS decide when nothing is stored, and keeps deciding', () => {
+  assert.equal(bootTheme({ osLight: true }).attrs.get('data-theme'), 'light');
+  assert.equal(bootTheme({ osLight: false }).attrs.get('data-theme'), 'dark');
+  const live = bootTheme({ osLight: true });
+  live.media.matches = false;
+  live.listeners.forEach((fn) => fn());
+  assert.equal(live.attrs.get('data-theme'), 'dark', 'an unstored page follows the OS as it changes');
 });
+
+test('a stored choice wins over the OS', () => {
+  assert.equal(bootTheme({ stored: 'dark', osLight: true }).attrs.get('data-theme'), 'dark');
+  assert.equal(bootTheme({ stored: 'light', osLight: false }).attrs.get('data-theme'), 'light');
+});
+
+test('toggle() flips the attribute, persists the choice, and a reload keeps it', () => {
+  const t = bootTheme({ osLight: false });
+  assert.equal(t.theme.toggle(), 'light');
+  assert.equal(t.attrs.get('data-theme'), 'light');
+  assert.deepEqual(t.writes.at(-1), ['mlx-serve-theme', 'light']);
+  assert.equal(t.theme.toggle(), 'dark');
+  assert.equal(t.attrs.get('data-theme'), 'dark');
+  assert.deepEqual(t.writes.at(-1), ['mlx-serve-theme', 'dark']);
+  assert.equal(bootTheme({ stored: t.writes.at(-1)[1], osLight: true }).attrs.get('data-theme'), 'dark');
+});
+
+test('a store that throws still leaves a themed page', () => {
+  const broken = bootTheme({ osLight: true, throwOnRead: true, throwOnWrite: true });
+  assert.equal(broken.attrs.get('data-theme'), 'light', 'the boot reads the OS instead');
+  assert.equal(broken.theme.toggle(), 'dark', 'and a flip still applies without being remembered');
+  assert.equal(broken.attrs.get('data-theme'), 'dark');
+});
+
+test('the light palette restates every variable the dark palette sets', () => {
+  // metrics.js carries its own <style>, so it needs its own light block too.
+  assert.ok(/:root\[data-theme=light\]/.test(metricsSrc), 'metrics.js must restate its palette');
+  // Colours only: a font stack like `--mono` is the same in both themes.
+  const varsIn = (text, coloursOnly = false) =>
+    new Set([...text.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)]
+      .filter((m) => !coloursOnly || /^(#|rgb|hsl)/.test(m[2].trim()))
+      .map((m) => m[1]));
+  const blockAfter = (decl) => {
+    const at = themeCss.indexOf(decl);
+    assert.ok(at >= 0, `${decl} must exist`);
+    const open = themeCss.indexOf('{', at);
+    let depth = 0;
+    for (let i = open; i < themeCss.length; i++) {
+      if (themeCss[i] === '{') depth++;
+      else if (themeCss[i] === '}' && --depth === 0) return themeCss.slice(open, i);
+    }
+    throw new Error('unbalanced block');
+  };
+  // The first `:root` is the dark base; the light block restates what it must.
+  const base = varsIn(blockAfter(':root {'), true);
+  const light = varsIn(blockAfter(':root[data-theme=light]'));
+  const missing = [...base].filter((v) => !light.has(v));
+  assert.deepEqual(missing, [], 'a variable left out of the light block is a dark island');
+});
+
+

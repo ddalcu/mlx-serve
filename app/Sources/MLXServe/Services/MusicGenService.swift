@@ -204,7 +204,7 @@ final class MusicGenService: ObservableObject {
            let dir = ServerManager.resolveModelDir(repo: request.model.repo),
            Self.coverWeightsMissing(packDir: dir) {
             task?.cancel()
-            phase = .running(step: 0, total: 0, message: "Downloading cover weights (\(Self.coverWeightsFile))…")
+            phase = .running(step: 0, total: 0, message: L10n.format("Downloading cover weights (%@)…", Self.coverWeightsFile))
             downloads.startPackFile(repoId: request.model.repo, fileName: Self.coverWeightsFile) { [weak self] in
                 self?.generate(request, server: server)
             }

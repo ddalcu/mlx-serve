@@ -151,7 +151,7 @@ func warnIfSmallContext(agentId: String, context: Int) {
     guard let text = AgentBudget.contextWarning(agentId: agentId, context: context) else { return }
     MainActor.assumeIsolated {
         let alert = NSAlert()
-        alert.messageText = "Small context window"
+        alert.messageText = L10n.text("Small context window")
         alert.informativeText = text
         alert.alertStyle = .warning
         alert.runModal()

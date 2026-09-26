@@ -325,7 +325,7 @@ LAN + console:
 Attention + KV:
 - **Prefill-chunk cap reads the SCORE width** (`ModelConfig.prefillScoreHeadDim`); hd-256 policy branches key on 256 EXACTLY. Every qwen3.5/3.6/3.8 checkpoint is hd 256 — read the CHECKPOINT before porting an hd-128 kernel.
 - **On NAX the stock sdpa is the hd-256 kernel** (`naxSdpaPreferred`, `MLX_SERVE_NAX_SDPA=0|1`); `force_fused` only where mlx has one (`sdpaForceFusedFor`). Band arm stays ours; hd 512 declined.
-- **MLX sdpa has a WIDTH WALL at hd 256** (`q_len*gqa <= 32`): causal q 6..9 ride `splitCausalSdpa`, array masks `splitMaskedSdpa256` (`MLX_SERVE_SDPA_SPLIT=0`). `--mtp-depth` is a CAP — force verify width via PLD draft-len in A/Bs.
+- **MLX sdpa has a WIDTH WALL** (`q_len*gqa <= 32`): at hd 256 only, causal qL 2..15 ride `splitCausalSdpa` in groups of min(8, 32/gqa) rows, yielding to NAX force-fuse past 8 rows; array masks ride `splitMaskedSdpa256` (`MLX_SERVE_SDPA_SPLIT=0` turns both off). `--mtp-depth` is a CAP — force verify width via PLD draft-len in A/Bs.
 - **hd-256 prefill kernel (`msv_attn_p256`)**: band always fused; causal via kv-chunk budget; q_len < 16 ALWAYS declined; its mask arm (`fusedSdpa256Masked`) is the QSA prefill FALLBACK. Guards bill through `prefillHeadDimFused`.
 - **Fused decode QK-norm+RoPE** (`fusedQkNormRope`, laguna, `MLX_SERVE_QK_NORM_ROPE_FUSED=0`): bit-identical; live paired A/B is the bar.
 - **Decode-only dense-attention requant** (`--decode-attn-quant`, default ON, LOSSY): side copies at decode AND verify; prefill dense; tail layers nvfp4-g16 (`attnDqFor`). A/B per newly-adopted dense arch. dsv4 comp_in requant is EXPLICIT opt-in (`decodeAttnQuantExplicit`).

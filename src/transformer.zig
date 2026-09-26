@@ -6883,21 +6883,39 @@ fn sdpaSplitEnabled() bool {
     return v;
 }
 
-/// One engagement log per width (6..9): the first engagement is usually the
-/// warmup's own 8-token prefill (kL==qL==8) — a per-width line is what
-/// witnesses the split at REAL verify shapes in an A/B arm's log.
-var sdpa_split_logged: [4]bool = .{ false, false, false, false };
+/// One engagement log per width (2..15): the first engagement is usually the
+/// warmup's own short prefill — a per-width line is what witnesses the split
+/// at REAL verify shapes in an A/B arm's log.
+var sdpa_split_logged: [16]bool = @splat(false);
 
-/// Width-wall query split for dense causal spec-verify blocks (B==1, hd 256,
-/// q_len 6..9). MLX's sdpa has no full-kernel arm at hd 256 and its vector
-/// kernel serves q_len * gqa <= 32, so a 6..9-row verify block otherwise runs
-/// the slow internal fallback on every machine. Splitting the queries at row
-/// 5 keeps both halves on the vector path with windows byte-identical to two
-/// consecutive <= 5-row rounds at the same offsets (bottom-right causal
-/// alignment): chunk A (rows 0..<5) over keys[0 .. kL-(qL-5)], chunk B
-/// (rows 5..) over the full keys, both "causal". K/V are re-sliced views,
-/// never recomputed. Returns null outside the envelope — the caller falls
-/// through to the single sdpa call. Port of the Layr-Labs
+/// Rows per group that MLX's vector sdpa kernel serves for this geometry, or
+/// null when one call already takes the fast path (or no split can help).
+/// The vector kernel serves q_len <= 8 with q_len * gqa <= 32 at hd
+/// {64, 96, 128, 256}; q_len > 8 runs MLX's fused full kernel except at hd
+/// 256, where MLX takes its unfused fallback unless NAX force-fuses it.
+/// Engages at hd 256 only until other head dims are measured.
+fn causalSplitGroupRows(q_len: c_int, gqa: c_int, head_dim: c_int) ?c_int {
+    const vector_hd = head_dim == 64 or head_dim == 96 or head_dim == 128 or head_dim == 256;
+    if (!vector_hd or gqa < 1) return null;
+    if (q_len < 2 or q_len >= FUSED256_MIN_Q_LEN) return null;
+    const fits_vector = q_len <= 8 and q_len * gqa <= 32;
+    if (fits_vector) return null;
+    if (q_len > 8 and head_dim != 256) return null;
+    // Measured only at hd 256 (Qwen3.8-Flash-Next, gqa 12). Other head dims
+    // need their own per-arch A/B before this default-on path reaches them.
+    if (head_dim != 256) return null;
+    return @min(8, @max(1, @divTrunc(32, gqa)));
+}
+
+/// Width-wall query split for dense causal spec-verify blocks (B==1). MLX's
+/// vector sdpa kernel serves q_len * gqa <= 32 (q_len <= 8), so a wider
+/// verify block otherwise runs the unfused fallback (~8 dispatches, scores
+/// materialized). Rows split into groups of min(8, 32/gqa): 5 at gqa 6, 2 at
+/// gqa 12 (Qwen3.8-Flash-Next). Group [r0, r1) runs "causal" over keys[0 ..
+/// kL-(qL-r1)]; bottom-right alignment then gives row r the window
+/// kL-qL+r, the same one a width-(r1-r0) round at that offset gets. K/V are
+/// views, never recomputed. Returns null outside the envelope — the caller
+/// falls through to the single sdpa call. Generalizes the Layr-Labs
 /// qwen-3.8-mtp-challenge width-wall split (see NOTICE).
 pub fn splitCausalSdpa(
     s: mlx.mlx_stream,
@@ -6911,59 +6929,55 @@ pub fn splitCausalSdpa(
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
-    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    const hd = qs[3];
+    if (ks[3] != hd or vs[3] != hd) return null;
     if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1) return null;
-    if (qs[2] < 6 or qs[2] > 9) return null;
-    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1]) return null;
-
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[1] < 1) return null;
+    if (@rem(qs[1], ks[1]) != 0) return null;
     const qL = qs[2];
     const kL = ks[2];
-    const split: c_int = 5;
-    const k_split: c_int = kL - (qL - split);
+    const gqa = @divTrunc(qs[1], ks[1]);
+    const group = causalSplitGroupRows(qL, gqa, hd) orelse return null;
+    // Fallback-only: where the caller's single call force-fuses onto MLX's
+    // NAX kernel (hd 256, qL > 8), that one dispatch beats any split.
+    if (sdpaForceFusedFor(naxSdpaPreferred(), qL, kL, hd)) return null;
+
     const strides = [_]c_int{ 1, 1, 1, 1 };
-
-    // Chunk A: rows 0..<5 vs keys[0 .. kL-(qL-5)] — row i's bottom-right
-    // causal window is exactly the one a width-5 round at this offset gets.
-    var q_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_a);
-    var k_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_a);
-    var v_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_a);
-    const zero4 = [_]c_int{ 0, 0, 0, 0 };
-    const qa_stop = [_]c_int{ 1, qs[1], split, 256 };
-    const ka_stop = [_]c_int{ 1, ks[1], k_split, 256 };
-    try mlx.check(mlx.mlx_slice(&q_a, q, &zero4, 4, &qa_stop, 4, &strides, 4, s));
-    try mlx.check(mlx.mlx_slice(&k_a, k, &zero4, 4, &ka_stop, 4, &strides, 4, s));
-    try mlx.check(mlx.mlx_slice(&v_a, v, &zero4, 4, &ka_stop, 4, &strides, 4, s));
-
-    // Chunk B: rows 5.. vs the full keys — the follow-up width-(qL-5) round.
-    var q_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_b);
-    const qb_start = [_]c_int{ 0, 0, split, 0 };
-    const qb_stop = [_]c_int{ 1, qs[1], qL, 256 };
-    try mlx.check(mlx.mlx_slice(&q_b, q, &qb_start, 4, &qb_stop, 4, &strides, 4, s));
-
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
-    var out_a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_a);
-    var out_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_b);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_a, q_a, k_a, v_a, scale, "causal", none_mask, .{ .ctx = null }, false, s));
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out_b, q_b, k, v, scale, "causal", none_mask, .{ .ctx = null }, false, s));
-
-    const parts = [_]mlx.mlx_array{ out_a, out_b };
-    const vec = mlx.mlx_vector_array_new_data(&parts, parts.len);
+    var parts = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (parts.items) |a| _ = mlx.mlx_array_free(a);
+        parts.deinit(std.heap.c_allocator);
+    }
+    var r0: c_int = 0;
+    while (r0 < qL) : (r0 += group) {
+        const r1: c_int = @min(r0 + group, qL);
+        const k_end: c_int = kL - (qL - r1);
+        var q_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_g);
+        var k_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_g);
+        var v_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_g);
+        try mlx.check(mlx.mlx_slice(&q_g, q, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, qs[1], r1, hd }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&k_g, k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], k_end, hd }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&v_g, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, vs[1], k_end, hd }, 4, &strides, 4, s));
+        var o_g = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o_g);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o_g, q_g, k_g, v_g, scale, "causal", none_mask, .{ .ctx = null }, false, s));
+        try parts.append(std.heap.c_allocator, o_g);
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
 
-    const log_idx: usize = @intCast(qL - 6);
+    const log_idx: usize = @intCast(qL);
     if (!sdpa_split_logged[log_idx]) {
         sdpa_split_logged[log_idx] = true;
-        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1] });
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} rows/group={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1], group });
     }
     return out;
 }
@@ -10791,6 +10805,284 @@ pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.ml
         try xfm.qsaAppendPooled(entry, new3, nb_cached);
     }
     try xfm.qsaAppendKeys(entry, chunk, offset);
+}
+
+/// Elements whose f32 bit patterns differ (bf16 → f32 is exact, so this is bf16 bit identity, ±0 and NaN included).
+fn qsaIdxBitMismatches(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !usize {
+    var a_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_c);
+    var b_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b_c);
+    try mlx.check(mlx.mlx_contiguous(&a_c, a, false, s));
+    try mlx.check(mlx.mlx_contiguous(&b_c, b, false, s));
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a_c, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b_c, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    const n = mlx.mlx_array_size(a32);
+    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
+    var bad: usize = 0;
+    for (0..n) |i| {
+        if (@as(u32, @bitCast(ad[i])) != @as(u32, @bitCast(bd[i]))) bad += 1;
+    }
+    return bad;
+}
+
+/// Raw index keys `[B, nb, ratio, 128]` bf16 with magnitudes spread over 10^lo_exp..10^hi_exp.
+fn qsaIdxTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f32, hi_exp: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = [_]c_int{ b, nb, ratio, 128 };
+    const n: usize = @intCast(b * nb * ratio * 128);
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    for (data) |*x| {
+        const mag = std.math.pow(f32, 10.0, lo_exp + (hi_exp - lo_exp) * rnd.float(f32));
+        x.* = if (rnd.boolean()) mag else -mag;
+    }
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
+    return out;
+}
+
+/// Fused vs composed pooled keys for one case; returns the bit-mismatch count (fails if the kernel declines).
+fn qsaIdxRopeCase(xfm: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: c_int, table_scale: ?f32) !usize {
+    const s = xfm.s;
+    const rope_dims: c_int = 64;
+    const nb = mlx.getShape(kb4)[1];
+    const ratio: f32 = @floatFromInt(mlx.getShape(kb4)[2]);
+    var cs = try xfm.ropeCosSinFromFreqs(rope_dims, try xfm.ropeInvFreq(rope_dims, xfm.config.rope_theta), @floatFromInt(base), ratio, nb, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    if (table_scale) |m| {
+        // YaRN tables arrive pre-multiplied by mscale in bf16; the kernel must read them as-is.
+        const ms = try scalarOf(m, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(ms);
+        var c2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&c2, cs.cos, ms, s));
+        _ = mlx.mlx_array_free(cs.cos);
+        cs.cos = c2;
+        var s2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&s2, cs.sin, ms, s));
+        _ = mlx.mlx_array_free(cs.sin);
+        cs.sin = s2;
+    }
+    const pn = try xfm.qsaPoolNorm(kb4, norm_w);
+    defer _ = mlx.mlx_array_free(pn);
+    const want = try xfm.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+    defer _ = mlx.mlx_array_free(want);
+    const got = (try qsaPoolNormRopeFused(s, kb4, norm_w, xfm.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(got);
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    return qsaIdxBitMismatches(want, got, s);
+}
+
+fn qsaIdxRopeTestXfm(s: mlx.mlx_stream) Transformer {
+    var xfm: Transformer = undefined;
+    xfm.rht = null;
+    xfm.s = s;
+    xfm.allocator = std.testing.allocator;
+    xfm.config = .{};
+    xfm.config.rms_norm_eps = 1e-6;
+    xfm.config.rope_theta = 10_000_000.0;
+    return xfm;
+}
+
+// Bar: the fused pooled-key kernel is bit-identical to the composed chain at every
+// block count, position, table scale and key dynamic range the indexer can hand it.
+test "qsa pooled keys: fused mean+norm+rope kernel is bit-identical to the composed chain" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x1D8_0BE5);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    // { batch, blocks, base position, lo exp, hi exp }
+    const cases = [_][5]f32{
+        .{ 1, 1, 0, -1, 0.5 }, // first block: cos 1, sin 0
+        .{ 1, 1, 2052, -1, 0.5 }, // verify S=4 just past the budget
+        .{ 1, 1, 32772, -1, 0.5 }, // past 32k
+        .{ 1, 1, 131080, -1, 0.5 }, // past 128k
+        .{ 1, 1, 1_000_000, -1, 0.5 }, // 1M context
+        .{ 1, 2, 16000, -1, 0.5 }, // S=8 verify: two blocks
+        .{ 1, 512, 0, -1, 0.5 }, // 2048-token prefill chunk
+        .{ 1, 37, 8196, -3, 4 }, // wide range: f32 block sums round
+        .{ 2, 5, 4096, -1, 0.5 }, // batch 2
+    };
+    for (cases) |c| {
+        const kb4 = try qsaIdxTestKeys(rnd, @intFromFloat(c[0]), @intFromFloat(c[1]), 4, c[3], c[4], s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const bad = try qsaIdxRopeCase(&xfm, kb4, norm_w, @intFromFloat(c[2]), null);
+        if (bad != 0) std.debug.print("qsa idx rope case {any}: {d} mismatches\n", .{ c, bad });
+        try std.testing.expectEqual(@as(usize, 0), bad);
+    }
+    // YaRN-scaled table.
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 3, 4, -1, 0.5, s);
+    defer _ = mlx.mlx_array_free(kb4);
+    try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 65540, 1.2071));
+}
+
+// Bar: a strided kb4 view (the live k_raw slice of the [S, (n+1)*128] indexer
+// projection, and the leftover+chunk concat) gives the same bits as a packed one.
+test "qsa pooled keys: fused kernel reads a strided raw-key view bit-identically" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x5171_DE);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const qk = try attn256RandBf16(rnd, &[_]c_int{ 1, 12, 5 * 128 }, s);
+    defer _ = mlx.mlx_array_free(qk);
+    var k_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_raw);
+    try mlx.check(mlx.mlx_slice(&k_raw, qk, &[_]c_int{ 0, 0, 4 * 128 }, 3, &[_]c_int{ 1, 12, 5 * 128 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var kb4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kb4);
+    try mlx.check(mlx.mlx_reshape(&kb4, k_raw, &[_]c_int{ 1, 3, 4, 128 }, 4, s));
+    try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 2048, null));
+}
+
+// Bar: shapes the kernel does not mirror decline (null) so the caller keeps the chain.
+test "qsa pooled keys: fused kernel declines non-bf16 weights and non-128 heads" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+    const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 0, 4, 1, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 1, 4, -1, 0.5, s);
+    defer _ = mlx.mlx_array_free(kb4);
+    const w_bf = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w_bf);
+    var w32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w32);
+    try mlx.check(mlx.mlx_astype(&w32, w_bf, .float32, s));
+    try std.testing.expect((try qsaPoolNormRopeFused(s, kb4, w32, 1e-6, cs.cos, cs.sin, 64)) == null);
+    const kb64 = try attn256RandBf16(rnd, &[_]c_int{ 1, 1, 4, 64 }, s);
+    defer _ = mlx.mlx_array_free(kb64);
+    const w64 = try testRandUniformBf16(rnd, &[_]c_int{64}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(w64);
+    try std.testing.expect((try qsaPoolNormRopeFused(s, kb64, w64, 1e-6, cs.cos, cs.sin, 64)) == null);
+    // Sanity: the supported shape does engage.
+    const got = (try qsaPoolNormRopeFused(s, kb4, w_bf, 1e-6, cs.cos, cs.sin, 64)) orelse return error.FusedDeclined;
+    _ = mlx.mlx_array_free(got);
+}
+
+/// Keys `[1, nb, ratio, 128]` whose f32 block sums depend on the add order: even
+/// columns hold 2^24, -2^24 (half a block later) and 1s, rotated per column and
+/// block, so row-order and tree-order sums disagree; odd columns are small noise.
+fn qsaIdxCancelKeys(rnd: std.Random, nb: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const r: usize = @intCast(ratio);
+    const n: usize = @as(usize, @intCast(nb)) * r * 128;
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    for (0..@intCast(nb)) |b| {
+        for (0..128) |c| {
+            for (0..r) |row| {
+                const at = (b * r + row) * 128 + c;
+                if (c % 2 == 1) {
+                    data[at] = rnd.float(f32) - 0.5;
+                    continue;
+                }
+                const p = (row + c / 2 + b) % r;
+                data[at] = if (r > 1 and p == 0) 16777216.0 else if (r > 1 and p == r / 2) -16777216.0 else 1.0;
+            }
+        }
+    }
+    const shape = [_]c_int{ 1, nb, ratio, 128 };
+    const f = mlx.mlx_array_new_data(data.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
+    return out;
+}
+
+// Bar: at every ratio the kernel serves (1..8), order-sensitive block sums still
+// match the composed mean bit for bit; past 8, MLX's reduce order differs, so
+// the kernel declines and the composed chain runs.
+test "qsa pooled keys: fused kernel matches order-sensitive sums at ratios 1..8, declines past 8" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0xCA2CE1);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    for ([_]c_int{ 1, 2, 3, 4, 8 }) |ratio| {
+        const kb4 = try qsaIdxCancelKeys(rnd, 9, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const bad = try qsaIdxRopeCase(&xfm, kb4, norm_w, 4096, null);
+        if (bad != 0) std.debug.print("qsa idx cancel ratio {d}: {d} mismatches\n", .{ ratio, bad });
+        try std.testing.expectEqual(@as(usize, 0), bad);
+        const rk = try qsaIdxTestKeys(rnd, 1, 5, ratio, -3, 4, s);
+        defer _ = mlx.mlx_array_free(rk);
+        try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, rk, norm_w, 8192, null));
+    }
+    for ([_]c_int{ 9, 16, 32 }) |ratio| {
+        const kb4 = try qsaIdxCancelKeys(rnd, 3, ratio, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 4096, @floatFromInt(ratio), 3, .bfloat16);
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        try std.testing.expect((try qsaPoolNormRopeFused(s, kb4, norm_w, 1e-6, cs.cos, cs.sin, 64)) == null);
+        // The composed chain the caller falls back to still serves the shape.
+        const pn = try xfm.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const want = try xfm.qsaPooledRopeComposed(pn, 64, cs.cos, cs.sin);
+        defer _ = mlx.mlx_array_free(want);
+        try std.testing.expect(qsaProbeAllFinite(s, want));
+        try std.testing.expectEqualSlices(c_int, &[_]c_int{ 1, 3, 128 }, mlx.getShape(want));
+    }
+}
+
+// Bar: the block count is a runtime input, so decode (1 block), verify (2) and a
+// prefill chunk (512) share ONE pipeline and stay bit-identical.
+test "qsa pooled keys: block counts 1, 2, 7, 512 share one fused pipeline" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var xfm = qsaIdxRopeTestXfm(s);
+    var prng = std.Random.DefaultPrng.init(0x919E);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    var after_first: ?usize = null;
+    for ([_]c_int{ 1, 2, 7, 512, 1 }) |nb| {
+        const kb4 = try qsaIdxTestKeys(rnd, 1, nb, 4, -1, 0.5, s);
+        defer _ = mlx.mlx_array_free(kb4);
+        try std.testing.expectEqual(@as(usize, 0), try qsaIdxRopeCase(&xfm, kb4, norm_w, 4096, null));
+        if (after_first == null) after_first = qsaPoolRopePipelineCount();
+        try std.testing.expectEqual(after_first.?, qsaPoolRopePipelineCount());
+    }
+}
+
+// Bar: a CPU stream never reaches the Metal kernel; the caller keeps the chain.
+test "qsa pooled keys: fused kernel declines a non-GPU stream" {
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try std.testing.expect(!mlx.streamIsGpu(cpu));
+    var xfm = qsaIdxRopeTestXfm(cpu);
+    var prng = std.Random.DefaultPrng.init(0xC9C);
+    const rnd = prng.random();
+    const norm_w = try testRandUniformBf16(rnd, &[_]c_int{128}, 0.25, 1.75, cpu);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const kb4 = try qsaIdxTestKeys(rnd, 1, 2, 4, -1, 0.5, cpu);
+    defer _ = mlx.mlx_array_free(kb4);
+    const cs = try xfm.ropeCosSinFromFreqs(64, try xfm.ropeInvFreq(64, xfm.config.rope_theta), 0, 4, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    const before = qsaPoolRopePipelineCount();
+    try std.testing.expect((try qsaPoolNormRopeFused(cpu, kb4, norm_w, 1e-6, cs.cos, cs.sin, 64)) == null);
+    try std.testing.expectEqual(before, qsaPoolRopePipelineCount());
 }
 
 test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identically to a full bank" {
@@ -19690,8 +19982,8 @@ pub const Transformer = struct {
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = fused;
                 } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
-                    // Verify-width (6..9) dense blocks: two vector-path halves
-                    // beat MLX's internal hd-256 fallback.
+                    // Verify widths past the vector wall (qL*gqa > 32): vector-path
+                    // row groups beat MLX's unfused fallback.
                     _ = mlx.mlx_array_free(attn_out);
                     attn_out = split_out;
                 } else {
@@ -21909,6 +22201,63 @@ pub const Transformer = struct {
         return cs;
     }
 
+    /// Pooled block keys `[B, nb, D]` from raw index keys `kb4 [B, nb, ratio, D]`:
+    /// f32 block mean → bf16 → idx_k_norm → partial RoPE at the block-start
+    /// positions `base + i*ratio`. One fused kernel on text turns, bit-identical
+    /// to the composed chain; M-RoPE and odd shapes keep the chain.
+    fn qsaPooledKeys(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(kb4);
+        if (ctx.mrope_pos == null and qsaIdxRopeFusedEnabled() and mlx.mlx_array_dtype(norm_w) == .bfloat16) {
+            const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], .bfloat16);
+            if (try qsaPoolNormRopeFused(self.s, kb4, norm_w, self.config.rms_norm_eps, cs.cos, cs.sin, rope_dims)) |out| return out;
+        }
+        return self.qsaPooledKeysComposed(ctx, kb4, norm_w, rope_dims, base);
+    }
+
+    /// The composed reference for `qsaPooledKeys` (and its M-RoPE arm).
+    fn qsaPooledKeysComposed(self: *Transformer, ctx: *ForwardCtx, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, rope_dims: c_int, base: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(kb4);
+        const pn = try self.qsaPoolNorm(kb4, norm_w);
+        defer _ = mlx.mlx_array_free(pn);
+        const cs = try self.qsaPooledCosSin(ctx, rope_dims, base, sh[2], sh[1], mlx.mlx_array_dtype(pn));
+        if (ctx.mrope_pos == null) return self.qsaPooledRopeComposed(pn, rope_dims, cs.cos, cs.sin);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const new_rope = try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims);
+        defer _ = mlx.mlx_array_free(new_rope);
+        var new3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ sh[0], sh[1], sh[3] }, 3, self.s));
+        return new3;
+    }
+
+    /// `rms_norm(bf16(mean_f32(kb4, axis 2)), w)` → `[B, nb, D]`.
+    fn qsaPoolNorm(self: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array) !mlx.mlx_array {
+        var kb_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kb_f32);
+        try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
+        var pooled_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled_f32);
+        try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
+        var pooled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pooled);
+        try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
+        return self.rmsNorm(pooled, norm_w);
+    }
+
+    /// Scalar partial RoPE of normed pooled keys `pn [B, nb, D]` with row-i cos/sin `[nb, rope_dims]`.
+    fn qsaPooledRopeComposed(self: *Transformer, pn: mlx.mlx_array, rope_dims: c_int, cosv: mlx.mlx_array, sinv: mlx.mlx_array) !mlx.mlx_array {
+        const sh = mlx.getShape(pn);
+        var pn4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pn4);
+        try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
+        const roped = try self.ropeApplyCosSin(pn4, rope_dims, cosv, sinv);
+        defer _ = mlx.mlx_array_free(roped);
+        var new3 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&new3, roped, &[_]c_int{ sh[0], sh[1], sh[2] }, 3, self.s));
+        return new3;
+    }
+
     /// QSA: append this chunk's raw index keys to the layer's history and,
     /// past the token budget, build the block-selection mask. Returns the
     /// bool `[B,1,S,kv]` mask or null-ctx for dense attention.
@@ -22073,29 +22422,8 @@ pub const Transformer = struct {
             var kb4 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kb4);
             try mlx.check(mlx.mlx_reshape(&kb4, kb_flat, &kb_shape, 4, self.s));
-            var kb_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(kb_f32);
-            try mlx.check(mlx.mlx_astype(&kb_f32, kb4, .float32, self.s));
-            var pooled_f32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled_f32);
-            try mlx.check(mlx.mlx_mean_axis(&pooled_f32, kb_f32, 2, false, self.s));
-            var pooled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pooled);
-            try mlx.check(mlx.mlx_astype(&pooled, pooled_f32, .bfloat16, self.s));
-            const pn = try self.rmsNorm(pooled, fa.idx_k_norm);
-            defer _ = mlx.mlx_array_free(pn);
-            var pn4 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(pn4);
-            try mlx.check(mlx.mlx_expand_dims(&pn4, pn, 1, self.s));
-            const cs = try self.qsaPooledCosSin(ctx, rope_dims, pos_base + nb_cached * ratio, ratio, n_new, mlx.mlx_array_dtype(pn4));
-            const new_rope = if (ctx.mrope_pos != null)
-                try self.applyMrope(pn4, cs.cos, cs.sin, rope_dims)
-            else
-                try self.ropeApplyCosSin(pn4, rope_dims, cs.cos, cs.sin);
-            defer _ = mlx.mlx_array_free(new_rope);
-            var new3 = mlx.mlx_array_new();
+            const new3 = try self.qsaPooledKeys(ctx, kb4, fa.idx_k_norm, rope_dims, pos_base + nb_cached * ratio);
             defer _ = mlx.mlx_array_free(new3);
-            try mlx.check(mlx.mlx_reshape(&new3, new_rope, &[_]c_int{ batch, n_new, idx_hd }, 3, self.s));
             try self.qsaAppendPooled(entry, new3, nb_cached);
         }
 
@@ -26093,8 +26421,8 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (try splitCausalSdpa(self.s, q_rope, full_k, full_v, attn_scale)) |split_out| {
-                // Verify-width (6..9) dense blocks: two vector-path halves
-                // beat MLX's internal hd-256 fallback.
+                // Verify widths past the vector wall (qL*gqa > 32): vector-path
+                // row groups beat MLX's unfused fallback.
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = split_out;
             } else {
@@ -34568,6 +34896,188 @@ pub fn gdnNormGateFused(
     if (!gdn_normgate_engaged) {
         gdn_normgate_engaged = true;
         log.info("[gdn] fused norm-gate engaged: Hv={d} S={d} gate={s}\n", .{ hv, seq, if (swish) "swish" else "sigmoid" });
+    }
+    return out;
+}
+
+// ── Fused QSA pooled-key upkeep ──
+pub var qsa_idx_rope_fused_override: ?bool = null;
+var qsa_idx_rope_fused_env: ?bool = null;
+
+/// `MLX_SERVE_QSA_IDX_ROPE_FUSED=0` restores the composed pooled-key chain.
+pub fn qsaIdxRopeFusedEnabled() bool {
+    if (qsa_idx_rope_fused_override) |v| return v;
+    if (qsa_idx_rope_fused_env) |v| return v;
+    const v = blk: {
+        const raw = std.c.getenv("MLX_SERVE_QSA_IDX_ROPE_FUSED") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    qsa_idx_rope_fused_env = v;
+    return v;
+}
+
+// Mirrors each rounding of the composed chain it replaces, so it is bit-identical:
+//   mean  = f32 sum in row order r = 0..R-1, times f32(1/R) (MLX
+//           NumberOfElements), then bf16. That order is MLX's only while
+//           R <= QSA_POOL_SERIAL_MAX_R (see there);
+//   norm  = `rms_single_row` at D = 128 (32 lanes x 4 reads, simd_sum, precise
+//           rsqrt, `w * T(x * inv)`);
+//   rope  = the bf16 cos/sin table and bf16(bf16(x*cos) + bf16(rot*sin)), with
+//           each product and the sum rounded as MLX's separate binary kernels do.
+// One simdgroup per pooled row; lane l owns dims 4l..4l+3, and rotate_half's
+// partner (d +- HALF) is HALF/4 lanes away at the same slot. The block count
+// `nblk` varies per call (1 at decode, up to 512 per prefill chunk), so it is a
+// scalar INPUT; the templates (T, R, RD, HALF) are fixed per model and name the
+// one pipeline MLX compiles.
+const QSA_POOL_ROPE_SOURCE =
+    \\uint lane = thread_position_in_threadgroup.x;
+    \\uint row = threadgroup_position_in_grid.y;
+    \\uint blk = row % uint(nblk);
+    \\uint kbase = row * uint(R * 128) + lane * 4;
+    \\float xs[4];
+    \\float sumsq = 0.0f;
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    float acc = 0.0f;
+    \\    for (uint r = 0; r < uint(R); ++r) acc = float(kb[kbase + r * 128 + j]) + acc;
+    \\    const T pooled = T(acc * inv_r);
+    \\    xs[j] = float(pooled);
+    \\    sumsq += xs[j] * xs[j];
+    \\}
+    \\sumsq = simd_sum(sumsq);
+    \\float inv = metal::precise::rsqrt(sumsq / 128.0f + eps);
+    \\for (uint j = 0; j < 4; ++j) {
+    \\    const T nv = norm_w[lane * 4 + j] * T(xs[j] * inv);
+    \\    const float nf = float(nv);
+    \\    const float up = simd_shuffle_down(nf, ushort(HALF / 4));
+    \\    const float dn = simd_shuffle_up(nf, ushort(HALF / 4));
+    \\    uint d = lane * 4 + j;
+    \\    T o = nv;
+    \\    if (d < uint(RD)) {
+    \\        const T rot = d < uint(HALF) ? T(-up) : T(dn);
+    \\        const T a = T(nf * float(cosv[blk * RD + d]));
+    \\        const T b = T(float(rot) * float(sinv[blk * RD + d]));
+    \\        o = T(float(a) + float(b));
+    \\    }
+    \\    out[row * 128 + d] = o;
+    \\}
+;
+
+/// Largest block ratio whose f32 block sum MLX folds in row order 0..R-1, the
+/// order the kernel uses. The mean over axis 2 of `[B, nb, R, 128]` is a strided
+/// reduce; below 32 rows `strided_reduce_general_dispatch` picks
+/// `col_reduce_small` with threadgroup_y = min(8, R). Up to 8 rows each y-thread
+/// owns ONE row and lid.y 0 folds them 0..R-1 (R == 1 is a copy). At 9..31 each
+/// thread sums rows y, y+8, ... first, and at 32+ the looped/2pass kernels
+/// reduce in simdgroup trees, so a sum that cancels can differ in f32.
+const QSA_POOL_SERIAL_MAX_R: c_int = 8;
+
+var qsa_pool_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var qsa_pool_rope_engaged: bool = false;
+const QsaPoolRopeCfgKey = struct { b: c_int, nb: c_int, r: c_int, rd: c_int };
+/// Int template values handed to MLX so far (T is always bf16); each distinct
+/// tuple is a pipeline compile.
+const QsaPoolRopeTpl = [4]c_int;
+var qsa_pool_rope_tpls: [64]QsaPoolRopeTpl = undefined;
+var qsa_pool_rope_tpl_count: usize = 0;
+
+/// Distinct kernel pipelines (template tuples) the fused pooled-key helper has requested.
+pub fn qsaPoolRopePipelineCount() usize {
+    return qsa_pool_rope_tpl_count;
+}
+
+fn qsaPoolRopeNoteTemplate(t: QsaPoolRopeTpl) void {
+    const kept = @min(qsa_pool_rope_tpl_count, qsa_pool_rope_tpls.len);
+    for (qsa_pool_rope_tpls[0..kept]) |seen| {
+        if (std.meta.eql(seen, t)) return;
+    }
+    // Past the table, every unseen tuple still counts: an overcount, never a miss.
+    if (kept < qsa_pool_rope_tpls.len) qsa_pool_rope_tpls[kept] = t;
+    qsa_pool_rope_tpl_count += 1;
+}
+var qsa_pool_rope_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var qsa_pool_rope_cfg_key: QsaPoolRopeCfgKey = std.mem.zeroes(QsaPoolRopeCfgKey);
+
+fn getQsaPoolRopeKernel() !mlx.mlx_fast_metal_kernel {
+    if (qsa_pool_rope_kernel) |k| return k;
+    const input_names = [_][*:0]const u8{ "kb", "norm_w", "cosv", "sinv", "eps", "inv_r", "nblk" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_qsa_pool_rope", in_vec, out_vec, QSA_POOL_ROPE_SOURCE, "", true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    qsa_pool_rope_kernel = kernel;
+    return kernel;
+}
+
+/// Pooled block keys in one launch: f32 block mean → bf16 → rms_norm(w) →
+/// partial RoPE with the bf16 cos/sin table `[nb, rope_dims]`. Null → the
+/// caller runs the composed chain (`qsaPoolNorm` + `qsaPooledRopeComposed`).
+pub fn qsaPoolNormRopeFused(
+    s: mlx.mlx_stream,
+    kb4: mlx.mlx_array, // [B, nb, R, D] bf16
+    norm_w: mlx.mlx_array, // [D] bf16
+    eps: f32,
+    cosv: mlx.mlx_array, // [nb, rope_dims] bf16
+    sinv: mlx.mlx_array,
+    rope_dims: c_int,
+) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const ksh = mlx.getShape(kb4);
+    const wsh = mlx.getShape(norm_w);
+    const csh = mlx.getShape(cosv);
+    if (ksh.len != 4 or ksh[3] != 128 or ksh[1] < 1 or ksh[2] < 1 or ksh[2] > QSA_POOL_SERIAL_MAX_R) return null;
+    if (wsh.len != 1 or wsh[0] != 128) return null;
+    // rotate_half's partner must sit whole lanes away: HALF a multiple of 4.
+    if (rope_dims <= 0 or rope_dims > 128 or @mod(rope_dims, 8) != 0) return null;
+    if (csh.len != 2 or csh[0] != ksh[1] or csh[1] != rope_dims) return null;
+    if (!std.mem.eql(c_int, csh, mlx.getShape(sinv))) return null;
+    inline for (.{ kb4, norm_w, cosv, sinv }) |arr| {
+        if (mlx.mlx_array_dtype(arr) != .bfloat16) return null;
+    }
+    const key = QsaPoolRopeCfgKey{ .b = ksh[0], .nb = ksh[1], .r = ksh[2], .rd = rope_dims };
+    if (qsa_pool_rope_cfg == null or !std.meta.eql(qsa_pool_rope_cfg_key, key)) {
+        if (qsa_pool_rope_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        qsa_pool_rope_cfg = null;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        const out_shape = [_]c_int{ ksh[0], ksh[1], 128 };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, ksh[0] * ksh[1], 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        const tpl_names = [_][*:0]const u8{ "R", "RD", "HALF" };
+        const tpl_vals = [_]c_int{ ksh[2], rope_dims, @divExact(rope_dims, 2) };
+        var noted: QsaPoolRopeTpl = .{ 0, 0, 0, 0 };
+        for (tpl_names, tpl_vals, 0..) |n, v, i| {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, n, v));
+            noted[i] = v;
+        }
+        qsaPoolRopeNoteTemplate(noted);
+        qsa_pool_rope_cfg = config;
+        qsa_pool_rope_cfg_key = key;
+    }
+    const kernel = try getQsaPoolRopeKernel();
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    // MLX's mean multiplies by NumberOfElements: f32(1.0 / n) computed in f64.
+    const inv_r = mlx.mlx_array_new_float(@floatCast(1.0 / @as(f64, @floatFromInt(ksh[2]))));
+    defer _ = mlx.mlx_array_free(inv_r);
+    const nblk = mlx.mlx_array_new_int(ksh[1]);
+    defer _ = mlx.mlx_array_free(nblk);
+    const inputs_arr = [_]mlx.mlx_array{ kb4, norm_w, cosv, sinv, eps_a, inv_r, nblk };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    if (!qsa_pool_rope_engaged) {
+        qsa_pool_rope_engaged = true;
+        log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d}) — MLX_SERVE_QSA_IDX_ROPE_FUSED=0 restores the composed chain\n", .{ ksh[1], ksh[2], rope_dims });
     }
     return out;
 }
@@ -53713,37 +54223,136 @@ fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !
     return max_diff;
 }
 
-test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..9)" {
+const CausalSplitCase = struct { hq: c_int, hkv: c_int, ql: c_int, kv: c_int, hd: c_int };
+
+fn causalSplitCaseArrays(rnd: std.Random, c: CausalSplitCase, s: mlx.mlx_stream) ![3]mlx.mlx_array {
+    const kL = c.kv + c.ql;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hq, c.ql, c.hd }, s);
+    errdefer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hkv, kL, c.hd }, s);
+    errdefer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &[_]c_int{ 1, c.hkv, kL, c.hd }, s);
+    return .{ q, k, v };
+}
+
+/// Row r of a bottom-right causal block sees keys 0 .. kL-qL+r. One qL=1
+/// vector call per row over exactly that prefix: an offset reference that
+/// does not go through MLX's causal fallback.
+fn causalPerRowReference(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    const none = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none);
+    var parts = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (parts.items) |a| _ = mlx.mlx_array_free(a);
+        parts.deinit(std.testing.allocator);
+    }
+    var r: c_int = 0;
+    while (r < qs[2]) : (r += 1) {
+        const kend = ks[2] - qs[2] + r + 1;
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_slice(&q_r, q, &[_]c_int{ 0, 0, r, 0 }, 4, &[_]c_int{ 1, qs[1], r + 1, qs[3] }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&k_r, k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], kend, ks[3] }, 4, &strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&v_r, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, ks[1], kend, ks[3] }, 4, &strides, 4, s));
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q_r, k_r, v_r, scale, "", none, .{ .ctx = null }, false, s));
+        try parts.append(std.testing.allocator, o);
+    }
+    const vec = mlx.mlx_vector_array_new_data(parts.items.ptr, parts.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
+    return out;
+}
+
+test "splitCausalSdpa: gqa-aware groups match one causal sdpa across widths, kv and head dims" {
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x5D9A);
     const rnd = prng.random();
-
-    // Qwen3.6-27B verify geometry: gqa 6 (24/4 scaled to 6/2 hd 256), long-ish
-    // KV so the chunk-A window (kL - (qL-5)) differs measurably from full kL.
-    const kL: c_int = 193;
-    var qL: c_int = 6;
-    while (qL <= 9) : (qL += 1) {
-        const q_shape = [_]c_int{ 1, 6, qL, 256 };
-        const kv_shape = [_]c_int{ 1, 2, kL, 256 };
-        const q = try attn256RandBf16(rnd, &q_shape, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try attn256RandBf16(rnd, &kv_shape, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try attn256RandBf16(rnd, &kv_shape, s);
-        defer _ = mlx.mlx_array_free(v);
-        const scale: f32 = 1.0 / 16.0;
-
-        const split = (try splitCausalSdpa(s, q, k, v, scale)) orelse return error.SplitDeclined;
+    const cases = [_]CausalSplitCase{
+        // Qwen3.8-Flash-Next: gqa 12 (24/2), 2 rows per group.
+        .{ .hq = 24, .hkv = 2, .ql = 3, .kv = 1, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 1, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 6, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+        // kL >= 1024: MLX's 2-pass vector kernel on Max/Ultra.
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 2051, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 2051, .hd = 256 },
+        // gqa 6 (27B geometry): 6..9 as before, 10..15 now split too.
+        .{ .hq = 12, .hkv = 2, .ql = 6, .kv = 187, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 9, .kv = 184, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+        // gqa 32: 1-row groups. gqa 3 at qL 11: an 8-row group + 3.
+        .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 100, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 11, .kv = 100, .hd = 256 },
+        // gqa 8 (gemma-like hd 256): 4-row groups.
+        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 1, .hd = 256 },
+    };
+    const scale: f32 = 1.0 / 16.0;
+    for (cases) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], scale)) orelse {
+            std.debug.print("split declined: {any}\n", .{c});
+            return error.SplitDeclined;
+        };
         defer _ = mlx.mlx_array_free(split);
-        const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+        // Tolerance, not byte-identity: the single call is MLX's unfused
+        // fallback, a different reduction order (the verify-lane rule).
+        const ref = try attn256Reference(arrs[0], arrs[1], arrs[2], scale, "causal", .{ .ctx = null }, s);
         defer _ = mlx.mlx_array_free(ref);
-
-        // Tolerance, not byte-identity: the split changes which sdpa kernel
-        // runs and therefore the reduction order (the verify-lane rule).
         const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        if (max_diff >= 0.005) std.debug.print("case {any}: max diff {d}\n", .{ c, max_diff });
         try std.testing.expect(max_diff < 0.005);
+    }
+}
+
+test "splitCausalSdpa: every row sees exactly its causal window (bit-identical to per-row vector calls below kL 1024)" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DA1);
+    const rnd = prng.random();
+    // kL < 1024 keeps both sides on the 1-pass vector kernel, which skips
+    // masked keys, so each row's math depends only on its key set.
+    const cases = [_]CausalSplitCase{
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 37, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 9, .kv = 100, .hd = 256 },
+        .{ .hq = 32, .hkv = 1, .ql = 3, .kv = 1, .hd = 256 },
+        .{ .hq = 16, .hkv = 2, .ql = 7, .kv = 100, .hd = 256 },
+    };
+    const scale: f32 = 1.0 / 16.0;
+    for (cases) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], scale)) orelse return error.SplitDeclined;
+        defer _ = mlx.mlx_array_free(split);
+        const ref = try causalPerRowReference(arrs[0], arrs[1], arrs[2], scale, s);
+        defer _ = mlx.mlx_array_free(ref);
+        const max_diff = try attn256FiniteMaxDiff(split, ref, s);
+        if (max_diff != 0) std.debug.print("case {any}: max diff {d}\n", .{ c, max_diff });
+        try std.testing.expect(max_diff == 0);
     }
 }
 
@@ -53751,53 +54360,91 @@ test "splitCausalSdpa: declines outside its envelope" {
     const s = mlx.gpuStream();
     sdpa_split_override = true;
     defer sdpa_split_override = null;
+    nax_sdpa_override = false;
+    defer nax_sdpa_override = null;
     var prng = std.Random.DefaultPrng.init(0x5DEC);
     const rnd = prng.random();
+    const declines = [_]CausalSplitCase{
+        // The vector kernel already serves qL*gqa <= 32.
+        .{ .hq = 24, .hkv = 2, .ql = 2, .kv = 64, .hd = 256 },
+        .{ .hq = 12, .hkv = 2, .ql = 5, .kv = 64, .hd = 256 },
+        .{ .hq = 6, .hkv = 2, .ql = 7, .kv = 64, .hd = 128 },
+        // qL > 8 below hd 256: MLX's fused full kernel serves it.
+        .{ .hq = 6, .hkv = 2, .ql = 10, .kv = 64, .hd = 128 },
+        // Below hd 256 the split is unmeasured, so it declines even past the
+        // vector wall (Llama/Mistral hd 128 gqa 8, hd 64).
+        .{ .hq = 32, .hkv = 4, .ql = 6, .kv = 64, .hd = 128 },
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 64, .hd = 128 },
+        .{ .hq = 16, .hkv = 2, .ql = 5, .kv = 64, .hd = 64 },
+        // qL >= 16: fusedSdpa256Prefill's range.
+        .{ .hq = 24, .hkv = 2, .ql = 16, .kv = 64, .hd = 256 },
+        // hd 192: MLX prefers its unfused path there.
+        .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 64, .hd = 192 },
+        // Decode width.
+        .{ .hq = 24, .hkv = 2, .ql = 1, .kv = 64, .hd = 256 },
+    };
+    for (declines) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if ((try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) != null) {
+            std.debug.print("split engaged outside envelope: {any}\n", .{c});
+            return error.SplitEngaged;
+        }
+    }
 
-    const kv_shape = [_]c_int{ 1, 2, 64, 256 };
-    const k = try attn256RandBf16(rnd, &kv_shape, s);
-    defer _ = mlx.mlx_array_free(k);
-
-    // q_len 5 (vector path already serves it) and 10 (above the split window).
-    const q5_shape = [_]c_int{ 1, 6, 5, 256 };
-    const q5 = try attn256RandBf16(rnd, &q5_shape, s);
-    defer _ = mlx.mlx_array_free(q5);
-    try std.testing.expect((try splitCausalSdpa(s, q5, k, k, 1.0)) == null);
-    const q10_shape = [_]c_int{ 1, 6, 10, 256 };
-    const q10 = try attn256RandBf16(rnd, &q10_shape, s);
-    defer _ = mlx.mlx_array_free(q10);
-    try std.testing.expect((try splitCausalSdpa(s, q10, k, k, 1.0)) == null);
-
-    // Batch 2 -> null (their gate; the exactness argument is B==1 only).
-    const qb_shape = [_]c_int{ 2, 6, 7, 256 };
-    const qb = try attn256RandBf16(rnd, &qb_shape, s);
+    // Batch 2 -> null (the exactness argument is B==1 only).
+    const qb = try attn256RandBf16(rnd, &[_]c_int{ 2, 24, 4, 256 }, s);
     defer _ = mlx.mlx_array_free(qb);
-    const kb_shape = [_]c_int{ 2, 2, 64, 256 };
-    const kb = try attn256RandBf16(rnd, &kb_shape, s);
+    const kb = try attn256RandBf16(rnd, &[_]c_int{ 2, 2, 64, 256 }, s);
     defer _ = mlx.mlx_array_free(kb);
     try std.testing.expect((try splitCausalSdpa(s, qb, kb, kb, 1.0)) == null);
 
-    // head_dim 128 -> null (MLX's own full kernel already covers it).
-    const q128_shape = [_]c_int{ 1, 6, 7, 128 };
-    const q128 = try attn256RandBf16(rnd, &q128_shape, s);
-    defer _ = mlx.mlx_array_free(q128);
-    const k128_shape = [_]c_int{ 1, 2, 64, 128 };
-    const k128 = try attn256RandBf16(rnd, &k128_shape, s);
-    defer _ = mlx.mlx_array_free(k128);
-    try std.testing.expect((try splitCausalSdpa(s, q128, k128, k128, 1.0)) == null);
-
     // KV shorter than q -> null (no window to split).
-    const kshort_shape = [_]c_int{ 1, 2, 5, 256 };
-    const kshort = try attn256RandBf16(rnd, &kshort_shape, s);
-    defer _ = mlx.mlx_array_free(kshort);
-    const q7_shape = [_]c_int{ 1, 6, 7, 256 };
-    const q7 = try attn256RandBf16(rnd, &q7_shape, s);
+    const q7 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 7, 256 }, s);
     defer _ = mlx.mlx_array_free(q7);
+    const kshort = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 5, 256 }, s);
+    defer _ = mlx.mlx_array_free(kshort);
     try std.testing.expect((try splitCausalSdpa(s, q7, kshort, kshort, 1.0)) == null);
 
     // Kill switch -> null even for a conforming call.
+    const k = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 64, 256 }, s);
+    defer _ = mlx.mlx_array_free(k);
     sdpa_split_override = false;
     try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
+}
+
+test "splitCausalSdpa: yields to the fused NAX sdpa at hd 256 past 8 rows, still splits below" {
+    const s = mlx.gpuStream();
+    sdpa_split_override = true;
+    defer sdpa_split_override = null;
+    nax_sdpa_override = true;
+    defer nax_sdpa_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5DAA);
+    const rnd = prng.random();
+    // qL > 8 at hd 256 with NAX preferred: the caller's single call runs
+    // MLX's fused NAX kernel (sdpaForceFused), so the split must decline.
+    for ([_]CausalSplitCase{
+        .{ .hq = 12, .hkv = 2, .ql = 10, .kv = 100, .hd = 256 },
+        .{ .hq = 24, .hkv = 2, .ql = 15, .kv = 100, .hd = 256 },
+    }) |c| {
+        const arrs = try causalSplitCaseArrays(rnd, c, s);
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        if ((try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) != null) {
+            std.debug.print("split pre-empted NAX: {any}\n", .{c});
+            return error.SplitEngaged;
+        }
+    }
+    // qL <= 8 never force-fuses (the vector wall would throw): split engages.
+    const arrs = try causalSplitCaseArrays(rnd, .{ .hq = 24, .hkv = 2, .ql = 4, .kv = 100, .hd = 256 }, s);
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) orelse return error.SplitDeclined;
+    _ = mlx.mlx_array_free(split);
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────

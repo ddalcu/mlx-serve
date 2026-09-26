@@ -965,6 +965,7 @@
 
   $('side-toggle').addEventListener('click', function () { $('app').classList.add('collapsed'); });
   $('side-open').addEventListener('click', function () { $('app').classList.remove('collapsed'); });
+  $('theme-toggle').addEventListener('click', function () { window.mlxTheme.toggle(); });
 
   // ── The API reference, read out of the page it is already rendered in ─────
   // One list, not two: the API panel's markup IS the reference the assistant

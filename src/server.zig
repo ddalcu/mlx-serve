@@ -7420,6 +7420,8 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
         // <title> version
         version_esc,
+        // <script> — src/html/theme.js (runs before the stylesheet paints)
+        @embedFile("html/theme.js"),
         // <style> — src/html/app.css
         @embedFile("html/app.css"),
         // header version

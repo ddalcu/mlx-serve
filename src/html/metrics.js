@@ -109,6 +109,15 @@ if (typeof document !== 'undefined') (function () {
 .msparkhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
 .msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9375rem;font-weight:700;color:#e6e9ee}
 .msparkbox svg{width:100%;height:44px;display:block}
+:root[data-theme=light] .mbase{stroke:var(--line)}
+:root[data-theme=light] .mtile,:root[data-theme=light] .msparkbox{background:#fff;border-color:#e1e2e6}
+:root[data-theme=light] .mval,:root[data-theme=light] .msparkval{color:#1e1f22}
+:root[data-theme=light] .mlbl,:root[data-theme=light] .munit{color:#5b616b}
+:root[data-theme=light] .msub{color:#878d96}
+:root[data-theme=light] .mbar{background:#e7e8ec}
+:root[data-theme=light] #m-status{background:#ececf0;color:#5b616b}
+:root[data-theme=light] #m-status.live{background:#e3f5ee;color:#0f7b5f}
+:root[data-theme=light] #m-status.err{background:#fdeceb;color:#b3261e}
 </style>
 <div class=mhead><h2 style="margin:0">Live metrics</h2><span id=m-status>connecting…</span></div>
 <div class=card style="padding:16px">
@@ -174,7 +183,7 @@ if (typeof document !== 'undefined') (function () {
     let m =
       '<polyline points="' + pts + '" fill="none" stroke="' + color +
       '" stroke-width="1.5" stroke-linejoin="round"/>' +
-      '<line x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) +
+      '<line class=mbase x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) +
       '" stroke="#1f242c" stroke-width="1"/>';
     const hi = hover[key];
     if (hi !== null && hi >= 0 && hi < n) {

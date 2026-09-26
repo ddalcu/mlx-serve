@@ -2627,6 +2627,12 @@ one `[sdpa-split] engaged` log per width 6..9 (the FIRST engagement is the
 warmup's own 8-token prefill at kL=8 — a single one-shot log would witness only
 that, never a real verify, which is why the log is per-width).
 
+Update (PR #554): the split is now gqa-aware. Rows go in groups of
+min(8, 32/gqa) (5 at gqa 6, as above; 2 at gqa 12, Qwen3.8-Flash-Next) over
+qL 2..15, hd 256 only, and it yields to the NAX force-fused call past 8 rows.
+The engagement log is per width 2..15. Flash Next S=4 kv 1500 (M5 Ultra,
+fwd-ubench, 6 on/off pairs): 18.89 -> 18.35 ms/forward median.
+
 Measured (M4 Max, Qwen3.6-27B-oQ4e, kv-quant off, PLD draft-len 6 on an 8k echo
 prompt, A/B/B/A boots, medians of 7 reps): split ON 63.3 / 66.7 tok/s, OFF
 60.9 / 61.3 — +4..9%. Engagement asserted per arm (`qL=7 kL=7430` in both ON

@@ -12,11 +12,15 @@
 "%@ available" = "%@ 个可用";
 "%@ chat column" = "%@ 聊天栏";
 "%@ context, KV %@" = "%@ 上下文，KV %@";
+"%@ couldn't be decoded." = "%@ 无法解码。";
+"%@ couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac." = "%@ 无法解码。支持：wav、mp3、m4a、aiff、caf、flac。";
 "%@ free" = "%@ 可用";
 "%@ has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/." = "%@ 目前还没有可下载版本 —— 请用仓库中匹配的脚本在本机转换权重（见其 README）。转换后的权重会安装到 ~/.mlx-serve/models/local/。";
 "%@ in Sandbox" = "在沙盒中 %@";
+"%@ is empty, encrypted, or contains only scanned images (no extractable text)." = "%@ 为空、已加密，或仅包含扫描图片（无法提取文字）。";
 "%@ is taken by another app — kept %@." = "%@ 已被其他应用占用 —— 已保留 %@。";
 "%@ model%@ on disk" = "磁盘上有 %@ 个模型";
+"%@ needs approval" = "%@ 需要批准";
 "%@ now · %@ avg tok/s" = "当前 %@ · 平均 %@ tok/s";
 "%@ of memory · about %@ usable for models" = "%@ 内存 · 约 %@ 可供模型使用";
 "%@ token%@" = "%@ 个 Token";
@@ -138,6 +142,7 @@
 "Add several" = "添加多个";
 "Add the tools from every enabled Model Context Protocol server." = "添加来自每个已启用的 Model Context Protocol 服务器的工具。";
 "Additive penalty per token already present in the context. 0 = none." = "对已出现在上下文中的每个 Token 施加的累加惩罚。0 = 不施加。";
+"Adds your enabled MCP servers' tools. Click to turn it %@; right-click for the Marketplace." = "加入已启用 MCP 服务器的工具。点击可%@；右键打开市场。";
 "Advanced" = "高级";
 "Advanced (overrides Quality preset)" = "高级（覆盖质量预设）";
 "Advanced options" = "高级选项";
@@ -364,6 +369,9 @@
 "Copy this reply" = "复制这条回复";
 "Couldn't Load Results" = "无法加载结果";
 "Couldn't convert the reference audio to 24 kHz mono." = "无法将参考音频转换为 24 kHz 单声道。";
+"Couldn't read PDF" = "无法读取 PDF";
+"Couldn't read audio" = "无法读取音频";
+"Couldn't read video" = "无法读取视频";
 "Cover" = "翻唱";
 "Cover strength" = "翻唱强度";
 "Create" = "新建";
@@ -446,6 +454,7 @@
 "Download %@ (%@ MB)" = "下载 %@（%@ MB）";
 "Download & Install" = "下载并安装";
 "Download (%@)" = "下载（%@）";
+"Download Failed: %@" = "下载失败：%@";
 "Download Models" = "下载模型";
 "Download a chat model from the menu bar to run a benchmark." = "从菜单栏下载一个聊天模型来运行基准测试。";
 "Download a model below to start chatting." = "在下方下载一个模型即可开始聊天。";
@@ -460,6 +469,7 @@
 "Downloaded and ready to use" = "已下载，可直接使用";
 "Downloaded by MLX-Serve" = "由 MLX-Serve 下载";
 "Downloading %@ %@" = "正在下载 %@ %@";
+"Downloading cover weights (%@)…" = "正在下载翻唱权重（%@）…";
 "Downloading drafter…" = "正在下载草稿模型…";
 "Downloading model %lld/%lld: " = "正在下载模型 %lld/%lld：";
 "Downloading the update…" = "正在下载更新…";
@@ -498,6 +508,7 @@
 "Enable MCP & Send" = "启用 MCP 并发送";
 "Enable PLD (recommended)" = "启用 PLD（推荐）";
 "Enable Telegram bot" = "启用 Telegram bot";
+"Enable microphone access for MLX-Serve in System Settings → Privacy & Security → Microphone, then try again." = "请在系统设置 → 隐私与安全性 → 麦克风中为 MLX-Serve 开启麦克风权限，然后重试。";
 "Enable thinking" = "启用思考";
 "Enabled" = "启用";
 "Encoding mp4…" = "正在编码 mp4…";
@@ -525,6 +536,7 @@
 "Every quantization is downloaded" = "所有量化版本均已下载";
 "Exact (Default)" = "Exact（默认）";
 "Examples" = "示例";
+"Exit code %lld. Full server log below — select & copy, or use the Copy Log button." = "退出码 %lld。完整服务器日志见下 —— 可选中复制，或使用“复制日志”按钮。";
 "Expose Prometheus metrics at /metrics and a live throughput/latency/GPU/memory panel on the server index page. Zero cost when off." = "在 /metrics 暴露 Prometheus 指标，并在服务器首页提供一个实时的吞吐/延迟/GPU/内存面板。关闭时零开销。";
 "Extra Large" = "特大";
 "Failed" = "失败";
@@ -786,6 +798,7 @@
 "Metrics" = "指标";
 "Metrics panel" = "指标面板";
 "Microphone access is off" = "麦克风访问已关闭";
+"Microphone access needed" = "需要麦克风权限";
 "Microsoft's native-resolution image EDITOR — change or compose images from one or more references plus a text instruction, in just 4 steps. Keeps the source's own resolution by default. Open (MIT)." = "微软的原生分辨率图像编辑器 —— 根据一张或多张参考图加文字指令修改或合成图像，只需 4 步。默认保持源图分辨率。开源（MIT）。";
 "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)." = "微软的原生分辨率图像编辑器，8-bit 量化版 —— 根据一张或多张参考图 4 步完成修改或合成，下载和内存减半。开源（MIT）。";
 "Microsoft's native-resolution image model — crisp, photorealistic results in just 4 steps, at any size from 512 to 2048 and any aspect ratio. Open (MIT) with no login or license step." = "微软的原生分辨率图像模型 —— 只需 4 步即可生成清晰的照片级效果，尺寸 512 到 2048、任意宽高比。开源（MIT），无需登录或许可步骤。";
@@ -901,6 +914,8 @@
 "Not available in the App Store build — get the CLI from GitHub." = "App Store 版本中不可用 —— 请从 GitHub 获取 CLI。";
 "Not available on %@" = "在 %@ 上不可用";
 "Not downloaded" = "未下载";
+"Not enough free memory to load the model. Quit some other apps to free memory, or turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n" = "可用内存不足以加载模型。请退出一些其他应用以释放内存，或打开设置 ▸ 跳过内存预检，或选择更小的模型。\n\n";
+"Not enough free memory to load the model. Using the most right now: %@ — quitting these frees about %@. You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n" = "可用内存不足以加载模型。当前占用最多的是：%@ —— 退出它们可释放约 %@。你也可以打开设置 ▸ 跳过内存预检，或选择更小的模型。\n\n";
 "Not enough memory" = "内存不足";
 "Not recommended on M5-family Macs yet: their GPU's neural accelerator (NAX) cores already speed up prompt processing, so this adds memory cost for little or no gain." = "暂不建议在 M5 系列 Mac 上使用：其 GPU 的神经加速器（NAX）核心已经能加速提示词处理，因此这只会增加内存开销，收益很小甚至没有。";
 "Not recorded (run before settings capture)." = "未记录（运行早于设置采集）。";
@@ -910,7 +925,9 @@
 "Nothing matches those filters yet." = "暂无符合这些筛选条件的内容。";
 "Noticeably better at following detailed, multi-step instructions and reasoning through trickier problems than the smaller Gemma models, without needing a huge amount of memory." = "在遵循详细的多步指令、推理更棘手的问题上明显优于较小的 Gemma 模型，而且不需要大量内存。";
 "Nucleus sampling threshold. 0.95 keeps all but the long tail. 1.0 disables top-p filtering. Also the server default for external clients that omit top_p (restart needed for that part)." = "核采样阈值。0.95 会保留除长尾外的所有 Token。1.0 关闭 top-p 过滤。对于未提供 top_p 的外部客户端，这也是服务器的默认值（这一部分需要重启生效）。";
+"OFF" = "关闭";
 "OK" = "好";
+"ON" = "开启";
 "Off" = "关闭";
 "Off (F16, libllama default)" = "关闭（F16，libllama 默认）";
 "Off (bf16)" = "关闭（bf16）";
@@ -1052,6 +1069,7 @@
 "Ready" = "就绪";
 "Reasoning" = "推理";
 "Reasoning budget" = "推理预算";
+"Reasoning trace before the answer. Click to turn it %@; right-click to set effort." = "回答前的推理过程。点击可%@；右键设置力度。";
 "Recolour something" = "重新上色";
 "Recommended" = "推荐";
 "Recommended for This Mac" = "推荐用于此 Mac";
@@ -1094,6 +1112,7 @@
 "Repetition penalty" = "重复惩罚";
 "Replace the background" = "替换背景";
 "Replace the subject" = "替换主体";
+"Replace your system prompt with the latest default?" = "要用最新的默认提示词替换系统提示词吗？";
 "Repos, issues, PRs, code search via the GitHub API" = "通过 GitHub API 访问仓库、issue、PR 和代码搜索";
 "Request timeout (s)" = "请求超时（秒）";
 "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth." = "要求来自其他机器的请求提供此 API key（OpenAI/Anthropic/Ollama API + 索引页 + 指标）。通过 Authorization: Bearer、x-api-key、HTTP Basic 或 ?api_key= 发送。本机地址受信任，因此本应用从不需要它 —— 它在服务器暴露到网络时提供保护。留空 = 不鉴权。";
@@ -1128,6 +1147,7 @@
 "Rock anthem" = "摇滚金曲";
 "Roll a new seed" = "随机生成新种子";
 "Root Directory" = "根目录";
+"Rounded to %lld × %lld — this model samples in steps of %lld px." = "已取整为 %lld × %lld —— 此模型以 %lld 像素为步长采样。";
 "Run Benchmark" = "运行基准测试";
 "Run a Benchmark" = "运行基准测试";
 "Run a shell command" = "运行 shell 命令";
@@ -1207,6 +1227,7 @@
 "Session cache entries" = "会话缓存条目数";
 "Sessions" = "会话";
 "Set by %@" = "由 %@ 设置";
+"Set by the agent %@. Edit the agent to change it." = "由 Agent %@ 设置。要修改请编辑该 Agent。";
 "Settings" = "设置";
 "Settings clip" = "设置中的片段";
 "Settings…" = "设置…";
@@ -1223,6 +1244,7 @@
 "Sharper version of the MoE model" = "MoE 模型的更强版本";
 "Shell & Processes" = "Shell 与进程";
 "Shell in Sandbox" = "在沙盒中启动 Shell";
+"Shell, files, web, media. Click to turn it %@; right-click to pick tools and set the workspace." = "Shell、文件、网页、媒体。点击可%@；右键选择工具并设置工作区。";
 "Show Details" = "显示详情";
 "Show Everything" = "显示全部";
 "Show Window" = "显示窗口";
@@ -1242,6 +1264,7 @@
 "Skip loading the SigLIP image encoder. Saves ~3 GB of memory on text-only workloads." = "跳过加载 SigLIP 图像编码器。在纯文本工作负载下可节省约 3 GB 内存。";
 "Skip memory pre-flight check" = "跳过内存预检";
 "Small" = "小";
+"Small context window" = "上下文窗口偏小";
 "Soft edges (HED)" = "柔和边缘（HED）";
 "Some changes require a server restart" = "部分更改需要重启服务器";
 "Some of this checkpoint’s weight files are missing, so it cannot load. Re-download it or delete it." = "此检查点的一部分权重文件缺失，因此无法加载。请重新下载或删除它。";
@@ -1318,6 +1341,8 @@
 "Synthwave" = "合成波";
 "System" = "系统";
 "System RAM: %lld" = "系统内存：%lld";
+"System prompt is up to date" = "系统提示词已是最新";
+"System prompt updated" = "系统提示词已更新";
 "System voice" = "系统音色";
 "THIS MAC" = "这台 Mac";
 "Talking character (dialogue)" = "说话的角色（对白）";
@@ -1360,6 +1385,7 @@
 "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare." = "这里保真度最高的全精度语音模型 —— 内存充足时最适合富有表现力的长篇朗读。";
 "The icon top-right: start the server, switch models, talk." = "右上角的图标：启动服务器、切换模型、对话。";
 "The lightest voice model — quick to generate speech and clone a voice from a short reference clip, with a small memory footprint." = "最轻的语音模型 —— 快速生成语音，并能从短参考片段克隆声音，内存占用小。";
+"The model advertises a %lld-token context; %@ needs %lld+ to work well. Raise Context size in Settings ▸ Server, or expect compaction and truncated turns." = "模型声明 %lld Token 的上下文；%@ 需要 %lld 以上才能良好工作。请在设置 ▸ 服务器中调高上下文长度，否则可能触发压缩并截断对话轮次。";
 "The model invents a soundtrack from your prompt. Attach speech to make characters say exact words." = "模型会根据你的提示词自行创作配乐。附加语音可让角色说出指定台词。";
 "The model is loaded when the run starts." = "模型会在运行开始时加载。";
 "The name other Macs see next to your shared models. Blank = this Mac's hostname." = "其他 Mac 在你的共享模型旁看到的名字。留空 = 这台 Mac 的主机名。";
@@ -1381,6 +1407,7 @@
 "The undistilled FLUX.2-klein 9B — more creative and varied than the fast distilled model, at the cost of many more steps (30+) and real guidance/negative-prompt control." = "未蒸馏的 FLUX.2-klein 9B —— 比快速蒸馏版更有创意、更多样，代价是步数多得多（30+），并支持真正的引导/反向提示词控制。";
 "Theme" = "主题";
 "Thinking" = "思考";
+"Thinking · %@" = "思考 · %@";
 "Thinking…" = "正在思考…";
 "This Mac" = "这台 Mac";
 "This agent can't answer until %@ is on disk. Nothing is downloaded automatically." = "%@ 下载到磁盘之前，这个 Agent 无法作答。不会自动下载任何内容。";
@@ -1390,8 +1417,10 @@
 "This is one of the built-in agents. Duplicate it to make it yours." = "这是内置 Agent 之一。复制它即可改成你自己的。";
 "This model is distilled for %@ steps; other values cost time without adding detail." = "该模型是按 %@ 步蒸馏的；其他步数只会耗时，不会增加细节。";
 "This model is loaded and serving requests." = "该模型已加载并正在处理请求。";
+"This model samples between %lld and %lld px per side. %lld is outside that." = "此模型每边采样 %lld 到 %lld 像素。%lld 超出了这个范围。";
 "This model will load when you start the server." = "该模型会在你启动服务器时加载。";
 "This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score)." = "这个模型会自行创作配乐。请在提示词中的 “overall_soundscape:” 后面描述它（配乐则写在 “non_diegetic_music:” 后面）。";
+"This overwrites ~/.mlx-serve/system-prompt.md with the latest built-in prompt. Your current prompt is backed up first so you can restore it." = "这会用最新的内置提示词覆盖 ~/.mlx-serve/system-prompt.md。当前提示词会先备份，以便你恢复。";
 "This request needed %@ tokens, but the model's context window holds only %@." = "这次请求需要 %@ 个 Token，但模型的上下文窗口只能容纳 %@。";
 "This request was larger than the model's context window." = "该请求超出了模型的上下文窗口。";
 "This resets every section — Server, Speculative Decoding, Performance, Per-Request Defaults, Voice, Agent Sandbox and Messaging — not just the one you're looking at. Your Telegram bot token is kept, since only @BotFather can reissue it. The running server keeps its current flags until you hit Restart Now." = "这会重置每一个区块 —— 服务器、投机解码、性能、每请求默认值、语音、Agent 沙盒和消息 —— 而不只是你当前看到的那一个。你的 Telegram 机器人令牌会保留，因为只有 @BotFather 才能重新签发它。在你点击“立即重启”之前，正在运行的服务器会保留当前的启动参数。";
@@ -1409,6 +1438,7 @@
 "Tool-call auto-correct" = "工具调用自动纠正";
 "Tool: %@" = "工具：%@";
 "Tools" = "工具";
+"Tools · %@" = "工具 · %@";
 "Tools — run a tool-calling loop" = "工具 —— 运行工具调用循环";
 "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem." = "服务器用已加载模型占用的内存上限，达到后就换出其中一个 —— 若无可换出者则拒绝加载。自动 = Metal 为这台 Mac 建议值的 80%。当空闲服务器上明明放得下的模型却被以“not enough memory”拒绝时，就把它调高；日志里的拒绝信息会写明所用的估算值。会传递 --max-resident-mem。";
 "Transcript of reference (optional)" = "参考音频的文字稿（可选）";
@@ -1440,6 +1470,7 @@
 "Update System Prompt to Latest…" = "把系统提示词更新到最新…";
 "Updated" = "更新时间";
 "Updated to the latest default." = "已更新为最新默认值。";
+"Updated to the latest default.\nYour previous prompt was saved to:\n%@" = "已更新为最新默认提示词。\n原提示词已保存到：\n%@";
 "Updates" = "更新";
 "Use" = "使用";
 "Use This Model" = "使用此模型";
@@ -1471,6 +1502,7 @@
 "Waiting for approval" = "等待批准";
 "Wake phrase" = "唤醒词";
 "Wants to run “%@”" = "想要运行“%@”";
+"Wants to run “%@”. %@" = "想要运行“%@”。%@";
 "Warn" = "警告";
 "Web" = "网页";
 "Web Search" = "网页搜索";
@@ -1488,6 +1520,7 @@
 "With only a last frame the model invents the opening and works toward it. Add a first frame to pin both ends." = "只给末帧时，模型会自行构想开场并朝它演进。加入首帧即可固定两端。";
 "Work items, pull requests, builds, pipelines, wiki, test plans" = "工作项、拉取请求、构建、流水线、Wiki、测试计划";
 "Workspace" = "工作区";
+"Workspace: %@" = "工作区：%@";
 "Workspace…" = "工作区…";
 "Write File" = "写入文件";
 "Write a file" = "写入一个文件";
@@ -1505,12 +1538,14 @@
 "Your Mac" = "你的 Mac";
 "Your agents" = "你的 Agent";
 "Your enabled MCP servers (configure them in Chat ▸ MCP). Outside Read-only/Workspace, MCP calls pause for approval." = "你已启用的 MCP 服务器（在 聊天 ▸ MCP 中配置）。在只读/工作区模式之外，MCP 调用会暂停等待批准。";
+"Your system prompt already matches the latest built-in default." = "你的系统提示词已与最新的内置默认值一致。";
 "Your voices" = "你的音色";
 "Zoom in" = "拉近";
 "Zoom out" = "拉远";
 "a different approach" = "换一种做法";
 "a hands-on programmer that reads and edits real files" = "一个会读取并编辑真实文件的动手型程序员";
 "a plain, direct general assistant" = "一个朴素、直接的通用助手";
+"a tool" = "一个工具";
 "a track" = "一段曲目";
 "a video" = "一段视频";
 "an image" = "一张图像";
@@ -1542,7 +1577,10 @@
 "mlx-serve is free and open source. A star helps other people find it." = "mlx-serve 是自由开源软件。给一个 star 能帮更多人发现它。";
 "no chat yet (first to message wins)" = "还没有会话（先发消息者胜出）";
 "no working folder is set for this session — the agent's file tools always run confined to one, in every mode. Set a working folder (the folder icon on the Agent pill, or Settings → Agent Sandbox) and retry." = "本次会话没有设置工作文件夹 —— 无论哪种模式，Agent 的文件工具始终被限制在一个文件夹内运行。请设置一个工作文件夹（Agent 胶囊上的文件夹图标，或设置 → Agent 沙盒），然后重试。";
+"not set" = "未设置";
 "nothing found" = "未找到任何结果";
+"off" = "关闭";
+"on" = "开启";
 "optional — audio-to-video" = "可选 —— 音频生视频";
 "optional — ends here" = "可选 —— 在此结束";
 "optional — the generation follows them" = "可选 —— 生成会跟随它们";
@@ -1583,6 +1621,7 @@
 "… %lld more characters" = "… 还有 %lld 个字符";
 "↑↓ move · ↩ switch · esc close" = "↑↓ 移动 · ↩ 切换 · esc 关闭";
 "↩ ask · esc close" = "↩ 提问 · esc 关闭";
+"⚠ %@ failed" = "⚠ %@ 失败";
 "✓ On disk" = "✓ 已在本地";
 "🎙️ I couldn't make out any speech in that clip. Try recording again." = "🎙️ 这段音频里听不出任何说话声。请重新录制。";
 "The 27B, sized for 16 GB" = "为 16 GB 精简的 27B";

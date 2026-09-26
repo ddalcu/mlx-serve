@@ -35,30 +35,30 @@ struct ComposerTip: Equatable {
         case (false, true): body = "Image, PDF or audio — or a folder to ask questions about."
         case (false, false): body = "Image or PDF — or a folder to ask questions about."
         }
-        return ComposerTip(title: "Attach", body: body)
+        return ComposerTip(title: L10n.text("Attach"), body: L10n.text(body))
     }
 
     static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
-        ComposerTip(title: "Thinking · \(state(isOn))",
+        ComposerTip(title: L10n.format("Thinking · %@", state(isOn)),
                     body: agent.map(locked)
-                        ?? "Reasoning trace before the answer. Click to turn it \(opposite(isOn)); right-click to set effort.")
+                        ?? L10n.format("Reasoning trace before the answer. Click to turn it %@; right-click to set effort.", opposite(isOn)))
     }
 
     static func tools(isOn: Bool, workspace: String?, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
-            title: "Tools · \(state(isOn))",
+            title: L10n.format("Tools · %@", state(isOn)),
             body: agent.map(locked)
-                ?? "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace.",
+                ?? L10n.format("Shell, files, web, media. Click to turn it %@; right-click to pick tools and set the workspace.", opposite(isOn)),
             // Still what every file and shell call resolves against, even when
             // it's the agent's folder rather than the chat's.
-            detail: "Workspace: \(workspace ?? "not set")")
+            detail: L10n.format("Workspace: %@", workspace ?? L10n.text("not set")))
     }
 
     static func mcp(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
-            title: "MCP · \(state(isOn))",
+            title: L10n.format("MCP · %@", state(isOn)),
             body: agent.map(locked)
-                ?? "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace.")
+                ?? L10n.format("Adds your enabled MCP servers' tools. Click to turn it %@; right-click for the Marketplace.", opposite(isOn)))
     }
 
     /// The body a control gets while its agent owns it. The title still carries
@@ -66,11 +66,11 @@ struct ComposerTip: Equatable {
     /// that can't happen is the dead-offer class, so this names the agent and
     /// where the setting actually lives instead.
     private static func locked(_ agent: String) -> String {
-        "Set by the agent \(agent). Edit the agent to change it."
+        L10n.format("Set by the agent %@. Edit the agent to change it.", agent)
     }
 
-    private static func state(_ isOn: Bool) -> String { isOn ? "ON" : "OFF" }
-    private static func opposite(_ isOn: Bool) -> String { isOn ? "off" : "on" }
+    private static func state(_ isOn: Bool) -> String { L10n.text(isOn ? "ON" : "OFF") }
+    private static func opposite(_ isOn: Bool) -> String { L10n.text(isOn ? "off" : "on") }
 }
 
 // MARK: - Hover lifecycle
@@ -208,14 +208,14 @@ struct ComposerTipCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(L10n.text(tip.title))
+            Text(tip.title)
                 .font(.app(.caption).weight(.semibold))
-            Text(L10n.text(tip.body))
+            Text(tip.body)
                 .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let detail = tip.detail {
-                Text(L10n.text(detail))
+                Text(detail)
                     .font(.app(.caption2).monospaced())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)

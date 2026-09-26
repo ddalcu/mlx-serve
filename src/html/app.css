@@ -539,3 +539,87 @@ table.models .state.error { color: #f28b82 }
    budget is full and anything added there re-triggers » eviction at small
    widths (same reason the sandbox shield sits here). */
 #chat-voice.listening { color: #e5534b; background: color-mix(in srgb, #e5534b 18%, transparent) }
+
+/* ── Theme toggle button ─────────────────────────────────────────────────── */
+
+.theme-toggle {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  color: var(--dim);
+  position: relative;
+}
+.theme-toggle:hover { background: #2a2b2d; color: var(--fg) }
+/* A half-filled circle: the switch, drawn rather than an icon font. */
+.theme-toggle::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+.theme-toggle::after {
+  content: "";
+  position: absolute;
+  inset: 6px 6px 6px 50%;
+  background: currentColor;
+  border-radius: 0 999px 999px 0;
+}
+
+/* ── Light theme ───────────────────────────────────────────────────────────
+ *
+ * `[data-theme=light]` is set by src/html/theme.js from the stored choice, or
+ * from the OS when nothing is stored. The dark palette above stays the base;
+ * the rules below restate the places whose colours are literals rather than
+ * variables — giving every literal a variable would touch most of this file. */
+
+:root[data-theme=light] {
+  --bg: #f6f6f7;
+  --side: #eff0f2;
+  --card: #ffffff;
+  --line: #e1e2e6;
+  --fg: #1e1f22;
+  --dim: #5b616b;
+  --faint: #878d96;
+  --accent: #1a73e8;
+  color-scheme: light;
+}
+:root[data-theme=light] code { background: #ececf0; color: #2b3a55 }
+:root[data-theme=light] pre { background: #f7f8fa; color: #333a45 }
+:root[data-theme=light] .side-toggle:hover,
+:root[data-theme=light] .side-open:hover,
+:root[data-theme=light] .theme-toggle:hover,
+:root[data-theme=light] .nav-item:hover,
+:root[data-theme=light] #nav-new,
+:root[data-theme=light] .recent:hover,
+:root[data-theme=light] .act:hover,
+:root[data-theme=light] .plus:hover,
+:root[data-theme=light] .send[stop] { background: #e6e7eb }
+:root[data-theme=light] #nav-new:hover,
+:root[data-theme=light] .menu-item:hover { background: #dcdde3 }
+:root[data-theme=light] .nav-item.active,
+:root[data-theme=light] .recent.active { background: #dcdee4 }
+:root[data-theme=light] .composer:focus-within { border-color: #c6c8ce }
+:root[data-theme=light] .pill { background: #eceef1 }
+:root[data-theme=light] .pill:hover { background: #e2e4e9 }
+:root[data-theme=light] .send:disabled { background: #c6c8ce }
+:root[data-theme=light] .send::before,
+:root[data-theme=light] .send::after { background: #ffffff; border-color: #ffffff }
+:root[data-theme=light] .send:disabled::before,
+:root[data-theme=light] .send:disabled::after { background: #f6f6f7; border-color: #f6f6f7 }
+:root[data-theme=light] .menu { background: #ffffff; border-color: #e1e2e6 }
+:root[data-theme=light] .menu-sep { border-top-color: #e1e2e6 }
+:root[data-theme=light] .msg.user .body { background: #eceef1 }
+:root[data-theme=light] details.think { background: #f1f2f4 }
+:root[data-theme=light] .tool { background: #eef2fb; border-color: #d3dff5 }
+:root[data-theme=light] .tool.err { color: #b3261e; background: #fdeceb; border-color: #f3c2bd }
+:root[data-theme=light] .attached .chip .x { background: #c6c8ce }
+:root[data-theme=light] .cap { background: #e8eefb; border-color: #d3dff5 }
+:root[data-theme=light] .recent .x:hover,
+:root[data-theme=light] .disclaimer.err,
+:root[data-theme=light] table.models .state.error { color: #b3261e }
+:root[data-theme=light] table.models .state.ready { color: #0f7b5f }
+:root[data-theme=light] .m.get { background: #e3f5ee; color: #0f7b5f }
+:root[data-theme=light] .m.post { background: #e6effd; color: #1a5fd0 }
+:root[data-theme=light] .m.del { background: #fdeaea; color: #b3261e }
+:root[data-theme=light] .m.ws { background: #f1eafd; color: #6b3fbf }

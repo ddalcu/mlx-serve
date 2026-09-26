@@ -232,27 +232,27 @@ enum AgentPrompt {
     static func runSystemPromptUpdateFlow() {
         guard isSystemPromptOutdated() else {
             let a = NSAlert()
-            a.messageText = "System prompt is up to date"
-            a.informativeText = "Your system prompt already matches the latest built-in default."
+            a.messageText = L10n.text("System prompt is up to date")
+            a.informativeText = L10n.text("Your system prompt already matches the latest built-in default.")
             a.runModal()
             return
         }
         let confirm = NSAlert()
         confirm.alertStyle = .warning
-        confirm.messageText = "Replace your system prompt with the latest default?"
-        confirm.informativeText = "This overwrites ~/.mlx-serve/system-prompt.md with the latest built-in prompt. Your current prompt is backed up first so you can restore it."
-        confirm.addButton(withTitle: "Update")
-        confirm.addButton(withTitle: "Cancel")
+        confirm.messageText = L10n.text("Replace your system prompt with the latest default?")
+        confirm.informativeText = L10n.text("This overwrites ~/.mlx-serve/system-prompt.md with the latest built-in prompt. Your current prompt is backed up first so you can restore it.")
+        confirm.addButton(withTitle: L10n.text("Update"))
+        confirm.addButton(withTitle: L10n.text("Cancel"))
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
         let backup = updateSystemPromptToDefault()
         let done = NSAlert()
-        done.messageText = "System prompt updated"
-        done.informativeText = backup.map { "Updated to the latest default.\nYour previous prompt was saved to:\n\($0)" }
-            ?? "Updated to the latest default."
+        done.messageText = L10n.text("System prompt updated")
+        done.informativeText = backup.map { L10n.format("Updated to the latest default.\nYour previous prompt was saved to:\n%@", $0) }
+            ?? L10n.text("Updated to the latest default.")
         if backup != nil {
-            done.addButton(withTitle: "Reveal Backup")
-            done.addButton(withTitle: "OK")
+            done.addButton(withTitle: L10n.text("Reveal Backup"))
+            done.addButton(withTitle: L10n.text("OK"))
         }
         let resp = done.runModal()
         if let backup, resp == .alertFirstButtonReturn {
