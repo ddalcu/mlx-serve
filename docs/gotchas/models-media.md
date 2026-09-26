@@ -1943,9 +1943,9 @@ Symptom: the Lightning 30B-A3B answered short chats fluently, but a code hidden 
 
 Cause: `hybridAttnWith` serves LFM2 and Nemotron-H, and applied RoPE for both. Nemotron-H attention is NoPE (HF `NemotronHAttention`, mlx-lm): the config carries `rope_theta` and `partial_rotary_factor`, but nothing reads them. The Mamba2 layers carry position, so short text survives rotated keys; long-range lookup through the six attention layers does not.
 
-Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round.
+Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round. `ModelConfig.cacheLayoutNamespace` gives Nemotron-H a fresh SSD prefix-cache root, because the fingerprint hashes only the model dir, the config's stat and the overrides: keys persisted by the RoPE build would otherwise restore into the NoPE model.
 
-Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head).
+Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head), `modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root`.
 
 ## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
 

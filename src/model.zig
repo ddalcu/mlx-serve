@@ -887,6 +887,14 @@ pub const ModelConfig = struct {
         return configured;
     }
 
+    /// SSD prefix-cache layout marker (`kv_disk_cache.modelFingerprintWithLayout`).
+    /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
+    /// marker gives it a fresh root. Null keeps every other arch's root.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        return null;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }

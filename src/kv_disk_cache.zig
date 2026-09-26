@@ -3311,7 +3311,22 @@ fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
     pd.deleteTree(io, name) catch {};
 }
 
+/// Historical fingerprint for the default cache layout. Kept as a wrapper so
+/// existing callers and existing SSD roots remain stable.
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
+    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+/// Fingerprint a model plus an optional cache-layout namespace
+/// (`ModelConfig.cacheLayoutNamespace`). A layout that changes what the stored
+/// K/V mean gets a versioned marker, so an old SSD root is never restored into
+/// it; null keeps the historical fingerprint.
+pub fn modelFingerprintWithLayout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_dir: []const u8,
+    layout_namespace: ?[]const u8,
+) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -3323,6 +3338,10 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
         h.update(std.mem.asBytes(&mt));
     }
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout_namespace) |layout| {
+        h.update("\x00mlx-serve-kv-layout\x00");
+        h.update(layout);
+    }
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -5297,6 +5316,38 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
 
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+// Bar: a Nemotron-H SSD root written before its keys became NoPE is never
+// restored, and every other arch keeps its existing root.
+test "modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
+    defer testing.allocator.free(dir);
+
+    const nemo = try model.parseConfigFromJson(testing.allocator,
+        \\{"model_type": "nemotron_h", "hidden_size": 64, "num_hidden_layers": 2,
+        \\ "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
+        \\ "vocab_size": 16, "layers_block_type": ["mamba", "attention"]}
+    );
+    const qwen = try model.parseConfigFromJson(testing.allocator,
+        \\{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
+        \\ "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32, "vocab_size": 16}
+    );
+    const old = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(old);
+    const fp_nemo = try modelFingerprintWithLayout(testing.allocator, io, dir, nemo.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_nemo);
+    const fp_qwen = try modelFingerprintWithLayout(testing.allocator, io, dir, qwen.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_qwen);
+    try testing.expect(!std.mem.eql(u8, old, fp_nemo));
+    try testing.expectEqualStrings(old, fp_qwen);
 }
 
 test "modelFingerprint: rolls with --config-overrides" {
