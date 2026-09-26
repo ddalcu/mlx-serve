@@ -27,11 +27,29 @@ A fork's delta is rarely "a whole engine". Sushi's is three separate things, and
 |---|---|---|---|---|
 | `quant` | weight load + `QLinear`/MoE matmul | format detection from `quantization_config`, tensor loader, `matmul`, `gatherMatmul` for experts | trunk, KV, batching, spec, cache | EXL3 experts (`expert_exl3*.zig`, `expert_quant.zig`) |
 | `expert_source` | the MoE layer's expert fetch | where routed experts live and how they reach the GPU; a memory bill | the MoE math, routing | SSD expert streaming (`expert_stream.zig`, `expert_io.zig`, `expert_bf16_kernels.zig`, these import only `mlx` + `log`) |
+| `source` | opening a model path | claim a non-HF container, synthesize `config.json`/`tokenizer.json`/`tokenizer_config.json`/`generation_config.json`, fill the weight map, report disk bytes | everything after load | mlx-serve-gguf (a `.gguf` read as a model dir); sushi MiMo original checkpoint (`mimo_source.zig`) |
 | `arch` | `transformer.zig` dispatch on `model_type` | a forward over the host's `KVCache` + `ModelConfig` | HTTP, templates, tools, sampling, scheduler, prefix cache | MiMo-V2 (`mimo_source.zig`, `mimo_mtp.zig`, `mimo_vision.zig`) |
 | `engine` | registry: an opaque session | open/close, tokenize, session `sync`/`eval`/`sample`/`rewind`/snapshot | HTTP, templates, tools, routing | ds4, llama.cpp (moved behind the interface) |
 
 The deeper the kind, the more of our stack the plugin gets for free (`arch` gets batching, MTP, prefix cache; `engine`
 gets none of it). Plugins pick the shallowest kind that expresses their work.
+
+## Reference plugins
+
+We control both, and between them they exercise every kind:
+
+- **[mlx-serve-gguf](https://github.com/ddalcu/mlx-serve-gguf)**: `source` (GGUF → HF sidecars + tensor map) +
+  `quant` (15 ggml block types through its own Metal matvec/matmat/gather kernels). It declines what it cannot
+  serve, and the llama.cpp `engine` claims the file at a lower priority, which replaces `preferredEngine` +
+  `servablePath` + `--engine` with one `claims` ordering. It already takes MLX from its host through one import
+  (`mlx_host`, root exposes `pub const mlx`); that import becomes `sdk`, and `standalone/mlx_host.zig` is the slim-host
+  shim in miniature.
+- **[sushi](https://github.com/beamivalice/sushi)**: `quant` (EXL3), `expert_source` (SSD streaming), `source`
+  (MiMo's original checkpoint), `arch` (MiMo-V2).
+
+The glue on the `mlx-gguf-engine` branch shows the cost of NOT having `source`: `mlx_gguf.sidecar` threaded into
+`parseConfig`, `loadTokenizer`, `loadChatConfig`, plus `loadModelWeights`, `modelDiskBytes`, `preloadCpuState` and
+`main`. With a `source` kind those become one host function that asks sources before reading files.
 
 ## The SDK: what a plugin may import
 
@@ -109,10 +127,13 @@ or turns out to be a hook the SDK is missing.
 2. `src/sdk.zig` + `sdk.Plugin` + compile-time negotiation + `src/plugins.zig` registry. Every kind has only
    `claims(peek) ?Priority` at first; a kind's full interface lands with its first real consumer. The check is a
    pure function returning a named error (unit-tested with fake plugins); `@compileError` only wraps it.
-3. `quant` kind, sushi EXL3 the first plugin: one entry file in sushi exporting `plugin`, pinned at a tag, its
-   own tests as a build step in our CI, one EXL3 pack served end to end (claim, load, MoE matmul, memory bill).
-4. `expert_source` kind (sushi SSD expert streaming) + `-Dslim` host + `sdk.testing` conformance.
-5. `engine` kind: ds4 and llama.cpp moved behind it (characterization tests first). `arch` (MiMo) after.
+3. `source` + `quant` kinds, mlx-serve-gguf the first plugin: it already serves end to end, so this PR is mostly
+   moving its existing glue behind the two hooks (`mlx_host` → `sdk`, `QuantMode.gguf` dispatch → the `quant` hook,
+   the sidecar reads → one `source` call). llama.cpp claims below it until PR 6.
+4. sushi EXL3 as the second `quant` plugin: one entry file exporting `plugin`, pinned at a tag, its own tests as a
+   build step in our CI, one EXL3 pack served end to end (claim, load, MoE matmul, memory bill).
+5. `expert_source` kind (sushi SSD expert streaming) + `-Dslim` host + `sdk.testing` conformance.
+6. `engine` kind: ds4 and llama.cpp moved behind it (characterization tests first). `arch` (MiMo) after.
 
 Pins may be a submodule (as ds4) or a `build.zig.zon` hash; either way a tag, never a branch head.
 
