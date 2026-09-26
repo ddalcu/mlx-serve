@@ -299,8 +299,8 @@ fi
 # 3.5/3.6 checkpoint is hd 256 with GDN layers, so both fusions must fire on
 # the verify widths this server just ran. Output equality alone is blind to a
 # decline gate quietly routing everything back to the composed chain.
-for ENGAGE_LINE in "\[attn\] fused QK-norm+RoPE (hd-256) engaged" "\[gdn\] packed prework engaged"; do
-    if grep -q "$ENGAGE_LINE" "$LOG"; then
+for ENGAGE_LINE in "\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur) engaged"; do
+    if grep -qE "$ENGAGE_LINE" "$LOG"; then
         echo "PASS [engaged: $ENGAGE_LINE]"; PASS=$((PASS+1))
     else
         echo "FAIL [not engaged: $ENGAGE_LINE] — fused path silently declined"; FAIL=$((FAIL+1))
@@ -326,8 +326,10 @@ curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: applicati
     $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
     \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
 ECHO_STATS=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1)
-ECHO_ROUNDS=$(echo "$ECHO_STATS" | grep -o 'attempts=[0-9]*' | cut -d= -f2)
-ECHO_DRAFTED=$(echo "$ECHO_STATS" | grep -o ' drafted=[0-9]*' | cut -d= -f2)
+# Prompt lookup (default on) serves most echo rounds; its rounds and drafts count too.
+ECHO_LOOKUP=$(echo "$ECHO_STATS" | grep -o 'lookup=[0-9]*/[0-9]*' | cut -d= -f2)
+ECHO_ROUNDS=$(( $(echo "$ECHO_STATS" | grep -o 'attempts=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP%%/*} ))
+ECHO_DRAFTED=$(( $(echo "$ECHO_STATS" | grep -o ' drafted=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP##*/} ))
 if [ "${ECHO_ROUNDS:-0}" -gt 0 ] && [ "${ECHO_DRAFTED:-0}" -gt $((2 * ECHO_ROUNDS)) ]; then
     echo "PASS [EV controller climbs on echo] (drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"; PASS=$((PASS+1))
 else

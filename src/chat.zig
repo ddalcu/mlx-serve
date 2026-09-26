@@ -2556,6 +2556,23 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
     return .{ .reasoning_content = reasoning, .content = trimLeakedToolMarkup(split.content) };
 }
 
+/// First match of a client stop string at or after `from` that the split delivers as
+/// answer content, never reasoning. Judged on the text up to the match only, so a
+/// stream and its finished text cut at the same byte.
+pub fn answerStopIndex(text: []const u8, from: usize, stop: []const u8, opened_by_template: bool) ?usize {
+    var pos = from;
+    while (std.mem.indexOfPos(u8, text, pos, stop)) |idx| : (pos = idx + 1) {
+        const head = text[0 .. idx + stop.len];
+        const c = splitThinkBlockKeepingMarkup(head, true, opened_by_template).content;
+        const start = @intFromPtr(c.ptr) -% @intFromPtr(head.ptr);
+        if (c.len == 0 or start > idx) continue;
+        // The split trims trailing whitespace off the content; a match right after it is still answer.
+        const end = start + c.len;
+        if (idx <= end or std.mem.trim(u8, head[end..idx], " \t\r\n").len == 0) return idx;
+    }
+    return null;
+}
+
 /// The split WITHOUT the leaked-markup cut — for the one caller that feeds the
 /// content back to `parseToolCalls` (the /v1/messages non-streaming path).
 /// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
@@ -14727,4 +14744,14 @@ test "media renders one template placeholder per item, a tool image inside its t
         try testing.expectEqual(@as(usize, 4), std.mem.count(u8, rendered, c.ph));
         try testing.expect(std.mem.indexOf(u8, rendered, c.tool_image) != null);
     }
+}
+
+test "answerStopIndex: a stop after trailing whitespace in the answer still cuts" {
+    const t = std.testing;
+    const text = "</think>\n\nHi \n\nmore";
+    try t.expectEqual(@as(?usize, std.mem.indexOf(u8, text, "Hi ").? + 3), answerStopIndex(text, 0, "\n\n", true));
+    const hard_break = "</think>\n\nline  \nnext";
+    try t.expectEqual(@as(?usize, std.mem.indexOf(u8, hard_break, "  \n").? + 2), answerStopIndex(hard_break, 0, "\n", true));
+    // Whitespace leading the answer is never delivered, so it never matches.
+    try t.expectEqual(@as(?usize, null), answerStopIndex("</think>\n\nHi", 0, "\n\n", true));
 }

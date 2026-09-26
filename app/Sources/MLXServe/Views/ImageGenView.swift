@@ -99,10 +99,11 @@ struct ImageGenView: View {
     private var readyView: some View {
         HSplitView {
             ScrollView {
+                // The model decides what the rest of the pane offers, so it is read first.
                 VStack(alignment: .leading, spacing: 14) {
+                    modelSection
                     promptSection
                     sourceImageSection
-                    modelSection
                     qualitySection
                     resolutionSection
                     if showAdvanced { advancedSection } else { advancedToggle }
@@ -338,8 +339,22 @@ struct ImageGenView: View {
             bundleOf: { $0.bundle },
             downloads: downloads,
             onDownloadFinished: { appState.refreshModels() },
-            persist: persist)
+            persist: persist,
+            accessory: keepResidentToggle)
         .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
+    }
+
+    private var keepResidentToggle: AnyView {
+        AnyView(
+            Toggle(isOn: $keepResident) {
+                Text("Keep model loaded after generating")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+                .font(.caption)
+                .controlSize(.small)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+        )
     }
 
     @ViewBuilder
@@ -516,10 +531,6 @@ struct ImageGenView: View {
                         .font(.caption)
                 }
             }
-            Toggle("Keep model loaded after generating", isOn: $keepResident)
-                .font(.caption)
-                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
-
             // Rebalance scales the TAPPED text-encoder layers. A backend that
             // conditions on a single final hidden state has none to tap
             // (`condWeightCount == 0`), and the panel used to ask for

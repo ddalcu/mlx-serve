@@ -2341,3 +2341,19 @@ Guards: `DiskTier: a restore wider than the fd limit closes each chunk as it goe
 `DiskTier: a failed restore drops the latch it raised and keeps a foreign one`, and
 `tests/test_prefix_cache_disk.sh` [7] (a restore under a lowered `ulimit -n`, plus a chunk
 made unreadable after boot).
+
+## A stop string inside the thought ended the whole reply (#549)
+
+Defect: `stop: ["```"]` (or any common word) on a thinking model ended the request at the first
+match inside `<think>`: reasoning cut mid-sentence, empty content, `finish_reason: "stop"`, on
+chat, messages and responses, streamed and not.
+
+Cause: every stop site searched the RAW generated text, reasoning included, before the split.
+
+Fix: `chat.answerStopIndex` accepts a match only where `splitThinkBlockKeepingMarkup` delivers
+it as content, judged on the text up to the match. Prefix-only judgment is what keeps the stream
+and the finished text on the same byte: text a later close turns into a thought (Gemma with
+thinking off) was still answer when the stop arrived, and a thought opened after the answer
+is dropped by a stop before it. `/v1/completions` keeps matching raw text.
+Guards: corpus `a stop string ends the answer, never the reasoning` (every word of every entry
+as a stop, plus a byte-by-byte stream replay), `tests/test_stop_in_reasoning.sh`.

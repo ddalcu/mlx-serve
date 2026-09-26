@@ -3,30 +3,44 @@
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 
 ### Highlights
+
+- **Qwen3.8 Flash Next reaches up to ~243-300+ tok/s decode and 3,362 tok/s prefill, on an M5 Ultra.** MTP drafts from the conversation itself when the reply copies it, so file rewrites and edits decode 1.3-1.5x faster (on by default, `MLX_SERVE_MTP_LOOKUP=0` turns it off); GDN layers run as one GPU dispatch (a few percent on every Mac, 27B included); Ultra chips verify through the fused MoE kernel (+14%); and M5 Ultra fuses the verify across 2 or more streams (+13% at 4 streams). Peak on M5 Ultra, Flash Next mixed 4-8 bit with `--mtp`: 219 tok/s decode, 227 tok/s across 4 streams, 3,150 tok/s prefill on an 8k prompt. Thanks @STRML MVP of this release! (#517, #519, #523, #533, #534).
+
+- **Laya typed decisions.** `POST /v1/decisions` answers score, yes/no and choice questions about a game or app state with Laya checkpoints (`aac6fef/laya-multilingual-mlx`), and concurrent requests are answered in one pass. Thanks @sbusso (#475, #511).
+
 - **Every image in a conversation reaches the model.** Earlier turns and images returned by tools (pi, Claude Code's Read) are seen where they were sent; before, only the latest turn's images were, so an agent that read three pages saw only the last one. An image already seen is not re-encoded on later turns.
 
 - **Qwen3.8 agents stop going in circles.** Earlier turns' thinking is no longer replayed into the prompt, so long agent sessions use about half the context. The cost is a short pause when you send a new instruction; tool rounds are unaffected. `chat_template_kwargs: {"preserve_thinking": true}` in Model Settings restores the old behaviour.
 
-- **Laya typed decisions.** `POST /v1/decisions` answers score, yes/no and choice questions about a game or app state with Laya checkpoints (`aac6fef/laya-multilingual-mlx`), and concurrent requests are answered in one pass.
+- **Steer a running agent.** Press Return while an agent chat works to queue a note; the agent picks it up at its next tool round as your next message. Thanks @lojza3d (#497, #537).
 
-- **Steer a running agent.** Press Return while an agent chat works to queue a note; the agent picks it up at its next tool round as your next message.
+- **Redesigned Create panes.** Image, Voice, Music, Video and 3D share one layout with the model first, the Video and 3D panes keep your prompt and files when you switch away, and file pickers open over the window. Thanks @lojza3d (#445, #521).
 
 - **The app is now MLX-Serve.app** and the download is MLX-Serve.dmg. Settings carry over; an app updated in place from 26.9.5 keeps its old folder name until the next update renames it.
 
 ### Changes
-- Claude Code on `/v1/messages` streams thinking as it is generated when tools are on, instead of showing nothing and then one block.
-- A long prompt that does not fit in memory frees prefix cache from other chats to make room instead of being refused. Before, only Qwen3.8 Flash Next did this.
-- A long agent turn whose cached context no longer fits twice in memory reuses the cache in place instead of being refused (PR #518). A repeated one-token prompt on `/v1/completions` no longer crashes the server.
-- A short chat that starts like a long one (same system prompt, e.g. a "hi" in omp) no longer pushes the long session out of the prefix cache and forces it to re-read its whole context.
-- `/v1/chat/completions` reads a request's `chat_template_kwargs` (vLLM style): `{"enable_thinking": false}` there turns thinking off.
-- Mistral 7B v0.3 and other SentencePiece models with byte fallback tokenize like Hugging Face: newlines and tabs were dropped from the prompt, and no stray space is added after special tokens.
-- The app's chats and agents send earlier images again on every turn (Qwen, LFM2-VL, Muse); Gemma still sends only the latest message's images. LFM2-VL models loaded from the app get their image markers back, and LFM2-VL 1.6B no longer drops agent tool turns to a generic prompt format.
-- Models without vision tell an agent when its tool returned an image they cannot see, instead of dropping it silently.
-- opencode and opencode2 launchers turn thinking on (medium by default, with none/low/medium/high variants); Claude Code launched from the app skips permission prompts.
-- Qwen3.8 27B and Flash Next decode a few percent faster: each GDN layer runs its prework and recurrence as one GPU dispatch, in plain decode and MTP verify (M4 Max +1-3%, M5 Ultra +4%). Thanks @STRML (#517).
-- On Ultra chips, MTP decode with Qwen3.8 Flash Next is about 14% faster: verify steps use the fused MoE kernel. Thanks @STRML (#519).
-- A request without `tools` gets the model's reply as-is, like other engines: tool-call markup the model writes anyway is no longer cut to an empty answer when not streaming, and streaming returns the same text.
-- "Choose file…" in the Voice, Music, Video, Image and 3D panes opens over the window instead of in the bottom-left corner of the screen. Thanks @lojza3d (#521).
+- Claude Code shows thinking as it streams when tools are on.
+- A long prompt that does not fit in memory clears other chats' cache to make room instead of failing. Thanks @celestial-rose.
+- Long agent sessions keep their cache when memory is tight (#518), and a short chat no longer pushes out a long one that starts the same way.
+- Fixed a crash on a repeated one-token prompt in `/v1/completions`.
+- A stop string ends the answer, not the thinking: a match inside the reasoning no longer cuts the reply short (#549).
+- `chat_template_kwargs` in a request is honoured, so `{"enable_thinking": false}` turns thinking off.
+- Mistral 7B v0.3 and similar models keep newlines and tabs in the prompt.
+- App chats and agents resend earlier images every turn (Qwen, LFM2-VL, Muse), and LFM2-VL handles images and agent tool calls correctly.
+- Text-only models tell the agent when a tool returned an image they cannot see.
+- opencode launchers turn thinking on, and Claude Code launched from the app skips permission prompts.
+- A request without tools gets the model's reply exactly as written, like other engines.
+- Qwen-Image-2.1 is about 10% faster and can return transparent PNGs. Thanks @mrv777 (#510) and @ChadCSong (#481).
+- Bonsai 2 decodes faster, up to 20% with several chats at once, and Bonsai 1 packs get the fast kernel too. Thanks @jasontitus (#530).
+- The sidebar shows which chats are working, finished or stopped on an error. Thanks @lojza3d (#536).
+- The model browser and Settings no longer freeze while the library rescans. Thanks @LXD-8 (#480).
+- Hand edits to `mcp.json`, `providers.json` and the agents list survive a save from the app. Thanks @LXD-8 (#482, #483).
+- Codex sees its MCP tools. Thanks @kmahara (#479).
+- `mlx-serve pull` downloads everything Kokoro and Qwen3-TTS need to speak. Thanks @brandondyal (#526).
+- Very long sessions (250k+ tokens) restore reliably from the SSD cache. Thanks @brandondyal (#527).
+- `logprobs` work with `response_format` (JSON mode and JSON schema). Thanks @brandondyal (#552).
+- A model that failed to load can be loaded again after its files are fixed, without restarting the server. Thanks @brandondyal (#550).
+- The web console has a new icon toolbar, and its media tools can be turned off.
 
 ## v26.9.5 — Bonsai - Qwen-Image 2.1 - Concurrency & Speed
 

@@ -197,9 +197,10 @@ def go(i): out[i] = post(*reqs[i])
 first = threading.Thread(target=post, args=("keep the model busy " * 60, busy)); first.start()
 th = [threading.Thread(target=go, args=(i,)) for i in range(len(reqs))]
 [t.start() for t in th]; [t.join() for t in th]; first.join()
+# A merged pass past 8 rows runs other fp16 GEMM tiles: the bar is the laya_mlx parity tolerance.
 def close(a, b):
     if isinstance(a, dict): return a.keys() == b.keys() and all(close(a[k], b[k]) for k in a)
-    if isinstance(a, (int, float)) and not isinstance(a, bool): return abs(a - b) <= 1e-3
+    if isinstance(a, (int, float)) and not isinstance(a, bool): return abs(a - b) <= 1e-2
     return a == b
 print("same" if all(close(a, b) for a, b in zip(serial, out)) else f"differ {serial} {out}", out[-1])
 EOF

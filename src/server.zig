@@ -9476,6 +9476,20 @@ fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8
     return best;
 }
 
+/// `stopSequenceCut` for a chat surface: a stop string ends the answer, never the reasoning.
+/// Only matches ending in the arriving token are new; earlier ones were judged already.
+fn answerStopCut(text: []const u8, token_len: usize, stops: []const []const u8, opened_by_template: bool) ?StopCut {
+    const emitted = text.len - @min(token_len, text.len);
+    var best: ?StopCut = null;
+    for (stops) |stop_seq| {
+        if (stop_seq.len == 0) continue;
+        const idx = chat_mod.answerStopIndex(text, emitted -| (stop_seq.len - 1), stop_seq, opened_by_template) orelse continue;
+        if (best) |b| if (b.index <= idx) continue;
+        best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
+    }
+    return best;
+}
+
 /// A client that vanished mid-generation did not hit a token cap.
 fn nonStreamFinishReason(client_gone: bool, slot_reason: []const u8) []const u8 {
     return if (client_gone) "client_disconnect" else slot_reason;
@@ -9801,15 +9815,19 @@ fn handleNonStreamingGeneration(
         allocator.free(lps);
     };
 
-    // Apply stop sequences: truncate text at first match
+    // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
+    // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
+    // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
+    // (chat.noThinkTailSuffix commits the channel), so any reasoning that
+    // still shows up here is real work the client gets to see.
+    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
-    for (stop_sequences) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            break;
-        }
+    if (answerStopCut(result.text, result.text.len, stop_sequences, opens_think and !constrained_proto)) |cut| {
+        final_text = result.text[0..cut.index];
+        finish_reason = "stop";
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
@@ -9822,13 +9840,6 @@ fn handleNonStreamingGeneration(
         normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
         if (normalized_text) |n| final_text = n;
     }
-
-    // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
-    // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
-    // never paid-for-and-dropped — thinking-off is enforced on the PROMPT side
-    // (chat.noThinkTailSuffix commits the channel), so any reasoning that
-    // still shows up here is real work the client gets to see.
-    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
 
     // Apply reasoning budget: truncate reasoning by token count
     // For non-streaming, we truncate after generation since we can't interrupt mid-generation
@@ -10700,7 +10711,7 @@ fn handleStreamingGeneration(
 
         // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
                 stopped = true;
                 text_buf.shrinkRetainingCapacity(cut.index);
                 if (cut.token_keep == 0) {
@@ -15224,13 +15235,12 @@ fn handleAnthropicNonStreaming(
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
     var matched_stop_seq: ?[]const u8 = null;
-    for (stop_sequences) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            matched_stop_seq = stop_seq;
-            break;
-        }
+    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+    if (answerStopCut(result.text, result.text.len, stop_sequences, opens_think and !constrained_proto)) |cut| {
+        final_text = result.text[0..cut.index];
+        finish_reason = "stop";
+        matched_stop_seq = cut.matched;
     }
 
     // Merge re-opened mid-text thought channels into the leading block so the
@@ -15265,7 +15275,7 @@ fn handleAnthropicNonStreaming(
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
     {
-        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = if (has_tools) chat_mod.trimLeakedToolMarkup(r) else r;
@@ -15656,7 +15666,7 @@ fn handleAnthropicStreaming(
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
+            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
                 stopped = true;
                 matched_stop_seq = cut.matched;
                 text_buf.shrinkRetainingCapacity(cut.index);
@@ -17102,7 +17112,8 @@ fn handleResponsesInner(
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
         const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
-        var in_think_block = promptOpensThink(allocator, lm, tok, prompt_ids) and !constrained_proto;
+        const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+        var in_think_block = opens_think and !constrained_proto;
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
@@ -17179,7 +17190,7 @@ fn handleResponsesInner(
             try raw_buf.appendSlice(allocator, token_text);
 
             if (stop_sequences.items.len > 0) {
-                if (stopSequenceCut(raw_buf.items, token_text.len, stop_sequences.items)) |cut| {
+                if (answerStopCut(raw_buf.items, token_text.len, stop_sequences.items, opens_think and !constrained_proto)) |cut| {
                     stopped = true;
                     raw_buf.shrinkRetainingCapacity(cut.index);
                     if (cut.token_keep == 0) break;
@@ -17403,12 +17414,11 @@ fn handleResponsesInner(
     // ── apply stop sequences ──
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
-    for (stop_sequences.items) |stop_seq| {
-        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
-            final_text = final_text[0..idx];
-            finish_reason = "stop";
-            break;
-        }
+    const opens_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const constrained_proto = sampling.constraint != null and sampling.constraint.?.proto != null;
+    if (answerStopCut(result.text, result.text.len, stop_sequences.items, opens_think and !constrained_proto)) |cut| {
+        final_text = result.text[0..cut.index];
+        finish_reason = "stop";
     }
 
     const status_str: []const u8 = if (std.mem.eql(u8, finish_reason, "length")) "incomplete" else "completed";
@@ -17430,7 +17440,7 @@ fn handleResponsesInner(
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, !has_tools, promptOpensThink(allocator, lm, tok, prompt_ids));
+    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, !has_tools, opens_think);
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
@@ -23706,6 +23716,21 @@ test "a streaming stop sequence cuts at the match, not at the token boundary" {
     const many = [_][]const u8{ "END", "N" };
     try t.expectEqual(@as(usize, 1), stopSequenceCut("aNbEND", 6, &many).?.index);
     try t.expectEqual(@as(?StopCut, null), stopSequenceCut("all clear", 3, &stops));
+}
+
+test "a stop string matches the answer, never the reasoning" {
+    const t = std.testing;
+    const stops = [_][]const u8{"the"};
+    // Template-opened thought: nothing matches until the block closes.
+    try t.expectEqual(@as(?StopCut, null), answerStopCut("so the answer", 13, &stops, true));
+    try t.expectEqual(@as(?StopCut, null), answerStopCut("<think>so the answer", 20, &stops, false));
+    // The token straddling the close keeps its bytes up to the match in the answer.
+    const buf = "so the</think>\nIn the";
+    const cut = answerStopCut(buf, "</think>\nIn the".len, &stops, true).?;
+    try t.expectEqual(std.mem.lastIndexOf(u8, buf, "the").?, cut.index);
+    try t.expectEqual("</think>\nIn ".len, cut.token_keep);
+    // No thought at all: the whole output is the answer.
+    try t.expectEqual(@as(usize, 3), answerStopCut("in the", 6, &stops, false).?.index);
 }
 
 test "generated think tags require an unambiguous literal template opener" {
