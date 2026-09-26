@@ -219,7 +219,7 @@ struct BenchmarkView: View {
             VStack(spacing: 0) {
                 BenchRow("Model", detail: pickedIsResident || loadingModel ? nil : "Loaded when the run starts.") {
                     if pickableModels.isEmpty {
-                        Text("No chat model on this Mac").foregroundStyle(.secondary)
+                        Text("No chat model on this Mac").font(.app(.callout)).foregroundStyle(.secondary)
                     } else {
                         HStack(spacing: 6) {
                             if loadingModel { ProgressView().controlSize(.small) }
@@ -505,6 +505,7 @@ struct BenchmarkView: View {
                             }
                         } message: {
                             Text("Results already shared to the community stay on the board.")
+                                .font(.app(.callout))
                         }
                     }
                 }
@@ -515,6 +516,7 @@ struct BenchmarkView: View {
 
     private func rateCell(_ value: Double?) -> some View {
         Text(BenchmarkFormat.rate(value ?? 0, decimals: 1))
+            .font(.app(.callout))
             .monospacedDigit()
             .fontWeight(value == nil ? .regular : .medium)
             .foregroundStyle(value == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
@@ -610,6 +612,7 @@ struct BenchmarkView: View {
                     // data point, not a benchmark.
                     TableColumn("n", sortUsing: BenchmarkFamilySort(.sessions)) { family in
                         Text("\(family.sessionCount)")
+                            .font(.app(.callout))
                             .monospacedDigit()
                             .foregroundStyle(family.sessionCount == 1 ? .orange : .secondary)
                     }

@@ -1141,6 +1141,7 @@ private struct UseModelButton: View {
                 Text("Use")
             }
         }
+        .font(.app(.callout))
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")

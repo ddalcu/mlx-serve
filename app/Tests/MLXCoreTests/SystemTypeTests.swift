@@ -135,6 +135,65 @@ final class SystemTypeTests: XCTestCase {
 
     // MARK: - The transcript
 
+    /// Text that states NO size at all renders at the platform default — 13pt on
+    /// macOS, an odd number the ladder does not contain — so it is off-scale by
+    /// construction. `.font()` on an ANCESTOR fixes that, and SwiftUI does
+    /// propagate it (measured: a `Text` inside `VStack { … }.font(…)` renders
+    /// at the ancestor's size), which is why the check walks outward.
+    ///
+    /// Two places it deliberately does not look, because a lexical scan cannot
+    /// see them and a false positive on correct code is worse than a miss:
+    ///
+    /// * **A project helper.** `footerBar` sets `.app(.caption)` on its own
+    ///   HStack 160 lines away from every call site; a scan sees the call and
+    ///   not the container. So text lexically inside a call to a capitalized
+    ///   name that is not a known SwiftUI/AppKit view is left alone — the
+    ///   helper may be the thing that sets the font.
+    /// * **AppKit draws it.** A menu item, an `Alert`'s title or its buttons
+    ///   are `NSMenuItem`/`NSAlert` text: `.font()` does not reach them on this
+    ///   platform, so demanding one would be demanding a lie. They are listed
+    ///   below with the surface that owns them.
+    func testEveryStatedTextNamesASize() throws {
+        let appKitDrawn: [(file: String, needle: String, surface: String)] = [
+            ("MLXServeApp.swift", "Text(\"\\(width.label) chat column\")", "View ▸ Interface menu (NSMenu)"),
+            ("MLXServeApp.swift", "Label(\"Interface\", systemImage:", "View ▸ Interface menu section header"),
+            ("Views/AgentsWindow.swift", "Alert(title: Text(\"Agents\")", "Alert title (NSAlert)"),
+            ("Views/AgentsWindow.swift", "dismissButton: .default(Text(\"OK\"))", "Alert button (NSAlert)"),
+            ("Views/AgentsWindow.swift", "message: Text(\"This can't be undone.\")", "Alert message (NSAlert)"),
+            ("Views/AgentsWindow.swift", "primaryButton: .destructive(Text(\"Delete\"))", "Alert button (NSAlert)"),
+            ("Views/AgentsWindow.swift", "Text(\"No clips yet\")", "voice-picker menu (NSMenu)"),
+            ("Views/AgentsWindow.swift", "Text(\"No voices installed\")", "voice-picker menu (NSMenu)"),
+            ("Services/CLILauncher.swift", "Label(\"\\(spec.displayName) in Sandbox\"", "new-session menu (NSMenu)"),
+            ("Services/CLILauncher.swift", "Label(\"Shell in Sandbox\"", "new-session menu (NSMenu)"),
+        ]
+        let knownContainers: Set<String> = [
+            "VStack", "HStack", "ZStack", "Group", "Section", "List", "Form", "LazyVStack",
+            "LazyVGrid", "Grid", "Table", "TableColumn", "ScrollView", "ScrollViewReader",
+            "Menu", "Button", "Toggle", "Label", "Text", "TextField", "SecureField", "TextEditor",
+            "Picker", "Link", "NavigationSplitView", "NavigationStack", "NavigationLink",
+            "TabView", "Divider", "Spacer", "Color", "Image", "ProgressView", "Gauge", "Canvas",
+            "ControlGroup", "DisclosureGroup", "SettingsRow", "EmptyView", "AnyView", "TupleView",
+            "_ConditionalContent", "ConditionalContent", "Optional", "ForEach", "Alert",
+            "confirmationDialog", "ContentUnavailableView", "ViewThatFits", "LabeledContent",
+            "MenuBarExtra", "Form", "List", "Table", "GridRow", "FlowLayout", "AttachmentFlowLayout",
+        ]
+        let offenders = try bareStatedText(knownContainers: knownContainers)
+            .filter { line in !appKitDrawn.contains { line.hasPrefix($0.file + ":") && line.contains($0.needle) } }
+        XCTAssertTrue(offenders.isEmpty, """
+            Text with no size of its own, and no ancestor that sets one:
+            \(offenders.joined(separator: "\n"))
+
+            It renders at the platform default (13pt on macOS), which is not on
+            the ladder. Either give it a step — `.app(.callout)`, or the step its
+            neighbours use — or set one on the container it lives in. Text inside
+            a project helper or on an AppKit surface is not reported: the helper
+            may be the thing that sets the size, and a menu item or an Alert is
+            drawn by AppKit.
+            """)
+    }
+
+    // MARK: - The transcript
+
     /// The chat-only size picker is untouched by the ladder and still moves the
     /// transcript: the setting is the user's, and one who set Extra Large must
     /// still get Extra Large after this change.
@@ -154,6 +213,115 @@ final class SystemTypeTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Every `Text`/`Label` that names no size and has no ancestor block that
+    /// does — reported as `file:line: text`, with the project-helper case
+    /// skipped (see `testEveryStatedTextNamesASize` for why it must be).
+    private func bareStatedText(knownContainers: Set<String>) throws -> [String] {
+        // A statement whose text is visible on screen. `.tag(…)`, a TextField's
+        // `prompt:` and `.help()` are drawn by the control or never drawn.
+        let skip = try NSRegularExpression(
+            pattern: "\\.tag\\(|prompt:\\s*Text\\(|accessibility(Text|Label|Value|Hint)|\\.help\\(\"")
+        let stated = try NSRegularExpression(pattern: "\\b(?:Text|Label)\\(\\s*\"")
+        var found: [String] = []
+        for (file, code) in try swiftSources() {
+            let lines = SourceScan.strippingComments(code).components(separatedBy: "\n")
+            let depths = Self.braceDepths(lines)
+            for i in 0..<lines.count {
+                let line = lines[i]
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("//") { continue }
+                let range = NSRange(line.startIndex..., in: line)
+                guard stated.firstMatch(in: line, range: range) != nil else { continue }
+                if skip.firstMatch(in: line, range: range) != nil { continue }
+                // Its own chain: the next two lines, which is where a trailing
+                // `.font(…)` / `.app(…)` on the same expression lands.
+                if (i..<min(i + 3, lines.count)).contains(where: {
+                    lines[$0].contains(".font(") || lines[$0].contains(".app(")
+                }) { continue }
+                if Self.ancestorSetsSize(lines: lines, depths: depths, at: i) { continue }
+                if Self.insideProjectHelper(lines: lines, depths: depths, at: i, known: knownContainers) { continue }
+                found.append("\(file):\(i + 1): \(trimmed)")
+            }
+        }
+        return found
+    }
+
+    /// Depth of each line, counted before the line's own braces.
+    private static func braceDepths(_ lines: [String]) -> [Int] {
+        var depth = 0
+        return lines.map { line in
+            let here = depth
+            depth += line.reduce(0) { $1 == "{" ? $0 + 1 : ($1 == "}" ? $0 - 1 : $0) }
+            return here
+        }
+    }
+
+    /// Is the line lexically inside a call to a capitalized name that is NOT a
+    /// known SwiftUI/AppKit view? That call is a project helper, and a helper is
+    /// allowed to set the font on itself — `footerBar` is, in fact, exactly
+    /// that. Returns true (skip) for those, false for a plain container chain.
+    /// Is the line lexically inside a call to a capitalized name that is NOT a
+    /// known SwiftUI/AppKit view? That call is a project helper, and a helper is
+    /// allowed to set the font on itself — `footerBar` is, in fact, exactly
+    /// that. Returns true (skip) for those, false for a plain container chain.
+    private static func insideProjectHelper(lines: [String], depths: [Int],
+                                            at index: Int, known: Set<String>) -> Bool {
+        let call = try? NSRegularExpression(pattern: #"\b([A-Z][A-Za-z0-9_]*)\s*[({]"#)
+        var level = depths[index]
+        var j = index - 1
+        while j >= 0 {
+            while j >= 0 && depths[j] >= level { j -= 1 }
+            guard j >= 0, let call else { break }
+            let openers = (0...j).reversed().filter { depths[$0] == level - 1 }
+            guard let open = openers.first(where: { lines[$0].contains("{") }) else { level -= 1; j -= 1; continue }
+            // A declaration is not a call. `struct PaneTitle: View {` matches the
+            // call regex on `View`, and reading that as a project helper would
+            // swallow EVERY bare Text in the file — the scan would pass vacuously,
+            // which is the one failure mode it cannot afford.
+            if Self.isDeclaration(lines[open]) { return false }
+            let range = NSRange(lines[open].startIndex..., in: lines[open])
+            if let m = call.firstMatch(in: lines[open], range: range),
+               let nameRange = Range(m.range(at: 1), in: lines[open]) {
+                let name = String(lines[open][nameRange])
+                if !known.contains(name) { return true }
+            }
+            level -= 1
+            j -= 1
+            if level <= 0 { break }
+        }
+        return false
+    }
+
+    /// Does an enclosing block set a size? The block's own lines count, AND the
+    /// two lines after its closing brace — SwiftUI's own idiom is a trailing
+    /// modifier on the container:
+    ///
+    ///     Button { } label: { Text("Check Now") }
+    ///         .font(.app(.callout))
+    ///
+    /// so a scan that only reads a block's interior reports every one of them.
+    private static func ancestorSetsSize(lines: [String], depths: [Int], at index: Int) -> Bool {
+        var level = depths[index]
+        while level > 0 {
+            guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
+            else { return false }
+            let close = (index..<lines.count).first(where: { depths[$0] < level }) ?? lines.count - 1
+            let window = lines[open...min(close + 2, lines.count - 1)].joined(separator: "\n")
+            if window.contains(".font(") || window.contains(".app(") { return true }
+            level -= 1
+        }
+        return false
+    }
+
+    /// Does this line open a type, function or stored property rather than call
+    /// anything?
+    private static func isDeclaration(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("//") || trimmed.hasPrefix("*") { return true }
+        return trimmed.range(of: #"^\s*(?:@\w+\s+)*(?:(?:public|private|fileprivate|internal|final|indirect|@\w+)\s+)*(struct|class|enum|extension|actor|protocol|func|init|subscript|var|let|case)\b"#,
+                            options: .regularExpression) != nil
+    }
 
     /// Every step named at a call site, spelled as `Font.TextStyle` prints.
     private func usedStyles() throws -> Set<String> {

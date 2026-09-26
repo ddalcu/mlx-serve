@@ -80,7 +80,8 @@ struct TaskDetailPane: View {
         } else {
             ContentUnavailableView("Select a task",
                                    systemImage: "clock.badge.checkmark",
-                                   description: Text("Pick a task to see its runs, or create a new one."))
+                                   description: Text("Pick a task to see its runs, or create a new one.")
+                                                          .font(.app(.callout)))
         }
     }
 }

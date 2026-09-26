@@ -7,7 +7,9 @@ struct LayaDecisionsWindow: View {
         if let path = appState.decisionsModelPath {
             LayaDecisionsPane(modelPath: path).id(path)
         } else {
-            Text("Pick a Laya model in Models \u{2192} Downloaded and press Use.").padding(40)
+            Text("Pick a Laya model in Models \u{2192} Downloaded and press Use.")
+                .font(.app(.callout))
+                .padding(40)
         }
     }
 }

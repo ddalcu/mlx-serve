@@ -265,7 +265,8 @@ struct AgentDetailPane: View {
             } else {
                 ContentUnavailableView("No agent selected",
                                        systemImage: "person.crop.circle.badge.questionmark",
-                                       description: Text("Pick an agent, or create one from a type."))
+                                       description: Text("Pick an agent, or create one from a type.")
+                                                          .font(.app(.callout)))
             }
         }
         .onChange(of: model.selectedId) { _, newValue in

@@ -2332,6 +2332,7 @@ struct ChatDetailView: View {
                             Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
                         }
                     }
+                    .font(.app(.callout))
                     .disabled(!allowed || isExternalBridgeSession)
                 }
             }

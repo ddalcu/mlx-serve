@@ -748,6 +748,7 @@ struct ImageGenView: View {
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid || !customSizeValid)
                 }
             }
+            .font(.app(.callout))
         }
     }
 

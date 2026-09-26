@@ -246,6 +246,10 @@ private struct SettingsSidebar: View {
                 }
             }
         }
+        // The sidebar rows are the app's other callouts, not the platform
+        // default: without this they render at 13pt while every pane they open
+        // reads from the ladder.
+        .font(.app(.callout))
         .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
     }
 }
@@ -2823,7 +2827,7 @@ private struct VoiceRecordControl: View {
                 Label(L10n.format("Stop (%.1fs)", recorder.duration), systemImage: "stop.circle")
             }
         } else {
-            Button(action: onRecord) { Label("Record", systemImage: "mic") }
+            Button(action: onRecord) { Label("Record", systemImage: "mic").font(.app(.callout)) }
         }
     }
 }
@@ -3152,6 +3156,7 @@ private struct UpdatesSectionContent: View {
                     Text("Check Now")
                 }
             }
+            .font(.app(.callout))
             .disabled(busy)
         }
 
