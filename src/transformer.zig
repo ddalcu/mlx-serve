@@ -24749,10 +24749,9 @@ pub const Transformer = struct {
             _ = mlx.mlx_vector_array_append_value(out_vec, y_t);
             _ = mlx.mlx_array_free(y_t);
 
-            if (t == 0) {
-                try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
-                log.debug("[mamba2] timestep 0 ok\n", .{});
-            } else if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
+            // Cadence eval only: a per-layer eval here is a GPU sync on
+            // every decode token (23 per token on Nemotron-3.5).
+            if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
                 try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
             }
         }
