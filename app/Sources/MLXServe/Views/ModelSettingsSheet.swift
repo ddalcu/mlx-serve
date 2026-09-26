@@ -79,9 +79,9 @@ struct ModelSettingsSheet: View {
         let value = override.templateKwargs[key] ?? ""
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(key).font(.body.monospaced())
+                Text(key).font(.app(.body).monospaced())
                 if let hint = TemplateKwargs.hint(for: key) {
-                    Text(L10n.text(hint)).font(.caption2).foregroundStyle(.secondary)
+                    Text(L10n.text(hint)).font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -98,7 +98,7 @@ struct ModelSettingsSheet: View {
                 TextField("value", text: Binding(
                     get: { TemplateKwargs.display(value) },
                     set: { if let v = TemplateKwargs.parse($0) { override.templateKwargs[key] = v } }))
-                    .font(.body.monospaced()).frame(width: 140)
+                    .font(.app(.body).monospaced()).frame(width: 140)
             }
             Button { override.templateKwargs[key] = nil } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
@@ -124,8 +124,8 @@ struct ModelSettingsSheet: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Model Settings").font(.title3.weight(.semibold))
-                    Text(request.title).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text("Model Settings").font(.app(.title3).weight(.semibold))
+                    Text(request.title).font(.app(.caption)).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
             }
@@ -172,8 +172,8 @@ struct ModelSettingsSheet: View {
                         }
                         if addingCustom {
                             HStack {
-                                TextField("key", text: $customKey).font(.body.monospaced())
-                                TextField("value", text: $customValue).font(.body.monospaced())
+                                TextField("key", text: $customKey).font(.app(.body).monospaced())
+                                TextField("value", text: $customValue).font(.app(.body).monospaced())
                                     .onSubmit(commitCustom)
                                 Button("Add", action: commitCustom)
                                     .disabled(customKey.trimmingCharacters(in: .whitespaces).isEmpty || TemplateKwargs.parse(customValue) == nil)
@@ -213,14 +213,14 @@ struct ModelSettingsSheet: View {
             .frame(height: formHeight)
             if rows.acceptance {
                 Text(L10n.text("Lossy acceptance can loop on repetitive output: in our tests Typical looped 10% of runs, TokenV3 40%."))
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
                     .padding(.horizontal, 16).padding(.bottom, 4)
             }
             Text(L10n.text(footnote))
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
                 .padding(.horizontal, 16)
             if let error {
-                Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal, 16)
+                Text(error).font(.app(.caption)).foregroundStyle(.red).padding(.horizontal, 16)
             }
             HStack {
                 Spacer()

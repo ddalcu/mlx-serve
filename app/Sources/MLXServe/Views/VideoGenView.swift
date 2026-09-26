@@ -244,7 +244,7 @@ struct VideoGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Prompt").font(.subheadline.weight(.semibold))
+                Text("Prompt").font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 if let hint = promptHint { promptWarning(hint) }
                 templatesMenu
@@ -266,14 +266,14 @@ struct VideoGenView: View {
                 // when the editor is not the one being typed into.
                 TextEditor(text: $prompt, selection: $promptSelection)
                     .focused($promptFocused)
-                    .font(.body)
+                    .font(.app(.body))
                     .frame(height: promptHeight)
                     .overlay(
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
                     Text(L10n.text(H3PromptExamples.placeholder(for: model.promptFormat)))
-                        .font(.body)
+                        .font(.app(.body))
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
                         .padding(.vertical, 8)
@@ -301,7 +301,7 @@ struct VideoGenView: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
-        .font(.caption)
+        .font(.app(.caption))
         .foregroundStyle(.orange)
         .hoverReveal(placement: .pointerClamped(width: bubbleWidth, container: promptRow)) {
             Self.hoverBubble(L10n.text(hint))
@@ -333,7 +333,7 @@ struct VideoGenView: View {
         VStack(alignment: .leading, spacing: 6) {
             above()
             Text(text)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -420,7 +420,7 @@ struct VideoGenView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-                .font(.caption)
+                .font(.app(.caption))
                 .controlSize(.small)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
@@ -488,13 +488,13 @@ struct VideoGenView: View {
 
     private var qualitySection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Quality").font(.subheadline.weight(.semibold))
+            Text("Quality").font(.app(.subheadline).weight(.semibold))
             // Measured, not `ViewThatFits`: see `qualityFitsSegments`. Five
             // segments degrade to a menu rather than shortening the tier names
             // this pane shares with every other Create pane.
             qualityPicker(segmented: qualityFitsSegments)
             Text(qualityHint)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
         }
         // Measure the SECTION at the column's width, never the picker: the
@@ -632,14 +632,14 @@ struct VideoGenView: View {
             }
             if let hint = clipSizeHint(verdict) {
                 Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
             }
             // A two-stage tier denoises at HALF this canvas and upscales, so on
             // a small canvas "Quality" is softer than the one-stage tiers.
             if effectiveMode != .oneStage,
                let note = model.twoStageCanvasNote(width: effectiveSize.width, height: effectiveSize.height) {
-                Text(L10n.text(note)).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(note)).font(.app(.caption2)).foregroundStyle(.orange)
             }
         }
     }
@@ -649,7 +649,7 @@ struct VideoGenView: View {
             labelledSizeField("Clip width", text: $customWidthText)
             // Centred on the fields, not on the pair of labels above them.
             Image(systemName: "multiply")
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .frame(height: 24)
             labelledSizeField("Clip height", text: $customHeightText)
@@ -662,7 +662,7 @@ struct VideoGenView: View {
             // because a squeezed HStack proposes less than its widest child
             // and the TEXT is what gives first: two words on two lines.
             Text(L10n.text(title))
-                .font(.subheadline.weight(.semibold))
+                .font(.app(.subheadline).weight(.semibold))
                 .fixedSize()
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
@@ -746,7 +746,7 @@ struct VideoGenView: View {
         // Body, not caption: this sits beside the size fields rather than
         // above a text box. The height is the fields' own, so the two line up
         // instead of the chip hugging its text a few points shorter.
-        .font(.body)
+        .font(.app(.body))
         .modifier(PaneChip(height: 24))
     }
 
@@ -856,20 +856,20 @@ struct VideoGenView: View {
     private var framesSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Frames").font(.subheadline.weight(.semibold))
+                Text("Frames").font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 Text(L10n.format("%lld frames · ~%.1fs", Int64(numFrames), Double(numFrames) / Double(fps)))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             // Snap through LTX's valid `8N+1` frame ladder by index, so the
             // slider can only land on generatable lengths (9, 17, 25, … maxFrames).
             frameSlider
             if let warn = frameRAMWarning {
-                Text(L10n.text(warn)).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(warn)).font(.app(.caption2)).foregroundStyle(.orange)
             }
             if let advice = model.framesAdvisory(numFrames) {
-                Text(L10n.text(advice)).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(advice)).font(.app(.caption2)).foregroundStyle(.orange)
             }
         }
     }
@@ -1045,7 +1045,7 @@ struct VideoGenView: View {
                              help: "Select the image the clip should land on. The first frame sets the size; this one is fitted to it.")
                 if lastFrameImageURL != nil && firstFrameImageURL == nil {
                     Text("With only a last frame the model invents the opening and works toward it. Add a first frame to pin both ends.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
         }
@@ -1059,9 +1059,9 @@ struct VideoGenView: View {
             // The note reads as part of the heading, so it sits against it
             // rather than across the row from it.
             HStack(spacing: 6) {
-                Text(L10n.text(title)).font(.subheadline.weight(.semibold))
+                Text(L10n.text(title)).font(.app(.subheadline).weight(.semibold))
                 Text(L10n.text(note))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }
@@ -1078,7 +1078,7 @@ struct VideoGenView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
                         Text(picked.lastPathComponent)
-                            .font(.caption)
+                            .font(.app(.caption))
                             .lineLimit(1)
                             .truncationMode(.middle)
                         Spacer()
@@ -1118,13 +1118,13 @@ struct VideoGenView: View {
         if model.supportsReferences {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Text("References").font(.subheadline.weight(.semibold))
+                    Text("References").font(.app(.subheadline).weight(.semibold))
                     // A saved reference is gone and the tiles after it
                     // renumbered, so the prompt's `<Picture n>` may now name
                     // another picture. Cleared by the first edit to either.
                     if refsDroppedOnHydrate {
                         Image(systemName: "exclamationmark.circle.fill")
-                            .font(.caption)
+                            .font(.app(.caption))
                             .foregroundStyle(.orange)
                             .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                                     container: refHeaderRow)) {
@@ -1132,7 +1132,7 @@ struct VideoGenView: View {
                             }
                     }
                     Text("optional, the model follows them")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     // The combined budget, always in view, with the reason on
@@ -1142,7 +1142,7 @@ struct VideoGenView: View {
                         Text(L10n.format("%lld of %lld", Int64(refFilesAttached), Int64(H3RefLimits.total)))
                         Image(systemName: "info.circle")
                     }
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                             container: refHeaderRow)) {
@@ -1224,7 +1224,7 @@ struct VideoGenView: View {
 
     private func refGroupTitle(_ title: String, count: Int, limit: Int) -> some View {
         Text(L10n.format("%@ (%lld/%lld)", L10n.text(title), Int64(count), Int64(limit)))
-            .font(.caption.weight(.medium))
+            .font(.app(.caption).weight(.medium))
             .foregroundStyle(.secondary)
             // Four words on four lines is what a squeezed HStack does to the
             // text before it touches the control beside it.
@@ -1242,7 +1242,7 @@ struct VideoGenView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .font(.caption)
+        .font(.app(.caption))
         .fixedSize()
         // Reference tokens ride through EVERY sampling step, so this is a real
         // time cost, not a quality knob.
@@ -1355,7 +1355,7 @@ struct VideoGenView: View {
                                 .fill(Color(nsColor: .windowBackgroundColor))
                                 .frame(width: 17, height: 17)
                             Image(systemName: "multiply.circle.fill")
-                                .font(.system(size: 14))
+                                .font(.app(.body))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -1363,7 +1363,7 @@ struct VideoGenView: View {
                     .padding(3)
                 }
                 Text(promptMarker)
-                    .font(.caption2.monospacedDigit())
+                    .font(.app(.caption2).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -1497,9 +1497,9 @@ struct VideoGenView: View {
         if !model.supportsAudioInput {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
-                    Text("Sound").font(.subheadline.weight(.semibold))
+                    Text("Sound").font(.app(.subheadline).weight(.semibold))
                     Text(L10n.text(model.generatesAudio ? "generated with the video" : "not supported"))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                 }
@@ -1507,7 +1507,7 @@ struct VideoGenView: View {
                     // The same surface as the wells above it, so the block
                     // reads as one of them rather than a stray caption.
                     Text("This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score).")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
@@ -1529,9 +1529,9 @@ struct VideoGenView: View {
     private var audioInputSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("Speech & sound").font(.subheadline.weight(.semibold))
+                Text("Speech & sound").font(.app(.subheadline).weight(.semibold))
                 Text("optional, audio-to-video")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 // The way out of the composer, on the heading rather than in
@@ -1563,11 +1563,11 @@ struct VideoGenView: View {
                 Text(L10n.text(clipOutlastsVideo
                      ? "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline. The clip is longer than the video and is trimmed to it."
                      : "Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline."))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
             } else if audioSource == .none {
                 Text("The model invents a soundtrack from your prompt. Attach speech to make characters say exact words.")
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
             }
         }
@@ -1640,7 +1640,7 @@ struct VideoGenView: View {
                 TextField("Line to speak — e.g. Good morning. Coffee's ready.", text: $speechText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(2...4)
-                    .font(.body)
+                    .font(.app(.body))
                     .disabled(tts.isRunning)
                 // One width for all three titles, content centred in it: the
                 // button changes its word as the flow moves and must not
@@ -1649,7 +1649,7 @@ struct VideoGenView: View {
                     if tts.isRunning {
                         Button { tts.cancel() } label: {
                             Label("Stop", systemImage: "stop.fill")
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .frame(width: Self.speechButtonWidth)
                         }
                         .buttonStyle(.bordered)
@@ -1658,7 +1658,7 @@ struct VideoGenView: View {
                             tts.generate(AudioGenRequest(model: preset, text: speechText), server: server)
                         } label: {
                             Label(L10n.text(audioURL == nil ? "Create speech" : "Recreate speech"), systemImage: "waveform")
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .frame(width: Self.speechButtonWidth)
                         }
                         .buttonStyle(.bordered)
@@ -1668,18 +1668,18 @@ struct VideoGenView: View {
             }
             if speechPreset == nil {
                 Text("Download a voice first — open the Audio window and grab Qwen3-TTS, then come back.")
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.orange)
             }
             if case .failed(let msg) = tts.phase {
-                Text(msg).font(.caption2).foregroundStyle(.orange)
+                Text(msg).font(.app(.caption2)).foregroundStyle(.orange)
             }
             // The clip's row, holding its place while the clip is being made.
             if tts.isRunning {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     if case .running(_, _, let msg) = tts.phase {
-                        Text(msg).font(.caption).foregroundStyle(.secondary)
+                        Text(msg).font(.app(.caption)).foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.tail)
                     }
                     Spacer()
@@ -1703,12 +1703,12 @@ struct VideoGenView: View {
             Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
             if leadWithDuration, let d = audioDuration {
                 Text(String(format: "%.1fs", d))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
-                Text("·").font(.caption).foregroundStyle(.secondary)
+                Text("·").font(.app(.caption)).foregroundStyle(.secondary)
             }
             Text(audioURL?.lastPathComponent ?? "")
-                .font(.caption)
+                .font(.app(.caption))
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
@@ -1796,11 +1796,11 @@ struct VideoGenView: View {
             intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
             Text(L10n.text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp))
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             // The low end is REACHABLE and only advised against, so the pane
             // can load a community few-step adapter the way the server can.
             if let advice = model.stepsAdvisory(steps: steps, distilled: distilledSampling) {
-                Text(L10n.text(advice)).font(.caption2).foregroundStyle(.orange)
+                Text(L10n.text(advice)).font(.app(.caption2)).foregroundStyle(.orange)
             }
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
@@ -1815,7 +1815,7 @@ struct VideoGenView: View {
                           help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).",
                           lockedReadout: guidanceLockedReadout)
                 Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
 
                 // STG was sent on every LTX request from the day the wire was
                 // fixed, with nothing to set it — so it sat at whatever was in
@@ -1825,7 +1825,7 @@ struct VideoGenView: View {
                           help: "Spatio-temporal guidance. 0 = off (the default). Steadies motion and structure at the cost of speed.",
                           lockedReadout: guidanceLockedReadout)
                 Text("Steadies motion and shape by re-running part of the model with its attention perturbed. 0 = off, which is the default. Around 1.0 helps wobbly motion; higher costs time and can flatten detail.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
 
                 // Audio guidance belongs to the a2vid guider, so it only shows
                 // with a clip attached — otherwise it is a knob on something
@@ -1835,7 +1835,7 @@ struct VideoGenView: View {
                               help: "How closely the picture follows the attached soundtrack. LTX default: 7.0.",
                               lockedReadout: guidanceLockedReadout)
                     Text("How hard the video is pushed to match your clip — lip sync, timing, performance. 7.0 is the LTX default. Lower drifts from the audio; higher locks to it and can look stiff.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
 
@@ -1853,7 +1853,7 @@ struct VideoGenView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         // `fixedSize` for the reason `labelledSizeField` gives:
                         // a squeezed HStack gives first on the TEXT.
-                        Text("Mode").font(.caption).fixedSize()
+                        Text("Mode").font(.app(.caption)).fixedSize()
                         // Through `modeLabel`, the same three words as the
                         // caption under the Quality switcher. Shows the
                         // EFFECTIVE mode and locks while a clip forces it.
@@ -1864,7 +1864,7 @@ struct VideoGenView: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .fixedSize()
                         .disabled(modeUpgradedForAudio)
                     }
@@ -1880,7 +1880,7 @@ struct VideoGenView: View {
                         .frame(maxWidth: .infinity)
                 }
                 Text(L10n.text(modeHint))
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
 
             // Chained windows. Already wired end to end — this is the control
@@ -1897,7 +1897,7 @@ struct VideoGenView: View {
                         Int64(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)),
                         Int64(chainWindows))
                      : L10n.text("Joins several generations end to end for a longer clip. Each window costs another full generation."))
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
 
             HStack {
@@ -1930,31 +1930,31 @@ struct VideoGenView: View {
                             downloads.cancelTurboLora(repoId: model.repo)
                         }
                     }))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .help("Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.")
                 if turboFetchDecision == .fetch {
                     Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter this pack predates — it downloads once, and Generate waits for it.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 } else if turboFetchDecision == .unavailableRemotely {
                     Text("Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
             if model.supportsDiffusionDecoder {
                 Toggle("Diffusion decoder (sharper, slower)", isOn: $diffusionDecoder)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .help("Off (default): the plain convolutional decoder. On: LTX's own diffusion decoder — the one their published clips use. It denoises the frames instead of interpolating them, so fine texture and edges come out sharper. The decode itself takes about 21 s for a 97-frame clip at 768x512; measured end to end against the plain decoder in the same session the difference was inside run-to-run variance.")
             }
             if model.supportsFastRecipe {
                 Toggle("Max quality (slower)", isOn: $bestQuality)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders, and it drops the step cache, which is what makes a long clip fit in memory. Turbo runs without the recipe anyway, so this has nothing to add there.")
                     // Under turbo the recipe is already off server-side; a
                     // toggle that could not change anything is a dead control.
                     .disabled(turboEngaged)
             }
             Toggle("Show live preview while generating", isOn: $livePreview)
-                .font(.caption)
+                .font(.app(.caption))
                 .help("On: each denoising step sends a small still built by projecting the latent straight to RGB — enough to see the shot taking form, but flat and soft compared with the finished clip, which is decoded by the VAE. Off (default): no preview. It is not free — every step solves for the clean latent and copies the previewed frame to the CPU.")
 
             if model.supportsLoRA { loraSection }
@@ -1970,7 +1970,7 @@ struct VideoGenView: View {
     private var loraSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
-            Text("Style LoRAs").font(.caption.weight(.semibold))
+            Text("Style LoRAs").font(.app(.caption).weight(.semibold))
             ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
                 loraRow(index: index, lora: lora)
             }
@@ -2003,7 +2003,7 @@ struct VideoGenView: View {
                 Image(systemName: "paintpalette")
                     .foregroundStyle(.secondary)
                 Text(URL(fileURLWithPath: lora.path).lastPathComponent)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(lora.path)
@@ -2019,12 +2019,12 @@ struct VideoGenView: View {
                 .help("Remove this LoRA")
             }
             HStack(spacing: 8) {
-                Text("Scale").font(.caption)
+                Text("Scale").font(.app(.caption))
                 Slider(value: $loras[index].scale, in: 0...2, step: 0.05)
                 // Fixed width: a readout that sizes to its digits drags the
                 // slider's right edge every time the value crosses a width.
                 Text(String(format: "%.2f", lora.scale))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 34, alignment: .trailing)
             }
@@ -2044,7 +2044,7 @@ struct VideoGenView: View {
                 .fill(service.residency?.loaded == true ? Color.green : Color.secondary.opacity(0.4))
                 .frame(width: 7, height: 7)
             Text(L10n.text(residencyText))
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -2132,10 +2132,10 @@ struct VideoGenView: View {
                            step: Double, help: String? = nil, lockedReadout: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text(lockedReadout ?? String(format: "%.1f", value.wrappedValue))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
@@ -2149,10 +2149,10 @@ struct VideoGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, help: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text("\(value.wrappedValue)")
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(
@@ -2183,10 +2183,10 @@ struct VideoGenView: View {
                              : readout(value.wrappedValue)
         return VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text(L10n.text(shown))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(
@@ -2239,11 +2239,11 @@ struct VideoGenView: View {
             // it is the backstop, not the message people normally see.
             if !payloadFits {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
-                    .font(.caption2).foregroundStyle(.orange)
+                    .font(.app(.caption2)).foregroundStyle(.orange)
             }
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")
             }
@@ -2270,7 +2270,7 @@ struct VideoGenView: View {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -2298,7 +2298,7 @@ struct VideoGenView: View {
             }
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -2329,7 +2329,7 @@ struct VideoGenView: View {
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
-                .font(.caption)
+                .font(.app(.caption))
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)

@@ -7,7 +7,7 @@
 // functions and pinned here.
 //
 // Run: node --test tests/html_console_test.mjs
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -1071,4 +1071,34 @@ test('the light palette restates every variable the dark palette sets', () => {
   const light = varsIn(blockAfter(':root[data-theme=light]'));
   const missing = [...base].filter((v) => !light.has(v));
   assert.deepEqual(missing, [], 'a variable left out of the light block is a dark island');
+});
+
+// ── Type is relative, so the reader's browser size applies ────────────────
+// A `px` font size ignores the browser's own default font size AND the page
+// zoom, which is the one text-size control a reader of the console actually
+// has. `rem` follows the root size, so the same value renders at whatever the
+// reader chose. The app's own ladder is the same idea in point sizes
+// (`app/Sources/MLXServe/Support/AppType.swift`); this is the web half of the
+// same rule, and the scan is what stops a later stylesheet from quietly
+// putting px back.
+
+test('no console stylesheet states a font size in px', () => {
+  // The DIRECTORY, not a list of files. `src/html` gains scripts as the
+  // console grows (theme.js, i18n.js), and a fixed list quietly stops covering
+  // the day one is added — the rule would hold for the names in the array and
+  // for nothing else.
+  const dir = join(here, '..', 'src', 'html');
+  const files = readdirSync(dir).filter((f) => /\.(css|js|html)$/.test(f));
+  assert.ok(files.length >= 4, `only ${files.length} console files to scan — is the walk working?`);
+  const offenders = [];
+  for (const name of files) {
+    const text = readFileSync(join(dir, name), 'utf8');
+    for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
+      const line = text.slice(0, m.index).split('\n').length;
+      offenders.push(`${name}:${line}: ${m[0].trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
+    'Use rem (px / 16): 13px is 0.8125rem.');
 });

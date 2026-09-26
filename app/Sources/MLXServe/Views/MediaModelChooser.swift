@@ -39,7 +39,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
+            Text("Model").font(.app(.subheadline).weight(.semibold))
 
             // ONE row: the model that will run. A stack of radio rows read as
             // a multi-select and grew with the catalogue; what the pane has to
@@ -107,19 +107,19 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
         return HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(cur.name)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.app(.subheadline).weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 if !cur.detail.isEmpty || cur.ram != nil {
                     HStack(spacing: 4) {
                         if !cur.detail.isEmpty {
                             Text(L10n.text(cur.detail))
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .foregroundStyle(.secondary)
                         }
                         if let ram = cur.ram {
                             Text(L10n.text(ram))
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .foregroundStyle(.tertiary)
                         }
                     }
@@ -128,7 +128,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                     // Warn, don't block: it may still run, slowly.
                     Label("Needs more memory than this Mac has",
                           systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.orange)
                 }
             }
@@ -147,7 +147,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
                         onDownload(preset)
                     } label: {
                         Text(downloadLabel(preset))
-                            .font(.caption.weight(.medium))
+                            .font(.app(.caption).weight(.medium))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

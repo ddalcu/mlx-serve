@@ -63,7 +63,7 @@ struct TrayStatusChip: View {
                 .fill(model.tone.color)
                 .frame(width: 6, height: 6)
             Text(L10n.text(model.label))
-                .font(.caption.weight(.medium))
+                .font(.app(.caption).weight(.medium))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 7)
@@ -91,12 +91,12 @@ struct TraySectionHeader: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(L10n.text(title).uppercased())
-                .font(.caption2.weight(.semibold))
+                .font(.app(.caption2).weight(.semibold))
                 .tracking(0.6)
             Spacer(minLength: 0)
             if let detail {
                 Text(detail)
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.tertiary)
             }
         }
@@ -158,15 +158,15 @@ struct TrayFeatureRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 9) {
             Image(systemName: icon)
-                .font(.system(size: 13, weight: .medium))
+                .font(.app(.body, weight: .medium))
                 .foregroundStyle(isOn ? tint : Color.secondary)
                 .frame(width: 17)
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(title))
-                    .font(.subheadline.weight(.medium))
+                    .font(.app(.subheadline).weight(.medium))
                 if let subtitle {
                     Text(L10n.text(subtitle))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -194,11 +194,11 @@ struct TrayDisclosureHeader<Accessory: View>: View {
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "chevron.right")
-                        .font(.caption2.weight(.semibold))
+                        .font(.app(.caption2).weight(.semibold))
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .frame(width: 9)
                     Text(L10n.text(title))
-                        .font(.subheadline.weight(.medium))
+                        .font(.app(.subheadline).weight(.medium))
                     Spacer(minLength: 0)
                 }
                 .foregroundStyle(.secondary)
@@ -231,7 +231,7 @@ struct TrayAccessoryButton: View {
                 Image(systemName: icon)
                 Text(L10n.text(title))
             }
-            .font(.caption)
+            .font(.app(.caption))
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
@@ -285,11 +285,11 @@ struct TrayTileFace: View {
             // Glyphs differ in height (speedometer is taller than the chat
             // bubbles); a fixed box keeps every tile's title on one baseline.
             Image(systemName: icon)
-                .font(.system(size: 15, weight: .regular))
+                .font(.app(.title3, weight: .regular))
                 .foregroundStyle(isEnabled ? tint : Color.secondary)
                 .frame(height: 18)
             Text(L10n.text(title))
-                .font(.caption2.weight(.medium))
+                .font(.app(.caption2).weight(.medium))
                 .foregroundStyle(isEnabled ? .primary : .secondary)
                 .lineLimit(1)
         }

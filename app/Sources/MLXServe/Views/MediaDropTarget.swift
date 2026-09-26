@@ -312,13 +312,13 @@ struct MediaDropWellOption: View {
     var body: some View {
         VStack(spacing: 6) {
             Image(systemName: systemImage)
-                .font(.title2)
+                .font(.app(.title2))
                 .foregroundStyle(.secondary)
             Button(L10n.text(title), action: action)
                 .buttonStyle(.link)
-                .font(.caption)
+                .font(.app(.caption))
             Text(L10n.text(caption))
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.secondary)
                 // A caption long enough to wrap centres every line, not just
                 // the block: a left-aligned second line under a centred first
@@ -349,7 +349,7 @@ struct MediaWellAction: View {
         VStack(spacing: layout == .stacked ? 6 : 2) {
             if layout == .stacked {
                 Image(systemName: systemImage)
-                    .font(.title2)
+                    .font(.app(.title2))
                     .foregroundStyle(.secondary)
                 linkTitle(centred: true)
             } else {
@@ -360,7 +360,7 @@ struct MediaWellAction: View {
                 }
             }
             Text(L10n.text(caption))
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.secondary)
                 // Centres every LINE, for the reason `MediaDropWellOption`
                 // gives: in a narrow column this wraps.
@@ -370,7 +370,7 @@ struct MediaWellAction: View {
 
     private func linkTitle(centred: Bool) -> some View {
         Text(L10n.text(title))
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(Color(nsColor: .linkColor))
             .multilineTextAlignment(centred ? .center : .leading)
     }

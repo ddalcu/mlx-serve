@@ -159,14 +159,14 @@ struct BenchmarkRungTable: View {
                 }
             }
         }
-        .font(.callout)
+        .font(.app(.callout))
     }
 
     /// The caps are a render-time treatment: the catalog is keyed on the source
     /// literal, so the lookup has to run BEFORE uppercasing.
     private func header(_ text: String) -> some View {
         Text(L10n.text(text).uppercased())
-            .font(.system(size: 9, weight: .semibold))
+            .font(.app(.caption2, weight: .semibold))
             .tracking(0.5)
             .foregroundStyle(.tertiary)
     }
@@ -191,7 +191,7 @@ struct BenchmarkSettingsChips: View {
         HStack(spacing: 4) {
             ForEach(BenchmarkSettings.summaryChips(settings), id: \.self) { chip in
                 Text(L10n.text(chip))
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.app(.caption2, weight: .medium))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 2)
                     .background(.quaternary.opacity(0.5), in: Capsule())
@@ -219,14 +219,14 @@ struct BenchCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label(L10n.text(title), systemImage: icon)
-                .font(.subheadline.weight(.semibold))
+                .font(.app(.subheadline).weight(.semibold))
                 .foregroundStyle(.secondary)
 
             content
 
             if let footnote {
                 Text(L10n.text(footnote))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -258,7 +258,7 @@ struct BenchRow<Value: View>: View {
                 Text(L10n.text(label))
                 if let detail {
                     Text(L10n.text(detail))
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

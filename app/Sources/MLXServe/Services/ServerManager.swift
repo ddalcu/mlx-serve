@@ -460,7 +460,7 @@ class ServerManager: ObservableObject {
         let textView = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
         textView.isEditable = false
         textView.isSelectable = true
-        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.font = AppType.monospaced(.subheadline)
         textView.string = log
         // Wrap lines to the visible width instead of horizontal-scrolling.
         textView.isHorizontallyResizable = false
