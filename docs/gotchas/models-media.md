@@ -1925,14 +1925,24 @@ Fix: both exact. Large 3x3 convs run in row strips over a once-padded input (`Co
 
 Guard: `QwenImage VAE parity` re-runs the reference oracle with every stage forced into 8-row bands; `QwenImage strip conv equals the whole-image conv`. An uncapped MLX buffer pool in a test binary also reads as a leak: the e2e test sets the 1 GB cap the server sets in `main()`.
 
-## Nemotron-H: two spellings of the layer pattern, and an MoE arm that was `unreachable` (2026-09-26)
+## Nemotron-H: two spellings of the layer pattern, and an MoE arm that was `unreachable`
 
 Symptom: `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` failed to load with `MISSING WEIGHT: backbone.layers.0.mixer.q_proj.weight`.
 
-Cause 1: the transformers >= 5 export writes the layer pattern as `layers_block_type: ["mamba", "moe", ...]` instead of `hybrid_override_pattern: "MEM*..."`. Only the string was parsed, so every layer kept the `.attention` default and layer 0 (a Mamba2 block) looked for attention weights.
+Cause 1: Nemotron 3.5 configs write the layer pattern as `layers_block_type: ["mamba", "moe", ...]` instead of `hybrid_override_pattern: "MEM*..."`. Only the string was parsed, so every layer kept the `.attention` default and layer 0 (a Mamba2 block) looked for attention weights.
 
-Cause 2: once the list parsed, layer 1 (`moe`) failed on `mixer.up_proj.weight`. `initHybridLayers`' `.moe` arm was `unreachable` (a TODO). In ReleaseFast that is UB, and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. The `hybrid_override_pattern` packs (`E` blocks) hit the same arm.
+Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFast that is UB and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. Every `E`-block Nemotron (3 Nano, 3.5) hit it; only dense Nemotron-H ever loaded.
 
-Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, weights kept f32 until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path, shared expert always added. `moe_latent_size` packs are refused by name (`UnsupportedNemotronLatentMoe`). Decode uses the sorted path too; the gather-qmv decode kernels are SwiGLU-only.
+Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path, shared expert always added. `moe_latent_size` packs are refused by name. Decode uses the sorted path too; the gather-qmv decode kernels are SwiGLU-only.
 
-Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (transformer.zig). Live: all three local Nemotron-3.5-Lightning packs (4bit, OptiQ-4bit, Fastino 8bit) load and answer correctly.
+Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (transformer.zig).
+
+## Nemotron-H: the Mamba2 SSM output widened the whole residual stream to f32
+
+Symptom: `[dtype-trace] hybrid: residual widened at layer 0: bfloat16 -> float32` on every Nemotron-H run; decode ran at roughly half speed.
+
+Cause: `mamba2Mixer` keeps the SSM state in f32 (correct — `mamba_ssm_cache_dtype: float32`), so `y` is f32. mlx-lm's `ssm_attn` returns `y.astype(x.dtype)`; ours did not, so the gate, the group RMS norm and `out_proj` ran in f32 and returned f32. Layer 0 is a Mamba2 block, so every later layer read its weights wider.
+
+Fix: cast `y` to the SSM input's dtype before the gated norm. Greedy text diverges after a few words (bf16 vs f32 near-tie); both fluent.
+
+Guard: `mamba2Mixer keeps a bf16 residual stream bf16` (one bf16 Mamba2 layer through `forward`, asserts a bf16 result). Hybrid test setup is shared in `testHybridXfm`.

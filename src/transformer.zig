@@ -24766,11 +24766,17 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(y_bthd);
         try mlx.check(mlx.mlx_transpose_axes(&y_bthd, stacked, &perm_tbhd, 4, self.s));
 
-        // Flatten heads: [B, T, H, D] → [B, T, H*D]
+        // Flatten heads: [B, T, H, D] → [B, T, H*D], back in the input dtype.
+        // The state is f32, so y is too; mlx-lm's `ssm_attn` returns
+        // `y.astype(x.dtype)`. Without it the residual stream widens to f32
+        // here and every later layer reads its weights wider.
         const y_flat_shape = [_]c_int{ batch, seq_len, d_inner };
+        var y_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y_f32);
+        try mlx.check(mlx.mlx_reshape(&y_f32, y_bthd, &y_flat_shape, 3, self.s));
         var y_flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_flat);
-        try mlx.check(mlx.mlx_reshape(&y_flat, y_bthd, &y_flat_shape, 3, self.s));
+        try mlx.check(mlx.mlx_astype(&y_flat, y_f32, mlx.mlx_array_dtype(x_h), self.s));
 
         // 11. MambaRMSNormGated: silu(gate) * y, then group RMS norm, then weight
         // swiglu: silu(gate) * y
@@ -41719,6 +41725,9 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
             var out: [3]mlx.mlx_array = undefined;
             for (0..3) |i| {
                 out[i] = mlx.mlx_array_new();
+                errdefer for (out[0 .. i + 1]) |made| {
+                    _ = mlx.mlx_array_free(made);
+                };
                 try mlx.check(mlx.mlx_vector_array_get(&out[i], triple, i));
             }
             var dq = mlx.mlx_array_new();
@@ -41857,6 +41866,87 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
     try t.expect(max_err < 1e-3 * max_ref);
 }
 
+/// Bare Transformer over `initHybridLayers` output for hermetic hybrid tests.
+/// Pair with `deinitTestHybridXfm`.
+fn testHybridXfm(allocator: std.mem.Allocator, config: ModelConfig, cache: KVCache, emb_w: mlx.mlx_array, ssm_entries: []SSMCacheEntry, hybrid_layers: []HybridLayerWeights, s: mlx.mlx_stream) Transformer {
+    return .{
+        .config = config,
+        .cache = cache,
+        .s = s,
+        .allocator = allocator,
+        .emb_w = emb_w,
+        .emb_s = mlx.mlx_array_new(),
+        .emb_b = mlx.mlx_array_new(),
+        .emb_scale = null,
+        .final_norm = mlx.mlx_array_new(),
+        .lm_head_w = mlx.mlx_array_new(),
+        .lm_head_s = mlx.mlx_array_new(),
+        .lm_head_b = mlx.mlx_array_new(),
+        .layers = &.{},
+        .owns_lm_head = false,
+        .owns_norms = false,
+        .embedding_mode = true,
+        .gelu_coeff = null,
+        .gelu_inner = null,
+        .half = mlx.mlx_array_new(),
+        .one = mlx.mlx_array_new(),
+        .three = null,
+        .neg_one = null,
+        .ple_emb_w = mlx.mlx_array_new(),
+        .ple_emb_s = mlx.mlx_array_new(),
+        .ple_emb_b = mlx.mlx_array_new(),
+        .ple_proj_w = mlx.mlx_array_new(),
+        .ple_proj_s = mlx.mlx_array_new(),
+        .ple_proj_b = mlx.mlx_array_new(),
+        .ple_proj_norm = mlx.mlx_array_new(),
+        .ple_proj_quantized = false,
+        .softcap_scalar = null,
+        .v_norm_weight = null,
+        .v_norm_weight_global = null,
+        .rope_freqs_global = null,
+        .bert_layers = null,
+        .bert_pos_w = mlx.mlx_array_new(),
+        .bert_pos_s = mlx.mlx_array_new(),
+        .bert_pos_b = mlx.mlx_array_new(),
+        .bert_toktype_w = mlx.mlx_array_new(),
+        .bert_toktype_s = mlx.mlx_array_new(),
+        .bert_toktype_b = mlx.mlx_array_new(),
+        .bert_emb_norm_w = mlx.mlx_array_new(),
+        .bert_emb_norm_b = mlx.mlx_array_new(),
+        .moe_layers = null,
+        .ssm_entries = ssm_entries,
+        .moe_seq_offset = 0,
+        .hybrid_layers = hybrid_layers,
+        .embedding_norm = null,
+        .prompt_cache = null,
+    };}
+
+fn deinitTestHybridXfm(xfm: *Transformer) void {
+    _ = mlx.mlx_array_free(xfm.emb_s);
+    _ = mlx.mlx_array_free(xfm.emb_b);
+    _ = mlx.mlx_array_free(xfm.final_norm);
+    _ = mlx.mlx_array_free(xfm.lm_head_w);
+    _ = mlx.mlx_array_free(xfm.lm_head_s);
+    _ = mlx.mlx_array_free(xfm.lm_head_b);
+    _ = mlx.mlx_array_free(xfm.half);
+    _ = mlx.mlx_array_free(xfm.one);
+    _ = mlx.mlx_array_free(xfm.ple_emb_w);
+    _ = mlx.mlx_array_free(xfm.ple_emb_s);
+    _ = mlx.mlx_array_free(xfm.ple_emb_b);
+    _ = mlx.mlx_array_free(xfm.ple_proj_w);
+    _ = mlx.mlx_array_free(xfm.ple_proj_s);
+    _ = mlx.mlx_array_free(xfm.ple_proj_b);
+    _ = mlx.mlx_array_free(xfm.ple_proj_norm);
+    _ = mlx.mlx_array_free(xfm.bert_pos_w);
+    _ = mlx.mlx_array_free(xfm.bert_pos_s);
+    _ = mlx.mlx_array_free(xfm.bert_pos_b);
+    _ = mlx.mlx_array_free(xfm.bert_toktype_w);
+    _ = mlx.mlx_array_free(xfm.bert_toktype_s);
+    _ = mlx.mlx_array_free(xfm.bert_toktype_b);
+    _ = mlx.mlx_array_free(xfm.bert_emb_norm_w);
+    _ = mlx.mlx_array_free(xfm.bert_emb_norm_b);
+}
+
 // Bar: every layer's tail is copied and named in a cadence eval inside the loop (the peak itself is measured live, not on a tiny fixture).
 test "hybrid prefill: the cadence eval names every conv_state inside the layer loop" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -41933,82 +42023,8 @@ test "hybrid prefill: the cadence eval names every conv_state inside the layer l
     var cache = try KVCache.init(allocator, n_layers);
     defer cache.deinit();
 
-    var xfm = Transformer{
-        .config = config,
-        .cache = cache,
-        .s = s,
-        .allocator = allocator,
-        .emb_w = emb_w,
-        .emb_s = mlx.mlx_array_new(),
-        .emb_b = mlx.mlx_array_new(),
-        .emb_scale = null,
-        .final_norm = mlx.mlx_array_new(),
-        .lm_head_w = mlx.mlx_array_new(),
-        .lm_head_s = mlx.mlx_array_new(),
-        .lm_head_b = mlx.mlx_array_new(),
-        .layers = &.{},
-        .owns_lm_head = false,
-        .owns_norms = false,
-        .embedding_mode = true,
-        .gelu_coeff = null,
-        .gelu_inner = null,
-        .half = mlx.mlx_array_new(),
-        .one = mlx.mlx_array_new(),
-        .three = null,
-        .neg_one = null,
-        .ple_emb_w = mlx.mlx_array_new(),
-        .ple_emb_s = mlx.mlx_array_new(),
-        .ple_emb_b = mlx.mlx_array_new(),
-        .ple_proj_w = mlx.mlx_array_new(),
-        .ple_proj_s = mlx.mlx_array_new(),
-        .ple_proj_b = mlx.mlx_array_new(),
-        .ple_proj_norm = mlx.mlx_array_new(),
-        .ple_proj_quantized = false,
-        .softcap_scalar = null,
-        .v_norm_weight = null,
-        .v_norm_weight_global = null,
-        .rope_freqs_global = null,
-        .bert_layers = null,
-        .bert_pos_w = mlx.mlx_array_new(),
-        .bert_pos_s = mlx.mlx_array_new(),
-        .bert_pos_b = mlx.mlx_array_new(),
-        .bert_toktype_w = mlx.mlx_array_new(),
-        .bert_toktype_s = mlx.mlx_array_new(),
-        .bert_toktype_b = mlx.mlx_array_new(),
-        .bert_emb_norm_w = mlx.mlx_array_new(),
-        .bert_emb_norm_b = mlx.mlx_array_new(),
-        .moe_layers = null,
-        .ssm_entries = hl.ssm_entries,
-        .moe_seq_offset = 0,
-        .hybrid_layers = hl.hybrid_layers,
-        .embedding_norm = null,
-        .prompt_cache = null,
-    };
-    defer {
-        _ = mlx.mlx_array_free(xfm.emb_s);
-        _ = mlx.mlx_array_free(xfm.emb_b);
-        _ = mlx.mlx_array_free(xfm.final_norm);
-        _ = mlx.mlx_array_free(xfm.lm_head_w);
-        _ = mlx.mlx_array_free(xfm.lm_head_s);
-        _ = mlx.mlx_array_free(xfm.lm_head_b);
-        _ = mlx.mlx_array_free(xfm.half);
-        _ = mlx.mlx_array_free(xfm.one);
-        _ = mlx.mlx_array_free(xfm.ple_emb_w);
-        _ = mlx.mlx_array_free(xfm.ple_emb_s);
-        _ = mlx.mlx_array_free(xfm.ple_emb_b);
-        _ = mlx.mlx_array_free(xfm.ple_proj_w);
-        _ = mlx.mlx_array_free(xfm.ple_proj_s);
-        _ = mlx.mlx_array_free(xfm.ple_proj_b);
-        _ = mlx.mlx_array_free(xfm.ple_proj_norm);
-        _ = mlx.mlx_array_free(xfm.bert_pos_w);
-        _ = mlx.mlx_array_free(xfm.bert_pos_s);
-        _ = mlx.mlx_array_free(xfm.bert_pos_b);
-        _ = mlx.mlx_array_free(xfm.bert_toktype_w);
-        _ = mlx.mlx_array_free(xfm.bert_toktype_s);
-        _ = mlx.mlx_array_free(xfm.bert_toktype_b);
-        _ = mlx.mlx_array_free(xfm.bert_emb_norm_w);
-        _ = mlx.mlx_array_free(xfm.bert_emb_norm_b);
-    }
+    var xfm = testHybridXfm(allocator, config, cache, emb_w, hl.ssm_entries, hl.hybrid_layers, s);
+    defer deinitTestHybridXfm(&xfm);
 
     var ids = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids);
@@ -42029,6 +42045,88 @@ test "hybrid prefill: the cadence eval names every conv_state inside the layer l
     _ = mlx.mlx_array_free(out);
     try t.expectEqual(@as(u64, n_layers), compact_conv_state_copy_count);
     try t.expect(cadence_conv_eval_count >= 8);
+}
+
+// Bar: a Mamba2 layer returns the residual stream in its INPUT dtype. The SSM
+// state is f32 by design (mlx-lm `ssm_attn` returns `y.astype(x.dtype)`);
+// without that cast one Mamba2 layer promotes every later layer to f32.
+test "mamba2Mixer keeps a bf16 residual stream bf16" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const t = std.testing;
+    const allocator = t.allocator;
+    const s = mlx.gpuStream();
+    const H: c_int = 64;
+    const heads: c_int = 4;
+    const head_dim: c_int = 16;
+    const state: c_int = 16;
+    const kernel: c_int = 4;
+    const d_inner = heads * head_dim;
+    const conv_dim = d_inner + 2 * state;
+
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(weights: *Weights, alloc: std.mem.Allocator, name: []const u8, shape: []const c_int, v: f32, st: mlx.mlx_stream) !void {
+            const val = mlx.mlx_array_new_float(v);
+            defer _ = mlx.mlx_array_free(val);
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&arr, shape.ptr, shape.len, val, .bfloat16, st));
+            try weights.map.put(try alloc.dupe(u8, name), arr);
+        }
+    }.add;
+    try put(&w, allocator, "model.layers.0.norm.weight", &.{H}, 1.0, s);
+    try put(&w, allocator, "model.layers.0.mixer.in_proj.weight", &.{ d_inner + conv_dim + heads, H }, 0.02, s);
+    try put(&w, allocator, "model.layers.0.mixer.conv1d.weight", &.{ conv_dim, kernel, 1 }, 0.25, s);
+    try put(&w, allocator, "model.layers.0.mixer.A_log", &.{heads}, 0.5, s);
+    try put(&w, allocator, "model.layers.0.mixer.D", &.{heads}, 1.0, s);
+    try put(&w, allocator, "model.layers.0.mixer.dt_bias", &.{heads}, 0.1, s);
+    try put(&w, allocator, "model.layers.0.mixer.norm.weight", &.{d_inner}, 1.0, s);
+    try put(&w, allocator, "model.layers.0.mixer.out_proj.weight", &.{ H, d_inner }, 0.02, s);
+
+    var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "model" };
+    config.has_hybrid_layers = true;
+    config.num_hidden_layers = 1;
+    config.hidden_size = @intCast(H);
+    config.quant_bits = 0;
+    config.has_final_norm = false;
+    config.head_dim = 64;
+    config.num_attention_heads = 1;
+    config.num_key_value_heads = 1;
+    config.vocab_size = 8;
+    config.mamba_num_heads = @intCast(heads);
+    config.mamba_head_dim = @intCast(head_dim);
+    config.mamba_n_groups = 1;
+    config.ssm_state_size = @intCast(state);
+    config.mamba_conv_kernel = @intCast(kernel);
+    config.layer_block_types[0] = .mamba2;
+
+    var name_buf: [256]u8 = undefined;
+    const hl = try initHybridLayers(allocator, config, &w, &name_buf, s);
+    defer {
+        allocator.free(hl.hybrid_layers);
+        for (hl.ssm_entries) |*e| {
+            _ = mlx.mlx_array_free(e.conv_state);
+            _ = mlx.mlx_array_free(e.ssm_state);
+        }
+        allocator.free(hl.ssm_entries);
+        for (hl.owned_bf16) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(hl.owned_bf16);
+    }
+    var emb_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb_w);
+    try mlx.check(mlx.mlx_ones(&emb_w, &[_]c_int{ 8, H }, 2, .bfloat16, s));
+    var cache = try KVCache.init(allocator, 1);
+    defer cache.deinit();
+    var xfm = testHybridXfm(allocator, config, cache, emb_w, hl.ssm_entries, hl.hybrid_layers, s);
+    defer deinitTestHybridXfm(&xfm);
+
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_zeros(&ids, &[_]c_int{ 1, 4 }, 2, .int32, s));
+    const out = try xfm.forward(ids);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    try t.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
 }
 
 test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {

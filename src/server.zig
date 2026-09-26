@@ -21557,6 +21557,19 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
     lfm2.full_attention_interval = 4;
     lfm2.hidden_size = 2048;
     try t.expectEqual(@as(u64, 0), prefillStreamBytesPerToken(&lfm2));
+
+    // nemotron_h MoE (3.5 Lightning 30B-A3B): a hybrid whose MoE blocks bill
+    // the MoE stream term, and whose FFN width counts the shared expert.
+    var nemo = model_mod.ModelConfig{ .model_type = "nemotron_h" };
+    nemo.has_hybrid_layers = true;
+    nemo.num_hidden_layers = 52;
+    nemo.hidden_size = 2688;
+    nemo.num_experts = 128;
+    nemo.num_experts_per_tok = 6;
+    nemo.moe_intermediate_size = 1856;
+    nemo.shared_expert_intermediate_size = 3712;
+    try t.expectEqual(@as(u64, 4 * 6 * 2 * (2688 + 1856) * 2), prefillStreamBytesPerToken(&nemo));
+    try t.expectEqual(@as(u64, 1856 * 6 + 3712), prefillFfnWidth(&nemo));
 }
 
 test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the route's kill switch" {

@@ -3419,9 +3419,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
         }
-        // transformers >= 5 exports spell the same pattern as a list of names.
+        // Nemotron 3.5 configs spell the same pattern as a list of names; the
+        // string wins when both are present (mlx-lm's order).
         if (cfg_obj.get("layers_block_type")) |v| {
-            if (v == .array) {
+            if (v == .array and cfg_obj.get("hybrid_override_pattern") == null) {
                 for (v.array.items, 0..) |item, i| {
                     if (i >= 128) break;
                     if (item != .string) continue;
@@ -6762,10 +6763,8 @@ test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION 
 }
 
 test "nemotron_h: a layers_block_type LIST sets the per-layer blocks like hybrid_override_pattern" {
-    // mlx-community's Nemotron-3.5-Lightning packs (transformers >= 5 export)
-    // ship `layers_block_type` as a list of names and no pattern string. Left
-    // unread, every layer kept the `.attention` default and the load died on
-    // `backbone.layers.0.mixer.q_proj.weight` — layer 0 is a Mamba2 block.
+    // Nemotron 3.5 configs ship `layers_block_type` as a list of names and no
+    // pattern string; unread, every layer keeps the `.attention` default.
     const json =
         \\{
         \\  "model_type": "nemotron_h",
@@ -6805,6 +6804,9 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
     try testing.expectEqual(@as(u32, 1), cfg.moe_topk_group);
     try testing.expect(cfg.moe_route_norm);
     try testing.expectEqual(@as(f32, 2.5), cfg.router_scaling_factor);
+    // MoE bills and gates key on this; batching still declines on has_hybrid_layers first.
+    try testing.expect(cfg.isMoe());
+    try testing.expect(cfg.has_hybrid_layers);
 
     // The latent variant projects into a smaller expert space
     // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
