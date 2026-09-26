@@ -59,10 +59,11 @@ struct ChatErrorCard: View {
                 .stroke(Color.red.opacity(0.25), lineWidth: 1)
         )
         .contextMenu {
-            Button("Copy Error") {
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(notice.message, forType: .string)
-            }
+            } label: { Text("Copy Error")
+    .font(.app(.body)) }
         }
     }
 }

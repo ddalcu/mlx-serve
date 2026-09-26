@@ -39,7 +39,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.app(.subheadline).weight(.semibold))
+            Text("Model").font(.app(.headline).weight(.semibold))
 
             // ONE row: the model that will run. A stack of radio rows read as
             // a multi-select and grew with the catalogue; what the pane has to
@@ -212,9 +212,9 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
             onSelect(preset)
         } label: {
             if lanModel == nil && preset.id == selectedId {
-                Label(L10n.text(title), systemImage: "checkmark")
+                Label(L10n.text(title), systemImage: "checkmark").font(.app(.body))
             } else {
-                Text(L10n.text(title))
+                Text(L10n.text(title)).font(.app(.body))
             }
         }
     }

@@ -166,7 +166,7 @@ private struct TaskDetailView: View {
                     Button {
                         scheduler.runNow(task)
                     } label: {
-                        Label(L10n.text(isRunning ? "Running…" : "Run now"), systemImage: "play.fill")
+                        Label(L10n.text(isRunning ? "Running…" : "Run now"), systemImage: "play.fill").font(.app(.body))
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(isRunning)
@@ -181,7 +181,7 @@ private struct TaskDetailView: View {
                     Spacer()
 
                     Button { showEdit = true } label: {
-                        Label("Edit", systemImage: "pencil")
+                        Label("Edit", systemImage: "pencil").font(.app(.body))
                     }
                     .help("Edit task")
 
@@ -205,7 +205,8 @@ private struct TaskDetailView: View {
                     Text(L10n.text("Runs")).font(.app(.headline))
                     Spacer()
                     if runs.contains(where: { $0.status.isTerminal && scheduler.activeRun?.id != $0.id }) {
-                        Button(L10n.text("Clear finished")) { scheduler.clearFinishedRuns(taskId: task.id) }
+                        Button { scheduler.clearFinishedRuns(taskId: task.id) } label: { Text(L10n.text("Clear finished"))
+    .font(.app(.body)) }
                             .buttonStyle(.link)
                             .font(.app(.caption))
                             .help(L10n.text("Delete all completed, failed and cancelled runs"))
@@ -298,11 +299,11 @@ private struct RunRow: View {
             if !run.status.isTerminal {
                 Button(role: .destructive) {
                     scheduler.cancelRun(taskId: task.id, runId: run.id)
-                } label: { Label("Stop run", systemImage: "stop.circle") }
+                } label: { Label("Stop run", systemImage: "stop.circle").font(.app(.body)) }
             }
             Button(role: .destructive) {
                 scheduler.deleteRun(taskId: task.id, runId: run.id)
-            } label: { Label("Delete run", systemImage: "trash") }
+            } label: { Label("Delete run", systemImage: "trash").font(.app(.body)) }
             .disabled(isLive)
         }
         .onChange(of: expanded) { _, now in
@@ -334,8 +335,10 @@ private struct ApprovalCard: View {
                     .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
             }
             HStack {
-                Button("Deny") { scheduler.resume(runId: run.id, approved: false) }
-                Button("Approve") { scheduler.resume(runId: run.id, approved: true) }
+                Button { scheduler.resume(runId: run.id, approved: false) } label: { Text("Deny")
+    .font(.app(.body)) }
+                Button { scheduler.resume(runId: run.id, approved: true) } label: { Text("Approve")
+    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
             }
         }

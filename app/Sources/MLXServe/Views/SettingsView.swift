@@ -237,12 +237,12 @@ private struct SettingsSidebar: View {
                 onPick()
             }
         )) {
-            Label("All Settings", systemImage: "square.grid.2x2")
+            Label("All Settings", systemImage: "square.grid.2x2").font(.app(.body))
                 .tag(SettingsSelection.all)
             Section {
                 ForEach(categories) { category in
                     Label(L10n.text(category.sidebarLabel), systemImage: category.icon)
-                        .tag(SettingsSelection.category(category))
+                        .tag(SettingsSelection.category(category)).font(.app(.body))
                 }
             }
         }
@@ -317,7 +317,7 @@ private struct SettingsSearchField: View {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
             TextField("Filter settings", text: $text)
-                .textFieldStyle(.plain)
+                .textFieldStyle(.plain).font(.app(.body))
             if !text.isEmpty {
                 Button {
                     text = ""
@@ -351,7 +351,8 @@ private struct NoSearchResults: View {
             Text(L10n.format("No settings match \"%@\"", query))
                 .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
-            Button(L10n.text("Clear filter"), action: clear)
+            Button(action: clear, label: { Text(L10n.text("Clear filter"))
+    .font(.app(.body)) })
                 .buttonStyle(.bordered)
                 .controlSize(.small)
         }
@@ -387,7 +388,7 @@ private struct ResetDefaultsFooter: View {
                     Button(role: .destructive) {
                         showConfirm = true
                     } label: {
-                        Label(L10n.text(label), systemImage: "arrow.uturn.backward.circle")
+                        Label(L10n.text(label), systemImage: "arrow.uturn.backward.circle").font(.app(.body))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -399,11 +400,13 @@ private struct ResetDefaultsFooter: View {
                     isPresented: $showConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button("Reset", role: .destructive) {
+                    Button(role: .destructive) {
                         appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
-                    }
+                    } label: { Text("Reset")
+    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
-                    Button("Cancel", role: .cancel) { }
+                    Button(role: .cancel) { } label: { Text("Cancel")
+    .font(.app(.body)) }
                 } message: {
                     Text(L10n.text(helpText))
                 }
@@ -431,18 +434,19 @@ private struct RestartBanner: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Restart Now") {
+            Button {
                 let opts = appState.serverOptions
                 let model = appState.selectedModelPath
                 server.stop()
                 if !model.isEmpty {
                     server.start(modelPath: model, options: opts)
                 }
-            }
+            } label: { Text("Restart Now")
+    .font(.app(.body)) }
             .buttonStyle(.borderedProminent)
             .disabled(appState.selectedModelPath.isEmpty)
 
-            Button("Discard") {
+            Button {
                 if let last = server.lastLaunchedOptions {
                     // Revert every server-launch field to the last-launched
                     // snapshot; per-request defaults are preserved. Start
@@ -463,7 +467,8 @@ private struct RestartBanner: View {
                     reverted.perRequestEnableDrafter = current.perRequestEnableDrafter
                     appState.serverOptions = reverted
                 }
-            }
+            } label: { Text("Discard")
+    .font(.app(.body)) }
             .buttonStyle(.bordered)
             .disabled(server.lastLaunchedOptions == nil)
         }
@@ -658,7 +663,7 @@ private struct SettingsRow<Control: View>: View {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
                         Text(L10n.text(title))
-                            .font(.app(.body))
+                            .font(.app(.rowTitle))
                         if isDirty {
                             Image(systemName: "arrow.clockwise.circle.fill")
                                 .font(.app(.caption))
@@ -671,12 +676,12 @@ private struct SettingsRow<Control: View>: View {
                         .frame(maxWidth: 280, alignment: .trailing)
                 }
             Text(L10n.text(explainer))
-                    .font(.app(.caption2))
+                    .font(.app(.explainer))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let cost {
                     Text(L10n.text(cost))
-                        .font(.app(.caption))
+                        .font(.app(.value))
                         .fontWeight(costActive ? .semibold : .regular)
                         .foregroundStyle(costActive ? Color.orange : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -746,13 +751,15 @@ private struct ModelFoldersSectionContent: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
-                        Button("Choose…") { chooseDownloadFolder() }
+                        Button { chooseDownloadFolder() } label: { Text("Choose…")
+    .font(.app(.body)) }
                             .buttonStyle(.bordered)
-                        Button("Reset") {
+                        Button {
                             SecurityScopedBookmark.clear(name: DownloadManager.downloadFolderBookmarkName)
                             ModelRoots().configuredDownloadRoot = nil
                             applyFolderChange()
-                        }
+                        } label: { Text("Reset")
+    .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(configured == nil)
                     }
@@ -818,12 +825,14 @@ private struct ModelFoldersSectionContent: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
-                        Button("Choose…") { choose() }
+                        Button { choose() } label: { Text("Choose…")
+    .font(.app(.body)) }
                             .buttonStyle(.bordered)
-                        Button("Clear") {
+                        Button {
                             downloads.customRoot = nil
                             appState.refreshModels()
-                        }
+                        } label: { Text("Clear")
+    .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(!hasPath)
                     }
@@ -871,7 +880,7 @@ private struct LanSharingSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if appState.serverOptions.lanShareEnabled {
@@ -879,7 +888,7 @@ private struct LanSharingSectionContent: View {
                 SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareAll)) {
                     Toggle("", isOn: $appState.serverOptions.lanShareAll)
                         .labelsHidden()
-                        .toggleStyle(.switch)
+                        .toggleStyle(.switch).font(.app(.body))
                 }
             }
             if !appState.serverOptions.lanShareAll {
@@ -894,7 +903,7 @@ private struct LanSharingSectionContent: View {
                     )
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
-                    .frame(width: 200)
+                    .frame(width: 200).font(.app(.body))
                 }
             }
         }
@@ -902,7 +911,7 @@ private struct LanSharingSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanDiscoverEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanDiscoverEnabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         // The privacy disclosure — sharing means running other people's
@@ -992,7 +1001,8 @@ private struct ProvidersSectionContent: View {
                 Spacer()
                 // Fields also save on Enter, but an edit followed by a click
                 // elsewhere never submits — this is the button that always writes.
-                Button("Save") { save() }
+                Button { save() } label: { Text("Save")
+    .font(.app(.body)) }
                 .keyboardShortcut("s", modifiers: .command)
                 .help("Write providers.json and ask the server to re-probe now")
             }
@@ -1070,7 +1080,7 @@ private struct ProviderRow: View {
                 Toggle("", isOn: $entry.enabled)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .onChange(of: entry.enabled) { _, _ in onCommit() }
+                    .onChange(of: entry.enabled) { _, _ in onCommit() }.font(.app(.body))
                 Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
                     .buttonStyle(.borderless)
                     .help("Remove this provider")
@@ -1091,7 +1101,8 @@ private struct ProviderRow: View {
                         entry.models = ProviderEntry.parseModelList(t ?? "")
                     }
                     .onSubmit(onCommit)
-                Button(L10n.text("Pick…")) { picking = true }
+                Button { picking = true } label: { Text(L10n.text("Pick…"))
+    .font(.app(.body)) }
                     .disabled(entry.problem() != nil)
                     .help(L10n.text("Fetch the provider's model list and tick the ones to expose"))
             }
@@ -1160,13 +1171,16 @@ private struct ProviderModelPickerSheet: View {
             }
             HStack {
                 Text("\(chosen.count) of \(ids.count) selected").font(.app(.caption)).foregroundStyle(.secondary)
-                Button("Clear") { chosen = [] }.disabled(chosen.isEmpty)
+                Button { chosen = [] } label: { Text("Clear")
+    .font(.app(.body)) }.disabled(chosen.isEmpty)
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Done") {
+                Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                Button {
                     onDone(ids.filter { chosen.contains($0) })
                     dismiss()
-                }
+                } label: { Text("Done")
+    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
                 .disabled(loading)
             }
@@ -1257,7 +1271,7 @@ private struct ServerSectionContent: View {
         ) {
             Toggle("", isOn: $appState.autoStartServer)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(
             title: "Preload the model when the server starts",
@@ -1265,7 +1279,7 @@ private struct ServerSectionContent: View {
         ) {
             Toggle("", isOn: $appState.loadModelAtStart)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(
             title: "Which model",
@@ -1278,7 +1292,7 @@ private struct ServerSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .disabled(!appState.loadModelAtStart)
+            .disabled(!appState.loadModelAtStart).font(.app(.body))
         }
         SettingsRow(
             title: "Model",
@@ -1288,16 +1302,16 @@ private struct ServerSectionContent: View {
                 Picker("", selection: startupModelDisplay) {
                     let dupNames = LocalModel.duplicateNames(in: pickable)
                     ForEach(pickable) { model in
-                        Text(L10n.text(startupModelLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(startupModelLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                     // A selection that matches no row renders blank, so empty and
                     // uninstalled selections each get a row of their own.
                     if startupModelDisplay.wrappedValue.isEmpty {
-                        Text(L10n.text("None — starts with no model")).tag("")
+                        Text(L10n.text("None — starts with no model")).font(.app(.body)).tag("")
                     }
                     if !appState.startupModelPinnedPath.isEmpty,
                        !pickable.contains(where: { $0.path == appState.startupModelPinnedPath }) {
-                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed")
+                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed").font(.app(.body))
                             .tag(appState.startupModelPinnedPath)
                     }
                 }
@@ -1345,7 +1359,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.noVision)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["enableMetrics"] {
@@ -1356,7 +1370,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.enableMetrics)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["apiKey"] {
@@ -1374,7 +1388,7 @@ private struct ServerSectionContent: View {
                     prompt: Text("none")
                 )
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
+                .frame(width: 180).font(.app(.body))
             }
         }
         if let m = meta["toolAutocorrect"] {
@@ -1385,7 +1399,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.toolAutocorrect)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["logLevel"] {
@@ -1396,12 +1410,12 @@ private struct ServerSectionContent: View {
             ) {
                 Picker("", selection: $appState.serverOptions.logLevel) {
                     ForEach(ServerOptions.LogLevel.allCases) { lvl in
-                        Text(L10n.text(lvl.label)).tag(lvl)
+                        Text(L10n.text(lvl.label)).font(.app(.body)).tag(lvl)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(minWidth: 180)
+                .frame(minWidth: 180).font(.app(.body))
             }
         }
         if let m = meta["logToFile"] {
@@ -1412,7 +1426,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.logToFile)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["maxResidentMemGB"] {
@@ -1466,7 +1480,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.skipMemPreflight)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["osMemoryReserve"] {
@@ -1477,7 +1491,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.osMemoryReserve)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -1716,7 +1730,7 @@ private struct SpecDecodeSectionContent: View {
                 Toggle("", isOn: opts.enablePLD)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .disabled(drafterActive)
+                    .disabled(drafterActive).font(.app(.body))
             }
         }
         if let m = meta["pldDraftLen"] {
@@ -1760,7 +1774,7 @@ private struct SpecDecodeSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enableMTP)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["mtpDepth"] {
@@ -1779,18 +1793,18 @@ private struct SpecDecodeSectionContent: View {
                     // without benchmarking. It DISPLAYS what it resolved to
                     // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
                     if let specCost = server.specCost {
-                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).tag(0)
+                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).font(.app(.body)).tag(0)
                     } else {
-                        Text(L10n.text("Automatic")).tag(0)
+                        Text(L10n.text("Automatic")).font(.app(.body)).tag(0)
                     }
                     ForEach(1...6, id: \.self) { n in
-                        Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
+                        Text("\(n) token\(n == 1 ? "" : "s")").font(.app(.body)).tag(n)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 140)
-                .disabled(!appState.serverOptions.enableMTP)
+                .disabled(!appState.serverOptions.enableMTP).font(.app(.body))
             }
         }
         if let m = meta["mtpOnMoE"] {
@@ -1802,7 +1816,7 @@ private struct SpecDecodeSectionContent: View {
                 Toggle("", isOn: opts.mtpOnMoE)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .disabled(!appState.serverOptions.enableMTP)
+                    .disabled(!appState.serverOptions.enableMTP).font(.app(.body))
             }
         }
         // DSpark is DeepSeek-V4's own draft — independent of the Qwen MTP
@@ -1815,7 +1829,7 @@ private struct SpecDecodeSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enableDSpark)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -1891,7 +1905,7 @@ private struct PerformanceSectionContent: View {
                     set: { appState.serverOptions.decodeAttnQuantChoice = $0 }
                 ))
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["kvQuant"] {
@@ -1902,12 +1916,12 @@ private struct PerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.kvQuant) {
                     ForEach(ServerOptions.KVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).tag(q)
+                        Text(L10n.text(q.label)).font(.app(.body)).tag(q)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(minWidth: 220)
+                .frame(minWidth: 220).font(.app(.body))
             }
         }
         if let m = meta["prefixCacheEntries"] {
@@ -1949,7 +1963,7 @@ private struct PerformanceSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enablePrefixCacheDisk)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["prefixCacheDisk"], appState.serverOptions.enablePrefixCacheDisk {
@@ -2014,19 +2028,19 @@ private struct NeuralEngineSectionContent: View {
         if let m = meta["aneImage"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
                         cost: m.cost, costActive: appState.serverOptions.aneImage) {
-                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["aneVideo"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneVideo),
                         cost: m.cost, costActive: appState.serverOptions.aneVideo) {
-                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["aneAudio"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneAudio),
                         cost: m.cost, costActive: appState.serverOptions.aneAudio) {
-                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -2084,12 +2098,12 @@ private struct LlamaPerformanceSectionContent: View {
             ) {
                 Picker("", selection: opts.llamaKvQuant) {
                     ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).tag(q)
+                        Text(L10n.text(q.label)).font(.app(.body)).tag(q)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(minWidth: 260)
+                .frame(minWidth: 260).font(.app(.body))
             }
         }
         if let m = meta["llamaCacheEntries"] {
@@ -2132,7 +2146,7 @@ private struct Ds4PerformanceSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.ssdStreaming)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -2254,12 +2268,13 @@ private struct DrafterRow: View {
                 .padding(.top, 2)
             } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
                 // A dense Gemma 4 is loaded but its drafter isn't on disk —
-                Button(L10n.text(
+                Button {
+                    downloads.start(repoId: repo) { appState.refreshModels() }
+                } label: { Text(L10n.text(
                        downloads.downloads[repo]?.status == .downloading
                        ? "Downloading drafter…" : "Download drafter"
-)) {
-                    downloads.start(repoId: repo) { appState.refreshModels() }
-                }
+))
+    .font(.app(.body)) }
                 .controlSize(.small)
                 .disabled(downloads.downloads[repo]?.status == .downloading)
                 .padding(.top, 2)
@@ -2289,7 +2304,7 @@ private struct DrafterRow: View {
         Toggle("", isOn: isOn)
             .labelsHidden()
             .toggleStyle(.switch)
-            .disabled(!toggleEnabled)
+            .disabled(!toggleEnabled).font(.app(.body))
     }
 
     @ViewBuilder
@@ -2329,25 +2344,25 @@ private struct InterfaceSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 180)
+            .frame(width: 180).font(.app(.body))
         }
         SettingsRow(title: "Accent Color", explainer: "Tint for buttons, links and the selected message bubble.") {
             Picker("", selection: $accentColorRaw) {
                 ForEach(AppAccentColor.allCases) { accent in
-                    Text(L10n.text(accent.label)).tag(accent.rawValue)
+                    Text(L10n.text(accent.label)).font(.app(.body)).tag(accent.rawValue)
                 }
             }
             .labelsHidden()
-            .frame(width: 140)
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Text Size", explainer: "Size of the chat transcript's prose and code.") {
             Picker("", selection: $textSizeRaw) {
                 ForEach(ChatTextSize.allCases) { size in
-                    Text(L10n.text(size.label)).tag(size.rawValue)
+                    Text(L10n.text(size.label)).font(.app(.body)).tag(size.rawValue)
                 }
             }
             .labelsHidden()
-            .frame(width: 140)
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Chat Column",
                     explainer: "How wide a conversation reads. Narrow and Medium are fixed widths, so resizing the window moves the margins rather than the text; Wide follows the window. Also on ⌘⌥1-3, under View ▸ Interface.") {
@@ -2358,22 +2373,22 @@ private struct InterfaceSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 220).font(.app(.body))
         }
         SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen. Also on ⌘⌥C, under View ▸ Interface.") {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(title: "Terminal Theme",
                     explainer: "Colors for new sandbox terminals. Right-click a terminal in the sidebar to give one session a different theme.") {
             Picker("", selection: $terminalThemeId) {
                 ForEach(TerminalTheme.all) { theme in
-                    Text(theme.name).tag(theme.id)
+                    Text(theme.name).font(.app(.body)).tag(theme.id)
                 }
             }
             .labelsHidden()
-            .frame(width: 160)
+            .frame(width: 160).font(.app(.body))
         }
         SettingsRow(title: "Terminal Background",
                     explainer: "Ground under the default theme. Reset to use the theme's own.") {
@@ -2381,7 +2396,8 @@ private struct InterfaceSectionContent: View {
                 ColorPicker("", selection: terminalBackground, supportsOpacity: false)
                     .labelsHidden()
                 if !terminalBackgroundHex.isEmpty {
-                    Button("Reset") { terminalBackgroundHex = "" }
+                    Button { terminalBackgroundHex = "" } label: { Text("Reset")
+    .font(.app(.body)) }
                         .controlSize(.small)
                 }
             }
@@ -2583,7 +2599,7 @@ private struct WakePhraseSectionContent: View {
     var body: some View {
         SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(L10n.text("Wake phrase")).font(.app(.subheadline).weight(.semibold))
+                Text(L10n.text("Wake phrase")).font(.app(.rowTitle).weight(.semibold))
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 220)
@@ -2651,7 +2667,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var engineBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Voice engine")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Voice engine")).font(.app(.rowTitle).weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
                 ForEach(VoiceEngine.allCases, id: \.self) { e in
                     Text(L10n.text(e.label)).tag(e)
@@ -2675,7 +2691,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var kokoroBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Kokoro voice")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Kokoro voice")).font(.app(.headline).weight(.semibold))
             // Selecting the engine has to be able to GET the model — the gen
             // panes have had this bar all along; Settings ▸ Voice was the one
             // place that offered a backend with no way to fetch it. Collapses to
@@ -2691,7 +2707,7 @@ private struct VoiceCloneSectionContent: View {
                     ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
                         Section(L10n.text(group.language)) {
                             ForEach(group.voices, id: \.self) { v in
-                                Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
+                                Text(KokoroVoiceCatalog.displayName(for: v)).font(.app(.body)).tag(v)
                             }
                         }
                     }
@@ -2705,7 +2721,7 @@ private struct VoiceCloneSectionContent: View {
                     if previewer.isPreviewing(appState.serverOptions.kokoroVoice) {
                         ProgressView().controlSize(.small)
                     } else {
-                        Label("Play", systemImage: "play.circle")
+                        Label("Play", systemImage: "play.circle").font(.app(.body))
                     }
                 }
                 .help(kokoroReady ? "Hear a short sample of this voice"
@@ -2737,7 +2753,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var clipBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Voice clone clip")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Voice clone clip")).font(.app(.headline).weight(.semibold))
             HStack(spacing: 8) {
                 if !appState.serverOptions.voiceClonePath.isEmpty {
                     Image(systemName: "waveform").foregroundStyle(.secondary)
@@ -2861,7 +2877,7 @@ private struct SandboxSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.toolsOnlyWhenAsked)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2875,11 +2891,12 @@ private struct SandboxSectionContent: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(currentWorkspace)
-                Button("Choose…") {
+                Button {
                     if let picked = WorkspacePicker.pickDirectory() {
                         appState.setDefaultAgentWorkspace(picked)
                     }
-                }
+                } label: { Text("Choose…")
+    .font(.app(.body)) }
             }
         }
 
@@ -2893,7 +2910,7 @@ private struct SandboxSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
 
@@ -2903,7 +2920,7 @@ private struct SandboxSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.sandbox.network)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2916,10 +2933,10 @@ private struct SandboxSectionContent: View {
                 if resetting {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("Resetting…")
+                        Text("Resetting…").font(.app(.body))
                     }
                 } else {
-                    Label("Reset Sandbox…", systemImage: "trash")
+                    Label("Reset Sandbox…", systemImage: "trash").font(.app(.body))
                         .foregroundStyle(.red)
                 }
             }
@@ -2929,14 +2946,16 @@ private struct SandboxSectionContent: View {
                 isPresented: $showResetConfirm,
                 titleVisibility: .visible
             ) {
-                Button("Delete All Sandbox Data", role: .destructive) {
+                Button(role: .destructive) {
                     resetting = true
                     AgentSandbox.shared.resetAllData {
                         resetting = false
                     }
-                }
+                } label: { Text("Delete All Sandbox Data")
+    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-                Button("Cancel", role: .cancel) {}
+                Button(role: .cancel) {} label: { Text("Cancel")
+    .font(.app(.body)) }
             } message: {
                 Text("""
                 This permanently deletes everything the sandbox has downloaded and every change made inside it — installed agent CLIs (pi, hermes), their configs and logins, and any files outside the shared workspace. Any running guest and live sessions stop immediately.
@@ -2979,7 +2998,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enabled)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2999,7 +3018,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3008,7 +3027,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3017,7 +3036,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3025,13 +3044,13 @@ private struct MessagingSectionContent: View {
             explainer: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above."
         ) {
             Picker("", selection: $appState.serverOptions.telegram.agentId) {
-                Text("None").tag(UUID?.none)
+                Text("None").font(.app(.body)).tag(UUID?.none)
                 ForEach(appState.agents.allAgents) { agent in
-                    Text(agent.name).tag(UUID?.some(agent.id))
+                    Text(agent.name).font(.app(.body)).tag(UUID?.some(agent.id))
                 }
             }
             .labelsHidden()
-            .frame(width: 200)
+            .frame(width: 200).font(.app(.body))
         }
 
         // Allow-list / lock control.
@@ -3045,9 +3064,10 @@ private struct MessagingSectionContent: View {
                         Text(L10n.text(lockLabel))
                             .font(.app(.caption).monospacedDigit())
                             .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
-                        Button("Reset lock") {
+                        Button {
                             appState.serverOptions.telegram.allowedChatIds = []
-                        }
+                        } label: { Text("Reset lock")
+    .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(telegram.allowedChatIds.isEmpty)
@@ -3143,7 +3163,7 @@ private struct UpdatesSectionContent: View {
                 get: { updates.autoCheckEnabled },
                 set: { updates.autoCheckEnabled = $0 }))
                 .toggleStyle(.switch)
-                .labelsHidden()
+                .labelsHidden().font(.app(.body))
         }
 
         SettingsRow(
@@ -3192,9 +3212,10 @@ private struct UpdatesSectionContent: View {
                 case .installing:
                     ProgressView().controlSize(.small)
                 default:
-                    Button("Download & Install") {
+                    Button {
                         Task { await updates.downloadAndInstall() }
-                    }
+                    } label: { Text("Download & Install")
+    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                 }
             }

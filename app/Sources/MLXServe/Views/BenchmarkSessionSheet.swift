@@ -52,7 +52,8 @@ struct BenchmarkSessionSheet: View {
             HStack(spacing: 12) {
                 shareControl
                 Spacer()
-                Button("Done") { dismiss() }
+                Button { dismiss() } label: { Text("Done")
+    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -71,17 +72,18 @@ struct BenchmarkSessionSheet: View {
                 Button {
                     Task { await share(session) }
                 } label: {
-                    Label("Share to Community", systemImage: "square.and.arrow.up")
+                    Label("Share to Community", systemImage: "square.and.arrow.up").font(.app(.body))
                 }
                 .disabled(session.rungs.allSatisfy { !$0.isPublishable })
             case .sending:
                 ProgressView().controlSize(.small)
             case .sent:
-                Label("Shared", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                Label("Shared", systemImage: "checkmark.circle.fill").font(.app(.body)).foregroundStyle(.green)
             case .failed(let message):
                 Label(message, systemImage: "exclamationmark.octagon.fill")
                     .font(.app(.caption)).foregroundStyle(.red)
-                Button("Try Again") { Task { await share(session) } }
+                Button { Task { await share(session) } } label: { Text("Try Again")
+    .font(.app(.body)) }
                     .controlSize(.small)
             }
         }

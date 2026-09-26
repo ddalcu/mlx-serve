@@ -60,13 +60,85 @@ final class SystemTypeTests: XCTestCase {
 
     /// Every step the app can ask for is on the table, so `pointSize(for:)`
     /// never falls back to the floor for a name the app actually uses.
+    ///
+    /// A call may name a step (`.app(.body)`) or a ROLE (`.app(.rowTitle)`).
+    /// Both are the ladder: a role is the sentence for what a piece of text IS,
+    /// and it resolves to a step that has to be on the table like any other. The
+    /// point of accepting both is that a view states its intent either way, and
+    /// neither spelling can escape the floor.
     func testEveryStepTheAppAsksForIsOnTheTable() throws {
         let used = try usedStyles()
         XCTAssertFalse(used.isEmpty, "the scan found no steps — it is not walking the tree")
         let known = Set(AppType.table.map { "\($0.style)" })
+        let roles: [String: AppType.Role] = [
+            "pageTitle": .pageTitle, "sectionTitle": .sectionTitle, "rowTitle": .rowTitle,
+            "explainer": .explainer, "value": .value, "annotation": .annotation,
+        ]
         for name in used.sorted() {
-            XCTAssertTrue(known.contains(name), "\(name) is not in AppType.table")
+            if let role = roles[name] {
+                XCTAssertTrue(known.contains("\(role.step)"),
+                              "role \(name) asks for \(role.step), which is not in AppType.table")
+                XCTAssertTrue(AppType.isLegal(AppType.pointSize(for: role.step)),
+                              "role \(name) lands on an illegal size")
+            } else {
+                XCTAssertTrue(known.contains(name), "\(name) is neither a step in AppType.table nor a role")
+            }
         }
+    }
+
+    // MARK: - The floor, and the roles that sit on it
+
+    /// The ladder only ever makes text BIGGER, and it does it by ADDING one.
+    /// This is the whole point of the rule: text that is hard to read is the
+    /// defect the ladder exists to fix, so a step that renders SMALLER than the
+    /// macOS size it was derived from is the rule working backwards. The even
+    /// snap is `13 -> 14`, never `13 -> 12`, and an even system size is left
+    /// alone rather than nudged up again.
+    func testTheLadderOnlyEverMakesTextBigger() {
+        for step in AppType.table {
+            XCTAssertGreaterThanOrEqual(
+                step.pointSize, step.system,
+                "\(step.style) renders \(step.pointSize)pt from the system's \(step.system)pt — the ladder may round a step up, never down")
+            if Int(step.system) % 2 == 1 {
+                XCTAssertEqual(
+                    step.pointSize, step.system + 1,
+                    "\(step.style) is an odd step (\(step.system)); it moves up one, it does not come down")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(
+            AppType.floor, 10,
+            "the floor may rise for readability; lowering it puts small text back")
+    }
+
+
+    func testTheFloorIsTheSmallestTextTheAppIsAllowedToRender() {
+        XCTAssertEqual(AppType.floor, 12, "a 10pt explainer is readable, not pleasant to read")
+        XCTAssertFalse(AppType.isLegal(10), "10 is under the floor now")
+        XCTAssertTrue(AppType.isLegal(12))
+        XCTAssertFalse(AppType.isLegal(13), "odd sizes still go up one")
+    }
+
+    func testEveryRoleLandsOnARealStep() {
+        let roles: [(String, AppType.Role)] = [
+            ("pageTitle", .pageTitle), ("sectionTitle", .sectionTitle),
+            ("rowTitle", .rowTitle), ("explainer", .explainer),
+            ("value", .value), ("annotation", .annotation),
+        ]
+        for (name, role) in roles {
+            XCTAssertTrue(AppType.table.contains { $0.style == role.step },
+                          "\(name) asks for \(role.step), which is not on the ladder")
+            XCTAssertTrue(AppType.isLegal(AppType.pointSize(for: role.step)),
+                          "\(name) lands on an illegal size")
+        }
+    }
+
+    func testTheRolesReadAsAScaleFromBigToSmall() {
+        let sizes = [AppType.Role.pageTitle, .sectionTitle, .rowTitle, .explainer, .value, .annotation]
+            .map { AppType.pointSize(for: $0.step) }
+        for (bigger, smaller) in zip(sizes, sizes.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(bigger, smaller, "the role scale is out of order")
+        }
+        XCTAssertGreaterThan(sizes[0], sizes.last!, "a page title and an annotation should differ")
     }
 
     // MARK: - The call sites
@@ -151,21 +223,23 @@ final class SystemTypeTests: XCTestCase {
     ///   helper may be the thing that sets the font.
     /// * **AppKit draws it.** A menu item, an `Alert`'s title or its buttons
     ///   are `NSMenuItem`/`NSAlert` text: `.font()` does not reach them on this
-    ///   platform, so demanding one would be demanding a lie. They are listed
-    ///   below with the surface that owns them.
+    ///   platform, so demanding one would be demanding a lie. Keyed on the
+    ///   OWNING construct — is this text inside a `Menu` / `Alert` /
+    ///   `confirmationDialog` / `CommandMenu` — rather than on the copy, so a
+    ///   rewording or a catalogue wrap does not turn the entry into a false
+    ///   offender whose message points at the wrong thing.
     func testEveryStatedTextNamesASize() throws {
-        let appKitDrawn: [(file: String, needle: String, surface: String)] = [
-            ("MLXServeApp.swift", "Text(\"\\(width.label) chat column\")", "View ▸ Interface menu (NSMenu)"),
-            ("MLXServeApp.swift", "Label(\"Interface\", systemImage:", "View ▸ Interface menu section header"),
-            ("Views/AgentsWindow.swift", "Alert(title: Text(\"Agents\")", "Alert title (NSAlert)"),
-            ("Views/AgentsWindow.swift", "dismissButton: .default(Text(\"OK\"))", "Alert button (NSAlert)"),
-            ("Views/AgentsWindow.swift", "message: Text(\"This can't be undone.\")", "Alert message (NSAlert)"),
-            ("Views/AgentsWindow.swift", "primaryButton: .destructive(Text(\"Delete\"))", "Alert button (NSAlert)"),
-            ("Views/AgentsWindow.swift", "Text(\"No clips yet\")", "voice-picker menu (NSMenu)"),
-            ("Views/AgentsWindow.swift", "Text(\"No voices installed\")", "voice-picker menu (NSMenu)"),
-            ("Services/CLILauncher.swift", "Label(\"\\(spec.displayName) in Sandbox\"", "new-session menu (NSMenu)"),
-            ("Services/CLILauncher.swift", "Label(\"Shell in Sandbox\"", "new-session menu (NSMenu)"),
+        /// Surfaces AppKit draws itself, where a font modifier cannot reach.
+        let appKitSurfaces: Set<String> = [
+            "Alert", "Menu", "confirmationDialog", "CommandMenu", "CommandGroup", "MenuBarExtra",
         ]
+        /// A VIEW whose text is menu content by contract: it builds no chrome
+        /// of its own, it is only ever handed to a menu, so nothing inside it
+        /// can be sized. Named as a type, not as the copy it renders, so
+        /// rewording survives — and `testTheMenuContentViewStaysInAMenu` fails if
+        /// a call site ever stops being one, which is the moment this entry
+        /// stops being true.
+        let menuContentViews: Set<String> = ["CLILauncherMenuItems"]
         let knownContainers: Set<String> = [
             "VStack", "HStack", "ZStack", "Group", "Section", "List", "Form", "LazyVStack",
             "LazyVGrid", "Grid", "Table", "TableColumn", "ScrollView", "ScrollViewReader",
@@ -177,8 +251,8 @@ final class SystemTypeTests: XCTestCase {
             "confirmationDialog", "ContentUnavailableView", "ViewThatFits", "LabeledContent",
             "MenuBarExtra", "Form", "List", "Table", "GridRow", "FlowLayout", "AttachmentFlowLayout",
         ]
-        let offenders = try bareStatedText(knownContainers: knownContainers)
-            .filter { line in !appKitDrawn.contains { line.hasPrefix($0.file + ":") && line.contains($0.needle) } }
+        let offenders = try bareStatedText(knownContainers: knownContainers, appKitSurfaces: appKitSurfaces,
+                                          menuContentViews: menuContentViews)
         XCTAssertTrue(offenders.isEmpty, """
             Text with no size of its own, and no ancestor that sets one:
             \(offenders.joined(separator: "\n"))
@@ -217,7 +291,8 @@ final class SystemTypeTests: XCTestCase {
     /// Every `Text`/`Label` that names no size and has no ancestor block that
     /// does — reported as `file:line: text`, with the project-helper case
     /// skipped (see `testEveryStatedTextNamesASize` for why it must be).
-    private func bareStatedText(knownContainers: Set<String>) throws -> [String] {
+    private func bareStatedText(knownContainers: Set<String>, appKitSurfaces: Set<String>,
+                              menuContentViews: Set<String>) throws -> [String] {
         // A statement whose text is visible on screen. `.tag(…)`, a TextField's
         // `prompt:` and `.help()` are drawn by the control or never drawn.
         let skip = try NSRegularExpression(
@@ -241,6 +316,8 @@ final class SystemTypeTests: XCTestCase {
                 }) { continue }
                 if Self.ancestorSetsSize(lines: lines, depths: depths, at: i) { continue }
                 if Self.insideProjectHelper(lines: lines, depths: depths, at: i, known: knownContainers) { continue }
+                if Self.onAppKitSurface(lines: lines, depths: depths, at: i, surfaces: appKitSurfaces) { continue }
+                if Self.inside(lines: lines, depths: depths, at: i, opening: menuContentViews) { continue }
                 found.append("\(file):\(i + 1): \(trimmed)")
             }
         }
@@ -293,6 +370,140 @@ final class SystemTypeTests: XCTestCase {
         return false
     }
 
+    /// Is any enclosing block opened by one of `names`? Used for a view that
+    /// is menu content by contract, where the surface is decided by the CALLER.
+    ///
+    /// Matches two shapes, because a type names itself in two: a call
+    /// (`chipMenu(item) { … }`, any identifier — a lowercase helper is as
+    /// likely as a capitalized view) and its own declaration
+    /// (`struct CLILauncherMenuItems: View {`, the name before the colon). The
+    /// call-site check is what proves the surface; the declaration check is
+    /// what lets the scan recognise the text as belonging to that type at all.
+    private static func inside(lines: [String], depths: [Int], at index: Int, opening names: Set<String>) -> Bool {
+        let call = try? NSRegularExpression(pattern: #"\b([A-Za-z_][A-Za-z0-9_]*)\s*[({]"#)
+        let decl = try? NSRegularExpression(pattern: #"\b(?:struct|class|enum|extension)\s+([A-Za-z_][A-Za-z0-9_]*)"#)
+        func lineNames(_ text: String) -> Bool {
+            if let m = call?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+               let r = Range(m.range(at: 1), in: text), names.contains(String(text[r])) { return true }
+            if let m = decl?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+               let r = Range(m.range(at: 1), in: text), names.contains(String(text[r])) { return true }
+            return false
+        }
+        // A surface built as a VALUE names itself on the line the statement
+        // starts, not on any line that opens a brace:
+        //     return Alert(title: Text("Agents"), message: Text(text),
+        //                  dismissButton: .default(Text("OK")))
+        // The walk below only ever visits lines that OPEN a block, and this
+        // expression opens none — so the statement's own first line is checked
+        // directly.
+        var up = index
+        var seen = 0
+        while up >= 0 && seen < 3 {
+            if lineNames(lines[up]) { return true }
+            if up == index || !lines[up].trimmingCharacters(in: .whitespaces).hasSuffix(",") { break }
+            up -= 1; seen += 1
+        }
+        var level = depths[index]
+        while level > 0 {
+            guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
+            else { return false }
+            if lineNames(lines[open]) { return true }
+            // A call written across lines puts its name on the line that opens
+            // the paren and its brace on a later one:
+            //     .confirmationDialog(
+            //         "…", isPresented: $x
+            //     ) { … } message: { … }
+            // The `message:` block's brace line names nothing, so without
+            // looking back over the paren continuation an alert's own text reads
+            // as unlabelled — which is the one surface it is allowed to be.
+            var back = open
+            var looked = 0
+            while back > 0 && looked < 4 {
+                back -= 1; looked += 1
+                if lineNames(lines[back]) { return true }
+            }
+            level -= 1
+        }
+        return false
+    }
+
+    /// The exemption above is a claim about the CALL SITES: `CLILauncherMenuItems`
+    /// draws no chrome of its own and is only ever handed to a menu, so a font
+    /// modifier inside it would be ignored. This is what keeps that claim honest
+    /// — a new call site outside a menu fails here rather than quietly making
+    /// the guard skip text that IS rendered by SwiftUI.
+    func testTheMenuContentViewStaysInAMenu() throws {
+        let menus: Set<String> = ["Menu", "CommandMenu", "CommandGroup", "chipMenu"]
+        var escaped: [String] = []
+        for (file, code) in try swiftSources() {
+            let lines = SourceScan.strippingComments(code).components(separatedBy: "\n")
+            let depths = Self.braceDepths(lines)
+            for i in 0..<lines.count where lines[i].contains("CLILauncherMenuItems(") {
+                if !Self.inside(lines: lines, depths: depths, at: i, opening: menus) {
+                    escaped.append("\(file):\(i + 1): \(lines[i].trimmingCharacters(in: .whitespaces))")
+                }
+            }
+        }
+        XCTAssertTrue(escaped.isEmpty, """
+            CLILauncherMenuItems is rendered outside a menu:
+            \(escaped.joined(separator: "\n"))
+
+            Its text is skipped by the stated-text guard because the menus it
+            lives in are drawn by AppKit. Somewhere else, SwiftUI draws it and
+            the size matters — either name the step there, or drop the entry from
+            `menuContentViews`.
+            """)
+    }
+
+    /// Is this text on a surface AppKit draws itself — inside a `Menu`, an
+    /// `Alert`, a `confirmationDialog`, a `CommandMenu`? Keyed on the construct
+    /// rather than the copy, so rewording the string (or wrapping it in
+    /// `L10n.text`) cannot turn an entry into a false offender.
+    private static func onAppKitSurface(lines: [String], depths: [Int],
+                                        at index: Int, surfaces: Set<String>) -> Bool {
+        let call = try? NSRegularExpression(pattern: #"\b([A-Z][A-Za-z0-9_]*|confirmationDialog)\s*[({]"#)
+        if let call, let m = call.firstMatch(in: lines[index], range: NSRange(lines[index].startIndex..., in: lines[index])),
+           let r = Range(m.range(at: 1), in: lines[index]), surfaces.contains(String(lines[index][r])) {
+            return true
+        }
+        func names(_ text: String) -> Bool {
+            let range = NSRange(text.startIndex..., in: text)
+            guard let m = call?.firstMatch(in: text, range: range),
+                  let r = Range(m.range(at: 1), in: text) else { return false }
+            return surfaces.contains(String(text[r]))
+        }
+        // A surface built as a VALUE names itself where the statement starts and
+        // opens no brace for the walk below to find:
+        //     return Alert(title: Text("Agents"), message: Text(text),
+        //                  dismissButton: .default(Text("OK")))
+        for back in 1...3 where index - back >= 0 {
+            if names(lines[index - back]) { return true }
+        }
+        var level = depths[index]
+        while level > 0 {
+            guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
+            else { return false }
+            let range = NSRange(lines[open].startIndex..., in: lines[open])
+            if let m = call?.firstMatch(in: lines[open], range: range),
+               let r = Range(m.range(at: 1), in: lines[open]), surfaces.contains(String(lines[open][r])) {
+                return true
+            }
+            // A call written across lines puts its name on the line that opens
+            // the paren and its brace on a later one:
+            //     .confirmationDialog(
+            //         "…", isPresented: $x
+            //     ) { … } message: { … }
+            var back = open
+            var looked = 0
+            while back > 0 && looked < 4 {
+                back -= 1; looked += 1
+                if names(lines[back]) { return true }
+            }
+            level -= 1
+        }
+        return false
+    }
+
     /// Does an enclosing block set a size? The block's own lines count, AND the
     /// two lines after its closing brace — SwiftUI's own idiom is a trailing
     /// modifier on the container:
@@ -307,8 +518,14 @@ final class SystemTypeTests: XCTestCase {
             guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
             else { return false }
             let close = (index..<lines.count).first(where: { depths[$0] < level }) ?? lines.count - 1
-            let window = lines[open...min(close + 2, lines.count - 1)].joined(separator: "\n")
-            if window.contains(".font(") || window.contains(".app(") { return true }
+            // The trailing-modifier idiom only: a font on the block's own last
+            // line or within two lines of its closing brace, which is where a
+            // container carries one. Scanning the WHOLE block let an unrelated
+            // sibling's `.app(…)` vouch for a bare Text elsewhere in the same
+            // body — a false negative, and the reason 62 real offenders sat in
+            // main with the guard green.
+            let tail = lines[max(open, close - 1)...min(close + 2, lines.count - 1)].joined(separator: "\n")
+            if tail.contains(".font(") || tail.contains(".app(") { return true }
             level -= 1
         }
         return false

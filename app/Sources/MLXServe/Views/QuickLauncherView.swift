@@ -116,17 +116,20 @@ struct QuickLauncherView: View {
                 .foregroundStyle(.tertiary)
             Spacer()
             if generatingHere {
-                Button("Stop") { controller.stopOwnTurn() }
+                Button { controller.stopOwnTurn() } label: { Text("Stop")
+    .font(.app(.body)) }
                     .keyboardShortcut(".", modifiers: .command)
                     .controlSize(.small)
             }
-            Button("New  ⌘N") {
+            Button {
                 controller.newConversation()
                 query = ""
-            }
+            } label: { Text("New  ⌘N")
+    .font(.app(.body)) }
             .keyboardShortcut("n", modifiers: .command)
             .controlSize(.small)
-            Button("Open in Chat  ⌘↩") { controller.openInChat() }
+            Button { controller.openInChat() } label: { Text("Open in Chat  ⌘↩")
+    .font(.app(.body)) }
                 .keyboardShortcut(.return, modifiers: .command)
                 .controlSize(.small)
         }
@@ -152,7 +155,7 @@ struct QuickLauncherTrayRow: View {
             Toggle("", isOn: $appState.quickLauncherEnabled)
                 .labelsHidden()
                 .toggleStyle(.switch)
-                .controlSize(.small)
+                .controlSize(.small).font(.app(.body))
         }
         .help("Spotlight-style prompt panel on \(QuickLauncherHotKey.display): summon it from any app, ask the local model, and press ⌘↩ to continue in the chat window. If nothing happens on \(QuickLauncherHotKey.display), macOS may be using it for input-source switching (System Settings → Keyboard → Keyboard Shortcuts → Input Sources).")
     }

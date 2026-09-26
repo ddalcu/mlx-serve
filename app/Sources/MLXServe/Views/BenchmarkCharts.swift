@@ -81,7 +81,7 @@ private var rungAxis: some AxisContent {
         AxisGridLine()
         AxisValueLabel {
             if let tokens = value.as(Int.self) {
-                Text(BenchmarkSuite.title(forTarget: tokens))
+                Text(BenchmarkSuite.title(forTarget: tokens)).font(.app(.body))
             }
         }
     }
@@ -172,7 +172,7 @@ struct BenchmarkRungTable: View {
     }
 
     private func cell(_ text: String) -> some View {
-        Text(text).monospacedDigit()
+        Text(text).monospacedDigit().font(.app(.body))
     }
 }
 

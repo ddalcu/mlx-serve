@@ -93,17 +93,17 @@ struct LayaDecisionsPane: View {
                     ForEach($questions) { $q in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
-                                TextField("name", text: $q.name).frame(width: 120)
+                                TextField("name", text: $q.name).frame(width: 120).font(.app(.body))
                                 Picker("", selection: $q.type) {
-                                    ForEach(Question.Kind.allCases, id: \.self) { Text($0.rawValue) }
+                                    ForEach(Question.Kind.allCases, id: \.self) { Text($0.rawValue) }.font(.app(.body))
                                 }.frame(width: 100)
                                 Spacer()
                                 Button { questions.removeAll { $0.id == q.id } } label: { Image(systemName: "minus.circle") }
-                                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                                    .buttonStyle(.plain).foregroundStyle(.secondary).font(.app(.body))
                             }
-                            TextField("instructions", text: $q.instructions)
+                            TextField("instructions", text: $q.instructions).font(.app(.body))
                             TextField(criteriaHint(q.type), text: $q.criteria)
-                                .foregroundStyle(q.json == nil ? .red : .primary)
+                                .foregroundStyle(q.json == nil ? .red : .primary).font(.app(.body))
                         }
                         .padding(8)
                         .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.4)))
@@ -113,9 +113,9 @@ struct LayaDecisionsPane: View {
                         Button(busy ? "Asking…" : "Ask") { Task { await ask() } }
                             .keyboardShortcut(.return, modifiers: .command)
                             .disabled(busy || questions.allSatisfy { $0.json == nil })
-                        if let latencyMs { Text(String(format: "%.0f ms", latencyMs)).foregroundStyle(.secondary) }
+                        if let latencyMs { Text(String(format: "%.0f ms", latencyMs)).font(.app(.body)).foregroundStyle(.secondary) }
                         Spacer()
-                        Toggle("Raw JSON", isOn: $showRaw).toggleStyle(.checkbox)
+                        Toggle("Raw JSON", isOn: $showRaw).toggleStyle(.checkbox).font(.app(.body))
                     }
 
                     if let error { Text(error).foregroundStyle(.red).textSelection(.enabled) }

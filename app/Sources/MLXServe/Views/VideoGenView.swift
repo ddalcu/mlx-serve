@@ -229,13 +229,15 @@ struct VideoGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+    .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+    .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -244,7 +246,7 @@ struct VideoGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Prompt").font(.app(.subheadline).weight(.semibold))
+                Text("Prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
                 if let hint = promptHint { promptWarning(hint) }
                 templatesMenu
@@ -373,18 +375,19 @@ struct VideoGenView: View {
         return Menu {
             Section(L10n.text(title)) {
                 ForEach(examplePrompts, id: \.title) { ex in
-                    Button(L10n.text(ex.title)) { prompt = ex.body }
+                    Button { prompt = ex.body } label: { Text(L10n.text(ex.title))
+    .font(.app(.body)) }
                 }
             }
             Divider()
             // No tint: AppKit draws menu item titles in the system colour and
             // a `foregroundStyle` here is a modifier that does nothing.
             Link(destination: H3PromptExamples.tipsURL(for: model.promptFormat)) {
-                Label("Prompt tips…", systemImage: "arrow.up.forward.square")
+                Label("Prompt tips…", systemImage: "arrow.up.forward.square").font(.app(.body))
             }
         } label: {
             HStack(spacing: 5) {
-                Text("Templates")
+                Text("Templates").font(.app(.body))
                 Image(systemName: "chevron.down")
             }
             .modifier(PaneChip())
@@ -488,7 +491,7 @@ struct VideoGenView: View {
 
     private var qualitySection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Quality").font(.app(.subheadline).weight(.semibold))
+            Text("Quality").font(.app(.headline).weight(.semibold))
             // Measured, not `ViewThatFits`: see `qualityFitsSegments`. Five
             // segments degrade to a menu rather than shortening the tier names
             // this pane shares with every other Create pane.
@@ -514,7 +517,7 @@ struct VideoGenView: View {
                 Text("Custom").tag(QualitySelection.custom)
             }
         }
-        .labelsHidden()
+        .labelsHidden().font(.app(.body))
         if segmented {
             picker.pickerStyle(.segmented)
         } else {
@@ -666,7 +669,7 @@ struct VideoGenView: View {
                 .fixedSize()
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 80)
+                .frame(width: 80).font(.app(.body))
         }
     }
 
@@ -680,16 +683,19 @@ struct VideoGenView: View {
             // Disabled as a plain ITEM, not as a disabled submenu: a submenu
             // still opens on hover, and an empty one that opens reads as a
             // bug rather than as "pick a picture first".
-            Button("Set by starting frame…") {}
+            Button {} label: { Text("Set by starting frame…")
+    .font(.app(.body)) }
                 .disabled(true)
         } else {
             Menu {
                 if canvases.isEmpty {
                     // Two rows, because `NSMenu` renders a title on one line
                     // and drops the newline.
-                    Button("Selected first frame's picture does not fit this model.") {}
+                    Button {} label: { Text("Selected first frame's picture does not fit this model.")
+    .font(.app(.body)) }
                         .disabled(true)
-                    Button("Consider its cropping or adding a letterbox.") {}
+                    Button {} label: { Text("Consider its cropping or adding a letterbox.")
+    .font(.app(.body)) }
                         .disabled(true)
                 } else {
                     Section("Matching \(startingFrameRatio ?? "the starting frame")") {
@@ -709,7 +715,7 @@ struct VideoGenView: View {
                     }
                 }
             } label: {
-                Text("Set by starting frame…")
+                Text("Set by starting frame…").font(.app(.body))
             }
         }
     }
@@ -740,7 +746,7 @@ struct VideoGenView: View {
 
     private func clipMenuLabel(_ title: String) -> some View {
         HStack(spacing: 5) {
-            Text(title)
+            Text(title).font(.app(.body))
             Image(systemName: "chevron.down")
         }
         // Body, not caption: this sits beside the size fields rather than
@@ -856,7 +862,7 @@ struct VideoGenView: View {
     private var framesSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Frames").font(.app(.subheadline).weight(.semibold))
+                Text("Frames").font(.app(.headline).weight(.semibold))
                 Spacer()
                 Text(L10n.format("%lld frames · ~%.1fs", Int64(numFrames), Double(numFrames) / Double(fps)))
                     .font(.app(.caption).monospacedDigit())
@@ -1118,7 +1124,7 @@ struct VideoGenView: View {
         if model.supportsReferences {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Text("References").font(.app(.subheadline).weight(.semibold))
+                    Text("References").font(.app(.headline).weight(.semibold))
                     // A saved reference is gone and the tiles after it
                     // renumbered, so the prompt's `<Picture n>` may now name
                     // another picture. Cleared by the first edit to either.
@@ -1237,7 +1243,7 @@ struct VideoGenView: View {
     private var imageDetailPicker: some View {
         Picker("", selection: $refImageSize) {
             ForEach(RefImageSizing.allCases, id: \.self) { s in
-                Text(L10n.text(s.label)).tag(s)
+                Text(L10n.text(s.label)).font(.app(.body)).tag(s)
             }
         }
         .labelsHidden()
@@ -1497,7 +1503,7 @@ struct VideoGenView: View {
         if !model.supportsAudioInput {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
-                    Text("Sound").font(.app(.subheadline).weight(.semibold))
+                    Text("Sound").font(.app(.headline).weight(.semibold))
                     Text(L10n.text(model.generatesAudio ? "generated with the video" : "not supported"))
                         .font(.app(.caption))
                         .foregroundStyle(.secondary)
@@ -1529,7 +1535,7 @@ struct VideoGenView: View {
     private var audioInputSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("Speech & sound").font(.app(.subheadline).weight(.semibold))
+                Text("Speech & sound").font(.app(.headline).weight(.semibold))
                 Text("optional, audio-to-video")
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
@@ -1546,7 +1552,7 @@ struct VideoGenView: View {
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.backward")
-                        Text("Back")
+                        Text("Back").font(.app(.body))
                     }
                     .modifier(PaneChip())
                 }
@@ -1853,14 +1859,14 @@ struct VideoGenView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         // `fixedSize` for the reason `labelledSizeField` gives:
                         // a squeezed HStack gives first on the TEXT.
-                        Text("Mode").font(.app(.caption)).fixedSize()
+                        Text("Mode").font(.app(.rowTitle)).fixedSize()
                         // Through `modeLabel`, the same three words as the
                         // caption under the Quality switcher. Shows the
                         // EFFECTIVE mode and locks while a clip forces it.
                         Picker("", selection: modeSelection) {
-                            Text(L10n.text(modeLabel(.oneStage))).tag(VideoPipelineMode.oneStage)
-                            Text(L10n.text(modeLabel(.twoStage))).tag(VideoPipelineMode.twoStage)
-                            Text(L10n.text(modeLabel(.twoStageHQ))).tag(VideoPipelineMode.twoStageHQ)
+                            Text(L10n.text(modeLabel(.oneStage))).font(.app(.body)).tag(VideoPipelineMode.oneStage)
+                            Text(L10n.text(modeLabel(.twoStage))).font(.app(.body)).tag(VideoPipelineMode.twoStage)
+                            Text(L10n.text(modeLabel(.twoStageHQ))).font(.app(.body)).tag(VideoPipelineMode.twoStageHQ)
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
@@ -1970,7 +1976,7 @@ struct VideoGenView: View {
     private var loraSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
-            Text("Style LoRAs").font(.app(.caption).weight(.semibold))
+            Text("Style LoRAs").font(.app(.headline).weight(.semibold))
             ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
                 loraRow(index: index, lora: lora)
             }
@@ -2019,7 +2025,7 @@ struct VideoGenView: View {
                 .help("Remove this LoRA")
             }
             HStack(spacing: 8) {
-                Text("Scale").font(.app(.caption))
+                Text("Scale").font(.app(.rowTitle))
                 Slider(value: $loras[index].scale, in: 0...2, step: 0.05)
                 // Fixed width: a readout that sizes to its digits drags the
                 // slider's right edge every time the value crosses a width.
@@ -2140,7 +2146,7 @@ struct VideoGenView: View {
             }
             Slider(value: value, in: range, step: step)
                 .disabled(lockedReadout != nil)
-                .padding(.top, Self.steppedSliderTrackDrop)
+                .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
         .help(help ?? "")
     }
@@ -2163,7 +2169,7 @@ struct VideoGenView: View {
                 in: Double(range.lowerBound)...Double(range.upperBound),
                 step: 1
             )
-            .padding(.top, Self.steppedSliderTrackDrop)
+            .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
         .help(help ?? "")
     }
@@ -2201,7 +2207,7 @@ struct VideoGenView: View {
                 step: 1
             )
             .disabled(disabled)
-            .padding(.top, Self.steppedSliderTrackDrop)
+            .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
         .help(help ?? "")
     }
@@ -2218,7 +2224,7 @@ struct VideoGenView: View {
                     Button(role: .destructive) {
                         service.cancel()
                     } label: {
-                        Label("Cancel", systemImage: "stop.circle")
+                        Label("Cancel", systemImage: "stop.circle").font(.app(.body))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
@@ -2226,7 +2232,7 @@ struct VideoGenView: View {
                     Button {
                         tryGenerate()
                     } label: {
-                        Label("Generate", systemImage: "wand.and.stars")
+                        Label("Generate", systemImage: "wand.and.stars").font(.app(.body))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
@@ -2257,7 +2263,7 @@ struct VideoGenView: View {
             Group {
                 switch service.phase {
                 case .idle:
-                    ContentUnavailableView("No generation yet", systemImage: "film", description: Text("Enter a prompt and press Generate."))
+                    ContentUnavailableView("No generation yet", systemImage: "film", description: Text("Enter a prompt and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         if let img = service.livePreview {
@@ -2275,14 +2281,15 @@ struct VideoGenView: View {
                 case .completed(let path):
                     completedPreview(path: path)
                 case .cancelled:
-                    ContentUnavailableView("Cancelled", systemImage: "stop.circle", description: Text("Generation was cancelled."))
+                    ContentUnavailableView("Cancelled", systemImage: "stop.circle", description: Text("Generation was cancelled.").font(.app(.body)))
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+    .font(.app(.body)) }
                     }
                 }
             }

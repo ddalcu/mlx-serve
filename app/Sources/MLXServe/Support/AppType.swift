@@ -11,15 +11,24 @@ import AppKit
 /// `.xSmall` and under `.accessibility4`, because that environment is an iOS
 /// one. Naming a system style therefore buys ONE VOCABULARY, not scaling, and
 /// the numbers below are where that vocabulary comes from: each system size,
-/// taken once, with the odd steps moved up a point and nothing under 10.
+/// taken once, with the odd steps moved up a point and nothing under 12.
 ///
-/// Two steps collapse onto each other, and that is the price of even-only:
-/// `body`/`headline` both land on 14, and `subheadline` joins `callout` at 12.
-/// The names still differ because the roles differ — a heading is still a
-/// heading when the system's heading grows.
+/// The floor is 12, not 10. Ten was the system's own `caption` size and it is
+/// legal, but it is a size you *can* read rather than one you enjoy reading,
+/// and with a floor that low the smallest step a view could name was the one
+/// nobody wanted — settings prose ended up there by default. Raising the floor
+/// is what stops that from being reachable by accident: the smallest step a
+/// view can name is now one that reads.
+///
+/// Three steps collapse onto each other, and that is the price of even-only
+/// with this floor: `body`/`headline` both land on 14, and `subheadline`,
+/// `callout`, `footnote`, `caption` and `caption2` all land on 12. The names
+/// still differ because the roles differ — a heading is still a heading when
+/// the system's heading grows, and the role table below says which step each
+/// role takes so the collapse is a deliberate choice rather than a drift.
 enum AppType {
     /// No text in the app renders smaller than this.
-    static let floor: CGFloat = 10
+    static let floor: CGFloat = 12
 
     /// Every step, with the macOS size it was derived from. The `system` column
     /// is what the ladder is anchored to: `SystemTypeTests` fails when macOS
@@ -34,9 +43,9 @@ enum AppType {
         (.body,        13, 14),
         (.callout,     12, 12),
         (.subheadline, 11, 12),
-        (.footnote,    10, 10),
-        (.caption,     10, 10),
-        (.caption2,    10, 10),
+        (.footnote,    10, 12),
+        (.caption,     10, 12),
+        (.caption2,    10, 12),
     ]
 
     /// The point size a step renders at.
@@ -48,6 +57,55 @@ enum AppType {
     /// whole even points, and never under `floor`.
     static func isLegal(_ size: CGFloat) -> Bool {
         size >= floor && size.truncatingRemainder(dividingBy: 2) == 0
+    }
+
+    /// What a piece of text IS, which is what picks its step. Without this the
+    /// ladder has a floor and a rule and no way to say "an explainer is not a
+    /// caption", and every view picks the smallest step it can — which is how
+    /// the settings prose ended up at 10pt in the first place.
+    ///
+    /// The steps, read as a scale rather than as a menu: page > section > row >
+    /// supporting > annotation. `Font.app(_:)` takes the step directly; this is
+    /// the sentence that says which one a given piece of copy wants.
+    enum Role {
+        /// A window's own name. Once per window.
+        case pageTitle
+        /// A pane or sheet's heading.
+        case sectionTitle
+        /// The name of one setting, row, model or item.
+        case rowTitle
+        /// A sentence under a row that says what it does. The one that was too
+        /// small: prose the user reads on purpose, not a label.
+        case explainer
+        /// A value, a status, a cost, a count.
+        case value
+        /// A badge, a unit, a qualifier next to something bigger.
+        case annotation
+
+        /// The step this role takes.
+        var step: Font.TextStyle {
+            switch self {
+            case .pageTitle:   return .largeTitle
+            // 16, not `.headline`(14): seventeen sheet and section headings in
+            // this app already sit at `.title3`, and a pane column's title in
+            // the toolbar cannot render SMALLER than the section headings
+            // underneath it. The role table follows the code, not the other
+            // way round.
+            case .sectionTitle: return .title3
+            case .rowTitle:    return .body
+            case .explainer:   return .callout
+            case .value:       return .callout
+            case .annotation:  return .footnote
+            }
+        }
+    }
+}
+
+extension Font {
+    /// The ladder, by role: the step says what the text IS, so two views that
+    /// mean the same thing cannot pick two different sizes.
+    static func app(_ role: AppType.Role, weight: Font.Weight? = nil, design: Font.Design? = nil) -> Font {
+        .app(role.step, weight: weight, design: design)
     }
 }
 

@@ -819,3 +819,32 @@ MLXCore (the UI, not mlx-serve) sat near 100% of a core during any generation. F
 - One growing `Text` for the expanded reasoning was re-measured whole through CoreText several times per batch by the window's size-constraint pass, O(n) per batch and climbing. While it streams it is one `Text` per line (`StreamingLines`); selection returns when it stops.
 - Every batch re-rendered every transcript row and re-ran the LaTeX segmenter and inline markdown over the whole reply. `MessageBubble` is `Equatable` (callbacks compared by presence), `LaTeXSegmenter` returns early with no `$` or `\`, and `renderInline` is cached per block, so only the growing tail renders.
 Also: model and user text went through `L10n.text` (a bundle lookup keyed on the whole string), and the UI flush is 10 Hz. Measured on a FAST_DEV build, streaming a long markdown reply: 74% mean / 87% max before, about 45% after; idle 0%. What is left is not app code: each of the ~8 batches a second costs about 50 ms because `AppState.chatSessions` publishing invalidates the whole window, and a batch that changes nothing visible (thinking, collapsed) costs nearly as much as one that does. The fix for that is a per-message observable for the streaming text; owed. Guards: `MessageBubbleEquatableTests`, `StreamingLinesTests`, `HeldValueTests`.
+
+## A control's title is not your text (2026-09-27)
+The type ladder passed every test and 183 `Button("…")` titles were still at
+whatever AppKit drew. `.font()` does not reach a button's title on macOS: the
+same button measured 317px wide with a 12pt font and 317px with a 24pt one, and
+the same held for `.bordered`, `.destructive` and `.controlSize(.small)`. A
+`Picker` splits — `.radioGroup` and `.inline` draw their own text and take a
+font, `.automatic`, `.menu` and `.segmented` are NSPopUpButton and
+NSSegmentedControl and do not — which is worse than a uniform rule, because the
+style decides.
+
+Passing the title as the label is what works, in every style:
+
+    Button { … } label: { Text("Cancel").font(.app(.value)) }   // 298px → 515px
+
+Two Swift shapes bite on the rewrite. A trailing closure sits OUTSIDE the
+parenthesised argument list, so a scanner that reads `Button(…)` alone sees no
+action and writes `label:` in front of it. And Swift will not mix a labelled
+`action:` argument with a trailing `label:` — `Button(action: f) label: { … }` is
+a syntax error, so that shape has to become `Button(action: f, label: { … })`.
+
+## A guard that scans too much passes for the wrong reason (2026-09-27)
+`ancestorSetsSize` looked for a font anywhere between a block's opening line and
+two lines past its close. That made an unrelated SIBLING's `.app(…)` vouch for a
+bare `Text` elsewhere in the same body — so 62 real offenders sat in `main` with
+the guard green. A font is inherited through the trailing-modifier idiom: the
+block's own last line, or the couple of lines after its closing brace. Scanning
+only there surfaced every one of them, and a probe injected into a view the old
+window waved through now fails.

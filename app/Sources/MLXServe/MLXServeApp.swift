@@ -242,10 +242,11 @@ struct MLXCoreApp: App {
 
         .commands {
             CommandGroup(replacing: .newItem) {
-                    Button("New Chat") {
+                    Button {
                         openAndFocus("chat")
                         _ = appState.newChatSession()
-                    }
+                    } label: { Text("New Chat")
+    .font(.app(.body)) }
                     .keyboardShortcut("n", modifiers: [.command])
 
                     // ⌘⌫, Finder's own "move to trash". A MENU command rather
@@ -257,53 +258,62 @@ struct MLXCoreApp: App {
                     DeleteChatCommand(appState: appState)
                 }
             CommandMenu("Agent") {
-                Button("Agents…") { openAndFocus("agents") }
+                Button { openAndFocus("agents") } label: { Text("Agents…")
+    .font(.app(.body)) }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
 
-                Button("Browser") { openAndFocus("browser") }
+                Button { openAndFocus("browser") } label: { Text("Browser")
+    .font(.app(.body)) }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
 
                 // The tray button is disabled until the server is running;
                 // this stays reachable so the History and Community panes can
                 // be opened without a live server.
-                Button("Benchmarks…") { openAndFocus("benchmarks") }
+                Button { openAndFocus("benchmarks") } label: { Text("Benchmarks…")
+    .font(.app(.body)) }
                     .keyboardShortcut("k", modifiers: [.command, .shift])
 
-                Button("Settings…") { appState.showSettings() }
+                Button { appState.showSettings() } label: { Text("Settings…")
+    .font(.app(.body)) }
                     .keyboardShortcut(",", modifiers: [.command])
 
-                Button("Edit System Prompt") {
+                Button {
                     AgentPrompt.openSystemPromptInEditor()
-                }
+                } label: { Text("Edit System Prompt")
+    .font(.app(.body)) }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
                 // Pull in the latest built-in default when ours has moved ahead of
                 // the on-disk copy. Backs up the user's current prompt first.
-                Button("Update System Prompt to Latest…") {
+                Button {
                     AgentPrompt.runSystemPromptUpdateFlow()
-                }
+                } label: { Text("Update System Prompt to Latest…")
+    .font(.app(.body)) }
                 .disabled(!AgentPrompt.isSystemPromptOutdated())
 
-                Button("Open Memory File") {
+                Button {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath
                     if !FileManager.default.fileExists(atPath: path) {
                         try? "".write(toFile: path, atomically: true, encoding: .utf8)
                     }
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                }
+                } label: { Text("Open Memory File")
+    .font(.app(.body)) }
 
-                Button("Open Skills Folder") {
+                Button {
                     // Accessing the shared manager seeds the example skill on
                     // first run; the create is a no-op if it already exists.
                     let path = AgentPrompt.skillManager.skillsDirectory
                     try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                }
+                } label: { Text("Open Skills Folder")
+    .font(.app(.body)) }
 
-                Button("Open MLX Serve Folder") {
+                Button {
                     let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                }
+                } label: { Text("Open MLX Serve Folder")
+    .font(.app(.body)) }
             }
 
             // Menu-bar twin of the chat's empty-state discovery chips
@@ -343,13 +353,16 @@ struct MLXCoreApp: App {
                 // pill offers. A menu key equivalent so it works from every
                 // window, and it goes through AppState's door — which raises
                 // the picker AND brings the chat window forward.
-                Button("Switch Model…") { appState.showModelPalette() }
+                Button { appState.showModelPalette() } label: { Text("Switch Model…")
+    .font(.app(.body)) }
                     .keyboardShortcut("l", modifiers: [.command])
 
-                Button("Browse Models…") { appState.showModels() }
+                Button { appState.showModels() } label: { Text("Browse Models…")
+    .font(.app(.body)) }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
 
-                Button("Scheduled Tasks…") { appState.showTasks() }
+                Button { appState.showTasks() } label: { Text("Scheduled Tasks…")
+    .font(.app(.body)) }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
 
                 Divider()
@@ -359,7 +372,8 @@ struct MLXCoreApp: App {
                 // one door, `AppState.showCreate`.
                 ForEach(ChatEmptyState.mediaItems) { item in
                     if case .create(let experiment) = item.action {
-                        Button("\(item.title)…") { appState.showCreate(experiment) }
+                        Button { appState.showCreate(experiment) } label: { Text("\(item.title)…")
+    .font(.app(.body)) }
                     }
                 }
 
@@ -368,21 +382,23 @@ struct MLXCoreApp: App {
                 // DMG builds only — the MAS build can't detect or launch
                 // other apps' CLIs (same gate as the tray's Code button).
                 if BuildFeatures.current.cliLauncher {
-                    Button("Launch Claude Code…") {
+                    Button {
                         launchClaudeCodeWithPicker(
                             baseURL: appState.server.baseURL,
                             serverContextLength: appState.server.chatModelInfo?.contextLength)
-                    }
+                    } label: { Text("Launch Claude Code…")
+    .font(.app(.body)) }
                 }
 
                 // No .keyboardShortcut here: ⌃Space is registered as a GLOBAL
                 // Carbon hotkey (QuickLauncherController); a menu key
                 // equivalent on the same combo would race it while the app is
                 // frontmost, so the combo rides the title instead.
-                Button("Quick Launcher (\(QuickLauncherHotKey.display))") {
+                Button {
                     if !appState.quickLauncherEnabled { appState.quickLauncherEnabled = true }
                     appState.quickLauncher.show()
-                }
+                } label: { Text("Quick Launcher (\(QuickLauncherHotKey.display))")
+    .font(.app(.body)) }
             }
         }
     }
@@ -462,7 +478,8 @@ private struct DeleteChatCommand: View {
     @ObservedObject var appState: AppState
 
     var body: some View {
-        Button("Delete Chat") { appState.requestChatDeletionFromMenu() }
+        Button { appState.requestChatDeletionFromMenu() } label: { Text("Delete Chat")
+    .font(.app(.body)) }
             .keyboardShortcut(.delete, modifiers: [.command])
             .disabled(appState.chatDeletionTarget == nil)
     }

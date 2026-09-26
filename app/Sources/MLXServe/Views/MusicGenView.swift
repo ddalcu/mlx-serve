@@ -104,19 +104,23 @@ struct MusicGenView: View {
         }
         .alert("Save style prompt", isPresented: $showSaveStyle) {
             TextField("Name", text: $saveTitle)
-            Button("Save") { library.saveStyle(title: saveTitle, body: prompt) }
+            Button { library.saveStyle(title: saveTitle, body: prompt) } label: { Text("Save")
+    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) {}
+            Button(role: .cancel) {} label: { Text("Cancel")
+    .font(.app(.body)) }
         } message: {
-            Text("Give this style a name to reuse it from the Templates menu.")
+            Text("Give this style a name to reuse it from the Templates menu.").font(.app(.body))
         }
         .alert("Save lyrics", isPresented: $showSaveLyrics) {
             TextField("Name", text: $saveTitle)
-            Button("Save") { library.saveLyrics(title: saveTitle, body: lyrics) }
+            Button { library.saveLyrics(title: saveTitle, body: lyrics) } label: { Text("Save")
+    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) {}
+            Button(role: .cancel) {} label: { Text("Cancel")
+    .font(.app(.body)) }
         } message: {
-            Text("Give these lyrics a name to reuse them from the Templates menu.")
+            Text("Give these lyrics a name to reuse them from the Templates menu.").font(.app(.body))
         }
         .sheet(item: $rewriteKind) { kind in
             PromptRewriteSheet(
@@ -180,13 +184,15 @@ struct MusicGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+    .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server, downloads: downloads) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+    .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -195,7 +201,7 @@ struct MusicGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Style prompt").font(.app(.subheadline).weight(.semibold))
+                Text("Style prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
                 rewriteButton(.style, text: prompt)
                 styleExamplesMenu
@@ -214,7 +220,7 @@ struct MusicGenView: View {
     private var lyricsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Lyrics").font(.app(.subheadline).weight(.semibold))
+                Text("Lyrics").font(.app(.headline).weight(.semibold))
                 // The instrumental switch. Both engines can make a wordless
                 // track, but only ACE-Step ever said so (empty lyrics) and
                 // Music 3 refused outright — the server 400s an empty lyric
@@ -348,7 +354,8 @@ struct MusicGenView: View {
                             .font(.app(.caption2).monospacedDigit()).foregroundStyle(.secondary)
                         // Cancels ONLY this single-file fetch — a full pack
                         // download for the same repo is never touched.
-                        Button("Cancel") { downloads.cancelPackFile(repoId: model.repo) }
+                        Button { downloads.cancelPackFile(repoId: model.repo) } label: { Text("Cancel")
+    .font(.app(.body)) }
                             .buttonStyle(.borderless).font(.app(.caption))
                     }
                 default:
@@ -410,7 +417,7 @@ struct MusicGenView: View {
             if task == .cover {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Cover strength").font(.app(.caption))
+                        Text("Cover strength").font(.app(.rowTitle))
                         Spacer()
                         Text(String(format: "%.2f", coverStrength)).font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
@@ -423,7 +430,7 @@ struct MusicGenView: View {
                 .padding(.top, 6)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Noise strength").font(.app(.caption))
+                        Text("Noise strength").font(.app(.rowTitle))
                         Spacer()
                         Text(String(format: "%.2f", coverNoiseStrength)).font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
@@ -500,7 +507,7 @@ struct MusicGenView: View {
     private var referenceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Reference audio (optional)").font(.app(.subheadline).weight(.semibold))
+                Text("Reference audio (optional)").font(.app(.headline).weight(.semibold))
                 Spacer()
             }
             if let url = refAudioURL {
@@ -631,7 +638,7 @@ struct MusicGenView: View {
             // against the pane margin puts a number and its name at opposite
             // ends of a wide row with nothing between them to tie the two.
             HStack(spacing: 6) {
-                Text("Duration").font(.app(.subheadline).weight(.semibold))
+                Text("Duration").font(.app(.headline).weight(.semibold))
                 // Typed entry beside the slider: the slider steps by 5 and
                 // landing on 95 s by dragging is not a thing anyone should do.
                 NumberField(range: durationRangeInt,
@@ -737,9 +744,11 @@ struct MusicGenView: View {
                                                 placeholder: "Auto", width: 64,
                                                 help: "\(MusicOptions.bpmRange.lowerBound)–\(MusicOptions.bpmRange.upperBound), or leave empty to let the model decide.")
                             Menu {
-                                Button("Auto") { bpm = nil }
+                                Button { bpm = nil } label: { Text("Auto")
+    .font(.app(.body)) }
                                 ForEach(MusicOptions.bpms, id: \.bpm) { opt in
-                                    Button(L10n.text(opt.label)) { bpm = opt.bpm }
+                                    Button { bpm = opt.bpm } label: { Text(L10n.text(opt.label))
+    .font(.app(.body)) }
                                 }
                             } label: {
                                 Image(systemName: "chevron.down").modifier(PaneChip(square: true))
@@ -750,9 +759,9 @@ struct MusicGenView: View {
                     }
                     advancedCell("Key") {
                         Picker("", selection: $keyscale) {
-                            Text("Auto").tag("")
+                            Text("Auto").font(.app(.body)).tag("")
                             ForEach(MusicOptions.keyscales, id: \.self) { key in
-                                Text(MusicOptions.keyLabel(key)).tag(key)
+                                Text(MusicOptions.keyLabel(key)).font(.app(.body)).tag(key)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).fixedSize()
@@ -762,16 +771,16 @@ struct MusicGenView: View {
                     advancedCell("Vocal language") {
                         Picker("", selection: $vocalLanguage) {
                             ForEach(MusicOptions.languages, id: \.code) { opt in
-                                Text(L10n.text(opt.label)).tag(opt.code)
+                                Text(L10n.text(opt.label)).font(.app(.body)).tag(opt.code)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).fixedSize()
                     }
                     advancedCell("Time signature") {
                         Picker("", selection: $timesignature) {
-                            Text("Auto").tag("")
+                            Text("Auto").font(.app(.body)).tag("")
                             ForEach(MusicOptions.timeSignatures, id: \.value) { opt in
-                                Text(L10n.text(opt.label)).tag(opt.value)
+                                Text(L10n.text(opt.label)).font(.app(.body)).tag(opt.value)
                             }
                         }
                         .labelsHidden().pickerStyle(.menu).fixedSize()
@@ -792,12 +801,12 @@ struct MusicGenView: View {
         HStack {
             if service.isRunning {
                 Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                    Label("Cancel", systemImage: "stop.circle").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
                 Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "music.note").frame(maxWidth: .infinity)
+                    Label("Generate", systemImage: "music.note").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -829,7 +838,7 @@ struct MusicGenView: View {
                 switch service.phase {
                 case .idle:
                     ContentUnavailableView("No music yet", systemImage: "music.note",
-                                           description: Text("Describe a style, optionally add lyrics, and press Generate."))
+                                           description: Text("Describe a style, optionally add lyrics, and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         if total == 0 {
@@ -844,11 +853,12 @@ struct MusicGenView: View {
                     completedPreview(path: path)
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+    .font(.app(.body)) }
                     }
                 }
             }
@@ -865,7 +875,7 @@ struct MusicGenView: View {
             Button {
                 playing ? clipPlayer.stop() : clipPlayer.play(path)
             } label: {
-                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill")
+                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill").font(.app(.body))
             }
             .buttonStyle(.bordered)
             // The name and the way to reach the file belong together, centred
@@ -983,7 +993,7 @@ struct MusicGenView: View {
         return Button { rewriteKind = kind } label: {
             HStack(spacing: 5) {
                 Image(systemName: "wand.and.sparkles")
-                Text("Enhance…")
+                Text("Enhance…").font(.app(.body))
             }
             .modifier(PaneChip())
         }
@@ -998,15 +1008,17 @@ struct MusicGenView: View {
     /// Delete submenu) + the built-in genre starters.
     private var styleExamplesMenu: some View {
         Menu {
-            Button("Save current…") {
+            Button {
                 saveTitle = MusicPromptStore.autoTitle(from: prompt)
                 showSaveStyle = true
-            }
+            } label: { Text("Save current…")
+    .font(.app(.body)) }
             .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if !library.savedStyles.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedStyles) { p in
-                        Button(L10n.text(p.title)) { prompt = p.body }
+                        Button { prompt = p.body } label: { Text(L10n.text(p.title))
+    .font(.app(.body)) }
                     }
                 }
                 Menu("Delete saved…") {
@@ -1022,7 +1034,8 @@ struct MusicGenView: View {
             // Music 3 a structured caption.
             Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
-                    Button(L10n.text(p.title)) { prompt = p.body }
+                    Button { prompt = p.body } label: { Text(L10n.text(p.title))
+    .font(.app(.body)) }
                 }
             }
         } label: {
@@ -1035,7 +1048,7 @@ struct MusicGenView: View {
     /// chevron sits INSIDE the chip, beside the word.
     private var templatesChip: some View {
         HStack(spacing: 5) {
-            Text("Templates")
+            Text("Templates").font(.app(.body))
             Image(systemName: "chevron.down")
         }
         .modifier(PaneChip())
@@ -1045,15 +1058,17 @@ struct MusicGenView: View {
     /// submenu) + built-in ORIGINAL lyric templates to start from.
     private var lyricsExamplesMenu: some View {
         Menu {
-            Button("Save current…") {
+            Button {
                 saveTitle = MusicPromptStore.autoTitle(from: lyrics)
                 showSaveLyrics = true
-            }
+            } label: { Text("Save current…")
+    .font(.app(.body)) }
             .disabled(lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if !library.savedLyrics.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedLyrics) { p in
-                        Button(L10n.text(p.title)) { lyrics = p.body }
+                        Button { lyrics = p.body } label: { Text(L10n.text(p.title))
+    .font(.app(.body)) }
                     }
                 }
                 Menu("Delete saved…") {
@@ -1066,7 +1081,8 @@ struct MusicGenView: View {
             }
             Section("Example templates") {
                 ForEach(MusicPrompt.builtinLyrics) { p in
-                    Button(L10n.text(p.title)) { lyrics = p.body }
+                    Button { lyrics = p.body } label: { Text(L10n.text(p.title))
+    .font(.app(.body)) }
                 }
             }
         } label: {
@@ -1147,10 +1163,13 @@ struct PromptRewriteSheet: View {
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             HStack {
-                Button("Try again") { start() }.disabled(isWriting)
+                Button { start() } label: { Text("Try again")
+    .font(.app(.body)) }.disabled(isWriting)
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Apply") { onApply(text); dismiss() }
+                Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                Button { onApply(text); dismiss() } label: { Text("Apply")
+    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }

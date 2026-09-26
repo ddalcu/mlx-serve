@@ -148,13 +148,17 @@ final class ChatEmptyStateTests: XCTestCase {
         XCTAssertTrue(app.contains("ChatEmptyState.mediaItems"),
                       "the Tools menu must iterate the shared media catalog, not a second list")
         // Both of the Tools menu's own destinations are modes of the chat
-        // window now, reached through their AppState chokepoints.
-        XCTAssertTrue(app.contains("Button(\"Scheduled Tasks…\") { appState.showTasks() }"),
+        // window now, reached through their AppState chokepoints. The titles are
+        // `label:` closures rather than a `Button` title argument, so a test that
+        // looks for `Button("…")` would pass on a menu that shows nothing.
+        XCTAssertTrue(app.contains("appState.showTasks()"),
                       "the Tools menu must reach the Tasks pane via AppState.showTasks()")
-        // Browse Models is no longer a window — the menu item switches the chat
-        // window's mode through the one chokepoint.
-        XCTAssertTrue(app.contains("Button(\"Browse Models…\") { appState.showModels() }"),
-                      "the Tools menu must reach the models pane via AppState.showModels()")
+        XCTAssertTrue(app.contains("label: { Text(\"Browse Models\u{2026}\")"),
+                      "the Browse Models item must still show its title")
+        XCTAssertTrue(app.contains("label: { Text(\"Scheduled Tasks\u{2026}\")"),
+                      "the Scheduled Tasks item must still show its title")
+        // And every one of those titles is on the ladder, not at a bare 13pt.
+        XCTAssertFalse(app.contains("Button(\"Browse Models"), "a Button title arg is off-ladder")
         XCTAssertTrue(app.contains("BuildFeatures.current.cliLauncher"),
                       "the Claude Code menu item must carry the MAS gate")
     }

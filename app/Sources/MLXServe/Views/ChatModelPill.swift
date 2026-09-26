@@ -208,7 +208,7 @@ struct ChatModelPill: View {
         let pickable = pickableModels
         if pickable.isEmpty && lanChatModels.isEmpty {
             if !AppleFoundationChat.availability.isAvailable {
-                Text("No chat models downloaded")
+                Text("No chat models downloaded").font(.app(.body))
             }
         } else {
             // Same duplicate-name suffixing as the tray: a menu keys its
@@ -248,13 +248,14 @@ struct ChatModelPill: View {
             }
         }
         Divider()
-        Button("Manage Models…") {
+        Button {
             // A MODE of this window now, not a window of its own — so the
             // picker's "manage" route lands beside the picker rather than on
             // top of it. AppState.showModels is the one way in, and it is the
             // LAST row: everything above it is a model you can pick right now.
             appState.showModels()
-        }
+        } label: { Text("Manage Models…")
+    .font(.app(.body)) }
     }
 
     private func row(title: String, tag: String) -> some View {
@@ -262,9 +263,9 @@ struct ChatModelPill: View {
             selection.wrappedValue = tag
         } label: {
             if selection.wrappedValue == tag {
-                Label(L10n.text(title), systemImage: "checkmark")
+                Label(L10n.text(title), systemImage: "checkmark").font(.app(.body))
             } else {
-                Text(L10n.text(title))
+                Text(L10n.text(title)).font(.app(.body))
             }
         }
     }

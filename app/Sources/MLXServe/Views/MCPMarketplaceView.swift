@@ -189,7 +189,7 @@ struct MCPMarketplaceView: View {
                                 Task { await mcpManager.startEnabled() }
                             }
                         ))
-                        .labelsHidden()
+                        .labelsHidden().font(.app(.body))
                     }
                     .padding(10)
                     .background(Color.secondary.opacity(0.06))
@@ -204,7 +204,7 @@ struct MCPMarketplaceView: View {
             Button {
                 openMCPJsonInEditor()
             } label: {
-                Label("Open mcp.json", systemImage: "doc.text")
+                Label("Open mcp.json", systemImage: "doc.text").font(.app(.body))
             }
             .help("Edit ~/.mlx-serve/mcp.json to add custom servers or fine-tune existing ones")
 
@@ -215,9 +215,11 @@ struct MCPMarketplaceView: View {
                     .lineLimit(2)
             }
             Spacer()
-            Button("Cancel") { dismiss() }
+            Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }
                 .keyboardShortcut(.cancelAction)
-            Button("Save") { saveAndDismiss() }
+            Button { saveAndDismiss() } label: { Text("Save")
+    .font(.app(.body)) }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
         }

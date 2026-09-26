@@ -548,7 +548,7 @@ struct CLILauncherMenuItems: View {
                     Button {
                         openHostCLI(cli)
                     } label: {
-                        Label(L10n.text(cli.displayName), systemImage: cli.iconSystemName ?? "terminal")
+                        Label(L10n.text(cli.displayName), systemImage: cli.iconSystemName ?? "terminal").font(.app(.body))
                     }
                 }
             }
@@ -558,13 +558,13 @@ struct CLILauncherMenuItems: View {
                 Button {
                     openSandboxAgent(spec.id)
                 } label: {
-                    Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
+                    Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox").font(.app(.body))
                 }
             }
             Button {
                 openSandboxAgent(nil)
             } label: {
-                Label("Shell in Sandbox", systemImage: "terminal")
+                Label("Shell in Sandbox", systemImage: "terminal").font(.app(.body))
             }
         }
     }

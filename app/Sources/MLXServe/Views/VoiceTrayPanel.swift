@@ -55,7 +55,7 @@ struct VoiceTrayPanel: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
-                .disabled(appState.server.status != .running)
+                .disabled(appState.server.status != .running).font(.app(.body))
         }
         .help("Hands-free voice assistant — talk to the model with no chat window required. Speech-to-text and text-to-speech run locally on your Mac. When this popover is closed, feedback is audio-only; reopen it for status and controls.")
     }
@@ -92,12 +92,13 @@ struct VoiceTrayPanel: View {
                 .font(.app(.caption2))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button(L10n.text(VoicePreflight.actionLabel(for: issue))) {
+            Button {
                 if let url = URL(string: VoicePreflight.settingsURLString(for: issue)) {
                     NSWorkspace.shared.open(url)
                 }
-            }
-            .controlSize(.small)
+            } label: { Text(L10n.text(VoicePreflight.actionLabel(for: issue)))
+    .font(.app(.body)) }
+            .controlSize(.small).font(.app(.body))
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -146,16 +147,17 @@ struct VoiceTrayPanel: View {
                 .foregroundStyle(.secondary)
             Picker("", selection: Binding(get: { appState.defaultAgentId },
                                           set: { appState.defaultAgentId = $0 })) {
-                Text("None (app defaults)").tag(UUID?.none)
+                Text("None (app defaults)").font(.app(.body)).tag(UUID?.none)
                 ForEach(appState.agents.allAgents) { agent in
-                    Text(agentLabel(agent)).tag(UUID?.some(agent.id))
+                    Text(agentLabel(agent)).font(.app(.body)).tag(UUID?.some(agent.id))
                 }
             }
             .labelsHidden()
             .controlSize(.small)
             .fixedSize()
             Spacer(minLength: 0)
-            Button("Manage…") { openAgents() }
+            Button { openAgents() } label: { Text("Manage…")
+    .font(.app(.body)) }
                 .buttonStyle(.link)
                 .font(.app(.caption2))
         }
@@ -226,13 +228,13 @@ struct VoiceTrayPanel: View {
             }
             HStack(spacing: 6) {
                 Button(role: .destructive) { voice.resolve(.deny) } label: {
-                    Text("Deny").frame(maxWidth: .infinity)
+                    Text("Deny").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 Button { voice.resolve(.allow, allowAll: true) } label: {
-                    Text("Always").frame(maxWidth: .infinity)
+                    Text("Always").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 Button { voice.resolve(.allow) } label: {
-                    Text("Allow").frame(maxWidth: .infinity)
+                    Text("Allow").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
             }

@@ -16,6 +16,7 @@ struct BrowserView: View {
                 }
 
                 TextField("URL", text: $urlText)
+                    .font(.app(.body))
                     .textFieldStyle(.roundedBorder)
                     .onSubmit {
                         navigateToURL()

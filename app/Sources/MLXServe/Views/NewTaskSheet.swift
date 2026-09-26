@@ -225,7 +225,7 @@ struct NewTaskSheet: View {
                         .font(.app(.caption).weight(.semibold))
                         .rotationEffect(.degrees(showOptions ? 90 : 0))
                         .foregroundStyle(.secondary)
-                    Text("Options").font(.app(.subheadline).weight(.semibold))
+                    Text("Options").font(.app(.headline).weight(.semibold))
                     if !showOptions, let summary = optionsSummary {
                         Text(L10n.text(summary))
                             .font(.app(.caption))
@@ -243,9 +243,9 @@ struct NewTaskSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     field("Run as", hint: "An agent brings its own prompt, tools, model and workspace.") {
                         Picker("", selection: $agentId) {
-                            Text("None (app defaults)").tag(UUID?.none)
+                            Text("None (app defaults)").font(.app(.body)).tag(UUID?.none)
                             ForEach(appState.agents.allAgents) { agent in
-                                Text(agent.name).tag(UUID?.some(agent.id))
+                                Text(agent.name).font(.app(.body)).tag(UUID?.some(agent.id))
                             }
                         }
                         .labelsHidden()
@@ -254,9 +254,9 @@ struct NewTaskSheet: View {
                     if !baseModels.isEmpty {
                         field("Model") {
                             Picker("", selection: $modelPath) {
-                                Text("Use current model").tag(String?.none)
+                                Text("Use current model").font(.app(.body)).tag(String?.none)
                                 ForEach(baseModels) { model in
-                                    Text(model.name).tag(String?.some(model.path))
+                                    Text(model.name).font(.app(.body)).tag(String?.some(model.path))
                                 }
                             }
                             .labelsHidden()
@@ -289,9 +289,11 @@ struct NewTaskSheet: View {
     private var footer: some View {
         HStack {
             Spacer()
-            Button("Cancel") { dismiss() }
+            Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }
                 .keyboardShortcut(.cancelAction)
-            Button(L10n.text(isEditing ? "Save" : "Create Task")) { submit() }
+            Button { submit() } label: { Text(L10n.text(isEditing ? "Save" : "Create Task"))
+    .font(.app(.body)) }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canSave)
                 .keyboardShortcut(.defaultAction)

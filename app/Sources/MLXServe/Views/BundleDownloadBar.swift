@@ -43,7 +43,7 @@ struct BundleDownloadBar: View {
             Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
             } label: {
-                Label("Download (\(bundle.approxSizeLabel))", systemImage: "arrow.down.circle")
+                Label("Download (\(bundle.approxSizeLabel))", systemImage: "arrow.down.circle").font(.app(.body))
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -81,9 +81,10 @@ struct BundleDownloadBar: View {
         VStack(alignment: .leading, spacing: 4) {
             Text(state.error ?? "Download failed")
                 .font(.app(.caption2)).foregroundStyle(.red).lineLimit(2)
-            Button("Retry") {
+            Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
-            }
+            } label: { Text("Retry")
+    .font(.app(.body)) }
             .buttonStyle(.bordered).controlSize(.small)
         }
     }

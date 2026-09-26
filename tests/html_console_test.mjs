@@ -7,7 +7,7 @@
 // functions and pinned here.
 //
 // Run: node --test tests/html_console_test.mjs
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -1186,11 +1186,18 @@ test('every marked key in index.html has a zh-Hans entry', () => {
 // same rule, and the scan is what stops a later stylesheet from quietly
 // putting px back.
 
+
 test('no console stylesheet states a font size in px', () => {
-  const files = ['app.css', 'metrics.js', 'index.html', 'app.js'];
+  // The DIRECTORY, not a list of files. `src/html` gains scripts as the
+  // console grows (theme.js, i18n.js), and a fixed list quietly stops covering
+  // the day one is added — the rule would hold for the names in the array and
+  // for nothing else.
+  const dir = join(here, '..', 'src', 'html');
+  const files = readdirSync(dir).filter((f) => /\.(css|js|html)$/.test(f));
+  assert.ok(files.length >= 4, `only ${files.length} console files to scan — is the walk working?`);
   const offenders = [];
   for (const name of files) {
-    const text = readFileSync(join(here, '..', 'src', 'html', name), 'utf8');
+    const text = readFileSync(join(dir, name), 'utf8');
     for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
       const line = text.slice(0, m.index).split('\n').length;
       offenders.push(`${name}:${line}: ${m[0].trim()}`);

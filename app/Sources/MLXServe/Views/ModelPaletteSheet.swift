@@ -154,10 +154,11 @@ struct ModelPaletteSheet: View {
             // With nothing to pick, the one useful thing is the way to get a
             // model — the same door the pill's last row opens.
             if rows.isEmpty {
-                Button("Manage Models…") {
+                Button {
                     close()
                     appState.showModels()
-                }
+                } label: { Text("Manage Models…")
+    .font(.app(.body)) }
             }
             Spacer()
         }
@@ -170,10 +171,11 @@ struct ModelPaletteSheet: View {
                 .font(.app(.caption2))
                 .foregroundStyle(.tertiary)
             Spacer()
-            Button("Manage Models…") {
+            Button {
                 close()
                 appState.showModels()
-            }
+            } label: { Text("Manage Models…")
+    .font(.app(.body)) }
             .buttonStyle(.plain)
             .font(.app(.caption))
             .foregroundStyle(Color.accentColor)

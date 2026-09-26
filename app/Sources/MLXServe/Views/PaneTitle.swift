@@ -12,7 +12,7 @@ struct PaneTitleBar: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(L10n.text(title))
-                .font(.app(.headline))
+                .font(.app(.sectionTitle))
                 .foregroundStyle(.primary)
             Button(action: add) {
                 Image(systemName: "plus")

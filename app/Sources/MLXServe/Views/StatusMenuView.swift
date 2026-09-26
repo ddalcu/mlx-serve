@@ -305,42 +305,42 @@ struct StatusMenuView: View {
             if !mlxServe.isEmpty {
                 Section("MLX-Serve Models") {
                     ForEach(mlxServe) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !lmStudio.isEmpty {
                 Section(L10n.text(LocalModelSource.lmStudio.sectionTitle)) {
                     ForEach(lmStudio) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !mtplx.isEmpty {
                 Section(L10n.text(LocalModelSource.mtplx.sectionTitle)) {
                     ForEach(mtplx) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !osaurus.isEmpty {
                 Section(L10n.text(LocalModelSource.osaurus.sectionTitle)) {
                     ForEach(osaurus) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !huggingFace.isEmpty {
                 Section("Hugging Face Cache") {
                     ForEach(huggingFace) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !custom.isEmpty {
                 Section("Custom Folder") {
                     ForEach(custom) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
@@ -353,25 +353,25 @@ struct StatusMenuView: View {
             if !network.isEmpty {
                 Section(L10n.text(ModelPalette.networkSection)) {
                     ForEach(network, id: \.name) { m in
-                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).font(.app(.body)).tag("lan:" + m.name)
                     }
                 }
             }
             if !providers.isEmpty {
                 Section(L10n.text(ModelPalette.providersSection)) {
                     ForEach(providers, id: \.name) { m in
-                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).font(.app(.body)).tag("lan:" + m.name)
                     }
                 }
             }
             if case .available = AppleFoundationChat.availability {
                 Section(L10n.text(ModelPalette.onDeviceSection)) {
-                    Text(L10n.text(AppleFoundationChat.displayName)).tag(ChatModelSelection.appleTag)
+                    Text(L10n.text(AppleFoundationChat.displayName)).font(.app(.body)).tag(ChatModelSelection.appleTag)
                 }
             }
         }
         .labelsHidden()
-        .pickerStyle(.menu)
+        .pickerStyle(.menu).font(.app(.body))
     }
 
     /// The one state-driven action, plus the log window.
@@ -413,7 +413,7 @@ struct StatusMenuView: View {
                 } else if let systemImageName = control.systemImageName {
                     Image(systemName: systemImageName)
                 }
-                Text(L10n.text(control.title))
+                Text(L10n.text(control.title)).font(.app(.body))
             }
             .frame(maxWidth: .infinity)
         }
@@ -817,9 +817,10 @@ struct UpdateTrayRow: View {
                         ProgressView()
                             .controlSize(.small)
                     default:
-                        Button("Update") {
+                        Button {
                             Task { await updates.downloadAndInstall() }
-                        }
+                        } label: { Text("Update")
+    .font(.app(.body)) }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .help("Download v\(update.version), install, and relaunch")
@@ -1153,7 +1154,7 @@ struct ServerLogWindowView: View {
             Text(L10n.text(statusLabel))
                 .font(.app(.caption).weight(.medium))
                 .foregroundStyle(.secondary)
-            Text("·")
+            Text("·").font(.app(.body))
                 .foregroundStyle(.tertiary)
             // Byte counter from the poller mirror — same data the body
             // shows, so the number matches what's on screen rather than
@@ -1165,7 +1166,7 @@ struct ServerLogWindowView: View {
             Spacer()
 
             Toggle(isOn: $autoScroll) {
-                Label("Auto-scroll", systemImage: "arrow.down.to.line")
+                Label("Auto-scroll", systemImage: "arrow.down.to.line").font(.app(.body))
             }
             .toggleStyle(.button)
             .controlSize(.small)
@@ -1177,7 +1178,7 @@ struct ServerLogWindowView: View {
                 copyLog()
             } label: {
                 Label(L10n.text(copied ? "Copied" : "Copy"),
-                      systemImage: copied ? "checkmark" : "doc.on.doc")
+                      systemImage: copied ? "checkmark" : "doc.on.doc").font(.app(.body))
             }
             .controlSize(.small)
             .help("Copy the entire log to the clipboard")
@@ -1185,7 +1186,7 @@ struct ServerLogWindowView: View {
             Button {
                 saveLog()
             } label: {
-                Label("Save…", systemImage: "square.and.arrow.down")
+                Label("Save…", systemImage: "square.and.arrow.down").font(.app(.body))
             }
             .controlSize(.small)
             .help("Save the log to a .log file")
@@ -1193,7 +1194,7 @@ struct ServerLogWindowView: View {
             Button(role: .destructive) {
                 server.clearServerLog()
             } label: {
-                Label("Clear", systemImage: "trash")
+                Label("Clear", systemImage: "trash").font(.app(.body))
             }
             .controlSize(.small)
             .help("Clear the in-memory log buffer (does not affect the running server)")

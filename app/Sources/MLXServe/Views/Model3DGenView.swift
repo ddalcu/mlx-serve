@@ -90,13 +90,15 @@ struct Model3DGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+    .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+    .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -150,7 +152,7 @@ struct Model3DGenView: View {
 
     private var photoSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Photo").font(.app(.subheadline).weight(.semibold))
+            Text("Photo").font(.app(.headline).weight(.semibold))
             if let url = photoURL {
                 // Same surface and same floor height as the empty well.
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
@@ -196,7 +198,7 @@ struct Model3DGenView: View {
                 intSliderRow("Steps", value: $steps, range: 10...50)
                 sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Mesh resolution").font(.app(.caption))
+                    Text("Mesh resolution").font(.app(.rowTitle))
                     Picker("", selection: $resolution) {
                         Text("128 (fast)").tag(128)
                         Text("256 (balanced)").tag(256)
@@ -225,7 +227,7 @@ struct Model3DGenView: View {
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
-                .padding(.top, Self.steppedSliderTrackDrop)
+                .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
     }
 
@@ -247,7 +249,7 @@ struct Model3DGenView: View {
                 in: Double(range.lowerBound)...Double(range.upperBound),
                 step: 1
             )
-            .padding(.top, Self.steppedSliderTrackDrop)
+            .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
     }
 
@@ -259,12 +261,12 @@ struct Model3DGenView: View {
         HStack {
             if service.isRunning {
                 Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                    Label("Cancel", systemImage: "stop.circle").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
                 Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "cube.transparent").frame(maxWidth: .infinity)
+                    Label("Generate", systemImage: "cube.transparent").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -291,7 +293,7 @@ struct Model3DGenView: View {
                 switch service.phase {
                 case .idle:
                     ContentUnavailableView("No 3D model yet", systemImage: "cube.transparent",
-                                           description: Text("Choose a photo and press Generate."))
+                                           description: Text("Choose a photo and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
@@ -302,11 +304,12 @@ struct Model3DGenView: View {
                     completedPreview(path: path)
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+    .font(.app(.body)) }
                     }
                 }
             }

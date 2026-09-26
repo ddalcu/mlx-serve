@@ -96,7 +96,7 @@ struct BenchmarkView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .fixedSize()
+                .fixedSize().font(.app(.body))
             }
         }
         .onAppear {
@@ -225,26 +225,27 @@ struct BenchmarkView: View {
                             if loadingModel { ProgressView().controlSize(.small) }
                             Picker("Model", selection: $pickedModelPath) {
                                 ForEach(pickableModels) { model in
-                                    Text(model.name).tag(model.path)
+                                    Text(model.name).font(.app(.body)).tag(model.path)
                                 }
                             }
                             .labelsHidden()
                             .frame(maxWidth: 220)
-                            .disabled(loadingModel || isRunning)
+                            .disabled(loadingModel || isRunning).font(.app(.body))
                         }
                     }
                 }
                 Divider().padding(.vertical, 9)
                 BenchRow("Context") {
-                    Text(pickedIsResident ? (contextLength.map { ContextSizeDisplay.formatTokens($0) } ?? "—") : "—")
+                    Text(pickedIsResident ? (contextLength.map { ContextSizeDisplay.formatTokens($0) } ?? "—") : "—").font(.app(.body))
                 }
                 Divider().padding(.vertical, 9)
                 BenchRow("This Mac") {
-                    Text(hardware.displayName)
+                    Text(hardware.displayName).font(.app(.body))
                 }
                 Divider().padding(.vertical, 9)
                 BenchRow("Note", detail: "Anything you want on the row: your name, a nickname, what else was running.") {
                     TextField("Optional", text: $note)
+                        .font(.app(.body))
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 170)
                         .onChange(of: note) { _, new in
@@ -273,12 +274,14 @@ struct BenchmarkView: View {
                     BenchmarkSettingsChips(settings: liveSettings)
                 }
                 HStack {
-                    Button("Change in Settings…") { appState.showSettings() }
+                    Button { appState.showSettings() } label: { Text("Change in Settings…")
+    .font(.app(.body)) }
                         .controlSize(.small)
-                    Button("Model Settings…") {
+                    Button {
                         guard let pick = pickedModel else { return }
                         modelSettings = ModelSettingsRequest(path: pick.path, title: ModelDisplayName.pretty(pick.displayLabel))
-                    }
+                    } label: { Text("Model Settings…")
+    .font(.app(.body)) }
                     .controlSize(.small)
                     .disabled(pickedModel == nil || loadingModel || isRunning)
                     Button {
@@ -302,7 +305,8 @@ struct BenchmarkView: View {
                         .font(.app(.callout))
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
-                    Button("Change in Settings…") { appState.showSettings() }
+                    Button { appState.showSettings() } label: { Text("Change in Settings…")
+    .font(.app(.body)) }
                         .controlSize(.small)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -327,7 +331,7 @@ struct BenchmarkView: View {
                         Button(role: .destructive) {
                             runner.cancel()
                         } label: {
-                            Label("Stop", systemImage: "stop.fill")
+                            Label("Stop", systemImage: "stop.fill").font(.app(.body))
                         }
                         .tint(.red)
                         .buttonStyle(.borderedProminent)
@@ -348,7 +352,7 @@ struct BenchmarkView: View {
                 Task { await runBenchmark() }
             } label: {
                 Label(isRunning ? "Running…" : "Run Benchmark", systemImage: "play.fill")
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 8).font(.app(.body))
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -400,7 +404,8 @@ struct BenchmarkView: View {
                                 Label(message, systemImage: "exclamationmark.octagon.fill")
                                     .font(.app(.caption))
                                     .foregroundStyle(.red)
-                                Button("Try Again") { Task { await submit() } }
+                                Button { Task { await submit() } } label: { Text("Try Again")
+    .font(.app(.body)) }
                                     .controlSize(.small)
                             }
                         }
@@ -438,11 +443,12 @@ struct BenchmarkView: View {
         Group {
             if history.isEmpty {
                 ContentUnavailableView {
-                    Label("No Runs Yet", systemImage: "clock")
+                    Label("No Runs Yet", systemImage: "clock").font(.app(.body))
                 } description: {
-                    Text("Benchmarks you run are kept here, on this Mac. Double-click a row for the full detail.")
+                    Text("Benchmarks you run are kept here, on this Mac. Double-click a row for the full detail.").font(.app(.body))
                 } actions: {
-                    Button("Run a Benchmark") { pane = .run }
+                    Button { pane = .run } label: { Text("Run a Benchmark")
+    .font(.app(.body)) }
                         .buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -451,12 +457,12 @@ struct BenchmarkView: View {
                     Table(historySessions, selection: $historySelection) {
                         TableColumn("Date") { session in
                             Text(session.date, format: .dateTime.month(.abbreviated).day().hour().minute())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.secondary).font(.app(.body))
                         }
                         .width(min: 100, ideal: 120)
 
                         TableColumn("Model") { session in
-                            Text(session.modelId).lineLimit(1).truncationMode(.middle)
+                            Text(session.modelId).lineLimit(1).truncationMode(.middle).font(.app(.body))
                         }
                         .width(min: 140, ideal: 220)
 
@@ -466,7 +472,7 @@ struct BenchmarkView: View {
                         .width(min: 160, ideal: 220)
 
                         TableColumn("Note") { session in
-                            Text(session.note ?? "").lineLimit(1).foregroundStyle(.secondary)
+                            Text(session.note ?? "").lineLimit(1).foregroundStyle(.secondary).font(.app(.body))
                         }
                         .width(min: 60, ideal: 120)
 
@@ -480,7 +486,8 @@ struct BenchmarkView: View {
                     .tableStyle(.inset(alternatesRowBackgrounds: true))
                     .contextMenu(forSelectionType: String.self) { ids in
                         if let id = ids.first, let session = historySessions.first(where: { $0.id == id }) {
-                            Button("Show Details") { sheetSource = SheetSource(id: id, source: .session(session)) }
+                            Button { sheetSource = SheetSource(id: id, source: .session(session)) } label: { Text("Show Details")
+    .font(.app(.body)) }
                         }
                     } primaryAction: { ids in
                         if let id = ids.first, let session = historySessions.first(where: { $0.id == id }) {
@@ -489,22 +496,23 @@ struct BenchmarkView: View {
                     }
 
                     footerBar {
-                        Text("\(historySessions.count) session\(historySessions.count == 1 ? "" : "s") · decode tok/s per rung · double-click for detail")
+                        Text("\(historySessions.count) session\(historySessions.count == 1 ? "" : "s") · decode tok/s per rung · double-click for detail").font(.app(.body))
                         Spacer()
                         Button(role: .destructive) {
                             confirmingClear = true
                         } label: {
-                            Label("Clear", systemImage: "trash")
+                            Label("Clear", systemImage: "trash").font(.app(.body))
                         }
                         .controlSize(.small)
                         .confirmationDialog("Delete every benchmark run kept on this Mac?",
                                             isPresented: $confirmingClear, titleVisibility: .visible) {
-                            Button("Delete History", role: .destructive) {
+                            Button(role: .destructive) {
                                 BenchmarkStore.saveLocal([])
                                 history = []
-                            }
+                            } label: { Text("Delete History")
+    .font(.app(.body)) }
                         } message: {
-                            Text("Results already shared to the community stay on the board.")
+                            Text("Results already shared to the community stay on the board.").font(.app(.body))
                         }
                     }
                 }
@@ -527,20 +535,20 @@ struct BenchmarkView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Picker("Machine", selection: $machineFilter) {
-                    Text("All machines").tag("")
-                    ForEach(communityMachines, id: \.self) { Text($0).tag($0) }
+                    Text("All machines").font(.app(.body)).tag("")
+                    ForEach(communityMachines, id: \.self) { Text($0).font(.app(.body)).tag($0) }
                 }
                 .frame(maxWidth: 260)
                 Picker("Model", selection: $modelFilter) {
-                    Text("All models").tag("")
-                    ForEach(communityModels, id: \.self) { Text($0).tag($0) }
+                    Text("All models").font(.app(.body)).tag("")
+                    ForEach(communityModels, id: \.self) { Text($0).font(.app(.body)).tag($0) }
                 }
                 .frame(maxWidth: 320)
                 Spacer()
                 Button {
                     Task { await loadCommunity() }
                 } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
+                    Label("Refresh", systemImage: "arrow.clockwise").font(.app(.body))
                 }
                 .controlSize(.small)
                 .disabled(communityLoading)
@@ -557,23 +565,25 @@ struct BenchmarkView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let communityError {
                 ContentUnavailableView {
-                    Label("Couldn't Load Results", systemImage: "wifi.exclamationmark")
+                    Label("Couldn't Load Results", systemImage: "wifi.exclamationmark").font(.app(.body))
                 } description: {
                     Text(communityError)
                 } actions: {
-                    Button("Try Again") { Task { await loadCommunity() } }
+                    Button { Task { await loadCommunity() } } label: { Text("Try Again")
+    .font(.app(.body)) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if visibleFamilies.isEmpty {
                 ContentUnavailableView {
-                    Label("Nothing Here Yet", systemImage: "person.2")
+                    Label("Nothing Here Yet", systemImage: "person.2").font(.app(.body))
                 } description: {
                     Text(machineFilter.isEmpty && modelFilter.isEmpty
                          ? "Be the first to share a result."
                          : "Nothing matches those filters yet.")
                 } actions: {
                     if !machineFilter.isEmpty || !modelFilter.isEmpty {
-                        Button("Show Everything") { machineFilter = ""; modelFilter = "" }
+                        Button { machineFilter = ""; modelFilter = "" } label: { Text("Show Everything")
+    .font(.app(.body)) }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -581,17 +591,17 @@ struct BenchmarkView: View {
                 Table(visibleFamilies, selection: $communitySelection, sortOrder: $communitySort) {
                     TableColumn("Latest", sortUsing: BenchmarkFamilySort(.date)) { family in
                         Text(family.latestDate, format: .dateTime.month(.abbreviated).day().hour().minute())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondary).font(.app(.body))
                     }
                     .width(min: 100, ideal: 120)
 
                     TableColumn("Machine", sortUsing: BenchmarkFamilySort(.machine)) { family in
-                        Text(family.hardware.displayName).lineLimit(1)
+                        Text(family.hardware.displayName).lineLimit(1).font(.app(.body))
                     }
                     .width(min: 150, ideal: 200)
 
                     TableColumn("Model", sortUsing: BenchmarkFamilySort(.model)) { family in
-                        Text(family.modelId).lineLimit(1).truncationMode(.middle)
+                        Text(family.modelId).lineLimit(1).truncationMode(.middle).font(.app(.body))
                     }
                     .width(min: 140, ideal: 200)
 
@@ -620,7 +630,8 @@ struct BenchmarkView: View {
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let family = visibleFamilies.first(where: { $0.id == id }) {
-                        Button("Show Details") { sheetSource = SheetSource(id: id, source: .family(family)) }
+                        Button { sheetSource = SheetSource(id: id, source: .family(family)) } label: { Text("Show Details")
+    .font(.app(.body)) }
                     }
                 } primaryAction: { ids in
                     if let id = ids.first, let family = visibleFamilies.first(where: { $0.id == id }) {
@@ -629,7 +640,7 @@ struct BenchmarkView: View {
                 }
 
                 footerBar {
-                    Text("Median decode tok/s per rung, per machine + model + settings. n = sessions behind each row. Double-click for detail.")
+                    Text("Median decode tok/s per rung, per machine + model + settings. n = sessions behind each row. Double-click for detail.").font(.app(.body))
                     Spacer()
                 }
             }

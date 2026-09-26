@@ -55,7 +55,8 @@ struct TerminalPane: View {
                     Text(terminals.sessions.exitNotice(session.id) ?? "session ended")
                         .font(.app(.callout)).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Close") { appState.closeTerminal(session.id) }
+                    Button { appState.closeTerminal(session.id) } label: { Text("Close")
+    .font(.app(.body)) }
                 }
                 .controlSize(.small)
                 .padding(.horizontal, 14).padding(.vertical, 8)
@@ -63,7 +64,8 @@ struct TerminalPane: View {
                 notice {
                     Text(terminals.sessions.exitNotice(session.id) ?? "session ended")
                         .font(.app(.callout)).foregroundStyle(.secondary)
-                    Button("Close") { appState.closeTerminal(session.id) }
+                    Button { appState.closeTerminal(session.id) } label: { Text("Close")
+    .font(.app(.body)) }
                         .controlSize(.small)
                 }
             }
@@ -78,11 +80,14 @@ struct TerminalPane: View {
                     .textSelection(.enabled)
                 HStack {
                     if let fix = TerminalFailureFix.for(message: message) {
-                        Button(L10n.text(fix.title)) { apply(fix, to: session.id) }
+                        Button { apply(fix, to: session.id) } label: { Text(L10n.text(fix.title))
+    .font(.app(.body)) }
                             .keyboardShortcut(.defaultAction)
                     }
-                    Button("Retry") { terminals.retry(session.id) }
-                    Button("Close") { appState.closeTerminal(session.id) }
+                    Button { terminals.retry(session.id) } label: { Text("Retry")
+    .font(.app(.body)) }
+                    Button { appState.closeTerminal(session.id) } label: { Text("Close")
+    .font(.app(.body)) }
                 }
                 .controlSize(.small)
             }
@@ -144,7 +149,7 @@ struct TerminalPane: View {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedSsh = false }
                 } label: {
                     Label(L10n.text(copiedSsh ? "Copied" : "Copy"), systemImage: copiedSsh ? "checkmark" : "doc.on.doc")
-                        .labelStyle(.iconOnly)
+                        .labelStyle(.iconOnly).font(.app(.body))
                 }
                 .buttonStyle(.borderless)
                 .help("Copy the ssh command — opens another session into the same guest")

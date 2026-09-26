@@ -135,17 +135,19 @@ struct HotKeyRecorderControl: View {
                     )
                     .frame(width: 1, height: 1)
 
-                    Button(L10n.text(recording ? "Press keys… (⎋ to cancel)" : display)) {
+                    Button {
                         recording = true
-                    }
+                    } label: { Text(L10n.text(recording ? "Press keys… (⎋ to cancel)" : display))
+    .font(.app(.body)) }
                     .frame(minWidth: 140)
                 }
-                Button("Reset") {
+                Button {
                     QuickLauncherHotKeyStore.reset()
                     display = QuickLauncherHotKey.display
                     refusedCombo = nil
                     _ = onChange()
-                }
+                } label: { Text("Reset")
+    .font(.app(.body)) }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .disabled(QuickLauncherHotKeyStore.isDefault)

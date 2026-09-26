@@ -66,15 +66,17 @@ struct ModelDownloadRow: View {
                         .foregroundStyle(.green)
                         .font(.app(.caption))
                 } else if let state, state.status == .failed {
-                    Button(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry")) {
+                    Button {
                         startDownload()
-                    }
+                    } label: { Text(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry"))
+    .font(.app(.body)) }
                     .font(.app(.caption))
                     .controlSize(.mini)
                 } else {
-                    Button(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download")) {
+                    Button {
                         startDownload()
-                    }
+                    } label: { Text(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download"))
+    .font(.app(.body)) }
                     .font(.app(.caption))
                     .controlSize(.mini)
                 }

@@ -33,7 +33,8 @@ struct ModelDetailSheet: View {
                         Label("Open on Hugging Face", systemImage: "arrow.up.forward.square")
                     }
                 }
-                Button("Close") { dismiss() }
+                Button { dismiss() } label: { Text("Close")
+    .font(.app(.body)) }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(16)
@@ -56,7 +57,7 @@ struct ModelDetailSheet: View {
                     .font(.app(.largeTitle))
                     .foregroundStyle(.secondary)
                 Text(reason)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondary).font(.app(.body))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .ready(let markdown):

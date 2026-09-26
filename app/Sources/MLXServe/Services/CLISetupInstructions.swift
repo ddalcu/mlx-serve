@@ -203,7 +203,7 @@ struct CLISetupInstructionsView: View {
             // this popover's width.
             Picker("", selection: $selectedId) {
                 ForEach(tabs) { tab in
-                    Text(L10n.text(tab.title)).tag(tab.id)
+                    Text(L10n.text(tab.title)).font(.app(.body)).tag(tab.id)
                 }
             }
             .pickerStyle(.menu)
@@ -233,7 +233,7 @@ struct CLISetupInstructionsView: View {
                         copied = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
                     } label: {
-                        Label(L10n.text(copied ? "Copied" : "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
+                        Label(L10n.text(copied ? "Copied" : "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc").font(.app(.body))
                     }
                 }
             }

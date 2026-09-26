@@ -51,7 +51,7 @@ struct MemoryMeter: View {
     @ViewBuilder private func key(_ tint: Color, _ text: String) -> some View {
         HStack(spacing: 3) {
             Circle().fill(tint).frame(width: 5, height: 5)
-            Text(text).foregroundStyle(.secondary)
+            Text(text).foregroundStyle(.secondary).font(.app(.body))
         }
     }
 }

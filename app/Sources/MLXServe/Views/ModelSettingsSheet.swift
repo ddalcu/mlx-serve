@@ -91,7 +91,7 @@ struct ModelSettingsSheet: View {
                     set: { picked in
                         override.templateKwargs[key] = choices.first { TemplateKwargs.display($0) == picked } ?? picked
                     })) {
-                    ForEach(choices.map(TemplateKwargs.display), id: \.self) { Text($0).tag($0) }
+                    ForEach(choices.map(TemplateKwargs.display), id: \.self) { Text($0).font(.app(.body)).tag($0) }
                 }
                 .labelsHidden().fixedSize()
             } else {
@@ -101,7 +101,7 @@ struct ModelSettingsSheet: View {
                     .font(.app(.body).monospaced()).frame(width: 140)
             }
             Button { override.templateKwargs[key] = nil } label: { Image(systemName: "xmark") }
-                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .buttonStyle(.plain).foregroundStyle(.secondary).font(.app(.body))
         }
     }
 
@@ -135,16 +135,16 @@ struct ModelSettingsSheet: View {
                 Picker("Context size", selection: Binding(
                     get: { override.ctxSize ?? -1 },
                     set: { override.ctxSize = $0 < 0 ? nil : $0 })) {
-                    Text("Default").tag(-1)
+                    Text("Default").font(.app(.body)).tag(-1)
                     ForEach(ContextSizeDisplay.presets, id: \.self) { n in
-                        Text(ContextSizeDisplay.formatTokens(n)).tag(n)
+                        Text(ContextSizeDisplay.formatTokens(n)).font(.app(.body)).tag(n)
                     }
                 }
                 if !isGguf {
                 Picker("KV cache", selection: Binding(
                     get: { override.kvQuant?.rawValue ?? "" },
                     set: { override.kvQuant = KvQuantChoice(rawValue: $0) })) {
-                    Text("Default").tag("")
+                    Text("Default").tag("").font(.app(.body))
                     ForEach(KvQuantChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
                 }
@@ -153,7 +153,7 @@ struct ModelSettingsSheet: View {
                     get: { override.mtp.map { $0 ? 1 : 0 } ?? -1 },
                     set: { override.mtp = $0 < 0 ? nil : $0 == 1 })) {
                     Text("Default").tag(-1)
-                    Text("On").tag(1)
+                    Text("On").tag(1).font(.app(.body))
                     Text("Off").tag(0)
                 }
                 }
@@ -161,7 +161,7 @@ struct ModelSettingsSheet: View {
                 Picker("MTP acceptance", selection: Binding(
                     get: { override.mtpAcceptance?.rawValue ?? "" },
                     set: { override.mtpAcceptance = MtpAcceptanceChoice(rawValue: $0) })) {
-                    Text("Default").tag("")
+                    Text("Default").tag("").font(.app(.body))
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
                 }
@@ -175,35 +175,38 @@ struct ModelSettingsSheet: View {
                                 TextField("key", text: $customKey).font(.app(.body).monospaced())
                                 TextField("value", text: $customValue).font(.app(.body).monospaced())
                                     .onSubmit(commitCustom)
-                                Button("Add", action: commitCustom)
+                                Button(action: commitCustom, label: { Text("Add")
+    .font(.app(.body)) })
                                     .disabled(customKey.trimmingCharacters(in: .whitespaces).isEmpty || TemplateKwargs.parse(customValue) == nil)
                             }
                         }
                     } header: {
                         HStack {
-                            Text("Chat template kwargs")
+                            Text("Chat template kwargs").font(.app(.body))
                             Spacer()
                             Menu {
                                 ForEach(TemplateKwargs.known, id: \.key) { k in
-                                    Button(k.key) { override.templateKwargs[k.key] = k.choices[0] }
+                                    Button { override.templateKwargs[k.key] = k.choices[0] } label: { Text(k.key)
+    .font(.app(.body)) }
                                         .disabled(override.templateKwargs[k.key] != nil)
                                 }
                                 Divider()
-                                Button("Custom…") { addingCustom = true }
+                                Button { addingCustom = true } label: { Text("Custom…")
+    .font(.app(.body)) }
                             } label: {
-                                Label("Add", systemImage: "plus")
+                                Label("Add", systemImage: "plus").font(.app(.body))
                             }
                             .menuStyle(.borderlessButton).fixedSize()
                         }
                     } footer: {
-                        Text("Forwarded to the model's chat template. Values the request decides (thinking, effort) win.")
+                        Text("Forwarded to the model's chat template. Values the request decides (thinking, effort) win.").font(.app(.body))
                     }
                 }
                 if let live, live.loaded {
                     LabeledContent("Live") {
                         Text(isGguf ? "\(ContextSizeDisplay.formatTokens(live.contextLength)) context"
                              : "\(ContextSizeDisplay.formatTokens(live.contextLength)) context, KV \(live.kvQuant.isEmpty ? "default" : live.kvQuant)")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondary).font(.app(.body))
                     }
                 }
             }
@@ -224,8 +227,10 @@ struct ModelSettingsSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(L10n.text(plan == .restart ? "Save & Restart" : "Save")) { Task { await save() } }
+                Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                Button { Task { await save() } } label: { Text(L10n.text(plan == .restart ? "Save & Restart" : "Save"))
+    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(busy)
             }

@@ -49,7 +49,8 @@ struct ChatModelGateSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel", action: onCancel)
+                Button(action: onCancel, label: { Text("Cancel")
+    .font(.app(.body)) })
                     .keyboardShortcut(.cancelAction)
             }
         }

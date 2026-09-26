@@ -107,7 +107,7 @@ struct EmptyStateChipRow: View {
                     chipMenu(item) {
                         ForEach(ChatEmptyState.mediaItems) { media in
                             Button { open(media) } label: {
-                                Label(L10n.text(media.title), systemImage: media.systemImage)
+                                Label(L10n.text(media.title), systemImage: media.systemImage).font(.app(.body))
                             }
                         }
                     }

@@ -97,8 +97,8 @@ final class DialogDefaultActionTests: XCTestCase {
         // And it must be the DELETE button that Return hits, not Cancel —
         // a default action on the wrong branch reads as working and does the
         // opposite of what the key promises.
-        let delete = try XCTUnwrap(dialog.actions.range(of: "Button(\"Delete\""))
-        let cancel = try XCTUnwrap(dialog.actions.range(of: "Button(\"Cancel\""))
+        let delete = try XCTUnwrap(dialog.actions.range(of: "Text(\"Delete\""))
+        let cancel = try XCTUnwrap(dialog.actions.range(of: "Text(\"Cancel\""))
         let shortcut = try XCTUnwrap(dialog.actions.range(of: ".keyboardShortcut(.defaultAction)"))
         XCTAssertTrue(shortcut.lowerBound > delete.lowerBound && shortcut.lowerBound < cancel.lowerBound,
                       "the default action belongs to Delete, not Cancel")

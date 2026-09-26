@@ -41,14 +41,14 @@ struct PlanCardView: View {
             if plan.status == .pending {
                 HStack(spacing: 12) {
                     Button(action: onApprove) {
-                        Label("Approve", systemImage: "checkmark.circle.fill")
+                        Label("Approve", systemImage: "checkmark.circle.fill").font(.app(.body))
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.green)
                     .controlSize(.small)
 
                     Button(action: onReject) {
-                        Label("Reject", systemImage: "xmark.circle.fill")
+                        Label("Reject", systemImage: "xmark.circle.fill").font(.app(.body))
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
@@ -191,7 +191,7 @@ struct AgentModeToggle: View {
         }
         .toggleStyle(.button)
         .buttonStyle(.borderless)
-        .help("Tools — run a tool-calling loop")
+        .help("Tools — run a tool-calling loop").font(.app(.body))
     }
 }
 
