@@ -151,21 +151,23 @@ final class SystemTypeTests: XCTestCase {
     ///   helper may be the thing that sets the font.
     /// * **AppKit draws it.** A menu item, an `Alert`'s title or its buttons
     ///   are `NSMenuItem`/`NSAlert` text: `.font()` does not reach them on this
-    ///   platform, so demanding one would be demanding a lie. They are listed
-    ///   below with the surface that owns them.
+    ///   platform, so demanding one would be demanding a lie. Keyed on the
+    ///   OWNING construct — is this text inside a `Menu` / `Alert` /
+    ///   `confirmationDialog` / `CommandMenu` — rather than on the copy, so a
+    ///   rewording or a catalogue wrap does not turn the entry into a false
+    ///   offender whose message points at the wrong thing.
     func testEveryStatedTextNamesASize() throws {
-        let appKitDrawn: [(file: String, needle: String, surface: String)] = [
-            ("MLXServeApp.swift", "Text(\"\\(width.label) chat column\")", "View ▸ Interface menu (NSMenu)"),
-            ("MLXServeApp.swift", "Label(\"Interface\", systemImage:", "View ▸ Interface menu section header"),
-            ("Views/AgentsWindow.swift", "Alert(title: Text(\"Agents\")", "Alert title (NSAlert)"),
-            ("Views/AgentsWindow.swift", "dismissButton: .default(Text(\"OK\"))", "Alert button (NSAlert)"),
-            ("Views/AgentsWindow.swift", "message: Text(\"This can't be undone.\")", "Alert message (NSAlert)"),
-            ("Views/AgentsWindow.swift", "primaryButton: .destructive(Text(\"Delete\"))", "Alert button (NSAlert)"),
-            ("Views/AgentsWindow.swift", "Text(\"No clips yet\")", "voice-picker menu (NSMenu)"),
-            ("Views/AgentsWindow.swift", "Text(\"No voices installed\")", "voice-picker menu (NSMenu)"),
-            ("Services/CLILauncher.swift", "Label(\"\\(spec.displayName) in Sandbox\"", "new-session menu (NSMenu)"),
-            ("Services/CLILauncher.swift", "Label(\"Shell in Sandbox\"", "new-session menu (NSMenu)"),
+        /// Surfaces AppKit draws itself, where a font modifier cannot reach.
+        let appKitSurfaces: Set<String> = [
+            "Alert", "Menu", "confirmationDialog", "CommandMenu", "CommandGroup", "MenuBarExtra",
         ]
+        /// A VIEW whose text is menu content by contract: it builds no chrome
+        /// of its own, it is only ever handed to a menu, so nothing inside it
+        /// can be sized. Named as a type, not as the copy it renders, so
+        /// rewording survives — and `testTheMenuContentViewStaysInAMenu` fails if
+        /// a call site ever stops being one, which is the moment this entry
+        /// stops being true.
+        let menuContentViews: Set<String> = ["CLILauncherMenuItems"]
         let knownContainers: Set<String> = [
             "VStack", "HStack", "ZStack", "Group", "Section", "List", "Form", "LazyVStack",
             "LazyVGrid", "Grid", "Table", "TableColumn", "ScrollView", "ScrollViewReader",
@@ -177,8 +179,8 @@ final class SystemTypeTests: XCTestCase {
             "confirmationDialog", "ContentUnavailableView", "ViewThatFits", "LabeledContent",
             "MenuBarExtra", "Form", "List", "Table", "GridRow", "FlowLayout", "AttachmentFlowLayout",
         ]
-        let offenders = try bareStatedText(knownContainers: knownContainers)
-            .filter { line in !appKitDrawn.contains { line.hasPrefix($0.file + ":") && line.contains($0.needle) } }
+        let offenders = try bareStatedText(knownContainers: knownContainers, appKitSurfaces: appKitSurfaces,
+                                          menuContentViews: menuContentViews)
         XCTAssertTrue(offenders.isEmpty, """
             Text with no size of its own, and no ancestor that sets one:
             \(offenders.joined(separator: "\n"))
@@ -217,7 +219,8 @@ final class SystemTypeTests: XCTestCase {
     /// Every `Text`/`Label` that names no size and has no ancestor block that
     /// does — reported as `file:line: text`, with the project-helper case
     /// skipped (see `testEveryStatedTextNamesASize` for why it must be).
-    private func bareStatedText(knownContainers: Set<String>) throws -> [String] {
+    private func bareStatedText(knownContainers: Set<String>, appKitSurfaces: Set<String>,
+                              menuContentViews: Set<String>) throws -> [String] {
         // A statement whose text is visible on screen. `.tag(…)`, a TextField's
         // `prompt:` and `.help()` are drawn by the control or never drawn.
         let skip = try NSRegularExpression(
@@ -241,6 +244,8 @@ final class SystemTypeTests: XCTestCase {
                 }) { continue }
                 if Self.ancestorSetsSize(lines: lines, depths: depths, at: i) { continue }
                 if Self.insideProjectHelper(lines: lines, depths: depths, at: i, known: knownContainers) { continue }
+                if Self.onAppKitSurface(lines: lines, depths: depths, at: i, surfaces: appKitSurfaces) { continue }
+                if Self.inside(lines: lines, depths: depths, at: i, opening: menuContentViews) { continue }
                 found.append("\(file):\(i + 1): \(trimmed)")
             }
         }
@@ -289,6 +294,88 @@ final class SystemTypeTests: XCTestCase {
             level -= 1
             j -= 1
             if level <= 0 { break }
+        }
+        return false
+    }
+
+    /// Is any enclosing block opened by one of `names`? Used for a view that
+    /// is menu content by contract, where the surface is decided by the CALLER.
+    ///
+    /// Matches two shapes, because a type names itself in two: a call
+    /// (`chipMenu(item) { … }`, any identifier — a lowercase helper is as
+    /// likely as a capitalized view) and its own declaration
+    /// (`struct CLILauncherMenuItems: View {`, the name before the colon). The
+    /// call-site check is what proves the surface; the declaration check is
+    /// what lets the scan recognise the text as belonging to that type at all.
+    private static func inside(lines: [String], depths: [Int], at index: Int, opening names: Set<String>) -> Bool {
+        let call = try? NSRegularExpression(pattern: #"\b([A-Za-z_][A-Za-z0-9_]*)\s*[({]"#)
+        let decl = try? NSRegularExpression(pattern: #"\b(?:struct|class|enum|extension)\s+([A-Za-z_][A-Za-z0-9_]*)"#)
+        func lineNames(_ text: String) -> Bool {
+            if let m = call?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+               let r = Range(m.range(at: 1), in: text), names.contains(String(text[r])) { return true }
+            if let m = decl?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+               let r = Range(m.range(at: 1), in: text), names.contains(String(text[r])) { return true }
+            return false
+        }
+        var level = depths[index]
+        while level > 0 {
+            guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
+            else { return false }
+            if lineNames(lines[open]) { return true }
+            level -= 1
+        }
+        return false
+    }
+
+    /// The exemption above is a claim about the CALL SITES: `CLILauncherMenuItems`
+    /// draws no chrome of its own and is only ever handed to a menu, so a font
+    /// modifier inside it would be ignored. This is what keeps that claim honest
+    /// — a new call site outside a menu fails here rather than quietly making
+    /// the guard skip text that IS rendered by SwiftUI.
+    func testTheMenuContentViewStaysInAMenu() throws {
+        let menus: Set<String> = ["Menu", "CommandMenu", "CommandGroup", "chipMenu"]
+        var escaped: [String] = []
+        for (file, code) in try swiftSources() {
+            let lines = SourceScan.strippingComments(code).components(separatedBy: "\n")
+            let depths = Self.braceDepths(lines)
+            for i in 0..<lines.count where lines[i].contains("CLILauncherMenuItems(") {
+                if !Self.inside(lines: lines, depths: depths, at: i, opening: menus) {
+                    escaped.append("\(file):\(i + 1): \(lines[i].trimmingCharacters(in: .whitespaces))")
+                }
+            }
+        }
+        XCTAssertTrue(escaped.isEmpty, """
+            CLILauncherMenuItems is rendered outside a menu:
+            \(escaped.joined(separator: "\n"))
+
+            Its text is skipped by the stated-text guard because the menus it
+            lives in are drawn by AppKit. Somewhere else, SwiftUI draws it and
+            the size matters — either name the step there, or drop the entry from
+            `menuContentViews`.
+            """)
+    }
+
+    /// Is this text on a surface AppKit draws itself — inside a `Menu`, an
+    /// `Alert`, a `confirmationDialog`, a `CommandMenu`? Keyed on the construct
+    /// rather than the copy, so rewording the string (or wrapping it in
+    /// `L10n.text`) cannot turn an entry into a false offender.
+    private static func onAppKitSurface(lines: [String], depths: [Int],
+                                        at index: Int, surfaces: Set<String>) -> Bool {
+        let call = try? NSRegularExpression(pattern: #"\b([A-Z][A-Za-z0-9_]*|confirmationDialog)\s*[({]"#)
+        if let call, let m = call.firstMatch(in: lines[index], range: NSRange(lines[index].startIndex..., in: lines[index])),
+           let r = Range(m.range(at: 1), in: lines[index]), surfaces.contains(String(lines[index][r])) {
+            return true
+        }
+        var level = depths[index]
+        while level > 0 {
+            guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
+            else { return false }
+            let range = NSRange(lines[open].startIndex..., in: lines[open])
+            if let m = call?.firstMatch(in: lines[open], range: range),
+               let r = Range(m.range(at: 1), in: lines[open]), surfaces.contains(String(lines[open][r])) {
+                return true
+            }
+            level -= 1
         }
         return false
     }
