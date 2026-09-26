@@ -1933,9 +1933,27 @@ Cause 1: Nemotron 3.5 configs write the layer pattern as `layers_block_type: ["m
 
 Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFast that is UB and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. Every `E`-block Nemotron (3 Nano, 3.5) hit it; only dense Nemotron-H ever loaded.
 
-Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 single-token step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
+Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 decode step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
 
 Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
+
+## Nemotron-H: the fused add+norm path dropped the shared expert
+
+Symptom: after the decode fusions landed, greedy text was coherent for ~30 tokens and then degenerated into word salad; every kernel unit test was green.
+
+Cause: `add_norm.moeCombineAddNorm` (residual add + next norm with the MoE K-sum folded in) was written while the shared expert rode the expert banks as extra rows. When that fold was measured slower and removed, the fused MoE arm in `forwardHybridWith` kept summing only the routed slots — the composed `nemotronMoeCombine` still added the shared expert, so the plain path was right and the fused path was wrong, and nothing compared the two at the forward level.
+
+Fix: the kernel takes the shared expert's output as an input (`XS`, `SHARED` template flag) and mirrors MLX's single-row `rms_norm` reduction exactly, so the fused step is bit-equal to the composed ops. Rule: a fused path that replaces a chain carries every term of the chain, and a forward-level test compares the two.
+
+Guards: `hybrid decode: the fused add+norm path equals the unfused blocks (Nemotron-H)` (tiny Mamba2 + MoE-with-shared trunk, fused vs `add_norm_max_rows = 0`, tolerance 0), `add_norm: plain and MoE-combine arms match the composed ops` (tolerance 0, with and without a shared expert).
+
+## Nemotron-H: a single routing group ran the composed router chain
+
+Symptom: the decode micro-benchmark counted ~1400 ops per forward; the per-MoE-layer routing cost ~30 µs against a ~5 µs router matvec.
+
+Cause: `groupLimitedRouting` only tried the `.sigmoid_bias_grouped` kernel, which declines `n_group <= 1`. Nemotron 3.5 configs set `n_group: 1`, so every MoE layer fell to the astype/sigmoid/add/argpartition/take/sum chain.
+
+Fix: a single group selects the ungrouped `.sigmoid_bias` kernel (the hy3 chain's semantics: sigmoid + bias keys, raw sigmoid weights, renorm, scale). Guard: `nemotronMoe matches a host reference of NemotronHMoE` runs through the fused router.
 
 ## Nemotron-H: the Mamba2 SSM output widened the whole residual stream to f32
 
