@@ -41,6 +41,11 @@ const stb = @import("stb");
 
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
+
+pub fn resolveSteps(steps: u32) u32 {
+    return if (steps == 0) DEFAULT_STEPS else steps;
+}
+
 const VAE_DOWNSAMPLE: u32 = 16;
 /// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
@@ -1970,6 +1975,8 @@ fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
 pub const EditOpts = struct {
     guidance_scale: f32 = 1.0,
     negative_prompt: []const u8 = "",
+    /// Selected by request memory admission; direct callers default to uncached.
+    prefix_cache: bool = false,
     /// Reference conditioning resolution — diffusers' per-call
     /// `output_resolution` knob. Lower = fewer joint tokens per ref (speed)
     /// at conditioning-fidelity cost; 1024 is the trained regime.
@@ -2163,7 +2170,7 @@ pub const Engine = struct {
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
         const s = self.s;
-        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const n_steps = resolveSteps(steps);
         const lat_h: usize = height / VAE_DOWNSAMPLE;
         const lat_w: usize = width / VAE_DOWNSAMPLE;
         const n_img: c_int = @intCast(lat_h * lat_w);
@@ -2293,7 +2300,7 @@ pub const Engine = struct {
         if (image_bytes.len == 0) return error.NoReferenceImages;
         const a = allocator;
         const s = self.s;
-        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const n_steps = resolveSteps(steps);
         const lat_h: usize = out_h / VAE_DOWNSAMPLE;
         const lat_w: usize = out_w / VAE_DOWNSAMPLE;
         const target_tokens: usize = lat_h * lat_w;
@@ -2439,7 +2446,7 @@ pub const Engine = struct {
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
         //    target]; only the target rows step.
         {
-            const use_cache = n_steps > 1 and prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+            const use_cache = n_steps > 1 and opts.prefix_cache;
             var cache: ?PrefixCache = if (use_cache) try PrefixCache.initEdit(a, self.dit.blocks.len, &geo, s) else null;
             defer if (cache) |*c| c.deinit();
             var neg_cache: ?PrefixCache = if (use_cache and neg_geo != null) try PrefixCache.initEdit(a, self.dit.blocks.len, &neg_geo.?, s) else null;
@@ -2977,9 +2984,11 @@ test "QwenImage edit prefix cache matches block-causal forwards across steps and
                     try testing.expectEqual(dtype, mlx.mlx_array_dtype(got));
                     try testing.expectEqualSlices(c_int, &.{ 1, 8, 8 }, mlx.getShape(got));
                     const p = try parity(got, want32, s);
-                    std.debug.print("[qwen-image] edit cache {s} refs={d} text={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), refs, text_len, step, p.cos, p.rms_ratio });
+                    const tolerance: f32 = if (dtype == .float32) 1e-5 else 0.002;
+                    if (!(p.cos > 0.99999) or !(@abs(p.rms_ratio - 1) <= tolerance))
+                        std.debug.print("[qwen-image] edit cache {s} refs={d} text={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), refs, text_len, step, p.cos, p.rms_ratio });
                     try testing.expect(p.cos > 0.99999);
-                    try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, @as(f32, if (dtype == .float32) 1e-5 else 0.002));
+                    try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, tolerance);
                     for (cache.layers) |kv| {
                         try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.k)[2]);
                         try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.v)[2]);

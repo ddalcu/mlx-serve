@@ -573,6 +573,8 @@ pub const ImageGenOpts = struct {
     /// per-call `output_resolution` knob. [256,1024] at the wire; 1024 is
     /// the trained regime, lower trades conditioning fidelity for speed.
     ref_resolution: u32 = 1024,
+    /// Qwen edit cache decision from request memory admission.
+    qwen_edit_prefix_cache: bool = false,
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -779,6 +781,7 @@ pub const ImageEngine = struct {
                         .guidance_scale = opts.guidance_scale,
                         .negative_prompt = opts.negative_prompt,
                         .ref_resolution = opts.ref_resolution,
+                        .prefix_cache = opts.qwen_edit_prefix_cache,
                     }, progress);
                 if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
@@ -2123,7 +2126,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
+    var steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2377,12 +2380,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
-    if (want_stream) try conn.writeAll(sse.headers);
 
-    const gen_opts = ImageGenOpts{
+    var gen_opts = ImageGenOpts{
         .transparent = transparent,
         .init_image = init_img, // null in edit mode
         .strength = strength,
@@ -2400,34 +2401,38 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // and running past the working set hangs the first denoise step with no
     // error — refuse by NAME with the number we compared.
     if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
-        const cached_branches: u32 = if (steps > 1 and qwen_image.prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE")))
-            (if (guidance_scale != 1) @as(u32, 2) else 1)
-        else
-            0;
-        const bill = qwenImageEditTransientBytes(
+        const cache_enabled = qwen_image.prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+        const base_bill = qwenImageEditTransientBytes(
             @intCast(gen_opts.edit_image_bytes.len),
             gen_opts.ref_resolution,
             width,
             height,
-        ) + qwenImageEditPrefixBytes(
+        );
+        const prefix_bill = qwenImageEditPrefixBytes(
             @intCast(gen_opts.edit_image_bytes.len),
             gen_opts.ref_resolution,
             engine.backend.qwen_image.dit_cfg,
-            cached_branches,
+            if (guidance_scale != 1) 2 else 1,
         );
-        if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
-            var active: usize = 0;
-            _ = mlx.mlx_get_active_memory(&active);
-            const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
-            const need: u64 = bill - QWEN_IMAGE_EDIT_TRANSIENT_BYTES;
-            if (need > headroom) {
-                log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
-                    gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, need >> 20, headroom >> 20,
-                });
-                return sendError(conn, 400, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
-            }
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+        const plan = planQwenImageEdit(steps, cache_enabled, base_bill, prefix_bill, headroom) catch {
+            log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
+                gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
+            });
+            return sendError(conn, 400, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
+        };
+        steps = plan.steps;
+        gen_opts.qwen_edit_prefix_cache = plan.prefix_cache;
+        if (cache_enabled and steps > 1 and !plan.prefix_cache) {
+            log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
+                ((base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
+            });
         }
     }
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
+    if (want_stream) try conn.writeAll(sse.headers);
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
         // saying "generation failed" would be a lie about a job we stopped.
@@ -4296,6 +4301,20 @@ fn qwenImageEditPrefixBytes(refs: u32, ref_resolution: u32, cfg: qwen_image.DitC
     return prefix * cfg.layers * cfg.hidden() * 2 * 2 * branches;
 }
 
+const QwenImageEditPlan = struct { steps: u32, prefix_cache: bool };
+
+/// Prefer cached edits, but preserve requests that fit only without the cache.
+fn planQwenImageEdit(steps: u32, cache_enabled: bool, base_bill: u64, prefix_bill: u64, headroom: u64) !QwenImageEditPlan {
+    const resolved_steps = qwen_image.resolveSteps(steps);
+    if (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES > headroom)
+        return error.QwenImageEditMemoryBudget;
+    return .{
+        .steps = resolved_steps,
+        .prefix_cache = cache_enabled and resolved_steps > 1 and
+            (base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES <= headroom,
+    };
+}
+
 /// The edit-capable pack's bill: the SAME staging answer as t2i (the engine
 /// and the residency bill read one `qwenImageStagesTextEncoder`), with the
 /// heavier edit transient whenever the tower is present.
@@ -5928,6 +5947,30 @@ test "Qwen-Image edit transient: the request-scope bill scales with refs x ref t
     // ref_resolution halves the joint: the scores term shrinks with it.
     const half = qwenImageEditTransientBytes(10, 512, 2048, 2048);
     try testing.expect(half * 2 < ten);
+}
+
+test "Qwen-Image edit admission chooses cached, uncached or refuses using resolved steps" {
+    const GB: u64 = 1 << 30;
+    const base = QWEN_IMAGE_EDIT_TRANSIENT_BYTES + 2 * GB;
+    const prefix = 4 * GB;
+    const cached = try planQwenImageEdit(20, true, base, prefix, 6 * GB);
+    try testing.expect(cached.prefix_cache);
+    try testing.expectEqual(@as(u32, 20), cached.steps);
+    const fallback = try planQwenImageEdit(20, true, base, prefix, 2 * GB);
+    try testing.expect(!fallback.prefix_cache);
+    try testing.expectEqual(@as(u32, 20), fallback.steps);
+    try testing.expectError(error.QwenImageEditMemoryBudget, planQwenImageEdit(20, true, base, prefix, 2 * GB - 1));
+    try testing.expectError(error.QwenImageEditMemoryBudget, planQwenImageEdit(20, false, base, prefix, 0));
+    const zero = try planQwenImageEdit(0, true, base, prefix, 6 * GB);
+    try testing.expectEqual(qwen_image.DEFAULT_STEPS, zero.steps);
+    try testing.expect(zero.prefix_cache);
+    const zero_fallback = try planQwenImageEdit(0, true, base, prefix, 2 * GB);
+    try testing.expectEqual(qwen_image.DEFAULT_STEPS, zero_fallback.steps);
+    try testing.expect(!zero_fallback.prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(1, true, base, prefix, 6 * GB)).prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(20, false, base, prefix, 6 * GB)).prefix_cache);
+    try testing.expect((try planQwenImageEdit(20, true, 1 * GB, 2 * GB, 0)).prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(20, true, base, std.math.maxInt(u64), 6 * GB)).prefix_cache);
 }
 
 test "Qwen-Image edit prefix bill includes every layer and independent CFG branch" {
