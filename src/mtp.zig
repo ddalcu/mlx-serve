@@ -559,6 +559,8 @@ const MtpMlp = union(enum) {
         down: QLinear,
     },
     moe: transformer_mod.MoeMlpWeights,
+    /// Nemotron-H head: the trunk's own sigmoid-router ReLU^2 MoE block.
+    nemotron_moe: transformer_mod.NemotronMoeWeights,
 
     fn deinit(self: *MtpMlp) void {
         switch (self.*) {
@@ -583,9 +585,25 @@ const MtpMlp = union(enum) {
                 if (m.shared_expert_gate_b) |a| _ = mlx.mlx_array_free(a);
                 if (m.expert_bias) |a| _ = mlx.mlx_array_free(a);
             },
+            .nemotron_moe => |*nm| {
+                const arrs = [_]mlx.mlx_array{
+                    nm.router_w, nm.router_s, nm.router_b, nm.expert_bias,
+                    nm.fc1_w,    nm.fc1_s,    nm.fc1_b,    nm.fc2_w,
+                    nm.fc2_s,    nm.fc2_b,
+                };
+                for (arrs) |a| _ = mlx.mlx_array_free(a);
+                if (nm.shared) |sm| {
+                    for ([_]mlx.mlx_array{ sm.up_w, sm.up_s, sm.up_b, sm.down_w, sm.down_s, sm.down_b }) |a| _ = mlx.mlx_array_free(a);
+                }
+            },
         }
     }
 };
+
+/// Which head shape the sidecar loaded as. Everything the shapes share reads
+/// the same fields; the few forks (attention gate, QK norms, MLP kind) key here
+/// or on `eh_proj`.
+pub const Layout = enum { qwen, hy3, nemotron };
 
 pub const MtpModel = struct {
     allocator: std.mem.Allocator,
@@ -625,6 +643,10 @@ pub const MtpModel = struct {
     v: QLinear,
     o: QLinear,
     mlp: MtpMlp,
+    layout: Layout = .qwen,
+    /// Nemotron-H attention has no q/k RMSNorm; the norm handles are empty
+    /// placeholders and the forward skips them.
+    has_qk_norm: bool = true,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
     /// bind time (MLX_SERVE_MTP_DRAFT_HEAD_BITS, default 3, 0 disables).
@@ -767,7 +789,7 @@ pub const MtpModel = struct {
                     },
                 )) return .generic;
             },
-            .moe => return .generic,
+            .moe, .nemotron_moe => return .generic,
         }
 
         const draft: ?*const QLinear = if (self.draft_head) |*q| q else null;
@@ -794,8 +816,9 @@ pub const MtpModel = struct {
     pub fn bind(self: *MtpModel, target: *Transformer) !void {
         const cfg = &target.config;
         if (self.eh_proj != null) {
-            // Hy3 head: no attention output gate, sigmoid-router MoE.
-            if (!std.mem.eql(u8, cfg.model_type, "hy_v3")) return error.UnsupportedMtpArch;
+            // Hy3 / Nemotron-H heads: no attention output gate, sigmoid-router MoE.
+            const want_arch: []const u8 = if (self.layout == .nemotron) "nemotron_h" else "hy_v3";
+            if (!std.mem.eql(u8, cfg.model_type, want_arch)) return error.UnsupportedMtpArch;
             const en_shape = mlx.getShape(self.pre_fc_norm_emb);
             if (en_shape.len != 1 or en_shape[0] != @as(c_int, @intCast(cfg.hidden_size)))
                 return error.MtpTargetMismatch;
@@ -1502,6 +1525,7 @@ pub const sidecar_rel_paths = [_][]const u8{
     "mtp.safetensors", // others
     "model-mtp.safetensors", // others
     "optiq/mtp.safetensors", // oMLX OptiQ (delta-encoded norms — folded at load)
+    "mtp_head.safetensors", // Nemotron-H heads (sevren-ai packs, bare keys)
 };
 
 /// Relative path (one of `sidecar_rel_paths`) of the first sidecar file under
@@ -1541,6 +1565,7 @@ const mtp_marker_keys = [_][]const u8{
     "language_model.mtp.fc.weight",
     "mtp.eh_proj.weight",
     "language_model.mtp.eh_proj.weight",
+    "attn.mixer.q_proj.weight", // Nemotron-H head (bare keys, dense `eh_proj`)
 };
 
 /// Any tensor belonging to the head (either root prefix).
@@ -2204,6 +2229,10 @@ pub fn loadMtp(
         }
     };
 
+    // Nemotron-H layout: bare keys, `attn.*` + `moe.*` blocks, dense `eh_proj`.
+    if (weights.get("attn.mixer.q_proj.weight") != null) {
+        return loadNemotronMtp(allocator, s, &weights);
+    }
     // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
     // sigmoid-router MoE). Detected by its distinctive projection name.
     if (weights.get(K.k(&kb, p, "eh_proj.weight")) != null) {
@@ -2354,6 +2383,7 @@ pub fn loadMtp(
                 for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
                 if (mw.shared_expert_gate_w) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
             },
+            .nemotron_moe => unreachable, // loadNemotronMtp builds that head
         }
         _ = mlx.mlx_eval(eval_vec);
     }
@@ -2416,6 +2446,7 @@ fn loadHy3Mtp(
         .k = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.k_proj"), s),
         .v = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.v_proj"), s),
         .o = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.o_proj"), s),
+        .layout = .hy3,
         .mlp = .{ .moe = .{
             .router_w = router.w,
             .router_s = router.s,
@@ -2481,7 +2512,95 @@ fn loadHy3Mtp(
     return m;
 }
 
+/// Nemotron-H head (sevren-ai `mtp_head.safetensors`): x = eh_proj([enorm(emb),
+/// hnorm(h)]); x += attn(attn.norm(x)); x += moe(moe.norm(x)); final_norm(x)
+/// → the trunk's lm_head. Attention is the trunk's (RoPE, no QK norm, no
+/// output gate); the MoE is the trunk's `nemotronMoe`. `h` is the residual
+/// BEFORE the trunk's final norm.
+fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights) !MtpModel {
+    const has_shared = weights.get("moe.mixer.shared_experts.up_proj.weight") != null;
+    const fc1 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc1");
+    const fc2 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc2");
+    const router = try loadLinear(weights, allocator, "moe.mixer.gate", s);
+    const shared: ?transformer_mod.SimpleMlpWeights = if (has_shared) blk: {
+        const up = try loadLinear(weights, allocator, "moe.mixer.shared_experts.up_proj", s);
+        const down = try loadLinear(weights, allocator, "moe.mixer.shared_experts.down_proj", s);
+        break :blk .{ .up_w = up.w, .up_s = up.s, .up_b = up.b, .down_w = down.w, .down_s = down.s, .down_b = down.b };
+    } else null;
+
+    var m = MtpModel{
+        .allocator = allocator,
+        .s = s,
+        .quant_bits = 0,
+        .quant_group_size = 0,
+        .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
+        // Dense bf16 `[H, 2H]`, pre-transposed for the plain-matmul arm.
+        .eh_proj = .{ .w = try ownAndTranspose2D(weights, "eh_proj", s), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() },
+        .pre_fc_norm_emb = try ownWeight(weights, "enorm"),
+        .pre_fc_norm_hidden = try ownWeight(weights, "hnorm"),
+        .final_norm = try ownWeight(weights, "final_norm"),
+        .input_norm = try ownWeight(weights, "attn.norm.weight"),
+        .post_attn_norm = try ownWeight(weights, "moe.norm.weight"),
+        .q_norm = mlx.mlx_array_new(),
+        .k_norm = mlx.mlx_array_new(),
+        .q = try loadLinear(weights, allocator, "attn.mixer.q_proj", s),
+        .k = try loadLinear(weights, allocator, "attn.mixer.k_proj", s),
+        .v = try loadLinear(weights, allocator, "attn.mixer.v_proj", s),
+        .o = try loadLinear(weights, allocator, "attn.mixer.o_proj", s),
+        .layout = .nemotron,
+        .has_qk_norm = false,
+        .mlp = .{ .nemotron_moe = .{
+            .router_w = router.w,
+            .router_s = router.s,
+            .router_b = router.b,
+            .expert_bias = try ownWeight(weights, "moe.mixer.gate.e_score_correction_bias"),
+            .fc1_w = fc1.w,
+            .fc1_s = fc1.s,
+            .fc1_b = fc1.b,
+            .fc2_w = fc2.w,
+            .fc2_s = fc2.s,
+            .fc2_b = fc2.b,
+            .shared = shared,
+        } },
+    };
+    errdefer m.deinit();
+
+    {
+        const en_shape = mlx.getShape(m.pre_fc_norm_emb);
+        const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
+        m.quant_bits = inferBits(&m.q, hidden) orelse 4;
+        m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+        m.quant_mode = sidecarQuantMode(&m.q, hidden);
+    }
+    {
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        const nm = &m.mlp.nemotron_moe;
+        const base = [_]mlx.mlx_array{
+            m.eh_proj.?.w, m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
+            m.input_norm,  m.post_attn_norm,  m.q.w,                m.k.w,
+            m.v.w,         m.o.w,             nm.router_w,          nm.expert_bias,
+            nm.fc1_w,      nm.fc2_w,
+        };
+        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        if (nm.shared) |sm| {
+            _ = mlx.mlx_vector_array_append_value(eval_vec, sm.up_w);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, sm.down_w);
+        }
+        _ = mlx.mlx_eval(eval_vec);
+    }
+    log.info("[mtp] loaded Nemotron-H MTP head (attention + sigmoid-MoE; per-weight quant, fallback bits={d}/gs={d})\n", .{ m.quant_bits, m.quant_group_size });
+    return m;
+}
+
 // ── Forward ──
+
+/// A second owned handle to the same array (refcount share, no copy).
+inline fn shareArr(x: mlx.mlx_array) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&out, x));
+    return out;
+}
 
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
@@ -2793,9 +2912,9 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
     try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
 
-    const q_normed = try rmsNormFn(queries, self.q_norm, eps, s);
+    const q_normed = if (self.has_qk_norm) try rmsNormFn(queries, self.q_norm, eps, s) else try shareArr(queries);
     defer _ = mlx.mlx_array_free(q_normed);
-    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    const k_normed = if (self.has_qk_norm) try rmsNormFn(k_r, self.k_norm, eps, s) else try shareArr(k_r);
     defer _ = mlx.mlx_array_free(k_normed);
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
@@ -2880,6 +2999,7 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
             break :blk try qLinearFwd(self, act, &d.down);
         },
         .moe => |*mw| try target.moeMLP(ff_normed, mw),
+        .nemotron_moe => |*nm| try transformer_mod.nemotronMoe(ff_normed, nm, &target.config, s),
     };
     defer _ = mlx.mlx_array_free(mlp_out);
 
@@ -3004,7 +3124,7 @@ pub fn appendKvOnly(
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
     try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
 
-    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
+    const k_normed = if (self.has_qk_norm) try rmsNormFn(k_r, self.k_norm, eps, s) else try shareArr(k_r);
     defer _ = mlx.mlx_array_free(k_normed);
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var k_t = mlx.mlx_array_new();
@@ -3725,6 +3845,80 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
     try testing.expectEqual(@as(c_int, 8), en_shape[0]);
 }
 
+test "mtp: loadMtp detects the Nemotron-H layout (bare keys, mtp_head.safetensors)" {
+    // sevren-ai's `mtp_head.safetensors`: bare keys (`eh_proj`, `enorm`,
+    // `attn.*`, `moe.*`), dense bf16 eh_proj/router, no QK norms. Toy bf16
+    // geometry pins discovery + layout; the math rides the generate.zig
+    // greedy-equivalence test and tests/test_mtp_equivalence.sh.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp_head.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(arr);
+                try mlx.check(mlx.mlx_astype(&arr, f32_arr, dt, st));
+                try mlx.check(mlx.mlx_array_eval(arr));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, arr);
+            }
+        };
+        // hidden 8, heads 2 x hd 4, kv 1, experts 4, expert inter 6, shared 12.
+        try H.put(map, "eh_proj", &.{ 8, 16 }, .bfloat16, s);
+        try H.put(map, "enorm", &.{8}, .bfloat16, s);
+        try H.put(map, "hnorm", &.{8}, .bfloat16, s);
+        try H.put(map, "final_norm", &.{8}, .bfloat16, s);
+        try H.put(map, "attn.norm.weight", &.{8}, .bfloat16, s);
+        try H.put(map, "attn.mixer.q_proj.weight", &.{ 8, 8 }, .bfloat16, s);
+        try H.put(map, "attn.mixer.k_proj.weight", &.{ 4, 8 }, .bfloat16, s);
+        try H.put(map, "attn.mixer.v_proj.weight", &.{ 4, 8 }, .bfloat16, s);
+        try H.put(map, "attn.mixer.o_proj.weight", &.{ 8, 8 }, .bfloat16, s);
+        try H.put(map, "moe.norm.weight", &.{8}, .bfloat16, s);
+        try H.put(map, "moe.mixer.gate.weight", &.{ 4, 8 }, .bfloat16, s);
+        try H.put(map, "moe.mixer.gate.e_score_correction_bias", &.{4}, .float32, s);
+        try H.put(map, "moe.mixer.switch_mlp.fc1.weight", &.{ 4, 6, 8 }, .bfloat16, s);
+        try H.put(map, "moe.mixer.switch_mlp.fc2.weight", &.{ 4, 8, 6 }, .bfloat16, s);
+        try H.put(map, "moe.mixer.shared_experts.up_proj.weight", &.{ 12, 8 }, .bfloat16, s);
+        try H.put(map, "moe.mixer.shared_experts.down_proj.weight", &.{ 8, 12 }, .bfloat16, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    // Discovery: the bare `attn.mixer.q_proj.weight` marker at the new path.
+    try testing.expectEqualStrings("mtp_head.safetensors", resolveMtpSidecarInDir(io, allocator, tmp_dir.dir) orelse return error.SidecarNotFound);
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+    try testing.expectEqual(Layout.nemotron, m.layout);
+    try testing.expect(!m.has_qk_norm);
+    try testing.expect(m.eh_proj != null);
+    try testing.expect(m.eh_proj.?.s.ctx == null); // dense arm
+    try testing.expectEqualSlices(c_int, &.{ 16, 8 }, mlx.getShape(m.eh_proj.?.w)); // pre-transposed [2H, H]
+    try testing.expect(m.fc.w.ctx == null);
+    try testing.expect(m.mlp == .nemotron_moe);
+    try testing.expect(m.mlp.nemotron_moe.shared != null);
+    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w)); // [H, E]
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(m.mlp.nemotron_moe.expert_bias));
+}
+
 test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
     const s = mlx.gpuStream();
     const rows: usize = 64;
@@ -4306,7 +4500,7 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
     // MoE arm selected; router pre-transposed for the trunk's dense fallback
     // ([hidden, experts]); packed switch experts kept raw 3D.
     switch (m.mlp) {
-        .dense => return error.TestUnexpectedResult,
+        .dense, .nemotron_moe => return error.TestUnexpectedResult,
         .moe => |*mw| {
             const rs = mlx.getShape(mw.router_w);
             try testing.expectEqual(@as(c_int, 8), rs[0]);

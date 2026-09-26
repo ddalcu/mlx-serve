@@ -880,6 +880,10 @@ pub const ModelConfig = struct {
     /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
     pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
         if (configured == 0 and self.hadamard_block > 0) return 2;
+        // Nemotron-H MoE: every verify row routes to more experts, so the
+        // round cost climbs with depth while the head's acceptance decays;
+        // depths 1-2 pay, the adaptive default cap (6) loses to serial.
+        if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
         return configured;
     }
 

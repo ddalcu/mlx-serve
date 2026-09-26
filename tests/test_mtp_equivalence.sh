@@ -63,6 +63,7 @@ checkpoint_has_mtp_head() {
         [ -f "$MODEL/mtp.safetensors" ] ||
         [ -f "$MODEL/model-mtp.safetensors" ] ||
         [ -f "$MODEL/optiq/mtp.safetensors" ] ||
+        [ -f "$MODEL/mtp_head.safetensors" ] ||
         python3 - "$MODEL" <<'PY'
 import json
 import pathlib
@@ -299,7 +300,15 @@ fi
 # 3.5/3.6 checkpoint is hd 256 with GDN layers, so both fusions must fire on
 # the verify widths this server just ran. Output equality alone is blind to a
 # decline gate quietly routing everything back to the composed chain.
-for ENGAGE_LINE in "\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur) engaged"; do
+# Nemotron-H (Mamba2 + hd-128 attention) has its own kernels; its engagement
+# line is the fused Mamba2 step.
+ARCH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1] + '/config.json')).get('model_type', ''))" "$MODEL" 2>/dev/null)
+if [ "$ARCH" = "nemotron_h" ]; then
+    ENGAGE_LINES=("\[mamba2\] fused step engaged")
+else
+    ENGAGE_LINES=("\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur) engaged")
+fi
+for ENGAGE_LINE in "${ENGAGE_LINES[@]}"; do
     if grep -qE "$ENGAGE_LINE" "$LOG"; then
         echo "PASS [engaged: $ENGAGE_LINE]"; PASS=$((PASS+1))
     else
@@ -330,7 +339,11 @@ ECHO_STATS=$(grep 'spec-stats\] mode=mtp' "$LOG" | tail -1)
 ECHO_LOOKUP=$(echo "$ECHO_STATS" | grep -o 'lookup=[0-9]*/[0-9]*' | cut -d= -f2)
 ECHO_ROUNDS=$(( $(echo "$ECHO_STATS" | grep -o 'attempts=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP%%/*} ))
 ECHO_DRAFTED=$(( $(echo "$ECHO_STATS" | grep -o ' drafted=[0-9]*' | cut -d= -f2) + ${ECHO_LOOKUP##*/} ))
-if [ "${ECHO_ROUNDS:-0}" -gt 0 ] && [ "${ECHO_DRAFTED:-0}" -gt $((2 * ECHO_ROUNDS)) ]; then
+if [ "$ARCH" = "nemotron_h" ]; then
+    # A MoE trunk pays per verify row (more experts routed), so the controller
+    # correctly keeps this head at depth 1-2; the auto cap is 2 (ModelConfig.mtpDepth).
+    echo "SKIP [EV controller climb] (nemotron_h: depth capped at 2; drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"
+elif [ "${ECHO_ROUNDS:-0}" -gt 0 ] && [ "${ECHO_DRAFTED:-0}" -gt $((2 * ECHO_ROUNDS)) ]; then
     echo "PASS [EV controller climbs on echo] (drafted=$ECHO_DRAFTED over $ECHO_ROUNDS rounds)"; PASS=$((PASS+1))
 else
     echo "FAIL [EV controller climb]: drafted=${ECHO_DRAFTED:-none} over ${ECHO_ROUNDS:-none} rounds on a max-acceptance echo — depth never rose"

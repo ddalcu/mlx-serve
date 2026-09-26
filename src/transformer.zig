@@ -13122,7 +13122,7 @@ const Mamba2Weights = struct {
     out_proj_b: mlx.mlx_array,
 };
 
-const SimpleMlpWeights = struct {
+pub const SimpleMlpWeights = struct {
     up_w: mlx.mlx_array,
     up_s: mlx.mlx_array,
     up_b: mlx.mlx_array,
@@ -13132,7 +13132,7 @@ const SimpleMlpWeights = struct {
 };
 
 /// Nemotron-H MoE block (mlx-lm `NemotronHMoE` without the latent projection).
-const NemotronMoeWeights = struct {
+pub const NemotronMoeWeights = struct {
     router_w: mlx.mlx_array, // mixer.gate.weight — dense, pre-transposed [hidden, E]
     router_s: mlx.mlx_array,
     router_b: mlx.mlx_array,
@@ -24454,17 +24454,38 @@ pub const Transformer = struct {
                 pending_normed = null;
                 break :blk pn;
             } else try self.rmsNorm(h, self.final_norm);
+            // Spec-decode capture: the Nemotron-H MTP head consumes the
+            // residual BEFORE the final norm (its own hnorm follows).
+            try captureHidden(ctx, h, self.s);
             _ = mlx.mlx_array_free(h);
-            if (self.embedding_mode) return final_normed;
+            if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
             const logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
             _ = mlx.mlx_array_free(final_normed);
             return logits;
         } else {
-            if (self.embedding_mode) return h;
+            try captureHidden(ctx, h, self.s);
+            if (self.embedding_mode or ctx.skip_lm_head) return h;
             const logits = try self.lmHeadProject(h, ctx.argmax_only);
             _ = mlx.mlx_array_free(h);
             return logits;
         }
+    }
+
+    /// `ctx.capture_hidden` gets the LAST row of `src` `[B, 1, H]`,
+    /// `ctx.capture_hidden_all` the whole `[B, L, H]` (refcount-shared).
+    fn captureHidden(ctx: *ForwardCtx, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
+        if (ctx.capture_hidden) |target| {
+            const shape = mlx.getShape(src);
+            const last = shape[1] - 1;
+            const start = [_]c_int{ 0, last, 0 };
+            const stop = [_]c_int{ shape[0], shape[1], shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            var sliced = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&sliced, src, &start, 3, &stop, 3, &strides, 3, s));
+            _ = mlx.mlx_array_set(target, sliced);
+            _ = mlx.mlx_array_free(sliced);
+        }
+        if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, src);
     }
 
     // ── Gated Convolution (LFM2) ──
@@ -24745,6 +24766,11 @@ pub const Transformer = struct {
         const T: usize = @intCast(seq_len);
         const out_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(out_vec);
+        // Spec-decode capture: the state after every row, same [T,B,H,Dh,Ds]
+        // the fused window records, so a partial accept rolls back on any geometry.
+        const capture_states = self.spec_capture_ssm;
+        const state_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(state_vec);
 
         for (0..T) |t| {
             const ti: c_int = @intCast(t);
@@ -24856,6 +24882,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_add(&new_state, decayed, update, self.s));
             _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = new_state;
+            if (capture_states) _ = mlx.mlx_vector_array_append_value(state_vec, new_state);
 
             // Output: y = sum_s(state * C_t) + x * D
             // C_t: [B, H, S] → [B, H, 1, S]
@@ -24887,6 +24914,12 @@ pub const Transformer = struct {
             if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
                 try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
             }
+        }
+
+        if (capture_states) {
+            if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+            ssm.spec_state_seq = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_stack_axis(&ssm.spec_state_seq, state_vec, 0, self.s));
         }
 
         // 10. Stack: [T, B, H, D] → transpose to [B, T, H, D]
@@ -31796,8 +31829,8 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
 
     var y_tkh = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y_tkh);
-    if (t_count == 1) {
-        try nemotronMoeDecodeExperts(&y_tkh, x_flat, nm, routing.inds, k_count, d_dim, cfg, s);
+    if (t_count <= nemotron_gather_max_rows) {
+        try nemotronMoeDecodeExperts(&y_tkh, x_flat, nm, routing.inds, t_count, k_count, d_dim, cfg, s);
     } else {
         // Global sort so gather_qmm streams each expert's rows once (the
         // `inklingExpertsApply` pattern, ungated).
@@ -31848,7 +31881,7 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
 /// reads, `nemotronMoeDecodeExperts`; else the sorted gather_qmm path), the
 /// f32 routing weights applied before the K-sum, then the shared expert
 /// added. x [B, S, hidden] → [B, S, hidden]; caller owns.
-fn nemotronMoe(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn nemotronMoe(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
     const parts = try nemotronMoeExperts(x, nm, cfg, s);
     defer parts.deinit();
     return nemotronMoeCombine(x, &parts, nm, cfg, s);
@@ -31905,27 +31938,43 @@ fn nemotronMoeCombine(x: mlx.mlx_array, parts: *const NemotronMoeParts, nm: *con
 }
 
 var nemotron_gqmv_engaged = false;
+/// Widest token window that reads its experts in place (decode steps and
+/// spec-decode verify windows); wider windows take the sorted gather_qmm
+/// path, which streams each expert once. Test seam.
+pub var nemotron_gather_max_rows: c_int = 8;
 
-/// One token: the K experts are read in place by `gatherQmv` (fc1 over the
-/// shared token, fc2 per expert), falling back to UNSORTED gather_qmm when the
-/// bank is outside its envelope. Either way none of the sort machinery runs.
-/// Writes [1, K, D] into `res`.
-fn nemotronMoeDecodeExperts(res: *mlx.mlx_array, x_flat: mlx.mlx_array, nm: *const NemotronMoeWeights, inds: mlx.mlx_array, k_count: c_int, d_dim: c_int, cfg: *const ModelConfig, s: mlx.mlx_stream) !void {
+/// A short window of T tokens: every (token, expert) pair is one `gatherQmv`
+/// row (fc1 with ReLU^2 fused, then fc2), falling back to UNSORTED
+/// gather_qmm when the bank is outside its envelope. Either way none of the
+/// sort machinery runs. `res` = [T, K, hidden].
+fn nemotronMoeDecodeExperts(res: *mlx.mlx_array, x_flat: mlx.mlx_array, nm: *const NemotronMoeWeights, inds: mlx.mlx_array, t_count: c_int, k_count: c_int, d_dim: c_int, cfg: *const ModelConfig, s: mlx.mlx_stream) !void {
     const no_idx = mlx.mlx_array{ .ctx = null };
-    const out_shape = [_]c_int{ 1, k_count, d_dim };
-    var inds_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inds_k);
-    try mlx.check(mlx.mlx_reshape(&inds_k, inds, &[_]c_int{k_count}, 1, s));
+    const out_shape = [_]c_int{ t_count, k_count, d_dim };
+    const pairs = t_count * k_count;
+    var inds_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inds_flat);
+    try mlx.check(mlx.mlx_reshape(&inds_flat, inds, &[_]c_int{pairs}, 1, s));
     const fc1_qp = quantParamsOrDense(cfg, nm.fc1_w, nm.fc1_s, @intCast(d_dim));
 
     if (nm.fc1_s.ctx != null and nm.fc2_s.ctx != null) fused: {
         var inds_u32 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(inds_u32);
-        try mlx.check(mlx.mlx_astype(&inds_u32, inds_k, .uint32, s));
-        var x_1d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_1d);
-        try mlx.check(mlx.mlx_reshape(&x_1d, x_flat, &[_]c_int{d_dim}, 1, s));
-        const act = (try gatherQmvAct(s, x_1d, nm.fc1_w, nm.fc1_s, nm.fc1_b, inds_u32, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, false, true)) orelse break :fused;
+        try mlx.check(mlx.mlx_astype(&inds_u32, inds_flat, .uint32, s));
+        // One token: x shared by its K experts. T tokens: x repeated per pair.
+        var x_in = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_in);
+        if (t_count == 1) {
+            try mlx.check(mlx.mlx_reshape(&x_in, x_flat, &[_]c_int{d_dim}, 1, s));
+        } else {
+            var x_3d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_3d);
+            try mlx.check(mlx.mlx_reshape(&x_3d, x_flat, &[_]c_int{ t_count, 1, d_dim }, 3, s));
+            var x_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_b);
+            try mlx.check(mlx.mlx_broadcast_to(&x_b, x_3d, &[_]c_int{ t_count, k_count, d_dim }, 3, s));
+            try mlx.check(mlx.mlx_reshape(&x_in, x_b, &[_]c_int{ pairs, d_dim }, 2, s));
+        }
+        const act = (try gatherQmvAct(s, x_in, nm.fc1_w, nm.fc1_s, nm.fc1_b, inds_u32, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, t_count > 1, true)) orelse break :fused;
         defer _ = mlx.mlx_array_free(act);
         const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, lastDim(act));
         const y = (try gatherQmv(s, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, inds_u32, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true)) orelse break :fused;
@@ -31940,16 +31989,19 @@ fn nemotronMoeDecodeExperts(res: *mlx.mlx_array, x_flat: mlx.mlx_array, nm: *con
 
     var x_rep = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x_rep);
-    try mlx.check(mlx.mlx_reshape(&x_rep, x_flat, &[_]c_int{ 1, 1, d_dim }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&x_rep, x_flat, &[_]c_int{ t_count, 1, d_dim }, 3, s));
+    var inds_tk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inds_tk);
+    try mlx.check(mlx.mlx_reshape(&inds_tk, inds, &[_]c_int{ t_count, k_count }, 2, s));
     var h_3d = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(h_3d);
-    try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, inds_k, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, false, s);
+    try gatherExpertMm(&h_3d, x_rep, nm.fc1_w, nm.fc1_s, nm.fc1_b, no_idx, inds_tk, fc1_qp.bits, fc1_qp.group_size, fc1_qp.mode, false, s);
     const act = try reluSquaredOp(h_3d, s);
     defer _ = mlx.mlx_array_free(act);
     const fc2_qp = quantParamsOrDense(cfg, nm.fc2_w, nm.fc2_s, lastDim(act));
     var y_3d = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y_3d);
-    try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, inds_k, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, false, s);
+    try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, inds_tk, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, false, s);
     try mlx.check(mlx.mlx_reshape(res, y_3d, &out_shape, 3, s));
 }
 
@@ -42129,6 +42181,19 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
     try t.expect(max_ref > 0.1);
     try t.expect(max_err < 1e-3 * max_ref);
     try t.expect(max_err_one < 1e-3 * max_ref);
+
+    // Sorted gather_qmm path (windows wider than the in-place seam), same reference.
+    {
+        nemotron_gather_max_rows = 0;
+        defer nemotron_gather_max_rows = 8;
+        const got_sorted = try nemotronMoe(x, &nm, &cfg, s);
+        defer _ = mlx.mlx_array_free(got_sorted);
+        try mlx.check(mlx.mlx_array_eval(got_sorted));
+        const gs_p = mlx.mlx_array_data_float32(got_sorted) orelse return error.MlxArrayDataNull;
+        var max_err_sorted: f32 = 0;
+        for (0..T * D) |i| max_err_sorted = @max(max_err_sorted, @abs(gp[i] - gs_p[i]));
+        try t.expect(max_err_sorted < 2e-3 * max_ref);
+    }
 }
 
 // Bar: the fused residual add + next norm is BIT-EQUAL to add -> fast rms_norm,
@@ -42887,6 +42952,36 @@ test "mamba2Mixer: fused single steps and a fused 3-row window match the chain" 
     if (!(st_ref > 0 and st_err <= 1e-5 * st_ref)) {
         std.debug.print("mamba2 window state[1] vs two single steps: err={d:.6} ref={d:.6}\n", .{ st_err, st_ref });
         return error.StateCaptureMismatch;
+    }
+
+    // The op chain (kernel-declined geometry) records the same per-row capture.
+    resetState(hl.ssm_entries);
+    {
+        mamba2_fused_max_rows = 0;
+        defer mamba2_fused_max_rows = mamba2_decode.MAX_ROWS;
+        var ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids);
+        ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, T }, 2, .int32);
+        var cctx = xfm.defaultCtx();
+        cctx.capture_ssm_seq = true;
+        const out_chain = try xfm.forwardWith(&cctx, ids);
+        defer _ = mlx.mlx_array_free(out_chain);
+        const e = &hl.ssm_entries[0];
+        if (e.spec_state_seq.ctx == null or e.spec_conv_input.ctx == null) return error.NoChainSpecCapture;
+        try t.expectEqualSlices(c_int, &.{ T, 1, heads, head_dim, state }, mlx.getShape(e.spec_state_seq));
+        try t.expectEqualSlices(c_int, &.{ 1, kernel - 1 + T, conv_dim }, mlx.getShape(e.spec_conv_input));
+        var row1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row1);
+        try mlx.check(mlx.mlx_slice(&row1, e.spec_state_seq, &[_]c_int{ 1, 0, 0, 0, 0 }, 5, &[_]c_int{ 2, 1, heads, head_dim, state }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
+        const chain_state_1 = try allocator.alloc(f32, state_elems);
+        defer allocator.free(chain_state_1);
+        try readF32(row1, s, chain_state_1);
+        var c_err: f32 = 0;
+        for (chain_state_1, window_state_1) |a, b| c_err = @max(c_err, @abs(a - b));
+        if (c_err > 1.5e-2 * st_ref) {
+            std.debug.print("mamba2 chain capture state[1] vs fused window: err={d:.6} ref={d:.6}\n", .{ c_err, st_ref });
+            return error.ChainCaptureMismatch;
+        }
     }
 }
 

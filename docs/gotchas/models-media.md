@@ -1937,6 +1937,16 @@ Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `Nemo
 
 Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
 
+## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
+
+Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded SLOWER than serial (121-191 vs 205 tok/s); a post-norm hidden input accepted 0.90 tokens per round against 1.20 for the pre-norm one.
+
+Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m (6 → ~12 → ~35 of 128); on a 3B-active MoE the verify forward's weight traffic doubles by depth 2 and quadruples by depth 6, while the head's chained acceptance decays (0.72, then 0.47). Depth 1-2 breaks even with serial (within run-to-run noise on prose; the head is not free on a 3B-active trunk); the generic adaptive cap (6) loses.
+
+Fix: `forwardHybridWith` captures `h` before the final norm; `MtpModel.layout == .nemotron` (bare keys, dense `eh_proj`, no QK norms, `nemotronMoe` MLP); `ModelConfig.mtpDepth` returns 2 for `nemotron_h` when no depth is configured; verify windows up to 8 rows ride the in-place expert path (`nemotronMoeDecodeExperts` over (token, expert) pairs) instead of the sort machinery.
+
+Guards: `mtp: loadMtp detects the Nemotron-H layout`, `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (tiny trunk + head on disk, greedy MTP == serial), `nemotronMoe matches a host reference` (in-place window path AND the sorted path), live `tests/test_mtp_equivalence.sh` with `MTP_FORCE_ENABLE=1`.
+
 ## Nemotron-H: the fused add+norm path dropped the shared expert
 
 Symptom: after the decode fusions landed, greedy text was coherent for ~30 tokens and then degenerated into word salad; every kernel unit test was green.
