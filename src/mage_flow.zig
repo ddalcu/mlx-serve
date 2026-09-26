@@ -508,6 +508,32 @@ fn ownOpt(w: *const Weights, key: []const u8) ?mlx.mlx_array {
     return o;
 }
 
+/// Affine-quantized matrix back to a dense `[rows, in_features]` tensor.
+/// `group_size` is 64 on every Qwen-Image MLX pack we load; `bits` falls out
+/// of the packed width. Caller frees the result.
+fn dequantizeAffine(weight: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, in_features: u32, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+    const w_cols: u32 = @intCast(mlx.getShape(weight)[1]);
+    const s_cols: u32 = @intCast(mlx.getShape(scales)[1]);
+    if (in_features == 0 or s_cols == 0 or w_cols == 0 or in_features % s_cols != 0) return error.MissingMageFlowWeight;
+    const bits: u32 = 32 * w_cols / in_features;
+    if (bits == 0 or (w_cols * 32) % in_features != 0) return error.MissingMageFlowWeight;
+    const gs: u32 = in_features / s_cols;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(
+        &out,
+        weight,
+        scales,
+        biases,
+        mlx.mlx_optional_int.some(@intCast(gs)),
+        mlx.mlx_optional_int.some(@intCast(bits)),
+        "affine",
+        .{ .ctx = null },
+        .{ .value = dtype, .has_value = true },
+        s,
+    ));
+    return out;
+}
+
 /// A DiT / text-encoder / ViT linear, dense bf16 OR affine-quantized, decided
 /// per tensor by the presence of a `.scales` sibling. The upstream Microsoft
 /// repos are dense; our 8-bit mirrors quantize most of the same tensors and
@@ -738,9 +764,9 @@ const MF_COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// VAE downsample × nothing (native-resolution) — dimensions must be /16.
 const MF_DOWNSAMPLE: u32 = 16;
 const MF_DEFAULT_STEPS: u32 = 4; // Turbo default
-/// Reference-image cap for one edit (mirrors `gen.MAX_EDIT_IMAGES` — the HTTP
-/// layer rejects earlier with a 400; this is the engine's own backstop, since
-/// every extra reference adds a FULL image's tokens to the DiT stream).
+/// Mage-Flow's own reference cap. HTTP rejects earlier (`gen.editRefCap`:
+/// 4 here, 10 for Qwen-Image). Every extra reference adds a full image of
+/// DiT tokens to the stream.
 const MF_MAX_EDIT_REFS: usize = 4;
 
 pub const Engine = struct {
@@ -3132,9 +3158,25 @@ pub const VisionTower = struct {
         self.patch_b = try loadVecDt(w, a, pe_pfx, "bias", dtype, s);
         const pos_key = try std.fmt.allocPrint(a, "{s}.pos_embed.weight", .{cfg.prefix});
         defer a.free(pos_key);
-        const pe = try ownWeight(w, pos_key);
-        defer _ = mlx.mlx_array_free(pe);
-        self.pos_embed = try astype(pe, dtype, s);
+        const pos_sk = try std.fmt.allocPrint(a, "{s}.pos_embed.scales", .{cfg.prefix});
+        defer a.free(pos_sk);
+        const pos_bk = try std.fmt.allocPrint(a, "{s}.pos_embed.biases", .{cfg.prefix});
+        defer a.free(pos_bk);
+        if (ownOpt(w, pos_sk)) |raw_scales| {
+            // Quantized gather table (mlx-community packs): dequantize to the
+            // dense logical shape.
+            defer _ = mlx.mlx_array_free(raw_scales);
+            const pe = try ownWeight(w, pos_key);
+            defer _ = mlx.mlx_array_free(pe);
+            const pb = try ownWeight(w, pos_bk);
+            defer _ = mlx.mlx_array_free(pb);
+            const s_cols: u32 = @intCast(mlx.getShape(raw_scales)[1]);
+            self.pos_embed = try dequantizeAffine(pe, raw_scales, pb, s_cols * 64, dtype, s);
+        } else {
+            const pe = try ownWeight(w, pos_key);
+            defer _ = mlx.mlx_array_free(pe);
+            self.pos_embed = try astype(pe, dtype, s);
+        }
         self.blocks = try a.alloc(VitBlockW, cfg.depth);
         for (0..cfg.depth) |i| self.blocks[i] = try loadVitBlock(w, a, cfg, i, dtype, s);
         const mg = try std.fmt.allocPrint(a, "{s}.merger", .{cfg.prefix});
@@ -3622,26 +3664,58 @@ pub const TextEncoder = struct {
     layers: [TE_LAYERS]TeLayerW,
     final_norm: mlx.mlx_array, // f32
 
+    /// Open {model_dir}/text_encoder (vision keys dropped) and load from it.
     pub fn load(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, dtype: mlx.mlx_dtype) !TextEncoder {
         const dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
         defer allocator.free(dir);
         var w = try model_mod.loadWeights(io, allocator, dir);
         defer w.deinit();
+        return loadFrom(allocator, s, &w, dtype);
+    }
+
+    /// Load from an ALREADY-OPEN weight map (Qwen-Image-2.1 edit passes the
+    /// same vision-keeping map to this and `VisionTower.loadFrom`).
+    pub fn loadFrom(allocator: std.mem.Allocator, s: S, w: *const Weights, dtype: mlx.mlx_dtype) !TextEncoder {
         const a = allocator;
         var self: TextEncoder = undefined;
         self.allocator = allocator;
         self.s = s;
         self.dtype = dtype;
 
-        // Raw checkpoint keys carry the full `model.language_model.` prefix (the
-        // reference strips `model.` at map time; loadWeights keeps names verbatim).
-        const pfx = "model.language_model.";
+        // Diffusers packs say `model.language_model.`; mlx-community says
+        // `language_model.model.`. Same tensors, the prefix is probed.
+        const pfx = if (w.get("model.language_model.embed_tokens.weight") != null)
+            "model.language_model."
+        else if (w.get("language_model.model.embed_tokens.weight") != null)
+            "language_model.model."
+        else {
+            log.err("[mageflow] text encoder embed_tokens not found under either prefix\n", .{});
+            return error.MissingMageFlowWeight;
+        };
         const ek = try std.fmt.allocPrint(a, "{s}embed_tokens.weight", .{pfx});
         defer a.free(ek);
-        const raw_emb = try ownWeight(&w, ek);
-        defer _ = mlx.mlx_array_free(raw_emb);
-        self.embed_table = try astype(raw_emb, dtype, s);
-        self.hidden = mlx.getShape(raw_emb)[1];
+        const esk = try std.fmt.allocPrint(a, "{s}embed_tokens.scales", .{pfx});
+        defer a.free(esk);
+        const ebk = try std.fmt.allocPrint(a, "{s}embed_tokens.biases", .{pfx});
+        defer a.free(ebk);
+        if (ownOpt(w, esk)) |raw_scales| {
+            defer _ = mlx.mlx_array_free(raw_scales);
+            const raw_w = try ownWeight(w, ek);
+            defer _ = mlx.mlx_array_free(raw_w);
+            const raw_b = try ownWeight(w, ebk);
+            defer _ = mlx.mlx_array_free(raw_b);
+            // group 64 is the pack's own quantization; the dequantized width
+            // IS the LM hidden size.
+            const s_cols: u32 = @intCast(mlx.getShape(raw_scales)[1]);
+            const in_features: u32 = s_cols * 64;
+            self.embed_table = try dequantizeAffine(raw_w, raw_scales, raw_b, in_features, dtype, s);
+            self.hidden = @intCast(in_features);
+        } else {
+            const raw_emb = try ownWeight(w, ek);
+            defer _ = mlx.mlx_array_free(raw_emb);
+            self.embed_table = try astype(raw_emb, dtype, s);
+            self.hidden = mlx.getShape(raw_emb)[1];
+        }
         const hidden: u32 = @intCast(self.hidden);
         const gate0 = w.get(pfx ++ "layers.0.mlp.gate_proj.weight") orelse return error.MissingMageFlowWeight;
         const inter: u32 = @intCast(mlx.getShape(gate0)[0]);
@@ -3670,20 +3744,20 @@ pub const TextEncoder = struct {
             const dp = try std.fmt.allocPrint(a, "{s}layers.{d}.mlp.down_proj", .{ pfx, i });
             defer a.free(dp);
             layer.* = .{
-                .input_ln = try loadVec(&w, a, p_in, "weight", s),
-                .post_ln = try loadVec(&w, a, p_post, "weight", s),
-                .qw = try MfLinear.load(&w, a, qp, hidden, dtype, s),
-                .kw = try MfLinear.load(&w, a, kp, hidden, dtype, s),
-                .vw = try MfLinear.load(&w, a, vp, hidden, dtype, s),
-                .ow = try MfLinear.load(&w, a, op, TE_HEADS * TE_HEAD_DIM, dtype, s),
-                .q_norm = try loadVec(&w, a, qn, "weight", s),
-                .k_norm = try loadVec(&w, a, kn, "weight", s),
-                .gate_w = try MfLinear.load(&w, a, gp, hidden, dtype, s),
-                .up_w = try MfLinear.load(&w, a, upp, hidden, dtype, s),
-                .down_w = try MfLinear.load(&w, a, dp, inter, dtype, s),
+                .input_ln = try loadVec(w, a, p_in, "weight", s),
+                .post_ln = try loadVec(w, a, p_post, "weight", s),
+                .qw = try MfLinear.load(w, a, qp, hidden, dtype, s),
+                .kw = try MfLinear.load(w, a, kp, hidden, dtype, s),
+                .vw = try MfLinear.load(w, a, vp, hidden, dtype, s),
+                .ow = try MfLinear.load(w, a, op, TE_HEADS * TE_HEAD_DIM, dtype, s),
+                .q_norm = try loadVec(w, a, qn, "weight", s),
+                .k_norm = try loadVec(w, a, kn, "weight", s),
+                .gate_w = try MfLinear.load(w, a, gp, hidden, dtype, s),
+                .up_w = try MfLinear.load(w, a, upp, hidden, dtype, s),
+                .down_w = try MfLinear.load(w, a, dp, inter, dtype, s),
             };
         }
-        self.final_norm = try loadVec(&w, a, pfx ++ "norm", "weight", s);
+        self.final_norm = try loadVec(w, a, pfx ++ "norm", "weight", s);
         return self;
     }
 
@@ -3832,7 +3906,7 @@ pub const TextEncoder = struct {
 /// Scatter `values` [Nvis, H] into rows `positions` of `flat` [L, H]; when `add`,
 /// accumulate onto the existing rows (DeepStack). Returns a new [L, H] (caller
 /// frees). Positions must be distinct (they are — a placeholder run has no dups).
-fn scatterRows(flat: mlx.mlx_array, positions: mlx.mlx_array, values: mlx.mlx_array, add: bool, s: S) !mlx.mlx_array {
+pub fn scatterRows(flat: mlx.mlx_array, positions: mlx.mlx_array, values: mlx.mlx_array, add: bool, s: S) !mlx.mlx_array {
     const H = mlx.getShape(flat)[1];
     const nvis = mlx.getShape(values)[0];
     const idx1 = try reshape(positions, &[_]c_int{ nvis, 1 }, s);
@@ -3859,7 +3933,7 @@ fn scatterRows(flat: mlx.mlx_array, positions: mlx.mlx_array, values: mlx.mlx_ar
 }
 
 /// One Qwen3-VL decoder layer: h += attn(input_ln(h)); h += mlp(post_ln(h)).
-fn teLayerForward(layer: *const TeLayerW, x: mlx.mlx_array, mask: mlx.mlx_array, rope_cos: mlx.mlx_array, rope_sin: mlx.mlx_array, seq: c_int, s: S) !mlx.mlx_array {
+pub fn teLayerForward(layer: *const TeLayerW, x: mlx.mlx_array, mask: mlx.mlx_array, rope_cos: mlx.mlx_array, rope_sin: mlx.mlx_array, seq: c_int, s: S) !mlx.mlx_array {
     const xn = try rmsNormLast(x, layer.input_ln, TE_EPS, s);
     defer _ = mlx.mlx_array_free(xn);
     const q = try layer.qw.forward(xn, null, s);
@@ -3919,7 +3993,7 @@ fn teLayerForward(layer: *const TeLayerW, x: mlx.mlx_array, mask: mlx.mlx_array,
 
 /// Causal + padding additive mask [1,1,seq,seq] (0 keep, -1e9 blocked) in the
 /// compute dtype. `-1e9` (not -inf) avoids bf16 NaN; proven parity-equivalent.
-fn buildTeMask(allocator: std.mem.Allocator, mask: []const i32, seq: c_int, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+pub fn buildTeMask(allocator: std.mem.Allocator, mask: []const i32, seq: c_int, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     const n: usize = @intCast(seq);
     const buf = try allocator.alloc(f32, n * n);
     defer allocator.free(buf);
@@ -5078,4 +5152,159 @@ test "MfLinear: bias is applied in the compute dtype on both paths" {
         defer _ = mlx.mlx_array_free(delta);
         try testing.expect(try maxAbsDiff(delta, bias, s) < 1e-2);
     }
+}
+
+test "dequantizeAffine is the exact affine roundtrip" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+
+    const rows: usize = 33;
+    const cols: usize = 128;
+    const raw = try a.alloc(f32, rows * cols);
+    defer a.free(raw);
+    for (raw, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 17)) * 0.03 - 0.25;
+    const rsh = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const dense = mlx.mlx_array_new_data(raw.ptr, &rsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(dense);
+
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    const null_gscale = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_quantize(&qv, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gscale, s));
+    var qw = mlx.mlx_array_new();
+    var qs = mlx.mlx_array_new();
+    var qb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qw);
+    defer _ = mlx.mlx_array_free(qs);
+    defer _ = mlx.mlx_array_free(qb);
+    try mlx.check(mlx.mlx_vector_array_get(&qw, qv, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qs, qv, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&qb, qv, 2));
+
+    // The helper derives (bits, group) from the packed geometry; the result
+    // must equal the stock dequantize at the KNOWN (64, 4) bit for bit.
+    const got = try dequantizeAffine(qw, qs, qb, @intCast(cols), .float32, s);
+    defer _ = mlx.mlx_array_free(got);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, qw, qs, qb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gscale, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try mlx.check(mlx.mlx_array_eval(want));
+    try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(rows), @intCast(cols) }, mlx.getShape(got));
+    const g = mlx.mlx_array_data_float32(got) orelse return error.NoData;
+    const w = mlx.mlx_array_data_float32(want) orelse return error.NoData;
+    try testing.expectEqualSlices(f32, w[0 .. rows * cols], g[0 .. rows * cols]);
+
+    // Inconsistent geometry (in_features not a whole number of scale groups)
+    // is a named refusal, never a garbage dequant.
+    try testing.expectError(error.MissingMageFlowWeight, dequantizeAffine(qw, qs, qb, 63, .float32, s));
+}
+
+test "VisionTower pos_embed dequantizes a packed table to the dense shape" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+
+    const H: usize = 64; // tower hidden; /64 so the table packs at group 64
+    const I: usize = 128; // mlp inter
+    const ROWS: usize = 16; // pos-table rows
+    var w = model_mod.Weights.init(a);
+    defer w.deinit();
+
+    // Deterministic filler — this is a LOAD test; the dequant math itself is
+    // pinned by the roundtrip test above.
+    const put = struct {
+        fn f(m: *model_mod.Weights, al: std.mem.Allocator, key: []const u8, arr: mlx.mlx_array) !void {
+            try m.map.put(try al.dupe(u8, key), arr);
+        }
+    }.f;
+    const vec = struct {
+        fn f(al: std.mem.Allocator, n: usize) !mlx.mlx_array {
+            const buf = try al.alloc(f32, n);
+            defer al.free(buf);
+            for (buf, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.1;
+            const sh = [_]c_int{@intCast(n)};
+            return mlx.mlx_array_new_data(buf.ptr, &sh, 1, .float32);
+        }
+    }.f;
+    const mat = struct {
+        fn f(al: std.mem.Allocator, r: usize, c: usize) !mlx.mlx_array {
+            const buf = try al.alloc(f32, r * c);
+            defer al.free(buf);
+            for (buf, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.05 - 0.15;
+            const sh = [_]c_int{ @intCast(r), @intCast(c) };
+            return mlx.mlx_array_new_data(buf.ptr, &sh, 2, .float32);
+        }
+    }.f;
+
+    // pos_embed: packed 4-bit gs64 + sidecars — the mlx-community pack shape.
+    const pos_host = try a.alloc(f32, ROWS * H);
+    defer a.free(pos_host);
+    for (pos_host, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 11)) * 0.02 - 0.1;
+    const pos_sh = [_]c_int{ @intCast(ROWS), @intCast(H) };
+    const pos_dense = mlx.mlx_array_new_data(pos_host.ptr, &pos_sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(pos_dense);
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    const null_gscale = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_quantize(&qv, pos_dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gscale, s));
+    var qw = mlx.mlx_array_new();
+    var qs = mlx.mlx_array_new();
+    var qb = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&qw, qv, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qs, qv, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&qb, qv, 2));
+    try put(&w, a, "vision_tower.pos_embed.weight", qw);
+    try put(&w, a, "vision_tower.pos_embed.scales", qs);
+    try put(&w, a, "vision_tower.pos_embed.biases", qb);
+
+    // Patch embed: OITHW [hidden, 3, 2, 16, 16].
+    {
+        const buf = try a.alloc(f32, H * 3 * 2 * 16 * 16);
+        defer a.free(buf);
+        for (buf, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 13)) * 0.01;
+        const sh = [_]c_int{ @intCast(H), 3, 2, 16, 16 };
+        try put(&w, a, "vision_tower.patch_embed.proj.weight", mlx.mlx_array_new_data(buf.ptr, &sh, 5, .float32));
+    }
+    try put(&w, a, "vision_tower.patch_embed.proj.bias", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.norm1.weight", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.norm1.bias", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.norm2.weight", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.norm2.bias", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.attn.qkv.weight", try mat(a, 3 * H, H));
+    try put(&w, a, "vision_tower.blocks.0.attn.qkv.bias", try vec(a, 3 * H));
+    try put(&w, a, "vision_tower.blocks.0.attn.proj.weight", try mat(a, H, H));
+    try put(&w, a, "vision_tower.blocks.0.attn.proj.bias", try vec(a, H));
+    try put(&w, a, "vision_tower.blocks.0.mlp.linear_fc1.weight", try mat(a, I, H));
+    try put(&w, a, "vision_tower.blocks.0.mlp.linear_fc1.bias", try vec(a, I));
+    try put(&w, a, "vision_tower.blocks.0.mlp.linear_fc2.weight", try mat(a, H, I));
+    try put(&w, a, "vision_tower.blocks.0.mlp.linear_fc2.bias", try vec(a, H));
+    // Merger + the three DeepStack mergers consume the 2x2-shuffled block.
+    for ([_][]const u8{ "vision_tower.merger", "vision_tower.deepstack_merger_list.0", "vision_tower.deepstack_merger_list.1", "vision_tower.deepstack_merger_list.2" }) |p| {
+        const nk = try std.fmt.allocPrint(a, "{s}.norm.weight", .{p});
+        defer a.free(nk);
+        try put(&w, a, nk, try vec(a, 4 * H));
+        const nb = try std.fmt.allocPrint(a, "{s}.norm.bias", .{p});
+        defer a.free(nb);
+        try put(&w, a, nb, try vec(a, 4 * H));
+        const f1 = try std.fmt.allocPrint(a, "{s}.linear_fc1.weight", .{p});
+        defer a.free(f1);
+        try put(&w, a, f1, try mat(a, 4 * H, 4 * H));
+        const b1 = try std.fmt.allocPrint(a, "{s}.linear_fc1.bias", .{p});
+        defer a.free(b1);
+        try put(&w, a, b1, try vec(a, 4 * H));
+        const f2 = try std.fmt.allocPrint(a, "{s}.linear_fc2.weight", .{p});
+        defer a.free(f2);
+        try put(&w, a, f2, try mat(a, 4 * H, 4 * H));
+        const b2 = try std.fmt.allocPrint(a, "{s}.linear_fc2.bias", .{p});
+        defer a.free(b2);
+        try put(&w, a, b2, try vec(a, 4 * H));
+    }
+
+    const cfg = VitConfig{ .hidden = @intCast(H), .heads = 4, .inter = @intCast(I), .depth = 1, .out = @intCast(H), .deepstack = .{ 0, 0, 0 }, .prefix = "vision_tower" };
+    var vit = try VisionTower.loadFrom(a, s, &w, cfg, .float32);
+    defer vit.deinit();
+    // The packed [16, 8] table loads as its DENSE logical [16, 64] shape.
+    try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(ROWS), @intCast(H) }, mlx.getShape(vit.pos_embed));
 }

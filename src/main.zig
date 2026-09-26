@@ -1807,8 +1807,14 @@ fn runGenServe(
         e
     else if (registry.peekByPath(model_dir)) |e|
         e
-    else
-        try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
+    else blk: {
+        // The boot stub's arch hint should be the pack's real model_type
+        // (`/v1/models` reports it); the modality marker is only the
+        // no-config fallback.
+        const real = gen_mod.peekModelType(io, allocator, model_dir);
+        defer if (real) |mt| allocator.free(mt);
+        break :blk try registry.registerStubWithArch(model_id, model_dir, null, real orelse modality.modelType());
+    };
     try registry.setDefault(entry.id);
 
     // Registry takes ownership of the stub if the inference thread installed it.

@@ -160,6 +160,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // A Laya decision checkpoint ships encoder/config.json + rl_agent_config.json.
         if (peekLayaCheckpoint(io, sub))
             return .{ .supported = allocator.dupe(u8, "laya") catch return .missing_or_unparseable };
+        // …and an mlx-community-style Qwen-Image-2.1 repo: no root
+        // config.json, model_index.json's `_class_name` its only marker
+        // (the 2.0 family's "QwenImagePipeline" is a different architecture).
+        if (peekQwenImage21Index(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
     };
     defer file.close(io);
@@ -230,6 +235,23 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// True when `sub/model_index.json` names the Qwen-Image-2.1 pipeline. The 2.0
+/// family spells "QwenImagePipeline" — a different architecture, never matched.
+/// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
+pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "QwenImage21Pipeline");
 }
 
 /// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
@@ -870,7 +892,8 @@ fn tryAddModel(
         if (!has_config and
             !peekMageFlowIndex(io, allocator, sub) and
             !peekMfluxFlux2(io, allocator, sub) and
-            !peekLayaCheckpoint(io, sub)) return false;
+            !peekLayaCheckpoint(io, sub) and
+            !peekQwenImage21Index(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1482,6 +1505,39 @@ test "discoverModels finds a MageFlow repo (model_index.json, no root config.jso
     try testing.expectEqualStrings("mage_flow", result.models[0].model_type);
     // Size is the whole tree — the weights live in component subdirs.
     try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // An mlx-community-style 2.1 repo ships no root config.json — its only
+    // marker is model_index.json's `_class_name`. The 2.0 family spells
+    // "QwenImagePipeline": a different architecture (20B, 2x2-packed) we do
+    // not serve, so it stays invisible with the same directory shape.
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer");
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/model_index.json",
+        .data = "{\"_class_name\":\"QwenImage21Pipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.0-MLX/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.0-MLX/model_index.json",
+        .data = "{\"_class_name\":\"QwenImagePipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.0-MLX/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
+    try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
 }
 
 test "discoverModels finds an mflux FLUX.2 repo (no root config.json)" {

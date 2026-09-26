@@ -6438,6 +6438,10 @@ fn renderModelEntry(
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
+        // Loaded and unloaded rows report the same `architecture` — the
+        // registry's arch hint (the pack's real model_type), never the stub
+        // config's modality marker ("flux2" for every image backend).
+        const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
         const mtp_loaded = entry.mtp != null;
@@ -6488,7 +6492,7 @@ fn renderModelEntry(
             if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
             mods.items,
-            config.model_type,
+            arch_label,
             modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,

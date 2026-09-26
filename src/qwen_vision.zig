@@ -358,6 +358,77 @@ pub fn resizeRgbNormalizedChw(
     }
 }
 
+/// Pillow-compatible separable resize of interleaved u8 pixels with ANY
+/// channel count (the edit path resizes RGBA; the RGB path above normalizes
+/// inline). Two passes, fixed-point taps, u8 quantization per pass — the same
+/// boundary as `PIL.Image.resize`, so a 4-channel source rides the machinery
+/// the RGB oracles pin. Caller owns the returned `target_w*target_h*channels`
+/// buffer.
+pub fn resizeInterleavedPil(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+    channels: u32,
+    filter: Filter,
+) ![]u8 {
+    if (source_h == 0 or source_w == 0 or target_h == 0 or target_w == 0)
+        return error.InvalidImageDimensions;
+    const ch: usize = channels;
+    if (src.len != @as(usize, source_h) * source_w * ch)
+        return error.InvalidImageBuffer;
+
+    var horizontal_owned: ?[]u8 = null;
+    defer if (horizontal_owned) |buffer| allocator.free(buffer);
+    const horizontal: []const u8 = if (target_w != source_w) h: {
+        const buffer = try allocator.alloc(u8, @as(usize, source_h) * target_w * ch);
+        horizontal_owned = buffer;
+        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w, filter);
+        defer coefficients.deinit(allocator);
+        for (0..source_h) |y| {
+            for (0..target_w) |x| {
+                const bound = coefficients.bounds[x];
+                const weights = coefficients.weights[x * coefficients.kernel_size ..][0..bound.len];
+                for (0..ch) |channel| {
+                    var sum: i64 = RESAMPLE_ROUNDING_BIAS;
+                    for (weights, 0..) |weight, source_offset| {
+                        const source = (y * source_w + bound.start + source_offset) * ch + channel;
+                        sum += @as(i64, src[source]) * @as(i64, weight);
+                    }
+                    buffer[(y * target_w + x) * ch + channel] = clipFixedResample(sum);
+                }
+            }
+        }
+        break :h buffer;
+    } else src;
+
+    const out = try allocator.alloc(u8, @as(usize, target_h) * target_w * ch);
+    errdefer allocator.free(out);
+    if (target_h != source_h) {
+        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h, filter);
+        defer coefficients.deinit(allocator);
+        for (0..target_h) |y| {
+            const bound = coefficients.bounds[y];
+            const weights = coefficients.weights[y * coefficients.kernel_size ..][0..bound.len];
+            for (0..target_w) |x| {
+                for (0..ch) |channel| {
+                    var sum: i64 = RESAMPLE_ROUNDING_BIAS;
+                    for (weights, 0..) |weight, source_offset| {
+                        const source = ((bound.start + source_offset) * target_w + x) * ch + channel;
+                        sum += @as(i64, horizontal[source]) * @as(i64, weight);
+                    }
+                    out[(y * target_w + x) * ch + channel] = clipFixedResample(sum);
+                }
+            }
+        }
+    } else {
+        @memcpy(out, horizontal);
+    }
+    return out;
+}
+
 /// Number of LLM image-pad tokens an image of resized (H,W) expands to.
 pub fn imageTokenCount(resized: Resized, patch: u32, merge: u32) u32 {
     const gh = resized.h / patch;
@@ -1294,6 +1365,38 @@ test "qwen bicubic RGB preprocessing preserves colors and interpolates" {
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[9 + center], 1e-6);
     try std.testing.expectApproxEqAbs(pillow_center, upsampled[18 + center], 1e-6);
+}
+
+test "resizeInterleavedPil: identity copy, channel independence, u8 domain" {
+    const a = std.testing.allocator;
+    // Same dims: the resampler is an exact copy (identity taps, u8 in/out).
+    const rgba = [_]u8{
+        10, 20, 30, 255, 200, 100, 50, 128,
+        0, 255, 0, 255, 255, 255, 255, 0,
+    };
+    const same = try resizeInterleavedPil(a, &rgba, 2, 2, 2, 2, 4, .lanczos);
+    defer a.free(same);
+    try std.testing.expectEqualSlices(u8, &rgba, same);
+
+    // Channels resample independently: swapping two channels of the source
+    // swaps exactly those channels of the output.
+    var swapped: [rgba.len]u8 = undefined;
+    for (0..rgba.len / 4) |i| {
+        swapped[i * 4 + 0] = rgba[i * 4 + 1];
+        swapped[i * 4 + 1] = rgba[i * 4 + 0];
+        swapped[i * 4 + 2] = rgba[i * 4 + 2];
+        swapped[i * 4 + 3] = rgba[i * 4 + 3];
+    }
+    const out = try resizeInterleavedPil(a, &rgba, 2, 2, 3, 3, 4, .lanczos);
+    defer a.free(out);
+    const out_sw = try resizeInterleavedPil(a, &swapped, 2, 2, 3, 3, 4, .lanczos);
+    defer a.free(out_sw);
+    for (0..out.len / 4) |i| {
+        try std.testing.expectEqual(out[i * 4 + 2], out_sw[i * 4 + 2]);
+        try std.testing.expectEqual(out[i * 4 + 3], out_sw[i * 4 + 3]);
+        try std.testing.expectEqual(out[i * 4 + 0], out_sw[i * 4 + 1]);
+        try std.testing.expectEqual(out[i * 4 + 1], out_sw[i * 4 + 0]);
+    }
 }
 
 test "resampleWeightMatrix reproduces torch's antialiased bilinear on one axis" {

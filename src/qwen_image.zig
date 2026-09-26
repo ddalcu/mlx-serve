@@ -28,15 +28,24 @@ const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");
 const mage_flow = @import("mage_flow.zig");
 const qwen_kernels = @import("qwen_image_kernels.zig");
+const qwen_image_edit = @import("qwen_image_edit.zig");
+const model_discovery = @import("model_discovery.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 const MfLinear = mage_flow.MfLinear;
 const TextEncoder = mage_flow.TextEncoder;
+const VisionTower = mage_flow.VisionTower;
+const stb = @import("stb");
 
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
+
+pub fn resolveSteps(steps: u32) u32 {
+    return if (steps == 0) DEFAULT_STEPS else steps;
+}
+
 const VAE_DOWNSAMPLE: u32 = 16;
 /// Text encoding stays bf16; the DiT defaults to bf16 and the VAE stays f32.
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
@@ -187,6 +196,14 @@ fn sdpa(q: A, k: A, v: A, scale: f32, mode: [*:0]const u8, s: S) !A {
     const none = A{ .ctx = null };
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, none, none, false, s));
+    return o;
+}
+
+/// sdpa with an explicit boolean mask ([.., q_len, kv_len], true = attend).
+fn sdpaMasked(q: A, k: A, v: A, scale: f32, mask: A, s: S) !A {
+    const none = A{ .ctx = null };
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", mask, none, false, s));
     return o;
 }
 
@@ -423,9 +440,8 @@ pub const Geometry = struct {
     }
 };
 
-/// Text is causal and always modulated at t=0, so its per-layer K/V is
-/// invariant across denoising steps. This cache belongs to ONE conditioning
-/// branch of ONE request; positive and negative CFG branches never share it.
+/// The t=0 prefix cannot attend to the target, so its per-layer K/V is
+/// invariant across steps. One cache belongs to one request and CFG branch.
 const PrefixKV = struct {
     k: A,
     v: A,
@@ -459,6 +475,10 @@ const PrefixCache = struct {
         return .{ .allocator = a, .layers = layers, .image_geo = try geo.imageOnly(s) };
     }
 
+    fn initEdit(a: std.mem.Allocator, n_layers: usize, geo: *const EditGeometry, s: S) !PrefixCache {
+        return init(a, n_layers, &geo.ropeGeometry(), s);
+    }
+
     fn deinit(self: *PrefixCache) void {
         for (self.layers) |*kv| if (kv.*) |*pair| pair.deinit();
         self.allocator.free(self.layers);
@@ -481,9 +501,220 @@ const PrefixCache = struct {
     }
 };
 
-fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
+pub fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
 }
+
+// ── Edit (ti2i) geometry ──
+
+/// One run of the edit joint prefix: a text run or a whole image block.
+pub const EditSeg = struct { start: c_int, end: c_int, is_text: bool };
+
+/// Per-request constants of the edit (ti2i) joint sequence: the VLM output
+/// (text 1x, image slots 4x each — one slot is 2x2 latent tokens) with the
+/// target's slots appended and expanded the same way. Block boundaries come
+/// from the img_shapes token counts, never from mask runs (two adjacent
+/// images are separate blocks); the layout is step-invariant, so it builds
+/// once per request and is reused by every step and layer.
+pub const EditGeometry = struct {
+    allocator: std.mem.Allocator,
+    joint_len: c_int,
+    /// First target row; `segments` covers [0, target_start).
+    target_start: c_int,
+    target_tokens: c_int,
+    cos: A, // [1, L, 1, head_dim/2, 1] f32
+    sin: A,
+    /// [L] i32: 1 on text/ref tokens (the t=0 modulation row), 0 on target.
+    mod_row: A,
+    /// [L] i32: -1 at text, a unique id per image block.
+    image_ids: A,
+    /// [L] i32: 1 on target tokens.
+    target_mask: A,
+    segments: []EditSeg,
+    /// Expanded row j reads txt row txt_row[j] (appended target slots read the
+    /// zero pad) and, where img_cond holds, latents row lat_row[j] instead.
+    txt_row: A, // [L] i32
+    lat_row: A, // [L] i32
+    img_cond: A, // [1, L, 1] bool
+
+    /// Borrowed tables; only imageOnly's slices are owned by the cache.
+    fn ropeGeometry(self: *const EditGeometry) Geometry {
+        return .{ .text_len = self.target_start, .cos = self.cos, .sin = self.sin, .mod_row = self.mod_row };
+    }
+
+    /// `n` is the VLM sequence length; `mask` is the pre-expansion joint mask
+    /// (1 at a VLM image slot or an appended target slot, else 0); `shapes`
+    /// are the per-image (frame, lat_h, lat_w) blocks, target last.
+    pub fn init(a: std.mem.Allocator, cfg: DitConfig, n: usize, mask: []const i32, shapes: []const [3]u32) !EditGeometry {
+        if (shapes.len == 0 or mask.len < n) return error.QwenImageBadConfig;
+        if (cfg.axes[0] + cfg.axes[1] + cfg.axes[2] != cfg.head_dim) return error.QwenImageBadConfig;
+        var total_slots: usize = 0;
+        for (shapes) |sh| {
+            // Single frame only: the walk below counts h*w tokens per block.
+            if (sh[0] != 1) return error.QwenImageBadConfig;
+            const tokens: usize = @as(usize, sh[1]) * sh[2];
+            if (tokens == 0 or tokens % 4 != 0) return error.QwenImageBadConfig;
+            total_slots += tokens / 4;
+        }
+        const target_tokens: usize = @as(usize, shapes[shapes.len - 1][1]) * shapes[shapes.len - 1][2];
+        if (target_tokens / 4 != mask.len - n) return error.QwenImageBadConfig;
+        var ones: usize = 0;
+        for (mask) |m| if (m != 0) {
+            ones += 1;
+        };
+        if (ones != total_slots) return error.QwenImageBadConfig;
+
+        // Pre-expansion row -> first expanded row.
+        const off = try a.alloc(usize, mask.len + 1);
+        defer a.free(off);
+        off[0] = 0;
+        for (mask, 0..) |m, p| off[p + 1] = off[p] + @as(usize, if (m != 0) 4 else 1);
+        const L: usize = off[mask.len];
+
+        const frame = try a.alloc(i64, L);
+        defer a.free(frame);
+        const hpos = try a.alloc(i64, L);
+        defer a.free(hpos);
+        const wpos = try a.alloc(i64, L);
+        defer a.free(wpos);
+        const ids = try a.alloc(i32, L);
+        defer a.free(ids);
+        const tgtm = try a.alloc(i32, L);
+        defer a.free(tgtm);
+        const rows = try a.alloc(i32, L);
+        defer a.free(rows);
+        const trow = try a.alloc(i32, L);
+        defer a.free(trow);
+        const lrow = try a.alloc(i32, L);
+        defer a.free(lrow);
+        const icond = try a.alloc(bool, L);
+        defer a.free(icond);
+        @memset(ids, -1);
+        @memset(tgtm, 0);
+        @memset(lrow, 0);
+
+        // The rope walk: text advances a shared position on all axes; an image
+        // block freezes the frame axis there and lays out a zero-centred h/w
+        // grid, then position += max(lat_h, lat_w).
+        var segs: std.ArrayList(EditSeg) = .empty;
+        defer segs.deinit(a);
+        var cursor: usize = 0;
+        var position: i64 = 0;
+        var img_rank: usize = 0;
+        var target_start: usize = 0;
+        for (shapes, 0..) |sh, blk| {
+            const h: usize = sh[1];
+            const w: usize = sh[2];
+            const slots: usize = h * w / 4;
+            var bs: usize = cursor;
+            while (bs < mask.len and mask[bs] == 0) bs += 1;
+            if (bs + slots > mask.len) return error.QwenImageBadConfig;
+            for (bs..bs + slots) |p| if (mask[p] == 0) return error.QwenImageBadConfig;
+            if (bs > cursor) {
+                for (cursor..bs) |p| {
+                    const pos = position + @as(i64, @intCast(p - cursor));
+                    frame[off[p]] = pos;
+                    hpos[off[p]] = pos;
+                    wpos[off[p]] = pos;
+                    trow[off[p]] = @intCast(p);
+                    icond[off[p]] = false;
+                }
+                position += @intCast(bs - cursor);
+                try segs.append(a, .{ .start = @intCast(off[cursor]), .end = @intCast(off[bs]), .is_text = true });
+            }
+            const e0: usize = off[bs];
+            const h0: i64 = -@as(i64, @intCast(h - h / 2));
+            const w0: i64 = -@as(i64, @intCast(w - w / 2));
+            for (0..h * w) |t| {
+                const e = e0 + t;
+                frame[e] = position;
+                hpos[e] = h0 + @as(i64, @intCast(t / w));
+                wpos[e] = w0 + @as(i64, @intCast(t % w));
+                ids[e] = @intCast(blk);
+                trow[e] = @intCast(bs + t / 4);
+                lrow[e] = @intCast(img_rank + t);
+                icond[e] = true;
+            }
+            if (blk + 1 == shapes.len) {
+                target_start = e0;
+                @memset(tgtm[e0..e0 + h * w], 1);
+            } else {
+                // The target block is not a prefix segment: its rows are the
+                // maskless target query range.
+                try segs.append(a, .{ .start = @intCast(e0), .end = @intCast(e0 + h * w), .is_text = false });
+            }
+            img_rank += h * w;
+            position += @intCast(@max(h, w));
+            cursor = bs + slots;
+        }
+        if (cursor < mask.len) {
+            for (cursor..mask.len) |p| {
+                const pos = position + @as(i64, @intCast(p - cursor));
+                frame[off[p]] = pos;
+                hpos[off[p]] = pos;
+                wpos[off[p]] = pos;
+                trow[off[p]] = @intCast(p);
+                icond[off[p]] = false;
+            }
+            try segs.append(a, .{ .start = @intCast(off[cursor]), .end = @intCast(L), .is_text = true });
+        }
+        for (0..L) |p| rows[p] = 1 - tgtm[p];
+
+        // f32 tables throughout, like the reference's numpy tables.
+        const half: usize = cfg.head_dim / 2;
+        const cosb = try a.alloc(f32, L * half);
+        defer a.free(cosb);
+        const sinb = try a.alloc(f32, L * half);
+        defer a.free(sinb);
+        for (0..L) |p| {
+            const pos = [3]i64{ frame[p], hpos[p], wpos[p] };
+            var col: usize = 0;
+            for (cfg.axes, pos) |dim, ax_pos| {
+                for (0..dim / 2) |kk| {
+                    const expo = @as(f32, @floatFromInt(2 * kk)) / @as(f32, @floatFromInt(dim));
+                    const omega: f32 = 1.0 / std.math.pow(f32, 10000.0, expo);
+                    const ang: f32 = @as(f32, @floatFromInt(ax_pos)) * omega;
+                    cosb[p * half + col] = @cos(ang);
+                    sinb[p * half + col] = @sin(ang);
+                    col += 1;
+                }
+            }
+        }
+        const segments = try segs.toOwnedSlice(a);
+        errdefer a.free(segments);
+
+        const tsh = [_]c_int{ 1, @intCast(L), 1, @intCast(half), 1 };
+        const lsh = [_]c_int{@intCast(L)};
+        const csh = [_]c_int{ 1, @intCast(L), 1 };
+        return .{
+            .allocator = a,
+            .joint_len = @intCast(L),
+            .target_start = @intCast(target_start),
+            .target_tokens = @intCast(target_tokens),
+            .cos = mlx.mlx_array_new_data(cosb.ptr, &tsh, tsh.len, .float32),
+            .sin = mlx.mlx_array_new_data(sinb.ptr, &tsh, tsh.len, .float32),
+            .mod_row = mlx.mlx_array_new_data(rows.ptr, &lsh, lsh.len, .int32),
+            .image_ids = mlx.mlx_array_new_data(ids.ptr, &lsh, lsh.len, .int32),
+            .target_mask = mlx.mlx_array_new_data(tgtm.ptr, &lsh, lsh.len, .int32),
+            .segments = segments,
+            .txt_row = mlx.mlx_array_new_data(trow.ptr, &lsh, lsh.len, .int32),
+            .lat_row = mlx.mlx_array_new_data(lrow.ptr, &lsh, lsh.len, .int32),
+            .img_cond = mlx.mlx_array_new_data(icond.ptr, &csh, csh.len, .bool_),
+        };
+    }
+
+    pub fn deinit(self: *EditGeometry) void {
+        free(self.cos);
+        free(self.sin);
+        free(self.mod_row);
+        free(self.image_ids);
+        free(self.target_mask);
+        free(self.txt_row);
+        free(self.lat_row);
+        free(self.img_cond);
+        self.allocator.free(self.segments);
+    }
+};
 
 const Block = struct {
     q: MfLinear,
@@ -569,9 +800,21 @@ pub const Dit = struct {
         self.txt_norm = try addScalar(tn, 1.0, s);
         self.txt_in = try loadLinear(&w, a, cfg.context, dtype, s, "txt_in.in_layer", .{});
         self.txt_out = try loadLinear(&w, a, H, dtype, s, "txt_in.out_layer", .{});
-        self.t1 = try loadLinear(&w, a, 256, dtype, s, "time_text_embed.timestep_embedder.linear_1", .{});
-        self.t2 = try loadLinear(&w, a, H, dtype, s, "time_text_embed.timestep_embedder.linear_2", .{});
-        self.modulation = try loadLinear(&w, a, H, dtype, s, "modulation.1", .{});
+        // ddalcu/diffusers spell the time embedder nested + modulation.1;
+        // mlx-community flattens both — probe which naming is on disk.
+        const t_nested = w.get("time_text_embed.timestep_embedder.linear_1.weight") != null;
+        self.t1 = if (t_nested)
+            try loadLinear(&w, a, 256, dtype, s, "time_text_embed.timestep_embedder.linear_1", .{})
+        else
+            try loadLinear(&w, a, 256, dtype, s, "time_text_embed.linear_1", .{});
+        self.t2 = if (t_nested)
+            try loadLinear(&w, a, H, dtype, s, "time_text_embed.timestep_embedder.linear_2", .{})
+        else
+            try loadLinear(&w, a, H, dtype, s, "time_text_embed.linear_2", .{});
+        self.modulation = if (w.get("modulation.1.weight") != null)
+            try loadLinear(&w, a, H, dtype, s, "modulation.1", .{})
+        else
+            try loadLinear(&w, a, H, dtype, s, "modulation.0", .{});
         self.norm_out = try loadLinear(&w, a, H, dtype, s, "norm_out.linear", .{});
         self.proj_out = try loadLinear(&w, a, H, dtype, s, "proj_out", .{});
 
@@ -842,7 +1085,250 @@ pub const Dit = struct {
         if (cache) |c| if (!cached) try c.materialize(output);
         return output;
     }
+
+    // ── Edit (ti2i) forward ──
+
+    /// `stepMod` with the edit row selection: target tokens read the sampled-t
+    /// row, text and condition-image tokens the t=0 row.
+    fn editStepMod(self: *const Dit, temb_act: A, mod_row: A) !StepMod {
+        const s = self.s;
+        const H: c_int = @intCast(self.cfg.hidden());
+        const mod = try self.modulation.forward(temb_act, null, s);
+        defer free(mod);
+        const opm = try addScalar(mod, 1.0, s);
+        defer free(opm);
+        const th = try tanhA(mod, s);
+        defer free(th);
+        var out: [4]A = undefined;
+        for (&out, 0..) |*o, i| {
+            const src = if (i % 2 == 0) opm else th;
+            const lo: c_int = @as(c_int, @intCast(i)) * H;
+            const part = try sliceAxis(src, 1, lo, lo + H, s);
+            defer free(part);
+            var rows = mlx.mlx_array_new();
+            defer free(rows);
+            try mlx.check(mlx.mlx_take_axis(&rows, part, mod_row, 0, s));
+            o.* = try reshape(rows, &[_]c_int{ 1, -1, H }, s);
+        }
+        return .{ .scale1 = out[0], .gate1 = out[1], .scale2 = out[2], .gate2 = out[3] };
+    }
+
+    /// `applyRope` over the edit tables (same layout as the t2i ones).
+    fn editApplyRope(self: *const Dit, x: A, cos: A, sin: A) !A {
+        const s = self.s;
+        const sh = mlx.getShape(x);
+        const half = @divExact(sh[3], 2);
+        const xf = try astype(x, .float32, s);
+        defer free(xf);
+        const pairs = try reshape(xf, &[_]c_int{ sh[0], sh[1], sh[2], half, 2 }, s);
+        defer free(pairs);
+        const re = try sliceAxis(pairs, 4, 0, 1, s);
+        defer free(re);
+        const im = try sliceAxis(pairs, 4, 1, 2, s);
+        defer free(im);
+        const rc = try mulA(re, cos, s);
+        defer free(rc);
+        const is_ = try mulA(im, sin, s);
+        defer free(is_);
+        const o_re = try subA(rc, is_, s);
+        defer free(o_re);
+        const rs = try mulA(re, sin, s);
+        defer free(rs);
+        const ic = try mulA(im, cos, s);
+        defer free(ic);
+        const o_im = try addA(rs, ic, s);
+        defer free(o_im);
+        const joined = try concat(&.{ o_re, o_im }, 4, s);
+        defer free(joined);
+        const flat = try reshape(joined, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, s);
+        defer free(flat);
+        return astype(flat, self.dtype, s);
+    }
+
+    /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
+    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
+        const s = self.s;
+        const sh = mlx.getShape(x);
+        const y = try lin.forward(x, null, s);
+        defer free(y);
+        const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
+        defer free(y4);
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const nw = norm orelse return transpose(y4, &perm, s);
+        const yn = try rmsNorm(y4, nw, self.cfg.eps, s);
+        defer free(yn);
+        const yr = try self.editApplyRope(yn, geo.cos, geo.sin);
+        defer free(yr);
+        return transpose(yr, &perm, s);
+    }
+
+    fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
+        const s = self.s;
+        const sh = mlx.getShape(x);
+        const q = try self.editHeadsOf(&b.q, b.norm_q, x, rope);
+        defer free(q);
+        const k = try self.editHeadsOf(&b.k, b.norm_k, x, rope);
+        defer free(k);
+        const v = try self.editHeadsOf(&b.v, null, x, rope);
+        defer free(v);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
+        const attn = if (cached) blk: {
+            const pair = slot.?.*.?;
+            const keys = try concat(&.{ pair.k, k }, 2, s);
+            defer free(keys);
+            const values = try concat(&.{ pair.v, v }, 2, s);
+            defer free(values);
+            break :blk try sdpa(q, keys, values, scale, "", s);
+        } else blk: {
+            if (slot) |kv| kv.* = try PrefixKV.capture(k, v, geo.target_start, s);
+            break :blk try segmentSdpaWalk(q, k, v, geo, scale, s, self.allocator);
+        };
+        defer free(attn);
+        const back = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer free(back);
+        const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
+        defer free(flat);
+        return b.o.forward(flat, null, s);
+    }
+
+    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
+        const s = self.s;
+        const n1 = try layerNorm(x, self.cfg.eps, s);
+        defer free(n1);
+        const a_in = try mulA(n1, mod.scale1, s);
+        defer free(a_in);
+        const attn = try self.editAttention(b, a_in, geo, rope, slot, cached);
+        defer free(attn);
+        const ga = try mulA(attn, mod.gate1, s);
+        defer free(ga);
+        const h = try addA(x, ga, s);
+        defer free(h);
+
+        const n2 = try layerNorm(h, self.cfg.eps, s);
+        defer free(n2);
+        const m_in = try mulA(n2, mod.scale2, s);
+        defer free(m_in);
+        const g = try b.gate.forward(m_in, null, s);
+        defer free(g);
+        const sg = try silu(g, s);
+        defer free(sg);
+        const p = try b.proj.forward(m_in, null, s);
+        defer free(p);
+        const gp = try mulA(sg, p, s);
+        defer free(gp);
+        const mlp = try b.out.forward(gp, null, s);
+        defer free(mlp);
+        const gm = try mulA(mlp, mod.gate2, s);
+        defer free(gm);
+        return addA(h, gm, s);
+    }
+
+    /// Velocity for one edit flow step: `latents` are the PACKED [refs |
+    /// target] latent tokens, `hidden` the VLM output; the joint sequence
+    /// (VLM slots expanded 4x, ref latents substituted in order, target rows
+    /// appended) lives in `geo` — `mask` is what `geo` was built from.
+    /// Returns the target rows [1, target_tokens, out_ch].
+    pub fn forwardEdit(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry) !A {
+        return self.forwardEditCached(latents, hidden, mask, t, geo, null);
+    }
+
+    /// First call receives [refs | target]; once ready, only target latents
+    /// enter the DiT. The original block-causal prefix and RoPE stay fixed.
+    fn forwardEditCached(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry, cache: ?*PrefixCache) !A {
+        _ = mask;
+        const s = self.s;
+        const cached = if (cache) |c| c.ready else false;
+        const full_rope = geo.ropeGeometry();
+        const rope = if (cached) &cache.?.image_geo else &full_rope;
+        const temb = try self.timeEmbed(t);
+        defer free(temb);
+        const temb_act = try silu(temb, s);
+        defer free(temb_act);
+        var mod = try self.editStepMod(temb_act, rope.mod_row);
+        defer mod.deinit();
+
+        const H: c_int = @intCast(self.cfg.hidden());
+        var x = if (cached) try self.img_in.forward(latents, null, s) else blk: {
+            const th = try self.textIn(hidden);
+            defer free(th);
+            var zeros = mlx.mlx_array_new();
+            defer free(zeros);
+            const zsh = [_]c_int{ 1, @divExact(geo.target_tokens, 4), H };
+            try mlx.check(mlx.mlx_zeros(&zeros, &zsh, zsh.len, self.dtype, s));
+            const joint_txt = try concat(&.{ th, zeros }, 1, s);
+            defer free(joint_txt);
+            var txt_rows = mlx.mlx_array_new();
+            defer free(txt_rows);
+            try mlx.check(mlx.mlx_take_axis(&txt_rows, joint_txt, geo.txt_row, 1, s));
+            const lat = try self.img_in.forward(latents, null, s);
+            defer free(lat);
+            var lat_rows = mlx.mlx_array_new();
+            defer free(lat_rows);
+            try mlx.check(mlx.mlx_take_axis(&lat_rows, lat, geo.lat_row, 1, s));
+            var joint = mlx.mlx_array_new();
+            errdefer free(joint);
+            try mlx.check(mlx.mlx_where(&joint, geo.img_cond, lat_rows, txt_rows, s));
+            break :blk joint;
+        };
+        defer free(x);
+        for (self.blocks, 0..) |*b, i| {
+            const slot = if (cache) |c| &c.layers[i] else null;
+            const nx = try self.editBlockForward(b, x, &mod, geo, rope, slot, cached);
+            free(x);
+            x = nx;
+        }
+        // Prefix rows use t=0; target-only steps retain their original t row.
+        const n = try layerNorm(x, self.cfg.eps, s);
+        defer free(n);
+        const sc2 = try self.norm_out.forward(temb_act, null, s);
+        defer free(sc2);
+        var sel = mlx.mlx_array_new();
+        defer free(sel);
+        try mlx.check(mlx.mlx_take_axis(&sel, sc2, rope.mod_row, 0, s));
+        const selr = try reshape(sel, &[_]c_int{ 1, -1, H }, s);
+        defer free(selr);
+        const opsc = try addScalar(selr, 1.0, s);
+        defer free(opsc);
+        const scaled = try mulA(n, opsc, s);
+        defer free(scaled);
+        const out = try self.proj_out.forward(scaled, null, s);
+        defer free(out);
+        const result = try sliceAxis(out, 1, if (cached) 0 else geo.target_start, mlx.getShape(out)[1], s);
+        errdefer free(result);
+        if (cache) |c| if (!cached) try c.materialize(result);
+        return result;
+    }
 };
+
+/// Block-causal attention over the edit joint sequence, as the reference
+/// segments it: a text run is causal over kv[0..end) (mlx causal carries the
+/// kv−q offset, so the fully visible prefix plus the run's own triangle is one
+/// call), an image block and the target rows attend maskless up to their end.
+fn segmentSdpaWalk(q: A, k: A, v: A, geo: *const EditGeometry, scale: f32, s: S, a: std.mem.Allocator) !A {
+    const L: c_int = @intCast(mlx.getShape(q)[2]);
+    const outs = try a.alloc(A, geo.segments.len + 1);
+    defer a.free(outs);
+    var filled: usize = 0;
+    errdefer for (outs[0..filled]) |o| free(o);
+    for (geo.segments) |seg| {
+        const qs = try sliceAxis(q, 2, seg.start, seg.end, s);
+        defer free(qs);
+        const ks = try sliceAxis(k, 2, 0, seg.end, s);
+        defer free(ks);
+        const vs = try sliceAxis(v, 2, 0, seg.end, s);
+        defer free(vs);
+        const mode: [*:0]const u8 = if (seg.is_text) "causal" else "";
+        outs[filled] = try sdpa(qs, ks, vs, scale, mode, s);
+        filled += 1;
+    }
+    const qt = try sliceAxis(q, 2, geo.target_start, L, s);
+    defer free(qt);
+    outs[filled] = try sdpa(qt, k, v, scale, "", s);
+    filled += 1;
+    const joined = try concat(outs[0..filled], 2, s);
+    for (outs[0..filled]) |o| free(o);
+    return joined;
+}
 
 // ── VAE (f32, NHWC inside) ──
 
@@ -1420,6 +1906,37 @@ pub const VaeEncoder = struct {
         defer free(normed);
         return transpose(normed, &[_]c_int{ 0, 3, 1, 2 }, s);
     }
+
+    /// RGBA pixels [1, 4, H, W] f32 (alpha last, any range) → normalized
+    /// latent mean [1, z, H/16, W/16]. Same body as `encode` minus the const-1
+    /// alpha append: the input already carries a real mask channel.
+    pub fn encodeRgba(self: *const VaeEncoder, image: A) !A {
+        const s = self.h.s;
+        const nhwc = try transpose(image, &[_]c_int{ 0, 2, 3, 1 }, s);
+        defer free(nhwc);
+        var x = try self.h.conv_in.forward(nhwc, 1, 1, s);
+        errdefer free(x);
+        for (self.h.stages) |*st| {
+            const nx = try st.down(x, s);
+            free(x);
+            x = nx;
+            try mlx.check(mlx.mlx_array_eval(x));
+        }
+        defer free(x);
+        const m = try self.h.mid.forward(x, s);
+        defer free(m);
+        const moments = try self.h.head(m);
+        defer free(moments);
+        const q = try self.h.quant.forward(moments, 1, 0, s);
+        defer free(q);
+        const mu = try sliceAxis(q, 3, 0, self.z_dim, s);
+        defer free(mu);
+        const centered = try subA(mu, self.h.mean, s);
+        defer free(centered);
+        const normed = try divA(centered, self.h.std, s);
+        defer free(normed);
+        return transpose(normed, &[_]c_int{ 0, 3, 1, 2 }, s);
+    }
 };
 
 // ── Engine ──
@@ -1455,6 +1972,52 @@ fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
     return if (!explicit_env and q.quantized and q.bits == 4) 1024 else null;
 }
 
+pub const EditOpts = struct {
+    guidance_scale: f32 = 1.0,
+    negative_prompt: []const u8 = "",
+    /// Selected by request memory admission; direct callers default to uncached.
+    prefix_cache: bool = false,
+    /// Reference conditioning resolution — diffusers' per-call
+    /// `output_resolution` knob. Lower = fewer joint tokens per ref (speed)
+    /// at conditioning-fidelity cost; 1024 is the trained regime.
+    ref_resolution: u32 = EDIT_REF_RESOLUTION,
+};
+
+/// diffusers calculate_dimensions: source aspect at output_resolution², round() each side.
+pub fn editTargetSize(src_w: u32, src_h: u32, output_resolution: u32) struct { w: u32, h: u32 } {
+    const wf: f64 = @floatFromInt(src_w);
+    const hf: f64 = @floatFromInt(src_h);
+    const res: f64 = @floatFromInt(output_resolution);
+    const w: u32 = @intFromFloat(@round(@sqrt(res * res * (wf / hf))));
+    // Multiply by src_h before dividing by src_w: an exact .5 quotient (a 4:3
+    // source) stays exact in f64, so half-away rounding sees the true half.
+    const h: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(w)) * hf / wf));
+    return .{ .w = w, .h = h };
+}
+
+/// The pipeline's default output_resolution — every condition image resizes
+/// at its square, whatever the target's own size.
+const EDIT_REF_RESOLUTION: u32 = 1024;
+
+/// round(x/32)*32 with a u64 intermediate (x+16 can wrap u32); floored at 32 —
+/// the grid the slot math needs (smart_resize's own `max(factor, …)` floor).
+/// gen.zig's `qwenSnap32` is the wire-side twin (aligned then capped); keep
+/// the two in sync.
+fn snap32(x: u32) u32 {
+    const r: u64 = (@as(u64, x) + 16) / 32 * 32;
+    const cap: u64 = @as(u64, std.math.maxInt(u32)) / 32 * 32;
+    return @intCast(@min(@max(r, 32), cap));
+}
+
+/// A reference's resize target: its aspect at the request's ref resolution²
+/// (`EditOpts.ref_resolution` — diffusers' `output_resolution` per-call knob),
+/// each side onto the /32 grid. /32 keeps the grid the slot math needs
+/// (smart_resize's own `max(factor, …)` floor).
+fn refResizeDimsAt(src_w: u32, src_h: u32, res: u32) struct { w: u32, h: u32 } {
+    const t = editTargetSize(src_w, src_h, res);
+    return .{ .w = snap32(t.w), .h = snap32(t.h) };
+}
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1474,6 +2037,9 @@ pub const Engine = struct {
     te: ?TextEncoder = null,
     /// Loaded on the first img2img request; txt2img never pays for it.
     vae_enc: ?VaeEncoder = null,
+    /// The pack's text_encoder/ carries the Qwen3-VL tower (edit capability),
+    /// probed at load by `towerPresentIn`; the tower weights load on demand.
+    has_tower: bool = false,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool) !*Engine {
         const dit_cfg = try DitConfig.parse(io, allocator, model_dir);
@@ -1493,6 +2059,7 @@ pub const Engine = struct {
             .staged = staged,
         };
         errdefer allocator.free(self.model_dir);
+        self.has_tower = towerPresentIn(io, allocator, self.model_dir);
         self.vae_cfg = try VaeConfig.parse(io, allocator, model_dir);
         errdefer self.vae_cfg.deinit(allocator);
 
@@ -1569,10 +2136,41 @@ pub const Engine = struct {
         return .{ .pos = pos, .neg = neg };
     }
 
+    /// One ti2i conditioning arm: template (the negative renders through it
+    /// too, only the text differs) → tokenize (text-capped like t2i) →
+    /// placeholder expansion → the joint VLM encode. Mask all-ones: one
+    /// unpadded prompt, exactly what the processor emits for batch 1.
+    fn encodeTi2iPrompt(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        te: *TextEncoder,
+        vit: *const VisionTower,
+        prompt: []const u8,
+        slots_per_image: []const usize,
+        pixel_values: A,
+        grids: []const [3]i64,
+    ) !qwen_image_edit.EditCond {
+        const a = allocator;
+        const text = try qwen_image_edit.buildTi2iPrompt(a, prompt, slots_per_image.len);
+        defer a.free(text);
+        const enc = try self.tok.encode(a, text);
+        defer a.free(enc);
+        const n = @min(enc.len, MAX_PROMPT_TOKENS);
+        const ids = try a.alloc(i32, n);
+        defer a.free(ids);
+        for (enc[0..n], 0..) |t, i| ids[i] = @intCast(t);
+        const expanded = try qwen_image_edit.expandImagePads(a, ids, slots_per_image);
+        defer a.free(expanded);
+        const mask = try a.alloc(i32, expanded.len);
+        defer a.free(mask);
+        @memset(mask, 1);
+        return qwen_image_edit.encodeTi2i(a, self.s, te, vit, expanded, mask, pixel_values, grids, self.drop_tokens);
+    }
+
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !A {
         const s = self.s;
-        const n_steps: u32 = if (steps == 0) DEFAULT_STEPS else steps;
+        const n_steps = resolveSteps(steps);
         const lat_h: usize = height / VAE_DOWNSAMPLE;
         const lat_w: usize = width / VAE_DOWNSAMPLE;
         const n_img: c_int = @intCast(lat_h * lat_w);
@@ -1683,7 +2281,264 @@ pub const Engine = struct {
         defer free(mixed);
         return astype(mixed, self.dit.dtype, s);
     }
+
+    /// True when the pack's text_encoder/ carries the Qwen3-VL tower (edit capability).
+    pub fn supportsEdit(self: *const Engine) bool {
+        return self.has_tower;
+    }
+
+    /// Instruction edit: Qwen3-VL joint conditioning over the reference
+    /// images, their clean VAE latents held constant beside the denoising
+    /// target. Mirrors `generateImage`'s conventions (seeded noise, Euler
+    /// sigma loop, real CFG blend, per-step progress, banded VAE decode).
+    /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
+    pub fn editImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8,
+        image_bytes: []const []const u8, out_w: u32, out_h: u32, seed: u64, steps: u32,
+        opts: EditOpts, progress: ?sse.Progress) !mlx.mlx_array
+    {
+        if (!self.has_tower) return error.QwenEditNotImplemented;
+        if (image_bytes.len == 0) return error.NoReferenceImages;
+        const a = allocator;
+        const s = self.s;
+        const n_steps = resolveSteps(steps);
+        const lat_h: usize = out_h / VAE_DOWNSAMPLE;
+        const lat_w: usize = out_w / VAE_DOWNSAMPLE;
+        const target_tokens: usize = lat_h * lat_w;
+        const n_img: c_int = @intCast(target_tokens);
+        const z: c_int = @intCast(self.dit_cfg.in_ch);
+
+        log.info("[qwen-image] edit {d}x{d} refs={d} steps={d} guidance={d:.1} refres={d} ({s})\n", .{
+            out_w,                      out_h,  image_bytes.len, n_steps, opts.guidance_scale, opts.ref_resolution,
+            if (opts.guidance_scale != 1.0) "two forwards per step" else "one forward per step",
+        });
+        if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
+
+        // 1. Per reference: decode, resize at its own aspect, patchify for the
+        //    tower, VAE-encode the clean latent. The patch grid and the latent
+        //    grid are the same pixels/16 (one DiT token per 16px tile).
+        if (self.vae_enc == null) self.vae_enc = try VaeEncoder.load(self.io, self.allocator, s, self.model_dir, self.vae_cfg);
+        var pv_chunks: std.ArrayList(A) = .empty;
+        defer {
+            for (pv_chunks.items) |p| free(p);
+            pv_chunks.deinit(a);
+        }
+        var ref_lats: std.ArrayList(A) = .empty;
+        defer {
+            for (ref_lats.items) |l| free(l);
+            ref_lats.deinit(a);
+        }
+        var grids: std.ArrayList([3]i64) = .empty;
+        defer grids.deinit(a);
+        var shapes: std.ArrayList([3]u32) = .empty;
+        defer shapes.deinit(a);
+        var slots: std.ArrayList(usize) = .empty;
+        defer slots.deinit(a);
+        // Capacity up front: the per-ref appends are assume-capacity, so a
+        // failed ref leaks nothing it already handed to the lists.
+        try pv_chunks.ensureTotalCapacity(a, image_bytes.len);
+        try ref_lats.ensureTotalCapacity(a, image_bytes.len);
+        try grids.ensureTotalCapacity(a, image_bytes.len);
+        try shapes.ensureTotalCapacity(a, image_bytes.len);
+        try slots.ensureTotalCapacity(a, image_bytes.len);
+
+        for (image_bytes) |bytes| {
+            var sw: c_int = 0;
+            var sh: c_int = 0;
+            var ch: c_int = 0;
+            if (stb.stbi_info_from_memory(bytes.ptr, @intCast(bytes.len), &sw, &sh, &ch) == 0) return error.ImageDecodeFailed;
+            const tgt = refResizeDimsAt(@intCast(sw), @intCast(sh), opts.ref_resolution);
+            var e_owned = true;
+            var e = try qwen_image_edit.prepareEditImage(a, s, bytes, tgt.w, tgt.h);
+            errdefer if (e_owned) e.deinit();
+            const gh: u32 = tgt.h / VAE_DOWNSAMPLE;
+            const gw: u32 = tgt.w / VAE_DOWNSAMPLE;
+            const pv = try qwen_image_edit.vlmPixelValues(a, s, e.rgb, gh, gw);
+            errdefer free(pv);
+            const lat_mean = try self.vae_enc.?.encodeRgba(e.vae_in); // [1, z, gh, gw]
+            e.deinit();
+            e_owned = false;
+            // Pack [1, tokens, z] like `noisedSource`; refs stay CLEAN (constant
+            // across steps — never noised, never re-encoded).
+            const nhwc = try transpose(lat_mean, &[_]c_int{ 0, 2, 3, 1 }, s);
+            free(lat_mean);
+            const packed_z = try reshape(nhwc, &[_]c_int{ 1, @intCast(gh * gw), z }, s);
+            free(nhwc);
+            const lat = try astype(packed_z, COMPUTE, s);
+            free(packed_z);
+            pv_chunks.appendAssumeCapacity(pv);
+            ref_lats.appendAssumeCapacity(lat);
+            grids.appendAssumeCapacity(.{ 1, @intCast(gh), @intCast(gw) });
+            shapes.appendAssumeCapacity(.{ 1, @intCast(gh), @intCast(gw) });
+            slots.appendAssumeCapacity(@as(usize, gh) * gw / 4);
+        }
+        const pixel_values = try concat(pv_chunks.items, 0, s);
+        defer free(pixel_values);
+        const ref_latents = try concat(ref_lats.items, 1, s); // [1, ref_tokens, z]
+        defer free(ref_latents);
+
+        // 2. Conditioning (positive, + negative when guiding — a blank negative
+        //    still encodes, t2i's convention): TE and tower load as ONE
+        //    per-request unit and free before the denoise. A resident
+        //    text-only TE frees first — exactly one LM is ever live, staged
+        //    or not (the next t2i request reloads it lazily).
+        if (self.te) |*te| {
+            te.deinit();
+            self.te = null;
+            _ = mlx.mlx_clear_cache();
+        }
+        var vlm = try qwen_image_edit.loadTeWithTower(self.io, self.allocator, s, self.model_dir, COMPUTE);
+        var vlm_freed = false;
+        defer if (!vlm_freed) {
+            vlm.te.deinit();
+            vlm.vit.deinit();
+        };
+        var cond = try self.encodeTi2iPrompt(a, &vlm.te, &vlm.vit, prompt, slots.items, pixel_values, grids.items);
+        defer cond.deinit(a);
+        var neg_cond: ?qwen_image_edit.EditCond = if (opts.guidance_scale != 1.0)
+            try self.encodeTi2iPrompt(a, &vlm.te, &vlm.vit, opts.negative_prompt, slots.items, pixel_values, grids.items)
+        else
+            null;
+        defer if (neg_cond) |*nc| nc.deinit(a);
+        vlm.te.deinit();
+        vlm.vit.deinit();
+        vlm_freed = true;
+        _ = mlx.mlx_clear_cache();
+        logMemory("edit conditioning");
+
+        // 3. Target noise — the t2i seed semantics on the target's token grid.
+        var key = mlx.mlx_array_new();
+        defer free(key);
+        try mlx.check(mlx.mlx_random_key(&key, seed));
+        const nsh = [_]c_int{ 1, n_img, z };
+        var noise = mlx.mlx_array_new();
+        defer free(noise);
+        try mlx.check(mlx.mlx_random_normal(&noise, &nsh, 3, .float32, 0.0, 1.0, key, s));
+        var target = try astype(noise, COMPUTE, s);
+        defer free(target);
+
+        // 4. Joint geometry: pre-expansion mask = VLM pad mask ++ target-slot
+        //    ones; shapes = per-ref grids with the target LAST. The negative
+        //    arm gets its OWN mask/geometry (its text length differs).
+        const target_slots: usize = target_tokens / 4;
+        try shapes.append(a, .{ 1, @intCast(lat_h), @intCast(lat_w) });
+        const mask_pos = try a.alloc(i32, cond.n + target_slots);
+        defer a.free(mask_pos);
+        @memcpy(mask_pos[0..cond.n], cond.pad_mask);
+        @memset(mask_pos[cond.n..], 1);
+        var geo = try EditGeometry.init(a, self.dit_cfg, cond.n, mask_pos, shapes.items);
+        defer geo.deinit();
+        var neg_geo: ?EditGeometry = null;
+        defer if (neg_geo) |*g| g.deinit();
+        var mask_neg: ?[]i32 = null;
+        defer if (mask_neg) |m| a.free(m);
+        if (neg_cond) |*nc| {
+            mask_neg = try a.alloc(i32, nc.n + target_slots);
+            @memcpy(mask_neg.?[0..nc.n], nc.pad_mask);
+            @memset(mask_neg.?[nc.n..], 1);
+            neg_geo = try EditGeometry.init(a, self.dit_cfg, nc.n, mask_neg.?, shapes.items);
+        }
+
+        // 5. The mu/shift input counts TARGET tokens only (the reference
+        //    pipeline feeds the target latents' length, never the joint's).
+        const sigmas = try computeSigmas(a, n_steps, @intCast(target_tokens));
+        defer a.free(sigmas);
+
+        // 6. Euler denoise: the packed stream is [refs (constant clean) |
+        //    target]; only the target rows step.
+        {
+            const use_cache = n_steps > 1 and opts.prefix_cache;
+            var cache: ?PrefixCache = if (use_cache) try PrefixCache.initEdit(a, self.dit.blocks.len, &geo, s) else null;
+            defer if (cache) |*c| c.deinit();
+            var neg_cache: ?PrefixCache = if (use_cache and neg_geo != null) try PrefixCache.initEdit(a, self.dit.blocks.len, &neg_geo.?, s) else null;
+            defer if (neg_cache) |*c| c.deinit();
+            log.info("[qwen-image] edit prefix cache enabled={} target={d} prefix={d} negative_prefix={d}\n", .{
+                use_cache, geo.target_tokens, geo.target_start, if (neg_geo) |ng| ng.target_start else @as(c_int, 0),
+            });
+            for (0..n_steps) |i| {
+                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                const model_input = if (use_cache and cache.?.ready) try contig(target, s) else try concat(&.{ ref_latents, target }, 1, s);
+                defer free(model_input);
+                var v = try self.dit.forwardEditCached(model_input, cond.hidden, mask_pos, sigmas[i], &geo, if (cache) |*c| c else null);
+                defer free(v);
+                if (neg_cond) |*nc| {
+                    // uncond + scale·(cond − uncond)
+                    const vn = try self.dit.forwardEditCached(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
+                    defer free(vn);
+                    const diff = try subA(v, vn, s);
+                    defer free(diff);
+                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
+                    defer free(scaled);
+                    const blended = try addA(vn, scaled, s);
+                    free(v);
+                    v = blended;
+                }
+                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
+                defer free(dv);
+                const next = try addA(target, dv, s);
+                free(target);
+                target = next;
+                try mlx.check(mlx.mlx_array_eval(target));
+                if (i == 0 and use_cache) log.info("[qwen-image] edit prefix cached: {d} layers, {d} branch(es); remaining steps target-only\n", .{
+                    self.dit.blocks.len, @as(u32, if (neg_cache != null) 2 else 1),
+                });
+                if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
+            }
+        } // Release every branch's K/V before the VAE decode working set.
+
+        // 7. Decode the target rows only — same unpack + banded path as t2i.
+        logMemory("denoise");
+        if (progress) |p| p.emit("Decoding image", n_steps, n_steps);
+        const grid = try reshape(target, &[_]c_int{ 1, @intCast(lat_h), @intCast(lat_w), z }, s);
+        defer free(grid);
+        const latent = try transpose(grid, &[_]c_int{ 0, 3, 1, 2 }, s);
+        defer free(latent);
+        const decoded = try self.vae.decode(latent);
+        defer free(decoded);
+        try mlx.check(mlx.mlx_array_eval(decoded));
+        logMemory("vae decode");
+        return denormImage(decoded, s);
+    }
 };
+
+/// Header-peek: does {model_dir}/text_encoder carry tower keys
+/// (`model.visual.*` or `vision_tower.*`)?
+pub fn towerPresentIn(io: anytype, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const te_path = std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir}) catch return false;
+    defer allocator.free(te_path);
+    var dir = std.Io.Dir.openDirAbsolute(io, te_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+
+    // The index names the shards; anything else is not peeked (indexShardSet policy).
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        if (towerShardHasVisual(io, allocator, dir, entry.name)) return true;
+    }
+    return false;
+}
+
+const tower_header_limit: usize = 64 * 1024 * 1024;
+
+/// Substring scan of one shard's safetensors JSON header for the tower keys —
+/// `model.visual.` (diffusers/ddalcu) or `vision_tower.` (mlx-community).
+fn towerShardHasVisual(io: anytype, allocator: std.mem.Allocator, dir: std.Io.Dir, name: []const u8) bool {
+    const f = dir.openFile(io, name, .{}) catch return false;
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const header_len = rs.interface.takeInt(u64, .little) catch return false;
+    if (header_len == 0 or header_len > tower_header_limit) return false;
+    const header = allocator.alloc(u8, @intCast(header_len)) catch return false;
+    defer allocator.free(header);
+    rs.interface.readSliceAll(header) catch return false;
+    return std.mem.indexOf(u8, header, "model.visual.") != null or
+        std.mem.indexOf(u8, header, "\"vision_tower.") != null;
+}
 
 /// [-1,1] → clip(x·0.5 + 0.5, 0, 1).
 fn denormImage(decoded: A, s: S) !A {
@@ -1775,6 +2630,120 @@ test "QwenImage guidance 1.0 never pays for the second forward" {
     try testing.expect(!cfgActive(.{}));
     try testing.expect(!cfgActive(.{ .guidance_scale = 1.0, .negative_prompt = "blurry" }));
     try testing.expect(cfgActive(.{ .guidance_scale = 4.0 }));
+}
+
+// Hand-pinned from calculate_dimensions: w = round(sqrt(res²·ratio)), h =
+// round(w·src_h/src_w), round-half-away, before any /32 snapping.
+test "QwenImage editTargetSize: source aspect at output_resolution squared, rounded" {
+    const Case = struct { src_w: u32, src_h: u32, res: u32, w: u32, h: u32 };
+    const cases = [_]Case{
+        .{ .src_w = 512, .src_h = 512, .res = 1024, .w = 1024, .h = 1024 },
+        .{ .src_w = 512, .src_h = 512, .res = 512, .w = 512, .h = 512 },
+        // 4:3: h lands on the exact half 886.5 → 887 (floor would say 886).
+        .{ .src_w = 4032, .src_h = 3024, .res = 1024, .w = 1182, .h = 887 },
+        // 7:5: w = 1211.613 → 1212 (floor would say 1211) — round, not floor.
+        .{ .src_w = 1400, .src_h = 1000, .res = 1024, .w = 1212, .h = 866 },
+        .{ .src_w = 3024, .src_h = 4032, .res = 1024, .w = 887, .h = 1183 },
+    };
+    for (cases) |c| {
+        const got = editTargetSize(c.src_w, c.src_h, c.res);
+        try testing.expectEqual(c.w, got.w);
+        try testing.expectEqual(c.h, got.h);
+    }
+}
+
+test "QwenImage refResizeDimsAt: ref resolution is the per-request knob" {
+    // (1184, 896) is the pinned 1024-regime reference for a 4:3 source; the
+    // same source at 512² conditioning halves the joint tokens per ref.
+    const d = refResizeDimsAt(512, 384, 1024);
+    try testing.expectEqual(@as(u32, 1184), d.w);
+    try testing.expectEqual(@as(u32, 896), d.h);
+    const e = refResizeDimsAt(512, 384, 512);
+    try testing.expectEqual(@as(u32, 576), e.w);
+    try testing.expectEqual(@as(u32, 448), e.h);
+    // Degenerate aspect still snaps to the /32 grid both sides.
+    const f = refResizeDimsAt(100, 3000, 512);
+    try testing.expectEqual(@as(u32, 96), f.w);
+    try testing.expectEqual(@as(u32, 2784), f.h);
+}
+
+/// safetensors-shaped bytes: u64 LE header length + JSON + a small data pad.
+fn stubSafetensors(a: std.mem.Allocator, header_json: []const u8) ![]u8 {
+    const out = try a.alloc(u8, 8 + header_json.len + 16);
+    std.mem.writeInt(u64, out[0..8], @intCast(header_json.len), .little);
+    @memcpy(out[8 .. 8 + header_json.len], header_json);
+    @memset(out[8 + header_json.len ..], 0);
+    return out;
+}
+
+test "QwenImage towerPresentIn: header-peek of text_encoder" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+
+    const lang = try stubSafetensors(a, "{\"model.language_model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}");
+    defer a.free(lang);
+    const visual = try stubSafetensors(a, "{\"model.visual.blocks.0.mlp.gate_proj.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}");
+    defer a.free(visual);
+
+    // No text_encoder dir at all.
+    try testing.expect(!towerPresentIn(io, a, root));
+
+    // Language-only shard: the tower is absent.
+    try tmp.dir.createDirPath(io, "lang/text_encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lang/text_encoder/model.safetensors", .data = lang });
+    const lang_dir = try std.fmt.allocPrint(a, "{s}/lang", .{root});
+    defer a.free(lang_dir);
+    try testing.expect(!towerPresentIn(io, a, lang_dir));
+
+    // A model.visual.* key in the header: the tower is present.
+    try tmp.dir.createDirPath(io, "tower/text_encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tower/text_encoder/model.safetensors", .data = visual });
+    const tower_dir = try std.fmt.allocPrint(a, "{s}/tower", .{root});
+    defer a.free(tower_dir);
+    try testing.expect(towerPresentIn(io, a, tower_dir));
+
+    // mlx-community's spelling: `vision_tower.*` keys mean the tower too.
+    const vt = try stubSafetensors(a, "{\"vision_tower.patch_embed.proj.weight\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}");
+    defer a.free(vt);
+    try tmp.dir.createDirPath(io, "vt/text_encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "vt/text_encoder/model.safetensors", .data = vt });
+    const vt_dir = try std.fmt.allocPrint(a, "{s}/vt", .{root});
+    defer a.free(vt_dir);
+    try testing.expect(towerPresentIn(io, a, vt_dir));
+
+    // The index names only the language shard; the visual shard is not named
+    // and never peeked — the index wins.
+    try tmp.dir.createDirPath(io, "indexed/text_encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "indexed/text_encoder/shard-00001-of-00002.safetensors", .data = lang });
+    try tmp.dir.writeFile(io, .{ .sub_path = "indexed/text_encoder/shard-00002-of-00002.safetensors", .data = visual });
+    try tmp.dir.writeFile(io, .{ .sub_path = "indexed/text_encoder/model.safetensors.index.json", .data = "{\"metadata\":{\"total_size\":16},\"weight_map\":{\"model.language_model.layers.0.self_attn.q_proj.weight\":\"shard-00001-of-00002.safetensors\"}}" });
+    const indexed_dir = try std.fmt.allocPrint(a, "{s}/indexed", .{root});
+    defer a.free(indexed_dir);
+    try testing.expect(!towerPresentIn(io, a, indexed_dir));
+}
+
+test "QwenImage edit scaffold: no capability by default, editImage refuses" {
+    var e = Engine{
+        .allocator = undefined,
+        .io = undefined,
+        .s = undefined,
+        .model_dir = undefined,
+        .dit_cfg = undefined,
+        .vae_cfg = undefined,
+        .dit = undefined,
+        .vae = undefined,
+        .tok = undefined,
+        .drop_tokens = 0,
+        .staged = false,
+    };
+    try testing.expect(!e.supportsEdit());
+    try testing.expectError(error.QwenEditNotImplemented, e.editImage(
+        testing.allocator, "make the sky red", &.{"stub bytes"}, 512, 512, 7, 4, .{}, null,
+    ));
 }
 
 const Parity = struct { cos: f32, rms_ratio: f32 };
@@ -1960,6 +2929,76 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
     }
 }
 
+test "QwenImage edit prefix cache matches block-causal forwards across steps and reference layouts" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dtype| {
+        var dit = try TinyPrefixModel.init(dtype, s);
+        defer dit.deinit();
+        for ([_]usize{ 1, 2, 10 }) |refs| {
+            // Unequal prompt lengths exercise independently owned CFG caches.
+            for ([_]usize{ 1, 5 }) |text_len| {
+                var shapes: std.ArrayList([3]u32) = .empty;
+                defer shapes.deinit(a);
+                var mask: std.ArrayList(i32) = .empty;
+                defer mask.deinit(a);
+                try mask.appendNTimes(a, 0, text_len);
+                var ref_tokens: c_int = 0;
+                for (0..refs) |r| {
+                    const w: u32 = if (r % 2 == 0) 2 else 4;
+                    try shapes.append(a, .{ 1, 2, w });
+                    try mask.appendNTimes(a, 1, w / 2);
+                    ref_tokens += @intCast(2 * w);
+                    // Cover both adjacent image blocks and intervening text.
+                    if (text_len == 5) try mask.append(a, 0);
+                }
+                try mask.append(a, 0);
+                const n = mask.items.len;
+                try shapes.append(a, .{ 1, 2, 4 });
+                try mask.appendNTimes(a, 1, 2);
+                var geo = try EditGeometry.init(a, dit.cfg, n, mask.items, shapes.items);
+                defer geo.deinit();
+                var cache = try PrefixCache.initEdit(a, dit.blocks.len, &geo, s);
+                defer cache.deinit();
+                const hidden = try TinyPrefixModel.tensor(&.{ 1, @intCast(n), 24 }, @floatFromInt(text_len), 1);
+                defer free(hidden);
+                const ref = try TinyPrefixModel.tensor(&.{ 1, ref_tokens, 8 }, @floatFromInt(refs + text_len), 1);
+                defer free(ref);
+                for ([_]f32{ 0.9, 0.5, 0.02 }, 0..) |t, step| {
+                    const target = try TinyPrefixModel.tensor(&.{ 1, 8, 8 }, t + 0.2, 1);
+                    defer free(target);
+                    const full_input = try concat(&.{ ref, target }, 1, s);
+                    defer free(full_input);
+                    const want = try dit.forwardEdit(full_input, hidden, mask.items, t, &geo);
+                    defer free(want);
+                    const want32 = try astype(want, .float32, s);
+                    defer free(want32);
+                    const got = try dit.forwardEditCached(if (cache.ready) target else full_input, hidden, mask.items, t, &geo, &cache);
+                    defer free(got);
+                    const got32 = try astype(got, .float32, s);
+                    defer free(got32);
+                    try mlx.check(mlx.mlx_array_eval(got32));
+                    for (mlx.mlx_array_data_float32(got32).?[0 .. 8 * 8]) |v|
+                        try testing.expect(std.math.isFinite(v));
+                    try testing.expect(cache.ready);
+                    try testing.expectEqual(dtype, mlx.mlx_array_dtype(got));
+                    try testing.expectEqualSlices(c_int, &.{ 1, 8, 8 }, mlx.getShape(got));
+                    const p = try parity(got, want32, s);
+                    const tolerance: f32 = if (dtype == .float32) 1e-5 else 0.002;
+                    if (!(p.cos > 0.99999) or !(@abs(p.rms_ratio - 1) <= tolerance))
+                        std.debug.print("[qwen-image] edit cache {s} refs={d} text={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), refs, text_len, step, p.cos, p.rms_ratio });
+                    try testing.expect(p.cos > 0.99999);
+                    try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, tolerance);
+                    for (cache.layers) |kv| {
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.k)[2]);
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.v)[2]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "QwenImage DiT parity (env-gated)" {
     var f = try Fixture.open();
     defer f.fx.deinit();
@@ -2031,6 +3070,285 @@ test "QwenImage VAE parity (env-gated)" {
     try expectParity("vae encode, banded", banded_enc, try f.get("vae_encoded"), s);
 }
 
+// ── Edit (ti2i) oracles: the edit half of tests/dump_qwen_image21_fixtures.py ──
+
+/// i32 mlx array → owned host slice.
+fn hostI32(a: std.mem.Allocator, arr: A) ![]i32 {
+    try mlx.check(mlx.mlx_array_eval(arr));
+    const n = mlx.mlx_array_size(arr);
+    const d = mlx.mlx_array_data_int32(arr) orelse return error.NoData;
+    const out = try a.alloc(i32, n);
+    @memcpy(out, d[0..n]);
+    return out;
+}
+
+/// The edit fixture's shared setup: pack DiT config, img_shapes, and the
+/// pre-expansion joint mask (the VLM pad mask with the appended target slots).
+const EditSetup = struct {
+    cfg: DitConfig,
+    shapes: [][3]u32,
+    mask: []i32,
+    n: usize,
+
+    fn deinit(self: *const EditSetup, a: std.mem.Allocator) void {
+        a.free(self.shapes);
+        a.free(self.mask);
+    }
+};
+
+fn openEditSetup(a: std.mem.Allocator, io: std.Io, f: *const Fixture) !EditSetup {
+    const cfg = try DitConfig.parse(io, a, f.dir);
+    const raw = try hostI32(a, try f.get("edit_img_shapes"));
+    defer a.free(raw);
+    const shapes = try a.alloc([3]u32, raw.len / 3);
+    errdefer a.free(shapes);
+    for (0..shapes.len) |i| shapes[i] = .{ @intCast(raw[i * 3]), @intCast(raw[i * 3 + 1]), @intCast(raw[i * 3 + 2]) };
+    const n: usize = @intCast(mlx.getShape(try f.get("edit_hidden"))[1]);
+    const target_slots = @as(usize, shapes[shapes.len - 1][0]) * shapes[shapes.len - 1][1] * shapes[shapes.len - 1][2] / 4;
+    const pad = try hostI32(a, try f.get("edit_pad_mask"));
+    defer a.free(pad);
+    const mask = try a.alloc(i32, pad.len + target_slots);
+    @memcpy(mask[0..pad.len], pad);
+    @memset(mask[pad.len..], 1);
+    return .{ .cfg = cfg, .shapes = shapes, .mask = mask, .n = n };
+}
+
+test "QwenImage edit rope (env-gated)" {
+    var f = try Fixture.open();
+    defer f.fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    var setup = try openEditSetup(a, io, &f);
+    defer setup.deinit(a);
+
+    var geo = try EditGeometry.init(a, setup.cfg, setup.n, setup.mask, setup.shapes);
+    defer geo.deinit();
+    const half: c_int = @intCast(setup.cfg.head_dim / 2);
+    const cos_t = try reshape(geo.cos, &[_]c_int{ -1, half }, s);
+    defer free(cos_t);
+    const sin_t = try reshape(geo.sin, &[_]c_int{ -1, half }, s);
+    defer free(sin_t);
+    try expectParity("edit rope cos", cos_t, try f.get("edit_rope_cos"), s);
+    try expectParity("edit rope sin", sin_t, try f.get("edit_rope_sin"), s);
+
+    // The real checkpoint's (16,56,56) layout as a pure table: same walk,
+    // different axes (the pack DiT's 16-wide head cannot run it).
+    const real_cfg = DitConfig{ .head_dim = 128, .axes = .{ 16, 56, 56 } };
+    var geo_real = try EditGeometry.init(a, real_cfg, setup.n, setup.mask, setup.shapes);
+    defer geo_real.deinit();
+    const cos_r = try reshape(geo_real.cos, &[_]c_int{ -1, 64 }, s);
+    defer free(cos_r);
+    const sin_r = try reshape(geo_real.sin, &[_]c_int{ -1, 64 }, s);
+    defer free(sin_r);
+    try expectParity("edit rope cos, real axes", cos_r, try f.get("edit_rope_cos_real"), s);
+    try expectParity("edit rope sin, real axes", sin_r, try f.get("edit_rope_sin_real"), s);
+}
+
+test "QwenImage edit geometry (env-gated)" {
+    var f = try Fixture.open();
+    defer f.fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    _ = s; // declared by the shared setup shape; this test reads host buffers only
+    var setup = try openEditSetup(a, io, &f);
+    defer setup.deinit(a);
+
+    var geo = try EditGeometry.init(a, setup.cfg, setup.n, setup.mask, setup.shapes);
+    defer geo.deinit();
+    // The fixture's joint: 27 text + 2060 slots ×4 = 12363, target = last 4096.
+    try testing.expectEqual(@as(c_int, 12363), geo.joint_len);
+    try testing.expectEqual(@as(c_int, 8267), geo.target_start);
+    try testing.expectEqual(@as(c_int, 4096), geo.target_tokens);
+
+    const ids = try hostI32(a, geo.image_ids);
+    defer a.free(ids);
+    const ids_want = try hostI32(a, try f.get("edit_image_ids"));
+    defer a.free(ids_want);
+    try testing.expectEqualSlices(i32, ids_want, ids);
+
+    const tgt = try hostI32(a, geo.target_mask);
+    defer a.free(tgt);
+    const tgt_want = try hostI32(a, try f.get("edit_target_token_mask"));
+    defer a.free(tgt_want);
+    try testing.expectEqualSlices(i32, tgt_want, tgt);
+
+    // The reference walk's prefix segments (its own expanded-run structure).
+    try testing.expectEqual(@as(usize, 5), geo.segments.len);
+    const want = [_]EditSeg{
+        .{ .start = 0, .end = 8, .is_text = true },
+        .{ .start = 8, .end = 4152, .is_text = false },
+        .{ .start = 4152, .end = 4158, .is_text = true },
+        .{ .start = 4158, .end = 8254, .is_text = false },
+        .{ .start = 8254, .end = 8267, .is_text = true },
+    };
+    for (geo.segments, want) |got, w| {
+        try testing.expectEqual(w.start, got.start);
+        try testing.expectEqual(w.end, got.end);
+        try testing.expectEqual(w.is_text, got.is_text);
+    }
+}
+
+test "QwenImage edit forward (env-gated)" {
+    var f = try Fixture.open();
+    defer f.fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    var setup = try openEditSetup(a, io, &f);
+    defer setup.deinit(a);
+
+    var dit = try Dit.load(io, a, s, f.dir, setup.cfg, .float32);
+    defer dit.deinit();
+    var geo = try EditGeometry.init(a, setup.cfg, setup.n, setup.mask, setup.shapes);
+    defer geo.deinit();
+    var t_raw: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&t_raw, try f.get("edit_dit_t")));
+    const out = try dit.forwardEdit(try f.get("edit_latents"), try f.get("edit_hidden"), setup.mask, t_raw / 1000.0, &geo);
+    defer free(out);
+    try expectParity("edit dit", out, try f.get("edit_dit_out"), s);
+}
+
+test "QwenImage edit VAE encode RGBA (env-gated)" {
+    var f = try Fixture.open();
+    defer f.fx.deinit();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    var cfg = try VaeConfig.parse(io, a, f.dir);
+    defer cfg.deinit(a);
+    var enc = try VaeEncoder.load(io, a, s, f.dir, cfg);
+    defer enc.deinit();
+    const out = try enc.encodeRgba(try f.get("edit_vae_image"));
+    defer free(out);
+    try expectParity("vae encode rgba", out, try f.get("edit_vae_encoded"), s);
+
+    // Same oracle with every stage forced into 8-row bands: banding is exact.
+    band_budget_bytes = 1;
+    defer band_budget_bytes = 256 << 20;
+    const banded = try enc.encodeRgba(try f.get("edit_vae_image"));
+    defer free(banded);
+    try expectParity("vae encode rgba, banded", banded, try f.get("edit_vae_encoded"), s);
+}
+
+// The equivalence invariant: the per-segment sdpa walk (what the DiT runs)
+// against the dense block-causal mask (q_idx >= kv_idx or same image block)
+// built explicitly — small random data, no pack.
+test "QwenImage edit segment walk equals the dense block-causal mask" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    // [text 3 | ref1 (1 slot, 2x2) | text 2 | ref2 (2 slots, 2x4) | text 4 | target 4 slots, 4x4]
+    const mask = [_]i32{ 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1 };
+    const shapes = [_][3]u32{ .{ 1, 2, 2 }, .{ 1, 2, 4 }, .{ 1, 4, 4 } };
+    const cfg = DitConfig{ .head_dim = 16, .axes = .{ 4, 6, 6 } };
+    var geo = try EditGeometry.init(a, cfg, 12, &mask, &shapes);
+    defer geo.deinit();
+    // 3 + 4 + 2 + 8 + 4 + 16 = 37; target rows are [21, 37).
+    try testing.expectEqual(@as(c_int, 37), geo.joint_len);
+    try testing.expectEqual(@as(c_int, 21), geo.target_start);
+
+    var key = mlx.mlx_array_new();
+    defer free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 11));
+    const draw = struct {
+        fn f(shape: []const c_int, k: A, st: S) !A {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .float32, 0.0, 1.0, k, st));
+            return o;
+        }
+    }.f;
+    const q = try draw(&.{ 1, 2, 37, 16 }, key, s);
+    defer free(q);
+    const k = try draw(&.{ 1, 2, 37, 16 }, key, s);
+    defer free(k);
+    const v = try draw(&.{ 1, 2, 37, 16 }, key, s);
+    defer free(v);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+
+    const walk = try segmentSdpaWalk(q, k, v, &geo, scale, s, a);
+    defer free(walk);
+
+    const ids = try hostI32(a, geo.image_ids);
+    defer a.free(ids);
+    const L: usize = @intCast(geo.joint_len);
+    const mbuf = try a.alloc(bool, L * L);
+    defer a.free(mbuf);
+    for (0..L) |p| for (0..L) |j| {
+        const same_block = ids[p] >= 0 and ids[p] == ids[j];
+        mbuf[p * L + j] = p >= j or same_block;
+    };
+    const msh = [_]c_int{ 1, 1, @intCast(L), @intCast(L) };
+    const marr = mlx.mlx_array_new_data(mbuf.ptr, &msh, 4, .bool_);
+    defer free(marr);
+    const dense = try sdpaMasked(q, k, v, scale, marr, s);
+    defer free(dense);
+    try expectParity("segment walk vs dense mask", walk, dense, s);
+}
+
+// The red-line case: two image blocks back-to-back in the mask (no text
+// between) are still SEPARATE blocks — separate ids and segments, because
+// the walk consumes blocks by img_shapes slot counts, never mask runs.
+test "QwenImage edit segment walk: adjacent image blocks stay separate" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    // [text 3 | ref1 (1 slot, 2x2) | ref2 (2 slots, 2x4) | text 4 | target 4 slots, 4x4]
+    const mask = [_]i32{ 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1 };
+    const shapes = [_][3]u32{ .{ 1, 2, 2 }, .{ 1, 2, 4 }, .{ 1, 4, 4 } };
+    const cfg = DitConfig{ .head_dim = 16, .axes = .{ 4, 6, 6 } };
+    var geo = try EditGeometry.init(a, cfg, 10, &mask, &shapes);
+    defer geo.deinit();
+    // 3 + 4 + 8 + 4 + 16 = 35; target rows are [19, 35).
+    try testing.expectEqual(@as(c_int, 35), geo.joint_len);
+    try testing.expectEqual(@as(c_int, 19), geo.target_start);
+    try testing.expectEqual(@as(usize, 4), geo.segments.len);
+    // text [0,3) | ref1 [3,7) | ref2 [7,15) | text [15,19)
+    try testing.expectEqual(EditSeg{ .start = 0, .end = 3, .is_text = true }, geo.segments[0]);
+    try testing.expectEqual(EditSeg{ .start = 3, .end = 7, .is_text = false }, geo.segments[1]);
+    try testing.expectEqual(EditSeg{ .start = 7, .end = 15, .is_text = false }, geo.segments[2]);
+    try testing.expectEqual(EditSeg{ .start = 15, .end = 19, .is_text = true }, geo.segments[3]);
+    const ids = try hostI32(a, geo.image_ids);
+    defer a.free(ids);
+    try testing.expectEqualSlices(i32, &([_]i32{ -1, -1, -1 }), ids[0..3]);
+    try testing.expectEqualSlices(i32, &[_]i32{ 0, 0, 0, 0 }, ids[3..7]); // ref1
+    try testing.expectEqualSlices(i32, &[_]i32{ 1, 1, 1, 1, 1, 1, 1, 1 }, ids[7..15]); // ref2, NOT ref1
+    try testing.expectEqualSlices(i32, &[_]i32{ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 }, ids[19..35]);
+
+    var key = mlx.mlx_array_new();
+    defer free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 23));
+    const draw = struct {
+        fn f(shape: []const c_int, k: A, st: S) !A {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .float32, 0.0, 1.0, k, st));
+            return o;
+        }
+    }.f;
+    const q = try draw(&.{ 1, 2, 35, 16 }, key, s);
+    defer free(q);
+    const k = try draw(&.{ 1, 2, 35, 16 }, key, s);
+    defer free(k);
+    const v = try draw(&.{ 1, 2, 35, 16 }, key, s);
+    defer free(v);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+    const walk = try segmentSdpaWalk(q, k, v, &geo, scale, s, a);
+    defer free(walk);
+    const L: usize = @intCast(geo.joint_len);
+    const mbuf = try a.alloc(bool, L * L);
+    defer a.free(mbuf);
+    for (0..L) |p| for (0..L) |j| {
+        const same_block = ids[p] >= 0 and ids[p] == ids[j];
+        mbuf[p * L + j] = p >= j or same_block;
+    };
+    const msh = [_]c_int{ 1, 1, @intCast(L), @intCast(L) };
+    const marr = mlx.mlx_array_new_data(mbuf.ptr, &msh, 4, .bool_);
+    defer free(marr);
+    const dense = try sdpaMasked(q, k, v, scale, marr, s);
+    defer free(dense);
+    try expectParity("adjacent-blocks walk vs dense mask", walk, dense, s);
+}
+
 // Whole pipeline on a REAL converted pack (QWEN_IMAGE_E2E_MODEL), text encoder
 // staged. Asserts a finite, non-flat image; QWEN_IMAGE_E2E_OUT=<file.png> keeps
 // it for a look, QWEN_IMAGE_E2E_STEPS / _SIZE / _GUIDANCE override the run.
@@ -2086,4 +3404,167 @@ test "QwenImage e2e on a real pack (env-gated)" {
         defer a.free(png);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(out), .data = png });
     }
+}
+
+// ── edit e2e on the tiny converted pack (QWEN_IMAGE_TEST_MODEL, the fixture
+// oracles' own env): synthesized RGBA reference PNGs, smoke bar — shape,
+// finiteness, same-seed determinism, and the CFG/negative divergence. ──
+
+/// Deterministic RGBA test source: channel-varying bytes with an alpha that is
+/// never 0 or 255, so the white-composite VLM copy and the alpha-carrying VAE
+/// copy both see real values.
+fn synthRgba(a: std.mem.Allocator, w: u32, h: u32, salt: u8) ![]u8 {
+    const buf = try a.alloc(u8, @as(usize, w) * h * 4);
+    for (buf, 0..) |*v, i| {
+        const px: u32 = @intCast(i / 4);
+        v.* = switch (i % 4) {
+            3 => @truncate(120 + px % 136),
+            else => salt +% @as(u8, @truncate(px >> 2)) +% @as(u8, @truncate(i % 4)) *% 37,
+        };
+    }
+    return buf;
+}
+
+/// Two encoded references: 512x384 (landscape — the resize lands on a
+/// non-square 74x56 grid) and 256x256. Caller frees each PNG.
+fn editE2eRefs(a: std.mem.Allocator) ![2][]u8 {
+    const png_mod = @import("png.zig");
+    const r1 = try synthRgba(a, 512, 384, 0x5a);
+    defer a.free(r1);
+    const r2 = try synthRgba(a, 256, 256, 0xa7);
+    defer a.free(r2);
+    return .{
+        try png_mod.encodeRgba(a, r1, 512, 384),
+        try png_mod.encodeRgba(a, r2, 256, 256),
+    };
+}
+
+/// Every element finite (NaN/Inf in the pipeline is the one hard failure a
+/// random-weight smoke can catch).
+fn expectFiniteImage(img: A, s: S) !void {
+    var fin = mlx.mlx_array_new();
+    defer free(fin);
+    try mlx.check(mlx.mlx_isfinite(&fin, img, s));
+    var allv = mlx.mlx_array_new();
+    defer free(allv);
+    try mlx.check(mlx.mlx_all(&allv, fin, false, s));
+    var fv: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&fv, allv));
+    try testing.expect(fv != 0.0);
+}
+
+/// Max |a − b| as a host f32 (0 == byte-identical images).
+fn maxAbsDiff(x: A, y: A, s: S) !f32 {
+    const d = try subA(x, y, s);
+    defer free(d);
+    var ad = mlx.mlx_array_new();
+    defer free(ad);
+    try mlx.check(mlx.mlx_abs(&ad, d, s));
+    var mx = mlx.mlx_array_new();
+    defer free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ad, false, s));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    return v;
+}
+
+test "QwenImage edit e2e (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prev_cap: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
+    const engine = try Engine.load(io, a, dir, true);
+    defer engine.deinit();
+    try testing.expect(engine.supportsEdit());
+
+    const refs = try editE2eRefs(a);
+    defer for (refs) |p| a.free(p);
+    const prompt = "make the fox wear a tiny hat";
+
+    const img1 = try engine.editImage(a, prompt, &refs, 256, 256, 42, 2, .{}, null);
+    defer free(img1);
+    try testing.expectEqualSlices(c_int, &.{ 1, 3, 256, 256 }, mlx.getShape(img1));
+    try expectFiniteImage(img1, engine.s);
+    try testing.expect(engine.te == null); // the edit's TE+tower freed before the denoise
+
+    // Same seed ⇒ identical bytes.
+    const img2 = try engine.editImage(a, prompt, &refs, 256, 256, 42, 2, .{}, null);
+    defer free(img2);
+    try testing.expectEqual(@as(f32, 0), try maxAbsDiff(img1, img2, engine.s));
+
+    const flat = try reshape(img1, &[_]c_int{-1}, engine.s);
+    defer free(flat);
+    var variance = mlx.mlx_array_new();
+    defer free(variance);
+    try mlx.check(mlx.mlx_var_axis(&variance, flat, 0, false, 0, engine.s));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, variance));
+    std.debug.print("[qwen-image] edit e2e 2 refs steps=2: pixel variance {d:.5}\n", .{v});
+    try testing.expect(v > 1e-6);
+}
+
+test "QwenImage edit e2e CFG (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var prev_cap: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
+    defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
+    const engine = try Engine.load(io, a, dir, true);
+    defer engine.deinit();
+
+    const refs = try editE2eRefs(a);
+    defer for (refs) |p| a.free(p);
+    const prompt = "make the fox wear a tiny hat";
+
+    const plain = try engine.editImage(a, prompt, &refs, 256, 256, 42, 2, .{}, null);
+    defer free(plain);
+    const guided = try engine.editImage(a, prompt, &refs, 256, 256, 42, 2, .{
+        .guidance_scale = 2.5,
+        .negative_prompt = "blurry",
+    }, null);
+    defer free(guided);
+    try expectFiniteImage(guided, engine.s);
+
+    // Real CFG: the second forward per step must move the output.
+    const d = try maxAbsDiff(plain, guided, engine.s);
+    std.debug.print("[qwen-image] edit e2e CFG 2.5: max |cfg - plain| {d:.5}\n", .{d});
+    try testing.expect(d > 0.0);
+}
+
+test "QwenImage edit e2e towerless refuses (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const notower = try std.fmt.allocPrint(a, "{s}-notower", .{dir});
+    defer a.free(notower);
+    var d = std.Io.Dir.openDirAbsolute(io, notower, .{}) catch return error.SkipZigTest;
+    d.close(io);
+
+    const engine = try Engine.load(io, a, notower, true);
+    defer engine.deinit();
+    try testing.expect(!engine.supportsEdit());
+    const refs = try editE2eRefs(a);
+    defer for (refs) |p| a.free(p);
+    try testing.expectError(error.QwenEditNotImplemented, engine.editImage(
+        a, "make the fox wear a tiny hat", &refs, 256, 256, 42, 2, .{}, null,
+    ));
+}
+
+// A pack that spells the DiT's time-embedder/modulation keys the
+// mlx-community way (flattened) loads through the loader's probe.
+test "QwenImage flattened DiT keys load (env-gated)" {
+    const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const flat = try std.fmt.allocPrint(a, "{s}-flatdit", .{dir});
+    defer a.free(flat);
+    var d = std.Io.Dir.openDirAbsolute(io, flat, .{}) catch return error.SkipZigTest;
+    d.close(io);
+
+    const engine = try Engine.load(io, a, flat, true);
+    defer engine.deinit();
+    try testing.expect(engine.supportsEdit());
 }
