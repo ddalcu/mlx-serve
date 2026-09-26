@@ -2689,7 +2689,7 @@ fn qsaFusedEnabled() bool {
 var qsa_fused_logged = false;
 var mamba2_fused_logged = false;
 /// Widest window the fused Mamba2 step serves; tests lower it to force the chain.
-pub var mamba2_fused_max_rows: c_int = mamba2_decode.MAX_ROWS;
+pub var mamba2_fused_max_rows: c_int = std.math.maxInt(c_int);
 pub var add_norm_max_rows: c_int = mamba2_decode.MAX_ROWS; // test seam
 
 /// Array-mask arm of msv_attn_p256 (qwen4_exp QSA prefill): `mask` is the
@@ -25663,9 +25663,9 @@ pub const Transformer = struct {
         const proj = try self.qmatmul(x, mw.in_proj_w, mw.in_proj_s, mw.in_proj_b);
         defer _ = mlx.mlx_array_free(proj);
 
-        // Short windows (decode, spec verify): conv + SSM + gate is ONE dispatch
-        // and the grouped norm a second (mamba2_decode.zig). The chain below
-        // serves prefill and any geometry the kernels decline.
+        // Any window (decode, spec verify, prefill): conv + SSM + gate is ONE
+        // dispatch and the grouped norm a second (mamba2_decode.zig). The chain
+        // below serves any geometry the kernels decline.
         if (seq_len <= mamba2_fused_max_rows and mw.conv1d_b != null) fused: {
             const act_dt = mlx.mlx_array_dtype(proj);
             var conv_in = ssm.conv_state;
@@ -44126,9 +44126,10 @@ test "mamba2Mixer keeps a bf16 residual stream bf16" {
 }
 
 // Bar: the fused Mamba2 step (mamba2_decode.zig) agrees with the op chain on
-// the same tokens, one row at a time AND as one multi-row window, to bf16
-// rounding; the window's per-row state capture equals the single-step states.
-test "mamba2Mixer: fused single steps and a fused 3-row window match the chain" {
+// the same tokens, one row at a time, as one multi-row window, and as a
+// prefill-width window, to bf16 rounding; the window's per-row state capture
+// equals the single-step states.
+test "mamba2Mixer: fused single steps and fused windows match the chain" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const allocator = t.allocator;
@@ -44249,7 +44250,7 @@ test "mamba2Mixer: fused single steps and a fused 3-row window match the chain" 
     var chain: [3 * 64]f32 = undefined;
     {
         mamba2_fused_max_rows = 0;
-        defer mamba2_fused_max_rows = mamba2_decode.MAX_ROWS;
+        defer mamba2_fused_max_rows = std.math.maxInt(c_int);
         var ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ids);
         ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, T }, 2, .int32);
@@ -44322,7 +44323,7 @@ test "mamba2Mixer: fused single steps and a fused 3-row window match the chain" 
     resetState(hl.ssm_entries);
     {
         mamba2_fused_max_rows = 0;
-        defer mamba2_fused_max_rows = mamba2_decode.MAX_ROWS;
+        defer mamba2_fused_max_rows = std.math.maxInt(c_int);
         var ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ids);
         ids = mlx.mlx_array_new_data(&tokens, &[_]c_int{ 1, T }, 2, .int32);
@@ -44346,6 +44347,62 @@ test "mamba2Mixer: fused single steps and a fused 3-row window match the chain" 
             std.debug.print("mamba2 chain capture state[1] vs fused window: err={d:.6} ref={d:.6}\n", .{ c_err, st_ref });
             return error.ChainCaptureMismatch;
         }
+    }
+
+    // Prefill widths (several 16-row B/C blocks, and a ragged last block) take
+    // the fused route and leave the chain's output, SSM state and conv state.
+    const conv_elems: usize = @intCast((kernel - 1) * conv_dim);
+    for ([_]c_int{ 37, 64 }) |TL| {
+        const n: usize = @intCast(TL);
+        const long_ids = try allocator.alloc(i32, n);
+        defer allocator.free(long_ids);
+        for (long_ids, 0..) |*v, i| v.* = @intCast((i * 5 + 1) % 8);
+        var outs: [2][]f32 = undefined;
+        var states: [2][]f32 = undefined;
+        var convs: [2][]f32 = undefined;
+        for (0..2) |arm| {
+            outs[arm] = try allocator.alloc(f32, n * 64);
+            states[arm] = try allocator.alloc(f32, state_elems);
+            convs[arm] = try allocator.alloc(f32, conv_elems);
+        }
+        defer for (0..2) |arm| {
+            allocator.free(outs[arm]);
+            allocator.free(states[arm]);
+            allocator.free(convs[arm]);
+        };
+        for (0..2) |arm| {
+            resetState(hl.ssm_entries);
+            mamba2_fused_logged = false;
+            if (arm == 0) mamba2_fused_max_rows = 0;
+            defer mamba2_fused_max_rows = std.math.maxInt(c_int);
+            const ids = mlx.mlx_array_new_data(long_ids.ptr, &[_]c_int{ 1, TL }, 2, .int32);
+            defer _ = mlx.mlx_array_free(ids);
+            const out = try xfm.forward(ids);
+            defer _ = mlx.mlx_array_free(out);
+            try readF32(out, s, outs[arm]);
+            try readF32(hl.ssm_entries[0].ssm_state, s, states[arm]);
+            try readF32(hl.ssm_entries[0].conv_state, s, convs[arm]);
+            if (arm == 1 and !mamba2_fused_logged) return error.LongWindowNotFused;
+        }
+        var ref: f32 = 0;
+        var err: f32 = 0;
+        for (outs[0], outs[1]) |a, b| {
+            try t.expect(std.math.isFinite(a) and std.math.isFinite(b));
+            ref = @max(ref, @abs(a));
+            err = @max(err, @abs(a - b));
+        }
+        var sref: f32 = 0;
+        var serr: f32 = 0;
+        for (states[0], states[1]) |a, b| {
+            try t.expect(std.math.isFinite(a) and std.math.isFinite(b));
+            sref = @max(sref, @abs(a));
+            serr = @max(serr, @abs(a - b));
+        }
+        if (!(ref > 0.01 and sref > 0) or err > 1.5e-2 * ref or serr > 1.5e-2 * sref) {
+            std.debug.print("mamba2 T={d} fused vs chain: out err={d:.5} ref={d:.5} state err={d:.6} ref={d:.6}\n", .{ TL, err, ref, serr, sref });
+            return error.LongWindowMismatch;
+        }
+        try t.expectEqualSlices(f32, convs[0], convs[1]);
     }
 }
 
