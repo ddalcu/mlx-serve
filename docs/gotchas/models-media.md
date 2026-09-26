@@ -1924,3 +1924,15 @@ Cause: two things in the f32 decoder's last two stages. MLX's 3x3 conv holds an 
 Fix: both exact. Large 3x3 convs run in row strips over a once-padded input (`Conv.forwardStrips`). Whole stages run in row bands with a `2·resnets + 2` row halo that is cropped (`Stage.banded`): the channel norm is per-pixel (it is `rms_norm`, which also replaced a five-tensor spelled-out chain), the shortcuts fold/unfold 2x2 cells, so only the 3x3 convs look sideways. Peak 18.1 → 9.5 GB, same pixels.
 
 Guard: `QwenImage VAE parity` re-runs the reference oracle with every stage forced into 8-row bands; `QwenImage strip conv equals the whole-image conv`. An uncapped MLX buffer pool in a test binary also reads as a leak: the e2e test sets the 1 GB cap the server sets in `main()`.
+
+## Nemotron-H: two spellings of the layer pattern, and an MoE arm that was `unreachable` (2026-09-26)
+
+Symptom: `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` failed to load with `MISSING WEIGHT: backbone.layers.0.mixer.q_proj.weight`.
+
+Cause 1: the transformers >= 5 export writes the layer pattern as `layers_block_type: ["mamba", "moe", ...]` instead of `hybrid_override_pattern: "MEM*..."`. Only the string was parsed, so every layer kept the `.attention` default and layer 0 (a Mamba2 block) looked for attention weights.
+
+Cause 2: once the list parsed, layer 1 (`moe`) failed on `mixer.up_proj.weight`. `initHybridLayers`' `.moe` arm was `unreachable` (a TODO). In ReleaseFast that is UB, and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. The `hybrid_override_pattern` packs (`E` blocks) hit the same arm.
+
+Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, weights kept f32 until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path, shared expert always added. `moe_latent_size` packs are refused by name (`UnsupportedNemotronLatentMoe`). Decode uses the sorted path too; the gather-qmv decode kernels are SwiGLU-only.
+
+Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (transformer.zig). Live: all three local Nemotron-3.5-Lightning packs (4bit, OptiQ-4bit, Fastino 8bit) load and answer correctly.

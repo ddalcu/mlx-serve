@@ -3419,6 +3419,45 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 }
             }
         }
+        // transformers >= 5 exports spell the same pattern as a list of names.
+        if (cfg_obj.get("layers_block_type")) |v| {
+            if (v == .array) {
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item != .string) continue;
+                    const name = item.string;
+                    config.layer_block_types[i] = if (std.mem.eql(u8, name, "mamba"))
+                        .mamba2
+                    else if (std.mem.eql(u8, name, "mlp"))
+                        .mlp
+                    else if (std.mem.eql(u8, name, "moe"))
+                        .moe
+                    else
+                        .attention;
+                }
+            }
+        }
+        // MoE blocks ('E' / "moe"): sigmoid router with a selection-only
+        // score-correction bias, ReLU^2 routed experts, one shared expert.
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("moe_shared_expert_intermediate_size")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("moe_latent_size")) |v| {
+            if (v == .integer) return error.UnsupportedNemotronLatentMoe;
+        }
         if (config.num_eos_tokens == 0) {
             if (cfg_obj.get("eos_token_id")) |v| {
                 if (v == .integer) config.addEosToken(@intCast(v.integer));
@@ -6720,6 +6759,65 @@ test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION 
     bare.head_dim = 128;
     bare.has_hybrid_layers = true;
     try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
+}
+
+test "nemotron_h: a layers_block_type LIST sets the per-layer blocks like hybrid_override_pattern" {
+    // mlx-community's Nemotron-3.5-Lightning packs (transformers >= 5 export)
+    // ship `layers_block_type` as a list of names and no pattern string. Left
+    // unread, every layer kept the `.attention` default and the load died on
+    // `backbone.layers.0.mixer.q_proj.weight` — layer 0 is a Mamba2 block.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 7,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072,
+        \\  "layers_block_type": ["mamba", "moe", "mamba", "attention", "mlp", "mamba", "moe"],
+        \\  "mtp_layers_block_type": ["attention", "moe"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    const want = [_]LayerBlockType{ .mamba2, .moe, .mamba2, .attention, .mlp, .mamba2, .moe };
+    for (want, 0..) |b, i| try testing.expectEqual(b, cfg.layer_block_types[i]);
+    try testing.expectEqual(@as(u32, 1), cfg.attnCacheLayerCount());
+}
+
+test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
+    // Nemotron-3.5-Lightning-30B-A3B's shipped values.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 128, "num_experts_per_tok": 6,
+        \\  "moe_intermediate_size": 1856, "moe_shared_expert_intermediate_size": 3712,
+        \\  "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5, "moe_latent_size": null
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 128), cfg.num_experts);
+    try testing.expectEqual(@as(u32, 6), cfg.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1856), cfg.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 3712), cfg.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_n_group);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_topk_group);
+    try testing.expect(cfg.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.5), cfg.router_scaling_factor);
+
+    // The latent variant projects into a smaller expert space
+    // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
+    const latent =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 4096, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_latent_size": 1024
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedNemotronLatentMoe, parseConfigFromJson(testing.allocator, latent));
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

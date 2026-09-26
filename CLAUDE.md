@@ -129,7 +129,7 @@ Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by
 | `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch |
 | `prism_hadamard_qwen35` | prism-ml Bonsai 2 = qwen3_5 behind block-1024 Hadamard rotations (`rht.zig`, `hadamard_block` from `modules[].block`); served in the pack's own numerics: f16 activations over its f16 scales, f32 GDN state (`ModelConfig.actDtype`/`ssmStateDtype`); fused QKV declines; MTP depth 2 |
 | `qwen3_next` | DeltaNet |
-| `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix) |
+| `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix); layer pattern from `hybrid_override_pattern` string OR `layers_block_type` list; MoE blocks = sigmoid router + ReLU^2 experts + shared expert (`nemotronMoe`); latent MoE (`moe_latent_size`) refused at parse |
 | `lfm2`, `lfm2_moe`, `lfm2_vl` | Hybrid gated conv + attention; `lfm2_moe` = sparse MoE past `num_dense_layers` (sigmoid routing, selection-only `expert_bias`, no shared expert); dense MLP `w1/w3/w2` OR `gate/up/down_proj` (probed); `lfm2_vl` = siglip2 tower + projector, NaFlex 64-256 merged tokens, tiling past `max_image_tokens x 2.0` into 512px tiles + thumbnail (`<|img_row_R_col_C|>`/`<|img_thumbnail|>`) |
 | `hy_v3` | Hunyuan 3 MoE (expert container probed) |
 | `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B): nvfp4 experts, softplus attn out gate, YaRN + sliding, sigmoid routing, UNGATED shared expert. Serial |
@@ -422,7 +422,7 @@ Kernels + numerics:
 Configs, templates, tokenizers:
 - **A marker family that is GLM/`<think>` under another spelling is ALIASED at decode, never re-parsed** (K2 `<ifm|…>` → `Tokenizer.marker_aliases`); only the rendered prompt keeps the pack's spelling (`k2ThinkOpenerAt`). JSON-schema + thinking on K2 keeps thinking off (known).
 - **`generation_config.json` `eos_token_id` joins the stop set** (`mergeEosTokens`, additive); Gemma terminators merge additively (`ensureGemmaTerminators`). jinja.cpp: `is sameas true` / `is divisibleby 3` parse a BARE test argument.
-- **Config reads**: when the reference IGNORES a field, the field is not the truth (laguna YaRN mscale); a field HF allows in two SHAPES is read as both (`chat_template`); `text_config` FIRST, then root, PER FIELD; a default only ONE family wants is pinned PER LAYER TYPE (muse `rope_local_base_freq`, `tests/test_muse_repetition.sh`).
+- **Config reads**: when the reference IGNORES a field, the field is not the truth (laguna YaRN mscale); a field HF allows in two SHAPES is read as both (`chat_template`; Nemotron-H's `hybrid_override_pattern` string vs `layers_block_type` list — the missed shape left every layer `.attention`); `text_config` FIRST, then root, PER FIELD; a default only ONE family wants is pinned PER LAYER TYPE (muse `rope_local_base_freq`, `tests/test_muse_repetition.sh`).
 - **`*_text` siblings**: accept the tag, collapse to base type, prefix by `text_config` presence, force `tie_word_embeddings` for Gemma, add to BOTH visibility allowlists.
 - **A sampler never draws a RESERVED special or a PADDING row** (`reservedOutputIds` + `definedVocabSize` → `installSuppressMask`, `MLX_SERVE_SUPPRESS_RESERVED=0`; `unpadded_vocab_size` = ONE trim); logprobs stay RAW.
 - **Metaspace `prepend_scheme` is THREE-valued** (`MetaspacePrepend`): `first` prepends ▁ only at offset 0, never after a special token (Mistral `[INST]Use`); `always` prepends per segment (laya). Diff `/tokenize` vs HF on a prompt WITH specials.
