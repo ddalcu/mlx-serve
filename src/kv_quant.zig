@@ -136,7 +136,7 @@ pub fn quantizeAffine(
     return out;
 }
 
-/// Affine dequantize a `(q, scales, biases)` triple to dense bf16. Caller
+/// Affine dequantize a `(q, scales, biases)` triple to the scales dtype. Caller
 /// owns the returned array.
 pub fn dequantizeAffine(
     s: mlx.mlx_stream,
@@ -157,7 +157,9 @@ pub fn dequantizeAffine(
         mlx.mlx_optional_int.some(@intCast(bits)),
         "affine",
         .{}, // global_scale (null)
-        .{ .value = .bfloat16, .has_value = true },
+        // The scales carry the dtype the cache was fed: a hardcoded bf16 met an
+        // f16 query in attention and widened the whole residual stream to f32.
+        .{ .value = mlx.mlx_array_dtype(scales), .has_value = true },
         s,
     ));
     return out;
@@ -536,6 +538,22 @@ test "quantizeAffine + dequantizeAffine round-trip at 8 bits" {
     }
     // 8-bit affine: ~256x finer steps than 4-bit; expect < 0.005 on smooth data.
     try testing.expect(max_err < 0.01);
+}
+
+test "dequantizeAffine returns the dtype the cache was fed" {
+    const s = mlx.gpuStream();
+    const bf16_src = try buildSmoothBf16(s, 256);
+    defer _ = mlx.mlx_array_free(bf16_src);
+    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
+        var src = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(src);
+        try mlx.check(mlx.mlx_astype(&src, bf16_src, dt, s));
+        var qkv = try quantizeAffine(s, src, 64, 8);
+        defer qkv.deinit();
+        const deq = try dequantizeAffine(s, qkv.q, qkv.scales, qkv.biases, 64, 8);
+        defer _ = mlx.mlx_array_free(deq);
+        try testing.expectEqual(dt, mlx.mlx_array_dtype(deq));
+    }
 }
 
 test "KVQuantConfig.affine builds a sane config" {

@@ -7608,10 +7608,14 @@ pub const KVCache = struct {
             kv_cap_buf_grows += 1;
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, vq_last, .uint32);
-            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
-            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
-            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, .bfloat16);
-            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, .bfloat16);
+            // Scales keep the dtype the quantizer emitted (the activation dtype): a
+            // bf16 buffer under an f16 model widens every later layer to f32.
+            const ksc_dt = mlx.mlx_array_dtype(new_kq.scales);
+            const vsc_dt = mlx.mlx_array_dtype(new_vq.scales);
+            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, ksc_dt);
+            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
+            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, vsc_last, vsc_dt);
             entry.initialized = true;
         }
 
@@ -39901,6 +39905,25 @@ test "KVCache updateAffine returns quant triples so fused attention can engage" 
     try testing.expect(dv.v_triple_q.ctx != null);
     try testing.expectEqual(@as(u8, 8), dv.bits);
     try testing.expectEqual(@as(u32, 64), dv.group_size);
+}
+
+test "KVCache affine quant hands attention the dtype it was fed" {
+    const s = mlx.gpuStream();
+    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
+        defer cache.deinit();
+        const shape = [_]c_int{ 1, 2, 4, 64 };
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_ones(&k, &shape, 4, dt, s));
+        var dv = try cache.update(0, k, k, s, 0);
+        defer dv.deinit();
+        try testing.expectEqual(dt, mlx.mlx_array_dtype(dv.k));
+        try testing.expectEqual(dt, mlx.mlx_array_dtype(dv.v));
+        var dv2 = try cache.denseView(0, s);
+        defer dv2.deinit();
+        try testing.expectEqual(dt, mlx.mlx_array_dtype(dv2.k));
+    }
 }
 
 /// Shared harness for the decode quantized-KV kernel parity tests: prefill
