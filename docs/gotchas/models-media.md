@@ -1949,7 +1949,7 @@ Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (p
 
 ## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
 
-Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded slower than serial, and a post-norm hidden input accepted fewer tokens per round than the pre-norm one.
+Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded slower than serial. (Pre- vs post-norm input measured a wash once NoPE landed; pre-norm stays, per the pack's config.)
 
 Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m; on a 3B-active MoE the verify forward's weight traffic doubles by depth 2, while the head's chained acceptance decays. Depth 2 is the peak (about 1.2x serial once the RoPE fix above landed); depth 1 and depth 3+ are slower.
 
