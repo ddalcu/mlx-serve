@@ -820,7 +820,8 @@ class ServerManager: ObservableObject {
     /// `.modelMissing` from every gen service.
     nonisolated static func resolveModelDir(repo: String, modelsRoot: String) -> String? {
         guard let dir = DownloadManager.existingModelDir(rootDir: modelsRoot, repoId: repo) else { return nil }
-        return DownloadManager.holdsWeightLayout(dir) ? dir : nil
+        guard DownloadManager.holdsWeightLayout(dir), DownloadManager.holdsCompleteMediaPack(dir) else { return nil }
+        return dir
     }
 
     private func killOrphanedServers(on port: UInt16) {

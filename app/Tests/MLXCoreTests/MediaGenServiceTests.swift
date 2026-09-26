@@ -988,6 +988,32 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(ServerManager.resolveModelDir(repo: "mlx-community/flux2-klein-9b-4bit", modelsRoot: root), dir)
     }
 
+    /// A media pack whose config.json is present but whose completeness
+    /// marker is not (the server's `requiredMediaMarker`) must not resolve:
+    /// a half-pulled copy in the first root shadowed the complete copy in a
+    /// later one and every load 400'd as an incomplete media pack.
+    func testResolveModelDirSkipsAnIncompleteMediaPack() throws {
+        let fm = FileManager.default
+        let base = NSTemporaryDirectory() + "resolvedir-partial-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: base) }
+        let repo = "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit"
+        let cfg = Data("{\"model_type\":\"acestep\"}".utf8)
+
+        let partialRoot = base + "/dl", fullRoot = base + "/models"
+        let partial = (partialRoot as NSString).appendingPathComponent(repo)
+        let full = (fullRoot as NSString).appendingPathComponent(repo)
+        try fm.createDirectory(atPath: partial, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: full + "/text_encoder", withIntermediateDirectories: true)
+        for dir in [partial, full] {
+            fm.createFile(atPath: dir + "/config.json", contents: cfg)
+            fm.createFile(atPath: dir + "/model.safetensors", contents: Data([0, 1]))
+        }
+        fm.createFile(atPath: full + "/text_encoder/model.safetensors", contents: Data([0, 1]))
+
+        XCTAssertNil(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot]))
+        XCTAssertEqual(ServerManager.resolveModelDir(repo: repo, roots: [partialRoot, fullRoot]), full)
+    }
+
     // MARK: - Residency default
 
     func testKeepResidentDefaultsOff() {

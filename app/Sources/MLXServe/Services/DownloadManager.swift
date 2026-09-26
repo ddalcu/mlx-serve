@@ -336,6 +336,30 @@ class DownloadManager: ObservableObject {
         return shards.contains { $0.hasSuffix(".safetensors") }
     }
 
+    /// The file beside config.json that makes a media `model_type` a COMPLETE
+    /// pack. Twin of `model_discovery.requiredMediaMarker`: the server skips a
+    /// dir without it, so the app must not hand it that dir by path.
+    nonisolated static func requiredMediaMarker(modelType: String) -> String? {
+        switch modelType {
+        case "AudioVideo": return "connector.safetensors"
+        case "minimax_h3": return "transformer.safetensors"
+        case "minimax_music3": return "vocoder.safetensors"
+        case "acestep": return "text_encoder/model.safetensors"
+        default: return nil
+        }
+    }
+
+    /// False only for a dir whose config.json names a media type and whose
+    /// completeness marker is missing.
+    nonisolated static func holdsCompleteMediaPack(_ dir: String) -> Bool {
+        let fm = FileManager.default
+        guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let mt = cfg["model_type"] as? String,
+              let marker = requiredMediaMarker(modelType: mt) else { return true }
+        return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
+    }
+
     /// Laya typed-decision checkpoints ship no root config.json; these two
     /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]

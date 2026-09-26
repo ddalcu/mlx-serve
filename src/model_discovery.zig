@@ -70,6 +70,7 @@ const supported_model_types = [_][]const u8{
 /// later roots, and loading it falls through to the text loader, which dies
 /// on the first missing weight. The ONE table: `gen.requiredMarkerFor`
 /// delegates here, so discovery, register-by-path and the load guard agree.
+/// App twin: `DownloadManager.requiredMediaMarker` (keep in sync).
 pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     // LTX: distinguishes the real bundle from any other "AudioVideo" config
     // and proves the text path can load.
@@ -78,6 +79,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
     // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
+    // ACE-Step: the text encoder is a subdir a partial pull can miss.
+    if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     return null;
 }
 
@@ -1252,6 +1255,38 @@ test "minimax_music3 classifies as audio media with the vocoder marker" {
     try testing.expect(isMediaModelType("minimax_music3"));
     try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
     try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var a_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer a_dir.cleanup();
+    var b_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer b_dir.cleanup();
+
+    const cfg = "{\"model_type\":\"acestep\"}";
+    try a_dir.dir.createDirPath(io, "org/ace");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.createDirPath(io, "org/ace/text_encoder");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/text_encoder/model.safetensors", .data = "0123" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    defer allocator.free(a_path);
+    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    defer allocator.free(b_path);
+
+    var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expect(std.mem.startsWith(u8, result.models[0].path, b_path));
 }
 
 test "discoverModels finds flat and org/repo model dirs" {

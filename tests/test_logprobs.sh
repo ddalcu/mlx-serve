@@ -70,7 +70,8 @@ def post(path, body, stream=False):
         return json.loads(raw.decode("utf-8", "replace"))
 
 MSG = [{"role": "user", "content": "Count from one to eight in words."}]
-REQ = {"model": MODEL, "messages": MSG, "max_tokens": 48, "temperature": 0,
+# Room for a model that thinks before it answers: entries describe content only.
+REQ = {"model": MODEL, "messages": MSG, "max_tokens": 512, "temperature": 0,
        "logprobs": True, "top_logprobs": 5}
 
 def entries_ok(label, content):
@@ -117,8 +118,8 @@ def first_content_entry(req):
         print("  \033[0;31mFAIL\033[0m  no content logprob entries to compare"); sys.exit(1)
     return ents[0]
 
-a = first_content_entry({**REQ, "max_tokens": 8, "stream": False})
-b = first_content_entry({**REQ, "max_tokens": 8, "temperature": 2.0, "top_k": 1, "stream": False})
+a = first_content_entry({**REQ, "stream": False})
+b = first_content_entry({**REQ, "temperature": 2.0, "top_k": 1, "stream": False})
 ck("same token drawn", a["token"] == b["token"], f"{a['token']!r} vs {b['token']!r}")
 ck("its logprob is temperature-INDEPENDENT", abs(a["logprob"] - b["logprob"]) < 1e-3,
    f"temp0={a['logprob']} temp2={b['logprob']}")
