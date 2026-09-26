@@ -435,9 +435,8 @@ pub const Geometry = struct {
     }
 };
 
-/// Text is causal and always modulated at t=0, so its per-layer K/V is
-/// invariant across denoising steps. This cache belongs to ONE conditioning
-/// branch of ONE request; positive and negative CFG branches never share it.
+/// The t=0 prefix cannot attend to the target, so its per-layer K/V is
+/// invariant across steps. One cache belongs to one request and CFG branch.
 const PrefixKV = struct {
     k: A,
     v: A,
@@ -471,6 +470,10 @@ const PrefixCache = struct {
         return .{ .allocator = a, .layers = layers, .image_geo = try geo.imageOnly(s) };
     }
 
+    fn initEdit(a: std.mem.Allocator, n_layers: usize, geo: *const EditGeometry, s: S) !PrefixCache {
+        return init(a, n_layers, &geo.ropeGeometry(), s);
+    }
+
     fn deinit(self: *PrefixCache) void {
         for (self.layers) |*kv| if (kv.*) |*pair| pair.deinit();
         self.allocator.free(self.layers);
@@ -493,7 +496,7 @@ const PrefixCache = struct {
     }
 };
 
-fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
+pub fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
     return if (value) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
 }
 
@@ -528,6 +531,11 @@ pub const EditGeometry = struct {
     txt_row: A, // [L] i32
     lat_row: A, // [L] i32
     img_cond: A, // [1, L, 1] bool
+
+    /// Borrowed tables; only imageOnly's slices are owned by the cache.
+    fn ropeGeometry(self: *const EditGeometry) Geometry {
+        return .{ .text_len = self.target_start, .cos = self.cos, .sin = self.sin, .mod_row = self.mod_row };
+    }
 
     /// `n` is the VLM sequence length; `mask` is the pre-expansion joint mask
     /// (1 at a VLM image slot or an appended target slot, else 0); `shapes`
@@ -1133,7 +1141,7 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
-    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const EditGeometry) !A {
+    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const y = try lin.forward(x, null, s);
@@ -1149,17 +1157,27 @@ pub const Dit = struct {
         return transpose(yr, &perm, s);
     }
 
-    fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry) !A {
+    fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.editHeadsOf(&b.q, b.norm_q, x, geo);
+        const q = try self.editHeadsOf(&b.q, b.norm_q, x, rope);
         defer free(q);
-        const k = try self.editHeadsOf(&b.k, b.norm_k, x, geo);
+        const k = try self.editHeadsOf(&b.k, b.norm_k, x, rope);
         defer free(k);
-        const v = try self.editHeadsOf(&b.v, null, x, geo);
+        const v = try self.editHeadsOf(&b.v, null, x, rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
-        const attn = try segmentSdpaWalk(q, k, v, geo, scale, s, self.allocator);
+        const attn = if (cached) blk: {
+            const pair = slot.?.*.?;
+            const keys = try concat(&.{ pair.k, k }, 2, s);
+            defer free(keys);
+            const values = try concat(&.{ pair.v, v }, 2, s);
+            defer free(values);
+            break :blk try sdpa(q, keys, values, scale, "", s);
+        } else blk: {
+            if (slot) |kv| kv.* = try PrefixKV.capture(k, v, geo.target_start, s);
+            break :blk try segmentSdpaWalk(q, k, v, geo, scale, s, self.allocator);
+        };
         defer free(attn);
         const back = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer free(back);
@@ -1168,13 +1186,13 @@ pub const Dit = struct {
         return b.o.forward(flat, null, s);
     }
 
-    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry) !A {
+    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const n1 = try layerNorm(x, self.cfg.eps, s);
         defer free(n1);
         const a_in = try mulA(n1, mod.scale1, s);
         defer free(a_in);
-        const attn = try self.editAttention(b, a_in, geo);
+        const attn = try self.editAttention(b, a_in, geo, rope, slot, cached);
         defer free(attn);
         const ga = try mulA(attn, mod.gate1, s);
         defer free(ga);
@@ -1206,50 +1224,62 @@ pub const Dit = struct {
     /// appended) lives in `geo` — `mask` is what `geo` was built from.
     /// Returns the target rows [1, target_tokens, out_ch].
     pub fn forwardEdit(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry) !A {
+        return self.forwardEditCached(latents, hidden, mask, t, geo, null);
+    }
+
+    /// First call receives [refs | target]; once ready, only target latents
+    /// enter the DiT. The original block-causal prefix and RoPE stay fixed.
+    fn forwardEditCached(self: *Dit, latents: A, hidden: A, mask: []const i32, t: f32, geo: *const EditGeometry, cache: ?*PrefixCache) !A {
         _ = mask;
         const s = self.s;
+        const cached = if (cache) |c| c.ready else false;
+        const full_rope = geo.ropeGeometry();
+        const rope = if (cached) &cache.?.image_geo else &full_rope;
         const temb = try self.timeEmbed(t);
         defer free(temb);
         const temb_act = try silu(temb, s);
         defer free(temb_act);
-        var mod = try self.editStepMod(temb_act, geo.mod_row);
+        var mod = try self.editStepMod(temb_act, rope.mod_row);
         defer mod.deinit();
 
         const H: c_int = @intCast(self.cfg.hidden());
-        const th = try self.textIn(hidden);
-        defer free(th);
-        var zeros = mlx.mlx_array_new();
-        defer free(zeros);
-        const zsh = [_]c_int{ 1, @divExact(geo.target_tokens, 4), H };
-        try mlx.check(mlx.mlx_zeros(&zeros, &zsh, zsh.len, self.dtype, s));
-        const joint_txt = try concat(&.{ th, zeros }, 1, s);
-        defer free(joint_txt);
-        var txt_rows = mlx.mlx_array_new();
-        defer free(txt_rows);
-        try mlx.check(mlx.mlx_take_axis(&txt_rows, joint_txt, geo.txt_row, 1, s));
-        const lat = try self.img_in.forward(latents, null, s);
-        defer free(lat);
-        var lat_rows = mlx.mlx_array_new();
-        defer free(lat_rows);
-        try mlx.check(mlx.mlx_take_axis(&lat_rows, lat, geo.lat_row, 1, s));
-        var x = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&x, geo.img_cond, lat_rows, txt_rows, s));
-        errdefer free(x);
-        for (self.blocks) |*b| {
-            const nx = try self.editBlockForward(b, x, &mod, geo);
+        var x = if (cached) try self.img_in.forward(latents, null, s) else blk: {
+            const th = try self.textIn(hidden);
+            defer free(th);
+            var zeros = mlx.mlx_array_new();
+            defer free(zeros);
+            const zsh = [_]c_int{ 1, @divExact(geo.target_tokens, 4), H };
+            try mlx.check(mlx.mlx_zeros(&zeros, &zsh, zsh.len, self.dtype, s));
+            const joint_txt = try concat(&.{ th, zeros }, 1, s);
+            defer free(joint_txt);
+            var txt_rows = mlx.mlx_array_new();
+            defer free(txt_rows);
+            try mlx.check(mlx.mlx_take_axis(&txt_rows, joint_txt, geo.txt_row, 1, s));
+            const lat = try self.img_in.forward(latents, null, s);
+            defer free(lat);
+            var lat_rows = mlx.mlx_array_new();
+            defer free(lat_rows);
+            try mlx.check(mlx.mlx_take_axis(&lat_rows, lat, geo.lat_row, 1, s));
+            var joint = mlx.mlx_array_new();
+            errdefer free(joint);
+            try mlx.check(mlx.mlx_where(&joint, geo.img_cond, lat_rows, txt_rows, s));
+            break :blk joint;
+        };
+        defer free(x);
+        for (self.blocks, 0..) |*b, i| {
+            const slot = if (cache) |c| &c.layers[i] else null;
+            const nx = try self.editBlockForward(b, x, &mod, geo, rope, slot, cached);
             free(x);
             x = nx;
         }
-        defer free(x);
-
-        // norm_out + proj_out on the full joint sequence, per-token scale row.
+        // Prefix rows use t=0; target-only steps retain their original t row.
         const n = try layerNorm(x, self.cfg.eps, s);
         defer free(n);
         const sc2 = try self.norm_out.forward(temb_act, null, s);
         defer free(sc2);
         var sel = mlx.mlx_array_new();
         defer free(sel);
-        try mlx.check(mlx.mlx_take_axis(&sel, sc2, geo.mod_row, 0, s));
+        try mlx.check(mlx.mlx_take_axis(&sel, sc2, rope.mod_row, 0, s));
         const selr = try reshape(sel, &[_]c_int{ 1, -1, H }, s);
         defer free(selr);
         const opsc = try addScalar(selr, 1.0, s);
@@ -1258,7 +1288,10 @@ pub const Dit = struct {
         defer free(scaled);
         const out = try self.proj_out.forward(scaled, null, s);
         defer free(out);
-        return sliceAxis(out, 1, geo.target_start, @intCast(mlx.getShape(out)[1]), s);
+        const result = try sliceAxis(out, 1, if (cached) 0 else geo.target_start, mlx.getShape(out)[1], s);
+        errdefer free(result);
+        if (cache) |c| if (!cached) try c.materialize(result);
+        return result;
     }
 };
 
@@ -2405,32 +2438,45 @@ pub const Engine = struct {
 
         // 6. Euler denoise: the packed stream is [refs (constant clean) |
         //    target]; only the target rows step.
-        for (0..n_steps) |i| {
-            if (progress) |p| if (p.cancelled()) return error.Cancelled;
-            const model_input = try concat(&.{ ref_latents, target }, 1, s);
-            defer free(model_input);
-            var v = try self.dit.forwardEdit(model_input, cond.hidden, mask_pos, sigmas[i], &geo);
-            defer free(v);
-            if (neg_cond) |*nc| {
-                // uncond + scale·(cond − uncond)
-                const vn = try self.dit.forwardEdit(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?);
-                defer free(vn);
-                const diff = try subA(v, vn, s);
-                defer free(diff);
-                const scaled = try mulScalar(diff, opts.guidance_scale, s);
-                defer free(scaled);
-                const blended = try addA(vn, scaled, s);
-                free(v);
-                v = blended;
+        {
+            const use_cache = n_steps > 1 and prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+            var cache: ?PrefixCache = if (use_cache) try PrefixCache.initEdit(a, self.dit.blocks.len, &geo, s) else null;
+            defer if (cache) |*c| c.deinit();
+            var neg_cache: ?PrefixCache = if (use_cache and neg_geo != null) try PrefixCache.initEdit(a, self.dit.blocks.len, &neg_geo.?, s) else null;
+            defer if (neg_cache) |*c| c.deinit();
+            log.info("[qwen-image] edit prefix cache enabled={} target={d} prefix={d} negative_prefix={d}\n", .{
+                use_cache, geo.target_tokens, geo.target_start, if (neg_geo) |ng| ng.target_start else @as(c_int, 0),
+            });
+            for (0..n_steps) |i| {
+                if (progress) |p| if (p.cancelled()) return error.Cancelled;
+                const model_input = if (use_cache and cache.?.ready) try contig(target, s) else try concat(&.{ ref_latents, target }, 1, s);
+                defer free(model_input);
+                var v = try self.dit.forwardEditCached(model_input, cond.hidden, mask_pos, sigmas[i], &geo, if (cache) |*c| c else null);
+                defer free(v);
+                if (neg_cond) |*nc| {
+                    // uncond + scale·(cond − uncond)
+                    const vn = try self.dit.forwardEditCached(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
+                    defer free(vn);
+                    const diff = try subA(v, vn, s);
+                    defer free(diff);
+                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
+                    defer free(scaled);
+                    const blended = try addA(vn, scaled, s);
+                    free(v);
+                    v = blended;
+                }
+                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
+                defer free(dv);
+                const next = try addA(target, dv, s);
+                free(target);
+                target = next;
+                try mlx.check(mlx.mlx_array_eval(target));
+                if (i == 0 and use_cache) log.info("[qwen-image] edit prefix cached: {d} layers, {d} branch(es); remaining steps target-only\n", .{
+                    self.dit.blocks.len, @as(u32, if (neg_cache != null) 2 else 1),
+                });
+                if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
             }
-            const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
-            defer free(dv);
-            const next = try addA(target, dv, s);
-            free(target);
-            target = next;
-            try mlx.check(mlx.mlx_array_eval(target));
-            if (progress) |p| p.emit("Generating", @intCast(i + 1), n_steps);
-        }
+        } // Release every branch's K/V before the VAE decode working set.
 
         // 7. Decode the target rows only — same unpack + banded path as t2i.
         logMemory("denoise");
@@ -2870,6 +2916,74 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
                 for (cache.layers) |kv| {
                     try testing.expectEqual(text_len, mlx.getShape(kv.?.k)[2]);
                     try testing.expectEqual(text_len, mlx.getShape(kv.?.v)[2]);
+                }
+            }
+        }
+    }
+}
+
+test "QwenImage edit prefix cache matches block-causal forwards across steps and reference layouts" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    for ([_]mlx.mlx_dtype{ .float32, .bfloat16, .float16 }) |dtype| {
+        var dit = try TinyPrefixModel.init(dtype, s);
+        defer dit.deinit();
+        for ([_]usize{ 1, 2, 10 }) |refs| {
+            // Unequal prompt lengths exercise independently owned CFG caches.
+            for ([_]usize{ 1, 5 }) |text_len| {
+                var shapes: std.ArrayList([3]u32) = .empty;
+                defer shapes.deinit(a);
+                var mask: std.ArrayList(i32) = .empty;
+                defer mask.deinit(a);
+                try mask.appendNTimes(a, 0, text_len);
+                var ref_tokens: c_int = 0;
+                for (0..refs) |r| {
+                    const w: u32 = if (r % 2 == 0) 2 else 4;
+                    try shapes.append(a, .{ 1, 2, w });
+                    try mask.appendNTimes(a, 1, w / 2);
+                    ref_tokens += @intCast(2 * w);
+                    // Cover both adjacent image blocks and intervening text.
+                    if (text_len == 5) try mask.append(a, 0);
+                }
+                try mask.append(a, 0);
+                const n = mask.items.len;
+                try shapes.append(a, .{ 1, 2, 4 });
+                try mask.appendNTimes(a, 1, 2);
+                var geo = try EditGeometry.init(a, dit.cfg, n, mask.items, shapes.items);
+                defer geo.deinit();
+                var cache = try PrefixCache.initEdit(a, dit.blocks.len, &geo, s);
+                defer cache.deinit();
+                const hidden = try TinyPrefixModel.tensor(&.{ 1, @intCast(n), 24 }, @floatFromInt(text_len), 1);
+                defer free(hidden);
+                const ref = try TinyPrefixModel.tensor(&.{ 1, ref_tokens, 8 }, @floatFromInt(refs + text_len), 1);
+                defer free(ref);
+                for ([_]f32{ 0.9, 0.5, 0.02 }, 0..) |t, step| {
+                    const target = try TinyPrefixModel.tensor(&.{ 1, 8, 8 }, t + 0.2, 1);
+                    defer free(target);
+                    const full_input = try concat(&.{ ref, target }, 1, s);
+                    defer free(full_input);
+                    const want = try dit.forwardEdit(full_input, hidden, mask.items, t, &geo);
+                    defer free(want);
+                    const want32 = try astype(want, .float32, s);
+                    defer free(want32);
+                    const got = try dit.forwardEditCached(if (cache.ready) target else full_input, hidden, mask.items, t, &geo, &cache);
+                    defer free(got);
+                    const got32 = try astype(got, .float32, s);
+                    defer free(got32);
+                    try mlx.check(mlx.mlx_array_eval(got32));
+                    for (mlx.mlx_array_data_float32(got32).?[0 .. 8 * 8]) |v|
+                        try testing.expect(std.math.isFinite(v));
+                    try testing.expect(cache.ready);
+                    try testing.expectEqual(dtype, mlx.mlx_array_dtype(got));
+                    try testing.expectEqualSlices(c_int, &.{ 1, 8, 8 }, mlx.getShape(got));
+                    const p = try parity(got, want32, s);
+                    std.debug.print("[qwen-image] edit cache {s} refs={d} text={d} step={d}: cos={d:.7} rms_ratio={d:.7}\n", .{ @tagName(dtype), refs, text_len, step, p.cos, p.rms_ratio });
+                    try testing.expect(p.cos > 0.99999);
+                    try testing.expectApproxEqAbs(@as(f32, 1), p.rms_ratio, @as(f32, if (dtype == .float32) 1e-5 else 0.002));
+                    for (cache.layers) |kv| {
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.k)[2]);
+                        try testing.expectEqual(geo.target_start, mlx.getShape(kv.?.v)[2]);
+                    }
                 }
             }
         }

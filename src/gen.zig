@@ -2400,8 +2400,20 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // and running past the working set hangs the first denoise step with no
     // error — refuse by NAME with the number we compared.
     if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
+        const cached_branches: u32 = if (steps > 1 and qwen_image.prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE")))
+            (if (guidance_scale != 1) @as(u32, 2) else 1)
+        else
+            0;
         const bill = qwenImageEditTransientBytes(
-            @intCast(gen_opts.edit_image_bytes.len), gen_opts.ref_resolution, width, height,
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            width,
+            height,
+        ) + qwenImageEditPrefixBytes(
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            engine.backend.qwen_image.dit_cfg,
+            cached_branches,
         );
         if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
             var active: usize = 0;
@@ -4276,6 +4288,14 @@ pub fn qwenImageEditTransientBytes(refs: u32, ref_resolution: u32, out_w: u32, o
     return scores + persistent;
 }
 
+/// BF16 K/V for all layers coexist with first-step attention. CFG branches
+/// each retain their own text and reference prefix; one-step edits cache none.
+fn qwenImageEditPrefixBytes(refs: u32, ref_resolution: u32, cfg: qwen_image.DitConfig, branches: u32) u64 {
+    const rt: u64 = @as(u64, ref_resolution / 16) * (ref_resolution / 16);
+    const prefix = @as(u64, refs) * rt + QWEN_IMAGE_EDIT_TEXT_TOKENS;
+    return prefix * cfg.layers * cfg.hidden() * 2 * 2 * branches;
+}
+
 /// The edit-capable pack's bill: the SAME staging answer as t2i (the engine
 /// and the residency bill read one `qwenImageStagesTextEncoder`), with the
 /// heavier edit transient whenever the tower is present.
@@ -5908,6 +5928,18 @@ test "Qwen-Image edit transient: the request-scope bill scales with refs x ref t
     // ref_resolution halves the joint: the scores term shrinks with it.
     const half = qwenImageEditTransientBytes(10, 512, 2048, 2048);
     try testing.expect(half * 2 < ten);
+}
+
+test "Qwen-Image edit prefix bill includes every layer and independent CFG branch" {
+    const cfg = qwen_image.DitConfig{};
+    const one = qwenImageEditPrefixBytes(1, 1024, cfg, 1);
+    try testing.expectEqual(@as(u64, (4096 + 2600) * 32 * 4096 * 4), one);
+    try testing.expectEqual(2 * one, qwenImageEditPrefixBytes(1, 1024, cfg, 2));
+    try testing.expectEqual(@as(u64, 0), qwenImageEditPrefixBytes(10, 1024, cfg, 0));
+    try testing.expect(qwenImageEditPrefixBytes(10, 1024, cfg, 2) > 40 << 30);
+    try testing.expect(qwenImageEditPrefixBytes(10, 512, cfg, 1) < qwenImageEditPrefixBytes(10, 1024, cfg, 1));
+    const tiny = qwen_image.DitConfig{ .layers = 2, .heads = 2, .head_dim = 16 };
+    try testing.expectEqual(@as(u64, (4096 + 2600) * 2 * 32 * 4), qwenImageEditPrefixBytes(1, 1024, tiny, 1));
 }
 
 test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
