@@ -31,6 +31,7 @@ const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const sushi_guest_mod = @import("arch/sushi_guest.zig");
 const gen_mod = @import("gen.zig");
 const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
@@ -241,6 +242,16 @@ pub const LoadedModel = struct {
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
 
+    /// An EXL3 Flash-Next pack, read once at registration (`model_discovery.engineTraits`):
+    /// it loads as the sushi guest, one engine at a time (`enginesConflict`).
+    sushi_pack: bool = false,
+    /// An embedding encoder (bert, bidirectional), read with `sushi_pack`: it stays
+    /// beside the guest instead of trading places with it.
+    encoder: bool = false,
+    /// The running sushi guest while this entry is resident. The CPU state is the
+    /// pack's own; every request is forwarded to the guest.
+    sushi_guest: ?*sushi_guest_mod.SushiGuest = null,
+
     /// Native media-generation engines, named by MODALITY (not by the FLUX/
     /// Qwen3-TTS/LTX implementations, which are swappable internals). When one
     /// is non-null the entry is a media model: the MLX/ds4/llama fields stay
@@ -389,6 +400,10 @@ pub const LoadedModel = struct {
         if (self.llama_engine) |engine| {
             engine.close();
             self.llama_engine = null;
+        }
+        if (self.sushi_guest) |guest| {
+            guest.stop();
+            self.sushi_guest = null;
         }
         if (self.image_engine) |e| {
             e.deinit();
@@ -560,6 +575,10 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        if (self.sushi_guest) |guest| {
+            guest.stop();
+            self.sushi_guest = null;
+        }
         if (self.image_engine) |e| {
             e.deinit();
             self.image_engine = null;
@@ -640,6 +659,17 @@ pub const LoadedModel = struct {
         self.state = .unloaded;
     }
 };
+
+/// One engine at a time: the sushi guest never shares the GPU with another model,
+/// except an embedding encoder, which is small and queried beside every chat.
+fn enginesConflict(a: *const LoadedModel, b: *const LoadedModel) bool {
+    return (a.sushi_pack or b.sushi_pack) and !a.encoder and !b.encoder;
+}
+
+/// The guest and an encoder stay together: neither is evicted to make room for the other.
+fn keptBeside(a: *const LoadedModel, b: *const LoadedModel) bool {
+    return (a.sushi_pack and b.encoder) or (a.encoder and b.sushi_pack);
+}
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
 /// the `/v1/models` JSON listing. All slices are borrowed from the
@@ -823,6 +853,7 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(path_owned);
         const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
         errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
+        const traits = model_discovery.engineTraits(self.io, self.allocator, path);
 
         stub.* = .{
             .allocator = self.allocator,
@@ -841,6 +872,8 @@ pub const ModelRegistry = struct {
             .drafter_block_size = 0,
             .prefix_cache = null,
             .ds4_engine = null,
+            .sushi_pack = traits.sushi,
+            .encoder = traits.encoder,
             .refcount = std.atomic.Value(u32).init(0),
             .last_used_ns = 0,
             .last_used_ms = std.atomic.Value(i64).init(0),
@@ -1155,12 +1188,14 @@ pub const ModelRegistry = struct {
     pub fn pickLruEvictable(self: *ModelRegistry, exclude_id: []const u8) ?*LoadedModel {
         var best: ?*LoadedModel = null;
         var best_used: i64 = std.math.maxInt(i64);
+        const loading = self.entries.get(exclude_id);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state != .ready) continue;
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (loading) |l| if (keptBeside(l, entry)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1287,6 +1322,23 @@ pub const ModelRegistry = struct {
     pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
+        // One engine at a time: the sushi guest and MLX never share the GPU. A
+        // model still serving a request refuses the plan, as a pinned LRU does.
+        const loading = self.entries.get(exclude_id);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (loading == null or e.state != .ready or e == loading.?) continue;
+            if (!enginesConflict(loading.?, e)) continue;
+            if (n >= out.len or e.refcount.load(.acquire) != 0) {
+                for (out[0..n]) |v| self.unmarkEvictingLocked(v);
+                return null;
+            }
+            self.markEvictingLocked(e);
+            freed += e.bytes_resident;
+            out[n] = e;
+            n += 1;
+        }
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
@@ -1314,6 +1366,19 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// Whether another entry on the other side of the engine swap (see
+    /// `planEvictionsLocked`) is mid-load or mid-eviction: `entry`'s load waits
+    /// for it to settle before claiming. Caller holds `mutex`.
+    pub fn engineSwapPendingLocked(self: *ModelRegistry, entry: *const LoadedModel) bool {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (e == entry or !enginesConflict(entry, e)) continue;
+            if (e.state == .loading or e.state == .evicting) return true;
+        }
+        return false;
+    }
+
     /// Map a stored load-failure name back to the typed error `ensureLoaded`
     /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
     /// layer answers with a named 503 instead of the generic "Model load
@@ -1325,10 +1390,11 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
+    pub fn loadErrorFromName(name: ?[]const u8) (error{ LoadFailed, InsufficientMemory } || sushi_guest_mod.TransientError) {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+            if (sushi_guest_mod.transientFromName(n)) |e| return e;
         }
         return error.LoadFailed;
     }
@@ -1374,6 +1440,38 @@ pub const ModelRegistry = struct {
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
         self.state_cond.broadcast(self.io);
+    }
+
+    /// A resident entry whose engine process died: release its residency and fail
+    /// it by `name`. A no-op unless `.ready`. Caller holds `mutex`.
+    pub fn markDiedLocked(self: *ModelRegistry, entry: *LoadedModel, name: []const u8) void {
+        if (entry.state != .ready) return;
+        self.accountEvictedLocked(entry.bytes_resident);
+        entry.bytes_resident = 0;
+        self.markErrorLocked(entry, name);
+    }
+
+    /// The model whose in-flight request refuses `entry`'s engine swap (see
+    /// `planEvictionsLocked`), or null. Caller holds `mutex`.
+    pub fn engineSwapBusyLocked(self: *ModelRegistry, entry: *const LoadedModel) ?*LoadedModel {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (e == entry or e.state != .ready or !enginesConflict(entry, e)) continue;
+            if (e.refcount.load(.acquire) != 0) return e;
+        }
+        return null;
+    }
+
+    /// Clear an entry whose engine process died (`markDiedLocked`) so it can
+    /// load again, once the requests still holding it are done. Caller holds `mutex`.
+    pub fn resetDiedLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        if (entry.state != .error_state or entry.sushi_guest == null) return;
+        self.waitForRefcountZeroLocked(entry);
+        const guest = entry.sushi_guest orelse return;
+        entry.sushi_guest = null;
+        guest.stop();
+        self.markUnloadedLocked(entry);
     }
 
     /// Duped copy of the stored load-failure name for `id` (empty/"mlx-serve"
@@ -2168,4 +2266,215 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: an EXL3 qwen4_exp pack registers as a sushi pack, an affine one does not" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "Sushi-3bpw");
+    try tmp.dir.writeFile(io, .{ .sub_path = "Sushi-3bpw/config.json", .data = "{\"model_type\":\"qwen4_exp\",\"quantization\":{\"mode\":\"affine\",\"bits\":8},\"expert_quant\":{\"format\":\"exl3\"}}" });
+    try tmp.dir.createDirPath(io, "mixed-4-8bit");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mixed-4-8bit/config.json", .data = "{\"model_type\":\"qwen4_exp\",\"quantization\":{\"mode\":\"affine\",\"bits\":4}}" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try testing.expect(reg.peek("Sushi-3bpw").?.sushi_pack);
+    try testing.expect(!reg.peek("mixed-4-8bit").?.sushi_pack);
+    // `--model <pack>` registers with no arch hint; it is still read from the pack.
+    const by_path = try std.fs.path.join(testing.allocator, &.{ root, "Sushi-3bpw" });
+    defer testing.allocator.free(by_path);
+    try testing.expect((try reg.registerStub("primary", by_path, null)).sushi_pack);
+}
+
+test "planEvictions: one engine at a time between the sushi guest and everything else" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [16]*LoadedModel = undefined;
+    {
+        // A guest load evicts every resident model; a model serving a request
+        // refuses the plan (never waited on: a WebSocket session pins for good).
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+        defer reg.deinit();
+        const a = try makeReadyStub(reg, "a", 10);
+        const b = try makeReadyStub(reg, "b", 10);
+        const g = try reg.registerStub("g", "g", 50);
+        g.sushi_pack = true;
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expect(reg.tryBeginLoadLocked(g));
+        reg.reserveLoadLocked(g, 50);
+        _ = a.refcount.fetchAdd(1, .acq_rel);
+        try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(g.id, &buf));
+        try testing.expectEqual(LoadState.ready, a.state);
+        try testing.expectEqual(LoadState.ready, b.state);
+        a.refcount.store(0, .release);
+        try testing.expectEqual(@as(?usize, 2), reg.planEvictionsLocked(g.id, &buf));
+        try testing.expectEqual(LoadState.evicting, a.state);
+        try testing.expectEqual(LoadState.evicting, b.state);
+    }
+    {
+        // Any other load evicts the guest and leaves MLX models to the caps.
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+        defer reg.deinit();
+        const g = try makeReadyStub(reg, "g", 50);
+        g.sushi_pack = true;
+        const b = try makeReadyStub(reg, "b", 10);
+        const m = try beginLoad(reg, "m", 10);
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(m.id, &buf));
+        try testing.expectEqual(g, buf[0]);
+        try testing.expectEqual(LoadState.ready, b.state);
+    }
+}
+
+test "engineSwapPendingLocked: a load waits while the other engine loads or unloads" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+    defer reg.deinit();
+    const x = try beginLoad(reg, "x", 10);
+    const m = try reg.registerStub("m", "m", 10);
+    const g = try reg.registerStub("g", "g", 50);
+    g.sushi_pack = true;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    try testing.expect(!reg.engineSwapPendingLocked(m)); // two MLX loads share the caps
+    try testing.expect(reg.engineSwapPendingLocked(g)); // the guest waits for x
+    try testing.expect(reg.tryBeginLoadLocked(g));
+    reg.markUnloadedLocked(x);
+    try testing.expect(reg.engineSwapPendingLocked(m)); // an MLX load waits for the guest
+    try testing.expect(!reg.engineSwapPendingLocked(g)); // never on itself
+    reg.markUnloadedLocked(g);
+}
+
+test "markDiedLocked: a dead guest releases its residency and fails by name" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const g = try makeReadyStub(reg, "g", 50);
+    reg.mutex.lockUncancelable(io);
+    reg.markDiedLocked(g, "SushiGuestExited (log: /h/.mlx-serve/logs/sushi-11234.log)");
+    reg.markDiedLocked(g, "again"); // only once
+    reg.mutex.unlock(io);
+    try testing.expectEqual(@as(u64, 0), reg.current_resident_bytes);
+    try testing.expectEqual(LoadState.error_state, g.state);
+    try testing.expectError(error.LoadFailed, reg.ensureLoaded("g"));
+    try testing.expectEqualStrings("SushiGuestExited (log: /h/.mlx-serve/logs/sushi-11234.log)", g.error_name.?);
+}
+
+test "resetDiedLocked: unloading a dead guest's entry lets the pack load again" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const g = try makeReadyStub(reg, "g", 50);
+    const quitter = try std.process.spawn(testing.io, .{ .argv = &.{"/usr/bin/true"}, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore });
+    const guest = try testing.allocator.create(sushi_guest_mod.SushiGuest);
+    guest.* = .{ .allocator = testing.allocator, .io = testing.io, .pid = quitter.id.?, .port = 0, .key = @splat('k') };
+    g.sushi_guest = guest;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    reg.markDiedLocked(g, "SushiGuestExited");
+    reg.resetDiedLocked(g);
+    try testing.expectEqual(LoadState.unloaded, g.state);
+    try testing.expect(g.sushi_guest == null);
+    try testing.expect(g.error_name == null);
+}
+
+test "loadErrorFromName: a retryable guest failure keeps its name" {
+    try testing.expectEqual(error.SushiDownloadFailed, ModelRegistry.loadErrorFromName("SushiDownloadFailed"));
+    try testing.expectEqual(error.LoadFailed, ModelRegistry.loadErrorFromName("SushiGuestExited (log: /h/x.log)"));
+}
+
+test "engineSwapBusyLocked: names the model whose request blocks an engine swap" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    const b = try makeReadyStub(reg, "b", 10);
+    const g = try reg.registerStub("g", "g", 50);
+    g.sushi_pack = true;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    try testing.expect(reg.engineSwapBusyLocked(g) == null);
+    _ = a.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectEqual(a, reg.engineSwapBusyLocked(g).?);
+    try testing.expect(reg.engineSwapBusyLocked(b) == null); // MLX beside MLX: the caps decide
+    a.refcount.store(0, .release);
+}
+
+test "planEvictions: an embedding encoder stays beside the sushi guest, both ways" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [16]*LoadedModel = undefined;
+    {
+        // A guest load evicts chat models and keeps the encoder.
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+        defer reg.deinit();
+        const chat = try makeReadyStub(reg, "chat", 10);
+        const enc = try makeReadyStub(reg, "enc", 1);
+        enc.encoder = true;
+        const g = try reg.registerStub("g", "g", 50);
+        g.sushi_pack = true;
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expect(reg.tryBeginLoadLocked(g));
+        reg.reserveLoadLocked(g, 50);
+        try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(g.id, &buf));
+        try testing.expectEqual(chat, buf[0]);
+        try testing.expectEqual(LoadState.ready, enc.state);
+    }
+    {
+        // An encoder load leaves the guest alone; a chat load still evicts it.
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+        defer reg.deinit();
+        const g = try makeReadyStub(reg, "g", 50);
+        g.sushi_pack = true;
+        _ = g.refcount.fetchAdd(1, .acq_rel); // busy: an encoder load neither waits nor refuses
+        const enc = try reg.registerStub("enc", "enc", 1);
+        enc.encoder = true;
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expect(reg.engineSwapBusyLocked(enc) == null);
+        try testing.expect(reg.tryBeginLoadLocked(enc));
+        reg.reserveLoadLocked(enc, 1);
+        try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(enc.id, &buf));
+        g.refcount.store(0, .release);
+        try testing.expectEqual(LoadState.ready, g.state);
+    }
+    {
+        // Past the memory cap, a guest load refuses rather than evict the encoder.
+        var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 55, null);
+        defer reg.deinit();
+        const enc = try makeReadyStub(reg, "enc", 10);
+        enc.encoder = true;
+        const g = try reg.registerStub("g", "g", 50);
+        g.sushi_pack = true;
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expect(reg.tryBeginLoadLocked(g));
+        reg.reserveLoadLocked(g, 50);
+        try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(g.id, &buf));
+        try testing.expectEqual(LoadState.ready, enc.state);
+    }
+}
+
+test "engineSwapPendingLocked: an encoder never waits on the guest, nor the guest on it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+    defer reg.deinit();
+    const g = try beginLoad(reg, "g", 50);
+    g.sushi_pack = true;
+    const enc = try reg.registerStub("enc", "enc", 1);
+    enc.encoder = true;
+    const chat = try reg.registerStub("chat", "chat", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    try testing.expect(!reg.engineSwapPendingLocked(enc));
+    try testing.expect(reg.engineSwapPendingLocked(chat));
+    reg.markUnloadedLocked(g);
+    try testing.expect(reg.tryBeginLoadLocked(enc));
+    try testing.expect(!reg.engineSwapPendingLocked(g));
+    reg.markUnloadedLocked(enc);
 }

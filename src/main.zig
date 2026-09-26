@@ -27,6 +27,7 @@ const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
+const sushi_guest_mod = @import("arch/sushi_guest.zig");
 const ane_mod = @import("ane.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -343,6 +344,12 @@ fn printUsage(io: std.Io) void {
         \\                        (speculative decode). On by default when the
         \\                        model dir ships one; auto-off under
         \\                        --ssd-streaming (ds4 refuses the combination).
+        \\  --sushi-path <file> Run this sushi binary for Qwen3.8-Flash-Next
+        \\                        EXL3 packs instead of the pinned release,
+        \\                        which is otherwise downloaded (sha256-checked)
+        \\                        into ~/.mlx-serve/engines/sushi/ on first use.
+        \\  --no-sushi          Never download or start the sushi engine; an
+        \\                        EXL3 pack then fails to load by name.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -588,6 +595,7 @@ pub fn main(init: std.process.Init) !void {
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
                 .ds4_commit = build_options.ds4_commit,
+                .sushi_tag = build_options.sushi_tag,
             };
             var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
@@ -957,6 +965,11 @@ pub fn main(init: std.process.Init) !void {
             ds4_ssd_streaming = true;
         } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
             ds4_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--sushi-path") and i + 1 < args.len) {
+            i += 1;
+            sushi_guest_mod.options.path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--no-sushi")) {
+            sushi_guest_mod.options.disabled = true;
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -981,6 +994,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+
+    sushi_guest_mod.options.host_port = port;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.

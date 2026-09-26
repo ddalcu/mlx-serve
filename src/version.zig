@@ -33,6 +33,8 @@ pub const Info = struct {
     gguf_format: []const u8,
     /// Pinned ds4 submodule short commit (no runtime API).
     ds4_commit: []const u8,
+    /// sushi guest-engine release tag, the fetch-sushi.sh pin.
+    sushi_tag: []const u8,
 };
 
 /// Render one `name value` line per component in a stable order. Machine-
@@ -53,6 +55,7 @@ pub fn writeReport(w: *std.Io.Writer, info: Info) !void {
     try w.print("llama.cpp {s}\n", .{val(info.llama_tag)});
     try w.print("gguf {s}\n", .{val(info.gguf_format)});
     try w.print("ds4 {s}\n", .{val(info.ds4_commit)});
+    try w.print("sushi {s}\n", .{val(info.sushi_tag)});
 }
 
 /// Allocate the report as a string (test/caller convenience).
@@ -80,6 +83,7 @@ test "version: report renders one name-value line per component" {
         .llama_tag = "b9999",
         .gguf_format = "3",
         .ds4_commit = "80ebbc3",
+        .sushi_tag = "v1.0.0",
     });
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings(
@@ -91,6 +95,7 @@ test "version: report renders one name-value line per component" {
         \\llama.cpp b9999
         \\gguf 3
         \\ds4 80ebbc3
+        \\sushi v1.0.0
         \\
     , s);
 }
@@ -106,6 +111,7 @@ test "version: empty ggml commit drops the parenthetical; blank pins read as unk
         .llama_tag = "b9999",
         .gguf_format = "3",
         .ds4_commit = "",
+        .sushi_tag = "",
     });
     defer std.testing.allocator.free(s);
     try std.testing.expectEqualStrings(
@@ -117,6 +123,7 @@ test "version: empty ggml commit drops the parenthetical; blank pins read as unk
         \\llama.cpp b9999
         \\gguf 3
         \\ds4 unknown
+        \\sushi unknown
         \\
     , s);
 }

@@ -274,6 +274,17 @@ Prebuilt release staged into `lib/llama` by `scripts/fetch-llama.sh` and linked
 into the mlx-serve binary as the generic GGUF engine. Unmodified.
 
 --------------------------------------------------------------------------------
+sushi
+https://github.com/beamivalice/sushi
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+
+Prebuilt release pinned and sha256-checked by `scripts/fetch-sushi.sh`,
+downloaded on first use and run as a separate process (the guest engine for
+Qwen3.8-Flash-Next EXL3 packs). Not linked into mlx-serve. Unmodified; the
+release ships its own MLX build and its own LICENSE and NOTICE.
+
+--------------------------------------------------------------------------------
 ds4.c
 https://github.com/antirez/ds4
 Copyright (c) 2026 The ds4.c authors

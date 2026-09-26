@@ -104,6 +104,20 @@ pub fn build(b: *std.Build) void {
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
+    // The sushi guest-engine release the server downloads on first use, its
+    // tarball sha256 and the digest of its unpacked tree: scripts/fetch-sushi.sh
+    // holds the pin. A tag alone could never pass the checks, so the three
+    // override together.
+    const sushi_tag_opt = b.option([]const u8, "sushi-tag", "sushi release tag (needs -Dsushi-sha256 and -Dsushi-tree-sha256)");
+    const sushi_sha_opt = b.option([]const u8, "sushi-sha256", "sha256 of that release's sushi-bin-macos-arm64.tar.gz");
+    const sushi_tree_sha_opt = b.option([]const u8, "sushi-tree-sha256", "digest of its unpacked tree (scripts/fetch-sushi.sh)");
+    if ((sushi_tag_opt == null) != (sushi_sha_opt == null) or (sushi_tag_opt == null) != (sushi_tree_sha_opt == null)) {
+        std.debug.print("\n[mlx-serve] pass -Dsushi-tag, -Dsushi-sha256 and -Dsushi-tree-sha256 together\n\n", .{});
+        std.process.exit(1);
+    }
+    const sushi_tag = sushi_tag_opt orelse readSushiPin(b, "SUSHI_TAG") orelse "unknown";
+    const sushi_sha256 = sushi_sha_opt orelse readSushiPin(b, "SUSHI_SHA256") orelse "";
+    const sushi_tree_sha256 = sushi_tree_sha_opt orelse readSushiPin(b, "SUSHI_TREE_SHA256") orelse "";
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -111,6 +125,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "ds4_commit", ds4_commit);
     build_options.addOption([]const u8, "llama_tag", llama_tag);
+    build_options.addOption([]const u8, "sushi_tag", sushi_tag);
+    build_options.addOption([]const u8, "sushi_sha256", sushi_sha256);
+    build_options.addOption([]const u8, "sushi_tree_sha256", sushi_tree_sha256);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
@@ -367,6 +384,9 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "ds4_commit", "unknown");
     build_options.addOption([]const u8, "llama_tag", "unavailable (macOS-only engine)");
+    build_options.addOption([]const u8, "sushi_tag", "unavailable (macOS-only engine)");
+    build_options.addOption([]const u8, "sushi_sha256", "");
+    build_options.addOption([]const u8, "sushi_tree_sha256", "");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
@@ -550,6 +570,9 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
+    ios_options.addOption([]const u8, "sushi_tag", "unknown");
+    ios_options.addOption([]const u8, "sushi_sha256", "");
+    ios_options.addOption([]const u8, "sushi_tree_sha256", "");
     ios_options.addOption([]const u8, "git_sha", "");
 
     const mod = b.createModule(.{
@@ -722,6 +745,23 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     ) catch return null;
     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
     return if (trimmed.len == 0) null else b.dupe(trimmed);
+}
+
+/// A `NAME="${NAME:-value}"` default out of scripts/fetch-sushi.sh, the one
+/// place the sushi pin is written. Null when the script is missing.
+fn readSushiPin(b: *std.Build, name: []const u8) ?[]const u8 {
+    // The configure phase is cached: without this a pin bump never reaches the binary.
+    b.dependOnFileContents(b.path("scripts/fetch-sushi.sh"));
+    const bytes = buildRootHandle(b).readFileAlloc(
+        b.graph.io,
+        "scripts/fetch-sushi.sh",
+        b.allocator,
+        .limited(64 * 1024),
+    ) catch return null;
+    const key = b.fmt("{s}=\"${{{s}:-", .{ name, name });
+    const start = (std.mem.indexOf(u8, bytes, key) orelse return null) + key.len;
+    const end = std.mem.indexOfScalarPos(u8, bytes, start, '}') orelse return null;
+    return b.dupe(bytes[start..end]);
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {

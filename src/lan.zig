@@ -992,13 +992,18 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
 /// stream — the client sees a closed socket, the peer sees a disconnect and
 /// cancels its slot.
 pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []const u8, conn: anytype) error{PeerUnreachable}!void {
+    return tunnelWithHeaders(remote, method, raw_path, "", body, conn);
+}
+
+/// `tunnel` with extra header lines, each ending in CRLF.
+pub fn tunnelWithHeaders(remote: Remote, method: []const u8, raw_path: []const u8, headers: []const u8, body: []const u8, conn: anytype) error{PeerUnreachable}!void {
     const fd = connectTimeout(remote.ip4, remote.port, 3000) catch return error.PeerUnreachable;
     defer _ = std.c.close(fd);
     var head_buf: [1024]u8 = undefined;
     const head = std.fmt.bufPrint(
         &head_buf,
-        "{s} {s} HTTP/1.1\r\nHost: {d}.{d}.{d}.{d}:{d}\r\nContent-Type: application/json\r\nAccept: */*\r\nConnection: close\r\nX-MLX-LAN: 1\r\nContent-Length: {d}\r\n\r\n",
-        .{ method, raw_path, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port, body.len },
+        "{s} {s} HTTP/1.1\r\nHost: {d}.{d}.{d}.{d}:{d}\r\nContent-Type: application/json\r\nAccept: */*\r\nConnection: close\r\nX-MLX-LAN: 1\r\n{s}Content-Length: {d}\r\n\r\n",
+        .{ method, raw_path, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port, headers, body.len },
     ) catch return error.PeerUnreachable;
     writeAllFd(fd, head) catch return error.PeerUnreachable;
     writeAllFd(fd, body) catch return error.PeerUnreachable;

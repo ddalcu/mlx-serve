@@ -200,6 +200,37 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
 }
 
+/// What the one-engine rule needs from a pack's config.json.
+pub const EngineTraits = struct {
+    /// A Qwen3.8-Flash-Next pack with EXL3 routed experts (`qwen4_exp` whose
+    /// `expert_quant.format` is `exl3`): the sushi guest engine serves it, the
+    /// MLX loader cannot.
+    sushi: bool = false,
+    /// An embedding encoder, by the stub rule (`StubMeta.is_encoder`).
+    encoder: bool = false,
+};
+
+pub fn engineTraits(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8) EngineTraits {
+    if (dir_path.len == 0) return .{};
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return .{};
+    defer dir.close(io);
+    const bytes = dir.readFileAlloc(io, "config.json", allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+    const encoder = parseStubMeta(allocator, bytes, false).is_encoder;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .{ .encoder = encoder };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .encoder = encoder };
+    const root = parsed.value.object;
+    const mt = root.get("model_type");
+    const eq = root.get("expert_quant");
+    const format = if (eq != null and eq.? == .object) eq.?.object.get("format") else null;
+    return .{
+        .encoder = encoder,
+        .sushi = mt != null and mt.? == .string and std.mem.eql(u8, mt.?.string, "qwen4_exp") and
+            format != null and format.? == .string and std.mem.eql(u8, format.?.string, "exl3"),
+    };
+}
+
 /// True when `sub` holds a Laya typed-decision checkpoint (no root config.json;
 /// identified by the two configs every Laya export carries). Twin of
 /// gen.isLayaRepo, which delegates here.
@@ -2053,4 +2084,58 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "engineTraits: only a qwen4_exp pack with EXL3 experts routes to the sushi engine" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const packs = [_]struct { name: []const u8, config: []const u8, sushi: bool }{
+        .{ .name = "exl3", .sushi = true, .config = "{\"model_type\":\"qwen4_exp\",\"quantization\":{\"mode\":\"affine\",\"bits\":8},\"expert_quant\":{\"format\":\"exl3\",\"k\":3}}" },
+        .{ .name = "affine", .sushi = false, .config = "{\"model_type\":\"qwen4_exp\",\"quantization\":{\"mode\":\"affine\",\"bits\":4}}" },
+        .{ .name = "mimo", .sushi = false, .config = "{\"model_type\":\"mimo_v2\",\"expert_quant\":{\"format\":\"exl3\"}}" },
+        .{ .name = "other-format", .sushi = false, .config = "{\"model_type\":\"qwen4_exp\",\"expert_quant\":{\"format\":\"mxfp4\"}}" },
+    };
+    for (packs) |p| {
+        try tmp.dir.createDirPath(io, p.name);
+        const rel = try std.fmt.allocPrint(allocator, "{s}/config.json", .{p.name});
+        defer allocator.free(rel);
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = p.config });
+        const dir = try std.fs.path.join(allocator, &.{ root, p.name });
+        defer allocator.free(dir);
+        try testing.expectEqual(p.sushi, engineTraits(io, allocator, dir).sushi);
+    }
+    try testing.expect(!engineTraits(io, allocator, "").sushi);
+    const missing = try std.fs.path.join(allocator, &.{ root, "missing" });
+    defer allocator.free(missing);
+    try testing.expect(!engineTraits(io, allocator, missing).sushi);
+}
+
+test "engineTraits: an embedding encoder is told apart by its config, not its name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const packs = [_]struct { name: []const u8, config: []const u8, encoder: bool }{
+        .{ .name = "chat-named-bge", .encoder = false, .config = "{\"model_type\":\"gemma3_text\"}" },
+        .{ .name = "e", .encoder = true, .config = "{\"model_type\":\"bert\"}" },
+        .{ .name = "g", .encoder = true, .config = "{\"model_type\":\"gemma3_text\",\"use_bidirectional_attention\":true}" },
+        .{ .name = "q", .encoder = false, .config = "{\"model_type\":\"qwen3\",\"pooling_mode\":\"last\"}" },
+    };
+    for (packs) |p| {
+        try tmp.dir.createDirPath(io, p.name);
+        const rel = try std.fmt.allocPrint(allocator, "{s}/config.json", .{p.name});
+        defer allocator.free(rel);
+        try tmp.dir.writeFile(io, .{ .sub_path = rel, .data = p.config });
+        const dir = try std.fs.path.join(allocator, &.{ root, p.name });
+        defer allocator.free(dir);
+        const traits = engineTraits(io, allocator, dir);
+        try testing.expectEqual(p.encoder, traits.encoder);
+        try testing.expect(!traits.sushi);
+    }
 }

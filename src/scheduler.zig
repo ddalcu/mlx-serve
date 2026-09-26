@@ -57,6 +57,7 @@ const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const sushi_guest_mod = @import("arch/sushi_guest.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
@@ -1955,6 +1956,8 @@ pub const Scheduler = struct {
         // re-check state — between the fast-path call and now another
         // caller could have completed the load.
         const entry = try self.registry.resolveEntry(id_or_empty);
+        // A pack whose engine cannot start fails here, before anything is evicted for it.
+        if (entry.sushi_pack) self.allocator.free(try sushi_guest_mod.prepare(self.allocator, self.io));
 
         // CPU-only pre-load: parse config / load tokenizer / load chat
         // config. Cheap (~tens of ms); kept outside the mutex so other
@@ -2013,7 +2016,10 @@ pub const Scheduler = struct {
                         self.registry.mutex.unlock(self.io);
                         return load_err;
                     },
-                    .unloaded => break :wait_loop,
+                    .unloaded => {
+                        if (!self.registry.engineSwapPendingLocked(entry)) break :wait_loop;
+                        self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
+                    },
                 }
             }
 
@@ -2036,6 +2042,12 @@ pub const Scheduler = struct {
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
             const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+                if (self.registry.engineSwapBusyLocked(entry)) |busy| {
+                    log.err("Refusing to load {s}: {s} is serving a request, and the sushi engine never shares the GPU; retry when it finishes.\n", .{ entry.id, busy.id });
+                    self.registry.markUnloadedLocked(entry);
+                    self.registry.mutex.unlock(self.io);
+                    return error.EngineBusy;
+                }
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -2204,8 +2216,10 @@ pub const Scheduler = struct {
             self.registry.mutex.lockUncancelable(self.io);
             wait: while (true) {
                 switch (entry.state) {
-                    // Already free (or failed-load stub) → nothing to do.
+                    // Already free (or failed-load stub) → nothing to do,
+                    // but a guest that died is cleared so its pack can load again.
                     .unloaded, .error_state => {
+                        self.registry.resetDiedLocked(entry);
                         self.registry.mutex.unlock(self.io);
                         return;
                     },
@@ -3092,6 +3106,48 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (hot_cache_budget_invalidate) |f| f();
 }
 
+/// sushi guest load: start the guest process on the pack and mark ready. The
+/// CPU state is the pack's own (the usual preload), so `/v1/models` describes
+/// the model as usual; the MLX fields stay null and the server forwards every
+/// request for this entry to the guest.
+fn doLoadSushiOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    // Buffers freed by evicted models go back to the OS: the guest needs the memory.
+    _ = mlx.mlx_clear_cache();
+    const config = params.config;
+    const guest = try sushi_guest_mod.SushiGuest.start(sch.allocator, sch.io, params.model_dir, if (config.ctx_override > 0) config.ctx_override else sch.gguf_ctx_size);
+    // Advertise the window the guest serves, not one computed for MLX.
+    if (guest.row.context_length > 0) config.ctx_override = guest.row.context_length;
+
+    const entry = params.entry;
+    entry.sushi_guest = guest;
+    entry.releaseRetainedCpuState();
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.dflash = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = "";
+    entry.prefix_cache = null;
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, entry.bytes_on_disk orelse 0);
+    sch.registry.mutex.unlock(sch.io);
+
+    sch.current_model = entry;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.drafter = null;
+    sch.dflash = null;
+    sch.hot_prefix_cache = null;
+    publishHotCacheResidency(sch);
+    if (hot_cache_budget_invalidate) |f| f();
+}
+
 /// The post-load residency bill the eviction gate reserves, in bytes.
 ///
 /// A media entry is billed by its BACKEND: a staged-residency model
@@ -3676,6 +3732,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    startup LoadParams AND cold-load LoadRequests carrying `llama_path`.
     if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
         try doLoadLlamaOnInferenceThread(sch, params);
+        return;
+    }
+    if (params.entry.sushi_pack) {
+        try doLoadSushiOnInferenceThread(sch, params);
         return;
     }
     // ── media-gen fast path: the (stub) config's model_type marks an image/
@@ -4549,8 +4609,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             signalStarted(sch);
         } else |err| {
             recordLoadError(sch, @errorName(err));
+            var label_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
             sch.registry.mutex.lockUncancelable(sch.io);
-            sch.registry.markErrorLocked(params.entry, @errorName(err));
+            sch.registry.markErrorLocked(params.entry, sushi_guest_mod.errorLabel(&label_buf, err));
             sch.registry.mutex.unlock(sch.io);
             signalStarted(sch);
             return;
@@ -5087,7 +5148,7 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     doLoadOnInferenceThread(sch, req) catch |err| {
         log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
         sch.registry.mutex.lockUncancelable(sch.io);
-        if (err == error.InsufficientMemory) {
+        if (loadFailureRetries(err)) {
             // A memory-preflight refusal is transient, not a property of the
             // checkpoint: the 503 tells the user to free memory and retry, so
             // the entry must go back to .unloaded — stuck in .error_state the
@@ -5096,7 +5157,8 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         } else {
             // markErrorLocked dupes the error name onto the entry; the
             // conn thread reads it back from the entry, not from req.
-            sch.registry.markErrorLocked(req.entry, @errorName(err));
+            var label_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+            sch.registry.markErrorLocked(req.entry, sushi_guest_mod.errorLabel(&label_buf, err));
         }
         sch.registry.mutex.unlock(sch.io);
         finishLoadRequest(sch, req, @errorName(err));
@@ -5111,6 +5173,12 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // (MTP head / drafter / vision land after the mid-load apply).
     logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
+}
+
+/// A load failure that says nothing about the model (memory, a guest that could
+/// not be fetched or started in time): the next request retries.
+fn loadFailureRetries(err: anyerror) bool {
+    return err == error.InsufficientMemory or sushi_guest_mod.isTransient(err);
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -5853,6 +5921,13 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         finishSlot(sch, slot, "length");
         return;
     }
+}
+
+test "loadFailureRetries: a failure that says nothing about the model is retried" {
+    try std.testing.expect(loadFailureRetries(error.InsufficientMemory));
+    try std.testing.expect(loadFailureRetries(error.SushiDownloadFailed));
+    try std.testing.expect(!loadFailureRetries(error.SushiGuestExited));
+    try std.testing.expect(!loadFailureRetries(error.MissingWeight));
 }
 
 test "ds4MtpShouldEngage: >1 draft tokens + greedy (legacy MTP and DSpark)" {

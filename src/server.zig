@@ -187,6 +187,7 @@ test "shouldWarnOpenBind: warn only on an UNCHOSEN non-loopback bind" {
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
 const providers_mod = @import("providers.zig");
+const sushi_guest_mod = @import("arch/sushi_guest.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
@@ -422,6 +423,7 @@ pub const Conn = struct {
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
+    sushi_guest_mod.stopping.store(true, .release);
 }
 
 /// Adaptive spec-decode gate threshold. Per-request, we score the prompt's
@@ -2222,11 +2224,13 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
         const id = path["/v1/responses/".len..];
+        if (try forwardResponseToGuest(allocator, stream, id, method, raw_path)) return;
         try handleResponsesGet(allocator, stream, id);
         return;
     }
     if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, path, "/v1/responses/")) {
         const id = path["/v1/responses/".len..];
+        if (try forwardResponseToGuest(allocator, stream, id, method, raw_path)) return;
         try handleResponsesDelete(allocator, stream, id);
         return;
     }
@@ -2348,6 +2352,14 @@ fn handleConnection(
             requested_model_id = resolved orelse "";
         }
     }
+    // Refused before ensureLoaded, which would start the guest just to 400.
+    if (std.mem.startsWith(u8, path, "/api/")) {
+        const target = registry.resolveEntry(requested_model_id) catch null;
+        if (target) |e| if (e.sushi_pack) {
+            try sendOllamaError(allocator, stream, "400 Bad Request", "This model runs on the sushi engine, which serves the OpenAI and Anthropic APIs only: use /v1/chat/completions or /v1/messages");
+            return;
+        };
+    }
     // Text-gen route aimed at a KNOWN non-text model: reject before
     // ensureLoaded, or the request cold-loads a multi-GB media model just
     // to earn its 400. The post-load `text_gen_reject` below stays the
@@ -2428,6 +2440,10 @@ fn handleConnection(
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
             return;
         },
+        error.EngineBusy => {
+            try sendEngineBusy(allocator, stream, registry, requested_model_id);
+            return;
+        },
         error.InsufficientMemory => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
             return;
@@ -2459,6 +2475,7 @@ fn handleConnection(
     // A status read must not look like use — see `isStatusRoute`.
     const status_read = isStatusRoute(method, path);
     defer if (status_read) scheduler.releaseStatus(lm) else scheduler.release(lm);
+    if (lm.sushi_guest) |guest| return handleGuestRequest(allocator, stream, lm, guest, method, raw_path, path, request[0..header_end_pos], request_body);
 
     // A model loaded on demand freezes its own auto-context here, for the same
     // reason the `--model` primary does at startup: the number we advertise is
@@ -2697,7 +2714,8 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+fn modelEngineName(has_ds4: bool, has_llama: bool, sushi_pack: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (sushi_pack) return sushi_guest_mod.engine_name;
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
     if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
@@ -6305,7 +6323,7 @@ fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
         .has_mesh_engine = lm.mesh_engine != null,
         .has_decision_engine = lm.decision_engine != null,
         .has_text_lm = lm.state != .ready or lm.transformer != null or
-            lm.ds4_engine != null or lm.llama_engine != null,
+            lm.ds4_engine != null or lm.llama_engine != null or lm.sushi_guest != null,
     };
 }
 
@@ -6391,7 +6409,15 @@ fn renderModelEntry(
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
-        const mtp_loaded = entry.mtp != null;
+        // A guest-served model reports what the guest runs, not what MLX would.
+        const guest_row: ?sushi_guest_mod.Row = if (entry.sushi_guest) |g| g.row else null;
+        const mtp_loaded = if (guest_row) |r| r.mtp_loaded else entry.mtp != null;
+        var quant_buf: [16]u8 = undefined;
+        const quantization = if (guest_row != null and guest_row.?.quantization.len > 0)
+            guest_row.?.quantization
+        else
+            std.fmt.bufPrint(&quant_buf, "{d}-bit", .{config.quant_bits}) catch "";
+        const kv_quant = if (guest_row != null and guest_row.?.kv_quant.len > 0) guest_row.?.kv_quant else configuredKvQuantFor(config).wireName();
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -6424,7 +6450,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{s}","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6440,11 +6466,11 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             config.model_type,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.sushi_pack, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
-            config.quant_bits,
+            quantization,
             ctx_str,
             config.max_position_embeddings,
             embed_limit_str,
@@ -6453,7 +6479,7 @@ fn renderModelEntry(
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
             if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
-            configuredKvQuantFor(config).wireName(),
+            kv_quant,
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
@@ -6474,13 +6500,10 @@ fn renderModelEntry(
         try allocator.dupe(u8, "null");
     defer allocator.free(bytes_on_disk_str);
     const err_part: []const u8 = if (entry.error_name) |name| blk: {
-        // Inline escape to avoid double allocation; the names we emit
-        // never contain quotes/backslashes (they're @errorName output).
-        break :blk try std.fmt.allocPrint(
-            allocator,
-            ",\"error\":\"{s}\"",
-            .{name},
-        );
+        // A guest failure names its log path.
+        const escaped = try jsonEscape(allocator, name);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, ",\"error\":{s}", .{escaped});
     } else &[_]u8{};
     defer if (err_part.len > 0) allocator.free(err_part);
     // Stub metadata sourced from config.json (+ chat-template presence) WITHOUT
@@ -6565,7 +6588,7 @@ fn renderModelEntry(
     // Unloaded entries have no engine attached yet — "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, entry.path, entry.arch_hint),
+        modelEngineName(false, false, entry.sushi_pack, entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -6796,6 +6819,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         },
         error.NotEnoughMemory => {
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
+            return;
+        },
+        error.EngineBusy => {
+            if (global_registry) |registry| try sendEngineBusy(allocator, stream, registry, requested_id);
             return;
         },
         error.InsufficientMemory => {
@@ -11954,6 +11981,74 @@ const LAN_PEER_WAIT_MS: i64 = 15_000;
 ///     (client disconnect abandons the wait), then 404.
 /// 502 when the peer resolves but stops accepting. Never a silent fallback
 /// to the local default model.
+/// Routes the sushi guest serves itself.
+fn guestForwards(method: []const u8, path: []const u8) bool {
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    const routes = [_][]const u8{ "/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses", "/v1/embeddings", "/tokenize", "/detokenize" };
+    for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
+    return false;
+}
+
+/// A model served by the sushi guest: its routes go to the guest byte-for-byte,
+/// `/props` is the guest's own with the engine named, and anything else is
+/// refused by name.
+fn handleGuestRequest(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, guest: *sushi_guest_mod.SushiGuest, method: []const u8, raw_path: []const u8, path: []const u8, head: []const u8, body: []const u8) !void {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        const raw = guest.fetch(allocator, "/props", 10_000) catch return guestUnreachable(allocator, stream, lm, guest);
+        defer allocator.free(raw);
+        const props = sushi_guest_mod.overlayProps(allocator, raw) catch return guestUnreachable(allocator, stream, lm, guest);
+        defer allocator.free(props);
+        return sendResponse(stream, "200 OK", "application/json", props);
+    }
+    const websocket = ws_mod.isUpgrade(head);
+    if (websocket or !guestForwards(method, path)) {
+        const msg = try std.fmt.allocPrint(allocator, "This model runs on the sushi engine, which does not serve {s} {s}{s}", .{ method, path, if (websocket) " over WebSocket" else "" });
+        defer allocator.free(msg);
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+    }
+    log.info("[sushi] {s} {s} -> guest :{d}\n", .{ method, raw_path, guest.port });
+    guest.forward(method, raw_path, body, stream) catch return guestUnreachable(allocator, stream, lm, guest);
+}
+
+/// The guest refused the connection. A guest that died fails its entry, naming
+/// its log, until the next boot; a live one is only unresponsive.
+fn guestUnreachable(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, guest: *sushi_guest_mod.SushiGuest) !void {
+    if (!guest.hasExited()) {
+        return sendErrorResponse(allocator, stream, "502 Bad Gateway", "engine_unreachable", "The sushi engine serving this model is not answering", 502);
+    }
+    var label_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const label = sushi_guest_mod.errorLabel(&label_buf, error.SushiGuestExited);
+    log.err("[sushi] guest pid={d} exited: {s}\n", .{ guest.pid, label });
+    if (global_registry) |registry| {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        registry.markDiedLocked(lm, label);
+    }
+    const msg = try std.fmt.allocPrint(allocator, "Model load failed: {s}", .{label});
+    defer allocator.free(msg);
+    return sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_load_failed", msg, 503);
+}
+
+/// A `/v1/responses/{id}` our store does not hold belongs to the resident sushi
+/// guest's store, when one runs. False when there is no guest to ask.
+fn forwardResponseToGuest(allocator: std.mem.Allocator, stream: *Conn, id: []const u8, method: []const u8, raw_path: []const u8) !bool {
+    if (getOrInitResponseStore(stream.io, allocator).get(id) != null) return false;
+    const registry = global_registry orelse return false;
+    const lm: *LoadedModel = blk: {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        var it = registry.entries.valueIterator();
+        while (it.next()) |e| if (e.*.state == .ready and e.*.sushi_guest != null) {
+            _ = e.*.refcount.fetchAdd(1, .acq_rel);
+            break :blk e.*;
+        };
+        return false;
+    };
+    defer registry.releaseStatus(lm);
+    lm.sushi_guest.?.forward(method, raw_path, "", stream) catch return false;
+    return true;
+}
+
 fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
     // Swift/PHP clients escape '/' as '\/', so the raw body slice can read
     // `ddalcu\/gemma…@peer` while the peer table stores the canonical id
@@ -12620,6 +12715,24 @@ pub const not_enough_memory_message =
     "Unload the model you are chatting with (tray > Models > eject), " ++
     "or raise or disable the cap with --max-resident-mem <size>|0. " ++
     "The server log names the exact figures and the current cap.";
+
+/// The refusal for a load that must swap engines while the other one serves a request.
+fn engineBusyMessage(buf: []u8, busy_id: []const u8, loading_guest: bool) []const u8 {
+    return std.fmt.bufPrint(buf, "Model {s} is serving a request; the sushi engine swaps {s} when it finishes. Retry then.", .{ busy_id, if (loading_guest) "in" else "out" }) catch
+        "Another engine is serving a request; retry when it finishes.";
+}
+
+fn sendEngineBusy(allocator: std.mem.Allocator, stream: *Conn, registry: *ModelRegistry, requested_id: []const u8) !void {
+    var buf: [640]u8 = undefined;
+    const msg = blk: {
+        const entry = registry.resolveEntry(requested_id) catch break :blk "Another engine is serving a request; retry when it finishes.";
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        const busy = registry.engineSwapBusyLocked(entry) orelse break :blk "Another engine was serving a request; retry now.";
+        break :blk engineBusyMessage(&buf, busy.id, entry.sushi_pack);
+    };
+    try sendErrorResponse(allocator, stream, "503 Service Unavailable", "engine_busy", msg, 503);
+}
 
 /// #144: the memory PREFLIGHT refusal (free RAM can't hold weights + warmup
 /// headroom) is distinct from the resident-budget gate above and has a
@@ -22839,15 +22952,32 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
+    // An EXL3 Flash-Next pack is the sushi guest's, loaded or not.
+    try testing.expectEqualStrings("sushi", modelEngineName(false, false, true, "/m/Qwen3.8-Flash-Next-Sushi-3bpw", "qwen4_exp"));
+}
+
+test "engineBusyMessage: names the busy model and which way the engines swap" {
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Model gemma-4-12b is serving a request; the sushi engine swaps in when it finishes. Retry then.", engineBusyMessage(&buf, "gemma-4-12b", true));
+    try testing.expectEqualStrings("Model Qwen3.8-Flash-Next-Sushi-3bpw is serving a request; the sushi engine swaps out when it finishes. Retry then.", engineBusyMessage(&buf, "Qwen3.8-Flash-Next-Sushi-3bpw", false));
+}
+
+test "guestForwards: the sushi guest serves the text routes, never media" {
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses", "/v1/embeddings", "/tokenize", "/detokenize" }) |p| {
+        try testing.expect(guestForwards("POST", p));
+    }
+    try testing.expect(!guestForwards("POST", "/v1/images/generations"));
+    try testing.expect(!guestForwards("POST", "/v1/audio/speech"));
+    try testing.expect(!guestForwards("GET", "/v1/responses"));
 }
 
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {
