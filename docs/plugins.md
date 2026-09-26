@@ -102,17 +102,19 @@ plugin; MiMo as an `arch` plugin once `sdk.KVCache`/`ForwardCtx` cover what it r
 `transformer.zig`, `server.zig`, etc. goes away. The work they do in those files either lands upstream as a normal PR
 or turns out to be a hook the SDK is missing.
 
-## Refactor plan (our side)
+## PR plan
 
-1. `src/sdk.zig` + `sdk.Plugin` + comptime negotiation, with hermetic tests (a fake plugin per kind, and one per
-   rejection: api major, mlx pin, missing fn).
-2. `engine` kind: move ds4 and llama.cpp behind it, deleting the scattered branches. Characterization tests first
-   (`tests/test_ds4_serve.sh` + the llama GGUF path must stay byte-identical).
-3. `quant` and `expert_source` hooks in the load path and the MoE layer (the resident path is itself the default
-   `expert_source`).
-4. `-Dslim` build + `sdk.testing` conformance + a template plugin repo.
-5. `arch` kind (widest surface: KV, ForwardCtx, capture for spec). Last, because it freezes the most internals.
-6. First external plugins: sushi `expert_source` and `quant`, with its authors.
+1. Shared modules: every `@import("mlx.zig")`/`log.zig`/`io_util.zig` becomes a named module, built once in
+   `build.zig`. Mechanical, scripted, no plugin code.
+2. `src/sdk.zig` + `sdk.Plugin` + compile-time negotiation + `src/plugins.zig` registry. Every kind has only
+   `claims(peek) ?Priority` at first; a kind's full interface lands with its first real consumer. The check is a
+   pure function returning a named error (unit-tested with fake plugins); `@compileError` only wraps it.
+3. `quant` kind, sushi EXL3 the first plugin: one entry file in sushi exporting `plugin`, pinned at a tag, its
+   own tests as a build step in our CI, one EXL3 pack served end to end (claim, load, MoE matmul, memory bill).
+4. `expert_source` kind (sushi SSD expert streaming) + `-Dslim` host + `sdk.testing` conformance.
+5. `engine` kind: ds4 and llama.cpp moved behind it (characterization tests first). `arch` (MiMo) after.
+
+Pins may be a submodule (as ds4) or a `build.zig.zon` hash; either way a tag, never a branch head.
 
 ## Open questions
 
