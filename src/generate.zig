@@ -11042,6 +11042,21 @@ pub const Generator = struct {
     /// grammar by the sampled token's bytes, and pre-launches the next forward
     /// pass to overlap with the next mask build.
     fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        if (self.logprobs_n == 0 or !self.has_pending_logits) return self.nextConstrainedToken(allocator);
+        // Every constrained arm returns a token drawn (or forced) at THIS position, with no
+        // one-token delay, so its entry comes from these logits: raw, before the grammar mask.
+        var logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_set(&logits, self.pending_logits));
+        const token = (try self.nextConstrainedToken(allocator)) orelse return null;
+        if (self.last_logprob) |*lp| allocator.free(lp.top_logprobs);
+        self.pending_logprob = try computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.s);
+        self.last_logprob = self.pending_logprob;
+        self.pending_logprob = null;
+        return token;
+    }
+
+    fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (!self.has_pending_logits) {
             self.done = true;
             return null;
@@ -20050,4 +20065,59 @@ fn suppressedArgmaxCase(allocator: std.mem.Allocator, s: mlx.mlx_stream, v: usiz
     const ids = try samplerTestReadFlat(allocator, masked.lazy(), rows, s);
     defer allocator.free(ids);
     for (ids, 0..) |id, r| try testing.expectEqual(@as(f32, @floatFromInt(100 + r)), id);
+}
+
+test "constrained generation returns one logprob entry per token, paired with that token" {
+    // Bar: a json_schema request with logprobs gets an entry for every returned token, describing it.
+    const path = std.c.getenv("LOGPROBS_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = std.mem.span(path);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, dir);
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var tok = try tokenizer_mod.loadTokenizer(io, a, dir);
+    defer tok.deinit();
+    var token_bytes = try token_mask.build(a, &tok);
+    defer token_bytes.deinit();
+
+    const schema_src =
+        \\{"type":"object","properties":{"a":{"type":"string","enum":["yes","no"]}},"required":["a"],"additionalProperties":false}
+    ;
+    var schema = try std.json.parseFromSlice(std.json.Value, a, schema_src, .{});
+    defer schema.deinit();
+    var sc: SchemaConstraint = undefined;
+    try sc.initFromValue(a, schema.value, &token_bytes);
+    defer sc.deinit();
+
+    const prompt = try tok.encode(a, "Answer yes or no in JSON: is water wet?\n");
+    defer a.free(prompt);
+    const result = try generate(io, a, &xfm, &tok, prompt, 16, .{ .temperature = 0, .constraint = &sc.constraint }, config.eosTokenSlice(), 0, 5);
+    defer {
+        a.free(result.text);
+        a.free(result.token_ids);
+        if (result.logprobs) |lps| {
+            for (lps) |lp| a.free(lp.top_logprobs);
+            a.free(lps);
+        }
+    }
+
+    const lps = result.logprobs orelse return error.NoLogprobs;
+    try testing.expect(result.token_ids.len > 0);
+    try testing.expectEqual(result.token_ids.len, lps.len);
+    var paired: usize = 0;
+    for (result.token_ids, lps) |id, lp| {
+        try testing.expect(lp.token_logprob <= 0);
+        for (lp.top_logprobs) |alt| {
+            if (alt.token_id != id) continue;
+            try testing.expectApproxEqAbs(alt.logprob, lp.token_logprob, 1e-5);
+            paired += 1;
+        }
+    }
+    try testing.expect(paired > 0);
 }

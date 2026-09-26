@@ -6733,7 +6733,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
 }
 
 /// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
-/// new dirs (add-only; `ModelRegistry.rescan`). Answers `{"added":N}`.
+/// new dirs, clearing failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
 fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
     const registry = global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);

@@ -87,7 +87,7 @@ def entries_ok(label, content):
            for e in content))
     ck(f"[{label}] every entry carries bytes", all("bytes" in e for e in content))
 
-print("── [1/7] chat non-streaming ──")
+print("── [1/8] chat non-streaming ──")
 r = post("/v1/chat/completions", {**REQ, "stream": False})
 ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
 ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
@@ -105,7 +105,7 @@ if ns:
        len(ns) <= r["usage"]["completion_tokens"],
        f"{len(ns)} entries vs {r['usage']['completion_tokens']} tokens")
 
-print("── [2/7] temperature must not move the model's own distribution ──")
+print("── [2/8] temperature must not move the model's own distribution ──")
 # max_tokens=1 is not enough to guarantee a CONTENT token: a model whose template
 # opens <think> unconditionally spends its first token closing it, and that token
 # has no logprobs.content entry (the field describes message.content). Ask for a
@@ -126,7 +126,7 @@ ck("distribution not saturated to 0.0 at temp 0",
    any(abs(t["logprob"]) > 1e-4 for t in a["top_logprobs"][1:]),
    f"{[round(t['logprob'],6) for t in a['top_logprobs']]}")
 
-print("── [3/7] /v1/completions: integer logprobs, four parallel arrays ──")
+print("── [3/8] /v1/completions: integer logprobs, four parallel arrays ──")
 r = post("/v1/completions", {"model": MODEL, "prompt": "Count from one to five:",
                              "max_tokens": 24, "temperature": 0, "logprobs": 5})
 lp = r["choices"][0].get("logprobs")
@@ -147,7 +147,7 @@ if lp:
                if m and abs(max(m.values()) - v) > 1e-4]
         ck("[completions] emitted token is the max of its map at temp 0", not bad, f"{bad[:3]}")
 
-print("── [4/7] STREAMING chat must carry the same logprobs ──")
+print("── [4/8] STREAMING chat must carry the same logprobs ──")
 resp = post("/v1/chat/completions", {**REQ, "stream": True}, stream=True)
 st = []
 for raw in resp:
@@ -169,7 +169,7 @@ if st:
     lp_mismatch = [i for i in range(n) if abs(st[i]["logprob"] - ns[i]["logprob"]) > 1e-6]
     ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
 
-print("── [5/7] STREAMING /v1/completions carries the legacy shape ──")
+print("── [5/8] STREAMING /v1/completions carries the legacy shape ──")
 CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,
         "temperature": 0, "logprobs": 5}
 ns = post("/v1/completions", {**CREQ, "stream": False})["choices"][0]
@@ -212,7 +212,7 @@ if toks:
            and all(abs(a - b) < 1e-6 for a, b in zip(tlp, nlp["token_logprobs"])),
            "values differ")
 
-print("── [6/7] logprobs describe message.content, not the reasoning we strip ──")
+print("── [6/8] logprobs describe message.content, not the reasoning we strip ──")
 # OpenAI defines `logprobs.content` as the tokens of the message CONTENT. We
 # built it from the whole generation, so on every model that thinks the array
 # described the reasoning block — text the client never receives — and entry 0
@@ -261,7 +261,58 @@ if sents:
        sjoined.strip() == sc.strip(),
        f"{len(sents)} entries -> {sjoined[:44]!r} vs deltas {sc[:44]!r}")
 
-print("── [7/7] every response body is valid UTF-8 ──")
+print("── [7/8] response_format keeps logprobs ──")
+# Entries are the model's raw distribution, so under a grammar the emitted token
+# need not be rank 1; the bar is that every content token has its own entry.
+SCHEMA = {"type": "json_schema", "json_schema": {"name": "d", "strict": True, "schema": {
+    "type": "object", "properties": {"a": {"type": "string", "enum": ["yes", "no"]}},
+    "required": ["a"], "additionalProperties": False}}}
+FMSG = [{"role": "user", "content": "Answer yes or no in JSON: is water wet?"}]
+FREQ = {"model": MODEL, "messages": FMSG, "max_tokens": 40, "temperature": 0,
+        "logprobs": True, "top_logprobs": 3, "enable_thinking": False}
+
+def format_entries_ok(label, ents, content):
+    if not content.strip():
+        print(f"  \033[33mNOTE\033[0m  [{label}] model produced no content; entry checks skipped")
+        return
+    ck(f"[{label}] logprobs present", bool(ents), "none")
+    if not ents:
+        return
+    # The last token may straddle the payload end (`}` plus a trailing byte), and it keeps its entry.
+    joined, content = "".join(e["token"] for e in ents).lstrip(), content.strip()
+    ck(f"[{label}] entries reconstruct the content",
+       joined.startswith(content) and len(joined) - len(content) < max(1, len(ents[-1]["token"])),
+       f"{joined[:44]!r} vs {content[:44]!r}")
+    unpaired = [i for i, e in enumerate(ents) for t in e.get("top_logprobs") or []
+                if t["token"] == e["token"] and abs(t["logprob"] - e["logprob"]) > 1e-4]
+    ck(f"[{label}] each entry describes its own token", not unpaired, f"{unpaired[:5]}")
+
+fr = {}
+for kind, rf in (("json_schema", SCHEMA), ("json_object", {"type": "json_object"})):
+    ch = post("/v1/chat/completions", {**FREQ, "response_format": rf})["choices"][0]
+    fr[kind] = ch
+    format_entries_ok(f"{kind} non-stream", (ch.get("logprobs") or {}).get("content") or [],
+                      ch["message"].get("content") or "")
+
+fc, fents = "", []
+for raw in post("/v1/chat/completions", {**FREQ, "response_format": SCHEMA, "stream": True}, stream=True):
+    line = raw.decode().strip()
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    for ch in json.loads(line[6:]).get("choices", []):
+        fc += (ch.get("delta") or {}).get("content") or ""
+        fents.extend((ch.get("logprobs") or {}).get("content") or [])
+format_entries_ok("json_schema stream", fents, fc)
+nsents = (fr["json_schema"].get("logprobs") or {}).get("content") or []
+ck("[json_schema stream] same tokens as non-streaming",
+   bool(fents) and [e["token"] for e in fents] == [e["token"] for e in nsents], f"{len(fents)} vs {len(nsents)}")
+
+ch = post("/v1/chat/completions", {**FREQ, "response_format": SCHEMA, "enable_thinking": True,
+                                   "max_tokens": 1000})["choices"][0]
+format_entries_ok("json_schema thinking", (ch.get("logprobs") or {}).get("content") or [],
+                  ch["message"].get("content") or "")
+
+print("── [8/8] every response body is valid UTF-8 ──")
 ck("no response carried a split multi-byte token as raw bytes", not utf8_bad,
    f"{len(utf8_bad)} bodies failed to decode: {utf8_bad[:2]}")
 

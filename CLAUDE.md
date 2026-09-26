@@ -257,7 +257,7 @@ Request parsing + media:
 
 Sampling + logprobs + streams:
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey` + `SamplingParams.draw`).
-- **Logprobs are the MODEL's distribution**: pre-temperature, `logits - logsumexp` in f32 (`computeLogprobs`), ids travel with values, entry belongs to the RETURNED token (`pending_logprob`). Bar: temp-0 rank 1 == chosen.
+- **Logprobs are the MODEL's distribution**: pre-temperature, `logits - logsumexp` in f32 (`computeLogprobs`), ids travel with values, entry belongs to the RETURNED token (`pending_logprob`), pre-GRAMMAR-mask under `response_format` (`nextConstrained`). Bar: temp-0 rank 1 == chosen.
 - **Streaming logprobs**: a SIBLING of `delta`/`text` (`ChunkExtras`), ONE collector `StreamLogprobs` with a high-water mark, shipped once; `logprobs.content` describes `message.content` (`contentTokenRange`, `skipToContent`, `dropPending`). `/v1/completions` logprobs is an INTEGER + four arrays. Guard: `tests/test_logprobs.sh`.
 - **A client stop string ends the ANSWER, never the reasoning** (#549, `chat.answerStopIndex`): a match counts only where the split delivers it as content, judged on the text UP TO the match, so stream and non-stream cut the same byte. Guard: corpus `a stop string ends the answer`.
 - **Stream and non-stream are the SAME BYTES**; only an all-whitespace lead chunk may be withheld (`streamContentLead`). Also agree: spent budget WITHHOLDS the rest; tool replies carry `visibleToolPreamble`; disconnect = `client_disconnect`; stop sequences cut at INDEX (`stopSequenceCut`).

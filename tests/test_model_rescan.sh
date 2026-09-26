@@ -111,6 +111,29 @@ HEALTH=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health")
 check "server survived the refused load (health $HEALTH)" \
     "$([ "$HEALTH" = "200" ] && echo 1 || echo 0)"
 
+# A failed load is not forever: rescan puts an entry whose dir is still there
+# back to "unloaded", so the next load re-reads the dir instead of replaying
+# the stored error until a restart.
+mkdir -p "$ROOT_DIR/org/no-tokenizer"
+echo '{"model_type":"llama"}' > "$ROOT_DIR/org/no-tokenizer/config.json"
+echo "stub" > "$ROOT_DIR/org/no-tokenizer/model.safetensors"
+curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan" >/dev/null
+curl -s -X POST "http://127.0.0.1:$PORT/v1/load-model" -H 'Content-Type: application/json' \
+    -d '{"model":"org/no-tokenizer"}' >/dev/null
+state_of() {
+    curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c \
+        "import json,sys; print(next((m.get('state','') for m in json.load(sys.stdin)['data'] if m['id']=='$1'),''))"
+}
+STATE=$(state_of org/no-tokenizer)
+check "a load missing tokenizer.json leaves the entry in error (got $STATE)" \
+    "$([ "$STATE" = "error" ] && echo 1 || echo 0)"
+curl -s -X POST "http://127.0.0.1:$PORT/v1/models/rescan" >/dev/null
+STATE=$(state_of org/no-tokenizer)
+check "rescan clears the failed load (got $STATE)" \
+    "$([ "$STATE" = "unloaded" ] && echo 1 || echo 0)"
+check "rescan logs the cleared entry" \
+    "$(grep -q 'rescan cleared 1 failed load' "$LOG" && echo 1 || echo 0)"
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" = "0" ] || exit 1
