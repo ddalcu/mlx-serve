@@ -17,7 +17,7 @@ streaming, MiMo-V2) on top of a copy of our tree. We want that work to ship insi
 ds4 is the right shape (pinned submodule, `src/arch/ds4.zig` bridge, Linux stub) but the wrong amount of glue: about
 80 `ds4_engine`/`llama_engine` branches spread over `server.zig`, `scheduler.zig`, `model_registry.zig`, `chat.zig`,
 `gen.zig`. A third engine done that way adds another 80. The refactor below turns those branches into ONE interface.
-ds4 and llama.cpp become the first two plugins, so the interface is tested by the code we already ship.
+mlx-serve-gguf is the first plugin (it already serves end to end); ds4 and llama.cpp move behind `engine` later.
 
 ## Plugin kinds (the extension points)
 
@@ -72,7 +72,7 @@ pub const plugin = sdk.Plugin{
     .api = .{ .major = 1, .minor = 0 },   // the SDK it was built against
     .mlx = "v0.32.2",                     // the pin it was tested on
     .macos_only = true,                   // Linux/iOS graphs get no-op registration
-    .provides = .{ .quant = Exl3 },       // any subset of: quant, expert_source, arch, engine
+    .provides = .{ .quant = Exl3 },       // any subset of: source, quant, expert_source, arch, engine
 };
 ```
 
@@ -85,16 +85,16 @@ pub const plugin = sdk.Plugin{
 4. registers each entry with its hook's table.
 
 At runtime routing is ONE question per hook, asked in registry order:
-`claims(peek: sdk.ConfigPeek) ?Priority`. Discovery asks the `engine` and `arch` tables for a model, the load path asks
+`claims(peek: sdk.ConfigPeek) ?Priority`. Discovery asks the `source`, `engine` and `arch` tables for a model, the load path asks
 `quant` per weight group and `expert_source` per MoE layer. `model-settings.json` may name a plugin to break a tie.
 `/v1/models` and `/props` carry `plugins: [...]` so a user can see what served a model.
 
 ## Pinning and build
 
-- Zig plugins are dependencies in `build.zig.zon` (url + content hash), which is a reproducible pin with no
-  submodule dance. C/C++ engines (ds4, llama.cpp) keep their submodule or fetch script, behind the same interface.
+- A plugin is pinned at a TAG, as a submodule under `lib/` (as ds4) or a `build.zig.zon` dependency (url + hash).
+  C/C++ engines (ds4, llama.cpp) keep their submodule or fetch script, behind the same interface.
 - The plugin's `build.zig` exposes a module WITHOUT importing the SDK itself; our `build.zig` injects our `sdk`
-  module (`addImport("mlxserve", sdk)`), so there is one SDK and one MLX in the binary.
+  module (`addImport("sdk", sdk)`), so there is one SDK and one MLX in the binary.
 - Bump = a PR that changes the hash. CI builds every plugin and runs its conformance tests; red = the bump waits.
 - The plugin's own license and attribution go into `NOTICE`, as for ds4.
 
@@ -114,7 +114,7 @@ mlx-serve" are the same test.
 
 ## What folding sushi back looks like
 
-In our tree: one `build.zig.zon` entry, one line in `src/plugins.zig`, one `NOTICE` paragraph. In theirs:
+In our tree: one pin, one line in `src/plugins.zig`, one `NOTICE` paragraph. In theirs:
 `expert_stream` + `expert_io` + kernels as an `expert_source` plugin; `expert_exl3*` + `expert_quant` as a `quant`
 plugin; MiMo as an `arch` plugin once `sdk.KVCache`/`ForwardCtx` cover what it reads. Their fork of our
 `transformer.zig`, `server.zig`, etc. goes away. The work they do in those files either lands upstream as a normal PR
@@ -134,8 +134,6 @@ or turns out to be a hook the SDK is missing.
    build step in our CI, one EXL3 pack served end to end (claim, load, MoE matmul, memory bill).
 5. `expert_source` kind (sushi SSD expert streaming) + `-Dslim` host + `sdk.testing` conformance.
 6. `engine` kind: ds4 and llama.cpp moved behind it (characterization tests first). `arch` (MiMo) after.
-
-Pins may be a submodule (as ds4) or a `build.zig.zon` hash; either way a tag, never a branch head.
 
 ## Open questions
 
