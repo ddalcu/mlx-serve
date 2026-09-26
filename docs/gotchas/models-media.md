@@ -1933,9 +1933,9 @@ Cause 1: Nemotron 3.5 configs write the layer pattern as `layers_block_type: ["m
 
 Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFast that is UB and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. Every `E`-block Nemotron (3 Nano, 3.5) hit it; only dense Nemotron-H ever loaded.
 
-Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path, shared expert always added. `moe_latent_size` packs are refused by name. Decode uses the sorted path too; the gather-qmv decode kernels are SwiGLU-only.
+Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 single-token step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
 
-Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (transformer.zig).
+Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
 
 ## Nemotron-H: the Mamba2 SSM output widened the whole residual stream to f32
 
