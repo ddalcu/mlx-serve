@@ -122,7 +122,7 @@ def generate(api, process, body, folder, name, timeout, guard_url):
         assert im.mode in ("RGB", "RGBA"), im.mode
         (folder / f"{name}.png").write_bytes(png)
         steps = [e["elapsed_s"] for e in events if e.get("stage") == "Generating"]
-        assert len(steps) == body["steps"], events
+        assert len(steps) == (body["steps"] or 40), events
         result = {"elapsed_s": elapsed, "first_step_including_encode_s": steps[0],
                   "steady_step_s": statistics.median(b - a for a, b in zip(steps, steps[1:])) if len(steps) > 1 else None,
                   "sha256": hashlib.sha256(png).hexdigest(), "events": events, "memory_samples": samples}
@@ -161,7 +161,7 @@ def main():
     parser.add_argument("--refs", type=int, choices=range(1, 11), default=1)
     parser.add_argument("--size", default="512x512")
     parser.add_argument("--ref-resolution", type=int, choices=(256, 512, 1024), default=512)
-    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--steps", type=int, default=20, help="Denoise steps; 0 tests the server's 40-step default")
     parser.add_argument("--cfg", type=float, default=1)
     parser.add_argument("--opaque", action="store_true", help="Use white rather than transparent reference backgrounds")
     parser.add_argument("--trials", type=int, default=3)
@@ -169,7 +169,8 @@ def main():
     parser.add_argument("--guard-url", help="Abort if this separate server loads any model")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    assert args.steps >= 1 and args.trials >= 1 and args.timeout > 0
+    assert args.steps >= 0 and args.trials >= 1 and args.timeout > 0
+    resolved_steps = args.steps or 40
     assert args.binary.is_file() and (args.model / "config.json").is_file()
     folder = args.out or Path(tempfile.mkdtemp(prefix="qwen-edit-cache-"))
     folder.mkdir(parents=True, exist_ok=True)
@@ -219,7 +220,8 @@ def main():
                     for trial in range(args.trials + 1):
                         results.append(generate(api, process, body, folder, f"{label}-{trial}", args.timeout, args.guard_url))
                     text = log_path.read_text()
-                    expected = enabled and args.steps > 1
+                    assert f"steps={resolved_steps} guidance=" in text, "admission did not resolve the step count"
+                    expected = enabled and resolved_steps > 1
                     assert f"edit prefix cache enabled={str(expected).lower()}" in text, "cache dispatch not engaged"
                     if expected:
                         branches = 2 if args.cfg != 1 else 1
@@ -247,7 +249,7 @@ def main():
                                 "mae_rgba": stat.mean, "max_error_rgba": [p[1] for p in stat.extrema]})
             assert max(stat.mean) < 1, comparisons[-1]
         report.update(status="passed_numeric_visual_review_required", comparisons=comparisons,
-                      speedup=report["arms"]["full"]["median_s"] / report["arms"]["cached"]["median_s"] if args.steps > 1 else None)
+                      speedup=report["arms"]["full"]["median_s"] / report["arms"]["cached"]["median_s"] if resolved_steps > 1 else None)
     except BaseException as error:
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
