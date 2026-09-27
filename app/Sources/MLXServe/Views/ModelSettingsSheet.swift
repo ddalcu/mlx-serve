@@ -176,7 +176,7 @@ struct ModelSettingsSheet: View {
                                 TextField("value", text: $customValue).font(.app(.body).monospaced())
                                     .onSubmit(commitCustom)
                                 Button(action: commitCustom, label: { Text("Add")
-    .font(.app(.body)) })
+                                    .font(.app(.body)) })
                                     .disabled(customKey.trimmingCharacters(in: .whitespaces).isEmpty || TemplateKwargs.parse(customValue) == nil)
                             }
                         }
@@ -187,12 +187,12 @@ struct ModelSettingsSheet: View {
                             Menu {
                                 ForEach(TemplateKwargs.known, id: \.key) { k in
                                     Button { override.templateKwargs[k.key] = k.choices[0] } label: { Text(k.key)
-    .font(.app(.body)) }
+                                        .font(.app(.body)) }
                                         .disabled(override.templateKwargs[k.key] != nil)
                                 }
                                 Divider()
                                 Button { addingCustom = true } label: { Text("Custom…")
-    .font(.app(.body)) }
+                                    .font(.app(.body)) }
                             } label: {
                                 Label("Add", systemImage: "plus").font(.app(.body))
                             }
@@ -228,9 +228,9 @@ struct ModelSettingsSheet: View {
             HStack {
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
                 Button { Task { await save() } } label: { Text(L10n.text(plan == .restart ? "Save & Restart" : "Save"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(busy)
             }

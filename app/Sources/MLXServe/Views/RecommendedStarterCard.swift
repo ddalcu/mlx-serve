@@ -62,7 +62,7 @@ struct RecommendedStarterCard: View {
                         downloads.cancel(pick.repoId)
                         appState.refreshModels()
                     } label: { Text("Cancel")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .buttonStyle(.plain)
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)

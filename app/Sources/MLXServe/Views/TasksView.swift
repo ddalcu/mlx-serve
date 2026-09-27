@@ -206,7 +206,7 @@ private struct TaskDetailView: View {
                     Spacer()
                     if runs.contains(where: { $0.status.isTerminal && scheduler.activeRun?.id != $0.id }) {
                         Button { scheduler.clearFinishedRuns(taskId: task.id) } label: { Text(L10n.text("Clear finished"))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                             .buttonStyle(.link)
                             .font(.app(.caption))
                             .help(L10n.text("Delete all completed, failed and cancelled runs"))
@@ -336,9 +336,9 @@ private struct ApprovalCard: View {
             }
             HStack {
                 Button { scheduler.resume(runId: run.id, approved: false) } label: { Text("Deny")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 Button { scheduler.resume(runId: run.id, approved: true) } label: { Text("Approve")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
             }
         }

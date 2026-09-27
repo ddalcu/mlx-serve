@@ -63,7 +63,7 @@ struct ChatErrorCard: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(notice.message, forType: .string)
             } label: { Text("Copy Error")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
     }
 }

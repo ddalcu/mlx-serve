@@ -105,20 +105,20 @@ struct MusicGenView: View {
         .alert("Save style prompt", isPresented: $showSaveStyle) {
             TextField("Name", text: $saveTitle)
             Button { library.saveStyle(title: saveTitle, body: prompt) } label: { Text("Save")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
             Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text("Give this style a name to reuse it from the Templates menu.").font(.app(.body))
         }
         .alert("Save lyrics", isPresented: $showSaveLyrics) {
             TextField("Name", text: $saveTitle)
             Button { library.saveLyrics(title: saveTitle, body: lyrics) } label: { Text("Save")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
             Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text("Give these lyrics a name to reuse them from the Templates menu.").font(.app(.body))
         }
@@ -185,12 +185,12 @@ struct MusicGenView: View {
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server, downloads: downloads) }
                 pendingRequest = nil
             } label: { Text("Generate Anyway")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
@@ -355,7 +355,7 @@ struct MusicGenView: View {
                         // Cancels ONLY this single-file fetch — a full pack
                         // download for the same repo is never touched.
                         Button { downloads.cancelPackFile(repoId: model.repo) } label: { Text("Cancel")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                             .buttonStyle(.borderless).font(.app(.caption))
                     }
                 default:
@@ -745,10 +745,10 @@ struct MusicGenView: View {
                                                 help: "\(MusicOptions.bpmRange.lowerBound)–\(MusicOptions.bpmRange.upperBound), or leave empty to let the model decide.")
                             Menu {
                                 Button { bpm = nil } label: { Text("Auto")
-    .font(.app(.body)) }
+                                    .font(.app(.body)) }
                                 ForEach(MusicOptions.bpms, id: \.bpm) { opt in
                                     Button { bpm = opt.bpm } label: { Text(L10n.text(opt.label))
-    .font(.app(.body)) }
+                                        .font(.app(.body)) }
                                 }
                             } label: {
                                 Image(systemName: "chevron.down").modifier(PaneChip(square: true))
@@ -858,7 +858,7 @@ struct MusicGenView: View {
                         Text(msg)
                     } actions: {
                         Button { showLogWindow() } label: { Text("Show log")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1012,13 +1012,13 @@ struct MusicGenView: View {
                 saveTitle = MusicPromptStore.autoTitle(from: prompt)
                 showSaveStyle = true
             } label: { Text("Save current…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if !library.savedStyles.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedStyles) { p in
                         Button { prompt = p.body } label: { Text(L10n.text(p.title))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
                 Menu("Delete saved…") {
@@ -1035,7 +1035,7 @@ struct MusicGenView: View {
             Section("Example templates for \(model.family == .minimaxMusic3 ? "MiniMax Music 3" : "ACE-Step")") {
                 ForEach(MusicPrompt.builtinStyles(for: model.family)) { p in
                     Button { prompt = p.body } label: { Text(L10n.text(p.title))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
             }
         } label: {
@@ -1062,13 +1062,13 @@ struct MusicGenView: View {
                 saveTitle = MusicPromptStore.autoTitle(from: lyrics)
                 showSaveLyrics = true
             } label: { Text("Save current…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .disabled(lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             if !library.savedLyrics.isEmpty {
                 Section("Saved") {
                     ForEach(library.savedLyrics) { p in
                         Button { lyrics = p.body } label: { Text(L10n.text(p.title))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
                 Menu("Delete saved…") {
@@ -1082,7 +1082,7 @@ struct MusicGenView: View {
             Section("Example templates") {
                 ForEach(MusicPrompt.builtinLyrics) { p in
                     Button { lyrics = p.body } label: { Text(L10n.text(p.title))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
             }
         } label: {
@@ -1164,12 +1164,12 @@ struct PromptRewriteSheet: View {
             }
             HStack {
                 Button { start() } label: { Text("Try again")
-    .font(.app(.body)) }.disabled(isWriting)
+                    .font(.app(.body)) }.disabled(isWriting)
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
                 Button { onApply(text); dismiss() } label: { Text("Apply")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }

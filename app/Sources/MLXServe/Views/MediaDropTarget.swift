@@ -315,7 +315,7 @@ struct MediaDropWellOption: View {
                 .font(.app(.title2))
                 .foregroundStyle(.secondary)
             Button(action: action, label: { Text(L10n.text(title))
-    .font(.app(.body)) })
+                .font(.app(.body)) })
                 .buttonStyle(.link)
                 .font(.app(.caption))
             Text(L10n.text(caption))

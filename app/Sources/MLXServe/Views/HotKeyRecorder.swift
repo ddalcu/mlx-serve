@@ -138,7 +138,7 @@ struct HotKeyRecorderControl: View {
                     Button {
                         recording = true
                     } label: { Text(L10n.text(recording ? "Press keys… (⎋ to cancel)" : display))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .frame(minWidth: 140)
                 }
                 Button {
@@ -147,7 +147,7 @@ struct HotKeyRecorderControl: View {
                     refusedCombo = nil
                     _ = onChange()
                 } label: { Text("Reset")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .disabled(QuickLauncherHotKeyStore.isDefault)

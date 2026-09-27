@@ -586,7 +586,7 @@ private struct AgentEditor: View {
                         .font(.app(.callout))
                     Spacer(minLength: 8)
                     Button(action: onDuplicate, label: { Text("Duplicate")
-    .font(.app(.body)) })
+                        .font(.app(.body)) })
                 }
             }
         }
@@ -896,7 +896,7 @@ private struct AgentEditor: View {
                             agent.capabilities.closeAdvanced()
                             showAdvancedTools = false
                         } label: { Text("Back to the simple switches")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .disabled(readOnly)
                     }
                 }
@@ -970,7 +970,7 @@ private struct AgentEditor: View {
                 Button {
                     appState.showModels()
                 } label: { Text("Open Model Browser")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .controlSize(.small)
                 .help(L10n.format("This agent can't answer until %@ is on disk. Nothing is downloaded automatically.",
                                   (path as NSString).lastPathComponent))
@@ -1012,7 +1012,7 @@ private struct AgentEditor: View {
                                              name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
                 onSave()
             } label: { Text("Choose…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .disabled(readOnly)
             if agent.workingDirectory != nil {
                 Button {
@@ -1020,7 +1020,7 @@ private struct AgentEditor: View {
                     agent.workingDirectory = nil
                     onSave()
                 } label: { Text("Reset")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .disabled(readOnly)
             }
             Spacer(minLength: 0)
@@ -1061,10 +1061,10 @@ private struct AgentEditor: View {
     private var voiceActions: some View {
         HStack(spacing: 8) {
             Button { previewVoice() } label: { Text("Preview")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .disabled(previewer.active != nil || agent.voice == nil)
             Button { addVoiceClip() } label: { Text("Add Voice…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .disabled(readOnly)
                 .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
             if let error = previewer.error ?? clipError {
@@ -1361,9 +1361,9 @@ private struct AgentVoiceMenu: View {
                     }
                     Divider()
                     Button(action: onAddClip, label: { Text("Add Voice…")
-    .font(.app(.body)) })
+                        .font(.app(.body)) })
                     Button(action: onRevealClips, label: { Text("Open Voices Folder")
-    .font(.app(.body)) })
+                        .font(.app(.body)) })
                 }
                 Menu("System") {
                     ForEach(systemVoices) { v in

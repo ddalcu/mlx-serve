@@ -230,12 +230,12 @@ struct VideoGenView: View {
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             } label: { Text("Generate Anyway")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
@@ -376,7 +376,7 @@ struct VideoGenView: View {
             Section(L10n.text(title)) {
                 ForEach(examplePrompts, id: \.title) { ex in
                     Button { prompt = ex.body } label: { Text(L10n.text(ex.title))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
             }
             Divider()
@@ -684,7 +684,7 @@ struct VideoGenView: View {
             // still opens on hover, and an empty one that opens reads as a
             // bug rather than as "pick a picture first".
             Button {} label: { Text("Set by starting frame…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .disabled(true)
         } else {
             Menu {
@@ -692,10 +692,10 @@ struct VideoGenView: View {
                     // Two rows, because `NSMenu` renders a title on one line
                     // and drops the newline.
                     Button {} label: { Text("Selected first frame's picture does not fit this model.")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .disabled(true)
                     Button {} label: { Text("Consider its cropping or adding a letterbox.")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .disabled(true)
                 } else {
                     Section("Matching \(startingFrameRatio ?? "the starting frame")") {
@@ -2289,7 +2289,7 @@ struct VideoGenView: View {
                         Text(msg)
                     } actions: {
                         Button { showLogWindow() } label: { Text("Show log")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }

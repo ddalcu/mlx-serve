@@ -290,10 +290,10 @@ struct NewTaskSheet: View {
         HStack {
             Spacer()
             Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.cancelAction)
             Button { submit() } label: { Text(L10n.text(isEditing ? "Save" : "Create Task"))
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .buttonStyle(.borderedProminent)
                 .disabled(!canSave)
                 .keyboardShortcut(.defaultAction)

@@ -53,7 +53,7 @@ struct BenchmarkSessionSheet: View {
                 shareControl
                 Spacer()
                 Button { dismiss() } label: { Text("Done")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -83,7 +83,7 @@ struct BenchmarkSessionSheet: View {
                 Label(message, systemImage: "exclamationmark.octagon.fill")
                     .font(.app(.caption)).foregroundStyle(.red)
                 Button { Task { await share(session) } } label: { Text("Try Again")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .controlSize(.small)
             }
         }

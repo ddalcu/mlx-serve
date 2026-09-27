@@ -540,12 +540,12 @@ private struct RecommendedModelTableRow: View {
                 .help("Delete model")
                 .alert("Delete Model", isPresented: $confirmDelete) {
                     Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     Button(role: .destructive) {
                         downloads.deleteModel(repoId: pick.repoId)
                         appState.refreshModels()
                     } label: { Text("Delete")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                 } message: {
                     Text(L10n.format("Delete %@? This will remove all downloaded files.", pick.name)).font(.app(.body))
@@ -573,7 +573,7 @@ private struct RecommendedModelTableRow: View {
         } else if let state, state.status == .failed {
             VStack(alignment: .trailing, spacing: 2) {
                 Button { startDownload() } label: { Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .controlSize(.small)
                 if let error = state.error {
                     Text(error)
@@ -584,7 +584,7 @@ private struct RecommendedModelTableRow: View {
             }
         } else {
             Button { startDownload() } label: { Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download"))
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .controlSize(.small).font(.app(.body))
         }
     }
@@ -650,7 +650,7 @@ private struct DiscoverPane: View {
                 Button {
                     Task { await searchService.search() }
                 } label: { Text("Search")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .controlSize(.regular)
             }
             .padding(12)
@@ -695,7 +695,7 @@ private struct DiscoverPane: View {
                         Button {
                             Task { await searchService.loadMore() }
                         } label: { Text("Load More")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
                         .padding(16)
@@ -1071,12 +1071,12 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                 .help("Delete model")
                 .alert("Delete Model", isPresented: $confirmDelete) {
                     Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     Button(role: .destructive) {
                         downloads.deleteModel(repoId: bundle.primaryRepo)
                         appState.refreshModels()
                     } label: { Text("Delete")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                 } message: {
                     Text(L10n.format("Delete %@? This will remove the downloaded files.", preset.name)).font(.app(.body))
@@ -1102,11 +1102,11 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
             }
         } else if active?.state.status == .failed {
             Button { startDownload() } label: { Text("Retry")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .controlSize(.small)
         } else {
             Button { startDownload() } label: { Text("Download")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .controlSize(.small)
         }
     }
@@ -1177,7 +1177,7 @@ private struct UseMediaModelButton: View {
             appState.showCreate(modality.experiment)
             AppActivation.openWindow(id: "chat", using: openWindow)
         } label: { Text("Use")
-    .font(.app(.body)) }
+            .font(.app(.body)) }
         .controlSize(.small)
         .help("Open \(name) in \(modality.paneName)")
     }
@@ -1194,7 +1194,7 @@ private struct UseDecisionModelButton: View {
             appState.decisionsModelPath = path
             AppActivation.openWindow(id: "layaDecisions", using: openWindow)
         } label: { Text("Use")
-    .font(.app(.body)) }
+            .font(.app(.body)) }
         .controlSize(.small)
         .help("Open \(name) in Laya Decisions")
     }
@@ -1564,7 +1564,7 @@ private struct ModelBrowserRow: View {
                 Button {
                     startDownload()
                 } label: { Text(L10n.text(resumable ? "Resume" : "Retry"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
 
@@ -1572,7 +1572,7 @@ private struct ModelBrowserRow: View {
                 Button {
                     startDownload()
                 } label: { Text(L10n.text(resumable ? "Resume" : "Download"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
             }
@@ -1614,12 +1614,12 @@ private struct ModelBrowserRow: View {
         .help("Delete model")
         .alert("Delete Model", isPresented: $confirmDelete) {
             Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 downloads.deleteModel(repoId: model.id)
                 appState.refreshModels()
             } label: { Text("Delete")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: {
             Text(L10n.format("Delete %@? This will remove all downloaded files.", model.modelName)).font(.app(.body))
@@ -1691,7 +1691,7 @@ private struct GgufQuantMenu: View {
                                 appState.refreshModels()
                             }
                         } label: { Text(L10n.text(quant.label))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1702,7 +1702,7 @@ private struct GgufQuantMenu: View {
                 Menu("Delete") {
                     ForEach(m.onDisk) { quant in
                         Button(role: .destructive) { pendingDelete = quant } label: { Text(L10n.text(quant.label))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1728,13 +1728,13 @@ private struct GgufQuantMenu: View {
             set: { if !$0 { pendingDelete = nil } }
         ), presenting: pendingDelete) { quant in
             Button(role: .cancel) { pendingDelete = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 if let p = path(of: quant) { downloads.removeGgufQuant(at: p) }
                 pendingDelete = nil
                 appState.refreshModels()
             } label: { Text("Delete")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: { quant in
             Text(L10n.format("Delete the %@ quant? Other quants of this model stay on disk.", quant.label)).font(.app(.body))
@@ -1800,7 +1800,7 @@ private struct MlxVariantMenu: View {
                                 appState.refreshModels()
                             }
                         } label: { Text(L10n.text(title(v)))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1811,7 +1811,7 @@ private struct MlxVariantMenu: View {
                 Menu("Delete") {
                     ForEach(m.onDisk) { v in
                         Button(role: .destructive) { pendingDelete = v } label: { Text(L10n.text(v.label))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1832,13 +1832,13 @@ private struct MlxVariantMenu: View {
             set: { if !$0 { pendingDelete = nil } }
         ), presenting: pendingDelete) { v in
             Button(role: .cancel) { pendingDelete = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 downloads.deleteModel(repoId: localId(v))
                 pendingDelete = nil
                 appState.refreshModels()
             } label: { Text("Delete")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: { v in
             Text(L10n.format("Delete the %@ build? Other quantizations of this model stay on disk.", v.label)).font(.app(.body))
@@ -2069,9 +2069,9 @@ private struct LocalModelRow: View {
         // two chances to word the consequence differently.
         .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
             Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) { performDelete() } label: { Text("Delete")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
         } message: {
             Text(ModelRowActions.deleteMessage(model)).font(.app(.body))
@@ -2084,37 +2084,37 @@ private struct LocalModelRow: View {
                 Button {
                     appState.selectedModelPath = model.path
                 } label: { Text("Use This Model")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             if cardRequest != nil {
                 Button { card = cardRequest } label: { Text("Model Details\u{2026}")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             if model.isChatPickable {
                 Button { settings = settingsRequest } label: { Text("Model Settings\u{2026}")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             Button(action: revealInFinder, label: { Text("Show in Finder")
-    .font(.app(.body)) })
+                .font(.app(.body)) })
             Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(model.path, forType: .string)
             } label: { Text("Copy Path")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(model.displayLabel, forType: .string)
             } label: { Text("Copy Model ID")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Divider()
             if ModelRowActions.showsTrash(model, unlocked: unlocked) {
                 Button(role: .destructive) { confirmDelete = true } label: { Text("Delete\u{2026}")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             } else {
                 // Same two-step as the lock button: the menu never deletes
                 // another app's model on one click.
                 Button { unlocked = true } label: { Text("Unlock to Delete")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
         }
     }
@@ -2178,7 +2178,7 @@ private struct ActiveDownloadRow: View {
                 Button {
                     downloads.start(repoId: repoId) { appState.refreshModels() }
                 } label: { Text(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
                 .frame(width: 90, alignment: .trailing)

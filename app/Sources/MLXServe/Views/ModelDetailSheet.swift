@@ -34,7 +34,7 @@ struct ModelDetailSheet: View {
                     }
                 }
                 Button { dismiss() } label: { Text("Close")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(16)

@@ -275,13 +275,13 @@ struct BenchmarkView: View {
                 }
                 HStack {
                     Button { appState.showSettings() } label: { Text("Change in Settings…")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .controlSize(.small)
                     Button {
                         guard let pick = pickedModel else { return }
                         modelSettings = ModelSettingsRequest(path: pick.path, title: ModelDisplayName.pretty(pick.displayLabel))
                     } label: { Text("Model Settings…")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .controlSize(.small)
                     .disabled(pickedModel == nil || loadingModel || isRunning)
                     Button {
@@ -306,7 +306,7 @@ struct BenchmarkView: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                     Button { appState.showSettings() } label: { Text("Change in Settings…")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .controlSize(.small)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -405,7 +405,7 @@ struct BenchmarkView: View {
                                     .font(.app(.caption))
                                     .foregroundStyle(.red)
                                 Button { Task { await submit() } } label: { Text("Try Again")
-    .font(.app(.body)) }
+                                    .font(.app(.body)) }
                                     .controlSize(.small)
                             }
                         }
@@ -448,7 +448,7 @@ struct BenchmarkView: View {
                     Text("Benchmarks you run are kept here, on this Mac. Double-click a row for the full detail.").font(.app(.body))
                 } actions: {
                     Button { pane = .run } label: { Text("Run a Benchmark")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -487,7 +487,7 @@ struct BenchmarkView: View {
                     .contextMenu(forSelectionType: String.self) { ids in
                         if let id = ids.first, let session = historySessions.first(where: { $0.id == id }) {
                             Button { sheetSource = SheetSource(id: id, source: .session(session)) } label: { Text("Show Details")
-    .font(.app(.body)) }
+                                .font(.app(.body)) }
                         }
                     } primaryAction: { ids in
                         if let id = ids.first, let session = historySessions.first(where: { $0.id == id }) {
@@ -510,7 +510,7 @@ struct BenchmarkView: View {
                                 BenchmarkStore.saveLocal([])
                                 history = []
                             } label: { Text("Delete History")
-    .font(.app(.body)) }
+                                .font(.app(.body)) }
                         } message: {
                             Text("Results already shared to the community stay on the board.").font(.app(.body))
                         }
@@ -570,7 +570,7 @@ struct BenchmarkView: View {
                     Text(communityError)
                 } actions: {
                     Button { Task { await loadCommunity() } } label: { Text("Try Again")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if visibleFamilies.isEmpty {
@@ -583,7 +583,7 @@ struct BenchmarkView: View {
                 } actions: {
                     if !machineFilter.isEmpty || !modelFilter.isEmpty {
                         Button { machineFilter = ""; modelFilter = "" } label: { Text("Show Everything")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -631,7 +631,7 @@ struct BenchmarkView: View {
                 .contextMenu(forSelectionType: String.self) { ids in
                     if let id = ids.first, let family = visibleFamilies.first(where: { $0.id == id }) {
                         Button { sheetSource = SheetSource(id: id, source: .family(family)) } label: { Text("Show Details")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 } primaryAction: { ids in
                     if let id = ids.first, let family = visibleFamilies.first(where: { $0.id == id }) {

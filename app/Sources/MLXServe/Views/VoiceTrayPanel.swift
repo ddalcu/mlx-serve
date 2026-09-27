@@ -97,7 +97,7 @@ struct VoiceTrayPanel: View {
                     NSWorkspace.shared.open(url)
                 }
             } label: { Text(L10n.text(VoicePreflight.actionLabel(for: issue)))
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .controlSize(.small).font(.app(.body))
         }
         .padding(10)
@@ -157,7 +157,7 @@ struct VoiceTrayPanel: View {
             .fixedSize()
             Spacer(minLength: 0)
             Button { openAgents() } label: { Text("Manage…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .buttonStyle(.link)
                 .font(.app(.caption2))
         }

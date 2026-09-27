@@ -822,7 +822,7 @@ struct UpdateTrayRow: View {
                         Button {
                             Task { await updates.downloadAndInstall() }
                         } label: { Text("Update")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .help("Download v\(update.version), install, and relaunch")

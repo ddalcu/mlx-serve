@@ -216,10 +216,10 @@ struct MCPMarketplaceView: View {
             }
             Spacer()
             Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.cancelAction)
             Button { saveAndDismiss() } label: { Text("Save")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
         }

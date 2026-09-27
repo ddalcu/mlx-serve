@@ -158,7 +158,7 @@ struct ModelPaletteSheet: View {
                     close()
                     appState.showModels()
                 } label: { Text("Manage Models…")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             Spacer()
         }
@@ -175,7 +175,7 @@ struct ModelPaletteSheet: View {
                 close()
                 appState.showModels()
             } label: { Text("Manage Models…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .buttonStyle(.plain)
             .font(.app(.caption))
             .foregroundStyle(Color.accentColor)

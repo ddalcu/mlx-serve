@@ -264,12 +264,12 @@ struct VoiceGenView: View {
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             } label: { Text("Generate Anyway")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
@@ -564,7 +564,7 @@ struct VoiceGenView: View {
                         Text(msg)
                     } actions: {
                         Button { showLogWindow() } label: { Text("Show log")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                     }
                 }
             }

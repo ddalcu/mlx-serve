@@ -255,7 +255,7 @@ struct ChatModelPill: View {
             // LAST row: everything above it is a model you can pick right now.
             appState.showModels()
         } label: { Text("Manage Models…")
-    .font(.app(.body)) }
+            .font(.app(.body)) }
     }
 
     private func row(title: String, tag: String) -> some View {

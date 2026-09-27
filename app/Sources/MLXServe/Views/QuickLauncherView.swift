@@ -117,7 +117,7 @@ struct QuickLauncherView: View {
             Spacer()
             if generatingHere {
                 Button { controller.stopOwnTurn() } label: { Text("Stop")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(".", modifiers: .command)
                     .controlSize(.small)
             }
@@ -125,11 +125,11 @@ struct QuickLauncherView: View {
                 controller.newConversation()
                 query = ""
             } label: { Text("New  ⌘N")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .keyboardShortcut("n", modifiers: .command)
             .controlSize(.small)
             Button { controller.openInChat() } label: { Text("Open in Chat  ⌘↩")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.return, modifiers: .command)
                 .controlSize(.small)
         }

@@ -58,7 +58,7 @@ struct TerminalPane: View {
                         .font(.app(.callout)).foregroundStyle(.secondary)
                     Spacer()
                     Button { appState.closeTerminal(session.id) } label: { Text("Close")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
                 .controlSize(.small)
                 .padding(.horizontal, 14).padding(.vertical, 8)
@@ -67,7 +67,7 @@ struct TerminalPane: View {
                     Text(terminals.sessions.exitNotice(session.id) ?? "session ended")
                         .font(.app(.callout)).foregroundStyle(.secondary)
                     Button { appState.closeTerminal(session.id) } label: { Text("Close")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .controlSize(.small)
                 }
             }
@@ -83,13 +83,13 @@ struct TerminalPane: View {
                 HStack {
                     if let fix = TerminalFailureFix.for(message: message) {
                         Button { apply(fix, to: session.id) } label: { Text(L10n.text(fix.title))
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                             .keyboardShortcut(.defaultAction)
                     }
                     Button { terminals.retry(session.id) } label: { Text("Retry")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     Button { appState.closeTerminal(session.id) } label: { Text("Close")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 }
                 .controlSize(.small)
             }

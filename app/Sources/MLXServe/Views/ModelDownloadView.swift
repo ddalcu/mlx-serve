@@ -69,14 +69,14 @@ struct ModelDownloadRow: View {
                     Button {
                         startDownload()
                     } label: { Text(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry"))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .font(.app(.caption))
                     .controlSize(.mini)
                 } else {
                     Button {
                         startDownload()
                     } label: { Text(L10n.text(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download"))
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .font(.app(.caption))
                     .controlSize(.mini)
                 }

@@ -84,7 +84,7 @@ struct BundleDownloadBar: View {
             Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
             } label: { Text("Retry")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .buttonStyle(.bordered).controlSize(.small)
         }
     }

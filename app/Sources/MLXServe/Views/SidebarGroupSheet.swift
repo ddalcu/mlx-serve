@@ -20,10 +20,10 @@ struct SidebarGroupSheet: View {
             HStack {
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.cancelAction)
                 Button { submit() } label: { Text(action)
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(isBlank)
             }

@@ -352,7 +352,7 @@ private struct NoSearchResults: View {
                 .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
             Button(action: clear, label: { Text(L10n.text("Clear filter"))
-    .font(.app(.body)) })
+                .font(.app(.body)) })
                 .buttonStyle(.bordered)
                 .controlSize(.small)
         }
@@ -403,10 +403,10 @@ private struct ResetDefaultsFooter: View {
                     Button(role: .destructive) {
                         appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
                     } label: { Text("Reset")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     Button(role: .cancel) { } label: { Text("Cancel")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                 } message: {
                     Text(L10n.text(helpText))
                 }
@@ -442,7 +442,7 @@ private struct RestartBanner: View {
                     server.start(modelPath: model, options: opts)
                 }
             } label: { Text("Restart Now")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .buttonStyle(.borderedProminent)
             .disabled(appState.selectedModelPath.isEmpty)
 
@@ -468,7 +468,7 @@ private struct RestartBanner: View {
                     appState.serverOptions = reverted
                 }
             } label: { Text("Discard")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             .buttonStyle(.bordered)
             .disabled(server.lastLaunchedOptions == nil)
         }
@@ -759,14 +759,14 @@ private struct ModelFoldersSectionContent: View {
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
                         Button { chooseDownloadFolder() } label: { Text("Choose…")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                             .buttonStyle(.bordered)
                         Button {
                             SecurityScopedBookmark.clear(name: DownloadManager.downloadFolderBookmarkName)
                             ModelRoots().configuredDownloadRoot = nil
                             applyFolderChange()
                         } label: { Text("Reset")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(configured == nil)
                     }
@@ -833,13 +833,13 @@ private struct ModelFoldersSectionContent: View {
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
                         Button { choose() } label: { Text("Choose…")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                             .buttonStyle(.bordered)
                         Button {
                             downloads.customRoot = nil
                             appState.refreshModels()
                         } label: { Text("Clear")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(!hasPath)
                     }
@@ -1009,7 +1009,7 @@ private struct ProvidersSectionContent: View {
                 // Fields also save on Enter, but an edit followed by a click
                 // elsewhere never submits — this is the button that always writes.
                 Button { save() } label: { Text("Save")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .keyboardShortcut("s", modifiers: .command)
                 .help("Write providers.json and ask the server to re-probe now")
             }
@@ -1109,7 +1109,7 @@ private struct ProviderRow: View {
                     }
                     .onSubmit(onCommit)
                 Button { picking = true } label: { Text(L10n.text("Pick…"))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .disabled(entry.problem() != nil)
                     .help(L10n.text("Fetch the provider's model list and tick the ones to expose"))
             }
@@ -1179,15 +1179,15 @@ private struct ProviderModelPickerSheet: View {
             HStack {
                 Text("\(chosen.count) of \(ids.count) selected").font(.app(.caption)).foregroundStyle(.secondary)
                 Button { chosen = [] } label: { Text("Clear")
-    .font(.app(.body)) }.disabled(chosen.isEmpty)
+                    .font(.app(.body)) }.disabled(chosen.isEmpty)
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
-    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
                 Button {
                     onDone(ids.filter { chosen.contains($0) })
                     dismiss()
                 } label: { Text("Done")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
                 .disabled(loading)
             }
@@ -2313,11 +2313,13 @@ private struct DrafterRow: View {
                 // A dense Gemma 4 is loaded but its drafter isn't on disk —
                 Button {
                     downloads.start(repoId: repo) { appState.refreshModels() }
-                } label: { Text(L10n.text(
-                       downloads.downloads[repo]?.status == .downloading
-                       ? "Downloading drafter…" : "Download drafter"
-))
-    .font(.app(.body)) }
+                } label: {
+                    Text(L10n.text(
+                        downloads.downloads[repo]?.status == .downloading
+                            ? "Downloading drafter…" : "Download drafter"
+                    ))
+                    .font(.app(.body))
+                }
                 .controlSize(.small)
                 .disabled(downloads.downloads[repo]?.status == .downloading)
                 .padding(.top, 2)
@@ -2440,7 +2442,7 @@ private struct InterfaceSectionContent: View {
                     .labelsHidden()
                 if !terminalBackgroundHex.isEmpty {
                     Button { terminalBackgroundHex = "" } label: { Text("Reset")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                         .controlSize(.small)
                 }
             }
@@ -2939,7 +2941,7 @@ private struct SandboxSectionContent: View {
                         appState.setDefaultAgentWorkspace(picked)
                     }
                 } label: { Text("Choose…")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
         }
 
@@ -2995,10 +2997,10 @@ private struct SandboxSectionContent: View {
                         resetting = false
                     }
                 } label: { Text("Delete All Sandbox Data")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
                 Button(role: .cancel) {} label: { Text("Cancel")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             } message: {
                 Text("""
                 This permanently deletes everything the sandbox has downloaded and every change made inside it — installed agent CLIs (pi, hermes), their configs and logins, and any files outside the shared workspace. Any running guest and live sessions stop immediately.
@@ -3110,7 +3112,7 @@ private struct MessagingSectionContent: View {
                         Button {
                             appState.serverOptions.telegram.allowedChatIds = []
                         } label: { Text("Reset lock")
-    .font(.app(.body)) }
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(telegram.allowedChatIds.isEmpty)
@@ -3258,7 +3260,7 @@ private struct UpdatesSectionContent: View {
                     Button {
                         Task { await updates.downloadAndInstall() }
                     } label: { Text("Download & Install")
-    .font(.app(.body)) }
+                        .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                 }
             }

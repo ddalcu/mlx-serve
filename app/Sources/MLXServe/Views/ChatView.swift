@@ -1145,7 +1145,7 @@ struct ChatSidebar: View {
                 deleteChats(ids)
                 appState.pendingChatDeletion = nil
             } label: { Text("Delete")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             // Return deletes. The dialog is the second time you have said so
             // (a menu command or a row's Delete raised it), and reaching for
             // the trackpad to confirm a decision already made is the whole
@@ -1153,7 +1153,7 @@ struct ChatSidebar: View {
             // AppKit gives the `.cancel` role that for free.
             .keyboardShortcut(.defaultAction)
             Button(role: .cancel) { appState.pendingChatDeletion = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: { _ in
             Text(L10n.text("This can't be undone.")).font(.app(.body))
         }
@@ -1462,9 +1462,9 @@ struct ChatSidebar: View {
         .onDrop(of: [.text], delegate: groupDrop(group.id))
         .contextMenu {
             Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
     }
 
@@ -1478,16 +1478,16 @@ struct ChatSidebar: View {
         Menu("Move to Group") {
             ForEach(appState.sidebarGroups.groups) { group in
                 Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .disabled(ids.count == 1 && group.id == current)
             }
             if !appState.sidebarGroups.groups.isEmpty { Divider() }
             Button { groupSheet = .create(ids) } label: { Text("New Group…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
         if current != nil {
             Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
         Divider()
     }
@@ -1686,19 +1686,19 @@ struct ChatSidebar: View {
             let inSelection = appState.sidebarSelection.count > 1
                 && appState.sidebarSelection.contains(session.id)
             Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
                       current: appState.sidebarGroups.group(of: session.id))
             if inSelection {
                 Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
                 } label: { Text(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)))
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             } else {
                 Button(role: .destructive) {
                     requestDeleteChats([session.id], keyboard: false)
                 } label: { Text("Delete")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
         }
     }
@@ -1764,14 +1764,14 @@ struct ChatSidebar: View {
         }
         .contextMenu {
             Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
             if t.isInOwnWindow {
                 Button { showTerminal(t.id) } label: { Text("Show Window")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             } else {
                 Button { moveToNewWindow(t.id) } label: { Text("Move Tab to New Window")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             Menu("Theme") {
                 Toggle("App Default", isOn: Binding(
@@ -1787,7 +1787,7 @@ struct ChatSidebar: View {
             Button(role: .destructive) {
                 requestCloseTerminal(t.id)
             } label: { Text(L10n.text(t.isActive ? "End Session" : "Close"))
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
         // Per row, so only the row asked presents; a live session's ✕ is a
         // small target and a misclick must not kill a TUI.
@@ -1797,10 +1797,10 @@ struct ChatSidebar: View {
                                  set: { if !$0 { appState.pendingTerminalClose = nil } })
         ) {
             Button(role: .destructive) { appState.closeTerminal(t.id) } label: { Text("End Session")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
             Button(role: .cancel) { appState.pendingTerminalClose = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text("The session running inside the sandbox will be terminated. Files it wrote are kept."))
         }
@@ -1876,10 +1876,10 @@ struct ChatSidebar: View {
                     appState.renameSession(id, to: renameDraft)
                     appState.pendingRename = nil
                 } label: { Text("Rename")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
                 Button(role: .cancel) { appState.pendingRename = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             } message: { _ in
                 Text("Leave it empty to go back to the automatic name.").font(.app(.body))
             }
@@ -2310,7 +2310,7 @@ struct ChatDetailView: View {
                 guard let id = activeAgent?.id else { return }
                 appState.openAgentSettings(id, using: openWindow)
             } label: { Text("Edit Agent…")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
     }
 
@@ -2488,7 +2488,7 @@ struct ChatDetailView: View {
                 workingDirectoryBinding.wrappedValue = picked
             }
         } label: { Text("Workspace…")
-    .font(.app(.body)) }
+            .font(.app(.body)) }
         .disabled(isExternalBridgeSession)
         Text(L10n.text(session?.workingDirectory ?? "No workspace set")).font(.app(.body))
     }
@@ -2535,7 +2535,7 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var mcpMenuContent: some View {
         Button { showMCPMarketplace = true } label: { Text("MCP Marketplace…")
-    .font(.app(.body)) }
+            .font(.app(.body)) }
     }
 
     /// A conversation with nothing in it yet. Rendered instead of an empty
@@ -3096,9 +3096,9 @@ struct ChatDetailView: View {
                 pendingIntentPrompt = nil
                 proceedSend()
             } label: { Text("Send Anyway")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
             Button(role: .cancel) { pendingIntentPrompt = nil } label: { Text("Cancel")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         } message: { prompt in
             Text(prompt == .mcp
                  ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
@@ -4677,7 +4677,7 @@ struct MessageBubble: View {
                                             .colorScheme(.dark)
                                     } else {
                                         Button { toggleLongTurn() } label: { Text(L10n.text(isFolded ? "Show more" : "Show less"))
-    .font(.app(.body)) }
+                                            .font(.app(.body)) }
                                             .buttonStyle(.plain)
                                             .font(.app(.caption).weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
@@ -4761,7 +4761,7 @@ struct MessageBubble: View {
         .contextMenu {
             if !message.content.isEmpty {
                 Button { copyMessage() } label: { Text("Copy Message")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
@@ -4770,14 +4770,14 @@ struct MessageBubble: View {
             }
             if onRegenerate != nil {
                 Button { onRegenerate?() } label: { Text("Regenerate")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
             if let onFork {
                 // Between the two destructive answers and Delete: a fork keeps
                 // BOTH branches, so it belongs next to the ones that don't.
                 Divider()
                 Button(action: onFork, label: { Text("Branch Chat From Here")
-    .font(.app(.body)) })
+                    .font(.app(.body)) })
             }
             if onDelete != nil {
                 // A reply takes the model's whole turn with it (`ChatTurn`).
@@ -4819,13 +4819,13 @@ struct MessageBubble: View {
 
             HStack(spacing: 8) {
                 Button { cancelEdit() } label: { Text("Cancel")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
 
                 Button { commitEdit() } label: { Text("Save")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                     .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
@@ -5688,7 +5688,7 @@ struct MarkdownText: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(source, forType: .string)
             } label: { Text("Copy All")
-    .font(.app(.body)) }
+                .font(.app(.body)) }
         }
     }
 
@@ -6573,7 +6573,7 @@ fileprivate struct DisplayLaTeXView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(raw, forType: .string)
                 } label: { Text("Copy Equation")
-    .font(.app(.body)) }
+                    .font(.app(.body)) }
             }
         } else {
             SelectableMarkdownNSText(attributed: NSAttributedString(
