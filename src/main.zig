@@ -105,6 +105,9 @@ fn printUsage(io: std.Io) void {
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.mlx-serve/models
         \\                      (every pulled model loads on demand by name)
+        \\  unload <model>      Free one loaded model; the server keeps running.
+        \\                      Id from GET /v1/models, or an absolute path.
+        \\                      --port <n> (default 11234), --url <base>
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
         \\                      hermes, aider); starts the MLX Core app if the
@@ -453,7 +456,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── Subcommands (Ollama-grade CLI): `mlx-serve run|pull|list|serve` ──
+    // ── Subcommands (Ollama-grade CLI): `mlx-serve run|pull|list|serve|unload` ──
     // `pull` and `list` finish here; `run` and `serve` fall through into the
     // normal flag parse (skipping the consumed positionals) and serve path.
     var arg_start: usize = 1;
@@ -508,8 +511,11 @@ pub fn main(init: std.process.Init) !void {
             }
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "unload")) {
+            try cli_mod.cmdUnload(allocator, io, args[2..]);
+            return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, unload, launch, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }

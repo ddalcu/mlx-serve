@@ -1,9 +1,10 @@
-//! CLI subcommands — `mlx-serve run|pull|list <model>` — Ollama-grade
+//! CLI subcommands — `mlx-serve run|pull|list|unload <model>` — Ollama-grade
 //! ergonomics for the terminal.
 //!
 //!   mlx-serve run gemma4        # download if missing, serve, drop into a REPL
 //!   mlx-serve pull qwen3.6      # download only
 //!   mlx-serve list              # what's on disk
+//!   mlx-serve unload <model>    # free one loaded model; the server keeps running
 //!
 //! Short names resolve through a curated alias table (mirroring the MLX
 //! Core app catalog in ChatModels.swift); anything containing '/' is
@@ -670,6 +671,173 @@ pub fn formatSize(buf: []u8, bytes: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d} KB", .{bytes / 1024}) catch "?";
 }
 
+// ── unload (client of an already-running server) ────────────────────────
+
+const UnloadArgs = struct {
+    model: []const u8,
+    base_url: []u8,
+};
+
+fn parseUnloadArgs(allocator: std.mem.Allocator, args: []const []const u8) !UnloadArgs {
+    var model: ?[]const u8 = null;
+    var port: u16 = 11234;
+    var url: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--port")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            port = std.fmt.parseInt(u16, args[i], 10) catch return error.Usage;
+        } else if (std.mem.eql(u8, arg, "--url")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            const trimmed = std.mem.trimEnd(u8, args[i], "/");
+            if (trimmed.len == 0) return error.Usage;
+            url = trimmed;
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return error.Usage;
+        } else if (arg.len > 0 and arg[0] == '-') {
+            return error.Usage;
+        } else if (model != null) {
+            return error.Usage;
+        } else {
+            model = arg;
+        }
+    }
+    const name = model orelse return error.Usage;
+    const base = if (url) |u|
+        try allocator.dupe(u8, u)
+    else
+        try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
+    return .{ .model = name, .base_url = base };
+}
+
+fn printUnloadUsage() void {
+    log.err(
+        \\usage: mlx-serve unload <model> [--port N] [--url BASE]
+        \\
+        \\  <model>      Id from GET /v1/models, or an absolute path
+        \\  --port <n>   Server port (default: 11234)
+        \\  --url <base> Server base URL (default: http://127.0.0.1:<port>)
+        \\
+    , .{});
+}
+
+const PostResult = struct {
+    status: u16,
+    body: []u8,
+};
+
+/// POST JSON. The handler does not answer until the free finishes, so the
+/// client timeout has to cover a large model's GPU free, not a health check.
+fn curlPostJson(allocator: std.mem.Allocator, io: std.Io, url: []const u8, json_body: []const u8) !PostResult {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{
+            "curl", "-s",      "-m", "300",
+            "-X",   "POST",    "-H", "Content-Type: application/json",
+            "-d",   json_body, "-w", "\n%{http_code}",
+            url,
+        },
+        .stdout_limit = .limited(1024 * 1024),
+    }) catch return error.FetchFailed;
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return error.FetchFailed;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.FetchFailed;
+        },
+    }
+    const stdout = result.stdout;
+    const nl = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse {
+        allocator.free(stdout);
+        return error.FetchFailed;
+    };
+    const status = std.fmt.parseInt(u16, std.mem.trim(u8, stdout[nl + 1 ..], " \r\n"), 10) catch 0;
+    if (status == 0) {
+        allocator.free(stdout);
+        return error.FetchFailed;
+    }
+    const body = allocator.dupe(u8, std.mem.trimEnd(u8, stdout[0..nl], "\r")) catch |err| {
+        allocator.free(stdout);
+        return err;
+    };
+    allocator.free(stdout);
+    return .{ .status = status, .body = body };
+}
+
+fn responseModelId(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const model = parsed.value.object.get("model") orelse return null;
+    if (model != .object) return null;
+    const id = model.object.get("id") orelse return null;
+    if (id != .string) return null;
+    return allocator.dupe(u8, id.string) catch null;
+}
+
+fn printUnloadFailure(allocator: std.mem.Allocator, status: u16, body: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.err("unload failed ({d})\n", .{status});
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("error")) |err_obj| {
+            if (err_obj == .object) {
+                if (err_obj.object.get("message")) |message| {
+                    if (message == .string) {
+                        log.err("{s}\n", .{message.string});
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    log.err("unload failed ({d})\n", .{status});
+}
+
+/// Free one model on a server that is already running. Does not start one.
+pub fn cmdUnload(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    const parsed = parseUnloadArgs(allocator, args) catch {
+        printUnloadUsage();
+        std.process.exit(1);
+    };
+    defer allocator.free(parsed.base_url);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/v1/unload-model", .{parsed.base_url});
+    defer allocator.free(url);
+    const req = try std.json.Stringify.valueAlloc(allocator, .{ .model = parsed.model }, .{});
+    defer allocator.free(req);
+
+    const resp = curlPostJson(allocator, io, url, req) catch {
+        log.err("no mlx-serve server at {s}\n", .{parsed.base_url});
+        std.process.exit(1);
+    };
+    defer allocator.free(resp.body);
+
+    if (resp.status < 200 or resp.status >= 300) {
+        printUnloadFailure(allocator, resp.status, resp.body);
+        std.process.exit(1);
+    }
+
+    const echoed = responseModelId(allocator, resp.body);
+    defer if (echoed) |owned| allocator.free(owned);
+    const id = echoed orelse parsed.model;
+
+    const line = try std.fmt.allocPrint(allocator, "unloaded {s}\n", .{id});
+    defer allocator.free(line);
+    var out_buf: [256]u8 = undefined;
+    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    try stdout_w.interface.writeAll(line);
+    try stdout_w.interface.flush();
+}
+
 // ── REPL (mlx-serve run) ────────────────────────────────────────────────
 //
 // The REPL is deliberately a real HTTP client against the server's own
@@ -1188,6 +1356,27 @@ test "cli: an unparsed argument is classified, never silently ignored" {
         try testing.expect(r.hint().len > 0);
     }
     try testing.expect(std.mem.indexOf(u8, ArgReject.equals_form.hint(), "separate argument") != null);
+}
+
+test "cli: unload args: missing model, url slash trimmed, default port" {
+    // Bar: no model is usage; --url drops a trailing slash; default base is loopback:11234.
+    try testing.expectError(error.Usage, parseUnloadArgs(testing.allocator, &.{}));
+    try testing.expectError(error.Usage, parseUnloadArgs(testing.allocator, &.{ "--port", "11234" }));
+
+    const trimmed = try parseUnloadArgs(testing.allocator, &.{ "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit", "--url", "http://x:1/" });
+    defer testing.allocator.free(trimmed.base_url);
+    try testing.expectEqualStrings("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit", trimmed.model);
+    try testing.expectEqualStrings("http://x:1", trimmed.base_url);
+
+    const def = try parseUnloadArgs(testing.allocator, &.{"id"});
+    defer testing.allocator.free(def.base_url);
+    try testing.expectEqualStrings("id", def.model);
+    try testing.expectEqualStrings("http://127.0.0.1:11234", def.base_url);
+
+    const ported = try parseUnloadArgs(testing.allocator, &.{ "--port", "11235", "id" });
+    defer testing.allocator.free(ported.base_url);
+    try testing.expectEqualStrings("id", ported.model);
+    try testing.expectEqualStrings("http://127.0.0.1:11235", ported.base_url);
 }
 
 test "cli: list tree walk descends into symlinked model dirs" {

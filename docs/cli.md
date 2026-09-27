@@ -10,11 +10,14 @@ mlx-serve pull qwen3.6:27b  # just download (resumable, straight from Hugging Fa
 mlx-serve list              # what's on disk
 mlx-serve serve             # serve everything you've pulled — models load on demand by name
 mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
+mlx-serve unload <model>    # free one loaded model; the server keeps running
 ```
 
 `launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `opencode2` also installs the mlx-serve monitor plugin, which needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX Core app uses too.
+
+`unload` frees one model a running server has loaded and leaves the process up. Pass the id from `GET /v1/models`, or an absolute path. `--port` defaults to `11234`; `--url` sets the base (`http://127.0.0.1:11234`). The next request for that id loads it again.
 
 ## Driving the server directly
 

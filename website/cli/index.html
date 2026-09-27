@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CLI Reference — run, pull, list, serve · mlx-serve</title>
+  <title>CLI Reference — run, pull, list, serve, unload · mlx-serve</title>
   <meta name="description" content="The mlx-serve command line: download and chat with a model in one command, serve your whole model library on demand, and tune everything — context, KV quantization, speculative decoding, multi-model residency — from flags. Full reference.">
   <meta name="keywords" content="mlx-serve CLI, local LLM command line Mac, ollama alternative CLI, MLX serve command, run LLM terminal Mac, Apple Silicon LLM server CLI">
   <meta name="author" content="David Dalcu">
@@ -146,13 +146,17 @@ mlx-serve pull qwen3.6:27b
 mlx-serve list
 
 <span class="c"># Headless server over everything you've pulled — loads on demand by name</span>
-mlx-serve serve</pre></div>
+mlx-serve serve
+
+<span class="c"># Free one loaded model; the server keeps running</span>
+mlx-serve unload &lt;model&gt;</pre></div>
     <table class="flag-table">
       <tr><th>Command</th><th>What it does</th></tr>
       <tr><td><code>run &lt;model&gt;</code></td><td>Pull-if-missing, start the server, and open an interactive chat REPL in the terminal. Ctrl-C leaves the server behind nothing — it exits with you.</td></tr>
       <tr><td><code>pull &lt;model&gt;</code></td><td>Resumable download into <code>~/.mlx-serve/models/&lt;org&gt;/&lt;repo&gt;</code> — interrupted pulls continue where they left off.</td></tr>
       <tr><td><code>list</code></td><td>Everything on disk, with sizes.</td></tr>
       <tr><td><code>serve</code></td><td>Serve the whole library on demand: any <a href="../api/">API</a> request naming a pulled model loads it on the fly. This is the drop-in <a href="../ollama-alternative/">Ollama replacement</a> mode — add <code>--port 11434</code> and Ollama clients connect unchanged.</td></tr>
+      <tr><td><code>unload &lt;model&gt;</code></td><td>Free one model a running server has loaded. The id is the one from <code>GET /v1/models</code>, or an absolute path. <code>--port</code> defaults to <code>11234</code>; <code>--url</code> sets the base. The process keeps listening, and the next request for that id loads it again.</td></tr>
     </table>
 
     <h2 id="names">Model names</h2>
