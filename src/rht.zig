@@ -216,6 +216,122 @@ const NORM_ROTATE_SOURCE =
     \\}
 ;
 
+/// SwiGLU folded into the input rotation: `rot = H(signs * (silu(gate) * up))`,
+/// one 128-thread group per `block`-wide stripe, same butterfly as
+/// `KERNEL_SOURCE`. The down projection of a Hadamard pack is the only caller:
+/// its activation is produced and immediately rotated, so the fused form never
+/// writes the `[rows, intermediate]` SwiGLU result to memory or reads it back.
+///
+/// Unlike `NORM_ROTATE_SOURCE` this needs no row-wide reduction, so there is no
+/// read amplification and no row cap: every stripe is independent at any width.
+///
+/// BIT-EXACT with `fusedSwiGLU` + `transform`: the sigmoid comes from the same
+/// tabulated-over-every-16-bit-pattern table, and the product is ROUNDED TO T
+/// before the rotation reads it, which is exactly where the two-kernel chain
+/// rounds when it writes its intermediate.
+const SWIGLU_ROTATE_SOURCE =
+    \\constexpr int S = 4;
+    \\constexpr int P = J / S;
+    \\threadgroup float tg[J * 32];
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint base = threadgroup_position_in_grid.x * (J * 32);
+    \\uint col = base % gate_shape[gate_ndim - 1];
+    \\float v[P];
+    \\for (int p = 0; p < P; ++p) {
+    \\  uint i = (sg * P + p) * 32 + lane;
+    \\  T g = gate[base + i];
+    \\  T sig = sigtab[as_type<ushort>(g)];
+    \\  T act = g * sig;
+    \\  T y = act * up[base + i];
+    \\  v[p] = float(y) * signs[col + i];
+    \\}
+    \\for (int h = 1; h < P; h <<= 1) {
+    \\  for (int p = 0; p < P; ++p) {
+    \\    if ((p & h) == 0) { float a = v[p], b = v[p + h]; v[p] = a + b; v[p + h] = a - b; }
+    \\  }
+    \\}
+    \\for (uint m = 1; m < 32; m <<= 1) {
+    \\  float sgn = (lane & m) ? -1.0f : 1.0f;
+    \\  for (int p = 0; p < P; ++p) v[p] = fma(sgn, v[p], simd_shuffle_xor(v[p], m));
+    \\}
+    \\for (int p = 0; p < P; ++p) tg[(sg * P + p) * 32 + lane] = v[p];
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\const float scale = rsqrt(float(J * 32));
+    \\for (uint p = sg; p < P; p += S) {
+    \\  float w[S];
+    \\  for (int q = 0; q < S; ++q) w[q] = tg[(q * P + p) * 32 + lane];
+    \\  float a0 = w[0] + w[1], a1 = w[0] - w[1], a2 = w[2] + w[3], a3 = w[2] - w[3];
+    \\  w[0] = a0 + a2; w[2] = a0 - a2; w[1] = a1 + a3; w[3] = a1 - a3;
+    \\  for (int q = 0; q < S; ++q) {
+    \\    uint i = (q * P + p) * 32 + lane;
+    \\    rot[base + i] = static_cast<T>(w[q] * scale);
+    \\  }
+    \\}
+;
+
+var swiglu_rotate_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var swiglu_rotate_env: ?bool = null;
+/// `MLX_SERVE_RHT_SWIGLU_ROTATE=0` puts the down projection back on the
+/// separate SwiGLU and rotate kernels.
+fn swigluRotateEnabled() bool {
+    if (swiglu_rotate_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_RHT_SWIGLU_ROTATE");
+    swiglu_rotate_env = raw == null or raw.?[0] != '0';
+    return swiglu_rotate_env.?;
+}
+
+/// `H(signs * (silu(gate) * up))` in one dispatch, or null when the shape or
+/// dtype is outside the kernel (caller keeps SwiGLU then `transform`).
+pub fn swigluRotate(
+    gate: mlx.mlx_array,
+    up: mlx.mlx_array,
+    sigtab: mlx.mlx_array,
+    signs: mlx.mlx_array,
+    block: c_int,
+    s: mlx.mlx_stream,
+) !?mlx.mlx_array {
+    if (!swigluRotateEnabled() or !kernelBlock(block)) return null;
+    const dt = mlx.mlx_array_dtype(gate);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    if (mlx.mlx_array_dtype(up) != dt or mlx.mlx_array_dtype(sigtab) != dt) return null;
+    const sh = mlx.getShape(gate);
+    if (sh.len == 0 or sh.len >= 16) return null;
+    if (!std.mem.eql(c_int, sh, mlx.getShape(up))) return null;
+    if (@rem(sh[sh.len - 1], block) != 0) return null;
+    var total: c_int = 1;
+    for (sh) |d| total *= d;
+
+    if (swiglu_rotate_kernel == null) {
+        const in_names = [_][*:0]const u8{ "gate", "up", "sigtab", "signs" };
+        const out_names = [_][*:0]const u8{"rot"};
+        const in_vec = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_swiglu_rotate", in_vec, out_vec, SWIGLU_ROTATE_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        swiglu_rotate_kernel = k;
+    }
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, sh.ptr, sh.len, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divExact(total, block) * 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "J", @divExact(block, 32)));
+    const inputs = [_]mlx.mlx_array{ gate, up, sigtab, signs };
+    const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, swiglu_rotate_kernel.?, in_vec, config, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    return y;
+}
+
 var norm_rotate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 pub const NormRotate = struct {
@@ -577,5 +693,160 @@ test "rht: normRotate matches add -> rms_norm -> transform" {
         var worst: f32 = 0;
         for (data[0 .. 2 * n]) |e| worst = @max(worst, @abs(e));
         try std.testing.expect(worst < 0.02); // one bf16 ulp at |x| ~ 4
+    }
+}
+
+test "rht: fused swiglu+rotate is byte-identical to swiglu then rotate" {
+    const s = mlx.gpuStream();
+    const rows: usize = 3;
+    const n: usize = 3072; // 3 whole 1024-blocks
+    const block: c_int = 1024;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+
+    // The sigmoid table the kernel indexes by the input's bit pattern. The
+    // test only needs BOTH sides to read the same table, so a host-computed
+    // one is enough; production passes mlx's own tabulated sigmoid.
+    const tab = try std.testing.allocator.alloc(f16, 1 << 16);
+    defer std.testing.allocator.free(tab);
+    for (tab, 0..) |*e, i| {
+        const v: f16 = @bitCast(@as(u16, @intCast(i)));
+        e.* = if (std.math.isNan(v)) 0.0 else @floatCast(1.0 / (1.0 + @exp(-@as(f32, v))));
+    }
+
+    const gate = try std.testing.allocator.alloc(f16, rows * n);
+    defer std.testing.allocator.free(gate);
+    const up = try std.testing.allocator.alloc(f16, rows * n);
+    defer std.testing.allocator.free(up);
+    for (gate, up) |*g, *u| {
+        g.* = @floatCast(rnd.floatNorm(f32) * 2.0);
+        u.* = @floatCast(rnd.floatNorm(f32));
+    }
+    const signs = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(signs);
+    for (signs) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+
+    // The chain's intermediate, in the kernel's own arithmetic: silu through
+    // the table, one T rounding per multiply, exactly as SWIGLU_SOURCE does.
+    const mid = try std.testing.allocator.alloc(f16, rows * n);
+    defer std.testing.allocator.free(mid);
+    for (gate, up, mid) |g, u, *m| {
+        const sig = tab[@as(u16, @bitCast(g))];
+        const act: f16 = g * sig;
+        m.* = act * u;
+    }
+
+    const gu_shape = [_]c_int{ @intCast(rows), @intCast(n) };
+    const sg_shape = [_]c_int{@intCast(n)};
+    const tb_shape = [_]c_int{1 << 16};
+    const gate_a = mlx.mlx_array_new_data(gate.ptr, &gu_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(gate_a);
+    const up_a = mlx.mlx_array_new_data(up.ptr, &gu_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(up_a);
+    const mid_a = mlx.mlx_array_new_data(mid.ptr, &gu_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(mid_a);
+    const sig_a = mlx.mlx_array_new_data(tab.ptr, &tb_shape, 1, .float16);
+    defer _ = mlx.mlx_array_free(sig_a);
+    const signs_a = mlx.mlx_array_new_data(signs.ptr, &sg_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(signs_a);
+
+    const chain = try transform(mid_a, signs_a, block, false, s);
+    defer _ = mlx.mlx_array_free(chain);
+    const fused = (try swigluRotate(gate_a, up_a, sig_a, signs_a, block, s)) orelse {
+        std.debug.print("[rht] swigluRotate declined a shape it should take\n", .{});
+        return error.SwigluRotateDeclined;
+    };
+    defer _ = mlx.mlx_array_free(fused);
+    try mlx.check(mlx.mlx_array_eval(chain));
+    try mlx.check(mlx.mlx_array_eval(fused));
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(chain), mlx.getShape(fused));
+    const cp = mlx.mlx_array_data_float16(chain).?;
+    const fp = mlx.mlx_array_data_float16(fused).?;
+    for (0..rows * n) |i| {
+        if (@as(u16, @bitCast(cp[i])) != @as(u16, @bitCast(fp[i]))) {
+            std.debug.print("[rht] swiglu+rotate diverged at {d}: chain {d} fused {d}\n", .{ i, cp[i], fp[i] });
+            return error.NotByteIdentical;
+        }
+    }
+}
+
+// The real-table test above is f16 at block 1024. The gate also accepts bf16
+// and blocks 512 and 2048, and an untested dtype is an untested rounding path,
+// so every combination is checked here with an ALL-ONES table: silu then
+// collapses to `gate`, the chain becomes a plain multiply plus `transform`
+// (computable in any dtype with mlx ops, no host bf16 needed), and byte
+// identity still pins the fused kernel's rounding and its butterfly.
+test "rht: fused swiglu+rotate is byte-identical for every dtype and block it takes" {
+    const s = mlx.gpuStream();
+    const rows: c_int = 5;
+    var prng = std.Random.DefaultPrng.init(23);
+    const rnd = prng.random();
+
+    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
+        for ([_]c_int{ 512, 1024, 2048 }) |block| {
+            const n: c_int = block * 3;
+            const cnt: usize = @intCast(rows * n);
+            const buf = try std.testing.allocator.alloc(f32, cnt);
+            defer std.testing.allocator.free(buf);
+            // Magnitudes that exercise the rounding, including a few large ones.
+            for (buf, 0..) |*e, i| e.* = if (i % 61 == 0) 40.0 * rnd.floatNorm(f32) else rnd.floatNorm(f32);
+            const buf2 = try std.testing.allocator.alloc(f32, cnt);
+            defer std.testing.allocator.free(buf2);
+            for (buf2) |*e| e.* = rnd.floatNorm(f32);
+            const signs = try std.testing.allocator.alloc(f32, @intCast(n));
+            defer std.testing.allocator.free(signs);
+            for (signs) |*e| e.* = if (rnd.boolean()) 1.0 else -1.0;
+            const ones = try std.testing.allocator.alloc(f32, 1 << 16);
+            defer std.testing.allocator.free(ones);
+            for (ones) |*e| e.* = 1.0;
+
+            const sh = [_]c_int{ rows, n };
+            const g32 = mlx.mlx_array_new_data(buf.ptr, &sh, 2, .float32);
+            defer _ = mlx.mlx_array_free(g32);
+            const u32a = mlx.mlx_array_new_data(buf2.ptr, &sh, 2, .float32);
+            defer _ = mlx.mlx_array_free(u32a);
+            const t32 = mlx.mlx_array_new_data(ones.ptr, &[_]c_int{1 << 16}, 1, .float32);
+            defer _ = mlx.mlx_array_free(t32);
+            const signs_a = mlx.mlx_array_new_data(signs.ptr, &[_]c_int{n}, 1, .float32);
+            defer _ = mlx.mlx_array_free(signs_a);
+
+            var g = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g);
+            var u = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(u);
+            var tab = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tab);
+            try mlx.check(mlx.mlx_astype(&g, g32, dt, s));
+            try mlx.check(mlx.mlx_astype(&u, u32a, dt, s));
+            try mlx.check(mlx.mlx_astype(&tab, t32, dt, s));
+
+            var mid = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(mid);
+            try mlx.check(mlx.mlx_multiply(&mid, g, u, s)); // silu with an all-ones table
+            const chain = try transform(mid, signs_a, block, false, s);
+            defer _ = mlx.mlx_array_free(chain);
+            const fused = (try swigluRotate(g, u, tab, signs_a, block, s)) orelse {
+                std.debug.print("[rht] swigluRotate declined dt={any} block={d}\n", .{ dt, block });
+                return error.SwigluRotateDeclined;
+            };
+            defer _ = mlx.mlx_array_free(fused);
+
+            var cb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cb);
+            var fb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(fb);
+            try mlx.check(mlx.mlx_astype(&cb, chain, .float32, s));
+            try mlx.check(mlx.mlx_astype(&fb, fused, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(cb));
+            try mlx.check(mlx.mlx_array_eval(fb));
+            const cp = mlx.mlx_array_data_float32(cb).?;
+            const fp = mlx.mlx_array_data_float32(fb).?;
+            for (0..cnt) |i| {
+                if (cp[i] != fp[i]) {
+                    std.debug.print("[rht] dt={any} block={d} diverged at {d}: chain {d} fused {d}\n", .{ dt, block, i, cp[i], fp[i] });
+                    return error.NotByteIdentical;
+                }
+            }
+        }
     }
 }
