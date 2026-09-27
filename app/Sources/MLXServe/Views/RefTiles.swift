@@ -106,8 +106,7 @@ struct RefTile: View {
     let insert: (String) -> Void
     let remove: () -> Void
 
-    /// Loaded once per tile, not in `body`: nine full-size photos re-read
-    /// on every change in the pane is a resize that drags.
+    /// One downsampled picture serves the tile and its hover bubble.
     @State private var image: NSImage?
 
     /// Half the tile, so a clip or a track reads as an icon, not a mark.
@@ -169,7 +168,12 @@ struct RefTile: View {
                 }
             }
         }
-        .onAppear { if kind.isImage { image = NSImage(contentsOf: url) } }
+        .task(id: url) {
+            image = nil
+            guard kind.isImage else { return }
+            let loaded = await MediaImage.load(url: url, maxPixel: 512)
+            if !Task.isCancelled { image = loaded }
+        }
     }
 
     @ViewBuilder

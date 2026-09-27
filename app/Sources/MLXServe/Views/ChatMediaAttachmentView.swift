@@ -70,8 +70,7 @@ struct ChatMediaAttachmentView: View {
 private struct ChatImageAttachment: View {
     let ref: ChatMediaRef
 
-    /// Read ONCE on appear. Reading it in `body` would re-open the file on
-    /// every render, and the transcript re-renders on every streamed token.
+    /// Reading from `body` would reopen the file on every streamed token.
     @State private var image: NSImage?
 
     var body: some View {
@@ -97,8 +96,11 @@ private struct ChatImageAttachment: View {
         }
         // Leading: `maxWidth` alone centres.
         .frame(maxWidth: ChatMetrics.generatedMediaMaxWidth, alignment: .leading)
-        .onAppear {
-            if image == nil { image = NSImage(contentsOfFile: ref.path) }
+        .task(id: ref.path) {
+            image = nil
+            let loaded = await MediaImage.load(url: URL(fileURLWithPath: ref.path),
+                                               maxPixel: 1024)
+            if !Task.isCancelled { image = loaded }
         }
     }
 }

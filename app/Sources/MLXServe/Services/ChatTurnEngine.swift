@@ -1564,9 +1564,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // caption the model reads.
         let caption = "Generated a \(req.width)×\(req.height) image for: \(req.prompt). Saved to \(path)."
         let ref = AgentMediaInline.mediaRefLine(kind: .image, path: path)
-        guard let dataURI = AgentMediaInline.pngFileToJpegDataURI(path) else {
-            return "\(caption)\n\(ref)"
-        }
+        // Full-size PNG decode + JPEG re-encode: ChatTurnEngine is
+        // @MainActor, so hop it off the transcript's thread.
+        let dataURI = await Task.detached(priority: .utility) {
+            AgentMediaInline.pngFileToJpegDataURI(path)
+        }.value
+        try Task.checkCancellation()
+        guard let dataURI else { return "\(caption)\n\(ref)" }
         return "\(caption)\n\(ref)\n\(dataURI)"
     }
 

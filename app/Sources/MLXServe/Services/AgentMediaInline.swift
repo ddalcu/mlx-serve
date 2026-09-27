@@ -1,5 +1,5 @@
 import Foundation
-import AppKit
+import ImageIO
 
 /// Helpers for showing an agent-generated image inline in chat.
 ///
@@ -67,15 +67,17 @@ enum AgentMediaInline {
         return (caption, ChatMediaRef(kind: kind, path: path, prompt: prompt))
     }
 
-    /// Transcode a PNG file on disk to a `data:image/jpeg;base64,<b64>` URI for
-    /// inline display (`ChatImage` is JPEG). nil when the file can't be read or
-    /// re-encoded.
+    /// Transcode PNG to a JPEG data URI without AppKit rasterization;
+    /// this runs off the main actor for generated images.
     static func pngFileToJpegDataURI(_ path: String) -> String? {
-        guard let image = NSImage(contentsOfFile: path),
-              let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9])
+        let url = URL(fileURLWithPath: path)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        guard let output = CFDataCreateMutable(kCFAllocatorDefault, 0),
+              let dest = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil)
         else { return nil }
-        return "\(jpegDataURIMarker)\(jpeg.base64EncodedString())"
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return "\(jpegDataURIMarker)\((output as Data).base64EncodedString())"
     }
 }

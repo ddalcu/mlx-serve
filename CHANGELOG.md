@@ -22,6 +22,7 @@
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
+- The app no longer stalls window moves and typing while photos or generated media are on screen: previews decode once, downsampled at load, off the main thread.
 
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 

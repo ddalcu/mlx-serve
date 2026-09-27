@@ -134,6 +134,7 @@ final class VideoGenService: ObservableObject {
                 let audioB64: String? = await Task.detached(priority: .userInitiated) {
                     audioPath.flatMap { Self.audioFileToWavBase64(path: $0) }
                 }.value
+                try Task.checkCancellation()
                 if audioPath != nil, audioB64 == nil {
                     setPhase(.failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file."), for: gen)
                     return
@@ -146,6 +147,7 @@ final class VideoGenService: ObservableObject {
                 let refPayloads: VideoRefPayloads? = await Task.detached(priority: .userInitiated) {
                     await Self.refPayloads(for: request)
                 }.value
+                try Task.checkCancellation()
                 guard let refs = refPayloads else {
                     setPhase(.failed("Couldn't read one of the reference files. Images must be PNG or JPEG, clips a QuickTime/MP4 movie of at least 5 frames, and audio a WAV, MP3, M4A or AAC file."), for: gen)
                     return
@@ -200,7 +202,12 @@ final class VideoGenService: ObservableObject {
                         }
                         setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
                     case "complete":
-                        decoded = Self.decodeFrames(ev)
+                        // 100 MB+ of RGB b64: cross into the hop as text.
+                        if let wire = Self.framesWire(of: ev) {
+                            decoded = await Task.detached(priority: .userInitiated) {
+                                Self.decodeFrames(wire)
+                            }.value
+                        }
                     case "error":
                         await releaseIfNeeded()
                         setPhase(.failed(ev["message"] as? String ?? L10n.text("Generation failed.")), for: gen)
@@ -239,6 +246,7 @@ final class VideoGenService: ObservableObject {
                     // a sidecar failure must not discard a successfully encoded clip.
                     try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
                 }.value
+                try Task.checkCancellation()
                 setPhase(.completed(path: outputPath), for: gen)
                 insertRecent(outputPath)
             } catch {
@@ -296,13 +304,18 @@ final class VideoGenService: ObservableObject {
                 case .progress(let step, let total, let stage):
                     report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    decoded = Self.decodeFrames(ev)
+                    if let wire = Self.framesWire(of: ev) {
+                        decoded = await Task.detached(priority: .userInitiated) {
+                            Self.decodeFrames(wire)
+                        }.value
+                    }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let frames = decoded else {
                 throw MediaGenError.server(L10n.text("Server returned no video frames."))
             }
@@ -321,6 +334,7 @@ final class VideoGenService: ObservableObject {
                     audioChannels: frames.audioChannels)
                 try? VideoGenService.writeSettingsSidecar(settings, forVideo: outputPath)
             }.value
+            try Task.checkCancellation()
             await releaseIfNeeded()
             return outputPath
         } catch {
@@ -782,6 +796,22 @@ final class VideoGenService: ObservableObject {
         var audioChannels: Int = 2
     }
 
+    /// A `complete` event with its base64 STRINGS kept (all fields Sendable):
+    /// the pane's stream loop inherits @MainActor, so the megabyte decode must
+    /// cross into a detached hop as text — a capture of the event dictionary
+    /// would be a Sendable violation, and calling a @MainActor helper from the
+    /// detached half would run the decode back on the main thread.
+    struct FramesWire: Sendable {
+        var frames: Int
+        var height: Int
+        var width: Int
+        var fps: Int
+        var rgbB64: String
+        var audioB64: String? = nil
+        var audioSampleRate: Int = 16000
+        var audioChannels: Int = 2
+    }
+
     /// Parse the native server's `{frames,height,width,fps,format,data,…audio}` body.
     nonisolated static func decodeFrames(_ body: Data) -> DecodedFrames? {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
@@ -790,31 +820,48 @@ final class VideoGenService: ObservableObject {
 
     /// Same, from an already-parsed object (the SSE `complete` event).
     nonisolated static func decodeFrames(_ obj: [String: Any]) -> DecodedFrames? {
-        guard let format = obj["format"] as? String, format == "rgb8",
+        guard let wire = framesWire(of: obj) else { return nil }
+        return decodeFrames(wire)
+    }
+
+    /// The Sendable fields of the event, without decoding any of them.
+    nonisolated static func framesWire(of obj: [String: Any]) -> FramesWire? {
+        guard obj["format"] as? String == "rgb8",
               let frames = obj["frames"] as? Int,
               let height = obj["height"] as? Int,
               let width = obj["width"] as? Int,
-              let b64 = obj["data"] as? String,
-              let rgb = Data(base64Encoded: b64),
-              rgb.count == frames * height * width * 3
+              let b64 = obj["data"] as? String
         else { return nil }
-        let fps = (obj["fps"] as? Int) ?? 24
-        var out = DecodedFrames(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
+        var wire = FramesWire(frames: frames, height: height, width: width,
+                              fps: (obj["fps"] as? Int) ?? 24, rgbB64: b64)
         // Audio is optional + best-effort: a malformed/absent track never blocks
-        // the (always-present) video.
+        // the (always-present) video. Server-controlled fields: an invalid
+        // sample rate / channel count drops the audio rather than crash the mux
+        // downstream (bytesPerFrame = 2 * channels would divide by zero).
         if obj["audio_format"] as? String == "pcm_s16le",
-           let ab64 = obj["audio_data"] as? String,
-           let pcm = Data(base64Encoded: ab64), !pcm.isEmpty {
+           let ab64 = obj["audio_data"] as? String {
             let sr = (obj["audio_sample_rate"] as? Int) ?? 16000
             let ch = (obj["audio_channels"] as? Int) ?? 2
-            // Server-controlled fields: an invalid sample rate / channel count
-            // drops the audio rather than crash the mux downstream
-            // (bytesPerFrame = 2 * channels would divide by zero).
             if sr > 0, ch > 0 {
-                out.audioPCM = pcm
-                out.audioSampleRate = sr
-                out.audioChannels = ch
+                wire.audioB64 = ab64
+                wire.audioSampleRate = sr
+                wire.audioChannels = ch
             }
+        }
+        return wire
+    }
+
+    /// Decode the b64 strings — the megabyte work, safe to run detached.
+    nonisolated static func decodeFrames(_ wire: FramesWire) -> DecodedFrames? {
+        guard let rgb = Data(base64Encoded: wire.rgbB64),
+              rgb.count == wire.frames * wire.height * wire.width * 3
+        else { return nil }
+        var out = DecodedFrames(rgb: rgb, frames: wire.frames, height: wire.height,
+                                width: wire.width, fps: wire.fps)
+        if let ab64 = wire.audioB64, let pcm = Data(base64Encoded: ab64), !pcm.isEmpty {
+            out.audioPCM = pcm
+            out.audioSampleRate = wire.audioSampleRate
+            out.audioChannels = wire.audioChannels
         }
         return out
     }

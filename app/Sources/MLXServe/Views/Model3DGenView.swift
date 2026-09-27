@@ -157,13 +157,9 @@ struct Model3DGenView: View {
                 // Same surface and same floor height as the empty well.
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
                     HStack(spacing: 8) {
-                        if let img = NSImage(contentsOf: url) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 64, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
+                        MediaImageView(url: url, maxPixel: 192)
+                            .frame(width: 64, height: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                         Text(url.lastPathComponent)
                             .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                         Spacer()
@@ -491,17 +487,22 @@ private struct Model3DHistoryThumb: View {
         .buttonStyle(.plain)
         .help((path as NSString).lastPathComponent)
         .task(id: path) {
-            let thumb = Model3DGenService.thumbnailPath(for: path)
-            if let img = NSImage(contentsOfFile: thumb) {
-                image = img
+            let thumb = URL(fileURLWithPath: Model3DGenService.thumbnailPath(for: path))
+            // Off-main + cached like every other picture: the shelf draws
+            // one of these per generation and re-renders on every pick.
+            let loaded = await MediaImage.load(url: thumb, maxPixel: 160)
+            if Task.isCancelled { return }
+            if let loaded {
+                image = loaded
                 return
             }
             // Lazy render off the main actor, then re-check.
             let rendered = await Task.detached(priority: .utility) { () -> Bool in
                 Model3DThumbnailer.ensure(glbPath: path)
-                return FileManager.default.fileExists(atPath: thumb)
+                return FileManager.default.fileExists(atPath: thumb.path)
             }.value
-            if rendered { image = NSImage(contentsOfFile: thumb) }
+            let img = rendered ? await MediaImage.load(url: thumb, maxPixel: 160) : nil
+            if !Task.isCancelled, let img { image = img }
         }
     }
 }
@@ -814,12 +815,26 @@ struct Model3DSceneView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: SCNView, context: Context) {
+        context.coordinator.animatePref = animate
         if context.coordinator.loadedURL != url {
             context.coordinator.loadedURL = url
-            let scene = url.flatMap { GLBMeshLoader.loadScene(url: $0) }
-            nsView.scene = scene
-            context.coordinator.modelNode = scene.flatMap { GLBMeshLoader.firstGeometryNode(in: $0) }
+            nsView.scene = nil
+            context.coordinator.modelNode = nil
             context.coordinator.animating = nil
+            // Parsing can outlive a later history selection.
+            let token = context.coordinator.nextLoadToken()
+            guard let url else { return }
+            Task { [coordinator = context.coordinator] in
+                let result = await Task.detached(priority: .userInitiated) { () -> (scene: SCNScene, node: SCNNode?)? in
+                    guard let scene = GLBMeshLoader.loadScene(url: url) else { return nil }
+                    return (scene: scene, node: GLBMeshLoader.firstGeometryNode(in: scene))
+                }.value
+                guard coordinator.loadToken == token else { return }
+                nsView.scene = result?.scene
+                coordinator.modelNode = result?.node
+                coordinator.animating = nil
+                coordinator.setAnimating(coordinator.animatePref)
+            }
         }
         context.coordinator.setAnimating(animate)
     }
@@ -831,6 +846,11 @@ struct Model3DSceneView: NSViewRepresentable {
         var modelNode: SCNNode?
         /// nil = fresh load (actions must be (re)installed either way).
         var animating: Bool?
+        var animatePref = true
+        /// Identity of the newest in-flight scene load; only it may apply.
+        private(set) var loadToken = 0
+
+        func nextLoadToken() -> Int { loadToken += 1; return loadToken }
 
         func setAnimating(_ on: Bool) {
             guard on != animating, let node = modelNode else { return }
