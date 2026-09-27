@@ -203,7 +203,7 @@ final class VideoGenService: ObservableObject {
                         }
                         setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
                     case "complete":
-                        decoded = Self.decodeFrames(ev)
+                        decoded = await offMain { Self.decodeFrames(ev) }
                     case "error":
                         await releaseIfNeeded()
                         setPhase(.failed(ev["message"] as? String ?? L10n.text("Generation failed.")), for: gen)
@@ -212,6 +212,7 @@ final class VideoGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let frames = decoded else {
                     setPhase(.failed(L10n.text("Server returned no video frames.")), for: gen)
@@ -299,13 +300,14 @@ final class VideoGenService: ObservableObject {
                 case .progress(let step, let total, let stage):
                     report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    decoded = Self.decodeFrames(ev)
+                    decoded = await offMain { Self.decodeFrames(ev) }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let frames = decoded else {
                 throw MediaGenError.server(L10n.text("Server returned no video frames."))
             }

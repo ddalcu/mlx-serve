@@ -262,7 +262,7 @@ final class MusicGenService: ObservableObject {
                         }
                         phase = .running(step: step, total: total, message: label)
                     case "complete":
-                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                        if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Music generation failed.")
@@ -271,6 +271,7 @@ final class MusicGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
@@ -337,13 +338,14 @@ final class MusicGenService: ObservableObject {
                 case .progress(let step, let total, let stage):
                     report(step, total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    if let b64 = ev["data"] as? String { wav = await offMain { Data(base64Encoded: b64) } }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let wav, wav.count > 44 else {
                 throw MediaGenError.server("Server returned an empty audio response.")
             }

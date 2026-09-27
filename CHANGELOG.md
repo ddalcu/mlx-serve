@@ -24,6 +24,7 @@
 - A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
 - `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - Deleting a provider in Settings no longer crashes the app.
+- The app no longer stalls window moves and typing while photos or generated media are on screen: pictures are decoded once, downsampled, off the main thread.
 - A speech request whose client disconnects now stops instead of finishing audio nobody will receive.
 - The model browser lists GLM-5.3-Flash and MiMo-V2.6-Flash packs as supported.
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.

@@ -860,3 +860,7 @@ window waved through now fails.
 ## Deleting a provider crashed Settings
 
 Defect: the trash button on the last Providers row crashed the app (`Array._checkSubscript` under `Binding.subscript.getter`, `SettingsView.swift:991`). Cause: rows come from `ForEach($formState.providerEntries) { $entry in }`, whose `entry` reads the array BY INDEX; the delete closure removed the row and then read `entry.id` again (inside `removeAll`'s predicate and for the field-text map). The last row's index no longer existed; on any other row the read returned the NEXT provider and cleared its text. Fix: the closure captures the id when it is built (`[id = entry.id]`) and calls `SettingsFormState.removeProvider(id:)`; the Laya question list had the same shape. Guard: `SettingsFormStateProviderTests`.
+
+## Full-size pictures decoded in a view body stall the window
+
+Defect: window moves and typing stuttered while photos or generated media were on screen. Cause: drop wells, reference tiles, previews and chat attachment bubbles built full-size `NSImage`s on the main thread, several straight from `body`, which re-runs on every streamed token and progress tick. Fix: `MediaImage` downsamples with ImageIO off the main thread and caches the result by path, mtime, size and display size; video frames and WAV payloads decode their base64 off the main actor too. Guard: `MediaImageTests`.

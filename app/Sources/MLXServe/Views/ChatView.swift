@@ -243,6 +243,42 @@ private struct AttachmentPreviewRow: View {
     }
 }
 
+/// A chat image decoded off-main once, not per bubble redraw.
+private struct AttachmentImageCell: View {
+    let image: ChatImage
+    @State private var decoded: NSImage?
+    @State private var undecodable = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                // `.fill`: the rounded corners clip the frame,
+                // so a letterboxed picture keeps square corners.
+                Image(nsImage: decoded)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: ChatImagePreview.displayWidth(for: decoded),
+                           height: ChatMetrics.attachmentHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(image) }
+                    .help("Double-click to open in Preview")
+            } else if !undecodable {
+                // Hold the row's height so the transcript does not jump.
+                Color.clear
+                    .frame(width: ChatMetrics.attachmentHeight,
+                           height: ChatMetrics.attachmentHeight)
+            }
+        }
+        .task(id: image.id) {
+            let loaded = await MediaImage.load(data: image.data,
+                                               id: image.id.uuidString,
+                                               maxPixel: 1536)
+            guard !Task.isCancelled else { return }
+            if let loaded { decoded = loaded } else { undecodable = true }
+        }
+    }
+}
+
 /// Chip for the attached document folder (mini RAG): shows live indexing
 /// progress, then the indexed file/chunk totals, with an ✕ to detach. Styled
 /// to match the `AttachmentPreviewRow` file chips.
@@ -4580,17 +4616,8 @@ struct MessageBubble: View {
                                     .padding(.vertical, 8)
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                            } else if let nsImage = NSImage(data: img.data) {
-                                // `.fill`: the rounded corners clip the frame,
-                                // so a letterboxed picture keeps square corners.
-                                Image(nsImage: nsImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
-                                           height: ChatMetrics.attachmentHeight)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
-                                    .help("Double-click to open in Preview")
+                            } else {
+                                AttachmentImageCell(image: img)
                             }
                         }
                     }

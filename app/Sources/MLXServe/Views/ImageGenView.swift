@@ -276,13 +276,9 @@ struct ImageGenView: View {
                     // grid of one.
                     MediaDropWellFilled(isTargeted: isDropTargeted) {
                         HStack(spacing: 8) {
-                            if let img = NSImage(contentsOf: url) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: 64, height: 48)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
+                            MediaImageView(url: url, maxPixel: 160)
+                                .frame(width: 64, height: 48)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
                             Text(url.lastPathComponent)
                                 .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                             Spacer()
@@ -968,7 +964,8 @@ struct ImageGenView: View {
 
     private func completedPreview(path: String) -> some View {
         VStack(spacing: 8) {
-            CompletedImage(path: path)
+            MediaImageView(url: URL(fileURLWithPath: path), maxPixel: 3072,
+                           contentMode: .fit)
             // The name and the ways to reach the file belong together, centred
             // under the picture they describe.
             HStack(spacing: 8) {
@@ -985,27 +982,6 @@ struct ImageGenView: View {
             }
         }
         .padding(8)
-    }
-
-    /// Decoded once per path, not in `body`: a fresh `NSImage` on every
-    /// layout pass is a content change, and inside an animated transaction
-    /// (the Advanced fold) SwiftUI cross-fades it.
-    private struct CompletedImage: View {
-        let path: String
-        @State private var image: NSImage?
-
-        var body: some View {
-            // A real container: modifiers on an empty `Group` land on
-            // `EmptyView`, which never appears, so nothing would ever load.
-            ZStack {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
-                }
-            }
-            .task(id: path) { image = NSImage(contentsOfFile: path) }
-        }
     }
 
     private var outputFolderLink: some View {

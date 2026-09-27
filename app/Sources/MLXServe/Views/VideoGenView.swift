@@ -1013,13 +1013,9 @@ struct VideoGenView: View {
                 // picked image must not change where the form sits.
                 MediaDropWellFilled(isTargeted: isTargeted.wrappedValue) {
                     HStack(spacing: 8) {
-                        if let img = NSImage(contentsOf: picked) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 64, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
+                        MediaImageView(url: picked, maxPixel: 192)
+                            .frame(width: 64, height: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                         Text(picked.lastPathComponent)
                             .font(.app(.caption))
                             .lineLimit(1)
