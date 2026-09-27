@@ -49,33 +49,35 @@ enum ModelRowActions {
         case .osaurus: where_ = "in Osaurus\u{2019}s models folder"
         case .custom: where_ = "in a custom folder you added"
         }
-        return "This model is \(where_). Click to unlock and delete it."
+        return L10n.format("This model is %@. Click to unlock and delete it.", L10n.text(where_))
     }
 
     /// Confirmation text. A foreign row names the PATH, because "Delete org/m?"
     /// does not say which of four tools' copies is about to go.
     static func deleteMessage(_ model: LocalModel) -> String {
+        // Producer-side formats: the row renders this verbatim, so the key has
+        // to be completed here rather than looked up afterwards.
         if let defect = model.defect {
-            return "\(defect.explanation)\n\nDelete \(model.path)?"
+            return L10n.format("%@\n\nDelete %@?", L10n.text(defect.explanation), model.path)
         }
         if model.quantFile != nil {
-            return "Delete \(model.displayLabel)? Other quants of this model stay on disk."
+            return L10n.format("Delete %@? Other quants of this model stay on disk.", model.displayLabel)
         }
         switch model.source {
         case .mlxServe:
-            return "Delete \(model.name)? This will remove all downloaded files."
+            return L10n.format("Delete %@? This will remove all downloaded files.", model.name)
         case .huggingFace:
             // The one tree where deleting damages models we are NOT deleting:
             // snapshots hard-link shared blobs. Allowed — it is the user's disk
             // — but never silently.
-            return """
+            return L10n.format("""
             This is in the Hugging Face cache, where models share downloaded files. \
             Deleting it can break other models that share the same files.
 
-            Delete \(model.path)?
-            """
+            Delete %@?
+            """, model.path)
         default:
-            return "This is in another app\u{2019}s models folder.\n\nDelete \(model.path)?"
+            return L10n.format("This is in another app\u{2019}s models folder.\n\nDelete %@?", model.path)
         }
     }
 

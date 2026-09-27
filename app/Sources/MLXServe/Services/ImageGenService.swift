@@ -51,7 +51,7 @@ final class ImageGenService: ObservableObject {
         }
 
         task?.cancel()
-        phase = .running(step: 0, total: request.steps, message: "Loading model…")
+        phase = .running(step: 0, total: request.steps, message: L10n.text("Loading model…"))
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
@@ -82,13 +82,14 @@ final class ImageGenService: ObservableObject {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? steps
-                        let stage = ev["stage"] as? String ?? "Generating"
-                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                        let stage = ev["stage"] as? String ?? L10n.text("Generating")
+                        phase = .running(step: step, total: max(total, 1),
+                                         message: L10n.format("%@…", L10n.text(stage)))
                     case "complete":
                         png = Self.decodePngB64(ev)
                     case "error":
                         await releaseIfNeeded()
-                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        phase = .failed(ev["message"] as? String ?? L10n.text("Generation failed."))
                         return
                     default:
                         break

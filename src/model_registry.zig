@@ -865,19 +865,21 @@ pub const ModelRegistry = struct {
     ///
     /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
     /// a small embedding encoder and registers it here no matter which org
-    /// dir the chat model (and thus --model-dir) points at.
-    pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
+    /// dir the chat model (and thus --model-dir) points at. `id` null names
+    /// the entry after the dir's basename.
+    pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8, id: ?[]const u8) ![]const u8 {
         var trimmed = abs_path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
+        const reg_id = id orelse base;
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
         {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            if (self.entries.get(base)) |existing| return existing.id;
+            if (self.entries.get(reg_id)) |existing| return existing.id;
         }
 
         // A discovery entry may hold this path under an org/name id whose
@@ -890,8 +892,8 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         // Re-check under the lock — another conn thread may have raced us.
-        if (self.entries.get(base)) |existing| return existing.id;
-        const stub = try self.registerStubWithArch(base, trimmed, probe.bytes_on_disk, probe.model_type);
+        if (self.entries.get(reg_id)) |existing| return existing.id;
+        const stub = try self.registerStubWithArch(reg_id, trimmed, probe.bytes_on_disk, probe.model_type);
         return stub.id;
     }
 
@@ -1497,7 +1499,7 @@ test "ModelRegistry: registerByPath reuses an existing id without touching the f
     const stub = try reg.registerStubWithArch("bge-x", "/models/bge-x", 64, "bert");
     // The path's parent doesn't exist — proves the fast path resolves by
     // basename before any probe.
-    const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/");
+    const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/", null);
     try testing.expectEqualStrings("bge-x", id);
     try testing.expectEqual(stub.id.ptr, id.ptr);
 }
@@ -1519,7 +1521,7 @@ test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename 
     try testing.expect(reg.peekByPath("/models/elsewhere") == null);
     // registerByPath also resolves through the path before creating a stub
     // (basename fast path misses, path match hits, no filesystem probe).
-    const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/");
+    const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/", null);
     try testing.expectEqualStrings("mlx-community/gemma-x", id);
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
 }
@@ -1528,8 +1530,8 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
-    try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
-    try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
+    try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model", null));
+    try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/", null));
 }
 
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {
@@ -2213,4 +2215,24 @@ test "ModelRegistry: rescan clears a failed load so the completed dir can load a
     const fine = reg.peek("org/fine") orelse return error.TestExpectedResult;
     try testing.expectEqual(LoadState.unloaded, fine.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+}
+
+test "ModelRegistry: registerByPath registers under the caller's org/name id" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    try tmp.dir.createDirPath(io, "org/name");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/name/config.json", .data = "{\"model_type\":\"llama\"}" });
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/org/name", .{root_buf[0..root_len]});
+    defer testing.allocator.free(path);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const id = try reg.registerByPath(io, path, "org/name");
+    try testing.expectEqualStrings("org/name", id);
+    try testing.expect(reg.peek("org/name") != null);
+    try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
 }

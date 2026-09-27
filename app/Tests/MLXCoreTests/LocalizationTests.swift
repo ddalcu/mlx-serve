@@ -92,6 +92,10 @@ final class LocalizationTests: XCTestCase {
 
     /// The file is a working table: resolving it through a bundle returns the
     /// same strings the catalog declares, escapes and all.
+    ///
+    /// A catalog that fails to parse resolves every key to itself, so the
+    /// lookup is asserted for every entry and never excused: `value: nil`
+    /// makes a miss return the key, which this compares against the entry.
     func testCatalogResolvesThroughBundle() throws {
         let bundle = try XCTUnwrap(Bundle(path: Self.catalogURL.deletingLastPathComponent().path),
                                    "zh-Hans.lproj does not load as a bundle")
@@ -206,12 +210,16 @@ final class LocalizationTests: XCTestCase {
 
     /// Helpers whose body looks one of their parameters up in the catalog:
     /// the function name, that parameter, and the external label call sites use.
+    ///
+    /// `field<Content: View>(_ title: String, …)` looks `title` up like any
+    /// other helper, so the generic clause is optional here.
     private static func lookupHelpers(
         in files: [(name: String, text: String)]
     ) -> [(name: String, label: String)] {
         let lookup = try! NSRegularExpression(
             pattern: #"L10n\.(?:text|format)\(\s*([A-Za-z_]\w*)\s*[,)]"#)
-        let definition = try! NSRegularExpression(pattern: #"func\s+(\w+)\s*\(([^)]*)\)"#)
+        let definition = try! NSRegularExpression(
+            pattern: #"func\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)"#)
         var seen = Set<String>()
         var out: [(String, String)] = []
         for file in files {
@@ -351,21 +359,28 @@ final class LocalizationTests: XCTestCase {
     /// it missed `sectionLabel` in another — this walks the helpers out of the
     /// sources instead of a hand-written list.
     ///
+    /// An *interpolated* literal is checked the same way, and can never pass:
+    /// the helper looks its parameter up in the table, so a caller that builds
+    /// the sentence first (`fileChip(detail: "PDF · \(count) chars")`) hands the
+    /// lookup a finished string no key can match. The format has to run at the
+    /// producer (`L10n.format`) and the helper render the resolved text — that
+    /// is the defect this arm of the test exists to catch.
+    ///
     /// `latinLabels` are values that are deliberately rendered in Latin — HTTP
-    /// verbs and sampling symbols — where the lookup falls through to the
-    /// literal by design.
+    /// verbs, sampling symbols and the two statistical headers the rung table
+    /// shares with its own "n = sessions behind each row" footnote, where the
+    /// lookup falls through to the literal by design.
     func testEveryLiteralReachingALookupHelperIsTranslated() throws {
         let files = try Self.sourceFiles()
         let calls = files.map { (name: $0.name, index: Self.callIndex(in: $0.text)) }
         let keys = Set(try catalog().map(\.key))
-        let latinLabels: Set<String> = ["BASE", "Top-p"]
+        let latinLabels: Set<String> = ["BASE", "Top-p", "TTFT", "n"]
         var sites = 0
         var missing: [String] = []
         for helper in Self.lookupHelpers(in: files) {
             for file in calls {
                 for arguments in file.index[helper.name] ?? [] {
-                    guard let literal = Self.literalArgument(arguments, label: helper.label),
-                          !literal.contains("\\(") else { continue }
+                    guard let literal = Self.literalArgument(arguments, label: helper.label) else { continue }
                     sites += 1
                     if latinLabels.contains(literal) || keys.contains(literal) { continue }
                     missing.append("\(file.name): \"\(literal)\" reaching \(helper.name)")
@@ -375,6 +390,280 @@ final class LocalizationTests: XCTestCase {
         XCTAssertGreaterThan(sites, 30, "the scan stopped finding literal call sites")
         XCTAssertTrue(missing.isEmpty,
                       "literals reaching a lookup with no catalog entry:\n\(missing.joined(separator: "\n"))")
+    }
+
+    // MARK: - Producer coverage
+
+    /// `LocalizationTests` walks the call sites; the tests below walk the
+    /// VALUES. A producer whose result a view renders verbatim — or hands to a
+    /// lookup as a whole — has to emit a string the catalog keys on, and the
+    /// only way to see that from here is to ask the producer.
+    ///
+    /// `L10n` resolves through `Bundle.main`, which carries no catalog in a
+    /// test bundle, so a producer that formats correctly comes back as the
+    /// English template with its values substituted. Putting each value back as
+    /// its placeholder recovers exactly the key the catalog has to hold.
+
+    /// Notation, not copy: protocol names, units and the two statistical
+    /// headers the rung table shares with its own "n = sessions behind each
+    /// row" footnote. Everything else a Chinese interface shows has an entry.
+    private static let latinNotation: Set<String> = [
+        "ds4", "llama.cpp", "MTP", "PLD", "DFlash", "KV 8-bit", "KV 4-bit",
+        "TTFT", "n",
+    ]
+
+    /// The keys a produced value can stand for: the value itself, the same
+    /// string with each number put back as `%lld`, and both with the caller's
+    /// text values put back as their placeholders.
+    private static func candidates(_ produced: String,
+                                   _ values: [(value: String, spec: String)] = []) -> [String] {
+        let ordered = values.sorted { $0.value.count > $1.value.count }
+        func substitute(_ text: String) -> String {
+            ordered.reduce(text) { $0.replacingOccurrences(of: $1.value, with: $1.spec) }
+        }
+        let digits = numberPlaceholders(produced)
+        return [produced, digits, substitute(produced), substitute(digits)]
+    }
+
+    /// `"ctx 48K"` → `"ctx %lldK"`: the template keeps everything but the value.
+    private static func numberPlaceholders(_ text: String) -> String {
+        var out = "", index = text.startIndex
+        while index < text.endIndex {
+            if text[index].isNumber {
+                while index < text.endIndex, text[index].isNumber { index = text.index(after: index) }
+                out += "%lld"
+            } else {
+                out.append(text[index])
+                index = text.index(after: index)
+            }
+        }
+        return out
+    }
+
+    private func assertResolves(_ produced: String, _ label: String,
+                                values: [(value: String, spec: String)] = [],
+                                keys: Set<String>,
+                                file: StaticString = #filePath, line: UInt = #line) {
+        guard !Self.latinNotation.contains(produced) else { return }
+        let found = Self.candidates(produced, values)
+        XCTAssertTrue(found.contains { keys.contains($0) },
+                      "\(label): \"\(produced)\" matches no catalog key (tried \(found))",
+                      file: file, line: line)
+    }
+
+    /// The benchmark window's own chrome: the pane picker, the rung table's
+    /// headers, the detail sheet's settings row and the summary chips — every
+    /// one of them was rendered by a `Text(String)` overload that never looked
+    /// anything up.
+    func testBenchmarkWindowValuesResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+
+        // Headers are uppercased AFTER the lookup, so the key is the source
+        // spelling; `TTFT` and `n` are notation and stay Latin.
+        let headers = ["Rung", "Prompt", "Prefill", "Decode", "Ceiling", "TTFT", "Ctx", "n"]
+
+        // One dictionary per chip branch, including the ds4 / llama.cpp
+        // engines and the two drafter spellings.
+        let chipSettings: [[String: String]] = [
+            ["engine": "mlx", "kv_quant": "off"],
+            ["engine": "mlx", "kv_quant": "8", "decode_attn_quant": "true",
+             "pld_default_on": "true", "mtp_default_on": "false",
+             "drafter": "dflash", "n_ctx": "49152"],
+            ["engine": "mlx", "kv_quant": "4", "mtp_default_on": "true", "drafter": "eagle"],
+            ["engine": "ds4", "kv_quant": "8", "mtp_default_on": "true"],
+            ["engine": "llama", "kv_quant": "4", "mtp_default_on": "true"],
+        ]
+
+        let values = BenchmarkView.Pane.allCases.map(\.rawValue)
+            + headers
+            + BenchmarkSettings.labels.map(\.label)
+            + chipSettings.flatMap(BenchmarkSettings.summaryChips)
+        for value in values {
+            assertResolves(value, "benchmark window", keys: keys)
+        }
+    }
+
+    /// The run's status line: the view renders it verbatim, so the sentences
+    /// that interpolate format at the producer. `.failed` carries the server's
+    /// own words and is deliberately left alone.
+    func testBenchmarkPhaseCopyResolvesInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        typealias Phase = BenchmarkRunner.Phase
+        // Values that cannot appear inside the sentence's own words.
+        let phases: [Phase] = [
+            .idle, .calibrating, .warmup(rung: "RUNG"),
+            .running(rung: "RUNG", run: 21, of: 37), .drift(run: 21, of: 37),
+            .stopping, .cancelled, .done,
+        ]
+        for phase in phases {
+            assertResolves(phase.localizedText, "\(phase)", values: [("RUNG", "%@")], keys: keys)
+        }
+    }
+
+    /// The machine cell and the drift cell: both are rendered verbatim, so both
+    /// producers resolve their copy (the chip can be the word "Unknown").
+    func testBenchmarkHardwareAndDriftResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+
+        let machine = BenchmarkHardware(chip: "Chip", gpuCores: 42, ramGB: 64,
+                                        osVersion: "27.0", onBattery: false)
+        assertResolves(machine.displayName, "displayName", values: [("Chip", "%@")], keys: keys)
+        XCTAssertTrue(keys.contains(BenchmarkHardware.unknown.chip),
+                      "\"\(BenchmarkHardware.unknown.chip)\" is what the unknown machine renders")
+
+        // `.unknown` never reaches the grid — it only picks the colour — so the
+        // three verdicts `summary` can print are the ones that need an entry.
+        for verdict: BenchmarkDrift.Verdict in [.steady, .degraded, .improved] {
+            XCTAssertTrue(keys.contains(verdict.rawValue),
+                          "drift verdict \"\(verdict.rawValue)\" has no catalog entry")
+        }
+        assertResolves(BenchmarkDrift.summary(first: nil, last: nil, percent: nil),
+                       "drift summary (not measured)", keys: keys)
+        // The formatted sentence escapes its literal percent sign (`%%`), which
+        // a produced value cannot show, so the format is checked as spelled.
+        XCTAssertTrue(keys.contains("%.1f → %.1f tok/s (%@%.1f%%, %@)"),
+                      "the drift summary's format has no catalog entry")
+    }
+
+    /// The music pane's dropdowns are producer tables: the BPM anchors, the
+    /// vocal languages, the key moods and the built-in starter titles.
+    func testMusicProducerTablesResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+
+        for value in MusicOptions.bpms.map(\.label) + MusicOptions.languages.map(\.label) {
+            assertResolves(value, "music dropdown", keys: keys)
+        }
+
+        // `keyLabel` formats the association onto the musical key, so the
+        // separator is a key of its own and the mood is another.
+        XCTAssertTrue(keys.contains("%@ — %@"), "the key-mood separator has no catalog entry")
+        for (key, _) in MusicOptions.keyMoods {
+            let produced = MusicOptions.keyLabel(key)
+            let parts = produced.components(separatedBy: " — ")
+            XCTAssertEqual(parts.count, 2, "keyLabel(\"\(key)\") → \"\(produced)\"")
+            XCTAssertTrue(keys.contains(parts[1]),
+                          "key mood \"\(parts[1])\" has no catalog entry")
+        }
+
+        for value in MusicPrompt.builtinStyles.map(\.title) + MusicPrompt.music3Styles.map(\.title) {
+            assertResolves(value, "music starter", keys: keys)
+        }
+    }
+
+    /// The image pane's resolution menu is a producer table too.
+    func testImageResolutionLabelsResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        for value in ImageModelPreset.qwenImage21_8bit.resolutions.map(\.label) {
+            assertResolves(value, "resolution option", keys: keys)
+        }
+    }
+
+    /// The "Thinking…" line's word. All 34 are shown in a Chinese interface, so
+    /// all 34 need an entry — the list is a producer, not chrome.
+    func testWhimsyListResolvesInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        let missing = GeneratingIndicator.whimsies.filter { !keys.contains($0) }
+        XCTAssertFalse(GeneratingIndicator.whimsies.isEmpty, "the whimsy list is not reachable")
+        XCTAssertTrue(missing.isEmpty, "whimsies with no catalog entry: \(missing)")
+    }
+
+    /// Row tooltips and delete confirmations: every branch is rendered verbatim.
+    func testModelBrowserProducerValuesResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        // Distinctive name/path: neither is a substring of the other, so the
+        // recovered template is unambiguous.
+        let model = LocalModel(id: "org/MdL", name: "MdL", path: "/models/org/MdL",
+                               sizeFormatted: "1 GB", modelType: "mlx",
+                               source: .custom, kind: .base)
+
+        for state in [ModelUseState.idle, .inUse, .loading, .selected] where !state.help.isEmpty {
+            assertResolves(state.help, "model state help", keys: keys)
+        }
+        // The location phrase is a key of its own — the sentence interpolates it.
+        let locations = ["in MLX-Serve\u{2019}s own models folder",
+                         "in LM Studio\u{2019}s models folder",
+                         "in the Hugging Face cache, where models share files",
+                         "in MTPLX\u{2019}s models folder", "in Osaurus\u{2019}s models folder",
+                         "in a custom folder you added"]
+        for source in LocalModelSource.allCases {
+            let row = LocalModel(id: model.id, name: model.name, path: model.path,
+                                 sizeFormatted: model.sizeFormatted,
+                                 modelType: model.modelType, source: source, kind: .base)
+            assertResolves(ModelRowActions.lockHelp(row), "lock help (\(source))",
+                           values: locations.map { ($0, "%@") }, keys: keys)
+            assertResolves(ModelRowActions.deleteMessage(row), "delete message (\(source))",
+                           values: [("/models/org/MdL", "%@"), ("MdL", "%@")], keys: keys)
+        }
+        for defect in ModelDefect.allCases {
+            let row = LocalModel(id: model.id, name: model.name, path: model.path,
+                                 sizeFormatted: model.sizeFormatted,
+                                 modelType: model.modelType, source: .mlxServe, kind: .base,
+                                 defect: defect)
+            assertResolves(ModelRowActions.deleteMessage(row), "delete message (\(defect))",
+                           values: [(defect.explanation, "%@"), ("/models/org/MdL", "%@")],
+                           keys: keys)
+        }
+        XCTAssertTrue(keys.contains(ModelRowActions.revealHelp(model)), "reveal help")
+        XCTAssertTrue(keys.contains(
+            ModelRowActions.revealHelp(LocalModel(id: model.id, name: model.name, path: model.path,
+                                                  sizeFormatted: model.sizeFormatted,
+                                                  modelType: model.modelType, source: .mlxServe,
+                                                  kind: .base, quantFile: "model-Q4.gguf"))),
+                      "reveal help (a quant file)")
+    }
+
+    /// The media panes' progress and failure lines, the quant menus and the
+    /// video pane's audio-source picker.
+    func testMediaProducerValuesResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+
+        for stage in ["encode", "prefill", "frames", "diffuse", "decode"] {
+            assertResolves(MediaSSE.stageLabel(stage), "stage label (\(stage))", keys: keys)
+        }
+        let progress = MediaGenProgress(kind: .image, step: 7, total: 30,
+                                        message: "Composing", startedAt: Date())
+        assertResolves(progress.detailText, "media progress",
+                       values: [("Composing", "%@")], keys: keys)
+
+        let onDisk = [GgufQuant(filename: "model-Q4_K_M.gguf", label: "Q4_K_M")]
+        assertResolves(GgufQuantMenuModel.buttonLabel(onDisk: [], failed: false, hasPartial: false),
+                       "quant button", keys: keys)
+        // A single quant's label is the file's own name — Latin either way — so
+        // only the count branch carries copy.
+        XCTAssertEqual(GgufQuantMenuModel.buttonLabel(onDisk: onDisk, failed: false, hasPartial: false),
+                       "✓ %@".replacingOccurrences(of: "%@", with: "Q4_K_M"))
+        assertResolves(GgufQuantMenuModel.buttonLabel(onDisk: onDisk + onDisk, failed: false, hasPartial: false),
+                       "quant button", keys: keys)
+        let variants = [MlxVariant(folder: "4bit", label: "4-bit", sizeBytes: 0)]
+        assertResolves(MlxVariantMenuModel.buttonLabel(onDisk: variants + variants, failed: false, hasPartial: false),
+                       "variant button", keys: keys)
+    }
+
+    /// Voice mode's notice card, the sidebar's delete confirmation and the two
+    /// sentences the agent picker shows about a model that is not reachable.
+    func testVoiceAndChatProducerValuesResolveInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+
+        for issue: VoicePreflight.Issue in [.microphoneDenied, .speechDenied,
+                                            .dictationUnavailable(locale: "en-US")] {
+            assertResolves(VoicePreflight.shortMessage(for: issue), "voice short message", keys: keys)
+            assertResolves(VoicePreflight.detail(for: issue), "voice detail",
+                           values: [("en-US", "%@")], keys: keys)
+            assertResolves(VoicePreflight.actionLabel(for: issue), "voice action", keys: keys)
+        }
+
+        assertResolves(SidebarDeleteConfirm.title(count: 1), "delete one chat", keys: keys)
+        assertResolves(SidebarDeleteConfirm.title(count: 42), "delete many chats", keys: keys)
+
+        // A pinned LAN id whose peer is not on the network is the one branch
+        // that hands a sentence to the picker.
+        let pin = "model@peer"
+        let decision = AgentModelSwitch.decide(modelPath: pin, selectedModelPath: "",
+                                               downloadedPaths: [], lanModelIds: [])
+        guard case .unavailable(let reason) = decision else {
+            return XCTFail("\(pin) did not decide as unavailable: \(decision)")
+        }
+        assertResolves(reason, "unreachable model", values: [(pin, "%@")], keys: keys)
     }
 
     private static func specs(_ text: String) -> [String] {

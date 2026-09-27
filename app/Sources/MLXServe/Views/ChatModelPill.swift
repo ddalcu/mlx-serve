@@ -134,20 +134,20 @@ struct ChatModelPill: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
                     Image(systemName: "cpu")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.app(.callout, weight: .medium))
                         .foregroundStyle(.secondary)
                     // The READABLE name (`ModelDisplayName`). The repo id it is
                     // built from stays the identity and is still what the menu
                     // rows carry underneath — this is the label, not a rename.
                     Text(ModelDisplayName.pretty(pill.name))
-                        .font(compact ? .callout.weight(.semibold) : .callout.weight(.medium))
+                        .font(compact ? .app(.callout, weight: .semibold) : .app(.callout, weight: .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth,
                                alignment: .leading)
                         .fixedSize(horizontal: false, vertical: true)
                     Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.app(.caption2, weight: .semibold))
                         .foregroundStyle(.secondary)
                     if pill.isLoading {
                         // A switch in flight. The dot would say GREEN here —
@@ -163,7 +163,7 @@ struct ChatModelPill: View {
                         // say it with the symbol rather than a dot that only
                         // reports.
                         Image(systemName: "arrow.down.circle.fill")
-                            .font(.system(size: 11))
+                            .font(.app(.subheadline))
                             .foregroundStyle(Color.accentColor)
                     } else {
                         Circle()

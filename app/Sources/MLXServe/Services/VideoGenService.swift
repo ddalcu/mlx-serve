@@ -91,7 +91,7 @@ final class VideoGenService: ObservableObject {
         generationSeq += 1
         let gen = generationSeq
         livePreview = nil
-        phase = .running(step: 0, total: 3, message: "Loading model…")
+        phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
@@ -187,9 +187,9 @@ final class VideoGenService: ObservableObject {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? steps
-                        let stage = ev["stage"] as? String ?? "Generating"
+                        let stage = ev["stage"] as? String ?? L10n.text("Generating")
                         clock.observe(step: step)
-                        var message = "\(stage)…"
+                        var message = L10n.format("%@…", L10n.text(stage))
                         if let eta = clock.eta(totalSteps: max(total, 1),
                                                floorPerStep: pricing.perStep, tail: pricing.tail),
                            eta > 0 {
@@ -203,7 +203,7 @@ final class VideoGenService: ObservableObject {
                         decoded = Self.decodeFrames(ev)
                     case "error":
                         await releaseIfNeeded()
-                        setPhase(.failed(ev["message"] as? String ?? "Generation failed."), for: gen)
+                        setPhase(.failed(ev["message"] as? String ?? L10n.text("Generation failed.")), for: gen)
                         return
                     default:
                         break
@@ -211,7 +211,7 @@ final class VideoGenService: ObservableObject {
                 }
                 await releaseIfNeeded()
                 guard let frames = decoded else {
-                    setPhase(.failed("Server returned no video frames."), for: gen)
+                    setPhase(.failed(L10n.text("Server returned no video frames.")), for: gen)
                     return
                 }
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
@@ -222,7 +222,7 @@ final class VideoGenService: ObservableObject {
                 H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
                                       frames: request.numFrames, steps: steps, fast: !request.bestQuality,
                                       measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
-                setPhase(.running(step: steps, total: steps, message: "Encoding mp4…"), for: gen)
+                setPhase(.running(step: steps, total: steps, message: L10n.text("Encoding mp4…")), for: gen)
                 let outFps = frames.fps > 0 ? frames.fps : fps
                 let settings = Self.settingsText(
                     request, modelId: modelId,
@@ -304,7 +304,7 @@ final class VideoGenService: ObservableObject {
                 }
             }
             guard let frames = decoded else {
-                throw MediaGenError.server("Server returned no video frames.")
+                throw MediaGenError.server(L10n.text("Server returned no video frames."))
             }
             report(steps, steps, "Encoding mp4")
             let outFps = frames.fps > 0 ? frames.fps : request.fps

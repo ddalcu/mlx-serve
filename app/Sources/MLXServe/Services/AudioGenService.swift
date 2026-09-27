@@ -49,7 +49,7 @@ final class AudioGenService: ObservableObject {
         }
 
         task?.cancel()
-        phase = .running(step: 0, total: 3, message: "Loading model…")
+        phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
 
         let outputPath = Self.makeOutputPath(text: request.text)
@@ -90,17 +90,17 @@ final class AudioGenService: ObservableObject {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? 0
-                        let stage = ev["stage"] as? String ?? "Generating audio"
+                        let stage = ev["stage"] as? String ?? L10n.text("Generating audio")
                         // ~0.08s of audio per talker frame (1920 samples @ 24 kHz).
                         let secs = Double(step) * 1920.0 / 24000.0
                         let msg = total == 0 && step > 0
-                            ? String(format: "%@ — ~%.1fs", stage, secs) : "\(stage)…"
+                            ? L10n.format("%@ — ~%.1fs", L10n.text(stage), secs) : L10n.format("%@…", L10n.text(stage))
                         phase = .running(step: step, total: total, message: msg)
                     case "complete":
                         if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
                     case "error":
                         await releaseIfNeeded()
-                        phase = .failed(ev["message"] as? String ?? "Synthesis failed.")
+                        phase = .failed(ev["message"] as? String ?? L10n.text("Synthesis failed."))
                         return
                     default:
                         break

@@ -60,6 +60,23 @@ assert "completion" in d["capabilities"], d["capabilities"]
 assert d["model_info"]["general.architecture"], d["model_info"]
 PY
 
+# ── 3b. /api/show on an UNLOADED thinking model reads its template from disk ──
+STUB=""
+for d in "$HOME"/.mlx-serve/models/*/*; do
+  [ "$d" = "$CHAT" ] && continue
+  grep -qsE 'enable_thinking|<think>' "$d/chat_template.jinja" && { STUB="${d#$HOME/.mlx-serve/models/}"; break; }
+done
+if [ -n "$STUB" ]; then
+  api /api/show -X POST -d "{\"model\":\"$STUB\"}" > /tmp/ollama_show_stub.json
+  python3 - /tmp/ollama_show_stub.json <<'PY' && ok "/api/show unloaded $STUB advertises thinking" || bad "/api/show unloaded $STUB ($(head -c 200 /tmp/ollama_show_stub.json))"
+import sys, json
+d = json.load(open(sys.argv[1]))
+assert "thinking" in d["capabilities"], d["capabilities"]
+PY
+else
+  echo "SKIP: no second thinking model on disk for the unloaded /api/show check"
+fi
+
 # ── 4. /api/chat non-stream ──
 api /api/chat -X POST -d '{"model":"mlx-serve","stream":false,"messages":[{"role":"user","content":"Say exactly: hello"}],"options":{"temperature":0,"num_predict":64}}' > /tmp/ollama_chat_ns.json
 python3 - /tmp/ollama_chat_ns.json <<'PY' && ok "/api/chat non-stream content + stats" || bad "/api/chat non-stream ($(head -c 200 /tmp/ollama_chat_ns.json))"

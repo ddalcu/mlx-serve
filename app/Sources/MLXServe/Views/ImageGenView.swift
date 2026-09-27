@@ -164,13 +164,13 @@ struct ImageGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Prompt").font(.subheadline.weight(.semibold))
+                Text("Prompt").font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 templatesMenu
             }
             TextEditor(text: $prompt, selection: $promptSelection)
                 .focused($promptFocused)
-                .font(.body)
+                .font(.app(.body))
                 .frame(height: promptHeight)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
@@ -221,15 +221,15 @@ struct ImageGenView: View {
         if takesSourceImage {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
-                    Text("Source image(s)").font(.subheadline.weight(.semibold))
+                    Text("Source image(s)").font(.app(.subheadline).weight(.semibold))
                     if refsDroppedOnHydrate {
                         Image(systemName: "exclamationmark.circle.fill")
-                            .font(.caption)
+                            .font(.app(.caption))
                             .foregroundStyle(.orange)
                             .help("Some previously added references were not found on disk. Double-check the media identifiers in the prompt and adjust them if necessary.")
                     }
                     Text("optional")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     // The mode switch belongs to the SECTION: it sits beside
@@ -252,17 +252,17 @@ struct ImageGenView: View {
                                   systemImage: "photo.badge.plus",
                                   isTargeted: isDropTargeted) { chooseSourceImage() }
                     Text(L10n.text(sourceImageHint))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 } else if effectiveEditMode {
                     imagesPanel
                     if refImageURLs.isEmpty {
                         Text("Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.")
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                     } else {
                         Text("Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”. Click a picture to drop its name into the prompt.")
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                     }
                 } else if let url = initImageURL {
@@ -278,7 +278,7 @@ struct ImageGenView: View {
                                     .clipShape(RoundedRectangle(cornerRadius: 4))
                             }
                             Text(url.lastPathComponent)
-                                .font(.caption).lineLimit(1).truncationMode(.middle)
+                                .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                             Spacer()
                             Button { initImageURL = nil; refImageURLs = [] } label: {
                                 Image(systemName: "xmark.circle.fill")
@@ -290,15 +290,15 @@ struct ImageGenView: View {
                     if model.supportsImg2Img {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
-                                Text("Variation strength").font(.caption)
+                                Text("Variation strength").font(.app(.caption))
                                 Spacer()
                                 Text(String(format: "%.0f%%", strength * 100))
-                                    .font(.caption)
+                                    .font(.app(.caption))
                                     .foregroundStyle(.secondary)
                             }
                             Slider(value: $strength, in: 0.1...1.0, step: 0.05)
                             Text("Low = stay close to the source; high = mostly the prompt.")
-                                .font(.caption2)
+                                .font(.app(.caption2))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -432,7 +432,7 @@ struct ImageGenView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-                .font(.caption)
+                .font(.app(.caption))
                 .controlSize(.small)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
@@ -444,20 +444,20 @@ struct ImageGenView: View {
         // is the same silent-no-op the capability flags exist to kill.
         if model.stepsAreFixed {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Quality").font(.subheadline.weight(.semibold))
+                Text("Quality").font(.app(.subheadline).weight(.semibold))
                 Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Quality").font(.subheadline.weight(.semibold))
+                Text("Quality").font(.app(.subheadline).weight(.semibold))
                 // Measured, not `ViewThatFits`: the menu variant is `fixedSize`
                 // and would never re-fit. Five segments degrade to a menu
                 // rather than shortening the tier names the Create panes share.
                 qualityPicker(segmented: qualityFitsSegments)
                 Text(L10n.text(qualityHint))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -533,8 +533,8 @@ struct ImageGenView: View {
                 presetsMenu
             }
             if let hint = verdict.hint {
-                Label(L10n.text(hint), systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
-                    .font(.caption2)
+                Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
+                    .font(.app(.caption2))
                     // A correction is information; a refusal is the reason
                     // Generate is disabled, so only that one is coloured.
                     .foregroundStyle(verdict.isValid ? Color.secondary : Color.orange)
@@ -547,7 +547,7 @@ struct ImageGenView: View {
             labelledSizeField("Width", text: $customWidthText)
             // Centred on the fields, not on the pair of labels above them.
             Image(systemName: "multiply")
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .frame(height: 24)
             labelledSizeField("Height", text: $customHeightText)
@@ -560,7 +560,7 @@ struct ImageGenView: View {
             // squeezed HStack proposes less than its widest child and the TEXT
             // is what gives first.
             Text(L10n.text(title))
-                .font(.subheadline.weight(.semibold))
+                .font(.app(.subheadline).weight(.semibold))
                 .fixedSize()
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
@@ -593,7 +593,7 @@ struct ImageGenView: View {
             }
             // Body, not caption: this sits beside the size fields rather than
             // above a text box. The height is the fields' own.
-            .font(.body)
+            .font(.app(.body))
             .modifier(PaneChip(height: 24))
         }
         .modifier(PaneChipMenu())
@@ -706,7 +706,7 @@ struct ImageGenView: View {
                 intSliderRow("Steps", value: $steps, range: 1...50)
                 if model.stepsAreFixed {
                     Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 }
 
@@ -714,13 +714,13 @@ struct ImageGenView: View {
                 // preset has guidance baked into its weights, so the field
                 // would be pure decoration there and stays hidden.
                 if model.supportsGuidance {
-                    Text("Classifier-free guidance").font(.caption.weight(.semibold))
+                    Text("Classifier-free guidance").font(.app(.caption).weight(.semibold))
                     sliderRow("Guidance scale", value: $guidanceScale, range: 1...20, step: 0.5)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Negative prompt").font(.caption)
+                        Text("Negative prompt").font(.app(.caption))
                         TextField("", text: $negativePrompt, prompt: Text("what to steer away from (optional)"))
                             .textFieldStyle(.roundedBorder)
-                            .font(.caption)
+                            .font(.app(.caption))
                     }
                 }
                 // -1 is the random sentinel and renders as an EMPTY box, so the
@@ -734,21 +734,21 @@ struct ImageGenView: View {
                 // "Layer weights (0 numbers…)".
                 if model.condWeightCount > 0 {
                     Divider()
-                    Text("Conditioning rebalance").font(.caption.weight(.semibold))
+                    Text("Conditioning rebalance").font(.app(.caption).weight(.semibold))
                     sliderRow("Global gain", value: $condGain, range: 0...4, step: 0.1)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Layer weights (\(model.condWeightCount) numbers, comma or space separated)")
-                            .font(.caption)
+                            .font(.app(.caption))
                         TextField("", text: $condWeightsText, prompt: Text(defaultWeightsPlaceholder))
                             .textFieldStyle(.roundedBorder)
-                            .font(.caption.monospaced())
+                            .font(.app(.caption).monospaced())
                         if !condWeightsValid {
                             Text("Needs exactly \(model.condWeightCount) numbers — one per tapped encoder layer.")
-                                .font(.caption2)
+                                .font(.app(.caption2))
                                 .foregroundStyle(.red)
                         } else {
                             Text("Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off.")
-                                .font(.caption2)
+                                .font(.app(.caption2))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -762,7 +762,7 @@ struct ImageGenView: View {
     private var loraSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
-            Text("Style LoRAs").font(.caption.weight(.semibold))
+            Text("Style LoRAs").font(.app(.caption).weight(.semibold))
             ForEach(Array(loras.enumerated()), id: \.element.id) { index, _ in
                 LoraAdapterRow(lora: $loras[index]) { loras.remove(at: index) }
             }
@@ -778,10 +778,10 @@ struct ImageGenView: View {
                            step: Double) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text(String(format: "%.1f", value.wrappedValue))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
@@ -793,10 +793,10 @@ struct ImageGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.caption)
+                Text(L10n.text(label)).font(.app(.caption))
                 Spacer()
                 Text("\(value.wrappedValue)")
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(
@@ -924,6 +924,7 @@ struct ImageGenView: View {
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid || !customSizeValid)
                 }
             }
+            .font(.app(.callout))
         }
     }
 
@@ -940,7 +941,7 @@ struct ImageGenView: View {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
                             .progressViewStyle(.linear)
                             .frame(width: 240)
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -965,7 +966,7 @@ struct ImageGenView: View {
             // under the picture they describe.
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -1016,7 +1017,7 @@ struct ImageGenView: View {
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
-                .font(.caption)
+                .font(.app(.caption))
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)

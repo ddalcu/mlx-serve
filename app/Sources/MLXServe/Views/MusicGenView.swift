@@ -195,33 +195,33 @@ struct MusicGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Style prompt").font(.subheadline.weight(.semibold))
+                Text("Style prompt").font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 rewriteButton(.style, text: prompt)
                 styleExamplesMenu
             }
             TextEditor(text: $prompt)
-                .font(.body)
+                .font(.app(.body))
                 .frame(height: 80)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
             Text("Genre, mood, instruments — e.g. \"upbeat synthwave with driving bass and dreamy pads\".")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
         }
     }
 
     private var lyricsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Lyrics").font(.subheadline.weight(.semibold))
+                Text("Lyrics").font(.app(.subheadline).weight(.semibold))
                 // The instrumental switch. Both engines can make a wordless
                 // track, but only ACE-Step ever said so (empty lyrics) and
                 // Music 3 refused outright — the server 400s an empty lyric
                 // block there, so this needed the `instrumental` field before a
                 // checkbox could work.
                 Toggle("Instrumental", isOn: $instrumental)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .fixedSize()
                     .help(L10n.text(model.family == .minimaxMusic3
                           ? "Asks for a track with no singing. This model has no dedicated instrumental switch, so it is requested in text — it may still add wordless vocals."
@@ -241,11 +241,11 @@ struct MusicGenView: View {
                 Text(L10n.text(model.family == .minimaxMusic3
                      ? "In instrumental mode, lyrics are not used. This model has no instrumental switch of its own, so it is asked in text and may still add wordless vocals. This is an experimental feature."
                      : "In instrumental mode, lyrics are not used."))
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             } else {
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $lyrics)
-                        .font(.body)
+                        .font(.app(.body))
                         .frame(height: lyricsHeight)
                         .overlay(
                             RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
@@ -254,7 +254,7 @@ struct MusicGenView: View {
                         Text(model.requiresLyrics
                              ? L10n.format("This model sings your lyrics. Section tags go on their own lines: %@", MusicOptions.sectionTagHint)
                              : L10n.format("Leave empty, or tick Instrumental, for a track with no vocals. Section tags: %@", MusicOptions.sectionTagHint))
-                            .font(.body)
+                            .font(.app(.body))
                             .foregroundStyle(.secondary.opacity(0.6))
                             .padding(.horizontal, 5)
                             .padding(.vertical, 8)
@@ -299,7 +299,7 @@ struct MusicGenView: View {
                     ? "Builds an arrangement around a vocal stem (or any part): pick the instruments to add, or leave them all off to let the model decide."
                     : "A new track from the style prompt and lyrics.")
 ))
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
             coverWeightsNotice
         }
     }
@@ -324,7 +324,7 @@ struct MusicGenView: View {
     private var coverWeightsNotice: some View {
         if task == .cover, let text = CoverWeightsFetch.notice(coverWeights) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(text).font(.caption2).foregroundStyle(.secondary)
+                Text(text).font(.app(.caption2)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 switch coverWeights {
@@ -337,7 +337,7 @@ struct MusicGenView: View {
                     } label: {
                         Label("Download \(CoverWeightsFetch.fileName) (\(CoverWeightsFetch.approxMB) MB)",
                               systemImage: "arrow.down.circle")
-                            .font(.caption)
+                            .font(.app(.caption))
                     }
                     .buttonStyle(.bordered)
                 case .downloading:
@@ -345,11 +345,11 @@ struct MusicGenView: View {
                         ProgressView(value: downloads.downloads[model.repo]?.progress ?? 0)
                             .progressViewStyle(.linear)
                         Text(downloads.downloads[model.repo]?.percentFormatted ?? "")
-                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                            .font(.app(.caption2).monospacedDigit()).foregroundStyle(.secondary)
                         // Cancels ONLY this single-file fetch — a full pack
                         // download for the same repo is never touched.
                         Button("Cancel") { downloads.cancelPackFile(repoId: model.repo) }
-                            .buttonStyle(.borderless).font(.caption)
+                            .buttonStyle(.borderless).font(.app(.caption))
                     }
                 default:
                     EmptyView()
@@ -366,7 +366,7 @@ struct MusicGenView: View {
     private var sourceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(L10n.text(task == .cover ? "Source track" : "Source stem")).font(.subheadline.weight(.semibold))
+                Text(L10n.text(task == .cover ? "Source track" : "Source stem")).font(.app(.subheadline).weight(.semibold))
                 Spacer()
             }
             if let url = srcAudioURL {
@@ -375,7 +375,7 @@ struct MusicGenView: View {
                         HStack(spacing: 8) {
                             Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
                             Text(url.lastPathComponent)
-                                .font(.caption).lineLimit(1).truncationMode(.middle)
+                                .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                             Spacer()
                             if clipPlayer.playingPath == url.path {
                                 Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
@@ -392,7 +392,7 @@ struct MusicGenView: View {
                         // task decides for you.
                         Text(srcSeconds.map { "The new track will be \(SourceTrackLength.spoken(seconds: $0)) long." }
                              ?? "The new track will be exactly as long as this clip.")
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(.app(.caption2)).foregroundStyle(.secondary)
                     }
                 }
             } else if srcBusy {
@@ -405,36 +405,36 @@ struct MusicGenView: View {
                               action: chooseSourceFile)
             }
             if let err = srcError {
-                Text(err).font(.caption2).foregroundStyle(.orange)
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
             }
             if task == .cover {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Cover strength").font(.caption)
+                        Text("Cover strength").font(.app(.caption))
                         Spacer()
-                        Text(String(format: "%.2f", coverStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", coverStrength)).font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
                     Slider(value: $coverStrength, in: 0...1, step: 0.05)
                     Text("How many of the steps follow the source. 1 keeps it all the way; lower lets the caption take over for the last steps.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
                 // The knobs under the clip are their own step, not a caption
                 // of the well above them.
                 .padding(.top, 6)
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Noise strength").font(.caption)
+                        Text("Noise strength").font(.app(.caption))
                         Spacer()
-                        Text(String(format: "%.2f", coverNoiseStrength)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Text(String(format: "%.2f", coverNoiseStrength)).font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
                     Slider(value: $coverNoiseStrength, in: 0...1, step: 0.05)
                     Text("0 starts from pure noise (the default). Higher starts closer to the original audio, so more of it comes through.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
                 .padding(.top, 6)
             }
             if task == .complete {
-                Text("Add").font(.caption).padding(.top, 6)
+                Text("Add").font(.app(.caption)).padding(.top, 6)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), alignment: .leading)], alignment: .leading, spacing: 4) {
                     ForEach(MusicTask.trackClasses, id: \.self) { name in
                         Toggle(L10n.text(name.replacingOccurrences(of: "_", with: " ")),
@@ -443,7 +443,7 @@ struct MusicGenView: View {
                                                  if on { if !trackClasses.contains(name) { trackClasses.append(name) } }
                                                  else { trackClasses.removeAll { $0 == name } }
                                              }))
-                            .font(.caption)
+                            .font(.app(.caption))
                     }
                 }
             }
@@ -500,7 +500,7 @@ struct MusicGenView: View {
     private var referenceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Reference audio (optional)").font(.subheadline.weight(.semibold))
+                Text("Reference audio (optional)").font(.app(.subheadline).weight(.semibold))
                 Spacer()
             }
             if let url = refAudioURL {
@@ -508,7 +508,7 @@ struct MusicGenView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
                         Text(url.lastPathComponent)
-                            .font(.caption).lineLimit(1).truncationMode(.middle)
+                            .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                         Spacer()
                         if clipPlayer.playingPath == url.path {
                             Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
@@ -531,7 +531,7 @@ struct MusicGenView: View {
                               action: chooseReferenceFile)
             }
             if let err = refError {
-                Text(err).font(.caption2).foregroundStyle(.orange)
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
             }
         }
         .mediaDrop(.audio, isTargeted: $isRefDropTargeted) { urls in
@@ -542,7 +542,7 @@ struct MusicGenView: View {
     private var converting: some View {
         HStack(spacing: 8) {
             ProgressView().controlSize(.small)
-            Text("Converting…").font(.caption).foregroundStyle(.secondary)
+            Text("Converting…").font(.app(.caption)).foregroundStyle(.secondary)
         }
     }
 
@@ -602,7 +602,7 @@ struct MusicGenView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-                .font(.caption)
+                .font(.app(.caption))
                 .controlSize(.small)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
@@ -631,7 +631,7 @@ struct MusicGenView: View {
             // against the pane margin puts a number and its name at opposite
             // ends of a wide row with nothing between them to tie the two.
             HStack(spacing: 6) {
-                Text("Duration").font(.subheadline.weight(.semibold))
+                Text("Duration").font(.app(.subheadline).weight(.semibold))
                 // Typed entry beside the slider: the slider steps by 5 and
                 // landing on 95 s by dragging is not a thing anyone should do.
                 NumberField(range: durationRangeInt,
@@ -639,13 +639,13 @@ struct MusicGenView: View {
                                            set: { durationSeconds = Double($0) }),
                             width: 52,
                             help: "Seconds. \(durationRangeInt.lowerBound)–\(durationRangeInt.upperBound) for this model.")
-                Text("sec · \(formattedDuration)").font(.caption2).foregroundStyle(.secondary)
+                Text("sec · \(formattedDuration)").font(.app(.caption2)).foregroundStyle(.secondary)
                 Spacer()
             }
             Slider(value: $durationSeconds, in: model.durationRange, step: 5)
             if model.family == .minimaxMusic3 {
                 Text("An upper bound — the model may end the song earlier.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
     }
@@ -656,7 +656,7 @@ struct MusicGenView: View {
         // grid column, which reads as an arbitrary gap between two controls.
         // The cell hugs its content and the grid sets it at the leading edge.
         VStack(alignment: .leading, spacing: 2) {
-            Text(L10n.text(label)).font(.caption)
+            Text(L10n.text(label)).font(.app(.caption))
             control()
         }
     }
@@ -695,7 +695,7 @@ struct MusicGenView: View {
             if model.supportsSteps {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Quality passes").font(.caption)
+                        Text("Quality passes").font(.app(.caption))
                         NumberField(range: model.stepsRange,
                                     value: Binding(get: { steps ?? model.fixedSteps },
                                                    set: { steps = $0 }),
@@ -708,7 +708,7 @@ struct MusicGenView: View {
                            in: Double(model.stepsRange.lowerBound)...Double(model.stepsRange.upperBound),
                            step: 1)
                     Text("More passes means more detail and a slower render.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
             // Dropdowns only — every choice is a value the server accepts,
@@ -781,10 +781,10 @@ struct MusicGenView: View {
             }
             if model.supportsTempoAndKey && model.family == .minimaxMusic3 {
                 Text("Tempo and key are written into the style prompt for this model — it has no separate fields for them.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             Text("Same seed + prompt reproduces the track.")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
         }
     }
 
@@ -813,9 +813,9 @@ struct MusicGenView: View {
     private var convertHint: some View {
         VStack(alignment: .leading, spacing: 5) {
             Label("Weights not found", systemImage: "wrench.and.screwdriver")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                .font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
             Text("\(model.name) has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/.")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.app(.caption2)).foregroundStyle(.secondary)
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -838,7 +838,7 @@ struct MusicGenView: View {
                             ProgressView(value: Double(step), total: max(1, Double(total)))
                                 .progressViewStyle(.linear).frame(width: 240)
                         }
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -872,7 +872,7 @@ struct MusicGenView: View {
             // under the track they describe.
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.app(.caption)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
@@ -893,7 +893,7 @@ struct MusicGenView: View {
                 .fill(.tint)
                 .frame(width: 64, height: 64)
             Image(systemName: "music.note.list")
-                .font(.system(size: 32))
+                .font(.app(.largeTitle))
                 .blendMode(.destinationOut)
                 .symbolEffect(.bounce.down.byLayer, options: .repeat(.continuous), isActive: playing)
         }
@@ -908,7 +908,7 @@ struct MusicGenView: View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.musicRoot)])
         } label: {
-            Label("Open output folder in Finder", systemImage: "folder").font(.caption)
+            Label("Open output folder in Finder", systemImage: "folder").font(.app(.caption))
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
@@ -1132,19 +1132,19 @@ struct PromptRewriteSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text(L10n.text(title)).font(.headline)
+                Text(L10n.text(title)).font(.app(.headline))
                 Spacer()
                 if isWriting { ProgressView().controlSize(.small) }
             }
             TextEditor(text: $text)
-                .font(.body)
+                .font(.app(.body))
                 .frame(minHeight: 220)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
             if let error {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Text(error).font(.app(.caption)).foregroundStyle(.red)
             } else {
                 Text("Edit the result, then Apply to replace your text.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
             HStack {
                 Button("Try again") { start() }.disabled(isWriting)

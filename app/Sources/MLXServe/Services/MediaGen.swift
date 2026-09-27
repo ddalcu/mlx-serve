@@ -107,15 +107,15 @@ struct ResolutionGrid: Hashable {
     /// requested size with nothing explaining why.
     func resolve(width: Int, height: Int) -> CustomResolution {
         for v in [width, height] where v <= 0 {
-            return .invalid(message: "Width and height must be whole numbers above zero.")
+            return .invalid(message: L10n.text("Width and height must be whole numbers above zero."))
         }
         for v in [width, height] where v < minDim || v > maxDim {
-            return .invalid(message: "This model samples between \(minDim) and \(maxDim) px per side. \(v) is outside that.")
+            return .invalid(message: L10n.formatUngrouped("This model samples between %lld and %lld px per side. %lld is outside that.", minDim, maxDim, v))
         }
         let w = snap(width), h = snap(height)
         guard w != width || h != height else { return .ok(width: width, height: height) }
         return .corrected(width: w, height: h,
-                          note: "Rounded to \(w) × \(h) — this model samples in steps of \(alignment) px.")
+                          note: L10n.formatUngrouped("Rounded to %lld × %lld — this model samples in steps of %lld px.", w, h, alignment))
     }
 }
 
@@ -1593,10 +1593,12 @@ enum MusicOptions {
         "G minor": "restless",
     ]
 
-    /// "C major — plain, open", or just "C major" where we have no association.
+    /// "C major — open", or just "C major" where we have no association. The
+    /// picker renders this verbatim, so the mood is looked up here; the key name
+    /// itself is musical notation and stays Latin.
     static func keyLabel(_ key: String) -> String {
         guard let mood = keyMoods[key] else { return key }
-        return "\(key) — \(mood)"
+        return L10n.format("%@ — %@", key, L10n.text(mood))
     }
 
     /// (label, wire value). The engine takes the beats-per-bar number.

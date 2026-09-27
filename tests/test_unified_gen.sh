@@ -51,6 +51,12 @@ assert m, "FLUX not ready with image cap: "+json.dumps(d)
 print("PASS: load-model by path -> FLUX ready, capabilities", m[0]["capabilities"])
 '
 
+# 2b. A media 400 carries CORS too, or a browser client sees an opaque failure instead of the message.
+HDRS=$(curl -s -i -m 60 "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' -d "{\"model\":\"$FLUX_ID\",\"prompt\":\"\"}")
+echo "$HDRS" | head -1 | grep -q " 400 " && echo "$HDRS" | grep -qi "^Access-Control-Allow-Origin: \*" \
+  || { echo "FAIL: media 400 without CORS header: $(echo "$HDRS" | head -c 300)"; exit 1; }
+echo "PASS: media 400 carries Access-Control-Allow-Origin"
+
 # 3. Generate an image -> valid PNG.
 api /v1/images/generations -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$FLUX_ID\",\"prompt\":\"a green triangle\",\"steps\":4}" -o /tmp/test_unified_img.json -w ''

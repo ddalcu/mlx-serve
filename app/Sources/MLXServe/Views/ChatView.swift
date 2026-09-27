@@ -65,26 +65,26 @@ struct ToolApprovalSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "shield.lefthalf.filled")
-                    .font(.title2)
+                    .font(.app(.title2))
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Allow this tool call?")
-                        .font(.headline)
+                    Text(L10n.text("Allow this tool call?"))
+                        .font(.app(.headline))
                     Text(L10n.text(headline))
-                        .font(.subheadline)
+                        .font(.app(.subheadline))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Tool: \(request.toolName)")
-                    .font(.caption.weight(.semibold))
+                Text(L10n.format("Tool: %@", request.toolName))
+                    .font(.app(.caption).weight(.semibold))
                     .foregroundStyle(.secondary)
                 if argPairs.isEmpty && !request.rawArguments.isEmpty {
                     ScrollView {
                         Text(L10n.text(request.rawArguments))
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.app(.subheadline, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(8)
@@ -94,7 +94,7 @@ struct ToolApprovalSheet: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 } else if argPairs.isEmpty {
                     Text("(no arguments)")
-                        .font(.caption.italic())
+                        .font(.app(.caption).italic())
                         .foregroundStyle(.tertiary)
                 } else {
                     ScrollView {
@@ -102,10 +102,10 @@ struct ToolApprovalSheet: View {
                             ForEach(argPairs, id: \.0) { (k, v) in
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     Text(L10n.text(k))
-                                        .font(.system(size: 11, design: .monospaced).weight(.semibold))
+                                        .font(.app(.subheadline, design: .monospaced).weight(.semibold))
                                         .foregroundStyle(.secondary)
                                     Text(L10n.text(v))
-                                        .font(.system(size: 11, design: .monospaced))
+                                        .font(.app(.subheadline, design: .monospaced))
                                         .textSelection(.enabled)
                                         .lineLimit(8)
                                         .fixedSize(horizontal: false, vertical: true)
@@ -166,16 +166,19 @@ private struct AttachmentPreviewRow: View {
                 ForEach(Array(images.enumerated()), id: \.offset) { idx, pending in
                     imageChip(idx: idx, img: pending.image)
                 }
+                // Each `detail` is localized by its producer, not by `fileChip`:
+                // a format key has to be completed BEFORE the catalog lookup, or
+                // the lookup keys on the finished sentence and can never match.
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
-                    fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
+                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.text.count),
                              icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
                 }
                 ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
-                    fileChip(idx: idx, name: vid.name, detail: "Video · \(vid.frameCount) frames",
+                    fileChip(idx: idx, name: vid.name, detail: L10n.format("Video · %lld frames", vid.frameCount),
                              icon: "video.fill", tint: .orange) { videos.remove(at: idx) }
                 }
                 ForEach(Array(audio.enumerated()), id: \.offset) { idx, clip in
-                    fileChip(idx: idx, name: clip.name, detail: String(format: "Audio · %.1fs", clip.durationSeconds),
+                    fileChip(idx: idx, name: clip.name, detail: L10n.format("Audio · %.1fs", clip.durationSeconds),
                              icon: "waveform", tint: .purple) { audio.remove(at: idx) }
                 }
             }
@@ -187,7 +190,7 @@ private struct AttachmentPreviewRow: View {
     private func removeButton(_ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 14))
+                .font(.app(.body))
                 .foregroundStyle(.white)
                 .background(Circle().fill(.black.opacity(0.5)))
         }
@@ -212,18 +215,20 @@ private struct AttachmentPreviewRow: View {
         ZStack(alignment: .topTrailing) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 18))
+                    .font(.app(.title2))
                     .foregroundStyle(.white)
                     .frame(width: 32, height: 32)
                     .background(tint.opacity(0.85))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 1) {
                     Text(name)
-                        .font(.caption.weight(.medium))
+                        .font(.app(.caption).weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(L10n.text(detail))
-                        .font(.caption2)
+                    // Verbatim: every caller hands in text its producer already
+                    // localized, so a lookup here would re-key the sentence.
+                    Text(detail)
+                        .font(.app(.caption2))
                         .foregroundStyle(.secondary)
                 }
             }
@@ -247,18 +252,18 @@ private struct DocumentFolderChip: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: iconName)
-                .font(.system(size: 18))
+                .font(.app(.title2))
                 .foregroundStyle(.white)
                 .frame(width: 32, height: 32)
                 .background(tint.opacity(0.85))
                 .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(index.folderName))
-                    .font(.caption.weight(.medium))
+                    .font(.app(.caption).weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(L10n.text(statusText))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
             }
             if case .indexing(let done, let total) = index.state {
@@ -268,7 +273,7 @@ private struct DocumentFolderChip: View {
             }
             Button(action: onRemove) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 14))
+                    .font(.app(.body))
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
@@ -316,10 +321,10 @@ private struct MicButton: View {
         Button(action: toggle) {
             HStack(spacing: 4) {
                 Image(systemName: recorder.isRecording ? "stop.fill" : "mic.fill")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.app(.callout, weight: .medium))
                 if recorder.isRecording {
                     Text(timeString(recorder.duration))
-                        .font(.caption2.monospacedDigit().weight(.medium))
+                        .font(.app(.caption2).monospacedDigit().weight(.medium))
                 }
             }
             .foregroundStyle(recorder.isRecording ? Color.white : Color.secondary)
@@ -601,6 +606,22 @@ struct SidebarReorder: ViewModifier {
     }
 }
 
+/// A group heading (or the Sessions one, nil) as a drop target: the dragged
+/// row joins it as the drag enters, the same live idiom as `SidebarReorder`.
+struct SidebarGroupDrop: DropDelegate {
+    @Binding var dragging: UUID?
+    let assign: (UUID) -> Void
+
+    func dropEntered(info: DropInfo) {
+        if let id = dragging { assign(id) }
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        return true
+    }
+}
+
 /// A sidebar destination's chrome: nothing drawn until you hover it, and the
 /// SAME gray when it is the selected one.
 struct DestinationRowButton<Label: View>: View {
@@ -741,8 +762,10 @@ enum SidebarDeleteConfirm {
     }
 
     /// The count is the thing to check before agreeing, so it is in the title.
+    /// The dialog renders this verbatim, so the format runs here.
     static func title(count: Int) -> String {
-        count == 1 ? "Delete this chat?" : "Delete \(count) chats?"
+        count == 1 ? L10n.text("Delete this chat?")
+                   : L10n.format("Delete %lld chats?", Int64(count))
     }
 }
 
@@ -841,6 +864,18 @@ struct SidebarClearBandBottomKey: PreferenceKey {
 }
 
 struct ChatSidebar: View {
+    private enum GroupSheet: Identifiable {
+        case create(Set<UUID>)
+        case rename(UUID, String)
+
+        var id: String {
+            switch self {
+            case .create: return "create"
+            case .rename(let id, _): return id.uuidString
+            }
+        }
+    }
+
     /// The one coordinate space the three band measurements share.
     ///
     /// Load-bearing that it is the COLUMN's own space and not `.global`: a
@@ -869,6 +904,8 @@ struct ChatSidebar: View {
     @State private var draggingRowId: UUID?
     /// The rename dialog's text.
     @State private var renameDraft = ""
+    /// The group name sheet, nil when closed.
+    @State private var groupSheet: GroupSheet?
     /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
     /// alone by shift itself so dragging a range up and down keeps re-ranging
     /// from the same origin instead of walking away from it.
@@ -956,24 +993,30 @@ struct ChatSidebar: View {
         }
     }
 
-    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
-    /// terminals interleaved), both in the ONE dragged order. `visible` is
-    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
-    /// a shift-range runs over — the split is a heading, not a wall.
-    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
-                            visible: [UUID], chats: [UUID]) {
-        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
-                                           order: appState.sidebarOrder)
-        let sessions = SidebarChatRows.merge(chats: groups.chats,
-                                             terminals: terminals.sessions.sessions,
-                                             order: appState.sidebarOrder)
-        let all = agents + sessions
-        let chats = all.compactMap { row -> UUID? in
+    /// The panel top to bottom: ungrouped Agents rows, the user's groups, then
+    /// ungrouped Sessions rows (chats and terminals interleaved), all in the
+    /// ONE dragged order. `visible` is what the ⌘ numbers read (collapsed
+    /// groups hide theirs); `all` is what a drop reorders, so a drag never
+    /// forgets a collapsed row's slot; `chats` is the conversation subset a
+    /// shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row],
+                            groups: [(group: SidebarGroups.Group, rows: [SidebarChatRows.Row])],
+                            sessions: [SidebarChatRows.Row],
+                            visible: [UUID], all: [UUID], chats: [UUID]) {
+        let agentIds = Set(SidebarSessionGroups.split(appState.visibleChatSessions).agents.map(\.id))
+        let rows = SidebarChatRows.merge(chats: appState.visibleChatSessions,
+                                         terminals: terminals.sessions.sessions,
+                                         order: appState.sidebarOrder)
+        let parts = appState.sidebarGroups.partition(rows)
+        let agents = parts.ungrouped.filter { agentIds.contains($0.id) }
+        let sessions = parts.ungrouped.filter { !agentIds.contains($0.id) }
+        let shown = agents + parts.groups.flatMap { $0.group.collapsed ? [] : $0.rows } + sessions
+        let all = agents + parts.groups.flatMap(\.rows) + sessions
+        let chats = shown.compactMap { row -> UUID? in
             if case .chat(let s) = row { return s.id }
             return nil
         }
-        return (agents, sessions, all.map(\.id), chats)
+        return (agents, parts.groups, sessions, shown.map(\.id), all.map(\.id), chats)
     }
 
     /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
@@ -1013,29 +1056,20 @@ struct ChatSidebar: View {
             // Conversations and sandbox terminals, one list (`panelRows`).
             // Terminals take no part in multi-select; they do wear ⌘ numbers.
             let rows = panelRows
-            let agentRows = rows.agents, sessionRows = rows.sessions
-            let visible = rows.visible, ordered = rows.chats
             LazyVStack(alignment: .leading, spacing: 2) {
-                if !agentRows.isEmpty {
+                if !rows.agents.isEmpty {
                     sectionHeader("Agents")
-                    ForEach(agentRows) { row in
-                        if case .chat(let session) = row {
-                            sessionRow(session, ordered: ordered)
-                                .modifier(reorderable(session.id, visible: visible))
-                        }
+                    ForEach(rows.agents) { panelRow($0, ordered: rows.chats, all: rows.all) }
+                }
+                ForEach(rows.groups, id: \.group.id) { entry in
+                    groupHeader(entry.group)
+                    if !entry.group.collapsed {
+                        ForEach(entry.rows) { panelRow($0, ordered: rows.chats, all: rows.all) }
                     }
                 }
-                sectionHeader("Sessions") { newSessionMenu }
-                ForEach(sessionRows) { row in
-                    switch row {
-                    case .chat(let session):
-                        sessionRow(session, ordered: ordered)
-                            .modifier(reorderable(session.id, visible: visible))
-                    case .terminal(let t):
-                        terminalRow(t)
-                            .modifier(reorderable(t.id, visible: visible))
-                    }
-                }
+                sectionHeader("Sessions") { newSessionMenu() }
+                    .onDrop(of: [.text], delegate: groupDrop(nil))
+                ForEach(rows.sessions) { panelRow($0, ordered: rows.chats, all: rows.all) }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
@@ -1119,13 +1153,25 @@ struct ChatSidebar: View {
             .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
         } message: { _ in
-            Text("This can't be undone.")
+            Text(L10n.text("This can't be undone."))
         }
         // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
         // they address THIS view's conversation list; hidden in a background so
         // they cost no layout.
         .background(quickSwitchShortcuts)
         .background(renameDialog)
+        .sheet(item: $groupSheet) { sheet in
+            switch sheet {
+            case .create(let ids):
+                SidebarGroupSheet(title: "New Group", action: "Create", name: "") {
+                    appState.sidebarGroups.create($0, with: ids)
+                }
+            case .rename(let id, let name):
+                SidebarGroupSheet(title: "Rename Group", action: "Rename", name: name) {
+                    appState.sidebarGroups.rename(id, to: $0)
+                }
+            }
+        }
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1297,24 +1343,24 @@ struct ChatSidebar: View {
         switch dot {
         case .generating:
             Image(systemName: "inset.filled.circle")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.green)
                 .symbolEffect(.pulse.byLayer, options: .repeat(.continuous))
                 .help("Generating")
         case .tool:
             Image(systemName: "inset.filled.circle.dashed")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.blue)
                 .symbolEffect(.rotate.clockwise.byLayer, options: .repeat(.continuous))
                 .help("Running a tool")
         case .finished:
             Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(Color(nsColor: .tertiaryLabelColor))
                 .help("Finished")
         case .attention:
             Image(systemName: "exclamationmark.circle.fill")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.orange)
                 .help("Stopped with an error")
         }
@@ -1373,6 +1419,72 @@ struct ChatSidebar: View {
         appState.deleteSessions(ids)
     }
 
+    @ViewBuilder
+    private func panelRow(_ row: SidebarChatRows.Row, ordered: [UUID], all: [UUID]) -> some View {
+        switch row {
+        case .chat(let session):
+            sessionRow(session, ordered: ordered)
+                .modifier(reorderable(session.id, visible: all))
+        case .terminal(let t):
+            terminalRow(t)
+                .modifier(reorderable(t.id, visible: all))
+        }
+    }
+
+    /// A user group's heading: the label folds it, the + adds a chat or
+    /// terminal straight into it, a row dropped on it joins it, right-click
+    /// renames or deletes it (its rows go back to their sections).
+    private func groupHeader(_ group: SidebarGroups.Group) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation { appState.sidebarGroups.toggleCollapsed(group.id) }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: group.collapsed ? "chevron.right" : "chevron.down")
+                        .frame(width: 10)
+                    Image(systemName: "folder")
+                    Text(verbatim: group.name)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.app(.caption).weight(.semibold))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            newSessionMenu(group: group.id)
+        }
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+        .onDrop(of: [.text], delegate: groupDrop(group.id))
+        .contextMenu {
+            Button("Rename Group…") { groupSheet = .rename(group.id, group.name) }
+            Button("Delete Group", role: .destructive) { appState.sidebarGroups.delete(group.id) }
+        }
+    }
+
+    private func groupDrop(_ group: UUID?) -> SidebarGroupDrop {
+        SidebarGroupDrop(dragging: $draggingRowId) { appState.sidebarGroups.assign([$0], to: group) }
+    }
+
+    /// "Move to Group" for a row, or for the multi-selection it sits in.
+    @ViewBuilder
+    private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
+        Menu("Move to Group") {
+            ForEach(appState.sidebarGroups.groups) { group in
+                Button(group.name) { appState.sidebarGroups.assign(ids, to: group.id) }
+                    .disabled(ids.count == 1 && group.id == current)
+            }
+            if !appState.sidebarGroups.groups.isEmpty { Divider() }
+            Button("New Group…") { groupSheet = .create(ids) }
+        }
+        if current != nil {
+            Button("Remove from Group") { appState.sidebarGroups.assign(ids, to: nil) }
+        }
+        Divider()
+    }
+
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
         sectionHeader(title) { EmptyView() }
@@ -1383,7 +1495,7 @@ struct ChatSidebar: View {
                                         @ViewBuilder trailing: () -> T) -> some View {
         HStack(spacing: 4) {
         Text(L10n.text(title))
-                .font(.caption.weight(.semibold))
+                .font(.app(.caption).weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             trailing()
@@ -1395,14 +1507,15 @@ struct ChatSidebar: View {
         .padding(.bottom, 2)
     }
 
-    /// The + beside Sessions: a new chat first, then the coding CLIs (the
-    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
-    /// Store build can't detect or launch other apps' CLIs).
-    private var newSessionMenu: some View {
+    /// The + beside Sessions and each group: a new chat first, then the coding
+    /// CLIs (the tray's own list, shared, so the two cannot drift; DMG-only —
+    /// the App Store build can't detect or launch other apps' CLIs). A group's
+    /// + files the new row under it.
+    private func newSessionMenu(group: UUID? = nil) -> some View {
         Menu {
             Button {
                 appState.showConversation()
-                _ = appState.newChatSession()
+                appState.sidebarGroups.assign([appState.newChatSession()], to: group)
             } label: {
                 Label("New Chat", systemImage: "square.and.pencil")
             }
@@ -1414,12 +1527,12 @@ struct ChatSidebar: View {
                     servedModelId: appState.server.chatModelId ?? "mlx-serve",
                     serverContextLength: appState.server.chatModelInfo?.contextLength,
                     models: appState.server.allModels,
-                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
-                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
+                    openSandboxAgent: { appState.startTerminal(agentId: $0, group: group) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0, group: group) })
             }
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.app(.headline, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 22, height: 22)
                 .contentShape(Rectangle())
@@ -1459,25 +1572,25 @@ struct ChatSidebar: View {
                 HStack(spacing: 4) {
                     if session.isExternalBridge {
                         Image(systemName: "paperplane.fill")
-                            .font(.system(size: 9))
+                            .font(.app(.caption2))
                             .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
                             .help("Telegram conversation (view only)")
                     }
                     if let agent {
                         Image(systemName: agent.symbol)
-                            .font(.system(size: 10))
+                            .font(.app(.caption2))
                             .foregroundStyle(Color.accentColor)
                     } else if !session.isExternalBridge {
                         // Every row in this column carries a glyph saying what
                         // it is — a terminal, an agent, a plain conversation.
                         Image(systemName: "bubble.left")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.app(.subheadline, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
                     let displayTitle = ChatSessionTitle.display(title: session.title,
                                                                 agentName: agent?.name)
                     Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     if let dot = activity.dot(for: session.id, isSelected: isSelected) {
@@ -1493,7 +1606,7 @@ struct ChatSidebar: View {
                 if let subject = ChatSessionTitle.subject(title: session.title,
                                                           agentName: agent?.name) {
                     Text(L10n.text(subject))
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .foregroundStyle(.secondary)
@@ -1548,7 +1661,7 @@ struct ChatSidebar: View {
                     requestDeleteChats([session.id], keyboard: false)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.app(.body))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
                 }
@@ -1561,12 +1674,15 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
-            Button("Rename…") { beginRename(session.id, current: session.title) }
             // Right-clicking INSIDE a multi-selection acts on all of it, and
-            // says how many; right-clicking outside one is a single delete.
-            if appState.sidebarSelection.count > 1,
-               appState.sidebarSelection.contains(session.id) {
-                Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
+            // says how many; right-clicking outside one acts on the row.
+            let inSelection = appState.sidebarSelection.count > 1
+                && appState.sidebarSelection.contains(session.id)
+            Button("Rename…") { beginRename(session.id, current: session.title) }
+            groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
+                      current: appState.sidebarGroups.group(of: session.id))
+            if inSelection {
+                Button(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)), role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
                 }
             } else {
@@ -1588,15 +1704,15 @@ struct ChatSidebar: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: t.isInOwnWindow ? "macwindow" : "terminal")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.app(.subheadline, weight: .medium))
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(t.displayName))
-                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     Text((t.workspace as NSString).lastPathComponent)
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .foregroundStyle(.secondary)
@@ -1624,7 +1740,7 @@ struct ChatSidebar: View {
                     requestCloseTerminal(t.id)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.app(.body))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(.secondary)
                 }
@@ -1638,6 +1754,7 @@ struct ChatSidebar: View {
         }
         .contextMenu {
             Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
             if t.isInOwnWindow {
                 Button("Show Window") { showTerminal(t.id) }
             } else {
@@ -1669,7 +1786,7 @@ struct ChatSidebar: View {
                 .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
         } message: {
-            Text("The session running inside the sandbox will be terminated. Files it wrote are kept.")
+            Text(L10n.text("The session running inside the sandbox will be terminated. Files it wrote are kept."))
         }
     }
 
@@ -1707,7 +1824,7 @@ struct ChatSidebar: View {
                                               numbering: numberedRows) else { return nil }
         return AnyView(
             Text("\(slot)")
-                .font(.caption2.weight(.semibold).monospacedDigit())
+                .font(.app(.caption2).weight(.semibold).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
@@ -1770,6 +1887,7 @@ struct ChatSidebar: View {
         switch phase {
         case .preparing: return .orange
         case .live: return .green
+        case .suspended: return .secondary
         case .exited: return .secondary
         case .failed: return .red
         }
@@ -1800,13 +1918,13 @@ struct ChatSidebar: View {
                                   badge: Int = 0) -> some View {
         HStack(spacing: 7) {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .medium))
+                .font(.app(.callout, weight: .medium))
                 .frame(width: 16)
-            Text(L10n.text(title)).font(.subheadline.weight(.medium))
+            Text(L10n.text(title)).font(.app(.subheadline).weight(.medium))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
-                    .font(.caption2.monospacedDigit())
+                    .font(.app(.caption2).monospacedDigit())
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(.quaternary, in: Capsule())
@@ -2056,10 +2174,10 @@ struct ChatDetailView: View {
                     if control == .starting {
                         ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 10, height: 10)
                     } else {
-                        Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
+                        Image(systemName: "play.fill").font(.app(.caption2, weight: .bold))
                     }
                     Text(L10n.text(control.title))
-                        .font(.caption.weight(.semibold))
+                        .font(.app(.caption).weight(.semibold))
                 }
                 .foregroundStyle(control.isRed ? Color.white : Color.secondary)
                 .padding(.horizontal, 8)
@@ -2099,7 +2217,7 @@ struct ChatDetailView: View {
             }
         } label: {
             Image(systemName: "paperclip")
-                .font(.system(size: 13, weight: .medium))
+                .font(.app(.body, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
                 .background(Color.secondary.opacity(0.15))
@@ -2128,7 +2246,7 @@ struct ChatDetailView: View {
     private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
                           lockedBy: String? = nil) -> some View {
         Image(systemName: icon)
-            .font(.system(size: 13, weight: .medium))
+            .font(.app(.body, weight: .medium))
             .foregroundStyle(isOn ? onColor : Color.secondary)
             .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
             .background(isOn ? onColor.opacity(0.20) : Color.secondary.opacity(0.15))
@@ -2158,9 +2276,9 @@ struct ChatDetailView: View {
         if agentName == AppleFoundationChat.displayName {
             // Not an agent, and nothing to edit: the on-device model simply
             // does not have these.
-            Text("Not available on \(AppleFoundationChat.displayName)")
+            Text(L10n.format("Not available on %@", AppleFoundationChat.displayName))
         } else {
-            Text("Set by \(agentName)")
+            Text(L10n.format("Set by %@", agentName))
             Button("Edit Agent…") {
                 // ON that agent — the window otherwise opens on whoever sorts
                 // first, which is the wrong one every time you got here from a
@@ -2332,6 +2450,7 @@ struct ChatDetailView: View {
                             Text("\(tool.displayName) — not in \(activeAgent?.name ?? "agent")'s capabilities")
                         }
                     }
+                    .font(.app(.callout))
                     .disabled(!allowed || isExternalBridgeSession)
                 }
             }
@@ -2444,12 +2563,12 @@ struct ChatDetailView: View {
             // inversion the sidebar rows had). Under it, what the agent is
             // FOR, which is what tells you what to ask it.
             Text(ChatGreeting.heading(agentName: activeAgent?.name))
-                .font(.system(size: 30, weight: .semibold))
+                .font(.app(.largeTitle, weight: .semibold))
                 .foregroundStyle(.primary)
             if let subtitle = ChatGreeting.subtitle(agentBrief: activeAgent?.brief,
                                                     serverRunning: canAnswer) {
                 Text(L10n.text(subtitle))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
@@ -2678,7 +2797,7 @@ struct ChatDetailView: View {
                     Image(systemName: "paperplane.fill")
                         .foregroundStyle(.secondary)
                     Text("Telegram conversation — view only. Reply from your phone.")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
@@ -3091,7 +3210,7 @@ struct ChatDetailView: View {
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
                     Text(L10n.text(composerPlaceholder))
-                        .font(.body)
+                        .font(.app(.body))
                         .foregroundStyle(.secondary)
                         .padding(.leading, ComposerTextMetrics.placeholderLeading)
                         .padding(.top, ComposerTextMetrics.placeholderTop)
@@ -3346,8 +3465,8 @@ struct ChatDetailView: View {
 
     private func showAudioError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read audio"
-        alert.informativeText = "\(name) couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac."
+        alert.messageText = L10n.text("Couldn't read audio")
+        alert.informativeText = L10n.format("%@ couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac.", name)
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3371,8 +3490,8 @@ struct ChatDetailView: View {
 
     private func showVideoError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read video"
-        alert.informativeText = "\(name) couldn't be decoded."
+        alert.messageText = L10n.text("Couldn't read video")
+        alert.informativeText = L10n.format("%@ couldn't be decoded.", name)
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3428,8 +3547,8 @@ struct ChatDetailView: View {
 
     private func showMicPermissionError() {
         let alert = NSAlert()
-        alert.messageText = "Microphone access needed"
-        alert.informativeText = "Enable microphone access for MLX-Serve in System Settings → Privacy & Security → Microphone, then try again."
+        alert.messageText = L10n.text("Microphone access needed")
+        alert.informativeText = L10n.text("Enable microphone access for MLX-Serve in System Settings → Privacy & Security → Microphone, then try again.")
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3447,8 +3566,8 @@ struct ChatDetailView: View {
 
     private func showPDFError(_ name: String) {
         let alert = NSAlert()
-        alert.messageText = "Couldn't read PDF"
-        alert.informativeText = "\(name) is empty, encrypted, or contains only scanned images (no extractable text)."
+        alert.messageText = L10n.text("Couldn't read PDF")
+        alert.informativeText = L10n.format("%@ is empty, encrypted, or contains only scanned images (no extractable text).", name)
         alert.alertStyle = .warning
         alert.runModal()
     }
@@ -3554,7 +3673,7 @@ struct ChatDetailView: View {
                     Text("Show earlier messages")
                 }
             }
-            .font(.caption.weight(.medium))
+            .font(.app(.caption).weight(.medium))
             .foregroundStyle(.secondary)
             .frame(height: 22)
             .padding(.horizontal, 12)
@@ -3605,7 +3724,7 @@ struct ChatDetailView: View {
     private var jumpToLatestButton: some View {
         Button { applyScroll(.jumpTapped) } label: {
             Image(systemName: "arrow.down")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.app(.callout, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: 28, height: 28)
                 .background(.regularMaterial, in: Circle())
@@ -4042,11 +4161,11 @@ struct GeneratingIndicator: View {
                 .frame(width: 20, height: 20)
 
             // Stats + whimsy
-            Text("GPU \(gpuPercent)%")
+            Text(L10n.format("GPU %lld%%", gpuPercent))
                 .foregroundStyle(gpuColor)
             Text("·")
                 .foregroundStyle(.tertiary)
-            Text("Mem \(memPercent)%")
+            Text(L10n.format("Mem %lld%%", memPercent))
                 .foregroundStyle(memColor)
             Text("·")
                 .foregroundStyle(.tertiary)
@@ -4061,7 +4180,7 @@ struct GeneratingIndicator: View {
                     .monospacedDigit()
             }
         }
-        .font(.system(size: 10, weight: .medium, design: .monospaced))
+        .font(.app(.caption2, weight: .medium, design: .monospaced))
         .onAppear {
             startDate = Date()
             pollMetrics()
@@ -4101,7 +4220,9 @@ struct GeneratingIndicator: View {
         }
     }
 
-    private static let whimsies = [
+    /// The "Thinking…" line's word, looked up at the render site. Internal so
+    /// the coverage test can hold every one of them to a catalog entry.
+    static let whimsies = [
         "marinating", "boondoggling", "razzle-dazzling", "percolating",
         "simmering", "noodling", "cogitating", "ruminating",
         "brainstorming", "daydreaming", "scheming", "concocting",
@@ -4360,7 +4481,7 @@ struct MessageBubble: View {
                         Image(systemName: "chevron.right")
                             .rotationEffect(.degrees(thinkingExpanded ? 90 : 0))
                     }
-                    .font(.caption2.weight(.medium))
+                    .font(.app(.caption2).weight(.medium))
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
                 }
@@ -4383,7 +4504,7 @@ struct MessageBubble: View {
                             Text(verbatim: reasoning).textSelection(.enabled)
                         }
                     }
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -4422,7 +4543,7 @@ struct MessageBubble: View {
                             // leave a hole where a picture was.
                             if img.data.isEmpty {
                                 Label("attachment no longer on disk", systemImage: "questionmark.folder")
-                                    .font(.caption)
+                                    .font(.app(.caption))
                                     .foregroundStyle(.secondary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 8)
@@ -4462,7 +4583,7 @@ struct MessageBubble: View {
                     ForEach(clips) { clip in
                         if clip.pcm.isEmpty {
                             Label("\(clip.name) · file no longer on disk", systemImage: "questionmark.folder")
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .foregroundStyle(.secondary)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 8)
@@ -4470,7 +4591,7 @@ struct MessageBubble: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                         } else {
                             Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
-                                .font(.caption.weight(.medium))
+                                .font(.app(.caption).weight(.medium))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(Color.purple.opacity(0.18))
@@ -4492,7 +4613,7 @@ struct MessageBubble: View {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
-                                .font(.caption2.weight(.medium))
+                                .font(.app(.caption2).weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
                         if message.role == .assistant {
@@ -4528,7 +4649,7 @@ struct MessageBubble: View {
                                     } else {
                                         Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
                                             .buttonStyle(.plain)
-                                            .font(.caption.weight(.medium))
+                                            .font(.app(.caption).weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
                                     }
                                 }
@@ -4576,7 +4697,7 @@ struct MessageBubble: View {
                 // back to the model as history.
                 if let notice = message.truncationNotice, !message.isStreaming {
                     Text(L10n.text(notice.text))
-                        .font(.callout)
+                        .font(.app(.callout))
                         .italic()
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
@@ -4673,7 +4794,7 @@ struct MessageBubble: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
-            .font(.caption)
+            .font(.app(.caption))
         }
         .padding(4)
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -4815,7 +4936,7 @@ struct MessageBubble: View {
                                                 MessageRevisions.label(index: message.activeRevision,
                                                 count: message.revisions.count)
 )
-                        .font(.caption2.monospacedDigit())
+                        .font(.app(.caption2).monospacedDigit())
                         .foregroundStyle(.tertiary)
                     footerButton("chevron.right", help: "Next version of this reply") {
                         onSelectRevision?(MessageRevisions.step(index: message.activeRevision,
@@ -4862,10 +4983,14 @@ struct MessageBubble: View {
             }
 
             if let tps = message.tokensPerSecond, tps > 0 {
-                StatPill(text: "\(Int(tps)) tok/sec",
+                // The format moves to the producer: `StatPill` renders its
+                // strings verbatim, so a lookup of an already-built `"42 tok/sec"`
+                // could never match a `%lld` key. Same shape as `ComposerTip`.
+                let speed = L10n.format("%lld tok/sec", Int(tps))
+                StatPill(text: speed,
                          expanded: message.completionTokens.map {
-                             "\(Int(tps)) tok/sec (\($0) tokens)"
-                         } ?? "\(Int(tps)) tok/sec")
+                             L10n.format("%lld tok/sec (%lld tokens)", Int(tps), $0)
+                         } ?? speed)
             }
 
             Spacer(minLength: 0)
@@ -4925,7 +5050,7 @@ private struct FooterIconButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .scaleEffect(y: flipped ? -1 : 1)
                 .foregroundStyle(.secondary)
                 .frame(width: 20, height: 18)
@@ -4979,8 +5104,11 @@ private struct StatPill: View {
     }
 
     private func label(_ string: String) -> some View {
-        Text(L10n.text(string))
-            .font(.caption2.monospacedDigit())
+        // Verbatim: both callers hand in finished text — timestamps already
+        // formatted by Foundation, and the tok/sec sentence localized by the
+        // producer — so a catalog lookup here would re-key the result.
+        Text(string)
+            .font(.app(.caption2).monospacedDigit())
             .foregroundStyle(.secondary)
             .lineLimit(1)
             .padding(.horizontal, 6)
@@ -5227,7 +5355,7 @@ private struct ToolCallRow: View {
         HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver")
                 .symbolEffect(.pulse, isActive: isRunning)
-                .font(.caption2.weight(.medium))
+                .font(.app(.caption2).weight(.medium))
                 .foregroundStyle(Color.accentColor.opacity(0.7))
             if calls.count > 1 {
                 multiToolTitle
@@ -5245,7 +5373,7 @@ private struct ToolCallRow: View {
             }
             Image(systemName: "chevron.right")
                 .rotationEffect(.degrees(expanded ? 90 : 0))
-                .font(.caption2.weight(.medium))
+                .font(.app(.caption2).weight(.medium))
                 .foregroundStyle(Color.accentColor.opacity(0.7))
         }
         .contentShape(Rectangle())
@@ -5261,11 +5389,11 @@ private struct ToolCallRow: View {
     /// everywhere. `variant` is the behaviour-choosing argument (`browse:click`).
     @ViewBuilder private func toolLabel(name: String, variant: String?) -> some View {
         Text(L10n.text(ToolCallDisplay.displayName(name)))
-            .font(.caption.monospaced())
+            .font(.app(.caption).monospaced())
             .foregroundStyle(Color.accentColor.opacity(0.7))
         if let variant {
             Text(":" + variant)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .padding(.leading, -4)
         }
@@ -5278,7 +5406,7 @@ private struct ToolCallRow: View {
                   } ?? nil)
         if let headline {
             Text("· " + headline)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 // Keep a path's filename.
@@ -5286,7 +5414,7 @@ private struct ToolCallRow: View {
         }
         if let resultHeadline {
             Text("· " + resultHeadline)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .layoutPriority(1)
@@ -5305,8 +5433,8 @@ private struct ToolCallRow: View {
         }
         if hidden > 0 {
             middot
-            Text("+\(hidden) other tool\(hidden == 1 ? "" : "s")")
-                .font(.caption)
+            Text(L10n.format(hidden == 1 ? "+%lld other tool" : "+%lld other tools", Int64(hidden)))
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
@@ -5314,7 +5442,7 @@ private struct ToolCallRow: View {
 
     private var middot: some View {
         Text("·")
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.secondary)
     }
 
@@ -5359,12 +5487,12 @@ private struct ToolCallRow: View {
                 }
                 GridRow {
                     Text("result")
-                        .font(.caption.monospaced())
+                        .font(.app(.caption).monospaced())
                         .foregroundStyle(.secondary)
                         .gridColumnAlignment(.leading)
                         .fixedSize(horizontal: true, vertical: false)
                     Text(verbatim: result)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5376,12 +5504,12 @@ private struct ToolCallRow: View {
     @ViewBuilder private func gridRow(name: String, value: String) -> some View {
         GridRow {
             Text(name)
-                .font(.caption.monospaced())
+                .font(.app(.caption).monospaced())
                 .foregroundStyle(.secondary)
                 .gridColumnAlignment(.leading)
                 .fixedSize(horizontal: true, vertical: false)
             Text(value)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -5414,7 +5542,7 @@ private struct RunningIndicator: View {
                 .accessibilityHidden(true)
 
             Text("running")
-                .font(.caption.weight(.bold))
+                .font(.app(.caption).weight(.bold))
                 .foregroundStyle(ink)
         }
         .padding(.horizontal, 8)
@@ -5439,8 +5567,8 @@ private struct StopProcessButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Stop background process \(handle)")
-        .accessibilityLabel("Stop background process \(handle)")
+        .help(L10n.format("Stop background process %@", handle))
+        .accessibilityLabel(L10n.format("Stop background process %@", handle))
     }
 }
 
@@ -6013,7 +6141,7 @@ struct MarkdownText: View {
                 p.firstLineHeadIndent = 8
                 p.headIndent = 8
                 let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                    .font: AppType.monospaced(.subheadline),
                     .foregroundColor: NSColor.systemPurple,
                     .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.10),
                     .paragraphStyle: p,

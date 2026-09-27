@@ -239,3 +239,24 @@ final class BenchmarkRunner: ObservableObject {
         )
     }
 }
+
+extension BenchmarkRunner.Phase {
+    /// The status line. Sentences that interpolate format HERE: the view renders
+    /// the resolved text verbatim, so a key assembled at the call site can never
+    /// match. `failed` carries the server's own words and stays as they came.
+    nonisolated var localizedText: String {
+        switch self {
+        case .idle: return L10n.text("Ready")
+        case .calibrating: return L10n.text("Calibrating the token fit")
+        case .warmup(let rung): return L10n.format("Warming up — %@", rung)
+        case .running(let rung, let run, let total):
+            return L10n.format("%@ context — run %lld of %lld", rung, Int64(run), Int64(total))
+        case .drift(let run, let total):
+            return L10n.format("Drift check — run %lld of %lld", Int64(run), Int64(total))
+        case .stopping: return L10n.text("Stopping after the current request…")
+        case .cancelled: return L10n.text("Stopped")
+        case .done: return L10n.text("Done")
+        case .failed(let message): return message
+        }
+    }
+}

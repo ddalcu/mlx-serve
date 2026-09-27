@@ -38,7 +38,7 @@ struct LoraAdapterRow: View {
                 Image(systemName: "paintpalette")
                     .foregroundStyle(.secondary)
                 Text(URL(fileURLWithPath: lora.path).lastPathComponent)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(lora.path)
@@ -51,12 +51,12 @@ struct LoraAdapterRow: View {
                 .help("Remove this LoRA")
             }
             HStack(spacing: 8) {
-                Text("Scale").font(.caption)
+                Text("Scale").font(.app(.caption))
                 Slider(value: $lora.scale, in: 0...2, step: 0.05)
                 // Fixed width: a readout that sizes to its digits drags the
                 // slider's right edge every time the value crosses a width.
                 Text(String(format: "%.2f", lora.scale))
-                    .font(.caption.monospacedDigit())
+                    .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(width: 34, alignment: .trailing)
             }

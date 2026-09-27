@@ -117,9 +117,9 @@ enum MlxVariantMenuModel {
     /// transfer of a *different* one — the row reports what you have, not the
     /// state of the last thing you clicked.
     static func buttonLabel(onDisk: [MlxVariant], failed: Bool, hasPartial: Bool) -> String {
-        if onDisk.count == 1 { return "✓ \(onDisk[0].label)" }
-        if onDisk.count > 1 { return "✓ \(onDisk.count) on disk" }
-        if failed { return "Retry" }
-        return hasPartial ? "Resume" : "Download"
+        if onDisk.count == 1 { return L10n.format("✓ %@", onDisk[0].label) }
+        if onDisk.count > 1 { return L10n.format("✓ %lld on disk", Int64(onDisk.count)) }
+        if failed { return L10n.text("Retry") }
+        return L10n.text(hasPartial ? "Resume" : "Download")
     }
 }

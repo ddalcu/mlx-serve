@@ -75,7 +75,7 @@ struct AudioHistoryShelf: View {
         Group {
             if !paths.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(L10n.text(title)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text(L10n.text(title)).font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
                     ScrollView {
                         VStack(spacing: 2) {
                             ForEach(paths, id: \.self) { path in
@@ -101,7 +101,7 @@ struct AudioHistoryShelf: View {
                               options: .repeat(.continuous), isActive: playing)
                 .frame(width: 16)
             Text(URL(fileURLWithPath: path).lastPathComponent)
-                .font(.caption)
+                .font(.app(.caption))
                 .lineLimit(1).truncationMode(.middle)
                 .help(path)
             Spacer()
@@ -278,18 +278,18 @@ struct VoiceGenView: View {
     private var textSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Text to be generated").font(.subheadline.weight(.semibold))
+                Text("Text to be generated").font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 dictationButton
             }
             TextEditor(text: $text)
-                .font(.body)
+                .font(.app(.body))
                 .frame(height: 120)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
             if let err = dictationError {
-                Text(err).font(.caption2).foregroundStyle(.orange)
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
             }
         }
     }
@@ -307,7 +307,7 @@ struct VoiceGenView: View {
                 Text(dictating ? "Listening…" : "Speak it")
                 if dictating { Image(systemName: "stop.fill") }
             }
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(dictating ? AnyShapeStyle(Color.white) : AnyShapeStyle(.primary))
             .padding(.horizontal, 9)
             .padding(.vertical, 4)
@@ -386,7 +386,7 @@ struct VoiceGenView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-                .font(.caption)
+                .font(.app(.caption))
                 .controlSize(.small)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         )
@@ -414,7 +414,7 @@ struct VoiceGenView: View {
 
     private var referenceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Reference voice").font(.subheadline.weight(.semibold))
+            Text("Reference voice").font(.app(.subheadline).weight(.semibold))
 
             if let url = refAudioURL {
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
@@ -422,7 +422,7 @@ struct VoiceGenView: View {
                         HStack(spacing: 8) {
                             Image(systemName: "waveform.circle.fill").foregroundStyle(.blue)
                             Text(url.lastPathComponent)
-                                .font(.caption).lineLimit(1).truncationMode(.middle)
+                                .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                             Spacer()
                             if clipPlayer.playingPath == url.path {
                                 Button { clipPlayer.stop() } label: { Image(systemName: "stop.circle.fill") }
@@ -435,26 +435,26 @@ struct VoiceGenView: View {
                                 .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                         }
                         // In the well with the clip it describes, not under it.
-                        Text("Transcript of reference (optional)").font(.caption)
+                        Text("Transcript of reference (optional)").font(.app(.caption))
                             .padding(.top, 6)
                         TextField("", text: $refText,
                                   prompt: Text("Optional — the reference audio alone clones the voice"))
                             .textFieldStyle(.roundedBorder)
-                            .font(.caption)
+                            .font(.app(.caption))
                     }
                 }
             } else if recorder.isRecording {
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
                     HStack(spacing: 10) {
                         Image(systemName: "microphone.fill")
-                            .font(.caption)
+                            .font(.app(.caption))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 4)
                             .background(Capsule().fill(Color.orange))
                         ProgressView(value: Double(recorder.level)).frame(width: 120)
                         Text(String(format: "%.1fs", recorder.duration))
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                         Spacer()
                         Button { stopRecording() } label: {
                             Label("Stop", systemImage: "stop.fill")
@@ -483,11 +483,11 @@ struct VoiceGenView: View {
                 // The well already says how to add a clip and how long it wants
                 // one; what is left to say is what happens without it.
                 Text("Without a reference, the model's default voice is used.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
             }
 
             if let err = refError {
-                Text(err).font(.caption2).foregroundStyle(.orange)
+                Text(err).font(.app(.caption2)).foregroundStyle(.orange)
             }
         }
         // One clip slot, so a drop replaces what's there. Routed through
@@ -503,13 +503,13 @@ struct VoiceGenView: View {
             FoldingSectionHeader(title: "Advanced options", isExpanded: $showAdvanced)
             if showAdvanced {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Speed (\(String(format: "%.2fx", speed)))").font(.caption)
+                    Text("Speed (\(String(format: "%.2fx", speed)))").font(.app(.caption))
                     Slider(value: $speed, in: 0.5...2.0, step: 0.05)
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Temperature (\(String(format: "%.2f", temperature)))").font(.caption)
+                    Text("Temperature (\(String(format: "%.2f", temperature)))").font(.app(.caption))
                     Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
-                    Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
+                    Text("Higher = more expressive and varied.").font(.app(.caption2)).foregroundStyle(.secondary)
                 }
             }
         }
@@ -551,7 +551,7 @@ struct VoiceGenView: View {
                             ProgressView(value: Double(step), total: max(1, Double(total)))
                                 .progressViewStyle(.linear).frame(width: 240)
                         }
-                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                        Text(message).font(.app(.footnote)).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
                     completedPreview(path: path)
@@ -588,7 +588,7 @@ struct VoiceGenView: View {
             // under the clip they describe.
             HStack(spacing: 8) {
                 Text(URL(fileURLWithPath: path).lastPathComponent)
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.app(.caption)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
                 Button {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
@@ -603,7 +603,7 @@ struct VoiceGenView: View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.audiosRoot)])
         } label: {
-            Label("Open output folder in Finder", systemImage: "folder").font(.caption)
+            Label("Open output folder in Finder", systemImage: "folder").font(.app(.caption))
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)

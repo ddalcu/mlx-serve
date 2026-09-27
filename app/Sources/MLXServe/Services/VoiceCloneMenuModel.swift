@@ -90,7 +90,7 @@ enum VoiceCloneMenuModel {
     /// clip is NOT a reason — that's what "Choose audio file…" is for.
     static func cloneUnavailableReason(ttsModelDownloaded: Bool) -> String? {
         ttsModelDownloaded ? nil
-            : "Requires the Qwen3-TTS voice model — download it from the Audio tile in the menu bar."
+            : L10n.text("Requires the Qwen3-TTS voice model — download it from the Audio tile in the menu bar.")
     }
 
     // MARK: - Disk seams (not unit-tested)

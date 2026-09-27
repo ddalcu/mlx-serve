@@ -49,20 +49,22 @@ enum VoicePreflight {
         }
     }
 
-    /// Full, actionable explanation for the notice card.
+    /// Full, actionable explanation for the notice card. The locale one is a
+    /// sentence the app assembles, so it formats here — the panel renders the
+    /// resolved text rather than looking the finished sentence up.
     static func detail(for issue: Issue) -> String {
         switch issue {
         case .microphoneDenied:
-            return "Voice mode can't hear you — Microphone access is off for MLX-Serve. " +
-                "Turn it on in System Settings → Privacy & Security → Microphone, then enable Voice again."
+            return L10n.text("Voice mode can't hear you — Microphone access is off for MLX-Serve. " +
+                "Turn it on in System Settings → Privacy & Security → Microphone, then enable Voice again.")
         case .speechDenied:
-            return "Voice mode needs Speech Recognition access (a separate permission from Microphone). " +
-                "Turn it on in System Settings → Privacy & Security → Speech Recognition, then enable Voice again."
+            return L10n.text("Voice mode needs Speech Recognition access (a separate permission from Microphone). " +
+                "Turn it on in System Settings → Privacy & Security → Speech Recognition, then enable Voice again.")
         case .dictationUnavailable(let locale):
-            return "Voice mode transcribes on-device — your audio never leaves this Mac — but on-device " +
-                "dictation isn't available for \(locale): it's either turned off or the language isn't " +
+            return L10n.format("Voice mode transcribes on-device — your audio never leaves this Mac — but on-device " +
+                "dictation isn't available for %@: it's either turned off or the language isn't " +
                 "installed. Turn on System Settings → Keyboard → Dictation (and add your language), then " +
-                "enable Voice again."
+                "enable Voice again.", locale)
         }
     }
 

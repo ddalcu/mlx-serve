@@ -109,6 +109,9 @@ pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
 pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
 pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
 pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+/// Wraps `data` in place when the backend can (Metal no-copy `newBuffer(ptr, len)`), else
+/// COPIES it and calls `dtor(payload)` at once. `dtor` also runs when the last reference drops.
+pub extern "c" fn mlx_array_new_data_managed_payload(data: *anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: *const fn (?*anyopaque) callconv(.c) void) mlx_array;
 pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
 
@@ -691,14 +694,23 @@ pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?
 pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
 
 pub fn maxRecommendedWorkingSet() usize {
+    return defaultDeviceInfoSize("max_recommended_working_set_size");
+}
+
+/// `MTLDevice.maxBufferLength`; 0 when the query fails.
+pub fn maxBufferLength() usize {
+    return defaultDeviceInfoSize("max_buffer_length");
+}
+
+fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
     if (mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0) return 0;
-    return max_rec;
+    var v: usize = 0;
+    if (mlx_device_info_get_size(&v, info, key) != 0) return 0;
+    return v;
 }
 
 /// Apply the wired-residency policy. Call on the inference thread AFTER a
@@ -853,6 +865,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     mlx_error_len = 0;
     mlx_error_latched.store(false, .release);
     return buf[0..n];
+}
+
+/// Consume the latch only when its message contains `needle`; any other error stays latched.
+pub fn takeErrorIf(needle: []const u8) bool {
+    if (!mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (std.mem.indexOf(u8, mlx_error_buf[0..mlx_error_len], needle) == null) return false;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return true;
 }
 
 /// Drop a latch a best-effort op raised and its caller already reported, so an

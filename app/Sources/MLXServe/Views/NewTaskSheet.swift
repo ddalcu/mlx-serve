@@ -93,9 +93,9 @@ struct NewTaskSheet: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(L10n.text(isEditing ? "Edit Task" : "New Task"))
-                .font(.title3.weight(.semibold))
+                .font(.app(.title3).weight(.semibold))
             Text("A goal the agent runs on its own, on a schedule.")
-                .font(.subheadline)
+                .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -110,7 +110,7 @@ struct NewTaskSheet: View {
         field("Goal") {
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $goal)
-                    .font(.body)
+                    .font(.app(.body))
                     .scrollContentBackground(.hidden)
                     .padding(8)
                     .frame(minHeight: 88)
@@ -119,7 +119,7 @@ struct NewTaskSheet: View {
                 // there is something to read instead.
                 if goal.isEmpty {
                     Text("Check Hacker News and write me the top AI stories")
-                        .font(.body)
+                        .font(.app(.body))
                         .foregroundStyle(.tertiary)
                         // The editor's own 8pt padding, plus the 5pt
                         // line-fragment padding NSTextView puts inside its text
@@ -167,7 +167,7 @@ struct NewTaskSheet: View {
                             .foregroundStyle(.orange)
                     }
                 }
-                .font(.caption)
+                .font(.app(.caption))
                 .frame(minHeight: 15, alignment: .leading)
             }
         }
@@ -180,7 +180,7 @@ struct NewTaskSheet: View {
             .caseInsensitiveCompare(value) == .orderedSame
         return Button { scheduleText = value } label: {
             Text(L10n.text(title))
-                .font(.caption.weight(.medium))
+                .font(.app(.caption).weight(.medium))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
                 .background(
@@ -204,7 +204,7 @@ struct NewTaskSheet: View {
                 .pickerStyle(.segmented)
                 Label(L10n.text(autonomy.blurb),
                       systemImage: autonomy == .yolo ? "exclamationmark.octagon.fill" : "info.circle")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(autonomy == .yolo ? Color.red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -222,13 +222,13 @@ struct NewTaskSheet: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
+                        .font(.app(.caption).weight(.semibold))
                         .rotationEffect(.degrees(showOptions ? 90 : 0))
                         .foregroundStyle(.secondary)
-                    Text("Options").font(.subheadline.weight(.semibold))
+                    Text("Options").font(.app(.subheadline).weight(.semibold))
                     if !showOptions, let summary = optionsSummary {
                         Text(L10n.text(summary))
-                            .font(.caption)
+                            .font(.app(.caption))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -266,7 +266,7 @@ struct NewTaskSheet: View {
                     field("MCP tools",
                           hint: "Your enabled MCP servers (configure them in Chat ▸ MCP). Outside Read-only/Workspace, MCP calls pause for approval.") {
                         Toggle(isOn: $useMCP) {
-                            Text("Available to this task").font(.subheadline)
+                            Text("Available to this task").font(.app(.subheadline))
                         }
                         .toggleStyle(.switch)
                     }
@@ -307,11 +307,11 @@ struct NewTaskSheet: View {
     private func field<Content: View>(_ title: String, hint: String? = nil,
                                       @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text(title)).font(.subheadline.weight(.semibold))
+            Text(L10n.text(title)).font(.app(.subheadline).weight(.semibold))
             content()
             if let hint {
                 Text(L10n.text(hint))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }

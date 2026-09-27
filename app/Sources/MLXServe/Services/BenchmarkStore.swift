@@ -246,11 +246,11 @@ enum BenchmarkCommunityError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notConfigured:
-            return "The community database hasn't been created yet. See docs/benchmarks-setup.md for the one-time Firebase setup."
+            return L10n.text("The community database hasn't been created yet. See docs/benchmarks-setup.md for the one-time Firebase setup.")
         case .denied:
-            return "The community database rejected the request. Its security rules may not be deployed yet — see docs/benchmarks-setup.md."
+            return L10n.text("The community database rejected the request. Its security rules may not be deployed yet — see docs/benchmarks-setup.md.")
         case .http(let code):
-            return "The community database returned HTTP \(code). Try again in a moment."
+            return L10n.format("The community database returned HTTP %lld. Try again in a moment.", Int64(code))
         }
     }
 

@@ -52,7 +52,7 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.noVision, false)             // main.zig no_vision
         XCTAssertEqual(d.maxConcurrent, 1)            // server.zig max_concurrent
         XCTAssertEqual(d.kvQuant, .off)               // server.zig kv-quant
-        XCTAssertEqual(d.prefixCacheMem, "2GB")       // server.zig prefix_cache_mem_bytes
+        XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
         XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
@@ -389,6 +389,37 @@ final class ServerOptionsTests: XCTestCase {
     /// differed from 1, but the SERVER default is 32 — so the flag was never
     /// sent and a 32-entry cache silently launched, filling 16 GB Macs. The
     /// flag must now ALWAYS be emitted so the server's 32 can't leak.
+    /// An explicit "2GB" is a choice, not the default: it must reach the server, which
+    /// otherwise sizes an unset budget to one session on long-context hybrid models.
+    func testPrefixCacheMemExplicitValueIsSent() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--prefix-cache-mem"))
+        opts.prefixCacheMem = "2GB"
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB),
+                               flag: "--prefix-cache-mem", value: "2GB"))
+    }
+
+    /// The n-gram table stays on disk unless the user opts in, matching the server default.
+    func testPleGpuIsOptIn() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+        opts.pleGpu = true
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+    }
+
+    /// A blob saved while "2GB" was the default migrates to Auto once; a later "2GB" stays.
+    func testLegacyPrefixCacheMemDefaultMigratesToAutoOnce() throws {
+        let defaults = UserDefaults(suiteName: "PrefixCacheMemMigration.\(UUID().uuidString)")!
+        var opts = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"prefixCacheMem":"2GB"}"#.utf8))
+        opts.migrateLegacyPrefixCacheMem(defaults)
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--prefix-cache-mem"))
+
+        opts.prefixCacheMem = "2GB"
+        opts.migrateLegacyPrefixCacheMem(defaults)
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB),
+                               flag: "--prefix-cache-mem", value: "2GB"))
+    }
+
     func testPrefixCacheEntriesAlwaysEmitted() {
         let args = ServerOptions().toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
         XCTAssertTrue(args.contains("--prefix-cache-entries"),

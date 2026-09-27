@@ -2,6 +2,9 @@ import Darwin
 import Foundation
 import IOKit
 import IOKit.ps
+#if canImport(Metal)
+import Metal
+#endif
 
 /// Host telemetry read straight from the kernel — no subprocesses.
 enum SystemMetrics {
@@ -144,6 +147,26 @@ enum SystemMetrics {
         let inactive = UInt64(stats.inactive_count)
         return (free &+ inactive) &* UInt64(vm_kernel_page_size)
     }
+
+    /// The GPU working-set cap: `iogpu.wired_limit_mb` when set (readable
+    /// without sudo, and live after a change), else Metal's default. nil when
+    /// neither answers.
+    static func gpuMemoryLimitBytes() -> Int64? {
+        var mb: Int64 = 0
+        var len = MemoryLayout<Int64>.size
+        if sysctlbyname("iogpu.wired_limit_mb", &mb, &len, nil, 0) == 0, mb > 0 {
+            return mb << 20
+        }
+        return metalWorkingSet > 0 ? Int64(metalWorkingSet) : nil
+    }
+
+    private static let metalWorkingSet: UInt64 = {
+        #if canImport(Metal)
+        return MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize ?? 0
+        #else
+        return 0
+        #endif
+    }()
 
     /// Bytes available for a NEW large allocation (a model load), using the
     /// SAME formula as the server's pre-flight (`status.zig` `computeAvailableBytes`):

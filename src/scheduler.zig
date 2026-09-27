@@ -1392,6 +1392,8 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// KV + recurrent state the decoding slots own, published once per tick (`/props`).
+    resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -1726,6 +1728,18 @@ pub const Scheduler = struct {
         if (self.load_error_name) |n| self.allocator.free(n);
 
         self.allocator.destroy(self);
+    }
+
+    /// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
+    fn liveDecodingCount(self: *Scheduler) usize {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        var n: usize = 0;
+        for (self.decoding.items) |s| {
+            if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+            n += 1;
+        }
+        return n;
     }
 
     /// Another request is queued, prefilling or decoding right now.
@@ -4297,7 +4311,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.full_attention_interval > 0;
         const disk_ok = !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+            const fp = kv_disk_cache.modelFingerprintWithLayout(
+                sch.allocator,
+                sch.io,
+                entry.path,
+                params.config.cacheLayoutNamespace(),
+            ) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
             };
@@ -4751,6 +4770,9 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
+                    slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
+                });
                 // Exact time-to-first-token: elapsed from request arrival
                 // (Slot.init, pre-queue-wait) to prefill completion. Captured
                 // here rather than derived by subtraction in finishSlot, so a
@@ -4817,8 +4839,25 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     _ = sch.decoding.orderedRemove(i);
                 } else i += 1;
             }
+            publishLiveKvResidency(sch, null);
         }
     }
+}
+
+/// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
+/// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
+fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+    var bytes: u64 = if (prefilling) |p| slotStateBytes(p) else 0;
+    for (sch.decoding.items) |s| bytes += slotStateBytes(s);
+    sch.resident_live_kv_bytes.store(bytes, .monotonic);
+}
+
+fn slotStateBytes(s: *const Slot) u64 {
+    var bytes = s.cache.residentBytes();
+    if (s.ssm_entries) |ents| for (ents) |*e| {
+        bytes += transformer_mod.ssmEntryBytes(e);
+    };
+    return bytes;
 }
 
 /// Phase A4: encode one or more images on the inference thread. Mirrors the
@@ -5946,8 +5985,21 @@ pub fn prefillInterleaveEnabled() bool {
     return on;
 }
 
+/// Target fraction of wall time the decoding streams get while another slot prefills,
+/// set once by `main` from `--prefill-decode-share` or MLX_SERVE_PREFILL_DECODE_SHARE
+/// (`resolveDecodeShare`). 0 = one boundary's `interleaveTicksFor` ticks and the company
+/// width, as before. Reads 0 under the MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch: no
+/// hook, nothing to share.
+pub var prefill_decode_share: f32 = 0;
+pub fn prefillDecodeShare() f32 {
+    if (!prefillInterleaveEnabled()) return 0;
+    return prefill_decode_share;
+}
+
 const InterleaveCtx = struct {
     sch: *Scheduler,
+    /// The slot being prefilled: not in `decoding` yet, its KV still counts.
+    slot: *Slot,
     decode_ns: u64 = 0,
     ticks: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
@@ -5982,6 +6034,72 @@ const COMPANY_PREFILL_CHUNK: u32 = 2048;
 pub fn companyPrefillChunk(chunk: u32, decoding: usize) u32 {
     if (decoding == 0) return chunk;
     return if (chunk == 0) COMPANY_PREFILL_CHUNK else @min(chunk, COMPANY_PREFILL_CHUNK);
+}
+
+/// Largest accepted decode share: at 0.9 the decoders own nine times each chunk's time.
+pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
+/// Prefill width while a decode share is live and someone decodes.
+pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
+
+/// `--prefill-decode-share` / MLX_SERVE_PREFILL_DECODE_SHARE text to a share in [0, 0.9].
+/// Above 0.9 clamps; anything that is not a number >= 0 is an error.
+pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
+    const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
+    if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
+    return @min(v, PREFILL_DECODE_SHARE_MAX);
+}
+
+/// The flag's text if given, else the env's, else 0.
+pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
+    const text = flag orelse env orelse return 0;
+    return parseDecodeShare(text);
+}
+
+/// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
+/// the prefill starts, after admission, so admission bills the uncapped width. A decoder
+/// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
+pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
+    if (decoding == 0 or share <= 0) return 0;
+    return DECODE_SHARE_PREFILL_CHUNK;
+}
+
+/// Decode wall time owed after a prefill chunk of `chunk_ns`: chunk * S / (1 - S).
+pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
+    if (share <= 0) return 0;
+    const s: f64 = @min(share, PREFILL_DECODE_SHARE_MAX);
+    return @intFromFloat(@as(f64, @floatFromInt(chunk_ns)) * s / (1 - s));
+}
+
+/// Is another decode tick owed at this boundary? Never fewer than `interleaveTicksFor`.
+pub fn interleaveTickOwed(share: f32, chunk_ns: u64, first_ns: u64, ticks: u32, decode_ns: u64) bool {
+    if (first_ns == 0) return false;
+    if (ticks < interleaveTicksFor(chunk_ns, first_ns)) return true;
+    return decode_ns < decodeShareBudgetNs(chunk_ns, share);
+}
+
+/// The adaptive width hook's pick, capped while a decode share is live and someone decodes.
+pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
+    const cap = decodeShareAdmissionCap(decoding, share);
+    return if (cap == 0) width else @min(width, cap);
+}
+
+pub const OwedTicks = struct { ticks: u32, spent_ns: u64 };
+
+/// The ticks after a boundary's first one: run until none is owed or the decoders run out
+/// (`tick` returns 0).
+pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopaque, tick: *const fn (*anyopaque) u64) OwedTicks {
+    var r: OwedTicks = .{ .ticks = 1, .spent_ns = first_ns };
+    while (interleaveTickOwed(share, chunk_ns, first_ns, r.ticks, r.spent_ns)) {
+        const ns = tick(ctx);
+        if (ns == 0) break;
+        r.ticks += 1;
+        r.spent_ns +|= ns;
+    }
+    return r;
+}
+
+fn interleaveDecodeTickOpaque(ctx: *anyopaque) u64 {
+    return interleaveDecodeTick(@ptrCast(@alignCast(ctx)));
 }
 
 const INTERLEAVE_MAX_TICKS: u32 = 8;
@@ -6085,6 +6203,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
 const ChunkWidthCtx = struct {
+    sch: *Scheduler,
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
     /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
@@ -6115,7 +6234,10 @@ fn chunkWidthCb(
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
-    return pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
+    // Only a live adaptive width may move; elsewhere the admitted width stands.
+    if (!adaptiveChunkWidthFor(cfg)) return next;
+    return decodeShareWidthCap(next, wc.sch.liveDecodingCount(), prefillDecodeShare());
 }
 
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
@@ -6124,15 +6246,15 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
     const chunk_ns = ic.chunk_sw.read();
+    const share = prefillDecodeShare();
     const first_ns = interleaveDecodeTick(ic.sch);
-    ic.ticks += 1;
-    ic.decode_ns +|= first_ns;
-    var left = if (first_ns == 0) 0 else interleaveTicksFor(chunk_ns, first_ns) - 1;
-    while (left > 0) : (left -= 1) {
-        const ns = interleaveDecodeTick(ic.sch);
-        if (ns == 0) break;
-        ic.ticks += 1;
-        ic.decode_ns +|= ns;
+    const r = runOwedDecodeTicks(share, chunk_ns, first_ns, ic.sch, interleaveDecodeTickOpaque);
+    ic.ticks += r.ticks;
+    ic.decode_ns +|= r.spent_ns;
+    {
+        ic.sch.queue_mu.lockUncancelable(ic.sch.io);
+        defer ic.sch.queue_mu.unlock(ic.sch.io);
+        publishLiveKvResidency(ic.sch, ic.slot);
     }
     ic.chunk_sw.reset();
 }
@@ -6487,10 +6609,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
+        .sch = sch,
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
         .hc = if (slot.model.prefix_cache) |*p| p else null,
@@ -6559,6 +6682,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
+            .decode_share_width_cap = decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -8976,6 +9100,11 @@ test "batchKvLenOf bills raw when any gather switch is off or the slot is vision
     transformer_mod.qsa_decode_gather_override = true;
     transformer_mod.qsa_verify_gather_override = false;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1, false));
+    // The fused verify kernel still serves S=4 on blocks; with it off too, the mask bills raw kv.
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    const prev_k = transformer_mod.qsa_attn_kernel_override;
+    defer transformer_mod.qsa_attn_kernel_override = prev_k;
+    transformer_mod.qsa_attn_kernel_override = false;
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 4, false));
 }
 
@@ -9022,7 +9151,7 @@ test "grouping a 300k text slot beside a 1k vision slot is not admitted on the s
     try testing.expectEqual(@as(usize, 2), batchedKvKeepCount(&per_slot));
 }
 
-test "S>=2 pad-waste floor is max of gather and verify mins" {
+test "S>=2 pad-waste floor: none under the fused verify kernel, else max of gather and verify mins" {
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
     const prev_v = transformer_mod.qsa_verify_gather_override;
@@ -9048,7 +9177,14 @@ test "S>=2 pad-waste floor is max of gather and verify mins" {
     var cache = try KVCache.init(testing.allocator, 32);
     defer cache.deinit();
     cache.entries[3].initialized = true;
+    // The fused verify kernel reads O(budget) keys per row at any kv: no floor at S=4.
+    const prev_k = transformer_mod.qsa_attn_kernel_override;
+    defer transformer_mod.qsa_attn_kernel_override = prev_k;
+    transformer_mod.qsa_attn_kernel_override = null;
     cache.entries[3].offset = 18_000;
+    try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
+    // Its kill switch restores the union gather's floor: max of the gather and verify mins.
+    transformer_mod.qsa_attn_kernel_override = false;
     try testing.expectEqual(@as(u32, 18_000), batchKvLenOfWith(&cache, &q4, 4, false));
     cache.entries[3].offset = 162_000;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4, false));
@@ -10164,6 +10300,79 @@ test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
     try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+}
+
+test "decode share: a live share caps the width only while someone decodes" {
+    const w = DECODE_SHARE_PREFILL_CHUNK;
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5));
+    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0));
+    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
+    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
+    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
+    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+}
+
+test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
+    try testing.expectEqual(@as(f32, 0), try parseDecodeShare("0"));
+    try testing.expectEqual(@as(f32, 0.5), try parseDecodeShare("0.5"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("0.95"));
+    try testing.expectEqual(PREFILL_DECODE_SHARE_MAX, try parseDecodeShare("inf"));
+    for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
+        try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
+    }
+    // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
+    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
+    try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
+    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
+    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
+}
+
+test "decode share: the budget is chunk * S / (1 - S), zero when off" {
+    const ms = std.time.ns_per_ms;
+    try testing.expectEqual(@as(u64, 0), decodeShareBudgetNs(400 * ms, 0));
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.5))), 1e3);
+    try testing.expectApproxEqAbs(@as(f64, 3600 * ms), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.9))), 1e4);
+    try testing.expectApproxEqAbs(@as(f64, 400 * ms * 3 / 7), @as(f64, @floatFromInt(decodeShareBudgetNs(400 * ms, 0.3))), 1e4);
+}
+
+const FakeDecodeTicks = struct {
+    left: u32,
+    ns: u64,
+    calls: u32 = 0,
+    fn tick(ctx: *anyopaque) u64 {
+        const f: *FakeDecodeTicks = @ptrCast(@alignCast(ctx));
+        f.calls += 1;
+        if (f.left == 0) return 0;
+        f.left -= 1;
+        return f.ns;
+    }
+};
+
+test "decode share: a boundary ticks to the budget, keeps today's count at S=0, stops when decoders run out" {
+    const ms = std.time.ns_per_ms;
+    // S=0.5 on a 400 ms chunk with 8 ms ticks: 50 ticks, 400 ms of decode.
+    var full = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+    const r = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &full, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 50), r.ticks);
+    try testing.expectEqual(@as(u64, 400 * ms), r.spent_ns);
+    // S=0 is exactly today's schedule, whatever the chunk cost.
+    for ([_]u64{ 100, 300, 2300, 8000 }) |c| {
+        var legacy = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+        const l = runOwedDecodeTicks(0, c * ms, 8 * ms, &legacy, FakeDecodeTicks.tick);
+        try testing.expectEqual(interleaveTicksFor(c * ms, 8 * ms), l.ticks);
+    }
+    // The decoders finish after 3 more ticks: the 4th call returns 0 and the loop stops.
+    var dry = FakeDecodeTicks{ .left = 3, .ns = 8 * ms };
+    const d = runOwedDecodeTicks(0.5, 400 * ms, 8 * ms, &dry, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 4), d.ticks);
+    try testing.expectEqual(@as(u32, 4), dry.calls);
+    try testing.expectEqual(@as(u64, 32 * ms), d.spent_ns);
+    // Nobody decoding at the boundary: the first tick measured 0, no more are tried.
+    var none = FakeDecodeTicks{ .left = 1000, .ns = 8 * ms };
+    const n = runOwedDecodeTicks(0.5, 2300 * ms, 0, &none, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 1), n.ticks);
+    try testing.expectEqual(@as(u32, 0), none.calls);
 }
 
 test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chunk, capped" {

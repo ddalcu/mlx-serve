@@ -42,7 +42,7 @@ struct BrowserView: View {
     private func navButton(_ symbol: String, enabled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.title3)
+                .font(.app(.title3))
                 .frame(width: 28, height: 28)
                 .contentShape(Rectangle())
         }

@@ -91,7 +91,7 @@ struct BenchmarkView: View {
             ToolbarItem(placement: .principal) {
                 Picker("View", selection: $pane) {
                     ForEach(Pane.allCases) { pane in
-                        Text(pane.rawValue).tag(pane)
+                        Text(L10n.text(pane.rawValue)).tag(pane)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -194,13 +194,13 @@ struct BenchmarkView: View {
     private var resultPlaceholder: some View {
         VStack(spacing: 10) {
             Image(systemName: "chart.xyaxis.line")
-                .font(.system(size: 32, weight: .light))
+                .font(.app(.largeTitle, weight: .light))
                 .foregroundStyle(.tertiary)
             Text("No result yet")
-                .font(.callout.weight(.medium))
+                .font(.app(.callout).weight(.medium))
                 .foregroundStyle(.secondary)
             Text("Run the ladder to see decode and prefill speed at each context size.")
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 240)
@@ -219,7 +219,7 @@ struct BenchmarkView: View {
             VStack(spacing: 0) {
                 BenchRow("Model", detail: pickedIsResident || loadingModel ? nil : "Loaded when the run starts.") {
                     if pickableModels.isEmpty {
-                        Text("No chat model on this Mac").foregroundStyle(.secondary)
+                        Text("No chat model on this Mac").font(.app(.callout)).foregroundStyle(.secondary)
                     } else {
                         HStack(spacing: 6) {
                             if loadingModel { ProgressView().controlSize(.small) }
@@ -266,7 +266,7 @@ struct BenchmarkView: View {
                          : server.status != .running ? "Server not running"
                          : server.residentChatModel == nil ? "No model loaded — settings are read from the loaded model."
                          : "Reading settings…")
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
@@ -299,7 +299,7 @@ struct BenchmarkView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("This model is serving \(ContextSizeDisplay.formatTokens(have)) of context; the ladder needs \(ContextSizeDisplay.formatTokens(need)). Raise it in Settings ▸ Context.",
                           systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                     Button("Change in Settings…") { appState.showSettings() }
@@ -313,13 +313,13 @@ struct BenchmarkView: View {
                     ProgressView(value: runner.progress.fraction)
                         .progressViewStyle(.linear)
                     HStack {
-                        Text(phaseDescription)
-                            .font(.callout)
+                        Text(runner.phase.localizedText)
+                            .font(.app(.callout))
                             .foregroundStyle(.secondary)
                         Spacer()
                         if runner.discardedRuns > 0 {
                             Label("\(runner.discardedRuns) discarded", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
+                                .font(.app(.caption))
                                 .foregroundStyle(.orange)
                         }
                         // Stops after the request in flight: a 16k prefill
@@ -339,7 +339,7 @@ struct BenchmarkView: View {
 
             if let runError {
                 Label(runError, systemImage: "exclamationmark.octagon.fill")
-                    .font(.callout)
+                    .font(.app(.callout))
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -356,12 +356,12 @@ struct BenchmarkView: View {
 
             if pickedModel == nil {
                 Text("Download a chat model from the menu bar to run a benchmark.")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             } else if !pickedIsResident {
                 Text(server.status == .running ? "The model is loaded when the run starts."
                      : "The server is started with this model when the run starts.")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
         }
@@ -398,7 +398,7 @@ struct BenchmarkView: View {
                             // Retry sends only the rows that did not land.
                             VStack(alignment: .leading, spacing: 4) {
                                 Label(message, systemImage: "exclamationmark.octagon.fill")
-                                    .font(.caption)
+                                    .font(.app(.caption))
                                     .foregroundStyle(.red)
                                 Button("Try Again") { Task { await submit() } }
                                     .controlSize(.small)
@@ -406,7 +406,7 @@ struct BenchmarkView: View {
                         }
                         Spacer(minLength: 0)
                         Text("Sends these numbers plus the server settings, your chip, GPU cores, memory and macOS version. No account, nothing identifying.")
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.tertiary)
                             .multilineTextAlignment(.trailing)
                             .frame(maxWidth: 260)
@@ -420,10 +420,10 @@ struct BenchmarkView: View {
         BenchCard("Result", icon: "chart.xyaxis.line") {
             VStack(alignment: .leading, spacing: 6) {
                 Label("No usable runs", systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout.weight(.medium))
+                    .font(.app(.callout).weight(.medium))
                     .foregroundStyle(.orange)
                 Text("Every coding run was served from the KV cache, so nothing was actually measured. Restarting the server clears it.")
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -515,6 +515,7 @@ struct BenchmarkView: View {
 
     private func rateCell(_ value: Double?) -> some View {
         Text(BenchmarkFormat.rate(value ?? 0, decimals: 1))
+            .font(.app(.callout))
             .monospacedDigit()
             .fontWeight(value == nil ? .regular : .medium)
             .foregroundStyle(value == nil ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
@@ -610,6 +611,7 @@ struct BenchmarkView: View {
                     // data point, not a benchmark.
                     TableColumn("n", sortUsing: BenchmarkFamilySort(.sessions)) { family in
                         Text("\(family.sessionCount)")
+                            .font(.app(.callout))
                             .monospacedDigit()
                             .foregroundStyle(family.sessionCount == 1 ? .orange : .secondary)
                     }
@@ -657,7 +659,7 @@ struct BenchmarkView: View {
         HStack(spacing: 8) {
             content()
         }
-        .font(.caption)
+        .font(.app(.caption))
         .foregroundStyle(.secondary)
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -667,20 +669,6 @@ struct BenchmarkView: View {
     }
 
     // MARK: - Actions
-
-    private var phaseDescription: String {
-        switch runner.phase {
-        case .idle: return "Ready"
-        case .calibrating: return "Calibrating the token fit"
-        case .warmup(let rung): return "Warming up — \(rung)"
-        case .running(let rung, let run, let total): return "\(rung) context — run \(run) of \(total)"
-        case .drift(let run, let total): return "Drift check — run \(run) of \(total)"
-        case .stopping: return "Stopping after the current request…"
-        case .cancelled: return "Stopped"
-        case .done: return "Done"
-        case .failed(let message): return message
-        }
-    }
 
     private func refreshSettings() async {
         guard server.status == .running, let model = server.residentChatModel?.name else {
@@ -713,7 +701,7 @@ struct BenchmarkView: View {
         runError = nil
         defer { loadingModel = false }
         if await loadPickedModel() == nil {
-            runError = "The model could not be loaded. Check the server log."
+            runError = L10n.text("The model could not be loaded. Check the server log.")
         }
         await refreshSettings()
     }
@@ -728,11 +716,12 @@ struct BenchmarkView: View {
         defer { isRunning = false }
 
         guard let resident = await loadPickedModel() else {
-            runError = "The model could not be loaded. Check the server log."
+            runError = L10n.text("The model could not be loaded. Check the server log.")
             return
         }
         if case .contextTooSmall(let have, let need) = LadderPreflight.decide(contextLength: resident.contextLength, ladder: ladder) {
-            runError = "This model is serving \(ContextSizeDisplay.formatTokens(have)) of context; the ladder needs \(ContextSizeDisplay.formatTokens(need)). Raise it in Settings ▸ Context."
+            runError = L10n.format("This model is serving %@ of context; the ladder needs %@. Raise it in Settings ▸ Context.",
+                                   ContextSizeDisplay.formatTokens(have), ContextSizeDisplay.formatTokens(need))
             return
         }
         let model = resident.name
@@ -742,7 +731,8 @@ struct BenchmarkView: View {
                                        note: BenchmarkResult.cleanNote(note), hardware: hardware)
         if case .failed(let message) = runner.phase { runError = message }
         if case .cancelled = runner.phase, !results.isEmpty {
-            runError = "Stopped after \(results.count) rung\(results.count == 1 ? "" : "s"); the drift check was skipped."
+            runError = L10n.format("Stopped after %lld rung%@; the drift check was skipped.",
+                                   Int64(results.count), results.count == 1 ? "" : "s")
         }
         lastResults = results
         if !results.isEmpty { history = BenchmarkStore.appendLocal(results) }

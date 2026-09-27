@@ -225,38 +225,47 @@ enum AgentPrompt {
         return backupPath
     }
 
-    /// Menu action for "Update System Prompt": confirm (warn it's destructive),
-    /// back up, overwrite with the latest default, then report where the backup
-    /// went. No-ops with a friendly note when already up to date.
+    /// Drives the "Update System Prompt and Skills" menu item's enabled state.
+    static func isPromptOrSkillsOutdated() -> Bool {
+        isSystemPromptOutdated() || AgentSkills.isOutdated()
+    }
+
+    /// Menu action for "Update System Prompt and Skills": confirm (it is
+    /// destructive), back up what the user changed, restore the latest
+    /// built-in prompt and skills, then report where the backups went.
     @MainActor
     static func runSystemPromptUpdateFlow() {
-        guard isSystemPromptOutdated() else {
+        guard isPromptOrSkillsOutdated() else {
             let a = NSAlert()
-            a.messageText = "System prompt is up to date"
-            a.informativeText = "Your system prompt already matches the latest built-in default."
+            a.messageText = L10n.text("System prompt and skills are up to date")
+            a.informativeText = L10n.text("Your system prompt and skills already match the latest built-in versions.")
             a.runModal()
             return
         }
         let confirm = NSAlert()
         confirm.alertStyle = .warning
-        confirm.messageText = "Replace your system prompt with the latest default?"
-        confirm.informativeText = "This overwrites ~/.mlx-serve/system-prompt.md with the latest built-in prompt. Your current prompt is backed up first so you can restore it."
-        confirm.addButton(withTitle: "Update")
-        confirm.addButton(withTitle: "Cancel")
+        confirm.messageText = L10n.text("Replace your system prompt and skills with the latest defaults?")
+        confirm.informativeText = L10n.text("This overwrites ~/.mlx-serve/system-prompt.md and the built-in skills in ~/.mlx-serve/skills with the latest versions. Anything you changed is backed up first so you can restore it.")
+        confirm.addButton(withTitle: L10n.text("Update"))
+        confirm.addButton(withTitle: L10n.text("Cancel"))
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
-        let backup = updateSystemPromptToDefault()
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        let promptBackup = isSystemPromptOutdated() ? updateSystemPromptToDefault() : nil
+        let backups = [promptBackup, AgentSkills.refresh(stamp: f.string(from: Date()))].compactMap { $0 }
         let done = NSAlert()
-        done.messageText = "System prompt updated"
-        done.informativeText = backup.map { "Updated to the latest default.\nYour previous prompt was saved to:\n\($0)" }
-            ?? "Updated to the latest default."
-        if backup != nil {
-            done.addButton(withTitle: "Reveal Backup")
-            done.addButton(withTitle: "OK")
+        done.messageText = L10n.text("System prompt and skills updated")
+        done.informativeText = backups.isEmpty
+            ? L10n.text("Updated to the latest defaults.")
+            : L10n.format("Updated to the latest defaults.\nYour previous versions were saved to:\n%@", backups.joined(separator: "\n"))
+        if !backups.isEmpty {
+            done.addButton(withTitle: L10n.text("Reveal Backup"))
+            done.addButton(withTitle: L10n.text("OK"))
         }
         let resp = done.runModal()
-        if let backup, resp == .alertFirstButtonReturn {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: backup)])
+        if !backups.isEmpty, resp == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting(backups.map { URL(fileURLWithPath: $0) })
         }
     }
 
@@ -408,6 +417,9 @@ struct Skill {
     let description: String
     let triggers: [String]
     let body: String
+    /// `SKILL.md` of a folder skill (Agent Skills layout), which the model
+    /// loads itself with readFile; nil for a flat trigger skill.
+    var path: String? = nil
 }
 
 class SkillManager {
@@ -415,8 +427,10 @@ class SkillManager {
     private var skills: [Skill] = []
     private var lastModDate: Date?
 
+    static let defaultSkillsDir = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+
     init(skillsDir: String? = nil) {
-        self.skillsDir = skillsDir ?? NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+        self.skillsDir = skillsDir ?? Self.defaultSkillsDir
         seedBuiltinSkills()
         reload()
     }
@@ -604,7 +618,7 @@ class SkillManager {
         reloadIfNeeded()
         guard let name = SlashCommands.invokedSkillName(in: userMessage),
               let skill = skills.first(where: { $0.name.lowercased() == name }) else { return "" }
-        return "\n\n## Skill: \(skill.name)\n\(skill.body)"
+        return Self.bodyBlock(skill)
     }
 
     /// Returns skill index (always) + matching skill bodies (when triggered,
@@ -617,15 +631,29 @@ class SkillManager {
         var result = "\nAvailable skills: " + skills.map { "\($0.name) (\($0.description))" }.joined(separator: ", ")
 
         let invoked = SlashCommands.invokedSkillName(in: userMessage)
+        let folders = skills.compactMap { s in s.path.map { "\(s.name) → \($0)" } }
+        if !folders.isEmpty {
+            result += "\nWhen your task matches one of these skills, readFile its instructions first: " + folders.joined(separator: ", ")
+        }
+
         let matched = skills.filter { skill in
             skill.name.lowercased() == invoked
                 || skill.triggers.contains { Self.triggerMatches(lower, $0) }
         }
         for skill in matched {
-            result += "\n\n## Skill: \(skill.name)\n\(skill.body)"
+            result += Self.bodyBlock(skill)
         }
 
         return result
+    }
+
+    /// A folder skill's body names sibling files by relative path.
+    private static func bodyBlock(_ skill: Skill) -> String {
+        var block = "\n\n## Skill: \(skill.name)\n\(skill.body)"
+        if let path = skill.path {
+            block += "\n\n(Files this skill mentions are in \((path as NSString).deletingLastPathComponent); read them with readFile.)"
+        }
+        return block
     }
 
     // MARK: - Private
@@ -647,14 +675,20 @@ class SkillManager {
             return
         }
         lastModDate = (try? fm.attributesOfItem(atPath: skillsDir))?[.modificationDate] as? Date
-        skills = files.filter { $0.hasSuffix(".md") }.compactMap { file in
+        skills = files.sorted().compactMap { file in
             let path = (skillsDir as NSString).appendingPathComponent(file)
-            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-            return parseSkill(content)
+            if file.hasSuffix(".md") {
+                guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+                return parseSkill(content, folderPath: nil)
+            }
+            let skillMd = (path as NSString).appendingPathComponent("SKILL.md")
+            guard let content = try? String(contentsOfFile: skillMd, encoding: .utf8) else { return nil }
+            return parseSkill(content, folderPath: skillMd)
         }
     }
 
-    private func parseSkill(_ content: String) -> Skill? {
+    /// A flat skill needs a `trigger`; a folder skill is loaded by the model from its description.
+    private func parseSkill(_ content: String, folderPath: String?) -> Skill? {
         guard content.hasPrefix("---") else { return nil }
         let afterOpener = content.index(content.startIndex, offsetBy: 3)
         guard let closeRange = content.range(of: "\n---", range: afterOpener..<content.endIndex) else { return nil }
@@ -683,7 +717,7 @@ class SkillManager {
             }
         }
 
-        guard !name.isEmpty, !triggers.isEmpty else { return nil }
-        return Skill(name: name, description: description, triggers: triggers, body: body)
+        guard !name.isEmpty, folderPath != nil || !triggers.isEmpty else { return nil }
+        return Skill(name: name, description: description, triggers: triggers, body: body, path: folderPath)
     }
 }

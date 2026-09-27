@@ -24,6 +24,31 @@
 (function () {
   'use strict';
 
+  // ══ Localization ══════════════════════════════════════════════════════════
+  // src/html/i18n.js (head) owns the tables and the language. Node — where the
+  // pure helpers below are unit-tested — has no page, so `t` falls back to the
+  // key, which IS the English source string and exactly what `en` resolves to.
+
+  var I18N = (typeof globalThis !== 'undefined' && globalThis.mlxI18n) ? globalThis.mlxI18n : null;
+
+  function t(key, params) {
+    if (I18N) return I18N.t(key, params);
+    if (!params || !params.length) return key;
+    var i = 0;
+    return String(key).replace(/%@/g, function () { return String(params[i++]); });
+  }
+
+  /// Write copy into an element and keep it translatable. Only a param-free key
+  /// may keep its `data-i18n` (applyMarkup has no params to re-substitute with);
+  /// anything formatted is re-rendered by whoever owns it when the language
+  /// changes — the monitor, Recents, the pill and the status line all are.
+  function setText(el, key, params) {
+    if (params && params.length) el.removeAttribute('data-i18n');
+    else el.setAttribute('data-i18n', key);
+    el.textContent = t(key, params);
+    return el;
+  }
+
   // ══ Pure helpers (tested) ═════════════════════════════════════════════════
 
   function capsOf(m) {
@@ -50,12 +75,12 @@
   function modelLabel(m) {
     var state = m && m.state ? m.state : (m && m.loaded ? 'ready' : 'unloaded');
     var size = formatBytes(m && (m.bytes_resident || m.bytes_on_disk));
-    return m.id + (size === '—' ? '' : '  ·  ' + size) + '  ·  ' + state;
+    return m.id + (size === '—' ? '' : '  ·  ' + size) + '  ·  ' + t(state);
   }
 
   /// The composer pill has room for a name, not an org path.
   function shortModelName(id) {
-    if (!id) return 'no model';
+    if (!id) return t('no model');
     var s = String(id);
     var slash = s.lastIndexOf('/');
     return slash >= 0 ? s.slice(slash + 1) : s;
@@ -67,8 +92,8 @@
     var bits = [];
     var size = formatBytes(m && (m.bytes_resident || m.bytes_on_disk));
     if (size !== '—') bits.push(size);
-    if (capsOf(m).indexOf('vision') >= 0) bits.push('vision');
-    bits.push((m && m.state) || 'unloaded');
+    if (capsOf(m).indexOf('vision') >= 0) bits.push(t('vision'));
+    bits.push(t((m && m.state) || 'unloaded'));
     return bits.join(' · ');
   }
 
@@ -392,7 +417,7 @@
       }
     }
     text = String(text || '').replace(/\s+/g, ' ').trim();
-    if (!text) return 'New chat';
+    if (!text) return t('New chat');
     return text.length > 48 ? text.slice(0, 48).trim() + '…' : text;
   }
 
@@ -696,7 +721,7 @@
   function formatTurnStats(acc) {
     if (!acc) return '';
     var bits = [];
-    if (acc.prefillMs > 0) bits.push((acc.prefillMs / 1000).toFixed(2) + 's prefill');
+    if (acc.prefillMs > 0) bits.push(t('%@s prefill', [(acc.prefillMs / 1000).toFixed(2)]));
     var tps = tokensPerSecond(acc.tokens, acc.decodeMs);
     if (tps) bits.push(tps + ' tok/s');
     return bits.join('  ·  ');
@@ -727,7 +752,7 @@
       if (typeof e.message === 'string' && e.message) return e.message;
     }
     if (payload && typeof payload.message === 'string' && payload.message) return payload.message;
-    return 'request failed (HTTP ' + status + ')';
+    return t('request failed (HTTP %@)', [status]);
   }
 
   /// Prose a TTS model should actually SAY, cut from one markdown reply.
@@ -743,15 +768,16 @@
     var text = String(md);
 
     // Fenced code: replace the WHOLE block with a spoken marker.
-    text = text.replace(/```[\s\S]*?```/g, ' (code block) ');
-    text = text.replace(/```[\s\S]*$/, ' (code block) ');   // unterminated fence
+    var skipped = ' ' + t('(code block)') + ' ';
+    text = text.replace(/```[\s\S]*?```/g, skipped);
+    text = text.replace(/```[\s\S]*$/, skipped);   // unterminated fence
     // Inline code keeps its content — it is usually a short identifier.
     text = text.replace(/`([^`]*)`/g, '$1');
     // Links: say the label, never the URL.
     text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
     text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
     // A bare URL is unspeakable.
-    text = text.replace(/https?:\/\/\S+/g, ' a link ');
+    text = text.replace(/https?:\/\/\S+/g, ' ' + t('a link') + ' ');
     // Emphasis, headings, quotes, list bullets, table pipes, rules.
     text = text.replace(/^\s{0,3}#{1,6}\s*/gm, '');
     text = text.replace(/(\*\*|__)(.*?)\1/g, '$2');
@@ -769,14 +795,14 @@
     var parts = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g) || [text];
     var out = [];
     for (var i = 0; i < parts.length; i++) {
-      var t = parts[i].trim();
-      if (!t) continue;
+      var piece = parts[i].trim();
+      if (!piece) continue;
       // Merge a RUNT onto the previous chunk — "OK." is a whole round trip for
       // nothing. The bar is deliberately low (8): "Yes indeed!" is a real
       // sentence and deserves its own prosody, so a generous threshold would
       // quietly flatten short replies together.
-      if (out.length && t.length < 8) out[out.length - 1] += ' ' + t;
-      else out.push(t);
+      if (out.length && piece.length < 8) out[out.length - 1] += ' ' + piece;
+      else out.push(piece);
     }
     // Cap each chunk: Kokoro's context is 510 phoneme tokens, and a very long
     // clause would 400 rather than truncate.
@@ -897,9 +923,14 @@
   /// The one place a status is set. It drives BOTH the line under the composer
   /// and the in-transcript waiting indicator, so a cold load, a prefill and an
   /// image's per-step progress all show up where the answer is going to appear.
+  var IDLE_STATUS = 'Runs entirely on this Mac. Models can make mistakes.';
+
   function setStatus(text, kind) {
     var el = $('chat-tools');
-    el.textContent = text || 'Runs entirely on this Mac. Models can make mistakes.';
+    // The idle line is table copy and stays marked, so a language switch
+    // re-renders it; a live message is not in any table and must not be.
+    if (text) { el.removeAttribute('data-i18n'); el.textContent = text; }
+    else setText(el, IDLE_STATUS);
     el.className = 'disclaimer' + (kind ? ' ' + kind : '');
     if (kind === 'busy' && CURRENT_OUT) {
       if (PENDING) PENDING.label.textContent = text || '';
@@ -954,8 +985,8 @@
     return true;
   }
 
-  for (var t = 0; t < tabs.length; t++) {
-    tabs[t].addEventListener('click', function (e) {
+  for (var k = 0; k < tabs.length; k++) {
+    tabs[k].addEventListener('click', function (e) {
       var name = e.currentTarget.getAttribute('data-tab');
       if (e.currentTarget.id === 'nav-new') newChat();
       showTab(name);
@@ -965,6 +996,10 @@
 
   $('side-toggle').addEventListener('click', function () { $('app').classList.add('collapsed'); });
   $('side-open').addEventListener('click', function () { $('app').classList.remove('collapsed'); });
+  $('theme-toggle').addEventListener('click', function () { window.mlxTheme.toggle(); });
+  $('lang-toggle').addEventListener('click', function () {
+    if (I18N) I18N.setLang(I18N.lang === 'zh-Hans' ? 'en' : 'zh-Hans');
+  });
 
   // ── The API reference, read out of the page it is already rendered in ─────
   // One list, not two: the API panel's markup IS the reference the assistant
@@ -977,10 +1012,14 @@
       var path = eps[i].querySelector('.p');
       var desc = eps[i].querySelector('.d');
       if (!method || !path) continue;
+      // The row is translated for the reader, so the description comes from the
+      // key — the English source — and the model's reference is the same in
+      // every language. Nothing rendered is trusted here.
+      var source = desc ? desc.getAttribute('data-i18n') : null;
       API_ENTRIES.push({
         method: method.textContent.trim(),
         path: path.textContent.trim(),
-        desc: desc ? desc.textContent.trim() : '',
+        desc: source || (desc ? desc.textContent.trim() : ''),
       });
     }
   })();
@@ -998,7 +1037,7 @@
 
   function syncModelPill() {
     var id = currentModel();
-    $('chat-model').title = id ? 'Model: ' + id : 'no chat model on this server';
+    $('chat-model').title = id || t('no chat model on this server');
     syncToggle('chat-think', THINKING, 'Thinking');
     syncToggle('chat-tools-toggle', TOOLS, 'Media tools');
     $('chat-tools-toggle').hidden = !mediaTools(MODELS).length;
@@ -1019,7 +1058,7 @@
     if (!list.length) {
       var e = document.createElement('div');
       e.className = 'empty';
-      e.textContent = 'No chat models found. Pull one with `mlx-serve pull`, or point the server at a models directory.';
+      setText(e, 'No chat models found. Pull one with `mlx-serve pull`, or point the server at a models directory.');
       menu.appendChild(e);
     }
     list.forEach(function (m) {
@@ -1045,6 +1084,7 @@
       });
       menu.appendChild(b);
     });
+
   }
 
   function openMenu() {
@@ -1079,7 +1119,7 @@
       var td = document.createElement('td');
       td.colSpan = 4;
       td.className = 'muted';
-      td.textContent = 'No models discovered. Point the server at a models directory with --model-dir, or pull one with `mlx-serve pull`.';
+      setText(td, 'No models discovered. Point the server at a models directory with --model-dir, or pull one with `mlx-serve pull`.');
       empty.appendChild(td);
       body.appendChild(empty);
       return;
@@ -1103,7 +1143,7 @@
       for (var c = 0; c < list.length; c++) {
         var pill = document.createElement('span');
         pill.className = 'cap';
-        pill.textContent = list[c];
+        pill.textContent = t(list[c]);
         caps.appendChild(pill);
       }
 
@@ -1113,7 +1153,7 @@
 
       var state = document.createElement('td');
       state.className = 'state ' + (m.state || 'unloaded');
-      state.textContent = m.state || 'unloaded';
+      state.textContent = t(m.state || 'unloaded');
 
       tr.appendChild(id); tr.appendChild(caps); tr.appendChild(size); tr.appendChild(state);
       body.appendChild(tr);
@@ -1133,10 +1173,15 @@
     if (!$('model-menu').hidden) buildMenu();
 
     var loaded = MODELS.filter(function (m) { return m.state === 'ready'; }).length;
-    $('hdr-models').textContent = MODELS.length + ' model' + (MODELS.length === 1 ? '' : 's') +
-      (loaded ? ' · ' + loaded + ' loaded' : '');
+    var bits = [t(MODELS.length === 1 ? '%@ model' : '%@ models', [MODELS.length])];
+    if (loaded) bits.push(t('%@ loaded', [loaded]));
+    $('hdr-models').textContent = bits.join(' · ');
     var first = pickModels(MODELS, 'chat')[0];
-    if (first && $('curl-model')) $('curl-model').textContent = first.id;
+    if (first && $('curl-model')) {
+      var cm = $('curl-model');
+      cm.removeAttribute('data-i18n');
+      cm.textContent = first.id;
+    }
   }
 
   async function refreshMemory() {
@@ -1144,7 +1189,7 @@
       var res = await fetch('/props', { headers: authHeaders(API_KEY) });
       var p = await res.json();
       var mem = p && p.memory ? p.memory.active_bytes : 0;
-      $('hdr-mem').textContent = formatBytes(mem) + ' resident';
+      $('hdr-mem').textContent = t('%@ resident', [formatBytes(mem)]);
     } catch (e) { /* transient */ }
   }
 
@@ -1180,20 +1225,20 @@
     if (!HISTORY.length) {
       var e = document.createElement('div');
       e.className = 'empty';
-      e.textContent = 'Your chats show up here.';
+      setText(e, 'Your chats show up here.');
       box.appendChild(e);
       return;
     }
     HISTORY.forEach(function (c) {
       var row = document.createElement('button');
       row.className = 'recent' + (c.id === CHAT_ID ? ' active' : '');
-      var t = document.createElement('span');
-      t.className = 't';
-      t.textContent = c.title;
+      var label = document.createElement('span');
+      label.className = 't';
+      label.textContent = c.title;
       var x = document.createElement('span');
       x.className = 'x';
       x.textContent = '✕';
-      x.title = 'Delete';
+      x.title = t('Delete');
       x.addEventListener('click', function (ev) {
         ev.stopPropagation();
         HISTORY = historyRemove(HISTORY, c.id);
@@ -1201,7 +1246,7 @@
         if (c.id === CHAT_ID) newChat();
         renderRecents();
       });
-      row.appendChild(t); row.appendChild(x);
+      row.appendChild(label); row.appendChild(x);
       row.addEventListener('click', function () { openChat(c.id); });
       box.appendChild(row);
     });
@@ -1297,7 +1342,7 @@
           var text = t.content.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
           b.textContent = text;
           if (t.content.some(function (p) { return p.type === 'image_omitted'; })) {
-            note(b, 'image attached (not stored)');
+            noteCopy(b, 'image attached (not stored)');
           }
         } else {
           b.textContent = t.content || '';
@@ -1338,7 +1383,7 @@
     var d = document.createElement('details');
     d.className = 'think';
     var s = document.createElement('summary');
-    s.textContent = 'thinking';
+    setText(s, 'thinking');
     var pre = document.createElement('div');
     pre.className = 'think-body';
     d.appendChild(s);
@@ -1346,6 +1391,10 @@
     parent.appendChild(d);
     return pre;
   }
+
+  /// A note that is table copy, so a language switch re-renders it. Tool notes
+  /// carry the tool name and the user's own words and are not in any table.
+  function noteCopy(parent, key) { return setText(note(parent, ''), key); }
 
   function note(parent, text, kind) {
     var n = document.createElement('div');
@@ -1365,7 +1414,7 @@
     a.href = img.src;
     a.download = 'mlx-serve.png';
     a.className = 'dl';
-    a.textContent = 'download png';
+    setText(a, 'download png');
     out.appendChild(img);
     out.appendChild(a);
     target.appendChild(out);
@@ -1383,7 +1432,7 @@
     a.href = blobUrl;
     a.download = name;
     a.className = 'dl';
-    a.textContent = 'download wav';
+    setText(a, 'download wav');
     out.appendChild(au);
     out.appendChild(a);
     target.appendChild(out);
@@ -1400,7 +1449,7 @@
   function readAsDataUrl(file) {
     return new Promise(function (resolve, reject) {
       var fr = new FileReader();
-      fr.onerror = function () { reject(new Error('could not read ' + file.name)); };
+      fr.onerror = function () { reject(new Error(t('could not read %@', [file.name]))); };
       fr.onload = function () { resolve(String(fr.result)); };
       fr.readAsDataURL(file);
     });
@@ -1424,7 +1473,7 @@
       var x = document.createElement('button');
       x.className = 'x';
       x.textContent = '✕';
-      x.title = 'remove ' + a.name;
+      x.title = t('remove %@', [a.name]);
       x.addEventListener('click', function () {
         ATTACHMENTS.splice(i, 1);
         renderAttachments();
@@ -1484,7 +1533,7 @@
 
     try {
       if (plan.path === '/v1/images/edits') {
-        setStatus('editing image…', 'busy');
+        setStatus(t('editing image…'), 'busy');
         var form = new FormData();
         plan.fields.forEach(function (f) { form.append(f[0], f[1]); });
         plan.refs.forEach(function (f, i) { form.append('image[]', f, f.name || ('ref' + i + '.png')); });
@@ -1548,7 +1597,7 @@
         var ev;
         try { ev = JSON.parse(fed.events[i]); } catch (e) { continue; }
         if (ev.type === 'progress') {
-          setStatus((ev.stage || 'working') + (ev.total ? ' ' + ev.step + '/' + ev.total : '') + '…', 'busy');
+          setStatus(t(ev.stage || 'working') + (ev.total ? ' ' + ev.step + '/' + ev.total : '') + '…', 'busy');
         } else if (ev.type === 'complete') {
           done = true;
           onComplete(ev);
@@ -1655,16 +1704,16 @@
     row.className = 'actions';
     var copy = document.createElement('button');
     copy.className = 'act';
-    copy.textContent = 'Copy';
+    setText(copy, 'Copy');
     copy.addEventListener('click', function () {
       navigator.clipboard.writeText(text).then(function () {
-        copy.textContent = 'Copied';
-        setTimeout(function () { copy.textContent = 'Copy'; }, 1200);
-      }, function () { copy.textContent = 'Copy failed'; });
+        setText(copy, 'Copied');
+        setTimeout(function () { setText(copy, 'Copy'); }, 1200);
+      }, function () { setText(copy, 'Copy failed'); });
     });
     var again = document.createElement('button');
     again.className = 'act';
-    again.textContent = 'Regenerate';
+    setText(again, 'Regenerate');
     again.addEventListener('click', regenerate);
     row.appendChild(copy);
     row.appendChild(again);
@@ -1708,7 +1757,7 @@
 
   async function runTurn(content, attached) {
     var model = currentModel();
-    if (!model) { setStatus('no chat model on this server', 'err'); return; }
+    if (!model) { setStatus(t('no chat model on this server'), 'err'); return; }
 
     turns.push({ role: 'user', content: content });
     $('tab-chat').classList.remove('empty');
@@ -1740,8 +1789,8 @@
     CURRENT_OUT = out;
     var picked = MODELS.filter(function (m) { return m.id === model; })[0];
     setStatus((!picked || picked.state !== 'ready')
-      ? 'loading ' + shortModelName(model) + '…'
-      : 'thinking…', 'busy');
+      ? t('loading %@…', [shortModelName(model)])
+      : t('thinking…'), 'busy');
 
     var partial = { text: '' };
     var stats = null, mediaUsed = 0, finalText = '';
@@ -1773,7 +1822,7 @@
         // the next unrelated question re-edit the same photo.
         ATTACHMENTS = [];
         renderAttachments();
-        setStatus('thinking…', 'busy');
+        setStatus(t('thinking…'), 'busy');
       }
       setStatus(formatTurnStats(stats));
       if (finalText) messageActions(out, finalText);
@@ -1790,7 +1839,7 @@
           sTurns.push({ role: 'assistant', content: partial.text });
         }
       }
-      if (err && err.name === 'AbortError') setStatus('stopped');
+      if (err && err.name === 'AbortError') setStatus(t('stopped'));
       else setStatus(String(err && err.message ? err.message : err), 'err');
     } finally {
       hidePending();
@@ -1830,10 +1879,10 @@
     VOICE.state = next;
     var b = $('chat-voice');
     b.className = 'ibtn' + (next === 'off' ? '' : ' on ' + next);
-    b.title = next === 'off' ? 'Voice mode: speak, and hear the reply'
-      : next === 'listening' ? 'Listening'
-      : next === 'thinking' ? 'Thinking'
-      : 'Speaking';
+    b.title = next === 'off' ? t('Voice mode: speak, and hear the reply')
+      : next === 'listening' ? t('Listening')
+      : next === 'thinking' ? t('Thinking')
+      : t('Speaking');
     if (micShouldRun(next)) startMic(); else stopMic();
     if (next === 'off') stopSpeaking();
   }
@@ -1843,7 +1892,10 @@
     var Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!Ctor) return;
     var rec = new Ctor();
-    rec.lang = navigator.language || 'en-US';
+    // Recognition follows the page, not the OS: a browser set to English but a
+    // console switched to Chinese must transcribe Chinese.
+    rec.lang = (I18N && I18N.lang === 'zh-Hans' && !/^zh/i.test(navigator.language || ''))
+      ? 'zh-CN' : (navigator.language || 'en-US');
     rec.interimResults = true;
     rec.continuous = false;
     rec.onresult = function (e) {
@@ -1865,7 +1917,7 @@
     rec.onerror = function (e) {
       VOICE.rec = null;
       if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
-        setStatus('microphone blocked — allow it in the browser', 'err');
+        setStatus(t('microphone blocked — allow it in the browser'), 'err');
         voiceSet('disable');
       }
     };
@@ -1978,9 +2030,21 @@
   if (!$('mlx-metrics')) {
     var hint = document.createElement('div');
     hint.className = 'hint';
-    hint.textContent = 'Live metrics are off. Restart the server with --metrics for decode/prefill rates, TTFT and cache hit rate here.';
+    setText(hint, 'Live metrics are off. Restart the server with --metrics for decode/prefill rates, TTFT and cache hit rate here.');
     var scroll = $('tab-monitor').querySelector('.scroll');
     scroll.insertBefore(hint, scroll.firstChild);
+  }
+  // i18n.js already re-applied the markup before this runs; these are the parts
+  // that only exist as DOM built from data (so nothing in a table can reach).
+  if (I18N) {
+    I18N.onChange(function () {
+      renderMonitor();
+      renderRecents();
+      if (!$('model-menu').hidden) buildMenu();
+      syncModelPill();
+      refreshModels();
+      refreshMemory();
+    });
   }
   showTab(location.hash.slice(1) || 'chat');
   refreshModels();

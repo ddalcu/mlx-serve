@@ -3,7 +3,8 @@ import Combine
 
 /// App-level owner of the sandbox terminal sessions (pi / hermes / shell over
 /// ssh into the guest VM). Lives on `AppState`, so a session survives the
-/// chat window closing — only app quit (which kills the VM) ends one.
+/// chat window closing. A quit ends the processes but not the rows: they come
+/// back suspended and resume the agent's last conversation when opened.
 ///
 /// The list model (`TerminalSessionList`) is pure; this class holds what it
 /// deliberately doesn't: the ssh handle + the process-owning terminal view.
@@ -22,12 +23,16 @@ final class TerminalSessionStore: ObservableObject {
         }
     }
 
-    @Published private(set) var sessions = TerminalSessionList()
+    private static let defaultsKey = "terminalSessions"
+
+    @Published private(set) var sessions: TerminalSessionList {
+        didSet {
+            UserDefaults.standard.set(try? JSONEncoder().encode(sessions), forKey: Self.defaultsKey)
+        }
+    }
     private var runtimes: [UUID: Runtime] = [:]
     /// An exited session's terminal, kept so its output stays readable until the row closes.
     private var endedHandles: [UUID: EmbeddedTerminalView.Handle] = [:]
-    /// The host CLI behind a `.host` row, for retries.
-    private var hostSpecs: [UUID: LauncherCLI] = [:]
     private let server: ServerManager
     private let options: () -> ServerOptions
     private let sandbox = AgentSandbox.shared
@@ -36,6 +41,8 @@ final class TerminalSessionStore: ObservableObject {
     init(server: ServerManager, options: @escaping () -> ServerOptions) {
         self.server = server
         self.options = options
+        sessions = UserDefaults.standard.data(forKey: Self.defaultsKey)
+            .flatMap { try? JSONDecoder().decode(TerminalSessionList.self, from: $0) } ?? TerminalSessionList()
         // Settings workspace pick under live sessions: the guest was already
         // torn down — restart every living session in the new guest.
         observers.append(NotificationCenter.default
@@ -81,7 +88,7 @@ final class TerminalSessionStore: ObservableObject {
     func start(agent: SandboxAgentSpec?, workspace: String) -> UUID {
         let label = agent?.displayName ?? "shell"
         let id = sessions.addPreparing(label: label, agentId: agent?.id, workspace: workspace)
-        preflightAndLaunch(into: id, agent: agent, workspace: workspace)
+        preflightAndLaunch(into: id)
         return id
     }
 
@@ -89,32 +96,38 @@ final class TerminalSessionStore: ObservableObject {
     /// script under a login+interactive zsh, on this Mac.
     @discardableResult
     func startHost(cli: LauncherCLI, workspace: String) -> UUID {
-        let id = sessions.addPreparing(label: cli.displayName, agentId: nil, workspace: workspace,
+        let id = sessions.addPreparing(label: cli.displayName, agentId: cli.id, workspace: workspace,
                                        kind: .host)
-        hostSpecs[id] = cli
-        preflightAndLaunch(into: id, agent: nil, workspace: workspace)
+        preflightAndLaunch(into: id)
         return id
     }
 
-    /// Try a failed row again in place, after `prepare` (start the server,
-    /// flip networking on) has run. The row reads "starting" meanwhile.
+    /// Start a failed or restored row again in place, after `prepare` (start
+    /// the server, flip networking on) has run. The row reads "starting" meanwhile.
     func retry(_ id: UUID, prepare: @escaping () async -> Void = {}) {
-        guard let s = sessions.session(id), case .failed = s.phase else { return }
-        sessions.retry(id)
+        guard sessions.retry(id) else { return }
         Task {
             await prepare()
             guard sessions.session(id)?.phase == .preparing else { return }
-            preflightAndLaunch(into: id, agent: SandboxAgentRegistry.all.first { $0.id == s.agentId },
-                               workspace: s.workspace)
+            preflightAndLaunch(into: id)
         }
     }
 
-    private func preflightAndLaunch(into id: UUID, agent: SandboxAgentSpec?, workspace: String) {
-        if let cli = hostSpecs[id] {
+    private func sandboxAgent(_ s: TerminalSessionList.Session) -> SandboxAgentSpec? {
+        SandboxAgentRegistry.all.first { $0.id == s.agentId }
+    }
+
+    private func preflightAndLaunch(into id: UUID) {
+        guard let s = sessions.session(id) else { return }
+        if s.kind == .host {
+            guard let cli = CLILauncher.cli(id: s.agentId) else {
+                sessions.markFailed(id, message: "unknown coding agent \(s.agentId ?? "")")
+                return
+            }
             // Same wording as the sandbox preflight, so the row offers the
             // same Start Server fix.
             guard !cli.requiresServer || server.status == .running else {
-                sessions.markFailed(id, message: "the server isn't running — load a model first; \(cli.displayName) talks to it")
+                sessions.markFailed(id, message: L10n.format("the server isn't running — load a model first; %@ talks to it", cli.displayName))
                 return
             }
             let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
@@ -123,10 +136,11 @@ final class TerminalSessionStore: ObservableObject {
                 cli, baseURL: server.baseURL, servedModelId: server.chatModelId ?? "mlx-serve",
                 budget: budget,
                 entries: AgentModelEntry.chatEntries(from: server.allModels),
-                workingDirectory: workspace)
+                workingDirectory: s.workspace, resume: s.resumes)
             install(handle: makeHandle(id: id, executable: cmd.executable, args: cmd.args), cli: nil, for: id)
             return
         }
+        let agent = sandboxAgent(s)
         let opts = options()
         // A plain shell needs no server — only agent sessions gate on it.
         let needsServer = agent != nil
@@ -136,7 +150,7 @@ final class TerminalSessionStore: ObservableObject {
             serverRunning: needsServer ? server.status == .running : true,
             serverHost: needsServer ? opts.host : "0.0.0.0")
         if issues.isEmpty {
-            launch(into: id, agent: agent, workspace: workspace)
+            launch(into: id, agent: agent, workspace: s.workspace, resume: s.resumes)
         } else {
             sessions.markFailed(id, message: issues.joined(separator: "\n\n"))
         }
@@ -144,7 +158,7 @@ final class TerminalSessionStore: ObservableObject {
 
     /// Boot + connect a CLI session into an existing (preparing) row. Shared
     /// by `start` and the workspace-remount respawn.
-    private func launch(into id: UUID, agent: SandboxAgentSpec?, workspace: String) {
+    private func launch(into id: UUID, agent: SandboxAgentSpec?, workspace: String, resume: Bool) {
         // Chat chokepoint rule: the model the sandboxed agent targets is
         // `server.chatModelId` (LAN picks win), budgets derive from the
         // advertised context — never hardcoded.
@@ -162,7 +176,7 @@ final class TerminalSessionStore: ObservableObject {
                 let cli = try await sandbox.startCliSession(
                     agent: agent, model: model, serverPort: port,
                     budget: budget, apiKey: key.isEmpty ? nil : key,
-                    entries: entries, workingDirectory: workspace)
+                    entries: entries, workingDirectory: workspace, resume: resume)
                 guard sessions.session(id)?.phase == .preparing else {
                     // Closed (or replaced) while the guest was booting — balance the pin.
                     sandbox.endCliSession(cli)
@@ -201,9 +215,7 @@ final class TerminalSessionStore: ObservableObject {
         for s in sessions.sessions where s.isActive && s.kind == .sandbox {
             endRuntime(s.id)
             sessions.restart(s.id)
-            launch(into: s.id,
-                   agent: SandboxAgentRegistry.all.first { $0.id == s.agentId },
-                   workspace: s.workspace)
+            launch(into: s.id, agent: sandboxAgent(s), workspace: s.workspace, resume: s.resumes)
         }
     }
 
@@ -229,7 +241,6 @@ final class TerminalSessionStore: ObservableObject {
     func close(_ id: UUID) {
         endRuntime(id)
         endedHandles.removeValue(forKey: id)
-        hostSpecs.removeValue(forKey: id)
         sessions.close(id)
     }
 }

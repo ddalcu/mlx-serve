@@ -55,10 +55,11 @@ struct BenchmarkHardware: Codable, Hashable {
     /// differentiator — a 32-core and a 40-core M4 Max share a chip string and
     /// do not share a decode speed.
     var displayName: String {
-        var parts = [chip]
-        if gpuCores > 0 { parts.append("\(gpuCores) GPU") }
-        parts.append("\(ramGB) GB")
-        return parts.joined(separator: " · ")
+        // The row renders this verbatim, so the chip — a product name, or the
+        // word "Unknown" — is resolved here and the core count is copy too.
+        let machine = L10n.text(chip)
+        guard gpuCores > 0 else { return "\(machine) · \(ramGB) GB" }
+        return L10n.format("%@ · %lld GPU · %lld GB", machine, Int64(gpuCores), Int64(ramGB))
     }
 }
 
@@ -429,7 +430,8 @@ enum BenchmarkSettings {
         if engine == "ds4" { chips.append("ds4") }
         if engine == "llama" { chips.append("llama.cpp") }
         if engine != "ds4", let kv = s["kv_quant"] {
-            chips.append(kv == "off" ? "KV off" : Int(kv) != nil ? "KV \(kv)-bit" : "KV \(kv)")
+            chips.append(kv == "off" ? "KV off"
+                        : Int(kv) != nil ? L10n.format("KV %@-bit", kv) : "KV \(kv)")
         }
         if s["decode_attn_quant"] == "true" { chips.append("Attn quant") }
         if s["pld_default_on"] == "true" { chips.append("PLD") }
@@ -438,7 +440,7 @@ enum BenchmarkSettings {
             chips.append(drafter == "dflash" ? "DFlash" : "Drafter")
         }
         if let ctx = s["n_ctx"].flatMap(Int.init), ctx > 0 {
-            chips.append("ctx \(ctx / 1024)K")
+            chips.append(L10n.format("ctx %lldK", Int64(ctx / 1024)))
         }
         return chips
     }
@@ -576,10 +578,11 @@ enum BenchmarkDrift {
 
     /// "61.2 → 58.4 tok/s (−4.6%, steady)"
     static func summary(first: Double?, last: Double?, percent: Double?) -> String {
-        guard let first, let last, let percent else { return "not measured" }
+        guard let first, let last, let percent else { return L10n.text("not measured") }
         let sign = percent > 0 ? "+" : ""
-        return String(format: "%.1f → %.1f tok/s (%@%.1f%%, %@)", first, last, sign, percent,
-                      verdict(percent: percent).rawValue)
+        let movement = verdict(percent: percent).rawValue
+        return L10n.format("%.1f → %.1f tok/s (%@%.1f%%, %@)", first, last, sign, percent,
+                           L10n.text(movement))
     }
 }
 

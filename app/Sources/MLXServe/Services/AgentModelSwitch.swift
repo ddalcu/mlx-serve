@@ -40,7 +40,8 @@ enum AgentModelSwitch {
         if pinned == selectedModelPath { return .noChange }
         if isLanId(pinned) {
             guard lanModelIds.contains(pinned) else {
-                return .unavailable(reason: "\(pinned) isn't on the network right now — the peer sharing it is offline or LAN discovery is off.")
+                return .unavailable(reason: L10n.format(
+                    "%@ isn't on the network right now — the peer sharing it is offline or LAN discovery is off.", pinned))
             }
             return .lan(id: pinned)
         }

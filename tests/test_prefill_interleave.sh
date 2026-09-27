@@ -14,6 +14,10 @@
 # [2] the on arm's max inter-token gap is under half the off arm's;
 # [3] stream A's output hash matches across arms.
 #
+# --prefill-decode-share: two more arms against a ~7-chunk B, today's schedule vs
+# share 0.5. Asserts [4] the share arm's hosted decode is over 1.5x today's fraction
+# of B's prefill wall time (the "[interleave] prefill X ms, hosted decode Y ms" line).
+#
 # Requires a small chat model; SKIPs without one.
 #   INTERLEAVE_TEST_MODEL=/path/to/model ./tests/test_prefill_interleave.sh [port]
 
@@ -45,6 +49,7 @@ cat > "$WORK/probe.py" <<'PYEOF'
 import hashlib, json, sys, threading, time, urllib.request
 
 PORT = int(sys.argv[1])
+B_WORDS = int(sys.argv[2]) if len(sys.argv) > 2 else 1200
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
 
 def stream(payload, stamps, parts):
@@ -64,7 +69,7 @@ def stream(payload, stamps, parts):
 a_st, a_tx, b_st = [], [], []
 a = {"model": "mlx-serve", "temperature": 0.0, "max_tokens": 500, "stream": True,
      "messages": [{"role": "user", "content": "Count from 1 to 200, one number per line."}]}
-words = " ".join(f"w{i}" for i in range(1200))
+words = " ".join(f"w{i}" for i in range(B_WORDS))
 b = {"model": "mlx-serve", "temperature": 0.0, "max_tokens": 4, "stream": True,
      "messages": [{"role": "user", "content": f"Summarize in one word. {words}"}]}
 ta = threading.Thread(target=stream, args=(a, a_st, a_tx))
@@ -81,11 +86,11 @@ print(json.dumps({"max_gap_ms": round(max(gaps) * 1000),
 PYEOF
 
 run_arm() {
-    local arm="$1" env_val="$2"
+    local arm="$1" env_val="$2" b_words="${3:-1200}" share="${4:-0}"
     local log="$WORK/$arm.log"
     MLX_SERVE_PREFILL_INTERLEAVE="$env_val" "$BINARY" --serve --model "$MODEL" \
         --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
-        --prefill-chunk 1024 --log-level debug --log-file "$log" \
+        --prefill-chunk 1024 --prefill-decode-share "$share" --log-level debug --log-file "$log" \
         >"$WORK/$arm.stdout" 2>&1 &
     SERVER_PID=$!
     local ready=0
@@ -98,14 +103,16 @@ run_arm() {
         exit 1
     fi
     # Two reps; keep the smaller gap (first rep can carry one-time JIT warmup).
-    python3 "$WORK/probe.py" "$PORT" > "$WORK/$arm.r1.json" || { echo "[fail] probe ($arm)"; exit 1; }
-    python3 "$WORK/probe.py" "$PORT" > "$WORK/$arm.r2.json" || { echo "[fail] probe ($arm)"; exit 1; }
+    python3 "$WORK/probe.py" "$PORT" "$b_words" > "$WORK/$arm.r1.json" || { echo "[fail] probe ($arm)"; exit 1; }
+    python3 "$WORK/probe.py" "$PORT" "$b_words" > "$WORK/$arm.r2.json" || { echo "[fail] probe ($arm)"; exit 1; }
     kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
     sleep 1
 }
 
 run_arm off 0
 run_arm on 1
+run_arm long 1 6000 0
+run_arm share 1 6000 0.5
 
 OFF_GAP=$(python3 -c "import json; print(min(json.load(open('$WORK/off.r1.json'))['max_gap_ms'], json.load(open('$WORK/off.r2.json'))['max_gap_ms']))")
 ON_GAP=$(python3 -c "import json; print(min(json.load(open('$WORK/on.r1.json'))['max_gap_ms'], json.load(open('$WORK/on.r2.json'))['max_gap_ms']))")
@@ -131,3 +138,24 @@ if [ $((ON_GAP * 2)) -ge "$OFF_GAP" ]; then
     exit 1
 fi
 echo "[pass] prefill interleaving bounds the concurrent-stream stall"
+
+# Hosted decode as a fraction of the prefill's wall time, summed over both reps.
+hosted_frac() {
+    python3 - "$1" <<'PY'
+import re, sys
+p = d = 0
+for line in open(sys.argv[1]):
+    m = re.search(r"\[interleave\] prefill (\d+) ms, hosted decode (\d+) ms", line)
+    if m:
+        p += int(m.group(1)); d += int(m.group(2))
+print(f"{d / (p + d):.3f}" if p + d else "0")
+PY
+}
+LONG_FRAC=$(hosted_frac "$WORK/long.log")
+SHARE_FRAC=$(hosted_frac "$WORK/share.log")
+echo "decode share: hosted fraction today=$LONG_FRAC share0.5=$SHARE_FRAC"
+if ! python3 -c "import sys; sys.exit(0 if $SHARE_FRAC > 1.5 * $LONG_FRAC and $SHARE_FRAC > 0 else 1)"; then
+    echo "[fail] --prefill-decode-share 0.5 did not raise the decode share of B's prefill (today=$LONG_FRAC share=$SHARE_FRAC)"
+    exit 1
+fi
+echo "[pass] --prefill-decode-share gives decoding streams more of a long prefill"

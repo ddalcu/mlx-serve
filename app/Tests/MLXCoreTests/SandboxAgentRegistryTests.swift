@@ -22,7 +22,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
 
     func testPiConfigIsAgentConfigsPiModelsJSONAtTheHostPlaceholder() {
         let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, nil, [])
-        XCTAssertEqual(files.count, 3, "models.json + AGENTS.md + the live-list extension")
+        XCTAssertEqual(files.count, 3 + AgentSkills.files().count, "models.json + AGENTS.md + the live-list extension + the skill")
         XCTAssertEqual(files[0].guestPath, "/root/.pi/agent/models.json",
                        "guest HOME is /root; pi reads ~/.pi/agent — no PI_CODING_AGENT_DIR isolation needed in a VM that is ALL ours")
         // Same generator the host launcher + MAS instructions use — one shape,
@@ -71,7 +71,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
         // custom_providers entry. Writing exactly what the wizard saves means
         // the first run starts CONFIGURED instead of launching the wizard.
         let files = SandboxAgentRegistry.hermes.configFiles("qwen3.6-27b", 11234, budget, "k1", [])
-        XCTAssertEqual(files.count, 2)
+        XCTAssertEqual(files.count, 2 + AgentSkills.files().count)
         XCTAssertEqual(files[0].guestPath, "/root/.hermes/config.yaml")
         let yaml = files[0].content
         XCTAssertTrue(yaml.contains("default: \"qwen3.6-27b\""), yaml)
@@ -124,7 +124,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
         // list is live), so the bootstrap's dummy-args path enumeration
         // always includes it.
         let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, "k7", [])
-        XCTAssertEqual(files.count, 3, "models.json + AGENTS.md + the live-list extension")
+        XCTAssertEqual(files.count, 3 + AgentSkills.files().count, "models.json + AGENTS.md + the live-list extension + the skill")
         let ext = files[2]
         XCTAssertEqual(ext.guestPath, "/root/.pi/agent/extensions/mlx-models.js",
                        "pi scans <agentDir>/extensions — guest agent dir is /root/.pi/agent")

@@ -35,20 +35,20 @@ struct PaneChip: ViewModifier {
     func body(content: Content) -> some View {
         if square {
             content
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.primary)
                 .frame(width: Self.side, height: Self.side)
                 .background(chipShape)
         } else if let height {
             content
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 9)
                 .frame(height: height)
                 .background(chipShape)
         } else {
             content
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 4)

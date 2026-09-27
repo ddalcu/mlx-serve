@@ -7002,7 +7002,7 @@ fn isJsonLiteral(s: []const u8) bool {
 }
 
 /// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
-fn isJsonNumber(s: []const u8) bool {
+pub fn isJsonNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
     if (i >= s.len or !std.ascii.isDigit(s[i])) return false;

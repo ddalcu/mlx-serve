@@ -153,13 +153,14 @@ enum ModelUseState: Equatable {
         }
     }
 
-    /// Tooltip. Says what the state *means* for the server, not what the badge says.
+    /// Tooltip. Says what the state *means* for the server, not what the badge
+    /// says. The row renders this verbatim, so the lookup runs here.
     var help: String {
         switch self {
         case .idle:     return ""
-        case .inUse:    return "This model is loaded and serving requests."
-        case .loading:  return "The server is loading this model…"
-        case .selected: return "This model will load when you start the server."
+        case .inUse:    return L10n.text("This model is loaded and serving requests.")
+        case .loading:  return L10n.text("The server is loading this model…")
+        case .selected: return L10n.text("This model will load when you start the server.")
         }
     }
 }

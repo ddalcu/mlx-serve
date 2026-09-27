@@ -29,7 +29,7 @@ struct MediaGenProgress: Equatable {
     /// steps to count.
     var detailText: String {
         guard total > 0 else { return message }
-        return "\(message) — step \(step) of \(total)"
+        return L10n.format("%@ — step %lld of %lld", message, Int64(step), Int64(total))
     }
 
     /// `m:ss` since the generation started. Never negative: a startedAt in the
@@ -76,13 +76,13 @@ enum MediaSSE {
         case "progress":
             return .progress(step: ev["step"] as? Int ?? 0,
                              total: ev["total"] as? Int ?? 0,
-                             stage: ev["stage"] as? String ?? "Generating")
+                             stage: ev["stage"] as? String ?? L10n.text("Generating"))
         case "complete":
             return .complete
         case "error":
             // A typed error with no message is still an error — never silently
             // ignored, or the stream just ends and the caller reports "no data".
-            return .failed(ev["message"] as? String ?? "Generation failed.")
+            return .failed(ev["message"] as? String ?? L10n.text("Generation failed."))
         default:
             return .ignored
         }

@@ -90,16 +90,16 @@ if (typeof document !== 'undefined') (function () {
 <style>
 .mhead{display:flex;align-items:center;gap:10px;margin:24px 0 10px}
 .mhead h2{margin:0}
-#m-status{font-size:11px;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;background:#1a1e25;color:#7d8794}
+#m-status{font-size:0.6875rem;font-weight:600;letter-spacing:.02em;padding:2px 9px;border-radius:999px;background:#1a1e25;color:#7d8794}
 #m-status.live{background:#0f2a17;color:#4ade80}
 #m-status.err{background:#2a0f14;color:#ff95a8}
 .mgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 @media(max-width:640px){.mgrid{grid-template-columns:repeat(2,1fr)}}
 .mtile{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:12px 14px}
-.mlbl{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;margin-bottom:7px}
-.mval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:26px;font-weight:700;line-height:1;color:#e6e9ee}
-.munit{font-size:12px;font-weight:400;color:#7d8794;margin-left:4px}
-.msub{font-size:11px;color:#5b6470;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mlbl{font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;margin-bottom:7px}
+.mval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.625rem;font-weight:700;line-height:1;color:#e6e9ee}
+.munit{font-size:0.75rem;font-weight:400;color:#7d8794;margin-left:4px}
+.msub{font-size:0.6875rem;color:#5b6470;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mbar{height:5px;background:#1f242c;border-radius:3px;margin-top:10px;overflow:hidden}
 .mfill{height:100%;width:0;border-radius:3px;background:#3b82f6;transition:width .5s}
 .mfill.warn{background:#f59e0b}.mfill.crit{background:#ef4444}
@@ -107,29 +107,44 @@ if (typeof document !== 'undefined') (function () {
 @media(max-width:640px){.mspark{grid-template-columns:1fr}}
 .msparkbox{background:#0f1216;border:1px solid #1f242c;border-radius:8px;padding:10px 12px}
 .msparkhead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
-.msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:15px;font-weight:700;color:#e6e9ee}
+.msparkval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9375rem;font-weight:700;color:#e6e9ee}
 .msparkbox svg{width:100%;height:44px;display:block}
+:root[data-theme=light] .mbase{stroke:var(--line)}
+:root[data-theme=light] .mtile,:root[data-theme=light] .msparkbox{background:#fff;border-color:#e1e2e6}
+:root[data-theme=light] .mval,:root[data-theme=light] .msparkval{color:#1e1f22}
+:root[data-theme=light] .mlbl,:root[data-theme=light] .munit{color:#5b616b}
+:root[data-theme=light] .msub{color:#878d96}
+:root[data-theme=light] .mbar{background:#e7e8ec}
+:root[data-theme=light] #m-status{background:#ececf0;color:#5b616b}
+:root[data-theme=light] #m-status.live{background:#e3f5ee;color:#0f7b5f}
+:root[data-theme=light] #m-status.err{background:#fdeceb;color:#b3261e}
 </style>
-<div class=mhead><h2 style="margin:0">Live metrics</h2><span id=m-status>connecting…</span></div>
+<div class=mhead><h2 style="margin:0" data-i18n="Live metrics">Live metrics</h2><span id=m-status data-i18n="connecting…">connecting…</span></div>
 <div class=card style="padding:16px">
 <div class=mgrid>
-<div class=mtile><div class=mlbl>Decode</div><div class=mval><span id=m-decode-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-decode-ms>— ms avg</div></div>
-<div class=mtile><div class=mlbl>Prefill</div><div class=mval><span id=m-prefill-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-prefill-ms>— ms avg</div></div>
-<div class=mtile><div class=mlbl>Requests</div><div class=mval><span id=m-running>0</span><span class=munit>running</span></div><div class=msub id=m-waiting>0 waiting · — req/s</div></div>
-<div class=mtile><div class=mlbl>Avg TTFT</div><div class=mval><span id=m-ttft>—</span><span class=munit>ms</span></div><div class=msub id=m-e2e>— ms e2e</div></div>
-<div class=mtile><div class=mlbl>Cache hit rate</div><div class=mval><span id=m-cache>—</span><span class=munit>%</span></div><div class=msub id=m-cachedetail>— / — queries</div></div>
+<div class=mtile><div class=mlbl data-i18n="Decode">Decode</div><div class=mval><span id=m-decode-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-decode-ms data-i18n="— ms avg">— ms avg</div></div>
+<div class=mtile><div class=mlbl data-i18n="Prefill">Prefill</div><div class=mval><span id=m-prefill-tps>—</span><span class=munit>tok/s</span></div><div class=msub id=m-prefill-ms data-i18n="— ms avg">— ms avg</div></div>
+<div class=mtile><div class=mlbl data-i18n="Requests">Requests</div><div class=mval><span id=m-running>0</span><span class=munit data-i18n="running">running</span></div><div class=msub id=m-waiting data-i18n="0 waiting · — req/s">0 waiting · — req/s</div></div>
+<div class=mtile><div class=mlbl data-i18n="Avg TTFT">Avg TTFT</div><div class=mval><span id=m-ttft>—</span><span class=munit>ms</span></div><div class=msub id=m-e2e data-i18n="— ms e2e">— ms e2e</div></div>
+<div class=mtile><div class=mlbl data-i18n="Cache hit rate">Cache hit rate</div><div class=mval><span id=m-cache>—</span><span class=munit>%</span></div><div class=msub id=m-cachedetail data-i18n="— / — queries">— / — queries</div></div>
 <div class=mtile><div class=mlbl>GPU</div><div class=mval><span id=m-gpu>0</span><span class=munit>%</span></div><div class=mbar><div class=mfill id=m-gpubar></div></div></div>
-<div class=mtile><div class=mlbl>Memory</div><div class=mval><span id=m-mem>0</span><span class=munit>MB</span></div><div class=msub>physical footprint</div></div>
-<div class=mtile><div class=mlbl>Generated</div><div class=mval><span id=m-gen>0</span><span class=munit>tok</span></div><div class=msub id=m-success>0 requests</div></div>
+<div class=mtile><div class=mlbl data-i18n="Memory">Memory</div><div class=mval><span id=m-mem>0</span><span class=munit>MB</span></div><div class=msub data-i18n="physical footprint">physical footprint</div></div>
+<div class=mtile><div class=mlbl data-i18n="Generated">Generated</div><div class=mval><span id=m-gen>0</span><span class=munit>tok</span></div><div class=msub id=m-success data-i18n="0 requests">0 requests</div></div>
 </div>
 <div class=mspark>
-<div class=msparkbox><div class=msparkhead><span class=mlbl>Decode tok/s · last 60s</span><span class=msparkval id=m-spark-decode-val>—</span></div><svg id=m-spark-decode viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
-<div class=msparkbox><div class=msparkhead><span class=mlbl>Prefill tok/s · last 60s</span><span class=msparkval id=m-spark-prefill-val>—</span></div><svg id=m-spark-prefill viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Decode tok/s · last 60s">Decode tok/s · last 60s</span><span class=msparkval id=m-spark-decode-val>—</span></div><svg id=m-spark-decode viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
+<div class=msparkbox><div class=msparkhead><span class=mlbl data-i18n="Prefill tok/s · last 60s">Prefill tok/s · last 60s</span><span class=msparkval id=m-spark-prefill-val>—</span></div><svg id=m-spark-prefill viewBox="0 0 300 44" preserveAspectRatio="none"></svg></div>
 </div>
 </div>`;
 
+  // The panel brings its own markup, so the language boot cannot know about it:
+  // translate it here, and follow later switches.
+  const I18N = (typeof window !== 'undefined' && window.mlxI18n) ? window.mlxI18n : null;
+  const t = (key, params) => (I18N ? I18N.t(key, params) : key);
+
   const mount = document.getElementById('mlx-metrics');
   if (mount) mount.innerHTML = PANEL_HTML;
+  if (I18N && mount) I18N.applyMarkup(mount);
 
   const $ = (id) => document.getElementById(id);
   const samples = [];              // {t, gen, dsum, prompt, psum, req} ring buffer
@@ -145,9 +160,20 @@ if (typeof document !== 'undefined') (function () {
     return v.toFixed(d === undefined ? 1 : d);
   }
 
+  // The status text is never table copy (it carries a fetch error verbatim), so
+  // the slot's data-i18n must go with it — otherwise a language switch would
+  // put "connecting…" back over a live feed.
+  // A value slot also carries a static placeholder in the markup ("— ms avg"),
+  // so writing a number has to take that key away: a language switch must
+  // re-render data by re-running the tick, not by restoring the placeholder.
+  function setVal(id, txt) {
+    const e = $(id);
+    if (e) { e.removeAttribute('data-i18n'); e.textContent = txt; }
+  }
+
   function setStatus(cls, txt) {
     const e = $('m-status');
-    if (e) { e.className = cls; e.textContent = txt; }
+    if (e) { e.removeAttribute('data-i18n'); e.className = cls; e.textContent = txt; }
   }
 
 
@@ -174,7 +200,7 @@ if (typeof document !== 'undefined') (function () {
     let m =
       '<polyline points="' + pts + '" fill="none" stroke="' + color +
       '" stroke-width="1.5" stroke-linejoin="round"/>' +
-      '<line x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) +
+      '<line class=mbase x1="' + p + '" y1="' + (H - 1) + '" x2="' + (W - p) + '" y2="' + (H - 1) +
       '" stroke="#1f242c" stroke-width="1"/>';
     const hi = hover[key];
     if (hi !== null && hi >= 0 && hi < n) {
@@ -214,12 +240,12 @@ if (typeof document !== 'undefined') (function () {
     let d;
     try {
       const r = await fetch('/metrics.json', { cache: 'no-store' });
-      if (r.status === 503) { setStatus('err', 'metrics disabled'); return; }
+      if (r.status === 503) { setStatus('err', t('metrics disabled')); return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       d = await r.json();
-    } catch (e) { setStatus('err', 'error: ' + e.message); return; }
+    } catch (e) { setStatus('err', t('error: %@', [e.message])); return; }
 
-    setStatus('live', '● live');
+    setStatus('live', t('● live'));
     const c = d.counters, g = d.gauges, h = d.histograms;
     const now = Date.now();
 
@@ -253,25 +279,25 @@ if (typeof document !== 'undefined') (function () {
     const tokPct = tokTotal > 0 ? Math.round((c.prefix_cache_tokens_total / tokTotal) * 100) : null;
 
     $('m-decode-tps').textContent = fmt(decodeTps, 1);
-    $('m-decode-ms').textContent = (decodeMs !== null ? fmt(decodeMs, 0) : '—') + ' ms avg';
+    setVal('m-decode-ms', t('%@ ms avg', [decodeMs !== null ? fmt(decodeMs, 0) : '—']));
     // Big number = live prefill speed, 0 when not prefilling (mirrors Decode).
     $('m-prefill-tps').textContent = fmt(prefillTps, 0);
     // Sub-line doubles as the phase indicator AND carries the stable average, so
     // "0 tok/s while decoding" never means "I don't know how fast prefill is".
     // The phase flag flips at prefill START; the token count appears once the
     // first chunk lands (and never for ds4/llama, which prefill elsewhere).
-    $('m-prefill-ms').textContent = prefilling
-      ? ('prefilling' + (r.livePre > 0 ? ' · ' + fmt(r.livePre, 0) + ' tok' : ''))
+    setVal('m-prefill-ms', prefilling
+      ? (t('prefilling') + (r.livePre > 0 ? ' · ' + fmt(r.livePre, 0) + ' tok' : ''))
       : (avgPrefillTps !== null
-          ? (fmt(avgPrefillTps, 0) + ' tok/s avg · ' + (prefillMs !== null ? fmt(prefillMs, 0) : '—') + ' ms')
-          : '— ms avg');
+          ? t('%@ tok/s avg · %@ ms', [fmt(avgPrefillTps, 0), prefillMs !== null ? fmt(prefillMs, 0) : '—'])
+          : t('%@ ms avg', ['—'])));
     $('m-running').textContent = g.requests_running;
-    $('m-waiting').textContent = g.requests_waiting + ' waiting · ' + (reqRate !== null ? fmt(reqRate, 2) : '—') + ' req/s';
+    setVal('m-waiting', t('%@ waiting · %@ req/s', [g.requests_waiting, reqRate !== null ? fmt(reqRate, 2) : '—']));
     $('m-ttft').textContent = ttft !== null ? fmt(ttft, 0) : '—';
-    $('m-e2e').textContent = (e2e !== null ? fmt(e2e, 0) : '—') + ' ms e2e';
+    setVal('m-e2e', t('%@ ms e2e', [e2e !== null ? fmt(e2e, 0) : '—']));
     $('m-cache').textContent = cachePct !== null ? cachePct : '—';
-    $('m-cachedetail').textContent = ch + ' / ' + cq + ' queries'
-      + (tokPct !== null ? ' · ' + tokPct + '% tokens reused' : '');
+    setVal('m-cachedetail', t('%@ / %@ queries', [ch, cq])
+      + (tokPct !== null ? ' · ' + t('%@% tokens reused', [tokPct]) : ''));
 
     const gp = g.gpu_utilization_pct;
     $('m-gpu').textContent = gp;
@@ -282,7 +308,7 @@ if (typeof document !== 'undefined') (function () {
     $('m-mem').textContent = g.memory_mb;
     // Live count (completed + in-flight) so it moves during a running request.
     $('m-gen').textContent = fmt(liveTok, 0);
-    $('m-success').textContent = fmt(c.requests_success_total, 0) + ' requests';
+    setVal('m-success', t('%@ requests', [fmt(c.requests_success_total, 0)]));
 
     spark('m-spark-decode', decodeHist, '#22c55e', 'm-spark-decode-val', 'decode', 1);
     spark('m-spark-prefill', prefillHist, '#3b82f6', 'm-spark-prefill-val', 'prefill', 0);
@@ -290,6 +316,8 @@ if (typeof document !== 'undefined') (function () {
 
   attachSparkHover('m-spark-decode', 'decode', function () { return decodeHist; }, '#22c55e', 'm-spark-decode-val', 1);
   attachSparkHover('m-spark-prefill', 'prefill', function () { return prefillHist; }, '#3b82f6', 'm-spark-prefill-val', 0);
+  if (I18N) I18N.onChange(function () { if (mount) I18N.applyMarkup(mount); tick(); });
+
   tick();
   setInterval(tick, 1000);
 })();

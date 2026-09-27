@@ -1924,3 +1924,63 @@ Cause: two things in the f32 decoder's last two stages. MLX's 3x3 conv holds an 
 Fix: both exact. Large 3x3 convs run in row strips over a once-padded input (`Conv.forwardStrips`). Whole stages run in row bands with a `2·resnets + 2` row halo that is cropped (`Stage.banded`): the channel norm is per-pixel (it is `rms_norm`, which also replaced a five-tensor spelled-out chain), the shortcuts fold/unfold 2x2 cells, so only the 3x3 convs look sideways. Peak 18.1 → 9.5 GB, same pixels.
 
 Guard: `QwenImage VAE parity` re-runs the reference oracle with every stage forced into 8-row bands; `QwenImage strip conv equals the whole-image conv`. An uncapped MLX buffer pool in a test binary also reads as a leak: the e2e test sets the 1 GB cap the server sets in `main()`.
+
+## Nemotron-H: two spellings of the layer pattern, and an MoE arm that was `unreachable`
+
+Symptom: `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` failed to load with `MISSING WEIGHT: backbone.layers.0.mixer.q_proj.weight`.
+
+Cause 1: Nemotron 3.5 configs write the layer pattern as `layers_block_type: ["mamba", "moe", ...]` instead of `hybrid_override_pattern: "MEM*..."`. Only the string was parsed, so every layer kept the `.attention` default and layer 0 (a Mamba2 block) looked for attention weights.
+
+Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFast that is UB and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. Every `E`-block Nemotron (3 Nano, 3.5) hit it; only dense Nemotron-H ever loaded.
+
+Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 decode step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
+
+Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
+
+## Nemotron-H: attention ran with RoPE the model never had
+
+Symptom: the Lightning 30B-A3B answered short chats fluently, but a code hidden in a 3k-28k token log came back as a wrong code or a run of comma-separated numbers. The MTP head, whose attention has the same bug, accepted about 1.1 tokens per round and only broke even.
+
+Cause: `hybridAttnWith` serves LFM2 and Nemotron-H, and applied RoPE for both. Nemotron-H attention is NoPE (HF `NemotronHAttention`, mlx-lm): the config carries `rope_theta` and `partial_rotary_factor`, but nothing reads them. The Mamba2 layers carry position, so short text survives rotated keys; long-range lookup through the six attention layers does not.
+
+Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round. `ModelConfig.cacheLayoutNamespace` gives Nemotron-H a fresh SSD prefix-cache root, because the fingerprint hashes only the model dir, the config's stat and the overrides: keys persisted by the RoPE build would otherwise restore into the NoPE model.
+
+Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head), `modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root`.
+
+## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
+
+Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded slower than serial. (Pre- vs post-norm input measured a wash once NoPE landed; pre-norm stays, per the pack's config.)
+
+Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m; on a 3B-active MoE the verify forward's weight traffic doubles by depth 2, while the head's chained acceptance decays. Depth 2 is the peak (about 1.2x serial once the RoPE fix above landed); depth 1 and depth 3+ are slower.
+
+Fix: `forwardHybridWith` captures `h` before the final norm; `MtpModel.layout == .nemotron` (bare keys, dense `eh_proj`, no QK norms, `nemotronMoe` MLP); `ModelConfig.mtpDepth` returns 2 for `nemotron_h` when no depth is configured; verify windows up to 8 rows ride the in-place expert path (`nemotronMoeDecodeExperts` over (token, expert) pairs) instead of the sort machinery.
+
+Guards: `mtp: loadMtp detects the Nemotron-H layout`, `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (tiny trunk + head on disk, greedy MTP == serial), `nemotronMoe matches a host reference` (in-place window path AND the sorted path), live `tests/test_mtp_equivalence.sh` with `MTP_FORCE_ENABLE=1`.
+
+## Nemotron-H: the fused add+norm path dropped the shared expert
+
+Symptom: after the decode fusions landed, greedy text was coherent for ~30 tokens and then degenerated into word salad; every kernel unit test was green.
+
+Cause: `add_norm.moeCombineAddNorm` (residual add + next norm with the MoE K-sum folded in) was written while the shared expert rode the expert banks as extra rows. When that fold was measured slower and removed, the fused MoE arm in `forwardHybridWith` kept summing only the routed slots — the composed `nemotronMoeCombine` still added the shared expert, so the plain path was right and the fused path was wrong, and nothing compared the two at the forward level.
+
+Fix: the kernel takes the shared expert's output as an input (`XS`, `SHARED` template flag) and mirrors MLX's single-row `rms_norm` reduction exactly, so the fused step is bit-equal to the composed ops. Rule: a fused path that replaces a chain carries every term of the chain, and a forward-level test compares the two.
+
+Guards: `hybrid decode: the fused add+norm path equals the unfused blocks (Nemotron-H)` (tiny Mamba2 + MoE-with-shared trunk, fused vs `add_norm_max_rows = 0`, tolerance 0), `add_norm: plain and MoE-combine arms match the composed ops` (tolerance 0, with and without a shared expert).
+
+## Nemotron-H: a single routing group ran the composed router chain
+
+Symptom: the decode micro-benchmark counted ~1400 ops per forward; the per-MoE-layer routing cost ~30 µs against a ~5 µs router matvec.
+
+Cause: `groupLimitedRouting` only tried the `.sigmoid_bias_grouped` kernel, which declines `n_group <= 1`. Nemotron 3.5 configs set `n_group: 1`, so every MoE layer fell to the astype/sigmoid/add/argpartition/take/sum chain.
+
+Fix: a single group selects the ungrouped `.sigmoid_bias` kernel (the hy3 chain's semantics: sigmoid + bias keys, raw sigmoid weights, renorm, scale). Guard: `nemotronMoe matches a host reference of NemotronHMoE` runs through the fused router.
+
+## Nemotron-H: the Mamba2 SSM output widened the whole residual stream to f32
+
+Symptom: `[dtype-trace] hybrid: residual widened at layer 0: bfloat16 -> float32` on every Nemotron-H run; decode ran at roughly half speed.
+
+Cause: `mamba2Mixer` keeps the SSM state in f32 (correct — `mamba_ssm_cache_dtype: float32`), so `y` is f32. mlx-lm's `ssm_attn` returns `y.astype(x.dtype)`; ours did not, so the gate, the group RMS norm and `out_proj` ran in f32 and returned f32. Layer 0 is a Mamba2 block, so every later layer read its weights wider.
+
+Fix: cast `y` to the SSM input's dtype before the gated norm. Greedy text diverges after a few words (bf16 vs f32 near-tie); both fluent.
+
+Guard: `mamba2Mixer keeps a bf16 residual stream bf16` (one bf16 Mamba2 layer through `forward`, asserts a bf16 result). Hybrid test setup is shared in `testHybridXfm`.

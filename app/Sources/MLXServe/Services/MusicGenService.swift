@@ -204,7 +204,7 @@ final class MusicGenService: ObservableObject {
            let dir = ServerManager.resolveModelDir(repo: request.model.repo),
            Self.coverWeightsMissing(packDir: dir) {
             task?.cancel()
-            phase = .running(step: 0, total: 0, message: "Downloading cover weights (\(Self.coverWeightsFile))…")
+            phase = .running(step: 0, total: 0, message: L10n.format("Downloading cover weights (%@)…", Self.coverWeightsFile))
             downloads.startPackFile(repoId: request.model.repo, fileName: Self.coverWeightsFile) { [weak self] in
                 self?.generate(request, server: server)
             }
@@ -221,7 +221,7 @@ final class MusicGenService: ObservableObject {
         }
 
         task?.cancel()
-        phase = .running(step: 0, total: 3, message: "Loading model…")
+        phase = .running(step: 0, total: 3, message: L10n.text("Loading model…"))
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
@@ -251,14 +251,14 @@ final class MusicGenService: ObservableObject {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? 0
-                        let stage = ev["stage"] as? String ?? "Generating"
+                        let stage = ev["stage"] as? String ?? L10n.text("Generating")
                         let label: String
                         switch stage {
-                        case "encode", "prefill": label = "Encoding prompt…"
+                        case "encode", "prefill": label = L10n.text("Encoding prompt…")
                         case "frames": label = "Composing (frame \(step)/\(total))…"
                         case "diffuse": label = "Composing (step \(step)/\(total))…"
                         case "decode": label = "Rendering audio (\(step)/\(total))…"
-                        default: label = "\(stage)…"
+                        default: label = L10n.format("%@…", L10n.text(stage))
                         }
                         phase = .running(step: step, total: total, message: label)
                     case "complete":

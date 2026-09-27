@@ -37,10 +37,15 @@ import sys
 GROUP_SIZE = 64
 PRESETS = {"32gb": (8, 8), "16gb": (4, 4)}
 
-# component -> (key prefix a quantized linear must carry, dropped key fragments)
+# component -> (quantize prefixes a 2D .weight may carry, dropped key fragments)
+# the tower prefixes name its matmul linears only: pos_embed is a gather-read table
+# (embed_tokens precedent) and patch_embed a conv, so both stay dense
 COMPONENTS = {
-    "transformer": ("transformer_blocks.", ()),
-    "text_encoder": ("model.language_model.layers.", ("model.visual.", "lm_head.")),
+    "transformer": (("transformer_blocks.",), ()),
+    "text_encoder": (
+        ("model.language_model.layers.", "model.visual.blocks.", "model.visual.merger.", "model.visual.deepstack_merger_list."),
+        ("lm_head.",),
+    ),
     "vae": (None, (".time_conv.",)),
 }
 COPY = {
@@ -80,10 +85,11 @@ pipeline_tag: text-to-image
 ## What is in it
 
 The checkpoint's own diffusers layout and key names, with the DiT block linears and the
-text-encoder layer linears affine-quantized to {bits}-bit (group 64). Kept dense: the VAE
-(f32), `embed_tokens`, norms, and the DiT's small or shared linears. Dropped: the Qwen3-VL
-vision tower and `lm_head` (text-to-image only) and the VAE's per-frame `time_conv`s.
-Built by `tests/convert_qwen_image21_weights.py --preset {preset}`.
+text-encoder layer linears affine-quantized to {bits}-bit (group 64), plus the Qwen3-VL
+vision tower kept with its 2D linears quantized the same way (patch embed and position
+table stay dense), so the pack also carries instruction-edit capability. Kept dense: the VAE (f32), `embed_tokens`, norms, and the DiT's small or
+shared linears. Dropped: `lm_head` (text-to-image only) and the VAE's per-frame
+`time_conv`s. Built by `tests/convert_qwen_image21_weights.py --preset {preset}`.
 
 ## Measured (M1 Pro, 32 GB)
 
@@ -131,8 +137,8 @@ def should_drop(component, name):
 
 
 def should_quantize(component, name, shape, bits):
-    prefix = COMPONENTS[component][0]
-    if prefix is None or bits >= 16 or not name.startswith(prefix):
+    prefixes = COMPONENTS[component][0]
+    if prefixes is None or bits >= 16 or not any(name.startswith(p) for p in prefixes):
         return False
     return name.endswith(".weight") and len(shape) == 2 and shape[1] % GROUP_SIZE == 0
 
@@ -211,8 +217,16 @@ def self_test():
     assert not q("text_encoder", "model.language_model.embed_tokens.weight", (151936, 4096), 8)
     assert not q("text_encoder", "model.language_model.layers.0.mlp.down_proj.weight", (4096, 12288), 16)
     assert not q("vae", "decoder.conv_in.weight", (1152, 64, 3, 3), 8)
-    assert should_drop("text_encoder", "model.visual.blocks.0.attn.qkv.weight")
     assert should_drop("text_encoder", "lm_head.weight")
+    # tower kept for the edit path: 2D linears quantize, pos_embed/patch-embed/norms stay dense
+    assert not should_drop("text_encoder", "model.visual.blocks.0.attn.qkv.weight")
+    assert q("text_encoder", "model.visual.blocks.0.attn.qkv.weight", (3456, 1152), 4)
+    assert q("text_encoder", "model.visual.blocks.0.mlp.linear_fc1.weight", (4304, 1152), 8)
+    assert q("text_encoder", "model.visual.merger.linear_fc1.weight", (2048, 4608), 4)
+    assert q("text_encoder", "model.visual.deepstack_merger_list.0.linear_fc1.weight", (2048, 4608), 4)
+    assert not q("text_encoder", "model.visual.pos_embed.weight", (2304, 1152), 4)
+    assert not q("text_encoder", "model.visual.patch_embed.proj.weight", (1152, 3, 2, 16, 16), 4)
+    assert not q("text_encoder", "model.visual.blocks.0.norm1.weight", (1152,), 4)
     assert should_drop("vae", "decoder.up_blocks.0.upsampler.time_conv.weight")
     assert not should_drop("vae", "decoder.up_blocks.0.upsampler.resample.1.weight")
     for preset in CARDS:

@@ -324,20 +324,21 @@ struct HFModel: Identifiable, Codable {
 
     private static let unsupportedQuantizationTokens: [String] = ["mxfp6"]
 
-    /// Human-readable reason why this model isn't compatible.
+    /// Human-readable reason why this model isn't compatible. The row renders
+    /// it verbatim, so the lookup runs here. `mlx-serve` is the repo's own name.
     var incompatibleReason: String? {
         if isServedMediaRepo {
             return mediaStructureVerified == true ? nil
-                : "Not an mlx-serve pack (missing converted files)"
+                : L10n.text("Not an mlx-serve pack (missing converted files)")
         }
         if !isCompatible, let tag = pipelineTag {
-            return "Not supported (\(tag))"
+            return L10n.format("Not supported (%@)", tag)
         }
         if !isSupportedArchitecture {
-            return "Unsupported architecture"
+            return L10n.text("Unsupported architecture")
         }
         if let quant = unsupportedQuantization {
-            return "Unsupported quantization (\(quant))"
+            return L10n.format("Unsupported quantization (%@)", quant)
         }
         return nil
     }

@@ -36,7 +36,7 @@ enum RefTiles {
         VStack(alignment: .leading, spacing: 6) {
             above()
             Text(text)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -148,7 +148,7 @@ struct RefTile: View {
                 .padding(3)
             }
             Text(promptMarker)
-                .font(.caption2.monospacedDigit())
+                .font(.app(.caption2).monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }

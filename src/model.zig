@@ -880,7 +880,19 @@ pub const ModelConfig = struct {
     /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
     pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
         if (configured == 0 and self.hadamard_block > 0) return 2;
+        // Nemotron-H MoE: every verify row routes to more experts, so the
+        // round cost climbs with depth while the head's acceptance decays;
+        // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
+        if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
         return configured;
+    }
+
+    /// SSD prefix-cache layout marker (`kv_disk_cache.modelFingerprintWithLayout`).
+    /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
+    /// marker gives it a fresh root. Null keeps every other arch's root.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
+        return null;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -3358,6 +3370,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
         config.query_pre_attn_scalar = config.head_dim;
+        // NoPE: the reference attention never rotates q/k, whatever
+        // rope_theta the config carries. Covers the MTP head's layer too.
+        config.layer_no_rope = @splat(true);
         if (cfg_obj.get("rms_norm_eps")) |v| {
             config.rms_norm_eps = jsonFloat(v);
         } else if (cfg_obj.get("layer_norm_epsilon")) |v| {
@@ -3418,6 +3433,46 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                     };
                 }
             }
+        }
+        // Nemotron 3.5 configs spell the same pattern as a list of names; the
+        // string wins when both are present (mlx-lm's order).
+        if (cfg_obj.get("layers_block_type")) |v| {
+            if (v == .array and cfg_obj.get("hybrid_override_pattern") == null) {
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item != .string) continue;
+                    const name = item.string;
+                    config.layer_block_types[i] = if (std.mem.eql(u8, name, "mamba"))
+                        .mamba2
+                    else if (std.mem.eql(u8, name, "mlp"))
+                        .mlp
+                    else if (std.mem.eql(u8, name, "moe"))
+                        .moe
+                    else
+                        .attention;
+                }
+            }
+        }
+        // MoE blocks ('E' / "moe"): sigmoid router with a selection-only
+        // score-correction bias, ReLU^2 routed experts, one shared expert.
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("moe_shared_expert_intermediate_size")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer);
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("moe_latent_size")) |v| {
+            if (v == .integer) return error.UnsupportedNemotronLatentMoe;
         }
         if (config.num_eos_tokens == 0) {
             if (cfg_obj.get("eos_token_id")) |v| {
@@ -3543,6 +3598,15 @@ pub const Weights = struct {
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
         return self.map.get(name);
+    }
+
+    /// Hand the map a new array under `name`, freeing the one it held (load-time
+    /// weight fusion parks its row views here so the originals go away).
+    pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
+        if (self.map.getPtr(name)) |p| {
+            _ = mlx.mlx_array_free(p.*);
+            p.* = arr;
+        }
     }
 
     pub fn count(self: *const Weights) u32 {
@@ -6720,6 +6784,83 @@ test "attnCacheLayerCount: a layer_block_types hybrid counts only its ATTENTION 
     bare.head_dim = 128;
     bare.has_hybrid_layers = true;
     try testing.expectEqual(@as(u32, 16), bare.attnCacheLayerCount());
+}
+
+test "nemotron_h: a layers_block_type LIST sets the per-layer blocks like hybrid_override_pattern" {
+    // Nemotron 3.5 configs ship `layers_block_type` as a list of names and no
+    // pattern string; unread, every layer keeps the `.attention` default.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 7,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072,
+        \\  "layers_block_type": ["mamba", "moe", "mamba", "attention", "mlp", "mamba", "moe"],
+        \\  "mtp_layers_block_type": ["attention", "moe"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    const want = [_]LayerBlockType{ .mamba2, .moe, .mamba2, .attention, .mlp, .mamba2, .moe };
+    for (want, 0..) |b, i| try testing.expectEqual(b, cfg.layer_block_types[i]);
+    try testing.expectEqual(@as(u32, 1), cfg.attnCacheLayerCount());
+}
+
+test "nemotron_h: attention is NoPE in every trunk layer and the MTP head" {
+    // The config ships rope_theta/partial_rotary_factor, but the reference
+    // attention (HF NemotronHAttention, mlx-lm) never rotates q or k.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 4,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "rope_theta": 10000, "partial_rotary_factor": 1.0,
+        \\  "layers_block_type": ["mamba", "attention", "moe", "attention"]
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    // Index num_hidden_layers is the MTP head's attention layer.
+    for (0..cfg.num_hidden_layers + 1) |i| try testing.expect(cfg.layerSkipsRope(@intCast(i)));
+}
+
+test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
+    // Nemotron-3.5-Lightning-30B-A3B's shipped values.
+    const json =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 2688, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 128, "num_experts_per_tok": 6,
+        \\  "moe_intermediate_size": 1856, "moe_shared_expert_intermediate_size": 3712,
+        \\  "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.5, "moe_latent_size": null
+        \\}
+    ;
+    const cfg = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 128), cfg.num_experts);
+    try testing.expectEqual(@as(u32, 6), cfg.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1856), cfg.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 3712), cfg.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_n_group);
+    try testing.expectEqual(@as(u32, 1), cfg.moe_topk_group);
+    try testing.expect(cfg.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.5), cfg.router_scaling_factor);
+    // MoE bills and gates key on this; batching still declines on has_hybrid_layers first.
+    try testing.expect(cfg.isMoe());
+    try testing.expect(cfg.has_hybrid_layers);
+
+    // The latent variant projects into a smaller expert space
+    // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
+    const latent =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 4096, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_latent_size": 1024
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedNemotronLatentMoe, parseConfigFromJson(testing.allocator, latent));
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

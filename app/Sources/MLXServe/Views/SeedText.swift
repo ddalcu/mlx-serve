@@ -104,7 +104,7 @@ struct SeedField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(L10n.text(label)).font(.caption)
+            Text(L10n.text(label)).font(.app(.caption))
             // 4pt, tighter than the gap between two form controls: the dice
             // belongs to the box beside it, not to the row.
             HStack(spacing: 4) {
@@ -114,7 +114,7 @@ struct SeedField: View {
                 } label: {
                     // The dice earns the room the square gives it.
                     Image(systemName: "die.face.5")
-                        .font(.body)
+                        .font(.app(.body))
                         .modifier(PaneChip(square: true))
                 }
                 .buttonStyle(.plain)
@@ -138,7 +138,7 @@ struct SeedField: View {
                 .textFieldStyle(.roundedBorder)
                 // Body, not caption: the bezel follows the font, and a smaller
                 // one sits below the controls it shares a row with.
-                .font(.body.monospacedDigit())
+                .font(.app(.body).monospacedDigit())
                 .frame(width: 160)
                 .focused($focused)
                 .onChange(of: text) { _, t in

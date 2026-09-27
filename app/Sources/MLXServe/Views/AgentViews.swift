@@ -15,7 +15,7 @@ struct PlanCardView: View {
                 Image(systemName: "list.bullet.clipboard")
                     .foregroundStyle(.blue)
                 Text("Plan (\(plan.steps.count) steps)")
-                    .font(.subheadline.weight(.semibold))
+                    .font(.app(.subheadline).weight(.semibold))
                 Spacer()
                 statusBadge
             }
@@ -30,9 +30,9 @@ struct PlanCardView: View {
                         .foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(L10n.text(step.description))
-                            .font(.caption)
+                            .font(.app(.caption))
                         Text(L10n.text(step.tool.displayName))
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -86,7 +86,7 @@ struct PlanCardView: View {
         case .failed: ("Failed", .red)
         }
         Text(text)
-            .font(.caption2.weight(.medium))
+            .font(.app(.caption2).weight(.medium))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(color.opacity(0.15))
@@ -103,14 +103,14 @@ struct PlanCardView: View {
                 .frame(width: 18, height: 18)
             if let result {
                 Image(systemName: result.status == .success ? "checkmark" : "xmark")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.app(.caption2, weight: .bold))
                     .foregroundStyle(.white)
             } else if currentStepIndex == index {
                 ProgressView()
                     .controlSize(.mini)
             } else {
                 Text("\(index + 1)")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.app(.caption2, weight: .semibold))
                     .foregroundStyle(.white)
             }
         }
@@ -136,7 +136,7 @@ struct ToolResultBlockView: View {
         DisclosureGroup(isExpanded: $isExpanded) {
             ScrollView {
                 Text(L10n.text(truncatedOutput))
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.app(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -144,7 +144,7 @@ struct ToolResultBlockView: View {
 
             if let error = result.error, !error.isEmpty {
                 Text(error)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.red)
             }
         } label: {
@@ -152,17 +152,17 @@ struct ToolResultBlockView: View {
                 Image(systemName: step.tool.icon)
                     .foregroundStyle(.secondary)
                 Text(L10n.text(step.description))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .lineLimit(1)
                 Spacer()
                 if result.durationMs > 0 {
                     Text("\(result.durationMs)ms")
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.tertiary)
                 }
                 Image(systemName: result.status == .success ? "checkmark.circle.fill" : "xmark.circle.fill")
                     .foregroundStyle(result.status == .success ? .green : .red)
-                    .font(.caption)
+                    .font(.app(.caption))
             }
         }
         .padding(8)

@@ -47,8 +47,8 @@ final class AgentsWorkspaceModel: ObservableObject {
            WakeWord.collides(phrase, with: store.takenWakePhrases(excluding: d.id)) {
             d.wakePhrase = nil
             draft = d
-            message("That wake phrase is taken",
-                    "Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one.")
+            message(L10n.text("That wake phrase is taken"),
+                    L10n.text("Another agent (or the app's own phrase) already answers to that name, so both would be unreachable. Pick a different one."))
         }
         store.update(d)
         // A live tab talking to this agent picks the change up on its next
@@ -112,7 +112,7 @@ struct AgentListPane: View {
 
     private var paneTitleOnly: some View {
         Text("Agents")
-            .font(.headline)
+            .font(.app(.headline))
             .foregroundStyle(.primary)
             .padding(.leading, 4)
     }
@@ -164,10 +164,10 @@ struct AgentListPane: View {
     private func unreadableIndexNotice(_ url: URL) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Label(L10n.text("Saved agents couldn't be read"), systemImage: "exclamationmark.triangle")
-                .font(.caption.weight(.semibold))
+                .font(.app(.caption).weight(.semibold))
                 .foregroundStyle(.orange)
             Text(L10n.format("The file is kept at %@.", url.lastPathComponent))
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
         }
@@ -176,7 +176,7 @@ struct AgentListPane: View {
 
     private func sectionLabel(_ title: String) -> some View {
         Text(L10n.text(title).uppercased())
-            .font(.caption2.weight(.semibold))
+            .font(.app(.caption2).weight(.semibold))
             .foregroundStyle(.secondary)
             .kerning(0.5)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -193,10 +193,10 @@ struct AgentListPane: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.app(.callout, weight: .semibold))
                     .frame(width: 18)
                 Text("Create New Agent")
-                    .font(.subheadline)
+                    .font(.app(.subheadline))
                 Spacer(minLength: 0)
             }
             .foregroundStyle(.secondary)
@@ -259,13 +259,17 @@ struct AgentDetailPane: View {
                                 appState.startChat(withAgent: draft.id)
                             },
                             onDuplicate: { duplicate(draft) },
-                            onDelete: { model.alert = .init(title: "Delete “\(draft.name)”?",
+                            // The format runs at the producer: the title is
+                            // rendered verbatim in the alert, so building the
+                            // sentence first would leave the key unreachable.
+                            onDelete: { model.alert = .init(title: L10n.format("Delete “%@”?", draft.name),
                                                             kind: .confirmDelete(draft)) },
                             onNotify: { model.message($0, $0) })
             } else {
                 ContentUnavailableView("No agent selected",
                                        systemImage: "person.crop.circle.badge.questionmark",
-                                       description: Text("Pick an agent, or create one from a type."))
+                                       description: Text("Pick an agent, or create one from a type.")
+                                                          .font(.app(.callout)))
             }
         }
         .onChange(of: model.selectedId) { _, newValue in
@@ -335,8 +339,8 @@ struct AgentDetailPane: View {
         guard var d = model.draft, !d.isBuiltIn else { return }
         let brief = d.brief.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !brief.isEmpty else {
-            model.message("Describe the agent first",
-                          "Write a line or two about the assistant you want, then let the model turn it into a prompt.")
+            model.message(L10n.text("Describe the agent first"),
+                          L10n.text("Write a line or two about the assistant you want, then let the model turn it into a prompt."))
             return
         }
         model.isWriting = true
@@ -347,8 +351,9 @@ struct AgentDetailPane: View {
                 result = try await AgentComposer.draftAgent(brief: brief, appState: appState)
             } catch {
                 result = AgentWriter.fallbackDraft(brief: brief)
-                model.message("Wrote it from your description",
-                              "\(error.localizedDescription)\n\nYour description was saved as the prompt — edit it directly, or try again once a model is running.")
+                model.message(L10n.text("Wrote it from your description"),
+                              L10n.format("%@\n\nYour description was saved as the prompt — edit it directly, or try again once a model is running.",
+                                          error.localizedDescription))
             }
             d.systemPrompt = result.systemPrompt
             if d.name.isEmpty || d.name == "New Agent" { d.name = result.name }
@@ -379,17 +384,17 @@ private struct AgentListRow: View {
         Button(action: select) {
             HStack(spacing: 8) {
                 Image(systemName: agent.symbol)
-                    .font(.system(size: 12))
+                    .font(.app(.callout))
                     .frame(width: 18)
                     .foregroundStyle(selectable ? Color.accentColor : .secondary)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(agent.isBuiltIn ? L10n.text(agent.name) : agent.name)
-                        .font(.subheadline)
+                        .font(.app(.subheadline))
                         .foregroundStyle(selected ? Color.accentColor : .primary)
                         .lineLimit(1)
                     if let sub = subtitle {
                         Text(agent.isBuiltIn ? L10n.text(sub) : sub)
-                            .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            .font(.app(.caption2)).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
@@ -419,7 +424,7 @@ private struct AgentListRow: View {
         if hovering || selected {
             Button(action: startChat) {
                 Image(systemName: "bubble.left.and.bubble.right")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.app(.subheadline, weight: .medium))
                     .foregroundStyle(selected ? Color.accentColor : .secondary)
                     .frame(width: 22, height: 22)
                     .contentShape(Rectangle())
@@ -430,7 +435,7 @@ private struct AgentListRow: View {
             .padding(.trailing, 6)
         } else if agent.isBuiltIn {
             Image(systemName: "lock")
-                .font(.caption2)
+                .font(.app(.caption2))
                 .foregroundStyle(.tertiary)
                 .padding(.trailing, 10)
                 .help("Built-in — duplicate it to make changes")
@@ -561,7 +566,7 @@ private struct AgentEditor: View {
     private var nameField: some View {
         TextField("Name", text: $agent.name)
             .textFieldStyle(.plain)
-            .font(.title3.weight(.medium))
+            .font(.app(.title3).weight(.medium))
             .disabled(readOnly)
     }
 
@@ -578,7 +583,7 @@ private struct AgentEditor: View {
                 HStack(spacing: 8) {
                     Image(systemName: "lock.fill").foregroundStyle(.secondary)
                     Text("This is one of the built-in agents. Duplicate it to make it yours.")
-                        .font(.callout)
+                        .font(.app(.callout))
                     Spacer(minLength: 8)
                     Button("Duplicate", action: onDuplicate)
                 }
@@ -654,7 +659,7 @@ private struct AgentEditor: View {
 
     private var symbolBadge: some View {
         Image(systemName: agent.symbol)
-            .font(.system(size: 19, weight: .medium))
+            .font(.app(.title2, weight: .medium))
             .foregroundStyle(Color.accentColor)
             .frame(width: AgentEditorMetrics.avatarSize, height: AgentEditorMetrics.avatarSize)
             .background(Circle().fill(Color.accentColor.opacity(0.16)))
@@ -666,7 +671,7 @@ private struct AgentEditor: View {
     private var symbolEditHint: some View {
         if !readOnly {
             Image(systemName: "pencil.circle.fill")
-                .font(.system(size: 14))
+                .font(.app(.body))
                 .symbolRenderingMode(.palette)
                 .foregroundStyle(Color.white, Color.accentColor)
         }
@@ -718,15 +723,15 @@ private struct AgentEditor: View {
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: showMoreOptions ? "chevron.down" : "chevron.right")
-                    .font(.caption.weight(.semibold))
+                    .font(.app(.caption).weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text("More options").font(.headline)
+                Text("More options").font(.app(.headline))
                 Spacer(minLength: 8)
                 // What's set behind the row while it's shut, so a collapsed
                 // non-default isn't a setting nobody can find again.
                 if !showMoreOptions, let summary = AgentAdvancedSummary.text(for: agent) {
                     Text(L10n.text(summary))
-                        .font(.subheadline)
+                        .font(.app(.subheadline))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -756,7 +761,7 @@ private struct AgentEditor: View {
 
     private var promptEditor: some View {
         TextEditor(text: $agent.systemPrompt)
-            .font(.body)
+            .font(.app(.body))
             .scrollContentBackground(.hidden)
             .frame(minHeight: AgentEditorMetrics.promptMinHeight)
             .padding(AgentEditorMetrics.wellPadding)
@@ -777,12 +782,12 @@ private struct AgentEditor: View {
             // with two fields on one screen, which is confusing even when (as
             // here, sharing a binding) they cannot disagree.
             Text("Written from the description under the name.")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.app(.subheadline)).foregroundStyle(.secondary)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
             Text("\(agent.systemPrompt.count)/\(AgentWriter.maxPromptCharacters)")
-                .font(.subheadline).foregroundStyle(.tertiary)
+                .font(.app(.subheadline)).foregroundStyle(.tertiary)
                 .monospacedDigit()
         }
     }
@@ -862,7 +867,7 @@ private struct AgentEditor: View {
         DisclosureGroup(isExpanded: $showAdvancedTools) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(.app(.caption2)).foregroundStyle(.secondary)
                     // The chat's Tools menu's own groups (`AgentToolGroup`) —
                     // one grouping for both surfaces, and SessionToolDisableTests
                     // pins that the groups cover exactly the toggleable set. A
@@ -873,7 +878,7 @@ private struct AgentEditor: View {
                         ForEach(AgentToolGroup.allCases, id: \.self) { group in
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(L10n.text(group.title).uppercased())
-                                    .font(.caption2.weight(.semibold))
+                                    .font(.app(.caption2).weight(.semibold))
                                     .foregroundStyle(.secondary)
                                     .kerning(0.5)
                                 ForEach(group.tools, id: \.self) { tool in
@@ -958,7 +963,7 @@ private struct AgentEditor: View {
         case .needsDownload(let path):
             HStack {
                 Label("Not downloaded", systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange).font(.subheadline)
+                    .foregroundStyle(.orange).font(.app(.subheadline))
                 Spacer(minLength: 8)
                 Button("Open Model Browser") {
                     appState.showModels()
@@ -968,10 +973,10 @@ private struct AgentEditor: View {
                                   (path as NSString).lastPathComponent))
             }
         case .unavailable(let reason):
-            Label(reason, systemImage: "wifi.slash").foregroundStyle(.orange).font(.subheadline)
+            Label(L10n.text(reason), systemImage: "wifi.slash").foregroundStyle(.orange).font(.app(.subheadline))
         case .noChange, .load, .lan:
             Text("Selecting this agent loads its model; “Current” leaves whatever is running alone.")
-                .font(.subheadline).foregroundStyle(.secondary)
+                .font(.app(.subheadline)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -984,7 +989,7 @@ private struct AgentEditor: View {
                 AgentEditorRow("Folder",
                                caption: "Where this agent's file and shell tools run. Several agents may share a folder.") {
                     Text(L10n.text(agent.workingDirectory ?? "App default"))
-                        .font(.subheadline.monospaced())
+                        .font(.app(.subheadline).monospaced())
                         .lineLimit(1).truncationMode(.head)
                         .foregroundStyle(agent.workingDirectory == nil ? .secondary : .primary)
                 }
@@ -1036,8 +1041,8 @@ private struct AgentEditor: View {
         // just quietly speak in the system voice — say so instead.
         if case .clone = agent.voice, !ttsDownloaded,
            let reason = VoiceCloneMenuModel.cloneUnavailableReason(ttsModelDownloaded: false) {
-            Label(reason, systemImage: "exclamationmark.triangle.fill")
-                .font(.subheadline).foregroundStyle(.orange)
+            Label(L10n.text(reason), systemImage: "exclamationmark.triangle.fill")
+                .font(.app(.subheadline)).foregroundStyle(.orange)
         }
         voiceActions
     }
@@ -1056,7 +1061,7 @@ private struct AgentEditor: View {
                 .disabled(readOnly)
                 .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
             if let error = previewer.error ?? clipError {
-                Text(error).font(.subheadline).foregroundStyle(.orange)
+                Text(L10n.text(error)).font(.app(.subheadline)).foregroundStyle(.orange)
             }
             Spacer(minLength: 0)
         }
@@ -1180,7 +1185,7 @@ private struct AgentEditor: View {
                 }
                 .frame(width: 160)
                 Text(String(format: "%.2f", value.wrappedValue ?? seed))
-                    .font(.caption.monospaced())
+                    .font(.app(.caption).monospaced())
                     .foregroundStyle(isDefault ? .secondary : .primary)
                     .frame(width: Self.valueColumnWidth, alignment: .trailing)
                 appDefaultToggle(value: value, seed: seed)
@@ -1213,7 +1218,7 @@ private struct AgentEditor: View {
                 }
                 .frame(width: 160)
                 Text(L10n.text(label(effective)))
-                    .font(.caption.monospaced())
+                    .font(.app(.caption).monospaced())
                     .foregroundStyle(isDefault ? .secondary : .primary)
                     .frame(width: Self.valueColumnWidth, alignment: .trailing)
                 appDefaultToggle(value: value, seed: seed)
@@ -1228,7 +1233,7 @@ private struct AgentEditor: View {
             Spacer()
             Text(L10n.text(ends.1))
         }
-        .font(.caption2)
+        .font(.app(.caption2))
         .foregroundStyle(dimmed ? .tertiary : .secondary)
     }
 
@@ -1333,7 +1338,7 @@ private struct AgentVoiceMenu: View {
                 }
                 Menu("Your voices") {
                     if !globalClipPath.isEmpty {
-                        choice(globalClipLabel.isEmpty ? "Settings clip" : "\(globalClipLabel) (Settings)",
+                        choice(globalClipLabel.isEmpty ? "Settings clip" : L10n.format("%@ (Settings)", globalClipLabel),
                                isOn: voice == .clone(globalClipPath)) { voice = .clone(globalClipPath) }
                             .disabled(!cloneAvailable)
                     }

@@ -64,8 +64,13 @@ struct FaviconView: View {
             } else {
                 ZStack {
                     monogramColor
+                    // A glyph in a circle, not running text: the smallest step
+                    // on the ladder, which is what a 16pt tile has room for.
+                    // It no longer scales with `size` — a bigger tile gets the
+                    // same glyph, because the ladder is the only place a
+                    // number comes from.
                     Text(String(domain.first ?? "?").uppercased())
-                        .font(.system(size: size * 0.6, weight: .semibold))
+                        .font(.app(.caption2, weight: .semibold))
                         .foregroundStyle(.white)
                 }
             }
@@ -105,10 +110,10 @@ struct WebSourcesChip: View {
                         }
                     }
                     Text("\(sources.count) source\(sources.count == 1 ? "" : "s")")
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.app(.caption2, weight: .semibold))
                         .foregroundStyle(.tertiary)
                 }
                 .padding(.horizontal, 8)
@@ -121,7 +126,7 @@ struct WebSourcesChip: View {
 
             if expanded {
                 Text("\(sources.count) WEB SOURCE\(sources.count == 1 ? "" : "S")")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.app(.caption2, weight: .semibold))
                     .foregroundStyle(.tertiary)
                     .padding(.top, 2)
                 VStack(spacing: 4) {
@@ -140,16 +145,16 @@ struct WebSourcesChip: View {
             HStack(spacing: 10) {
                 FaviconView(domain: source.domain, size: 20)
                 Text(L10n.text(source.title))
-                    .font(.callout)
+                    .font(.app(.callout))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 8)
                 Text(L10n.text(source.domain))
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.app(.caption2, weight: .semibold))
                     .foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 10)

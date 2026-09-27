@@ -55,11 +55,6 @@ enum SettingsReset {
                 f("enableMetrics") { $0.enableMetrics = $1.enableMetrics },
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
-                f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
-                f("osMemoryReserve") { $0.osMemoryReserve = $1.osMemoryReserve },
-                f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
-                f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
-                f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
             ]
 
         case .lanSharing:
@@ -85,15 +80,25 @@ enum SettingsReset {
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 
+        case .memory:
+            return [
+                f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
+                f("osMemoryReserve") { $0.osMemoryReserve = $1.osMemoryReserve },
+                f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
+                f("maxResidentModels") { $0.maxResidentModels = $1.maxResidentModels },
+                f("idleEvictSecs") { $0.idleEvictSecs = $1.idleEvictSecs },
+                f("kvQuant") { $0.kvQuant = $1.kvQuant },
+                f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
+                f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
+                f("pleGpu") { $0.pleGpu = $1.pleGpu },
+            ]
+
         // One section, so one reset: the universal knob and the MLX-only ones.
         case .performance:
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
                 f("decodeAttnQuantChoice") { $0.decodeAttnQuantChoice = $1.decodeAttnQuantChoice },
-                f("kvQuant") { $0.kvQuant = $1.kvQuant },
-                f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
-                f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },
                 f("enablePrefixCacheDisk") { $0.enablePrefixCacheDisk = $1.enablePrefixCacheDisk },
                 f("prefixCacheDisk") { $0.prefixCacheDisk = $1.prefixCacheDisk },
             ]

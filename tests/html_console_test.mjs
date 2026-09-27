@@ -7,10 +7,11 @@
 // functions and pinned here.
 //
 // Run: node --test tests/html_console_test.mjs
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -979,4 +980,253 @@ test('speechBody never sends both voice and ref_audio', () => {
 
   const plain = C.speechBody({ model: 'm', text: 'hi' });
   assert.deepEqual(plain, { model: 'm', input: 'hi' });
+});
+
+// ── theme.js ↔ app.css (the console's light/dark boot) ──────────────────────
+// The boot is plain DOM code, so the stub below is its whole environment: no
+// browser is needed to watch it pick a theme, flip it, or survive a store that
+// throws. What the shell script used to grep for is asserted here instead.
+const themeSrc = readFileSync(join(here, '..', 'src', 'html', 'theme.js'), 'utf8');
+const themeCss = readFileSync(join(here, '..', 'src', 'html', 'app.css'), 'utf8');
+const metricsSrc = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
+
+function bootTheme({ stored = null, osLight = false, throwOnRead = false, throwOnWrite = false } = {}) {
+  const attrs = new Map();
+  const writes = [];
+  const listeners = [];
+  const state = { stored };
+  const sandbox = {
+    document: { documentElement: { setAttribute: (k, v) => attrs.set(k, v) } },
+    localStorage: {
+      getItem: () => {
+        if (throwOnRead) throw new Error('blocked');
+        return state.stored;
+      },
+      setItem: (k, v) => {
+        if (throwOnWrite) throw new Error('blocked');
+        writes.push([k, v]);
+        state.stored = v;
+      },
+    },
+  };
+  const media = { matches: osLight, addEventListener: (_, fn) => listeners.push(fn) };
+  sandbox.window = { matchMedia: () => media };
+  runInNewContext(themeSrc, sandbox);
+  return { theme: sandbox.window.mlxTheme, attrs, writes, listeners, media };
+}
+
+test('theme.js lets the OS decide when nothing is stored, and keeps deciding', () => {
+  assert.equal(bootTheme({ osLight: true }).attrs.get('data-theme'), 'light');
+  assert.equal(bootTheme({ osLight: false }).attrs.get('data-theme'), 'dark');
+  const live = bootTheme({ osLight: true });
+  live.media.matches = false;
+  live.listeners.forEach((fn) => fn());
+  assert.equal(live.attrs.get('data-theme'), 'dark', 'an unstored page follows the OS as it changes');
+});
+
+test('a stored choice wins over the OS', () => {
+  assert.equal(bootTheme({ stored: 'dark', osLight: true }).attrs.get('data-theme'), 'dark');
+  assert.equal(bootTheme({ stored: 'light', osLight: false }).attrs.get('data-theme'), 'light');
+});
+
+test('toggle() flips the attribute, persists the choice, and a reload keeps it', () => {
+  const t = bootTheme({ osLight: false });
+  assert.equal(t.theme.toggle(), 'light');
+  assert.equal(t.attrs.get('data-theme'), 'light');
+  assert.deepEqual(t.writes.at(-1), ['mlx-serve-theme', 'light']);
+  assert.equal(t.theme.toggle(), 'dark');
+  assert.equal(t.attrs.get('data-theme'), 'dark');
+  assert.deepEqual(t.writes.at(-1), ['mlx-serve-theme', 'dark']);
+  assert.equal(bootTheme({ stored: t.writes.at(-1)[1], osLight: true }).attrs.get('data-theme'), 'dark');
+});
+
+test('a store that throws still leaves a themed page', () => {
+  const broken = bootTheme({ osLight: true, throwOnRead: true, throwOnWrite: true });
+  assert.equal(broken.attrs.get('data-theme'), 'light', 'the boot reads the OS instead');
+  assert.equal(broken.theme.toggle(), 'dark', 'and a flip still applies without being remembered');
+  assert.equal(broken.attrs.get('data-theme'), 'dark');
+});
+
+test('the light palette restates every variable the dark palette sets', () => {
+  // metrics.js carries its own <style>, so it needs its own light block too.
+  assert.ok(/:root\[data-theme=light\]/.test(metricsSrc), 'metrics.js must restate its palette');
+  // Colours only: a font stack like `--mono` is the same in both themes.
+  const varsIn = (text, coloursOnly = false) =>
+    new Set([...text.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)]
+      .filter((m) => !coloursOnly || /^(#|rgb|hsl)/.test(m[2].trim()))
+      .map((m) => m[1]));
+  const blockAfter = (decl) => {
+    const at = themeCss.indexOf(decl);
+    assert.ok(at >= 0, `${decl} must exist`);
+    const open = themeCss.indexOf('{', at);
+    let depth = 0;
+    for (let i = open; i < themeCss.length; i++) {
+      if (themeCss[i] === '{') depth++;
+      else if (themeCss[i] === '}' && --depth === 0) return themeCss.slice(open, i);
+    }
+    throw new Error('unbalanced block');
+  };
+  // The first `:root` is the dark base; the light block restates what it must.
+  const base = varsIn(blockAfter(':root {'), true);
+  const light = varsIn(blockAfter(':root[data-theme=light]'));
+  const missing = [...base].filter((v) => !light.has(v));
+  assert.deepEqual(missing, [], 'a variable left out of the light block is a dark island');
+});
+
+// ── i18n.js (the console's language boot) ───────────────────────────────────
+// The boot is DOM code with one file-private table pair, so the stub below is
+// its whole environment: what the shell script used to grep for is asserted by
+// running it.
+const i18nSrc = readFileSync(join(here, '..', 'src', 'html', 'i18n.js'), 'utf8');
+
+function bootI18n({ languages = ['en-US'], stored = null, nodes = [] } = {}) {
+  const store = { value: stored };
+  const htmlAttrs = [];
+  const sandbox = {
+    navigator: { languages },
+    localStorage: { getItem: () => store.value, setItem: (_, v) => { store.value = v; } },
+  };
+  sandbox.document = {
+    readyState: 'complete',
+    documentElement: { setAttribute: (k, v) => htmlAttrs.push([k, v]) },
+    querySelectorAll: () => nodes,
+    addEventListener: () => {},
+  };
+  sandbox.window = {};
+  runInNewContext(i18nSrc, sandbox);
+  return { i18n: sandbox.window.mlxI18n, htmlAttrs, store };
+}
+
+// A key whose zh-Hans value carries two `%@`, read out of the shipped table so
+// the assertion cannot drift from it.
+const twoParam = (() => {
+  for (const m of i18nSrc.matchAll(/^\s*"((?:[^"\\]|\\.)*)":\s*"((?:[^"\\]|\\.)*)",?$/gm)) {
+    if ((m[2].match(/%@/g) || []).length === 2) return [m[1], m[2]];
+  }
+  throw new Error('the zh-Hans table must carry a two-parameter line');
+})();
+
+test('t() falls back to the key and substitutes %@ positionally', () => {
+  const { i18n } = bootI18n({ languages: ['zh-CN'] });
+  assert.equal(i18n.lang, 'zh-Hans');
+  assert.equal(i18n.t('New chat'), '新建聊天');
+  assert.equal(i18n.t('a key no table carries'), 'a key no table carries');
+  // The fallback is the TEMPLATE, not the answer: a param-carrying key with
+  // no entry used to return early and leave the literal `%@` on the page.
+  assert.equal(i18n.t('a key no table carries %@', ['x']), 'a key no table carries x');
+  const [key, value] = twoParam;
+  const filled = value.replace('%@', 'ONE').replace('%@', 'TWO');
+  assert.equal(i18n.t(key, ['ONE', 'TWO']), filled, `${key} takes its arguments in order`);
+});
+
+test('the browser decides the language when nothing is stored', () => {
+  assert.equal(bootI18n({ languages: ['zh-CN', 'en'] }).i18n.lang, 'zh-Hans');
+  assert.equal(bootI18n({ languages: ['en-GB'] }).i18n.lang, 'en');
+  assert.equal(bootI18n({ languages: ['fr-FR'] }).i18n.lang, 'en', 'an unsupported language falls back to English');
+  assert.deepEqual(bootI18n({ languages: ['zh-CN'] }).htmlAttrs.at(-1), ['lang', 'zh-Hans']);
+});
+
+test('a stored choice wins over the browser, and a bogus one is ignored', () => {
+  assert.equal(bootI18n({ stored: 'zh-Hans', languages: ['en-US'] }).i18n.lang, 'zh-Hans');
+  assert.equal(bootI18n({ stored: 'en', languages: ['zh-CN'] }).i18n.lang, 'en');
+  assert.equal(bootI18n({ stored: 'de', languages: ['en-US'] }).i18n.lang, 'en');
+  const t = bootI18n({ stored: 'en', languages: ['en-US'] });
+  t.i18n.setLang('zh-Hans');
+  assert.equal(t.store.value, 'zh-Hans', 'a switch is remembered');
+  assert.equal(t.i18n.lang, 'zh-Hans');
+});
+
+test('applyMarkup fills the text, title, aria-label and placeholder slots', () => {
+  const el = (attrs) => {
+    const own = { ...attrs };
+    return {
+      getAttribute: (k) => (k in own ? own[k] : null),
+      setAttribute: (k, v) => { own[k] = v; },
+      textContent: '',
+      innerHTML: '',
+      matches: () => false,
+      own,
+    };
+  };
+  const text = el({ 'data-i18n': 'New chat' });
+  const title = el({ 'data-i18n-title': 'Language' });
+  const aria = el({ 'data-i18n-aria-label': 'Language' });
+  const placeholder = el({ 'data-i18n-placeholder': 'New chat' });
+  const root = { querySelectorAll: () => [text, title, aria, placeholder] };
+  const { i18n } = bootI18n({ languages: ['zh-CN'], nodes: [] });
+  i18n.applyMarkup(root);
+  assert.equal(text.textContent, '新建聊天');
+  assert.equal(title.own.title, '语言');
+  assert.equal(aria.own['aria-label'], '语言');
+  assert.equal(placeholder.own.placeholder, '新建聊天');
+});
+
+// A marked key with no entry falls back to English, so a missed entry is a
+// string that silently stays untranslated in a Chinese console.
+test('every marked key in index.html has a zh-Hans entry', () => {
+  const i18nSrc = readFileSync(join(here, '..', 'src', 'html', 'i18n.js'), 'utf8');
+  const table = i18nSrc.match(/var ZH = \{([\s\S]*?)\n  \}/);
+  assert.ok(table, 'i18n.js must carry the zh-Hans table');
+  const keys = new Set([...table[1].matchAll(/^\s*"((?:[^"\\]|\\.)*)"\s*:/gm)].map((m) => m[1]));
+
+  const page = readFileSync(join(here, '..', 'src', 'html', 'index.html'), 'utf8');
+  const marked = [...page.matchAll(/data-i18n(?:-title|-aria-label|-placeholder)?="([^"]*)"/g)].map((m) => m[1]);
+  assert.ok(marked.length > 10, `the markup scan found ${marked.length} marked keys`);
+
+  const missing = [...new Set(marked)].filter((k) => !keys.has(k));
+  assert.deepEqual(missing, [], `marked key(s) with no zh-Hans entry: ${missing.join(', ')}`);
+});
+
+// ── Type is relative, so the reader's browser size applies ────────────────
+// A `px` font size ignores the browser's own default font size AND the page
+// zoom, which is the one text-size control a reader of the console actually
+// has. `rem` follows the root size, so the same value renders at whatever the
+// reader chose. The app's own ladder is the same idea in point sizes
+// (`app/Sources/MLXServe/Support/AppType.swift`); this is the web half of the
+// same rule, and the scan is what stops a later stylesheet from quietly
+// putting px back.
+
+test('no console stylesheet states a font size in px', () => {
+  const files = ['app.css', 'metrics.js', 'index.html', 'app.js'];
+  const offenders = [];
+  for (const name of files) {
+    const text = readFileSync(join(here, '..', 'src', 'html', name), 'utf8');
+    for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
+      const line = text.slice(0, m.index).split('\n').length;
+      offenders.push(`${name}:${line}: ${m[0].trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
+    'Use rem (px / 16): 13px is 0.8125rem.');
+});
+
+// ── Type is relative, so the reader's browser size applies ────────────────
+// A `px` font size ignores the browser's own default font size AND the page
+// zoom, which is the one text-size control a reader of the console actually
+// has. `rem` follows the root size, so the same value renders at whatever the
+// reader chose. The app's own ladder is the same idea in point sizes
+// (`app/Sources/MLXServe/Support/AppType.swift`); this is the web half of the
+// same rule, and the scan is what stops a later stylesheet from quietly
+// putting px back.
+
+test('no console stylesheet states a font size in px', () => {
+  // The DIRECTORY, not a list of files. `src/html` gains scripts as the
+  // console grows (theme.js, i18n.js), and a fixed list quietly stops covering
+  // the day one is added — the rule would hold for the names in the array and
+  // for nothing else.
+  const dir = join(here, '..', 'src', 'html');
+  const files = readdirSync(dir).filter((f) => /\.(css|js|html)$/.test(f));
+  assert.ok(files.length >= 4, `only ${files.length} console files to scan — is the walk working?`);
+  const offenders = [];
+  for (const name of files) {
+    const text = readFileSync(join(dir, name), 'utf8');
+    for (const m of text.matchAll(/(?:^|[\s{;"'])font(?:-size)?\s*:\s*(\d+(?:\.\d+)?)px\b/g)) {
+      const line = text.slice(0, m.index).split('\n').length;
+      offenders.push(`${name}:${line}: ${m[0].trim()}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `font sizes in px ignore the reader's own text size:\n  ${offenders.join('\n  ')}\n` +
+    'Use rem (px / 16): 13px is 0.8125rem.');
 });

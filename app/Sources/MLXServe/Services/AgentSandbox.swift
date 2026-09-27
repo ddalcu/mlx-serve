@@ -702,14 +702,14 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     static func transportFallbackReason(kernelData: Data?, agentBinary: String?) -> String? {
         var missing: [String] = []
         if agentBinary == nil {
-            missing.append("the vz-agent guest binary is missing from the app bundle (reinstall or rebuild the app)")
+            missing.append(L10n.text("the vz-agent guest binary is missing from the app bundle (reinstall or rebuild the app)"))
         }
         if let kernelData {
             if !kernelHasVsockSupport(kernelData) {
-                missing.append("the guest kernel predates \(kernelTag) (no vsock support — delete ~/.mlx-serve/sandbox to re-fetch)")
+                missing.append(L10n.format("the guest kernel predates %@ (no vsock support — delete ~/.mlx-serve/sandbox to re-fetch)", kernelTag))
             }
         } else {
-            missing.append("the guest kernel could not be read")
+            missing.append(L10n.text("the guest kernel could not be read"))
         }
         return missing.isEmpty ? nil : missing.joined(separator: "; ")
     }
@@ -975,9 +975,10 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 do {
                     let (g, root) = try self.ensureBooted(image: image, workingDirectory: hostCwd)
                     guard self.transport == .vsock else {
-                        let why = self.transportFallback ?? "the guest booted the legacy console shell"
-                        throw SandboxError(message:
-                            "MCP servers need the vsock guest transport: \(why)")
+                        let why = self.transportFallback
+                            ?? L10n.text("the guest booted the legacy console shell")
+                        throw SandboxError(message: L10n.format(
+                            "MCP servers need the vsock guest transport: %@", why))
                     }
                     // Only the shared folder exists in the guest; anything else
                     // maps to /workspace rather than silently landing elsewhere.
@@ -1025,7 +1026,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
                          budget: AgentBudget.Budget, apiKey: String?,
                          entries: [AgentModelEntry] = [],
-                         workingDirectory: String? = nil) async throws -> CliSession {
+                         workingDirectory: String? = nil, resume: Bool = false) async throws -> CliSession {
         let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -1051,12 +1052,12 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                     let remoteCommand: String
                     if let agent {
                         guard let model, !model.isEmpty else {
-                            throw SandboxError(message: "no model is loaded — start the server before opening a \(agent.displayName) session")
+                            throw SandboxError(message: L10n.format("no model is loaded — start the server before opening a %@ session", agent.displayName))
                         }
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
                             budget: budget, apiKey: apiKey, entries: entries,
-                            rootfsDir: rootfsDir, cwd: cwd)
+                            rootfsDir: rootfsDir, cwd: cwd, resume: resume)
                         remoteCommand = "sh \(bootstrap)"
                     } else {
                         // The image's shell is bash (agent-shell-mlxserve Dockerfile).
@@ -1070,7 +1071,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         Thread.sleep(forTimeInterval: 0.1)
                     }
                     guard self.sshMirrorActive(port: sshPort) else {
-                        throw SandboxError(message: "the guest network never came up — no ssh mirror on localhost:\(sshPort)")
+                        throw SandboxError(message: L10n.format("the guest network never came up — no ssh mirror on localhost:%lld", Int(sshPort)))
                     }
 
                     let label = agent?.displayName ?? "shell"
@@ -1186,7 +1187,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         // something is wrong with the bundle. Fail loudly rather than boot a VM
         // whose MCP servers can never connect.
         if BuildFeatures.current.isMAS && cfg.transport == .legacyConsole {
-            throw SandboxError(message: "the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete")
+            throw SandboxError(message: L10n.text("the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete"))
         }
         let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
         cfg.network = net
@@ -1280,7 +1281,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             forwarder?.stop(); forwarder = nil
             sshForwarder?.stop(); sshForwarder = nil
             NSLog("[sandbox] boot failed: \(error)\n--- guest console tail ---\n\(tail)\n--- end ---")
-            throw SandboxError(message: "sandbox failed to start: \(error). Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)")
+            throw SandboxError(message: L10n.format("sandbox failed to start: %@. Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)", String(describing: error)))
         }
         guest = g; sharedRoot = root
         currentSshPort = bootSshPort; rootfsPath = rootfs
@@ -1368,11 +1369,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
         let (gz, resp) = try OCIClient.httpGet(Self.kernelURL)
         guard resp.statusCode == 200 else {
-            throw SandboxError(message: "could not download the sandbox kernel (HTTP \(resp.statusCode))")
+            throw SandboxError(message: L10n.format("could not download the sandbox kernel (HTTP %lld)", resp.statusCode))
         }
         let kernel = try OCIClient.gunzip(gz)
         guard Self.kernelHasVirtiofsSupport(kernel) else {
-            throw SandboxError(message: "downloaded sandbox kernel lacks virtiofs support — release asset mismatch")
+            throw SandboxError(message: L10n.text("downloaded sandbox kernel lacks virtiofs support — release asset mismatch"))
         }
         try kernel.write(to: dest, options: .atomic)
         return dest.path
@@ -1404,7 +1405,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 NSLog("[sandbox] \(msg)")
             }
         } catch {
-            throw SandboxError(message: "could not pull the sandbox base image \"\(image)\" (\(Self.guestArch)): \(error.localizedDescription)")
+            throw SandboxError(message: L10n.format("could not pull the sandbox base image \"%@\" (%@): %@", image, Self.guestArch, error.localizedDescription))
         }
         fm.createFile(atPath: marker.path, contents: Data())
         return dir.path

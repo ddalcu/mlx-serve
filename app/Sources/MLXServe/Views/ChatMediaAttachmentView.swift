@@ -52,7 +52,7 @@ struct ChatMediaAttachmentView: View {
 
     private var missingRow: some View {
         Label("\(ref.filename) — file no longer on disk", systemImage: "questionmark.folder")
-            .font(.caption)
+            .font(.app(.caption))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -112,7 +112,7 @@ private struct RevealInFinderButton: View {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
         } label: {
             Image(systemName: "folder")
-                .font(.system(size: 11))
+                .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
                 .contentShape(Rectangle())
         }
@@ -130,7 +130,7 @@ private struct ChatMediaCaption: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(ref.prompt.isEmpty ? ref.filename : ref.prompt)
-                .font(.caption)
+                .font(.app(.caption))
                 .foregroundStyle(.secondary)
                 .lineLimit(lines)
                 .truncationMode(.tail)
@@ -163,7 +163,7 @@ private struct ChatAudioAttachment: View {
                     isPlaying ? player.stop() : player.play(ref.path)
                 } label: {
                     Image(systemName: isPlaying ? "stop.circle.fill" : "play.circle.fill")
-                        .font(.title2)
+                        .font(.app(.title2))
                         .foregroundStyle(.tint)
                         .contentShape(Rectangle())
                 }
@@ -172,12 +172,12 @@ private struct ChatAudioAttachment: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(L10n.text(ref.filename))
-                        .font(.caption.weight(.medium))
+                        .font(.app(.caption).weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
                     if let duration {
                         Text(L10n.text(duration))
-                            .font(.caption2)
+                            .font(.app(.caption2))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -251,14 +251,14 @@ struct MediaProgressCard: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: progress.kind.icon)
-                        .font(.callout)
+                        .font(.app(.callout))
                         .foregroundStyle(.tint)
                     Text(L10n.text(progress.title))
-                        .font(.caption.weight(.semibold))
+                        .font(.app(.caption).weight(.semibold))
                     Spacer(minLength: 8)
                     TimelineView(.periodic(from: progress.startedAt, by: 1)) { context in
                         Text(progress.elapsedText(now: context.date))
-                            .font(.caption2.monospacedDigit())
+                            .font(.app(.caption2).monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -273,7 +273,7 @@ struct MediaProgressCard: View {
                 .frame(maxWidth: .infinity)
 
                 Text(L10n.text(progress.detailText))
-                    .font(.caption2)
+                    .font(.app(.caption2))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }

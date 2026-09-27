@@ -64,3 +64,24 @@ test "encodeRgb produces a valid PNG" {
     // Ends with IEND.
     try std.testing.expectEqualSlices(u8, "IEND", png[png.len - 8 .. png.len - 4]);
 }
+
+test "encodeRgba round-trips through stb decode" {
+    const a = std.testing.allocator;
+    // 2x2 RGBA with a mid alpha on one pixel.
+    const rgba = [_]u8{
+        10, 20, 30, 255, 200, 100, 50, 128,
+        0, 255, 0, 255, 255, 255, 255, 0,
+    };
+    const png = try encodeRgba(a, &rgba, 2, 2);
+    defer a.free(png);
+
+    const stb = @import("stb");
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const dec = stb.stbi_load_from_memory(png.ptr, @intCast(png.len), &w, &h, &ch, 4) orelse return error.DecodeFailed;
+    defer stb.stbi_image_free(dec);
+    try std.testing.expectEqual(@as(c_int, 2), w);
+    try std.testing.expectEqual(@as(c_int, 2), h);
+    try std.testing.expectEqualSlices(u8, &rgba, dec[0 .. @as(usize, 2) * 2 * 4]);
+}

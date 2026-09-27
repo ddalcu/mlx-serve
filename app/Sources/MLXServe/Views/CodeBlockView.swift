@@ -174,7 +174,10 @@ enum CodeBlockText {
 
 /// Layout constants for a code block.
 enum CodeBlockLayout {
-    static let fontSize: CGFloat = 12
+    /// The code block's text, on the same ladder as everything else: the
+    /// `callout` step, so a block reads at the same size as a chat bubble's
+    /// secondary line instead of at a number of its own.
+    static let fontSize = AppType.pointSize(for: .callout)
     static let cornerRadius: CGFloat = 10
     static let lineSpacing: CGFloat = 2.5
 }
@@ -235,7 +238,7 @@ struct CodeBlockView: View {
     private var header: some View {
         HStack(spacing: 6) {
             Text(L10n.text(label))
-                .font(.system(size: 10, weight: .medium))
+                .font(.app(.caption2, weight: .medium))
                 .foregroundStyle(.secondary)
             Spacer()
             Button {
@@ -251,9 +254,9 @@ struct CodeBlockView: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.app(.caption2, weight: .medium))
                     Text(L10n.text(copied ? "Copied" : "Copy"))
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.app(.caption2, weight: .medium))
                 }
                 .foregroundStyle(copied ? Color.green : Color.secondary)
                 .padding(.horizontal, 6)

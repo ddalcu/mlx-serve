@@ -28,15 +28,15 @@ struct RecommendedStarterCard: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "sparkles")
-                    .font(.system(size: 16))
+                    .font(.app(.title3))
                     .foregroundColor(.accentColor)
                     .frame(width: 24, alignment: .center)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(Self.lead(for: pick)))
-                        .font(.subheadline.weight(.semibold))
+                        .font(.app(.subheadline).weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
                     Text(pick.name)
-                        .font(.caption)
+                        .font(.app(.caption))
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
@@ -54,7 +54,7 @@ struct RecommendedStarterCard: View {
                 ProgressView(value: state.progress)
                 HStack(spacing: 6) {
                     Text("Downloading \(state.percentFormatted) \(state.speedFormatted)")
-                        .font(.caption.monospacedDigit())
+                        .font(.app(.caption).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 0)
@@ -63,7 +63,7 @@ struct RecommendedStarterCard: View {
                         appState.refreshModels()
                     }
                     .buttonStyle(.plain)
-                    .font(.caption)
+                    .font(.app(.caption))
                     .foregroundStyle(.secondary)
                 }
             }
@@ -76,14 +76,14 @@ struct RecommendedStarterCard: View {
                                           Self.actionTitle(hasPartial: downloads.hasPartialDownload(pick.repoId),
                                           failed: state?.status == .failed)
 ))
-                        .font(.subheadline.weight(.medium))
+                        .font(.app(.subheadline).weight(.medium))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 3)
                 }
                 .buttonStyle(.borderedProminent)
                 if let error = state?.error, state?.status == .failed {
                     Text(error)
-                        .font(.caption2)
+                        .font(.app(.caption2))
                         .foregroundStyle(.red)
                         .lineLimit(2)
                 }

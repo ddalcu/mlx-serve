@@ -28,6 +28,7 @@ const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("ane.zig");
+const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -186,6 +187,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
+        \\  --ple-gpu           Qwen3.8-Flash-Next: gather the n-gram table on the
+        \\                        GPU. Keeps the whole ~30 GB table resident beside
+        \\                        the weights for a few % faster prefill/decode;
+        \\                        off = rows read from the mmapped file on demand.
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
@@ -274,13 +279,20 @@ fn printUsage(io: std.Io) void {
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
         \\                        Lower it if a long prompt spikes memory.
+        \\  --prefill-decode-share <s>
+        \\                      Target fraction of wall time (0..0.9) the
+        \\                        decoding streams keep while another request
+        \\                        prefills; also narrows that prefill's chunks.
+        \\                        Default 0 (env MLX_SERVE_PREFILL_DECODE_SHARE).
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables the cache — which also
         \\                        turns off SSM checkpoint capture, since
         \\                        checkpoints exist only to feed it.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Hot prefix cache KV-bytes budget (default: 2GB).
+        \\                      Hot prefix cache KV-bytes budget (default: 2GB,
+        \\                        or one session at the working context on
+        \\                        qwen4_exp when that is larger).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
@@ -568,6 +580,7 @@ pub fn main(init: std.process.Init) !void {
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
     var log_level_explicit = false;
+    var decode_share_flag: ?[]const u8 = null;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -732,6 +745,8 @@ pub fn main(init: std.process.Init) !void {
             force_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
+        } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
+            ple_gpu.enabled = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
@@ -824,6 +839,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.prefix_cache_mem_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
@@ -882,6 +898,9 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
+            i += 1;
+            decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -986,6 +1005,12 @@ pub fn main(init: std.process.Init) !void {
     // server config in reach); the env stays the benching override.
     if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
+
+    const decode_share_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_PREFILL_DECODE_SHARE")) |r| std.mem.sliceTo(r, 0) else null;
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
+        log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+        std.process.exit(1);
+    };
 
     transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
@@ -1633,10 +1658,11 @@ fn chooseGgufEngine(
     defer info.deinit(allocator);
 
     const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={})\n", .{
         @tagName(e),
         info.architecture orelse "?",
         info.has_ds4_lora_rank,
+        info.ds4_unloadable,
     });
     return e;
 }
@@ -1807,8 +1833,14 @@ fn runGenServe(
         e
     else if (registry.peekByPath(model_dir)) |e|
         e
-    else
-        try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
+    else blk: {
+        // The boot stub's arch hint should be the pack's real model_type
+        // (`/v1/models` reports it); the modality marker is only the
+        // no-config fallback.
+        const real = gen_mod.peekModelType(io, allocator, model_dir);
+        defer if (real) |mt| allocator.free(mt);
+        break :blk try registry.registerStubWithArch(model_id, model_dir, null, real orelse modality.modelType());
+    };
     try registry.setDefault(entry.id);
 
     // Registry takes ownership of the stub if the inference thread installed it.

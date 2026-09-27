@@ -263,6 +263,8 @@ Trap: the draft TEMPERATURE is per family. 0.6 was swept on the dense 27B oQ4e s
 
 **MTP round pipelining — the CPU graph-build was the recoverable overhead; our emit gap is ~0.03 ms so pre-draft buys little beyond early dispatch.** Three landed levers, each kill-switched and BIT-IDENTICAL to its off state (lazy sampling ops bind their PRNG key at graph BUILD): (1) **early dispatch** (`MLX_SERVE_MTP_EARLY_DISPATCH=0`) — `mlx_async_eval` the draft chain as soon as Phase 1 builds it, so it runs while the CPU builds Phases 2–4. (2) **cross-round pre-draft** (`MLX_SERVE_MTP_PREDRAFT=0`) — `nextMtp` tail builds+dispatches the next round's chunk A (plan after the EV update == head-of-round); mirrors oMLX `_step_mtp` but our scheduler has no Python-sized emit window, so it ≈ early-dispatch on totals (kept for the cheaper EV boundary sync). A `MtpPreDraft` owns every handle; consume asserts stash-XOR-predraft. (3) **GDN capture-tail trim** — the seq kernel emits `state_out` from registers and never writes `state_seq[T-1]` (partial accept reads ≤ T-2), so the final state is no longer a slice VIEW pinning the whole [T,…] buffer. Residual vs oMLX is GPU work (their round ≈ their AR forward), not scheduling.
 
+**qwen4 lazy predraft — a solo greedy round builds round N+1's chain from its own LAZY verdict, before the host read.** Two layers, each kill-switched: (1) the **padded head** (`MLX_SERVE_MTP_PADDED_HEAD=0` restores the merged `1 + accepted` step) appends the whole verify row `[t1, drafts]` as head history and drafts past the dead rows through `HeadPlace` (dynamic RoPE offset `live_end`, a mask hiding rows `live_end..dead_end`, QSA blocks touching a dead row scored `-inf`), so one formulation serves every accept count; (2) the **lazy chain** (`MLX_SERVE_MTP_LAZY_PREDRAFT=0` restores the tail pre-draft) takes `a` = argmax over the draft/verify mismatch mask with a mismatch appended at m, `t1 = take(argmax, a)`, `h_prev = take_axis(verify_hidden, a)`, and dispatches the chain behind the verify. `mtpPreDraftResolve` keeps it, or discards it and truncates the head to the stash origin (exactly the tail path's input) on a budget/EOS cut, `done`, spec off, or a lookup pick. Gate: solo greedy padded rounds with a successor round only (`mtpLazyPredraftAllowedFor`). **The plan is drawn one round early**: an auto depth change lands a round later than on the tail path. Deliberate: `mtpRoundPlan` advances serial probes and width trials, so drawing it again after the read double-advances the planner. Byte bar is `MLX_SERVE_MTP_FORCE_DEPTH`. Draft ids arrive in mixed ranks (`[1]` head, `[1,1]` samplers): flatten before concatenating (`concatIds`). Measured M5 Ultra: +2.6% greedy decode; `[mtp-trace]` `dispatch` is 14.3 of a 19 ms round with `wait` 0, so host encode, not the tail, bounds what overlap can buy.
+
 **EV controller under honest costs — two structural traps fire once marginals stop being cheap.** (Refit cost constants only on a SATURATED sweep whose realized `m_avg`==depth — ladder prompts demote-flap and poison the fit; echo pins it.) Trap 1 — **two-chunk plans pay a mid-pipeline boundary sync the cost surface can't see** (the chunk-A sync blocks on the still-running head chain + confidence graphs): fix = the extension **dry-spell gate** (`mtpExtDryAllows`: ~16 dry rounds → short single-chunk cooldown → fresh trial; `MLX_SERVE_MTP_EXT_DRY=0`), fed by REALIZED extension rate never priors, cooldown SHORT vs a request's round count (64 swallowed a 160-token request's echo stretch). Trap 2 — **the horizon check deadlocks on an unobservable EMA**: `a[m_lo]` updates ONLY when extension fires, so a value dragged cold under an earlier workload closes the horizon FOREVER (pure echo runs ext_rounds=0). Fix: when the base pays (`best_r > MTP_EV_EXPLORE_MIN_R = 1.10`) one extension position stays reachable at the clamped tau. Pinned by the equivalence echo test + `mtpEvPlanFor` unit tests.
 
 ### A slice handle wrapped in `contiguous` and never freed pins its PARENT's buffer (MageFlow 2.2 GB-per-megapixel leak, 2026-07-25)
@@ -2624,6 +2626,12 @@ serves kv-quant-off and dense-mode reads. Kill switch `MLX_SERVE_SDPA_SPLIT=0`;
 one `[sdpa-split] engaged` log per width 6..9 (the FIRST engagement is the
 warmup's own 8-token prefill at kL=8 — a single one-shot log would witness only
 that, never a real verify, which is why the log is per-width).
+
+Update (PR #554): the split is now gqa-aware. Rows go in groups of
+min(8, 32/gqa) (5 at gqa 6, as above; 2 at gqa 12, Qwen3.8-Flash-Next) over
+qL 2..15, hd 256 only, and it yields to the NAX force-fused call past 8 rows.
+The engagement log is per width 2..15. Flash Next S=4 kv 1500 (M5 Ultra,
+fwd-ubench, 6 on/off pairs): 18.89 -> 18.35 ms/forward median.
 
 Measured (M4 Max, Qwen3.6-27B-oQ4e, kv-quant off, PLD draft-len 6 on an 8k echo
 prompt, A/B/B/A boots, medians of 7 reps): split ON 63.3 / 66.7 tok/s, OFF
@@ -5231,3 +5239,41 @@ only MTP slots draft and verify as a group.
 Fix: `server.requestSpecModes` takes `has_company` (`Scheduler.hasCompany`, any request in
 flight at admission) and hands a DFlash round to a loaded, enabled MTP head. Same cell: 122.
 Known gap: the first request of a burst sees no company and stays DFlash until it finishes.
+
+## Small dense models spent a third of a token on dependent launches (2026-09-26)
+
+- Defect: Spark-X2.5 4B, Gemma 4 E4B, Gemma 4 26B-A4B and LFM2.5 2.6B decoded at 55-65% of
+  the bandwidth floor while the 27B sat at 88%. A 4B forward was ~940 kernels; each dependent
+  small kernel costs ~3 us of GPU idle whatever it computes.
+- Cause: the standard/MoE/hybrid layer seams were op-for-op MLX chains: separate q/k/v and
+  gate/up matmuls, a 6-op exact-GELU, norm -> add -> norm residual seams, three per-head norms
+  plus two RoPEs, and Gemma's PLE gate as two compiled ops.
+- Fix, all bit-identical to the ops they replace: q|k|v(|gate) and gate|up rows JOINED at load
+  into one buffer whose axis-0 views the separate paths keep (`fuseRowGroup`, decode width only:
+  from M == 2 the verify lanes and MLX's split-K pick kernels by N); one residual kernel doing
+  pre-norm(s), add, scalar and post-norm(s) with MLX's own `rms_single_row` tree
+  (`fusedResidualNorm`); unary activations TABULATED once per dtype by running the op chain
+  itself over all 65536 patterns, then one multiply (`tableGateMul`: silu, erf-GELU, tanh-GELU);
+  the hd-256 norm+RoPE kernel grown to v rows, rd 256 and a no-norm form; LFM's gated conv step
+  as one kernel reproducing `depthwise_conv_1d`'s tap-order float loop; Gemma's PLE tail as
+  table-GELU x ple feeding an op-for-op replica of MLX's `qmv` (bf16 partial sums in
+  `load_vector`, masked-nibble products, `scale*accum + sum*bias`, `simd_sum`).
+- A `qmv` replica IS bit-identical to stock (0 mismatches over 10^5 outputs, plain or fma
+  forms alike: bf16 products are exact in f32). It only pays where nothing is recomputed:
+  a whole gate matmul redone per threadgroup, or the activation re-gathered per down-proj
+  threadgroup, both measured SLOWER than the separate dispatches.
+- What did NOT pay: joining independent matmuls alone (the GPU already overlapped them), and
+  cutting barriers inside the residual kernel. Only shortening the dependent chain moved the
+  clock. Decode: Spark +10%, Gemma E4B +9%, Gemma MoE +7%, LFM2.5 +4%; prefill untouched.
+- Bonsai's ternary codes carry log2(3) bits in 2-bit slots, so a base-3 repack (16 trits in
+  26 bits, decoded by one division and two 6561-entry lookups straight into the h2dec word
+  layout) reads 18.75% fewer bytes and IS bit-identical — and ran 20-30% SLOWER at
+  17408x5120 in a dependent chain: the 26-bit fields cost two unaligned word loads per lane
+  and the lookups compete with the weight stream. Prototype `~/claude-tmp/perf-0926/pack3.py`.
+- Guard: `fused row projections`, `fused residual norm chain`, `fused GELU-erf gate`,
+  `fused GELU-tanh gate`, `fused sigmoid gate`, `fused gated conv step`, `qk norm rope fused
+  hd-256 with v rows` tests, plus byte-identical 200-token greedy transcripts (top-5 logprobs)
+  on 17 packs across the standard, hybrid and MoE loops. The join only takes map-owned
+  handles (a copy would stay resident beside the joined buffer) and reports
+  `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
+

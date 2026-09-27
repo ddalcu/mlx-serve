@@ -478,6 +478,8 @@ final class ManagedAtomicFlag: @unchecked Sendable {
 
 struct ReadFileHandler: ToolHandler {
     var gate = FileToolSandboxGate()
+    /// Read-only roots outside the workspace: skill folders the model loads on demand.
+    var readableRoots: [String] = [SkillManager.defaultSkillsDir]
 
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         try gate.check(workingDirectory: workingDirectory)
@@ -485,7 +487,7 @@ struct ReadFileHandler: ToolHandler {
             throw ToolError.missingParameter("path")
         }
 
-        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory, readableRoots: readableRoots)
         guard let data = FileManager.default.contents(atPath: fullPath),
               let content = String(data: data, encoding: .utf8) else {
             throw ToolError.executionFailed("Cannot read file: \(fullPath)")
@@ -918,7 +920,7 @@ let workspaceRequiredMessage = "no working folder is set for this session — th
 /// Resolve a path and verify it stays within the working directory.
 /// Returns the resolved absolute path, or throws if it escapes the workspace
 /// — or when no workspace is set at all (never unconfined).
-private func resolveAndConfine(_ path: String, workingDirectory: String?) throws -> String {
+private func resolveAndConfine(_ path: String, workingDirectory: String?, readableRoots: [String] = []) throws -> String {
     guard let wd = workingDirectory else {
         throw ToolError.executionFailed(workspaceRequiredMessage)
     }
@@ -933,7 +935,8 @@ private func resolveAndConfine(_ path: String, workingDirectory: String?) throws
     let normalizedResolved = (resolved as NSString).standardizingPath
     let normalizedWd = (wd as NSString).standardizingPath
 
-    guard normalizedResolved == normalizedWd || normalizedResolved.hasPrefix(normalizedWd + "/") else {
+    let within = { (root: String) in normalizedResolved == root || normalizedResolved.hasPrefix(root + "/") }
+    guard within(normalizedWd) || readableRoots.contains(where: { within(($0 as NSString).standardizingPath) }) else {
         throw ToolError.executionFailed("Access denied: path '\(path)' resolves to '\(normalizedResolved)' which is outside the workspace '\(normalizedWd)'")
     }
 
