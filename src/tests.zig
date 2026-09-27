@@ -24,6 +24,7 @@ test {
     _ = @import("simd_qmm.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
+    _ = @import("qmv_nax2.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
