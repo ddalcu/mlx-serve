@@ -257,17 +257,43 @@ class DownloadManager: ObservableObject {
     nonisolated static func requiredSubdirs(modelType: String) -> [String] {
         switch modelType {
         case "laya": return ["encoder/", "tokenizer/"]
+        case "flux2-klein": return ["transformer/", "vae/", "text_encoder/", "tokenizer/"]
         default: return []
         }
     }
 
-    /// The configless checkpoint shape a repo's FILE listing describes (no disk
-    /// access) — twin of `model_discovery.checkpointTypeInTree`. A root
-    /// config.json outranks the Laya pair, same precedence as `configlessModelType`.
+    /// Directories a root-config.json media pack must hold before the app
+    /// serves it. A diffusers-layout pack (FLUX.2 klein) keeps every weight in
+    /// its component dirs — a fetch that skipped them leaves a config-shaped
+    /// shell that reads as a model everywhere and loads as `FileNotFound`.
+    /// Twin of `model_discovery.requiredMediaDirsForType` (keep in sync).
+    nonisolated static func requiredMediaDirs(modelType: String) -> [String] {
+        switch modelType {
+        case "flux2-klein": return ["transformer/", "vae/"]
+        default: return []
+        }
+    }
+
+    /// The configless checkpoint shape a repo's FILE listing describes (no
+    /// disk access): identity docs a starved copy cannot forge — they ARE the
+    /// files the old fetch dropped. Twin of `model_discovery.checkpointShapeInTree`
+    /// (keep in sync). A root `config.json`'s media `model_type` outranks both
+    /// rows in the server's order, but it is content a name set cannot read,
+    /// so the fetch flow classifies from that document instead.
     nonisolated static func checkpointType(inPaths paths: Set<String>) -> String {
-        if paths.contains("config.json") { return "" }
         if paths.contains("rl_agent_config.json") && paths.contains("encoder/config.json") { return "laya" }
+        if paths.contains("transformer/model.safetensors.index.json") { return "flux2-klein" }
         return ""
+    }
+
+    /// The shard names a `model.safetensors.index.json` body requires (its
+    /// `weight_map` values), or nil when the document is not an index. Twin of
+    /// `model_discovery.parseIndexShardsFromJson` (keep in sync).
+    nonisolated static func shardNames(fromIndexJSON data: Data) -> Set<String>? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = obj["weight_map"] as? [String: String] else { return nil }
+        let names = Set(map.values)
+        return names.isEmpty ? nil : names
     }
 
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
@@ -428,33 +454,85 @@ class DownloadManager: ObservableObject {
     }
 
     /// Completeness gate covering BOTH checkpoint families: a root-config.json
-    /// media pack via `holdsCompleteMediaPack`, and a CONFIGLESS shape (Laya)
-    /// via `configlessModelType` + its marker. A starved Laya dir must not
-    /// read as ready.
+    /// media pack via `holdsCompleteMediaPack`, and a CONFIGLESS shape (Laya,
+    /// mflux FLUX.2) via `configlessModelType` + its required dirs. A starved
+    /// shape must not read as ready.
     nonisolated static func holdsCompleteCheckpoint(_ dir: String) -> Bool {
         guard holdsCompleteMediaPack(dir) else { return false }
         let fm = FileManager.default
-        if configlessModelType(inDir: dir) == nil { return true }
-        guard let marker = requiredMediaMarker(modelType: "laya") else { return true }
-        let path = (dir as NSString).appendingPathComponent(marker)
-        guard let size = try? fm.attributesOfItem(atPath: path)[.size] as? UInt64 else { return false }
-        return (size ?? 0) > 0
+        guard let shape = configlessModelType(inDir: dir) else { return true }
+        for prefix in requiredSubdirs(modelType: shape) {
+            let sub = (dir as NSString).appendingPathComponent(String(prefix.dropLast()))
+            guard let names = try? fm.contentsOfDirectory(atPath: sub) else { return false }
+            // The dir must hold a real file, not a stub or an in-flight partial.
+            guard names.contains(where: { name in
+                guard !isSkipName(name), !name.hasSuffix(".partial") else { return false }
+                guard let attrs = try? fm.attributesOfItem(atPath: (sub as NSString).appendingPathComponent(name)) else { return false }
+                let size = attrs[.size] as? Int64
+                return (size ?? 0) > 0
+            }) else { return false }
+        }
+        return true
     }
 
     /// False only for a dir whose config.json names a media type and whose
-    /// completeness marker is missing.
+    /// completeness marker or required component dirs are missing.
     nonisolated static func holdsCompleteMediaPack(_ dir: String) -> Bool {
         let fm = FileManager.default
         guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mt = cfg["model_type"] as? String,
-              let marker = requiredMediaMarker(modelType: mt) else { return true }
-        return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
+              let mt = cfg["model_type"] as? String else { return true }
+        if let marker = requiredMediaMarker(modelType: mt) {
+            let path = (dir as NSString).appendingPathComponent(marker)
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let size = attrs[.size] as? UInt64, size > 0 else { return false }
+        }
+        for prefix in requiredMediaDirs(modelType: mt) {
+            let sub = (dir as NSString).appendingPathComponent(String(prefix.dropLast()))
+            guard let names = try? fm.contentsOfDirectory(atPath: sub) else { return false }
+            guard names.contains(where: { name in
+                guard !name.hasSuffix(".partial") else { return false }
+                guard let attrs = try? fm.attributesOfItem(atPath: (sub as NSString).appendingPathComponent(name)) else { return false }
+                let size = attrs[.size] as? UInt64
+                return (size ?? 0) > 0
+            }) else { return false }
+        }
+        return true
     }
 
     /// Laya typed-decision checkpoints ship no root config.json; these two
     /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
+
+    /// The FLUX.2 DiT's shared-modulation tensor — the same marker the server
+    /// keys on (`model_discovery.flux2_dit_marker` / `peekMfluxFlux2`). Unique
+    /// to the architecture, so a `transformer/` whose index or first shard
+    /// header carries it is an mflux FLUX.2 conversion (keep in sync).
+    nonisolated static let flux2DitMarker = "double_stream_modulation_img"
+
+    /// True when `dir/transformer/` holds FLUX.2 DiT weights: the shard index
+    /// (a bounded prefix — the marker is a tensor name near the top), else the
+    /// first shard's safetensors header. Twin of `peekMfluxFlux2` (keep in sync).
+    nonisolated static func holdsFlux2DiT(inDir dir: String) -> Bool {
+        let tdir = (dir as NSString).appendingPathComponent("transformer")
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: tdir) else { return false }
+        func prefix(_ path: String, _ limit: Int) -> String? {
+            guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: limit),
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            return text
+        }
+        if let idx = prefix((tdir as NSString).appendingPathComponent("model.safetensors.index.json"), 1 << 20) {
+            return idx.contains(flux2DitMarker)
+        }
+        for name in names where name.hasSuffix(".safetensors") {
+            guard let head = prefix((tdir as NSString).appendingPathComponent(name), 1 << 20) else { continue }
+            return head.contains(flux2DitMarker) // a single-file conversion: header only
+        }
+        return false
+    }
 
     /// The model_type of a checkpoint that has no root config.json to read
     /// it from, or nil when the dir is not one of those shapes.
@@ -463,6 +541,7 @@ class DownloadManager: ObservableObject {
         if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
             return "laya"
         }
+        if holdsFlux2DiT(inDir: dir) { return "flux2-klein" }
         return nil
     }
 
@@ -831,10 +910,53 @@ class DownloadManager: ObservableObject {
                 throw URLError(.cannotParseResponse)
             }
 
-            // Shape-aware selection: a configless Laya repo gets its required
-            // `encoder/` + `tokenizer/` dirs too.
-            let listing = Self.checkpointType(inPaths: Set(files.compactMap { $0["path"] as? String }))
-            let neededFiles = Self.selectNeededFiles(from: files, selection: selection, checkpointType: listing)
+            // The checkpoint shape decides which files this download NEEDS. A
+            // fetch filter is an allowlist, so the shape comes from documents,
+            // not name patterns: a configless shape's identity docs in the
+            // listing (the Laya pair, the FLUX.2 DiT index — a starved copy
+            // cannot forge them), or the `model_type` read from the root
+            // config.json's content. Chat repos with root weights classify off
+            // the listing with no extra fetch; a repo whose only model bytes
+            // sit below the root is a media pack, and its type is a content
+            // question. Twin of `cli.pullRepo`'s shape pre-flight (keep in sync).
+            let paths = Set(files.compactMap { $0["path"] as? String })
+            var listing = Self.checkpointType(inPaths: paths)
+            if listing.isEmpty && !paths.contains("model.safetensors")
+                && !paths.contains("model.safetensors.index.json") {
+                if paths.contains("config.json") {
+                    let url = URL(string: "https://huggingface.co/\(repoId)/resolve/main/config.json")!
+                    if let (data, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
+                       let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let mt = cfg["model_type"] as? String, isMediaModelType(mt) {
+                        listing = mt
+                    }
+                }
+            }
+
+            var neededFiles = Self.selectNeededFiles(from: files, selection: selection, checkpointType: listing)
+            // The shape's whole dirs join the selection for EVERY selection
+            // kind — required dirs are manifest requirements, not preferences.
+            if !listing.isEmpty {
+                let have = Set(neededFiles.map { $0.0 })
+                neededFiles += Self.selectNeededFiles(from: files, checkpointType: listing).filter { !have.contains($0.0) }
+            }
+
+            // A manifest file the hub's own listing doesn't contain is a
+            // broken repo; refuse before writing anything. Any index counts —
+            // the root's (chat) or a component's (a diffusers layout's DiT).
+            let indexNames = ["model.safetensors.index.json", "transformer/model.safetensors.index.json"]
+            for name in indexNames where paths.contains(name) {
+                let url = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(name)")!
+                if let (data, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
+                   let shards = Self.shardNames(fromIndexJSON: data) {
+                    let absent = shards.subtracting(paths)
+                    guard absent.isEmpty else {
+                        throw NSError(domain: "MLXServe.Download", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "\(repoId)'s manifest names \(absent.count) file(s) the repo does not contain (\(absent.sorted().prefix(3).joined(separator: ", "))) — the hub repo is incomplete; retry once the re-sharded upload settles.",
+                        ])
+                    }
+                }
+            }
 
             // A download that matches NOTHING must say so. `LiquidAI/LFM2.5-2.6B-MLX`
             // keeps every model in a quant subfolder and has no loadable file at
@@ -939,6 +1061,40 @@ class DownloadManager: ObservableObject {
 
                 downloadedSize += fileSize
                 downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
+            }
+
+            // "Complete" only after the required set re-verifies on disk: the
+            // shape's whole dirs each hold a real file, and every index's
+            // shards (the root's or a component's) landed with bytes. A
+            // shortfall names the files instead of a ready row that dies at
+            // `FileNotFound` later.
+            for prefix in Self.requiredSubdirs(modelType: listing) {
+                let sub = (destDir as NSString).appendingPathComponent(String(prefix.dropLast()))
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: sub)) ?? []
+                guard names.contains(where: { name in
+                    guard !Self.isSkipName(name) else { return false }
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: (sub as NSString).appendingPathComponent(name)) else { return false }
+                    let size = attrs[.size] as? Int64
+                    return (size ?? 0) > 0
+                }) else {
+                    throw NSError(domain: "MLXServe.Download", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Download incomplete — \(repoId) is missing every file under \(prefix). Re-download the model.",
+                    ])
+                }
+            }
+            for name in indexNames where FileManager.default.fileExists(atPath: (destDir as NSString).appendingPathComponent(name)) {
+                guard let data = FileManager.default.contents(atPath: (destDir as NSString).appendingPathComponent(name)),
+                      let shards = Self.shardNames(fromIndexJSON: data) else { continue }
+                let missing = shards.filter { path in
+                    guard let attrs = try? FileManager.default.attributesOfItem(atPath: (destDir as NSString).appendingPathComponent(path)) else { return true }
+                    let size = attrs[.size] as? Int64
+                    return (size ?? 0) == 0
+                }
+                guard missing.isEmpty else {
+                    throw NSError(domain: "MLXServe.Download", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "Download incomplete — \(repoId) is missing \(missing.count) manifest shard(s) (\(missing.sorted().prefix(3).joined(separator: ", "))). Re-download the model.",
+                    ])
+                }
             }
 
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",

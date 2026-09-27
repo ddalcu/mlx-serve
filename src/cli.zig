@@ -311,8 +311,8 @@ pub fn shouldDownload(path: []const u8) bool {
     return shouldDownloadAs(path, "");
 }
 
-/// `shouldDownload` plus the checkpoint-shape marker (`checkpointTypeInTree`,
-/// "" for an ordinary root-config.json repo).
+/// `shouldDownload` plus the checkpoint-shape marker (`checkpointShapeInTree`
+/// or a config.json's media `model_type`; "" for an ordinary repo).
 pub fn shouldDownloadAs(path: []const u8, model_type: []const u8) bool {
     if (path.len == 0 or path[0] == '.') return false;
     if (std.mem.indexOfScalar(u8, path, '/') != null) {
@@ -435,10 +435,23 @@ pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
-    return modelPresentInDir(io, dir);
+    // The shape is content, so re-ask the docs on disk (cheap prefix reads):
+    // a media pack's component dirs are required one level deeper than the
+    // .partial scan can see.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const shape = model_discovery.checkpointShapeInOpenDir(io, arena.allocator(), dir);
+    return modelPresentInDir(io, dir, shape orelse "");
 }
 
-fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
+/// True when the pull landed a COMPLETE, loadable copy of `model_type`'s
+/// checkpoint in `dir` — the resume fast-path's question. No .partial anywhere
+/// (root or one subdir deep), the shape's identity docs, and a real file in
+/// every required dir. Media packs keep weights in `requiredMediaDirsForType`
+/// dirs one level DEEPER than the .partial scan, so `model_type` must come
+/// from `checkpointShapeInOpenDir` (content), not a constant.
+/// `DownloadManager.holdsCompleteCheckpoint` (Swift).
+fn modelPresentInDir(io: std.Io, dir: std.Io.Dir, model_type: []const u8) bool {
     var has_config = false;
     var has_safetensors = false;
     var has_gguf = false;
@@ -467,7 +480,6 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
         }
     }
     if (has_gguf) return true;
-    if (!has_config and !has_rl_agent) return false;
     // A configless Laya dir is present only when PROVEN the shape (its
     // identity config `encoder/config.json` holds) and complete: an
     // unproven copy — weights + `rl_agent_config.json`, `encoder/` never
@@ -478,7 +490,27 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
         if (!isLayaDirInDir(io, dir)) return false;
         return has_safetensors and hasRequiredSubdir(io, dir, "tokenizer");
     }
-    return has_config and has_safetensors;
+    // A configless FLUX.2 build ships no root json at all: the shape is proven
+    // by the DiT index inside `transformer/`, so weight dirs are the checkpoint
+    // here. Present means every component dir holds a real file.
+    if (!has_config) {
+        if (!std.mem.eql(u8, model_type, "flux2-klein")) return false;
+        for (model_discovery.requiredSubdirsForType(model_type)) |d| {
+            if (!hasRequiredSubdir(io, dir, d[0 .. d.len - 1])) return false;
+        }
+        return true;
+    }
+    if (!has_safetensors) return false;
+    // Every required dir of the shape (media component dirs, configless shape
+    // dirs) must hold a real file — a pull interrupted inside `transformer/`
+    // leaves the root clean, so the one-deep .partial scan above misses it.
+    for (model_discovery.requiredMediaDirsForType(model_type)) |d| {
+        if (!hasRequiredSubdir(io, dir, d[0 .. d.len - 1])) return false;
+    }
+    for (model_discovery.requiredSubdirsForType(model_type)) |d| {
+        if (!hasRequiredSubdir(io, dir, d[0 .. d.len - 1])) return false;
+    }
+    return true;
 }
 
 /// `model_discovery.peekLayaCheckpoint` over an already-open iterable dir.
@@ -505,6 +537,21 @@ fn hasRequiredSubdir(io: std.Io, dir: std.Io.Dir, sub: []const u8) bool {
 fn treeHasPath(list: []const RepoFile, name: []const u8) bool {
     for (list) |f| if (std.mem.eql(u8, f.path, name)) return true;
     return false;
+}
+
+/// The raw bytes of the hub doc `<dest_dir>/<rel>` when a previous run
+/// landed it, else fetched from the hub (a read, not a pull). Callers parse
+/// the body through `model_discovery`'s shape tables.
+fn fetchTreeDoc(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, rel: []const u8) ![]u8 {
+    if (fileSizeAt(io, dest_dir, rel) != null) {
+        var dir = std.Io.Dir.openDirAbsolute(io, dest_dir, .{}) catch return error.FetchFailed;
+        defer dir.close(io);
+        return dir.readFileAlloc(io, rel, allocator, .limited(1 << 20)) catch error.FetchFailed;
+    } else {
+        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, rel });
+        defer allocator.free(url);
+        return try curlFetch(allocator, io, url);
+    }
 }
 
 /// The hub's tree listing IS the pull's manifest: every file it names that a
@@ -546,8 +593,14 @@ fn collectRequiredFiles(allocator: std.mem.Allocator, io: std.Io, resolved: Reso
             try out.put(try allocator.dupe(u8, f.path), {});
             continue;
         }
-        for (model_discovery.requiredSubdirsForType(checkpoint_type)) |d| {
+        // A media pack's component dirs are recursive — its whole tree is the
+        // pack. A configless shape's required dirs stay flat-part only.
+        for (model_discovery.requiredMediaDirsForType(checkpoint_type)) |d| {
             if (std.mem.startsWith(u8, f.path, d)) matched = true;
+        }
+        for (model_discovery.requiredSubdirsForType(checkpoint_type)) |d| {
+            if (std.mem.startsWith(u8, f.path, d) and
+                std.mem.indexOfScalar(u8, f.path[d.len..], '/') == null) matched = true;
         }
         if (matched and !isSkipName(f.path)) {
             try out.put(try allocator.dupe(u8, f.path), {});
@@ -562,6 +615,9 @@ fn collectRequiredFiles(allocator: std.mem.Allocator, io: std.Io, resolved: Reso
     }
     // The dir keys themselves: verification demands ≥1 non-junk file landed.
     for (model_discovery.requiredSubdirsForType(checkpoint_type)) |d| {
+        if (!out.contains(d)) try out.put(try allocator.dupe(u8, d), {});
+    }
+    for (model_discovery.requiredMediaDirsForType(checkpoint_type)) |d| {
         if (!out.contains(d)) try out.put(try allocator.dupe(u8, d), {});
     }
 }
@@ -597,6 +653,20 @@ fn verifyRequiredFiles(allocator: std.mem.Allocator, io: std.Io, dest_dir: []con
     }
 }
 
+/// True when `dest_dir/<rel>` is a directory holding at least one non-junk
+/// regular file — a required dir counts as satisfied by any real file in it
+/// (the whole-dir merge's post-verify). `DownloadManager`'s post-download dir
+/// check (keep in sync).
+fn dirHasRealFile(io: std.Io, allocator: std.mem.Allocator, dest_dir: []const u8, rel: []const u8) bool {
+    var sub = std.Io.Dir.openDirAbsolute(io, std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, rel }) catch return false, .{ .iterate = true }) catch return false;
+    defer sub.close(io);
+    var it = sub.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .file and !isSkipName(e.name)) return true;
+    }
+    return false;
+}
+
 fn freeMissingNames(allocator: std.mem.Allocator, missing: []const []u8) void {
     for (missing) |m| allocator.free(m);
     allocator.free(missing);
@@ -628,11 +698,32 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    // Checkpoint shape from the tree listing (configless shapes, `laya`).
     var tree_paths: std.ArrayList([]const u8) = .empty;
     defer tree_paths.deinit(allocator);
     for (files) |f| try tree_paths.append(allocator, f.path);
-    const checkpoint_type = model_discovery.checkpointTypeInTree(tree_paths.items);
+
+    // The checkpoint shape decides which files this pull NEEDS. A pull filter
+    // is an allowlist, so the shape comes from documents, not name patterns:
+    // the root config.json's media `model_type` (content — read from the hub's
+    // doc, or the dest dir's copy a previous run landed), else a configless
+    // shape's identity docs in the listing (the Laya pair, the FLUX.2 DiT
+    // index — a starved copy cannot forge them). A chat repo with root weights
+    // answers "" from the config fetch and pulls what it always did.
+    var shape_buf: ?[]const u8 = null;
+    defer if (shape_buf) |s| allocator.free(@constCast(s));
+    var shape: []const u8 = "";
+    if (resolved.gguf_file.len == 0) {
+        if (model_discovery.treeHasPath(tree_paths.items, "config.json")) {
+            if (fetchTreeDoc(allocator, io, resolved, dest_dir, "config.json")) |body| {
+                defer allocator.free(body);
+                shape_buf = model_discovery.mediaTypeFromConfigJson(allocator, body);
+                shape = shape_buf orelse "";
+            } else |_| {}
+        } else if (model_discovery.checkpointShapeInTree(allocator, tree_paths.items, null)) |s| {
+            shape_buf = @constCast(s);
+            shape = s;
+        }
+    }
 
     var required: std.StringHashMap(void) = .init(allocator);
     defer {
@@ -642,10 +733,24 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     }
     if (resolved.gguf_file.len == 0) {
         for (files) |f| {
-            if (shouldDownloadAs(f.path, checkpoint_type))
+            if (shouldDownloadAs(f.path, shape))
                 try required.put(try allocator.dupe(u8, f.path), {});
         }
-        try collectRequiredFiles(allocator, io, resolved, files, checkpoint_type, &required);
+        try collectRequiredFiles(allocator, io, resolved, files, shape, &required);
+        if (shape.len > 0) {
+            // The shape's whole dirs: required as a unit — every file the
+            // hub lists under them, plus the dir key itself.
+            for (model_discovery.requiredSubdirsForType(shape)) |d| {
+                for (files) |f| {
+                    if (!std.mem.startsWith(u8, f.path, d)) continue;
+                    if (isSkipName(f.path)) continue;
+                    if (std.mem.indexOfScalar(u8, f.path[d.len..], '/') != null) continue;
+                    if (!required.contains(f.path))
+                        try required.put(try allocator.dupe(u8, f.path), {});
+                }
+                if (!required.contains(d)) try required.put(try allocator.dupe(u8, d), {});
+            }
+        }
     }
 
     // A manifest file the hub's own listing doesn't contain is a broken repo;
@@ -715,11 +820,35 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         };
     }
 
-    // Claim success only after the required set re-verifies on disk.
+    // Claim success only after the required set re-verifies on disk: every
+    // file the manifest named holds bytes, and every required dir of the
+    // shape holds a real file — the shape the disk copy itself proves (docs
+    // this or a previous pull landed), so a copy starved of its whole dirs
+    // still classifies as its shape and fails with those dirs named.
     if (resolved.gguf_file.len == 0) {
         var missing: std.ArrayList([]u8) = .empty;
         errdefer freeMissingNames(allocator, missing.items);
         try verifyRequiredFiles(allocator, io, dest_dir, &required, &missing);
+        var landed_buf: ?[]const u8 = null;
+        defer if (landed_buf) |s| allocator.free(@constCast(s));
+        const landed: []const u8 = blk: {
+            var landed_dir = std.Io.Dir.openDirAbsolute(io, dest_dir, .{ .iterate = true }) catch {
+                break :blk "";
+            };
+            defer landed_dir.close(io);
+            landed_buf = model_discovery.checkpointShapeInOpenDir(io, allocator, landed_dir);
+            break :blk landed_buf orelse "";
+        };
+        for (model_discovery.requiredSubdirsForType(landed)) |d| {
+            if (!dirHasRealFile(io, allocator, dest_dir, d[0 .. d.len - 1])) {
+                try missing.append(allocator, try allocator.dupe(u8, d));
+            }
+        }
+        for (model_discovery.requiredMediaDirsForType(landed)) |d| {
+            if (!dirHasRealFile(io, allocator, dest_dir, d[0 .. d.len - 1])) {
+                try missing.append(allocator, try allocator.dupe(u8, d));
+            }
+        }
         if (missing.items.len > 0) {
             defer freeMissingNames(allocator, missing.items);
             reporter.say("error: {s} is still missing {d} required file(s):", .{ resolved.repo, missing.items.len });
@@ -1206,7 +1335,7 @@ test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "starved", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // Complete: tokenizer/tokenizer.json landed → present, no re-pull.
@@ -1219,7 +1348,7 @@ test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "whole", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
+        try testing.expect(modelPresentInDir(io, d, ""));
     }
 
     // An interrupted required dir (tokenizer/tokenizer.json.partial) is not
@@ -1228,7 +1357,7 @@ test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "whole", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // A root-config.json pack with a stray rl_agent_config.json keeps the
@@ -1240,7 +1369,7 @@ test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "stray", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
+        try testing.expect(modelPresentInDir(io, d, ""));
     }
 
     // Weights + `rl_agent_config.json` but no `encoder/config.json`: the
@@ -1252,7 +1381,7 @@ test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "identity", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 }
 
@@ -1273,7 +1402,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // config.json + interrupted weights: not present (the user's live repro).
@@ -1281,7 +1410,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // Complete single-file checkpoint: present.
@@ -1291,7 +1420,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
+        try testing.expect(modelPresentInDir(io, d, ""));
     }
 
     // Complete weights but another file still partial (e.g. tokenizer.json):
@@ -1300,7 +1429,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // Interrupted sidecar one subdir deep (mtp/weights.safetensors.partial):
@@ -1312,7 +1441,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "c", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 
     // GGUF: the file itself is the checkpoint (no config.json needed)…
@@ -1321,7 +1450,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "g", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
+        try testing.expect(modelPresentInDir(io, d, ""));
     }
 
     // …but a partial GGUF is not.
@@ -1330,7 +1459,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     {
         var d = try tmp.dir.openDir(io, "h", .{ .iterate = true });
         defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
+        try testing.expect(!modelPresentInDir(io, d, ""));
     }
 }
 

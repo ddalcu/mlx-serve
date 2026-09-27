@@ -88,12 +88,31 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Component dirs (with trailing '/') a media pack keeps its weights in,
+/// keyed on its `model_type`. A diffusers layout ships nothing at the root:
+/// a fetch that skipped these dirs leaves a config-shaped shell that reads
+/// as a model everywhere and dies `FileNotFound` at load. Discovery itself
+/// stays loadable-repo-tolerant (an mflux conversion may legitimately ship
+/// `transformer/` + `text_encoder/` only); the PULL and the resume fast-path
+/// enforce these. `requiredSubdirsForType` is the same contract for the
+/// CONFIGLESS spelling of a shape (no root config.json to read a type from) —
+/// there the whole set is required. App twin: `DownloadManager.requiredMediaDirs`
+/// / `requiredSubdirs` (keep in sync).
+pub fn requiredMediaDirsForType(model_type: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, model_type, "flux2-klein"))
+        return &.{ "transformer/", "vae/" };
+    return &.{};
+}
+
 /// Subdirectory prefixes (with trailing '/') whose files a checkpoint needs to
-/// LOAD, keyed on the configless shape `peekLayaCheckpoint` detects. App twin:
-/// `MediaBundle.laya`'s required dirs (keep in sync).
+/// LOAD, keyed on the configless shape `peekConfig` detects. A diffusers
+/// layout keeps every weight one level down; these are its component dirs.
+/// App twin: `DownloadManager.requiredSubdirs` (keep in sync).
 pub fn requiredSubdirsForType(model_type: []const u8) []const []const u8 {
     if (std.mem.eql(u8, model_type, "laya"))
         return &.{ "encoder/", "tokenizer/" };
+    if (std.mem.eql(u8, model_type, "flux2-klein"))
+        return &.{ "transformer/", "vae/", "text_encoder/", "tokenizer/" };
     return &.{};
 }
 
@@ -232,22 +251,48 @@ pub fn peekLayaCheckpoint(io: std.Io, sub: std.Io.Dir) bool {
     return true;
 }
 
-/// Classify a checkpoint shape from a repo's FILE-NAME listing (the parsed HF
-/// tree JSON — no disk access). "" = an ordinary root-config.json checkpoint;
-/// a root config.json outranks the Laya pair, same precedence as
-/// `configlessModelType`.
-pub fn checkpointTypeInTree(paths: []const []const u8) []const u8 {
-    var has_agent = false;
-    var has_enc = false;
-    var has_root_config = false;
-    for (paths) |p| {
-        if (std.mem.eql(u8, p, "rl_agent_config.json")) has_agent = true;
-        if (std.mem.eql(u8, p, "encoder/config.json")) has_enc = true;
-        if (std.mem.eql(u8, p, "config.json")) has_root_config = true;
+/// The checkpoint shape a hub listing DESCRIBES, in `peekConfig`'s priority
+/// order: the root config.json's media `model_type` outranks a configless
+/// shape's identity docs (the same doc `peekConfig` reads first), and the Laya
+/// pair outranks the diffusers DiT index. A pull filter is an allowlist, so a
+/// media type is never inferred from a name pattern: `config_json` is the
+/// document's bytes (the pull's pre-flight landed them), and an ordinary chat
+/// repo classifies as "" even when the listing carries configless identity
+/// docs (a chat repo that happens to own a `transformer/` must not gain a
+/// media required-set). A non-"" result is owned by `allocator` — the caller
+/// frees it. `DownloadManager.checkpointShape` (Swift).
+pub fn checkpointShapeInTree(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+    config_json: ?[]const u8,
+) ?[]const u8 {
+    if (treeHasPath(paths, "config.json")) {
+        const body = config_json orelse return null;
+        return mediaTypeFromConfigJson(allocator, body);
     }
-    if (has_root_config) return "";
-    if (has_agent and has_enc) return "laya";
-    return "";
+    if (treeHasPath(paths, "rl_agent_config.json") and treeHasPath(paths, "encoder/config.json"))
+        return allocator.dupe(u8, "laya") catch null;
+    if (treeHasPath(paths, "transformer/model.safetensors.index.json"))
+        return allocator.dupe(u8, "flux2-klein") catch null;
+    return null;
+}
+
+/// The media `model_type` a config.json body declares, or null when the
+/// document names an ordinary chat repo. The result is owned by `allocator`
+/// (dupe'd past the JSON parse's lifetime) — callers free it.
+pub fn mediaTypeFromConfigJson(allocator: std.mem.Allocator, bytes: []const u8) ?[]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const mt = parsed.value.object.get("model_type") orelse return null;
+    if (mt != .string or !isMediaModelType(mt.string)) return null;
+    return allocator.dupe(u8, mt.string) catch null;
+}
+
+/// True when `name` (repo-relative path) is in `list`.
+pub fn treeHasPath(list: []const []const u8, name: []const u8) bool {
+    for (list) |p| if (std.mem.eql(u8, p, name)) return true;
+    return false;
 }
 
 /// Parse `model.safetensors.index.json` content (the bytes fetched from
@@ -353,6 +398,40 @@ pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir)
         return std.mem.indexOf(u8, head[8..], flux2_dit_marker) != null;
     }
     return false;
+}
+
+/// True when the dir's `config.json` declares a media `model_type` (a bounded
+/// prefix read — the same doc discovery reads). `null` when the dir has no
+/// config.json, it doesn't parse, or it names an ordinary chat model. The
+/// result is owned by `allocator` — callers free it.
+fn configMediaTypeInOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
+    const cap = 1 << 20;
+    const buf = allocator.alloc(u8, cap) catch return null;
+    defer allocator.free(buf);
+    const head = readPrefix(io, dir, "config.json", buf) orelse return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, head, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const mt = parsed.value.object.get("model_type") orelse return null;
+    if (mt != .string or !isMediaModelType(mt.string)) return null;
+    // `deinit` frees the parse's strings, so hand back a copy that outlives it.
+    return allocator.dupe(u8, mt.string) catch null;
+}
+
+/// The checkpoint shape `dir` (already open) holds on disk, by the same
+/// document probes `peekConfig` runs (its priority order). The pull re-asks
+/// the content before claiming `success:` — a configless shape's identity docs
+/// (which a starved copy cannot forge) decide first, then the root
+/// config.json's `model_type`. A dir holding no shape doc classifies as null
+/// — an ordinary repo. A non-null result is owned by `allocator` — callers
+/// free it. `DownloadManager.holdsCompleteCheckpoint` (Swift) applies the same
+/// docs.
+pub fn checkpointShapeInOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
+    if (peekLayaCheckpoint(io, dir)) return "laya";
+    if (peekMfluxFlux2(io, allocator, dir)) return "flux2-klein";
+    if (peekMageFlowIndex(io, allocator, dir)) return "mage_flow";
+    if (peekQwenImage21Index(io, allocator, dir)) return "qwen_image21";
+    return configMediaTypeInOpenDir(io, allocator, dir);
 }
 
 /// The set of shard basenames in `model.safetensors.index.json`'s `weight_map`,
@@ -2279,7 +2358,51 @@ test "laya completeness marker + required subdirs" {
     try testing.expectEqual(@as(usize, 0), requiredSubdirsForType("").len);
 }
 
-test "checkpointTypeInTree classifies the configless Laya shape" {
+test "flux2 pull tables: configless dirs, media dirs, no load-time marker" {
+    const allocator = std.testing.allocator;
+    // The FLUX.2 shape has TWO spellings: the configless 9B build (no root
+    // config.json — `requiredSubdirsForType` applies its whole set) and the
+    // mflux media type (a root config.json — `requiredMediaDirsForType`).
+    const subs = requiredSubdirsForType("flux2-klein");
+    try testing.expectEqual(@as(usize, 4), subs.len);
+    try testing.expectEqualStrings("transformer/", subs[0]);
+    try testing.expectEqual(@as(usize, 2), requiredMediaDirsForType("flux2-klein").len);
+    try testing.expectEqual(@as(usize, 0), requiredMediaDirsForType("qwen3").len);
+    // Discovery's load-time refusal stays conversion-tolerant: the only MLX
+    // build of the 9B legitimately ships `transformer/` + `text_encoder/`
+    // with no `vae/`, so a marker here would hide a loadable repo. The PULL
+    // and the resume fast-path enforce the dirs; the loader refuses the
+    // weights itself.
+    try testing.expectEqual(@as(?[]const u8, null), requiredMediaMarker("flux2-klein"));
+    // Configless identity docs classify; a root config.json defers to its
+    // content (null until the caller feeds the document in).
+    const s = checkpointShapeInTree(allocator, &.{
+        "transformer/0.safetensors", "transformer/model.safetensors.index.json", "vae/0.safetensors",
+    }, null).?;
+    defer allocator.free(s);
+    try testing.expectEqualStrings("flux2-klein", s);
+    try testing.expectEqual(@as(?[]const u8, null), checkpointShapeInTree(std.heap.page_allocator,
+        &.{"config.json"}, null));
+    // A root config.json's media `model_type` is read from the document — a
+    // chat repo that happens to own a `transformer/` gains no media
+    // required-set when its config names an ordinary model.
+    {
+        const s2 = checkpointShapeInTree(allocator,
+            &.{ "config.json", "transformer/model.safetensors.index.json" },
+            "{\"model_type\":\"flux2-klein-4b\"}").?;
+        defer allocator.free(s2);
+        try testing.expectEqualStrings("flux2-klein-4b", s2);
+    }
+    try testing.expectEqual(@as(?[]const u8, null), checkpointShapeInTree(std.heap.page_allocator,
+        &.{"config.json"}, "{\"model_type\":\"qwen3\"}"));
+    const mt = mediaTypeFromConfigJson(allocator, "{\"model_type\":\"flux2-klein-4b\"}").?;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("flux2-klein-4b", mt);
+    try testing.expectEqual(@as(?[]const u8, null), mediaTypeFromConfigJson(std.heap.page_allocator,
+        "{\"model_type\":\"qwen3\"}"));
+}
+
+test "checkpointShapeInTree classifies the configless Laya shape" {
     const allocator = std.testing.allocator;
     const laya_tree = [_][]const u8{
         ".gitattributes", "NOTICE", "README.md", "encoder/config.json",
@@ -2287,16 +2410,13 @@ test "checkpointTypeInTree classifies the configless Laya shape" {
         "rl_agent_config.json", "tokenizer/tokenizer.json",
         "tokenizer/tokenizer_config.json", "validation.json",
     };
-    try testing.expectEqualStrings("laya", checkpointTypeInTree(&laya_tree));
+    const s = checkpointShapeInTree(allocator, &laya_tree, null).?;
+    defer allocator.free(s);
+    try testing.expectEqualStrings("laya", s);
 
-    // A root config.json outranks the Laya pair; half the pair is not the
-    // shape.
-    var chat_tree = try allocator.alloc([]const u8, laya_tree.len + 1);
-    defer allocator.free(chat_tree);
-    chat_tree[0] = "config.json";
-    @memcpy(chat_tree[1..], &laya_tree);
-    try testing.expectEqualStrings("", checkpointTypeInTree(chat_tree));
-    try testing.expectEqualStrings("", checkpointTypeInTree(&[_][]const u8{ "rl_agent_config.json", "model.safetensors" }));
+    // Half the pair is not the shape.
+    try testing.expectEqual(@as(?[]const u8, null), checkpointShapeInTree(allocator,
+        &.{ "rl_agent_config.json", "model.safetensors" }, null));
 }
 
 test "parseIndexShardsFromJson dedupes weight_map values; rejects non-index docs" {

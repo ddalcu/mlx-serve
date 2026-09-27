@@ -23,6 +23,7 @@
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
 - `pull` is manifest-driven: it downloads every file the hub's shard index, sidecar tables, or checkpoint shape require (`encoder/` + `tokenizer/` for configless Laya packs), pre-flights the manifest against the repo, and only claims `success:` after the required set re-verifies on disk — a starved pull now names the missing files and fails (`error.PullIncomplete`) instead of printing "ready" and dying later at `error: FileNotFound`. A starved Laya dir on disk is refused by name everywhere (`requiredMediaMarker("laya")`) and repairs itself on the next `pull`.
+- The same contract covers FLUX.2 diffusers packs (#362): the shape is content — a root config.json's media `model_type`, else the DiT index's own tensor names (the only MLX build of klein 9B ships no config.json) — and every file under `transformer/` + `vae/` (plus `text_encoder/` + `tokenizer/` for the configless 9B) is required, in `pull` and in the app's downloader. A copy starved of `vae/` never reads as present: the next pull re-enters the manifest instead of fast-pathing into `FileNotFound`.
 
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 

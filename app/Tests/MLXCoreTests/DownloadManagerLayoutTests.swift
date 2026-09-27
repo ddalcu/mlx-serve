@@ -200,11 +200,14 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(plain.contains("encoder/config.json"))
         XCTAssertFalse(plain.contains("tokenizer/tokenizer.json"))
 
-        // A root config.json outranks the Laya pair (same precedence as the
-        // server's `peekConfig` / `configlessModelType`).
+        // The Laya identity pair classifies off the name set even beside a
+        // root config.json — the pair IS what a starved copy cannot forge.
+        // The config's media `model_type` outranks it in the server's order,
+        // which only reading the doc's content can decide (the fetch flow
+        // does that; `checkpointType` never overrides it with a name pattern).
         var withConfig = Set(entries.compactMap { $0["path"] as? String })
         withConfig.insert("config.json")
-        XCTAssertEqual(DownloadManager.checkpointType(inPaths: withConfig), "")
+        XCTAssertEqual(DownloadManager.checkpointType(inPaths: withConfig), "laya")
     }
 
     /// Twin cells for the shared pull tables: the exact rows
