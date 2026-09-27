@@ -12,15 +12,18 @@ struct SidebarGroupSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(title).font(.app(.headline))
+            Text(title).font(.app(.sectionTitle))
             TextField("Group Name", text: $name)
                 .textFieldStyle(.roundedBorder)
+                .font(.app(.body))
                 .onSubmit(submit)
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
+                Button { dismiss() } label: { Text("Cancel")
+    .font(.app(.body)) }
                     .keyboardShortcut(.cancelAction)
-                Button(action, action: submit)
+                Button { submit() } label: { Text(action)
+    .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(isBlank)
             }

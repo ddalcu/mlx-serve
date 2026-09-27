@@ -1461,8 +1461,10 @@ struct ChatSidebar: View {
         .padding(.bottom, 2)
         .onDrop(of: [.text], delegate: groupDrop(group.id))
         .contextMenu {
-            Button("Rename Group…") { groupSheet = .rename(group.id, group.name) }
-            Button("Delete Group", role: .destructive) { appState.sidebarGroups.delete(group.id) }
+            Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
+    .font(.app(.body)) }
+            Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
+    .font(.app(.body)) }
         }
     }
 
@@ -1475,14 +1477,17 @@ struct ChatSidebar: View {
     private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
         Menu("Move to Group") {
             ForEach(appState.sidebarGroups.groups) { group in
-                Button(group.name) { appState.sidebarGroups.assign(ids, to: group.id) }
+                Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
+    .font(.app(.body)) }
                     .disabled(ids.count == 1 && group.id == current)
             }
             if !appState.sidebarGroups.groups.isEmpty { Divider() }
-            Button("New Group…") { groupSheet = .create(ids) }
+            Button { groupSheet = .create(ids) } label: { Text("New Group…")
+    .font(.app(.body)) }
         }
         if current != nil {
-            Button("Remove from Group") { appState.sidebarGroups.assign(ids, to: nil) }
+            Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
+    .font(.app(.body)) }
         }
         Divider()
     }
