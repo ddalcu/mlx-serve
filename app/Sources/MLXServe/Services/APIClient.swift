@@ -316,11 +316,12 @@ class APIClient {
     /// connection is torn down when the consuming task is cancelled.
     nonisolated func streamGeneration(port: UInt16, path: String, json: [String: Any]) -> AsyncThrowingStream<[String: Any], Error> {
         AsyncThrowingStream { continuation in
-            let task = Task {
+            // The caller is @MainActor; SSE parsing must not inherit it.
+            let task = Task.detached(priority: .userInitiated) {
                 do {
                     var body = json
                     body["stream"] = true
-                    var req = URLRequest(url: serverURL(port: port, path: path))
+                    var req = URLRequest(url: self.serverURL(port: port, path: path))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -630,7 +631,8 @@ class APIClient {
             // which closes the URLSessionDataTask, which FINs the TCP
             // connection, which surfaces to the server as `peerClosed → true`
             // on its next ts.next() iteration.
-            let producerTask = Task {
+            // The caller is @MainActor; parsing each chat token must not inherit it.
+            let producerTask = Task.detached(priority: .userInitiated) {
                 var lastError: Error?
                 for attempt in 0...retryPolicy.maxRetries {
                     do {

@@ -74,7 +74,12 @@ final class ImageGenService: ObservableObject {
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the PNG.
                 var png: Data? = nil
-                let genJson = Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
+                // The source + reference photos are multi-MB; requestJson reads
+                // and base64-encodes them, and this Task inherits @MainActor.
+                let genJson = await Task.detached(priority: .userInitiated) {
+                    Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
+                }.value
+                try Task.checkCancellation()
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/images/generations",
                     json: genJson) {
@@ -86,7 +91,14 @@ final class ImageGenService: ObservableObject {
                         phase = .running(step: step, total: max(total, 1),
                                          message: L10n.format("%@…", L10n.text(stage)))
                     case "complete":
-                        png = Self.decodePngB64(ev)
+                        // Several MB of PNG b64: decode off the main actor
+                        // (this Task inherits @MainActor); only the extracted
+                        // string crosses the boundary.
+                        if let b64 = Self.pngB64(of: ev) {
+                            png = await Task.detached(priority: .userInitiated) {
+                                Self.decodePngB64(b64: b64)
+                            }.value
+                        }
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? L10n.text("Generation failed."))
@@ -95,12 +107,16 @@ final class ImageGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let png else {
                     phase = .failed("Server returned no image data.")
                     return
                 }
-                try png.write(to: URL(fileURLWithPath: outputPath))
+                try await Task.detached(priority: .userInitiated) {
+                    try png.write(to: URL(fileURLWithPath: outputPath))
+                }.value
+                try Task.checkCancellation()
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
@@ -160,22 +176,35 @@ final class ImageGenService: ObservableObject {
         }
         do {
             var png: Data? = nil
-            let genJson = Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
+            // Reads + base64 of the source/ref photos: off the transcript's
+            // thread (generateForAgent runs on the main actor via ChatTurnEngine).
+            let genJson = await Task.detached(priority: .userInitiated) {
+                Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
+            }.value
+            try Task.checkCancellation()
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/images/generations", json: genJson) {
                 switch MediaSSE.classify(ev) {
                 case .progress(let step, let total, let stage):
                     report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    png = Self.decodePngB64(ev)
+                    if let b64 = Self.pngB64(of: ev) {
+                        png = await Task.detached(priority: .userInitiated) {
+                            Self.decodePngB64(b64: b64)
+                        }.value
+                    }
                 case .failed(let m):
                     throw GenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let png else { throw GenError.server("Server returned no image data.") }
-            try png.write(to: URL(fileURLWithPath: outputPath))
+            try await Task.detached(priority: .userInitiated) {
+                try png.write(to: URL(fileURLWithPath: outputPath))
+            }.value
+            try Task.checkCancellation()
             await releaseIfNeeded()
             return outputPath
         } catch {
@@ -191,7 +220,9 @@ final class ImageGenService: ObservableObject {
     /// (`cond_gain`+`cond_weights`), CFG (`guidance_scale`+`negative_prompt`,
     /// base klein only), and LoRA (`lora_paths`+`lora_scales`) are added only
     /// when set, so the server sees no behavior change otherwise.
-    static func requestJson(for request: ImageGenRequest, modelName: String, seed: Int) -> [String: Any] {
+    /// Nonisolated so the Generate-click hop actually leaves the main actor —
+    /// it reads and base64s every attached photo (multi-MB).
+    nonisolated static func requestJson(for request: ImageGenRequest, modelName: String, seed: Int) -> [String: Any] {
         var json: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
@@ -244,18 +275,27 @@ final class ImageGenService: ObservableObject {
 
     /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.
     /// Pure + static so it's unit-testable without a running server.
-    static func decodePngB64(_ body: Data) -> Data? {
+    nonisolated static func decodePngB64(_ body: Data) -> Data? {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
         return decodePngB64(obj)
     }
 
     /// Same, from an already-parsed object (the SSE `complete` event).
-    static func decodePngB64(_ obj: [String: Any]) -> Data? {
-        guard let arr = obj["data"] as? [[String: Any]],
-              let b64 = arr.first?["b64_json"] as? String,
-              let png = Data(base64Encoded: b64)
-        else { return nil }
-        return png
+    nonisolated static func decodePngB64(_ obj: [String: Any]) -> Data? {
+        guard let b64 = pngB64(of: obj) else { return nil }
+        return decodePngB64(b64: b64)
+    }
+
+    /// The `b64_json` string alone — the Sendable half, so the completion
+    /// hop can carry just the bytes across the actor boundary.
+    nonisolated static func pngB64(of obj: [String: Any]) -> String? {
+        guard let arr = obj["data"] as? [[String: Any]] else { return nil }
+        return arr.first?["b64_json"] as? String
+    }
+
+    /// Decode an extracted b64 string, off the main actor.
+    nonisolated static func decodePngB64(b64: String) -> Data? {
+        Data(base64Encoded: b64)
     }
 
     func cancel() {

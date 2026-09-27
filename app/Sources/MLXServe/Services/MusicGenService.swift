@@ -226,8 +226,6 @@ final class MusicGenService: ObservableObject {
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
-        let refB64 = Self.referenceB64(request)
-        let srcB64 = Self.sourceB64(request)
 
         task = Task {
             var loadedId: String? = nil
@@ -242,6 +240,13 @@ final class MusicGenService: ObservableObject {
                 // SSE stages: encode (conditioning) → diffuse (8 turbo steps)
                 // → decode (VAE chunks); the `complete` event carries the WAV.
                 var wav: Data? = nil
+                // The multi-MB clip reads + base64 go off the main actor
+                // (VideoGenService precedent): done synchronously here they
+                // held the pane un-redrawn until the first progress tick.
+                let (refB64, srcB64) = await Task.detached(priority: .userInitiated) {
+                    (Self.referenceB64(request), Self.sourceB64(request))
+                }.value
+                try Task.checkCancellation()
                 let reqJson = Self.requestBody(request, modelName: modelId, refAudioB64: refB64, srcAudioB64: srcB64)
                 let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
                 for try await ev in api.streamGeneration(
@@ -262,7 +267,14 @@ final class MusicGenService: ObservableObject {
                         }
                         phase = .running(step: step, total: total, message: label)
                     case "complete":
-                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                        // Up to ~100 MB of WAV b64: the decode hops off the
+                        // main actor; only the string crosses.
+                        let b64 = ev["data"] as? String
+                        if let b64 {
+                            wav = await Task.detached(priority: .userInitiated) {
+                                Data(base64Encoded: b64)
+                            }.value
+                        }
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Music generation failed.")
@@ -271,12 +283,16 @@ final class MusicGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
                     return
                 }
-                try wav.write(to: URL(fileURLWithPath: outputPath))
+                try await Task.detached(priority: .userInitiated) {
+                    try wav.write(to: URL(fileURLWithPath: outputPath))
+                }.value
+                try Task.checkCancellation()
                 // Settings sidecar: <track>.txt with the prompt/lyrics/params,
                 // so every generated track is documented + reproducible.
                 let settings = Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
@@ -314,7 +330,10 @@ final class MusicGenService: ObservableObject {
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let keep = request.keepResident
-        let refB64 = Self.referenceB64(request)
+        let refB64 = await Task.detached(priority: .userInitiated) {
+            Self.referenceB64(request)
+        }.value
+        try Task.checkCancellation()
         let startedAt = Date()
         func report(_ step: Int, _ total: Int, _ message: String) {
             onProgress?(MediaGenProgress(kind: .music, step: step, total: total,
@@ -337,17 +356,26 @@ final class MusicGenService: ObservableObject {
                 case .progress(let step, let total, let stage):
                     report(step, total, MediaSSE.stageLabel(stage))
                 case .complete:
-                    if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    let b64 = ev["data"] as? String
+                    if let b64 {
+                        wav = await Task.detached(priority: .userInitiated) {
+                            Data(base64Encoded: b64)
+                        }.value
+                    }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let wav, wav.count > 44 else {
                 throw MediaGenError.server("Server returned an empty audio response.")
             }
-            try wav.write(to: URL(fileURLWithPath: outputPath))
+            try await Task.detached(priority: .userInitiated) {
+                try wav.write(to: URL(fileURLWithPath: outputPath))
+            }.value
+            try Task.checkCancellation()
             try? Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
                 .write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                        atomically: true, encoding: .utf8)

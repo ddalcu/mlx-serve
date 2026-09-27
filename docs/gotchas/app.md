@@ -856,3 +856,6 @@ the guard green. A font is inherited through the trailing-modifier idiom: the
 block's own last line, or the couple of lines after its closing brace. Scanning
 only there surfaced every one of them, and a probe injected into a view the old
 window waved through now fails.
+
+## Full-size pictures in a rendered pane block window movement
+Image and video reference tiles opened full-size photos on the main actor as pane state changed; previews and chat attachments did the same. ImageIO downsampling in `MediaImage` runs off-main, and the display-size result is cached by file identity. SSE payload parsing, media byte conversion and GLB scene loads also leave the main actor. `MediaImageTests` guards thumbnail size, cache hits and file replacement.

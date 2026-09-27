@@ -60,12 +60,7 @@ final class AudioGenService: ObservableObject {
         // already normalized to 24 kHz mono WAV by AudioReference. Send it
         // base64 as `ref_audio`; the server runs it through the ECAPA-TDNN
         // speaker encoder and conditions the talker on it.
-        // Gated on the PRESET, here rather than in the pane: a model that
-        // cannot clone answers a named 400, and a clip left behind by a model
-        // switch must not reach it from the chat tool either.
-        let refB64: String? = AudioGenRequest.clonableReference(request).flatMap { path in
-            (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
-        }
+        // (the clone-clip read happens inside the task, off the main actor)
 
         task = Task {
             var loadedId: String? = nil
@@ -81,6 +76,17 @@ final class AudioGenService: ObservableObject {
                 // a growing frame count (total=0 → indeterminate bar); the
                 // `complete` event carries the WAV as base64.
                 var wav: Data? = nil
+                // Voice-clone clips are multi-MB WAVs: read + base64 off the
+                // main actor. Gated on the PRESET, here rather than in the
+                // pane: a model that cannot clone answers a named 400, and a
+                // clip left behind by a model switch must not reach it from
+                // the chat tool either.
+                let refB64 = await Task.detached(priority: .userInitiated) {
+                    AudioGenRequest.clonableReference(request).flatMap { path in
+                        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+                    }
+                }.value
+                try Task.checkCancellation()
                 var reqJson: [String: Any] = ["model": modelId, "input": text]
                 if let refB64 { reqJson["ref_audio"] = refB64 }
                 for try await ev in api.streamGeneration(
@@ -97,7 +103,13 @@ final class AudioGenService: ObservableObject {
                             ? L10n.format("%@ — ~%.1fs", L10n.text(stage), secs) : L10n.format("%@…", L10n.text(stage))
                         phase = .running(step: step, total: total, message: msg)
                     case "complete":
-                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                        // b64 decode of the whole track off the main actor.
+                        let b64 = ev["data"] as? String
+                        if let b64 {
+                            wav = await Task.detached(priority: .userInitiated) {
+                                Data(base64Encoded: b64)
+                            }.value
+                        }
                     case "error":
                         await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? L10n.text("Synthesis failed."))
@@ -106,12 +118,16 @@ final class AudioGenService: ObservableObject {
                         break
                     }
                 }
+                try Task.checkCancellation()
                 await releaseIfNeeded()
                 guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
                     return
                 }
-                try wav.write(to: URL(fileURLWithPath: outputPath))
+                try await Task.detached(priority: .userInitiated) {
+                    try wav.write(to: URL(fileURLWithPath: outputPath))
+                }.value
+                try Task.checkCancellation()
                 // Settings sidecar: <clip>.txt with the text + voice params.
                 try? sidecar.write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                                    atomically: true, encoding: .utf8)
@@ -159,10 +175,13 @@ final class AudioGenService: ObservableObject {
             var wav: Data? = nil
             var reqJson: [String: Any] = ["model": modelId, "input": request.text,
                                           "speed": request.speed]
-            if let ref = AudioGenRequest.clonableReference(request),
-               let data = try? Data(contentsOf: URL(fileURLWithPath: ref)) {
-                reqJson["ref_audio"] = data.base64EncodedString()
+            if let ref = AudioGenRequest.clonableReference(request) {
+                let b64 = await Task.detached(priority: .userInitiated) {
+                    (try? Data(contentsOf: URL(fileURLWithPath: ref)))?.base64EncodedString()
+                }.value
+                if let b64 { reqJson["ref_audio"] = b64 }
             }
+            try Task.checkCancellation()
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/audio/speech", json: reqJson) {
                 switch MediaSSE.classify(ev) {
@@ -176,17 +195,26 @@ final class AudioGenService: ObservableObject {
                         : MediaSSE.stageLabel(stage)
                     report(step, total, msg)
                 case .complete:
-                    if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    let b64 = ev["data"] as? String
+                    if let b64 {
+                        wav = await Task.detached(priority: .userInitiated) {
+                            Data(base64Encoded: b64)
+                        }.value
+                    }
                 case .failed(let m):
                     throw MediaGenError.server(m)
                 case .ignored:
                     break
                 }
             }
+            try Task.checkCancellation()
             guard let wav, wav.count > 44 else {
                 throw MediaGenError.server("Server returned an empty audio response.")
             }
-            try wav.write(to: URL(fileURLWithPath: outputPath))
+            try await Task.detached(priority: .userInitiated) {
+                try wav.write(to: URL(fileURLWithPath: outputPath))
+            }.value
+            try Task.checkCancellation()
             try? Self.settingsText(request, modelName: modelId)
                 .write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                        atomically: true, encoding: .utf8)

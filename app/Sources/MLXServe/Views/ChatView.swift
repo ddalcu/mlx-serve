@@ -156,7 +156,7 @@ struct ToolApprovalSheet: View {
 /// within the Swift type-checker's complexity budget.
 private struct AttachmentPreviewRow: View {
     @Binding var images: [PendingImage]
-    @Binding var pdfs: [(name: String, text: String)]
+    @Binding var pdfs: [(name: String, text: String, chars: Int)]
     @Binding var videos: [ChatVideo]
     @Binding var audio: [ChatAudio]
 
@@ -170,7 +170,9 @@ private struct AttachmentPreviewRow: View {
                 // a format key has to be completed BEFORE the catalog lookup, or
                 // the lookup keys on the finished sentence and can never match.
                 ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
-                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.text.count),
+                    // `chars` rides the tuple (computed at attach): the row
+                    // re-renders on every keystroke and String.count is O(n).
+                    fileChip(idx: idx, name: pdf.name, detail: L10n.format("PDF · %lld chars", pdf.chars),
                              icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
                 }
                 ForEach(Array(videos.enumerated()), id: \.offset) { idx, vid in
@@ -238,6 +240,45 @@ private struct AttachmentPreviewRow: View {
             .background(Color.secondary.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             removeButton(remove)
+        }
+    }
+}
+
+/// Byte-backed chat image decoded off-main and held across bubble redraws.
+private struct AttachmentImageCell: View {
+    let image: ChatImage
+    @State private var decoded: NSImage?
+    /// An invalid attachment must not reserve an empty image slot forever.
+    @State private var undecodable = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                // `.fill`: the rounded corners clip the frame, so a
+                // letterboxed picture keeps square corners.
+                Image(nsImage: decoded)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: ChatImagePreview.displayWidth(for: decoded),
+                           height: ChatMetrics.attachmentHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(image) }
+                    .help("Double-click to open in Preview")
+            } else if !undecodable {
+                // The square the picture will land in, so the bubble does
+                // not jump when the decode arrives.
+                Color.clear
+                    .frame(width: ChatMetrics.attachmentHeight,
+                           height: ChatMetrics.attachmentHeight)
+            }
+        }
+        .task(id: image.id) {
+            let loaded = await MediaImage.load(data: image.data,
+                                               id: image.id.uuidString,
+                                               maxPixel: 1536)
+            // A cancelled decode may finish after a newer selection.
+            guard !Task.isCancelled else { return }
+            if let loaded { decoded = loaded } else { undecodable = true }
         }
     }
 }
@@ -2029,7 +2070,7 @@ struct ChatDetailView: View {
     @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [PendingImage] = []
-    @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingPDFs: [(name: String, text: String, chars: Int)] = []
     @State private var pendingVideos: [ChatVideo] = []
     @State private var pendingAudio: [ChatAudio] = []
     @StateObject private var recorder = AudioRecorder()
@@ -2932,7 +2973,7 @@ struct ChatDetailView: View {
                         let name = url.lastPathComponent
                         if let text = Self.extractPDFText(from: url) {
                             DispatchQueue.main.async {
-                                pendingPDFs.append((name: name, text: text))
+                                pendingPDFs.append((name: name, text: text, chars: text.count))
                             }
                         } else {
                             DispatchQueue.main.async { showPDFError(name) }
@@ -3424,7 +3465,7 @@ struct ChatDetailView: View {
             attachDocumentFolder(url)
         case .pdf:
             if let text = Self.extractPDFText(from: url) {
-                pendingPDFs.append((name: url.lastPathComponent, text: text))
+                pendingPDFs.append((name: url.lastPathComponent, text: text, chars: text.count))
             } else {
                 showPDFError(url.lastPathComponent)
             }
@@ -3459,7 +3500,7 @@ struct ChatDetailView: View {
             for url in panel.urls {
                 if url.pathExtension.lowercased() == "pdf" {
                     if let text = Self.extractPDFText(from: url) {
-                        pendingPDFs.append((name: url.lastPathComponent, text: text))
+                        pendingPDFs.append((name: url.lastPathComponent, text: text, chars: text.count))
                     } else {
                         showPDFError(url.lastPathComponent)
                     }
@@ -4578,17 +4619,8 @@ struct MessageBubble: View {
                                     .padding(.vertical, 8)
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                            } else if let nsImage = NSImage(data: img.data) {
-                                // `.fill`: the rounded corners clip the frame,
-                                // so a letterboxed picture keeps square corners.
-                                Image(nsImage: nsImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
-                                           height: ChatMetrics.attachmentHeight)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
-                                    .help("Double-click to open in Preview")
+                            } else {
+                                AttachmentImageCell(image: img)
                             }
                         }
                     }

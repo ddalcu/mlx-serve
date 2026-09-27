@@ -386,10 +386,13 @@ if [ "$STAGE_FRAMEWORKS" = "1" ]; then
     # Metal shader library (NAX kernels included — guarded by tests/test_mlx_staged_nax.sh)
     cp "$MLX_STAGE_LIB/mlx.metallib" "$CONTENTS/Frameworks/"
 
-    # libwebp + libsharpyuv for WebP image decoding in vision pipeline
+    # WebP bottles can be read-only; install_name_tool needs a writable staged copy.
     WEBP_LIB="$(brew --prefix webp 2>/dev/null || echo "/opt/homebrew/opt/webp")/lib"
     for wlib in libwebp.dylib libsharpyuv.dylib; do
-        [ -f "$WEBP_LIB/$wlib" ] && cp "$WEBP_LIB/$wlib" "$CONTENTS/Frameworks/"
+        if [ -f "$WEBP_LIB/$wlib" ]; then
+            cp "$WEBP_LIB/$wlib" "$CONTENTS/Frameworks/"
+            chmod u+w "$CONTENTS/Frameworks/$wlib"
+        fi
     done
 
     # libllama (llama.cpp GGUF engine) — single self-contained dylib staged by
@@ -438,12 +441,14 @@ if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
         "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libwebp | awk '{print $1}')" \
         "@executable_path/../Frameworks/libwebp.dylib" \
         "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
-    # Fix libwebp -> libsharpyuv dependency
-    if [ "$STAGE_FRAMEWORKS" = "1" ]; then
+    # An unresolved libsharpyuv dependency prevents the bundled server from launching.
+    if [ "$STAGE_FRAMEWORKS" = "1" ] && \
+       otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep -q libsharpyuv; then
         install_name_tool -change \
             "$(otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
             "@loader_path/libsharpyuv.dylib" \
-            "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
+            "$CONTENTS/Frameworks/libwebp.dylib" \
+            || { echo "ERROR: cannot fix staged libwebp.dylib — is it writable?"; exit 1; }
     fi
 fi
 
