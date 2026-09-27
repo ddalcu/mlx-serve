@@ -728,7 +728,8 @@ struct MemoryInfo {
     /// server build predates the field — the suffix is hidden then.
     var cacheBytes: Int64 = 0
     /// The weights of every loaded model (the server's residency bill, the
-    /// on-disk size) and the prefix KV cache. 0 on a server that predates them.
+    /// on-disk size) and the KV cache (prefix cache + live requests). 0 on a
+    /// server that predates them.
     var weightsBytes: Int64 = 0
     var kvCacheBytes: Int64 = 0
     /// The GPU working-set cap, read app-side (`SystemMetrics.gpuMemoryLimitBytes`)
@@ -739,15 +740,15 @@ struct MemoryInfo {
         let model: Int64, kvCache: Int64, working: Int64
     }
 
-    /// `activeBytes` split into weights, the prefix KV cache and the rest (live
-    /// requests' KV + activations). Each part is clamped to what is left, since
-    /// the weights figure is an estimate that can read above MLX's own counter.
+    /// `activeBytes` split into weights, the KV cache and the rest (activations).
+    /// The KV is measured and comes off first; the weights figure is an estimate
+    /// that can read above MLX's own counter, so it takes only what is left.
     var gpuBreakdown: GpuBreakdown? {
         guard weightsBytes > 0 else { return nil }
         let active = max(0, activeBytes)
-        let model = min(weightsBytes, active)
-        let kv = min(max(0, kvCacheBytes), active - model)
-        return GpuBreakdown(model: model, kvCache: kv, working: active - model - kv)
+        let kv = min(max(0, kvCacheBytes), active)
+        let model = min(weightsBytes, active - kv)
+        return GpuBreakdown(model: model, kvCache: kv, working: active - kv - model)
     }
 
     var activeFormatted: String { Self.format(activeBytes) }

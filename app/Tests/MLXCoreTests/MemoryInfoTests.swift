@@ -137,7 +137,7 @@ final class MemoryMeterSplitTests: XCTestCase {
     }
 }
 
-/// The GPU footprint splits into loaded weights, the prefix KV cache and the rest.
+/// The GPU footprint splits into loaded weights, the KV cache and the rest.
 final class GpuBreakdownTests: XCTestCase {
     private let gb: Int64 = 1 << 30
 
@@ -148,11 +148,11 @@ final class GpuBreakdownTests: XCTestCase {
         XCTAssertEqual([b.model, b.kvCache, b.working], [20 * gb, 6 * gb, 4 * gb])
     }
 
-    func testEstimatesNeverExceedWhatIsActive() throws {
-        // The weights figure is the on-disk size; it can read above MLX's own counter.
+    func testTheWeightsEstimateNeverHidesTheMeasuredKV() throws {
+        // The weights figure is the on-disk size; it can read above MLX's own counter, the KV cannot.
         let m = MemoryInfo.parse(["active_bytes": 18 * gb, "weights_bytes": 20 * gb, "kv_cache_bytes": 6 * gb])
         let b = try XCTUnwrap(m.gpuBreakdown)
-        XCTAssertEqual([b.model, b.kvCache, b.working], [18 * gb, 0, 0])
+        XCTAssertEqual([b.model, b.kvCache, b.working], [12 * gb, 6 * gb, 0])
     }
 
     func testAnOlderServerHasNoBreakdown() {

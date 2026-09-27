@@ -7156,7 +7156,7 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
-    /// Registry residency of every ready model, and the hot prefix cache's KV.
+    /// Registry residency of every ready model, and the KV of the hot prefix cache + live slots.
     weights_mem: u64,
     kv_cache_mem: u64,
     /// Leading-comma JSON fragments spliced before the root close (the ANE
@@ -7413,7 +7413,10 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
     defer allocator.free(extra_json);
 
-    const kv_cache_mem: u64 = if (global_scheduler) |sch| sch.resident_hot_cache_bytes.load(.monotonic) else 0;
+    const kv_cache_mem: u64 = if (global_scheduler) |sch|
+        sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
+    else
+        0;
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);

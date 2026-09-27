@@ -1392,6 +1392,8 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// KV + recurrent state the decoding slots own, published once per tick (`/props`).
+    resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -4837,8 +4839,25 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     _ = sch.decoding.orderedRemove(i);
                 } else i += 1;
             }
+            publishLiveKvResidency(sch, null);
         }
     }
+}
+
+/// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
+/// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
+fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+    var bytes: u64 = if (prefilling) |p| slotStateBytes(p) else 0;
+    for (sch.decoding.items) |s| bytes += slotStateBytes(s);
+    sch.resident_live_kv_bytes.store(bytes, .monotonic);
+}
+
+fn slotStateBytes(s: *const Slot) u64 {
+    var bytes = s.cache.residentBytes();
+    if (s.ssm_entries) |ents| for (ents) |*e| {
+        bytes += transformer_mod.ssmEntryBytes(e);
+    };
+    return bytes;
 }
 
 /// Phase A4: encode one or more images on the inference thread. Mirrors the
@@ -5979,6 +5998,8 @@ pub fn prefillDecodeShare() f32 {
 
 const InterleaveCtx = struct {
     sch: *Scheduler,
+    /// The slot being prefilled: not in `decoding` yet, its KV still counts.
+    slot: *Slot,
     decode_ns: u64 = 0,
     ticks: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
@@ -6230,6 +6251,11 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const r = runOwedDecodeTicks(share, chunk_ns, first_ns, ic.sch, interleaveDecodeTickOpaque);
     ic.ticks += r.ticks;
     ic.decode_ns +|= r.spent_ns;
+    {
+        ic.sch.queue_mu.lockUncancelable(ic.sch.io);
+        defer ic.sch.queue_mu.unlock(ic.sch.io);
+        publishLiveKvResidency(ic.sch, ic.slot);
+    }
     ic.chunk_sw.reset();
 }
 
@@ -6583,7 +6609,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Chunk-boundary decode yields: the hook advances already-decoding
     // streams between this prefill's chunks. Ticks hosted here are billed
     // out of prefill_ns below (the decoding slots got the time).
-    var interleave_ctx = InterleaveCtx{ .sch = sch, .chunk_sw = io_util.Stopwatch.init(sch.io) };
+    var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{

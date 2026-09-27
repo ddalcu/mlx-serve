@@ -7637,6 +7637,19 @@ pub const KVCache = struct {
     }
 
     /// Capture cache state for speculative-decoding rollback (PLD/drafter).
+    /// GPU bytes of the buffers this cache owns. A restored share is billed to
+    /// the hot-cache entry that owns its buffer.
+    pub fn residentBytes(self: *const KVCache) u64 {
+        var total: u64 = 0;
+        for (self.entries) |e| {
+            if (!e.initialized or e.shared_view) continue;
+            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+                total += arrayBytes(arr);
+            }
+        }
+        return total;
+    }
+
     /// Snapshots own array handles that share the underlying buffer with the
     /// source via refcount — cheap (no data copy) and immune to subsequent
     /// `update()` calls (which create new buffer handles when growing).
@@ -8703,10 +8716,18 @@ pub const QsaHeadMarkSet = struct {
     }
 };
 
-fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
-    const arr = if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state;
+fn arrayBytes(arr: mlx.mlx_array) u64 {
     if (arr.ctx == null) return 0;
     return @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+}
+
+fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
+    return arrayBytes(if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state);
+}
+
+/// A live request's recurrent state: the hybrid's counterpart of its KV.
+pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
+    return arrayBytes(e.conv_state) + arrayBytes(e.ssm_state) + qsaRawKeyBytes(e);
 }
 
 fn qsaLeftoverAt(aux: mlx.mlx_array, hist: c_int, pos: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -42326,6 +42347,24 @@ fn testKVWide(seq_len: usize, head_dim: c_int, s: mlx.mlx_stream) mlx.mlx_array 
     var arr = mlx.mlx_array_new();
     _ = mlx.mlx_zeros(&arr, &shape, 4, .float32, s);
     return arr;
+}
+
+test "KVCache resident bytes are the buffers it owns, never a restored donor's" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testing.expectEqual(@as(u64, 0), cache.residentBytes());
+    const k = testKVWide(3, 64, s);
+    defer _ = mlx.mlx_array_free(k);
+    var dv = try cache.update(0, k, k, s, 0);
+    dv.deinit();
+    const e = cache.entries[0];
+    const want = 2 * @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
+    try testing.expect(want > 0);
+    try testing.expectEqual(want, cache.residentBytes());
+    cache.entries[0].shared_view = true;
+    try testing.expectEqual(@as(u64, 0), cache.residentBytes());
+    cache.entries[0].shared_view = false;
 }
 
 test "KVCache carries a V head dim narrower than K (MLA 192/128)" {

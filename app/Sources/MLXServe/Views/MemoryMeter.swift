@@ -55,7 +55,8 @@ struct MemoryMeter: View {
             .frame(height: 6)
             .clipShape(Capsule())
 
-            HStack(spacing: 6) {
+            // Wraps instead of truncating: the tray is too narrow for one line.
+            FlowLayout(spacing: 10, rowSpacing: 4) {
                 if gpuBytes != nil {
                     key(.accentColor, "GPU \(gpuLabel ?? MemoryInfo.format(s.gpu))")
                 }
@@ -65,19 +66,15 @@ struct MemoryMeter: View {
                 } else if availableBytes > 0 {
                     key(.green.opacity(0.6), L10n.format("%@ free", MemoryInfo.format(availableBytes)))
                 }
-                Spacer()
-                Text("\(MemoryInfo.format(totalBytes)) total")
-                    .foregroundStyle(.tertiary)
-            }
-            .font(.app(.caption2))
-            if let b = breakdown {
-                HStack(spacing: 6) {
+                if let b = breakdown {
                     key(.accentColor, L10n.format("Model %@", MemoryInfo.format(b.model)))
                     key(.accentColor.opacity(0.6), L10n.format("KV cache %@", MemoryInfo.format(b.kvCache)))
                     key(.accentColor.opacity(0.3), L10n.format("Working %@", MemoryInfo.format(b.working)))
                 }
-                .font(.app(.caption2))
+                Text("\(MemoryInfo.format(totalBytes)) total")
+                    .foregroundStyle(.tertiary)
             }
+            .font(.app(.caption2))
         }
         .help(gpuLimitBytes.map {
             L10n.format("GPU memory limit: %@ (iogpu.wired_limit_mb). Raise it with: sudo sysctl iogpu.wired_limit_mb=<MB>",
