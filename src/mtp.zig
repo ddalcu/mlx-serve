@@ -1528,6 +1528,63 @@ pub const sidecar_rel_paths = [_][]const u8{
     "mtp_head.safetensors", // Nemotron-H heads (sevren-ai packs, bare keys)
 };
 
+/// Nested sidecar layouts live in a dir whose ONLY member the pull wants:
+/// `mtp/weights.safetensors` and `optiq/mtp.safetensors` are the checkpoint,
+/// the dir's other files (`optiq/optiq_vision.safetensors` — a relocated
+/// vision tower, GBs) are not. The dirs themselves ("mtp/", "optiq/") are
+/// DERIVED from `sidecar_rel_paths` at comptime, so a new root-nested layout
+/// joins with its table row alone; the fine-grained EXACT paths are this
+/// list. Root-level layouts have no dir prefix and are ordinary files.
+/// App twins: the fine-grained list and sidecar dirs in
+/// `DownloadManager.selectNeededFiles` (keep in sync).
+pub const fine_grained_sidecar_paths = [_][]const u8{
+    "mtp/weights.safetensors",
+    "optiq/mtp.safetensors",
+};
+
+/// True when `path` is one of `fine_grained_sidecar_paths` (exact match).
+pub fn isFineGrainedSidecar(path: []const u8) bool {
+    for (&fine_grained_sidecar_paths) |s| if (std.mem.eql(u8, path, s)) return true;
+    return false;
+}
+
+/// The derived sidecar dirs ("mtp/", "optiq/") — a const array built inside a
+/// comptime-generated struct type; a `var` buffer captured by a global is
+/// illegal Zig ("reference to comptime var").
+const SidecarDirs = struct {
+    pub const list: []const []const u8 = list: {
+        var out: [sidecar_rel_paths.len][]const u8 = undefined;
+        var n: usize = 0;
+        for (sidecar_rel_paths) |rel| {
+            const slash = std.mem.indexOfScalar(u8, rel, '/') orelse continue;
+            const prefix = rel[0 .. slash + 1];
+            var dup = false;
+            for (out[0..n]) |p| dup = dup or std.mem.eql(u8, p, prefix);
+            if (!dup) {
+                out[n] = prefix;
+                n += 1;
+            }
+        }
+        const arr = out;
+        break :list &arr[0..n].*;
+    };
+};
+
+/// True when `dir_prefix` (with trailing '/') is a derived sidecar dir.
+pub fn isSidecarDir(dir_prefix: []const u8) bool {
+    for (SidecarDirs.list) |d| if (std.mem.eql(u8, d, dir_prefix)) return true;
+    return false;
+}
+
+/// Engine-READ root-level sidecars — files the loaders provably open that a
+/// name-based pull filter can silently drop (`ngram_table.bin` is qwen4_exp's
+/// PLE table: `parseConfig` points `ngram_table_path` at it, `ple_gpu.zig`
+/// mmaps it). Existence in the hub tree makes one required.
+/// App twin: `DownloadManager.engineSidecarPaths` (keep in sync).
+pub const engine_sidecar_paths = [_][]const u8{
+    "ngram_table.bin",
+};
+
 /// Relative path (one of `sidecar_rel_paths`) of the first sidecar file under
 /// `dir` whose HEADER carries a marker key, or null when the model ships no
 /// loadable MTP head. The marker gate is the same one discovery and the
@@ -6513,4 +6570,34 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             }
         }
     }
+}
+
+test "the sidecar dirs are derived from the sidecar table" {
+    // A new root-nested layout row joins the pull's dir gate automatically.
+    try testing.expectEqual(@as(usize, 2), SidecarDirs.list.len);
+    try testing.expectEqualStrings("mtp/", SidecarDirs.list[0]);
+    try testing.expectEqualStrings("optiq/", SidecarDirs.list[1]);
+    try testing.expect(isSidecarDir("mtp/"));
+    try testing.expect(!isSidecarDir("mtp")); // no trailing '/': not a dir
+    try testing.expect(!isSidecarDir("encoder/"));
+}
+
+test "fine-grained sidecars: the exact path, not the whole dir" {
+    // `optiq/optiq_vision.safetensors` sits beside the head and is a vision
+    // tower the server cannot read — the dir's other files never download.
+    try testing.expect(isFineGrainedSidecar("optiq/mtp.safetensors"));
+    try testing.expect(isFineGrainedSidecar("mtp/weights.safetensors"));
+    try testing.expect(!isFineGrainedSidecar("optiq/optiq_vision.safetensors"));
+    try testing.expect(!isFineGrainedSidecar("mtp.safetensors")); // root-level: no dir rule
+    // Every fine-grained path IS a sidecar layout in a derived dir.
+    for (&fine_grained_sidecar_paths) |p| {
+        const slash = std.mem.indexOfScalar(u8, p, '/').?;
+        try testing.expect(isSidecarDir(p[0 .. slash + 1]));
+    }
+}
+
+test "engine_sidecar_paths names the PLE table the loader provably opens" {
+    // qwen4 packs point `ngram_table_path` at exactly this file.
+    try testing.expectEqual(@as(usize, 1), engine_sidecar_paths.len);
+    try testing.expectEqualStrings("ngram_table.bin", engine_sidecar_paths[0]);
 }

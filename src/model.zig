@@ -3747,6 +3747,25 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     var referenced = model_discovery.indexShardSet(io, dir);
     defer if (referenced) |*r| model_discovery.freeShardSet(r);
 
+    // Pre-flight: every shard the index names must be on disk, non-zero,
+    // before anything loads — a missing or truncated index shard fails HERE,
+    // naming the file. `indexShardSet` already tolerates a stale index when NO
+    // named shard exists (a re-sharded upload); anything less than the full
+    // set is an incomplete checkpoint, not a loadable one.
+    if (referenced) |r| {
+        var keys = r.keyIterator();
+        while (keys.next()) |k| {
+            const st = dir.statFile(io, k.*, .{}) catch {
+                log.err("{s} is named by model.safetensors.index.json but missing from {s} — the checkpoint is incomplete (a partial pull or a deleted shard). Re-download the model (e.g. `mlx-serve pull <model>`) or delete the dir and re-fetch.\n", .{ k.*, model_dir });
+                return error.MissingShardFile;
+            };
+            if (st.kind != .file or st.size == 0) {
+                log.err("{s} is named by model.safetensors.index.json but is not a loadable file in {s} — the checkpoint is incomplete (a truncated download). Re-download the model (e.g. `mlx-serve pull <model>`) or delete the dir and re-fetch.\n", .{ k.*, model_dir });
+                return error.MissingShardFile;
+            }
+        }
+    }
+
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -4093,6 +4112,28 @@ test "loadWeights ignores an index that names no shard on disk (re-sharded uploa
     var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+test "loadWeights refuses a zero-byte index shard (a truncated download)" {
+    // The index names two shards, one is an empty stub: the loader refuses
+    // and names it instead of mmaps-ing whatever is there.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    var st: [8 + hdr.len + 4]u8 = undefined;
+    std.mem.writeInt(u64, st[0..8], hdr.len, .little);
+    @memcpy(st[8 .. 8 + hdr.len], hdr);
+    @memset(st[8 + hdr.len ..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001.safetensors", .data = &st });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00002.safetensors", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model-00001.safetensors\",\"v\":\"model-00002.safetensors\"}}" });
+
+    try std.testing.expectError(
+        error.MissingShardFile,
+        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/truncated-model", .{}),
+    );
 }
 
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {

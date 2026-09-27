@@ -233,6 +233,43 @@ class DownloadManager: ObservableObject {
         return ["pytorch_model", "rust_model", "tf_model"].contains { base.hasPrefix($0) }
     }
 
+        /// File basenames the chat default never pulls — the twin of `skip_exact`
+    /// + `skip_ext` in src/cli.zig (keep in sync; `DownloadManagerLayoutTests`
+    /// pins the rows). A required dir is required as a WHOLE minus these.
+    nonisolated static func isSkipName(_ path: String) -> Bool {
+        let base = (path as NSString).lastPathComponent.lowercased()
+        if ["readme.md", "license", "license.txt", "use_policy.md"].contains(base) { return true }
+        return ["png", "jpg", "jpeg", "gif", "webp", "pdf", "md", "pth", "h5", "msgpack", "ckpt"]
+            .contains { base.lowercased().hasSuffix(".\($0)") }
+    }
+
+    /// Engine-READ root-level sidecars outside the MTP sidecar layouts — the
+    /// twin of `mtp.engine_sidecar_paths` in src/mtp.zig (keep in sync). A
+    /// converter that adds a new engine-read sidecar name joins the pull by
+    /// adding one row to EACH table, and nothing else.
+    nonisolated static let engineSidecarPaths: Set<String> = ["ngram_table.bin"]
+
+    /// Subdirectory prefixes a checkpoint shape requires in FULL, keyed on the
+    /// configless shape `configlessModelType` detects. Twin of
+    /// `model_discovery.requiredSubdirsForType` (keep in sync): Laya ships no
+    /// root config.json — the encoder config lives in `encoder/` and the
+    /// tokenizer the encoder cannot run without lives in `tokenizer/`.
+    nonisolated static func requiredSubdirs(modelType: String) -> [String] {
+        switch modelType {
+        case "laya": return ["encoder/", "tokenizer/"]
+        default: return []
+        }
+    }
+
+    /// The configless checkpoint shape a repo's FILE listing describes (no disk
+    /// access) — twin of `model_discovery.checkpointTypeInTree`. A root
+    /// config.json outranks the Laya pair, same precedence as `configlessModelType`.
+    nonisolated static func checkpointType(inPaths paths: Set<String>) -> String {
+        if paths.contains("config.json") { return "" }
+        if paths.contains("rl_agent_config.json") && paths.contains("encoder/config.json") { return "laya" }
+        return ""
+    }
+
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
     /// weight files, PLUS the MTP multi-token-prediction sidecar the server
@@ -244,8 +281,13 @@ class DownloadManager: ObservableObject {
     /// (the server can't use a relocated vision tower, ~GB), `original/` or
     /// alternate-precision shadow copies — is skipped so we don't pull tens of
     /// GB of unused weights. This allowlist mirrors `mtp.sidecar_rel_paths`; keep
-    /// them in sync. Returns (path, size) pairs.
-    nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault) -> [(String, Int64)] {
+    /// them in sync.
+    ///
+    /// `checkpointType` ("" = an ordinary root-config.json repo) joins the
+    /// shape's required subdirs — the WHOLE dir — to the chat default; Laya's
+    /// `encoder/` + `tokenizer/` are the ones the depth gate must not drop.
+    /// Returns (path, size) pairs.
+    nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault, checkpointType: String = "") -> [(String, Int64)] {
         // `.bin` is allowed because some packs ship an engine-READ binary
         // sidecar (qwen4_exp's `ngram_table.bin`, mmapped at serve time); the
         // extension allowlist used to drop it, so app-downloaded packs failed
@@ -253,6 +295,11 @@ class DownloadManager: ObservableObject {
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
         // keep them in sync.
         let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin"]
+        // A required dir is required as a WHOLE in its FLAT part: every one-
+        // slash-deep file inside it downloads (junk basenames still drop per
+        // file), anything deeper is other bundles' territory (`mtp/lora/…`).
+        // Twin of `cli.requiredNestedPath`'s whole-dir semantics (keep in sync).
+        let requiredDirs = requiredSubdirs(modelType: checkpointType)
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
@@ -266,7 +313,33 @@ class DownloadManager: ObservableObject {
                 guard path.hasPrefix(sub + "/") else { return nil }
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
-                guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
+                // Top-level, a required dir's FLAT contents (sidecar dirs plus
+                // the checkpoint shape's required subdirs), or the exact
+                // sidecar paths `mtp.sidecar_rel_paths` carries.
+                if path.contains("/") {
+                    let slash = path.firstIndex(of: "/")!
+                    let rest = String(path[path.index(after: slash)...])
+                    let flat = !rest.contains("/")
+                    // A sidecar dir is FINE-GRAINED: only the exact paths in
+                    // `mtp.sidecar_rel_paths` download — the dir's other files
+                    // (`optiq/optiq_vision.safetensors`: a relocated vision
+                    // tower the server can't read, GBs) don't. A checkpoint
+                    // shape's required dir (`encoder/`, `tokenizer/`) is
+                    // required as a whole instead — junk basenames still drop.
+                    // Twin of `cli.requiredNestedPath` + the sidecar-dir /
+                    // fine-grained-path lists in `src/mtp.zig` (keep in sync).
+                    let dirPrefix = String(path[...slash])
+                    let sidecarDir = ["mtp/", "optiq/"].contains(dirPrefix)
+                    let requiredDir = requiredDirs.contains(dirPrefix)
+                    if sidecarDir {
+                        guard ["mtp/weights.safetensors", "mtp.safetensors", "model-mtp.safetensors",
+                               "mtp_head.safetensors", "optiq/mtp.safetensors"].contains(path) else { return nil }
+                    } else if requiredDir {
+                        guard flat && !Self.isSkipName(path) else { return nil }
+                    } else {
+                        return nil
+                    }
+                }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -345,8 +418,27 @@ class DownloadManager: ObservableObject {
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
+        // Laya ships no root config.json, so `holdsCompleteMediaPack` (which
+        // reads config.json) never sees it — `configlessModelType` decides
+        // that shape instead. Twin of the `laya` row in
+        // `model_discovery.requiredMediaMarker` (keep in sync).
+        case "laya": return "tokenizer/tokenizer.json"
         default: return nil
         }
+    }
+
+    /// Completeness gate covering BOTH checkpoint families: a root-config.json
+    /// media pack via `holdsCompleteMediaPack`, and a CONFIGLESS shape (Laya)
+    /// via `configlessModelType` + its marker. A starved Laya dir must not
+    /// read as ready.
+    nonisolated static func holdsCompleteCheckpoint(_ dir: String) -> Bool {
+        guard holdsCompleteMediaPack(dir) else { return false }
+        let fm = FileManager.default
+        if configlessModelType(inDir: dir) == nil { return true }
+        guard let marker = requiredMediaMarker(modelType: "laya") else { return true }
+        let path = (dir as NSString).appendingPathComponent(marker)
+        guard let size = try? fm.attributesOfItem(atPath: path)[.size] as? UInt64 else { return false }
+        return (size ?? 0) > 0
     }
 
     /// False only for a dir whose config.json names a media type and whose
@@ -739,7 +831,10 @@ class DownloadManager: ObservableObject {
                 throw URLError(.cannotParseResponse)
             }
 
-            let neededFiles = Self.selectNeededFiles(from: files, selection: selection)
+            // Shape-aware selection: a configless Laya repo gets its required
+            // `encoder/` + `tokenizer/` dirs too.
+            let listing = Self.checkpointType(inPaths: Set(files.compactMap { $0["path"] as? String }))
+            let neededFiles = Self.selectNeededFiles(from: files, selection: selection, checkpointType: listing)
 
             // A download that matches NOTHING must say so. `LiquidAI/LFM2.5-2.6B-MLX`
             // keeps every model in a quant subfolder and has no loadable file at

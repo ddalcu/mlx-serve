@@ -81,7 +81,20 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
     // ACE-Step: the text encoder is a subdir a partial pull can miss.
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
+    // Laya: no root config.json, and the encoder cannot run without
+    // `tokenizer/` — the dir a partial pull misses, the file every complete
+    // Laya export holds.
+    if (std.mem.eql(u8, model_type, "laya")) return "tokenizer/tokenizer.json";
     return null;
+}
+
+/// Subdirectory prefixes (with trailing '/') whose files a checkpoint needs to
+/// LOAD, keyed on the configless shape `peekLayaCheckpoint` detects. App twin:
+/// `MediaBundle.laya`'s required dirs (keep in sync).
+pub fn requiredSubdirsForType(model_type: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, model_type, "laya"))
+        return &.{ "encoder/", "tokenizer/" };
+    return &.{};
 }
 
 pub fn isMediaModelType(model_type: []const u8) bool {
@@ -217,6 +230,56 @@ pub fn peekLayaCheckpoint(io: std.Io, sub: std.Io.Dir) bool {
         f.close(io);
     }
     return true;
+}
+
+/// Classify a checkpoint shape from a repo's FILE-NAME listing (the parsed HF
+/// tree JSON — no disk access). "" = an ordinary root-config.json checkpoint;
+/// a root config.json outranks the Laya pair, same precedence as
+/// `configlessModelType`.
+pub fn checkpointTypeInTree(paths: []const []const u8) []const u8 {
+    var has_agent = false;
+    var has_enc = false;
+    var has_root_config = false;
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, "rl_agent_config.json")) has_agent = true;
+        if (std.mem.eql(u8, p, "encoder/config.json")) has_enc = true;
+        if (std.mem.eql(u8, p, "config.json")) has_root_config = true;
+    }
+    if (has_root_config) return "";
+    if (has_agent and has_enc) return "laya";
+    return "";
+}
+
+/// Parse `model.safetensors.index.json` content (the bytes fetched from
+/// `resolve/main`) into its `weight_map` VALUES — the shard paths the loader
+/// requires. Returns null when the document is not an index. Caller frees via
+/// `freeTreeShards`.
+pub fn parseIndexShardsFromJson(allocator: std.mem.Allocator, content: []const u8) ?[][]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const wm = parsed.value.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |s| allocator.free(s);
+        out.deinit(allocator);
+    }
+    for (wm.object.values()) |v| {
+        if (v != .string) continue;
+        var dup = false;
+        for (out.items) |s| {
+            if (std.mem.eql(u8, s, v.string)) dup = true;
+        }
+        if (dup) continue;
+        out.append(allocator, allocator.dupe(u8, v.string) catch return null) catch return null;
+    }
+    return out.toOwnedSlice(allocator) catch return null;
+}
+
+pub fn freeTreeShards(allocator: std.mem.Allocator, shards: []const []u8) void {
+    for (shards) |s| allocator.free(s);
+    allocator.free(shards);
 }
 
 /// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
@@ -1060,15 +1123,21 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
         .drafter => return error.UnsupportedArch,
         .supported => |mt| mt,
     };
-    errdefer allocator.free(model_type);
 
     // Same completeness rule as tryAddModel: registering an incomplete media
-    // pack by path would hand it straight to the text loader.
+    // pack by path would hand it straight to the text loader. On every failure
+    // path the marker is freed here; the success return transfers ownership.
     if (requiredMediaMarker(model_type)) |marker| {
-        var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
+        var msub = dir.openDir(io, base, .{}) catch {
+            allocator.free(model_type);
+            return error.ModelDirNotFound;
+        };
         defer msub.close(io);
         const present = if (msub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
-        if (!present) return error.IncompleteMediaPack;
+        if (!present) {
+            allocator.free(model_type);
+            return error.IncompleteMediaPack;
+        }
     }
 
     var bytes: u64 = 0;
@@ -1086,6 +1155,9 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
             bytes_ok = true;
         }
     }
+
+    // Success TRANSFERS `model_type` to the caller — a test calling this must
+    // consume the string. `Probe.model_type` is documented owned below.
     return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
 }
 
@@ -2192,4 +2264,112 @@ test "readStubMeta: has_thinking reads the template on disk" {
     try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_thinking);
     try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "<|im_start|>assistant\n<think>\n" });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+}
+
+test "laya completeness marker + required subdirs" {
+    // The marker is the file a partial Laya pull misses; the dirs are what
+    // the encoder needs to load.
+    try testing.expectEqualStrings("tokenizer/tokenizer.json", requiredMediaMarker("laya").?);
+    try testing.expectEqual(@as(?[]const u8, null), requiredMediaMarker("qwen3"));
+
+    const subs = requiredSubdirsForType("laya");
+    try testing.expectEqual(@as(usize, 2), subs.len);
+    try testing.expectEqualStrings("encoder/", subs[0]);
+    try testing.expectEqualStrings("tokenizer/", subs[1]);
+    try testing.expectEqual(@as(usize, 0), requiredSubdirsForType("").len);
+}
+
+test "checkpointTypeInTree classifies the configless Laya shape" {
+    const allocator = std.testing.allocator;
+    const laya_tree = [_][]const u8{
+        ".gitattributes", "NOTICE", "README.md", "encoder/config.json",
+        "manifest.json", "mlx_config.json", "model.safetensors",
+        "rl_agent_config.json", "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json", "validation.json",
+    };
+    try testing.expectEqualStrings("laya", checkpointTypeInTree(&laya_tree));
+
+    // A root config.json outranks the Laya pair; half the pair is not the
+    // shape.
+    var chat_tree = try allocator.alloc([]const u8, laya_tree.len + 1);
+    defer allocator.free(chat_tree);
+    chat_tree[0] = "config.json";
+    @memcpy(chat_tree[1..], &laya_tree);
+    try testing.expectEqualStrings("", checkpointTypeInTree(chat_tree));
+    try testing.expectEqualStrings("", checkpointTypeInTree(&[_][]const u8{ "rl_agent_config.json", "model.safetensors" }));
+}
+
+test "parseIndexShardsFromJson dedupes weight_map values; rejects non-index docs" {
+    const allocator = std.testing.allocator;
+    const shards = parseIndexShardsFromJson(allocator,
+        \\{"metadata":{"total_size":1},"weight_map":{
+        \\ "a.w":"model-00001.safetensors","b.w":"model-00002.safetensors",
+        \\ "c.w":"model-00001.safetensors","d.w":"model-vision.safetensors"}}
+    ).?;
+    defer freeTreeShards(allocator, shards);
+    try testing.expectEqual(@as(usize, 3), shards.len); // the dup collapses
+    try testing.expectEqualStrings("model-00001.safetensors", shards[0]);
+    try testing.expectEqualStrings("model-vision.safetensors", shards[2]);
+
+    try testing.expectEqual(@as(?[][]u8, null), parseIndexShardsFromJson(allocator, "{}"));
+    try testing.expectEqual(@as(?[][]u8, null), parseIndexShardsFromJson(allocator, "not json"));
+}
+
+test "a starved Laya dir (tokenizer/ never pulled) is refused as an incomplete media pack" {
+    // Top-level files complete, encoder config proven, marker absent → the
+    // probe refuses; the marker landing makes it load.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "starved/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/encoder/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/model.safetensors", .data = "0123" });
+    const starved = try std.fs.path.join(allocator, &.{ root, "starved" });
+    defer allocator.free(starved);
+    try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, starved));
+
+    // Complete: the marker file landed — the dir loads.
+    try tmp.dir.createDirPath(io, "whole/tokenizer");
+    try tmp.dir.createDirPath(io, "whole/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/encoder/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/model.safetensors", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/tokenizer/tokenizer.json", .data = "{}" });
+    const whole = try std.fs.path.join(allocator, &.{ root, "whole" });
+    defer allocator.free(whole);
+    const whole_probe = try probeModelDir(io, allocator, whole);
+    allocator.free(whole_probe.model_type);
+}
+
+test "tryAddModel does not register a starved laya dir (the marker gate applies to scans too)" {
+    // The live repro dir (top-level files complete, tokenizer/ never pulled)
+    // must NOT be registered from a scan/rescan — the same completeness rule
+    // `probeModelDir` applies to register-by-path. Once the marker lands, the
+    // dir registers, and a registry rescan picks it up without a restart.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "aac6fef/laya-starved/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "aac6fef/laya-starved/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "aac6fef/laya-starved/encoder/config.json", .data = "{\"model_type\":\"modernbert\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "aac6fef/laya-starved/model.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.models.len);
+
+    try tmp.dir.createDirPath(io, "aac6fef/laya-starved/tokenizer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "aac6fef/laya-starved/tokenizer/tokenizer.json", .data = "{}" });
+    var rescan = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer rescan.deinit();
+    try testing.expectEqual(@as(usize, 1), rescan.models.len);
+    try testing.expectEqualStrings("aac6fef/laya-starved", rescan.models[0].id);
+    try testing.expectEqualStrings("laya", rescan.models[0].model_type);
 }

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const mtp = @import("mtp.zig");
 const ollama = @import("ollama.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
@@ -262,26 +263,72 @@ pub fn isTorchShadowBin(path: []const u8) bool {
         std.ascii.startsWithIgnoreCase(base, "tf_model");
 }
 
-pub fn shouldDownload(path: []const u8) bool {
-    if (path.len == 0 or path[0] == '.') return false;
-    if (std.mem.indexOfScalar(u8, path, '/')) |_| {
-        const sidecar_dirs = [_][]const u8{ "mtp/", "g2p/", "speech_tokenizer/" };
-        for (sidecar_dirs) |d| {
-            if (std.mem.startsWith(u8, path, d)) break;
-        } else return false;
-    }
-    const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
+/// Repo housekeeping / demo-asset basenames the chat default never pulls.
+/// App twin: the extension allowlist in `DownloadManager.selectNeededFiles`
+/// (keep in sync).
+const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
+const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md", ".pth", ".h5", ".msgpack", ".ckpt" };
+
+fn isSkipName(path: []const u8) bool {
     for (skip_exact) |s| {
-        if (std.ascii.eqlIgnoreCase(path, s)) return false;
+        if (std.ascii.eqlIgnoreCase(path, s)) return true;
+    }
+    for (skip_ext) |ext| {
+        if (path.len > ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
+    }
+    return false;
+}
+
+/// A NESTED repo path the chat-default pull must fetch: a sidecar dir is fine-
+/// grained (only the exact `sidecar_rel_paths` file — the dir's neighbours are
+/// other bundles' weights), a checkpoint shape's required dir is required as a
+/// WHOLE in its flat part (junk basenames still drop per file), plus the two
+/// long-accepted engine dirs. `model_type` "" = an ordinary root-config.json
+/// checkpoint: only the static dirs apply. App twin: `selectNeededFiles`'s
+/// depth gate (keep in sync).
+fn requiredNestedPath(path: []const u8, model_type: []const u8) bool {
+    var prefix_buf: [64]u8 = undefined;
+    const slash = std.mem.indexOfScalar(u8, path, '/') orelse return false;
+    const prefix = prefix_buf[0 .. slash + 1];
+    @memcpy(prefix[0..slash + 1], path[0 .. slash + 1]);
+
+    const dir_prefix = path[0 .. slash + 1];
+    if (mtp.isSidecarDir(dir_prefix)) return mtp.isFineGrainedSidecar(path);
+    const flat = std.mem.indexOfScalar(u8, path[slash + 1 ..], '/') == null;
+    if (!flat) return false;
+
+    for (model_discovery.requiredSubdirsForType(model_type)) |d|
+        if (std.mem.startsWith(u8, path, d)) return !isSkipName(path);
+
+    // Kokoro's g2p tables are REQUIRED (`kokoro_g2p.zig` fails without
+    // us_gold.json); speech_tokenizer/ is the Qwen3-TTS codec dir.
+    if (std.mem.startsWith(u8, path, "g2p/") or std.mem.startsWith(u8, path, "speech_tokenizer/"))
+        return !isSkipName(path);
+    return false;
+}
+
+pub fn shouldDownload(path: []const u8) bool {
+    return shouldDownloadAs(path, "");
+}
+
+/// `shouldDownload` plus the checkpoint-shape marker (`checkpointTypeInTree`,
+/// "" for an ordinary root-config.json repo).
+pub fn shouldDownloadAs(path: []const u8, model_type: []const u8) bool {
+    if (path.len == 0 or path[0] == '.') return false;
+    if (std.mem.indexOfScalar(u8, path, '/') != null) {
+        if (!requiredNestedPath(path, model_type)) return false;
+    } else if (isSkipName(path)) {
+        // `config.json` is always pulled, and no skip rule covers the exact
+        // sidecar / engine-sidecar names — those fall through to `true`.
+        if (!std.mem.eql(u8, path, "config.json")) return false;
+        for (&mtp.engine_sidecar_paths) |s| if (std.mem.eql(u8, path, s)) return true;
+        for (&mtp.sidecar_rel_paths) |s| if (std.mem.eql(u8, path, s)) return true;
+        return false;
     }
     // Torch/flax shadow weights are a second copy of the same model in a format
     // the server never reads — a doubled download. `.bin` itself stays allowed:
     // qwen4_exp's `ngram_table.bin` is an engine-read sidecar (mmapped at serve
     // time), and dropping it is what made app-downloaded packs fail to load.
-    const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md", ".pth", ".h5", ".msgpack", ".ckpt" };
-    for (skip_ext) |ext| {
-        if (path.len > ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return false;
-    }
     if (isTorchShadowBin(path)) return false;
     return true;
 }
@@ -395,12 +442,14 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
     var has_config = false;
     var has_safetensors = false;
     var has_gguf = false;
+    var has_rl_agent = false;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         switch (entry.kind) {
             .file => {
                 if (std.mem.endsWith(u8, entry.name, ".partial")) return false;
                 if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
+                if (std.mem.eql(u8, entry.name, "rl_agent_config.json")) has_rl_agent = true;
                 if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
                 if (std.mem.endsWith(u8, entry.name, ".gguf")) has_gguf = true;
             },
@@ -418,11 +467,145 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
         }
     }
     if (has_gguf) return true;
+    if (!has_config and !has_rl_agent) return false;
+    // A configless Laya dir is present only when PROVEN the shape (its
+    // identity config `encoder/config.json` holds) and complete: an
+    // unproven copy — weights + `rl_agent_config.json`, `encoder/` never
+    // fetched — is not present, so the next `run` re-pulls instead of
+    // resuming into a `FileNotFound` dir. A PROVEN Laya dir must also hold a
+    // `tokenizer/` file — the dir a partial pull misses.
+    if (!has_config and has_rl_agent) {
+        if (!isLayaDirInDir(io, dir)) return false;
+        return has_safetensors and hasRequiredSubdir(io, dir, "tokenizer");
+    }
     return has_config and has_safetensors;
+}
+
+/// `model_discovery.peekLayaCheckpoint` over an already-open iterable dir.
+fn isLayaDirInDir(io: std.Io, dir: std.Io.Dir) bool {
+    for ([_][]const u8{ "rl_agent_config.json", "encoder/config.json" }) |rel| {
+        const f = dir.openFile(io, rel, .{}) catch return false;
+        f.close(io);
+    }
+    return true;
+}
+
+/// True when `dir/<sub>` holds at least one non-junk regular file.
+fn hasRequiredSubdir(io: std.Io, dir: std.Io.Dir, sub: []const u8) bool {
+    var sd = dir.openDir(io, sub, .{ .iterate = true }) catch return false;
+    defer sd.close(io);
+    var it = sd.iterate();
+    while (it.next(io) catch null) |e| {
+        if (e.kind == .file and !isSkipName(e.name)) return true;
+    }
+    return false;
+}
+
+/// True when `name` (repo-relative path) is in `list`.
+fn treeHasPath(list: []const RepoFile, name: []const u8) bool {
+    for (list) |f| if (std.mem.eql(u8, f.path, name)) return true;
+    return false;
+}
+
+/// The hub's tree listing IS the pull's manifest: every file it names that a
+/// loader provably opens (the index's `weight_map` shards, the sidecar tables,
+/// the checkpoint shape's required dirs) lands in `out` as an owned key.
+/// A name filter alone starves configless shapes — ask the hub, not a list.
+fn collectRequiredFiles(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, files: []const RepoFile, checkpoint_type: []const u8, out: *std.StringHashMap(void)) !void {
+    for (files) |f| {
+        if (out.contains(f.path)) continue;
+        if (std.mem.eql(u8, f.path, "model.safetensors.index.json")) {
+            const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+            defer allocator.free(url);
+            // An unreadable manifest doc must not block the pull — the file
+            // itself still downloads and the loader refuses a bad shard.
+            if (curlFetch(allocator, io, url)) |content| {
+                defer allocator.free(content);
+                if (model_discovery.parseIndexShardsFromJson(allocator, content)) |shards| {
+                    defer model_discovery.freeTreeShards(allocator, shards);
+                    for (shards) |s| {
+                        if (out.contains(s)) {
+                            allocator.free(s);
+                            continue;
+                        }
+                        out.put(s, {}) catch allocator.free(s); // ownership hands over
+                    }
+                }
+            } else |_| {}
+            try out.put(try allocator.dupe(u8, f.path), {});
+            continue;
+        }
+        var matched = false;
+        for (&mtp.engine_sidecar_paths) |s| {
+            if (std.mem.eql(u8, f.path, s)) matched = true;
+        }
+        for (&mtp.sidecar_rel_paths) |s| {
+            if (std.mem.eql(u8, f.path, s)) matched = true;
+        }
+        if (matched) {
+            try out.put(try allocator.dupe(u8, f.path), {});
+            continue;
+        }
+        for (model_discovery.requiredSubdirsForType(checkpoint_type)) |d| {
+            if (std.mem.startsWith(u8, f.path, d)) matched = true;
+        }
+        if (matched and !isSkipName(f.path)) {
+            try out.put(try allocator.dupe(u8, f.path), {});
+            continue;
+        }
+        // The Laya identity files: needed to load, and to stay detectable.
+        if (std.mem.eql(u8, checkpoint_type, "laya") and
+            (std.mem.eql(u8, f.path, "rl_agent_config.json") or std.mem.eql(u8, f.path, "model.safetensors")))
+        {
+            try out.put(try allocator.dupe(u8, f.path), {});
+        }
+    }
+    // The dir keys themselves: verification demands ≥1 non-junk file landed.
+    for (model_discovery.requiredSubdirsForType(checkpoint_type)) |d| {
+        if (!out.contains(d)) try out.put(try allocator.dupe(u8, d), {});
+    }
+}
+
+/// Stat every required name under `dest_dir`; appends missing repo-relative
+/// names to `missing` (owned). A trailing-'/' key is a required DIR, satisfied
+/// by any non-junk regular file inside it.
+fn verifyRequiredFiles(allocator: std.mem.Allocator, io: std.Io, dest_dir: []const u8, required: *const std.StringHashMap(void), missing: *std.ArrayList([]u8)) !void {
+    var it = required.keyIterator();
+    while (it.next()) |key| {
+        const name = key.*;
+        if (std.mem.endsWith(u8, name, "/")) {
+            const rel = name[0 .. name.len - 1];
+            var sub = std.Io.Dir.openDirAbsolute(io, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, rel }), .{ .iterate = true }) catch {
+                try missing.append(allocator, try allocator.dupe(u8, name));
+                continue;
+            };
+            defer sub.close(io);
+            var sit = sub.iterate();
+            var found = false;
+            while (sit.next(io) catch null) |e| {
+                if (e.kind != .file or isSkipName(e.name)) continue;
+                found = true;
+                break;
+            }
+            if (!found) try missing.append(allocator, try allocator.dupe(u8, name));
+            continue;
+        }
+        if (fileSizeAt(io, dest_dir, name)) |have| {
+            if (have > 0) continue;
+        }
+        try missing.append(allocator, try allocator.dupe(u8, name));
+    }
+}
+
+fn freeMissingNames(allocator: std.mem.Allocator, missing: []const []u8) void {
+    for (missing) |m| allocator.free(m);
+    allocator.free(missing);
 }
 
 /// Download `resolved.repo` into `dest_dir`. Skips files already complete
 /// on disk (size match), resumes partials, reports per-file progress.
+/// Selection = chat-default names PLUS the hub manifest, and `success:` only
+/// after the required set re-verifies on disk.
 pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, reporter: Reporter, show_progress: bool) !void {
     // The Mac App Store build has no `curl` (the sandboxed helper can't reach
     // it) and must not download to arbitrary paths — the Swift app owns model
@@ -445,10 +628,59 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
+    // Checkpoint shape from the tree listing (configless shapes, `laya`).
+    var tree_paths: std.ArrayList([]const u8) = .empty;
+    defer tree_paths.deinit(allocator);
+    for (files) |f| try tree_paths.append(allocator, f.path);
+    const checkpoint_type = model_discovery.checkpointTypeInTree(tree_paths.items);
+
+    var required: std.StringHashMap(void) = .init(allocator);
+    defer {
+        var kit = required.keyIterator();
+        while (kit.next()) |k| allocator.free(k.*);
+        required.deinit();
+    }
+    if (resolved.gguf_file.len == 0) {
+        for (files) |f| {
+            if (shouldDownloadAs(f.path, checkpoint_type))
+                try required.put(try allocator.dupe(u8, f.path), {});
+        }
+        try collectRequiredFiles(allocator, io, resolved, files, checkpoint_type, &required);
+    }
+
+    // A manifest file the hub's own listing doesn't contain is a broken repo;
+    // refuse before touching the network rather than verify nothing.
+    if (resolved.gguf_file.len == 0) {
+        var absent: std.ArrayList([]u8) = .empty;
+        errdefer freeMissingNames(allocator, absent.items);
+        var it = required.keyIterator();
+        while (it.next()) |key| {
+            if (std.mem.endsWith(u8, key.*, "/")) continue; // dir prefix
+            if (treeHasPath(files, key.*)) continue;
+            try absent.append(allocator, try allocator.dupe(u8, key.*));
+        }
+        if (absent.items.len > 0) {
+            defer freeMissingNames(allocator, absent.items);
+            std.mem.sort([]u8, absent.items, {}, struct {
+                fn less(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.less);
+            reporter.say("error: {s}'s manifest names {d} file(s) the repo does not contain:", .{ resolved.repo, absent.items.len });
+            const shown = @min(absent.items.len, @as(usize, 8));
+            for (absent.items[0..shown]) |m| reporter.say("  absent: {s}", .{m});
+            if (absent.items.len > shown) reporter.say("  … and {d} more", .{absent.items.len - shown});
+            reporter.say("error: the hub repo is incomplete — nothing downloaded (a re-sharded upload may need a moment to settle; retry)", .{});
+            return error.PullIncomplete;
+        }
+    }
+
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (resolved.gguf_file.len > 0) {
+            if (!std.mem.eql(u8, f.path, resolved.gguf_file)) continue;
+        } else if (!required.contains(f.path)) continue;
         wanted += 1;
         total_bytes += f.size;
     }
@@ -460,7 +692,9 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
 
     var idx: usize = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (resolved.gguf_file.len > 0) {
+            if (!std.mem.eql(u8, f.path, resolved.gguf_file)) continue;
+        } else if (!required.contains(f.path)) continue;
         idx += 1;
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
@@ -479,6 +713,27 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
             return error.PullFailed;
         };
+    }
+
+    // Claim success only after the required set re-verifies on disk.
+    if (resolved.gguf_file.len == 0) {
+        var missing: std.ArrayList([]u8) = .empty;
+        errdefer freeMissingNames(allocator, missing.items);
+        try verifyRequiredFiles(allocator, io, dest_dir, &required, &missing);
+        if (missing.items.len > 0) {
+            defer freeMissingNames(allocator, missing.items);
+            reporter.say("error: {s} is still missing {d} required file(s):", .{ resolved.repo, missing.items.len });
+            std.mem.sort([]u8, missing.items, {}, struct {
+                fn less(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.less);
+            const shown = @min(missing.items.len, @as(usize, 8));
+            for (missing.items[0..shown]) |m| reporter.say("  missing: {s}", .{m});
+            if (missing.items.len > shown) reporter.say("  … and {d} more", .{missing.items.len - shown});
+            reporter.say("error: pull incomplete — rerun `mlx-serve pull {s}` to resume, or fetch with `hf download`", .{resolved.repo});
+            return error.PullIncomplete;
+        }
     }
     reporter.say("success: {s} ready", .{resolved.repo});
 }
@@ -912,13 +1167,93 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(shouldDownload("speech_tokenizer/model.safetensors"));
     try testing.expect(shouldDownload("speech_tokenizer/config.json"));
     try testing.expect(!shouldDownload("g2p/README.md"));
-    // A `.bin` the engine READS (qwen4_exp ngram_table) is needed; torch-format
-    // shadow weights are a second copy of the same model. Same rule as the app's
-    // `DownloadManager.selectNeededFiles` — keep them in sync.
+    // A `.bin` the engine READS is needed; torch/flax shadow weights are a
+    // second copy of the same model. App twin: `selectNeededFiles` (sync).
     try testing.expect(shouldDownload("ngram_table.bin"));
     try testing.expect(!shouldDownload("pytorch_model-00001-of-00002.bin"));
     try testing.expect(!shouldDownload("consolidated.pth"));
     try testing.expect(!shouldDownload("flax_model.msgpack"));
+    // Sidecar dirs come from `mtp.sidecar_rel_paths` and are FINE-GRAINED:
+    // the exact head downloads, the dir's neighbours (OptiQ's relocated
+    // vision tower — GBs the server can't read) do not.
+    try testing.expect(shouldDownload("optiq/mtp.safetensors"));
+    try testing.expect(!shouldDownload("optiq/optiq_vision.safetensors"));
+    try testing.expect(!shouldDownload("mtp/lora.safetensors"));
+    // A Laya checkpoint's required subdirs are part of the chat default.
+    try testing.expect(shouldDownloadAs("encoder/config.json", "laya"));
+    try testing.expect(shouldDownloadAs("tokenizer/tokenizer.json", "laya"));
+    try testing.expect(shouldDownloadAs("tokenizer/tokenizer_config.json", "laya"));
+    try testing.expect(!shouldDownloadAs("tokenizer/README.md", "laya"));
+    // An ordinary chat checkpoint does NOT get the Laya dirs (a stray
+    // encoder/ would be tens of GB of app-bundle-territory weight).
+    try testing.expect(!shouldDownload("encoder/config.json"));
+    try testing.expect(!shouldDownload("tokenizer/tokenizer.json"));
+    try testing.expect(!shouldDownloadAs("tokenizer/tokenizer.json", ""));
+}
+
+test "cli: modelPresentInDir recognizes a COMPLETE configless Laya checkpoint" {
+    // Present means: the proven Laya shape, its weights, its tokenizer dir,
+    // no .partials.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Starved: weights complete, `tokenizer/` never fetched → not present.
+    try tmp.dir.createDirPath(io, "starved/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/encoder/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "starved/model.safetensors", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "starved", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // Complete: tokenizer/tokenizer.json landed → present, no re-pull.
+    try tmp.dir.createDirPath(io, "whole/tokenizer");
+    try tmp.dir.createDirPath(io, "whole/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/encoder/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/model.safetensors", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/tokenizer/tokenizer.json", .data = "{}" });
+    {
+        var d = try tmp.dir.openDir(io, "whole", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // An interrupted required dir (tokenizer/tokenizer.json.partial) is not
+    // present; a stray junk file inside it does not rescue it either.
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/tokenizer/tokenizer.json.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "whole", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // A root-config.json pack with a stray rl_agent_config.json keeps the
+    // ordinary MLX rule (weights only — no tokenizer-dir demand).
+    try tmp.dir.createDirPath(io, "stray");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray/model.safetensors", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "stray", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // Weights + `rl_agent_config.json` but no `encoder/config.json`: the
+    // shape is unproven, so the dir is not present — an unproven copy must
+    // re-pull, never resume into a FileNotFound dir.
+    try tmp.dir.createDirPath(io, "identity");
+    try tmp.dir.writeFile(io, .{ .sub_path = "identity/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "identity/model.safetensors", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "identity", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
 }
 
 test "cli: modelPresentInDir requires a COMPLETE checkpoint" {

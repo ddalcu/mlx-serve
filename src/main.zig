@@ -1263,6 +1263,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // A media model_type with a completeness marker (`requiredMediaMarker`)
+    // must not fall through to the MLX TEXT loader when its marker is missing
+    // — refuse and name the shape instead of loading a starved dir as text.
+    if (gen_mod.incompleteMediaDir(io, allocator, model_dir)) {
+        log.err("{s} is an incomplete media pack (its completeness marker is missing) and is not a text model either — refusing to load it through the text loader. Re-download it (the app or `mlx-serve pull`) or delete the dir.\n", .{model_dir});
+        return error.IncompleteMediaPack;
+    }
+
     // Parse config — heap allocate so the LoadedModel can take ownership
     // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
     // explicit defer on `config_storage`.

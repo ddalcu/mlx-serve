@@ -22,6 +22,7 @@
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
+- `pull` is manifest-driven: it downloads every file the hub's shard index, sidecar tables, or checkpoint shape require (`encoder/` + `tokenizer/` for configless Laya packs), pre-flights the manifest against the repo, and only claims `success:` after the required set re-verifies on disk — a starved pull now names the missing files and fails (`error.PullIncomplete`) instead of printing "ready" and dying later at `error: FileNotFound`. A starved Laya dir on disk is refused by name everywhere (`requiredMediaMarker("laya")`) and repairs itself on the next `pull`.
 
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 

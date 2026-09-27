@@ -167,6 +167,98 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertEqual(picked.first { $0.0 == "optiq/mtp.safetensors" }?.1, 314_000_000)
     }
 
+    /// Shape-aware selection: a Laya repo gets its `encoder/` + `tokenizer/`
+    /// dirs as a WHOLE — same rule as `cli.shouldDownloadAs`, same tables as
+    /// `mtp.sidecar_rel_paths` / `model_discovery.requiredSubdirsForType`
+    /// (keep in sync).
+    func testSelectNeededFilesShapeAwareKeepsLayaRequiredSubdirs() {
+        let entries: [[String: Any]] = [
+            ["path": ".gitattributes", "type": "file", "size": 100],
+            ["path": "README.md", "type": "file", "size": 5_000],
+            ["path": "encoder", "type": "directory", "size": 0],
+            ["path": "encoder/config.json", "type": "file", "size": 2_083],
+            ["path": "rl_agent_config.json", "type": "file", "size": 400],
+            ["path": "model.safetensors", "type": "file", "size": 803_000_000],
+            ["path": "tokenizer", "type": "directory", "size": 0],
+            ["path": "tokenizer/tokenizer.json", "type": "file", "size": 3_583_228],
+            ["path": "tokenizer/tokenizer_config.json", "type": "file", "size": 308],
+            ["path": "tokenizer/README.md", "type": "file", "size": 308],
+        ]
+        // The listing itself decides — no root config.json + the Laya pair.
+        XCTAssertEqual(DownloadManager.checkpointType(inPaths: Set(entries.compactMap { $0["path"] as? String })), "laya")
+
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries, checkpointType: "laya").map { $0.0 })
+        XCTAssertTrue(paths.contains("encoder/config.json"), "required subdir as a WHOLE must be pulled")
+        XCTAssertTrue(paths.contains("tokenizer/tokenizer.json"))
+        XCTAssertTrue(paths.contains("tokenizer/tokenizer_config.json"))
+        XCTAssertTrue(paths.contains("model.safetensors"))
+        XCTAssertFalse(paths.contains("tokenizer/README.md"), "the junk filter still applies inside a required dir")
+        XCTAssertFalse(paths.contains("encoder"), "a directory entry is not a downloadable file")
+
+        // An ordinary checkpoint does NOT get the Laya dirs.
+        let plain = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertFalse(plain.contains("encoder/config.json"))
+        XCTAssertFalse(plain.contains("tokenizer/tokenizer.json"))
+
+        // A root config.json outranks the Laya pair (same precedence as the
+        // server's `peekConfig` / `configlessModelType`).
+        var withConfig = Set(entries.compactMap { $0["path"] as? String })
+        withConfig.insert("config.json")
+        XCTAssertEqual(DownloadManager.checkpointType(inPaths: withConfig), "")
+    }
+
+    /// Twin cells for the shared pull tables: the exact rows
+    /// `mtp.sidecar_rel_paths`, `mtp.engine_sidecar_paths` and
+    /// `model_discovery.requiredMediaMarker` carry in src/ (keep in sync).
+    func testSharedPullTablesMatchTheZigSide() {
+        XCTAssertEqual(DownloadManager.engineSidecarPaths, ["ngram_table.bin"])
+        XCTAssertEqual(DownloadManager.requiredSubdirs(modelType: "laya"), ["encoder/", "tokenizer/"])
+        XCTAssertEqual(DownloadManager.requiredSubdirs(modelType: ""), [])
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "laya"), "tokenizer/tokenizer.json")
+        // Whole-dir junk filter (`skip_exact` + `skip_ext` in src/cli.zig).
+        XCTAssertTrue(DownloadManager.isSkipName("tokenizer/README.md"))
+        XCTAssertTrue(DownloadManager.isSkipName("encoder/banner.png"))
+        XCTAssertFalse(DownloadManager.isSkipName("tokenizer/tokenizer.json"))
+    }
+
+    /// A starved Laya dir (weights complete, `tokenizer/` never fetched) must
+    /// not read as a complete checkpoint; the marker landing makes it complete.
+    func testHoldsCompleteCheckpointRefusesAStarvedLayaDir() throws {
+        let fm = FileManager.default
+        let dir = try makeTempLayaDir(starved: true)
+        defer { try? fm.removeItem(at: URL(fileURLWithPath: dir)) }
+
+        // Detection still works (that's what made every old check lie: the dir
+        // WAS a Laya checkpoint, it just wasn't complete).
+        XCTAssertEqual(DownloadManager.configlessModelType(inDir: dir), "laya")
+        XCTAssertFalse(DownloadManager.holdsCompleteCheckpoint(dir),
+                       "a starved Laya dir must not read as a complete checkpoint")
+
+        // A zero-byte marker must not count either (a truncated fetch).
+        try fm.createDirectory(atPath: dir + "/tokenizer", withIntermediateDirectories: true)
+        try Data().write(to: URL(fileURLWithPath: dir + "/tokenizer/tokenizer.json"))
+        XCTAssertFalse(DownloadManager.holdsCompleteCheckpoint(dir),
+                       "a zero-byte marker is a truncated download, not a complete pack")
+
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: dir + "/tokenizer/tokenizer.json"))
+        XCTAssertTrue(DownloadManager.holdsCompleteCheckpoint(dir),
+                      "the marker landing must make it complete (a re-pull needs no restart)")
+    }
+
+    private func makeTempLayaDir(starved: Bool) throws -> String {
+        let fm = FileManager.default
+        let base = (NSTemporaryDirectory() as NSString).appendingPathComponent("laya-complete-\(UUID().uuidString)")
+        try fm.createDirectory(atPath: base + "/encoder", withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: base + "/rl_agent_config.json"))
+        try Data("{\"model_type\":\"modernbert\"}".utf8).write(to: URL(fileURLWithPath: base + "/encoder/config.json"))
+        try Data("weights".utf8).write(to: URL(fileURLWithPath: base + "/model.safetensors"))
+        if !starved {
+            try fm.createDirectory(atPath: base + "/tokenizer", withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: URL(fileURLWithPath: base + "/tokenizer/tokenizer.json"))
+        }
+        return base
+    }
+
     // MARK: - Drafter discovery
 
     func testDiscoverDraftersFindsAllPublishedVariants() throws {
