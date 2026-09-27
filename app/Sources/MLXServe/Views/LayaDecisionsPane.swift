@@ -110,7 +110,8 @@ struct LayaDecisionsPane: View {
                     }
 
                     HStack {
-                        Button(busy ? "Asking…" : "Ask") { Task { await ask() } }
+                        Button { Task { await ask() } } label: { Text(busy ? "Asking…" : "Ask")
+    .font(.app(.body)) }
                             .keyboardShortcut(.return, modifiers: .command)
                             .disabled(busy || questions.allSatisfy { $0.json == nil })
                         if let latencyMs { Text(String(format: "%.0f ms", latencyMs)).font(.app(.body)).foregroundStyle(.secondary) }
