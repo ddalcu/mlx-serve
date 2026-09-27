@@ -51,8 +51,8 @@ enum PromptEditorHeight {
 /// Presets (`ImageModelPreset` / `AudioModelPreset` / `VideoModelPreset`) and
 /// `ResolutionOption` are NOT Codable but have stable string `id`s, so we
 /// persist the id and reconstruct via `.all.first { $0.id == }` with the preset
-/// default as the unknown-id fallback. The prompt and transient inputs
-/// (reference audio, first-frame image) are deliberately NOT persisted.
+/// default as the unknown-id fallback. Each pane's draft (prompt, picked
+/// files) is persisted by path and checked on hydrate.
 
 // MARK: - Image
 
@@ -63,8 +63,7 @@ struct ImageGenSettings: Codable, Equatable {
     var steps: Int = 8
     var seed: Int = -1
     var keepResident: Bool = false
-    /// img2img renoise strength (the source image path itself is transient —
-    /// not persisted, like video's first-frame).
+    /// img2img renoise strength.
     var strength: Double = 0.6
     /// Source-image mode: instruction edit (FLUX.2) vs renoise variation.
     var editMode: Bool = true
@@ -72,15 +71,21 @@ struct ImageGenSettings: Codable, Equatable {
     var condGain: Double = 1.0
     var condWeightsText: String = ""
     /// Classifier-free guidance (Advanced, `ImageModelPreset.supportsGuidance`
-    /// models only): 1.0 = off. The negative prompt itself is transient, like
-    /// the main prompt — not persisted.
+    /// models only): 1.0 = off.
     var guidanceScale: Double = 1.0
+    /// The draft: what the pane shows when it is reopened. Paths are checked
+    /// on hydrate and dropped when the file is gone.
+    var prompt: String = ""
+    var negativePrompt: String = ""
+    var promptHeight: Double = PromptEditorHeight.defaultHeight
+    var showAdvanced: Bool = false
+    var sourcePath: String? = nil
+    var refPaths: [String] = []
     /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
     /// Empty = none attached.
     var loras: [LoraAdapter] = []
-    /// The size last typed into the Custom… fields. Kept even while a fixed
-    /// bucket is selected, so switching back to Custom restores what you had —
-    /// the same convention as the H3 reference lists surviving a preset switch.
+    /// The canvas the fields hold; what the Custom sentinel in `resolutionId`
+    /// resolves to.
     var customWidth: Int = 1024
     var customHeight: Int = 1024
 
@@ -173,6 +178,14 @@ extension ImageGenSettings {
         }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customWidth) { customWidth = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .customHeight) { customHeight = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prompt) { prompt = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .negativePrompt) { negativePrompt = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
+            promptHeight = PromptEditorHeight.clamp(v)
+        }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .showAdvanced) { showAdvanced = v }
+        sourcePath = try c.decodeIfPresent(String.self, forKey: .sourcePath)
+        if let v = try c.decodeIfPresent([String].self, forKey: .refPaths) { refPaths = v }
     }
 }
 

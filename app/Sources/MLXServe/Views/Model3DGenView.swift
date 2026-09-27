@@ -220,7 +220,7 @@ struct Model3DGenView: View {
                            step: Double) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.app(.caption))
+                Text(L10n.text(label)).font(.app(.rowTitle))
                 Spacer()
                 Text(String(format: "%.1f", value.wrappedValue))
                     .font(.app(.caption).monospacedDigit())
@@ -235,7 +235,7 @@ struct Model3DGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.app(.caption))
+                Text(L10n.text(label)).font(.app(.rowTitle))
                 Spacer()
                 Text("\(value.wrappedValue)")
                     .font(.app(.caption).monospacedDigit())

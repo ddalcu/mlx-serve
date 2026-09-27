@@ -170,6 +170,48 @@ final class MediaDropTests: XCTestCase {
         XCTAssertEqual(placed.refs, refs)
     }
 
+    /// The source and the references are one numbered list to the model, so a
+    /// file already in it is not placed twice: the tiles key on the file, and
+    /// a duplicate would draw once and remove both.
+    func testAFileAlreadyAttachedIsNotPlacedAgain() {
+        let placed = ImageDropPlacement.place(
+            [u("source.png"), u("r1.png"), u("b.png")], source: u("source.png"),
+            editing: true, refs: [u("r1.png")], refLimit: 3)
+        XCTAssertEqual(placed.source, u("source.png"))
+        XCTAssertEqual(placed.refs, [u("r1.png"), u("b.png")])
+    }
+
+    // MARK: - Restoring the saved draft
+
+    /// Files that are gone are dropped, and the first survivor is the source:
+    /// the list is numbered by position, so a missing image 1 makes the next
+    /// picture image 1 rather than leaving references with no source.
+    func testRestorePromotesTheFirstSurvivorToSource() {
+        let exists: (String) -> Bool = { !$0.hasPrefix("/gone") }
+        let r = ImageDraftImages.restore(sourcePath: "/gone/source.png",
+                                         refPaths: ["/kept/r1.png", "/gone/r2.png", "/kept/r3.png"],
+                                         exists: exists)
+        XCTAssertEqual(r.source, URL(fileURLWithPath: "/kept/r1.png"))
+        XCTAssertEqual(r.refs, [URL(fileURLWithPath: "/kept/r3.png")])
+        XCTAssertTrue(r.dropped)
+    }
+
+    func testRestoreKeepsACompleteDraftAsSavedAndDedupes() {
+        let r = ImageDraftImages.restore(sourcePath: "/kept/source.png",
+                                         refPaths: ["/kept/r1.png", "/kept/source.png"],
+                                         exists: { _ in true })
+        XCTAssertEqual(r.source, URL(fileURLWithPath: "/kept/source.png"))
+        XCTAssertEqual(r.refs, [URL(fileURLWithPath: "/kept/r1.png")])
+        XCTAssertFalse(r.dropped)
+    }
+
+    func testRestoreWithNoSourceSavedRestoresNothing() {
+        let r = ImageDraftImages.restore(sourcePath: nil, refPaths: ["/kept/r1.png"], exists: { _ in true })
+        XCTAssertNil(r.source)
+        XCTAssertTrue(r.refs.isEmpty)
+        XCTAssertFalse(r.dropped, "a draft that never had a source has nothing to miss")
+    }
+
     /// …which is exactly why that pane must report NO room: the old limit
     /// (`1 + refLimit - refs.count`) said 1 with the source set and the
     /// references full, so the file animated in and landed nowhere.

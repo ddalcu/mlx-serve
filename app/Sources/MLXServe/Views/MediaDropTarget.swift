@@ -93,6 +93,26 @@ enum MediaDrop {
     }
 }
 
+/// The Image pane's saved source and references, brought back on open.
+enum ImageDraftImages {
+    /// Files that are gone are dropped and the first survivor is the source:
+    /// the list is numbered by position ("image 1" is the source), so it never
+    /// comes back as references with no source. `dropped` says a saved file
+    /// was missing, which renumbers whatever the prompt named.
+    static func restore(sourcePath: String?, refPaths: [String],
+                        exists: (String) -> Bool) -> (source: URL?, refs: [URL], dropped: Bool) {
+        guard let sourcePath else { return (nil, [], false) }
+        var seen = Set<String>()
+        var kept: [URL] = []
+        var dropped = false
+        for path in [sourcePath] + refPaths {
+            guard seen.insert(path).inserted else { continue }
+            if exists(path) { kept.append(URL(fileURLWithPath: path)) } else { dropped = true }
+        }
+        return (kept.first, Array(kept.dropFirst()), dropped)
+    }
+}
+
 /// Where a dropped image lands on the Image pane, which is the one pane with
 /// two destinations. Kept pure and out of the view so the routing can be read
 /// (and tested) on its own.
@@ -130,6 +150,9 @@ enum ImageDropPlacement {
         var source = source
         var refs = refs
         for url in urls {
+            // One numbered list to the model, so a file already in it is not
+            // placed again.
+            if url == source || refs.contains(url) { continue }
             if source == nil {
                 source = url
             } else if refs.count < refLimit {

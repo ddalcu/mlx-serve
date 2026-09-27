@@ -102,6 +102,7 @@ pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
 pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
 
 // Array creation
 pub extern "c" fn mlx_array_new() mlx_array;

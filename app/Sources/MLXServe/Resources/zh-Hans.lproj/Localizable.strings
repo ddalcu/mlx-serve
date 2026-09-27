@@ -171,6 +171,7 @@
 "Acoustic ballad" = "原声抒情曲";
 "Acoustic folk" = "原声民谣";
 "Add" = "添加";
+"Add LoRA adapter for custom style. Several can stack at once." = "添加 LoRA 适配器以获得自定义风格。可同时叠加多个。";
 "Add OpenAI-compatible chat endpoints — a cloud API, another machine, a local runtime. Their models join the picker as <model>@<name> while the provider answers. Applies on save — no restart needed." = "添加兼容 OpenAI 的聊天端点 —— 云端 API、另一台机器或本地运行时。提供方在线时，它的模型会以 <model>@<name> 的形式出现在选择器中。保存即生效 —— 无需重启。";
 "Add Provider" = "添加提供商";
 "Add Voice" = "添加声音";
@@ -1301,6 +1302,7 @@
 "Recording" = "录音中";
 "Recreate speech" = "重新生成语音";
 "Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”." = "用编号来指代图片 —— 源图是图 1，参考图按顺序跟在后面：“把图 1 中男子的脸换成图 2 中的脸”。";
+"Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”. Click a picture to drop its name into the prompt." = "用编号来指代图片 —— 源图是图 1，参考图按顺序跟在后面：“把图 1 中男子的脸换成图 2 中的脸”。点击图片即可把它的名称插入提示词。";
 "Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1> — the numbering is per type, in the order below." = "在提示词中用 <Picture 1>、<Video 1>、<Audio 1> 来引用 —— 编号按类型分别计数，顺序如下。";
 "Reference audio (optional)" = "参考音频（可选）";
 "Reference voice" = "参考音色";
@@ -1472,6 +1474,7 @@
 "Session cache entries" = "会话缓存条目数";
 "Sessions" = "会话";
 "Set by %@" = "由 %@ 设置";
+"Set by source image…" = "按源图片设置…";
 "Set by starting frame…" = "由起始帧决定…";
 "Set by the agent %@. Edit the agent to change it." = "由 Agent %@ 设置。要修改请编辑该 Agent。";
 "Settings" = "设置";
@@ -1521,6 +1524,7 @@
 "Something went wrong" = "出错了";
 "Sound" = "声音";
 "Source image (optional)" = "源图像（可选）";
+"Source image(s)" = "源图片";
 "Source stem" = "源音轨";
 "Source track" = "源曲目";
 "Spanish" = "西班牙语";
@@ -1674,6 +1678,7 @@
 "The session running inside the sandbox will be terminated. Files it wrote are kept." = "沙盒中运行的会话将被终止。它写入的文件会保留。";
 "The sharpest LTX we ship. Same model as the 4-bit pack at twice the weight precision — noticeably more detail in faces, fur and fine texture, for about the same generation time. Needs a Mac with plenty of memory." = "我们提供的最清晰的 LTX。与 4-bit 包是同一模型，但权重精度翻倍 —— 面部、毛发和细腻纹理的细节明显更多，生成时间大致相同。需要内存充足的 Mac。";
 "The smallest rung's decode, measured again after the whole ladder. Beyond ±10% the run's numbers are a range, not figures." = "最小档位的解码速度，在整个阶梯测试结束后再测一次。超过 ±10% 时，本次结果只是一个范围，而不是确切数值。";
+"The source image does not fit this model." = "源图片不适合此模型。";
 "The sweet spot" = "最佳平衡点";
 "The task run failed." = "任务运行失败。";
 "The tensor library under the llama.cpp GGUF engine (with its short commit)." = "llama.cpp GGUF 引擎底层的张量库（含其短提交号）。";
@@ -1939,6 +1944,7 @@
 "off" = "关闭";
 "on" = "开启";
 "open" = "开阔";
+"optional" = "可选";
 "optional — I2V" = "可选 —— 图生视频";
 "optional — audio-to-video" = "可选 —— 音频生视频";
 "optional — ends here" = "可选 —— 在此结束";
