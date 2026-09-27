@@ -20,6 +20,7 @@ test {
     _ = @import("mrope.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
+    _ = @import("qmv_nax2.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
