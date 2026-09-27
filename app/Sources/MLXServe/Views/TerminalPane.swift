@@ -36,6 +36,8 @@ struct TerminalPane: View {
     @ViewBuilder
     private func content(_ session: TerminalSessionList.Session) -> some View {
         switch session.phase {
+        case .suspended:
+            Color.clear.onAppear { terminals.retry(session.id) }
         case .preparing:
             notice {
                 ProgressView()

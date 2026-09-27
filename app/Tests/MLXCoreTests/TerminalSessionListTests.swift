@@ -195,3 +195,28 @@ extension TerminalSessionListTests {
         XCTAssertEqual(m.displayName(a), "pi", "blank = back to the numbered auto name")
     }
 }
+
+extension TerminalSessionListTests {
+    func testRowsSurviveARestartSuspendedAndResuming() throws {
+        var m = TerminalSessionList()
+        let a = m.addPreparing(label: "pi", agentId: "pi", workspace: "/a")
+        let b = m.addPreparing(label: "pi", agentId: "pi", workspace: "/b")
+        let c = m.addPreparing(label: "Claude Code", agentId: "claude", workspace: "/c", kind: .host)
+        m.markLive(a); m.markExited(b, exitCode: 0); m.markFailed(c, message: "x")
+        m.rename(b, to: "backend")
+        m.setTheme(a, themeId: "dracula")
+
+        var r = try JSONDecoder().decode(TerminalSessionList.self, from: JSONEncoder().encode(m))
+        XCTAssertEqual(r.sessions.map(\.id), [a, b, c])
+        XCTAssertEqual(r.sessions.map(\.displayName), ["pi", "backend", "Claude Code"])
+        XCTAssertEqual(r.session(c)?.kind, .host)
+        XCTAssertEqual(r.session(a)?.themeId, "dracula")
+        // No process outlives a quit: every row waits to be opened, and closing one kills nothing.
+        XCTAssertTrue(r.sessions.allSatisfy { $0.phase == .suspended && $0.resumes })
+        XCTAssertFalse(r.closeNeedsConfirmation(a))
+        r.retry(a)
+        XCTAssertEqual(r.session(a)?.phase, .preparing, "opening a restored row starts it in place")
+        let d = r.addPreparing(label: "pi", agentId: "pi", workspace: "/d")
+        XCTAssertEqual(r.displayName(d), "pi 3", "numbering carries over")
+    }
+}

@@ -312,6 +312,7 @@ enum AgentConfigs {
         return """
         {
           "$schema": "https://opencode.ai/config.json",\(pinned)\(compactionBlock)
+          "skills": { "paths": ["~/.mlx-serve/skills/\(AgentSkills.name)"] },
           "provider": {
             "mlx": {
               "npm": "@ai-sdk/openai-compatible",

@@ -1108,6 +1108,8 @@ pub const StubMeta = struct {
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
     has_video: bool = false,
     has_chat: bool = false,
+    /// The chat template can open a reasoning block (`templateSupportsThinking`).
+    has_thinking: bool = false,
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
     /// advertises "embeddings" and no chat capabilities.
     is_encoder: bool = false,
@@ -1225,7 +1227,9 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
     defer allocator.free(bytes);
 
-    var meta = parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+    const sniff = sniffChatTemplate(io, allocator, dir);
+    var meta = parseStubMeta(allocator, bytes, sniff.present);
+    meta.has_thinking = meta.has_chat and sniff.thinking;
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even
     // when config.json says nothing (the load path parses its mode; the stub
@@ -1238,21 +1242,45 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     return meta;
 }
 
-/// True if the model dir ships a chat template — a `chat_template.jinja` file,
-/// or a `tokenizer_config.json` that carries a `chat_template` key. Cheap proxy
-/// for "this is an instruct/chat model" used to gate chat/tool capabilities on
-/// unloaded stubs.
-fn hasChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
-    if (dir.statFile(io, "chat_template.jinja", .{})) |st| {
-        if (st.kind == .file) return true;
+/// Whether a chat template can open a reasoning block; one rule for the stub
+/// and loaded capability paths.
+pub fn templateSupportsThinking(tmpl: []const u8) bool {
+    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
+        std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
+        std.mem.indexOf(u8, tmpl, "thought") != null or
+        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
+}
+
+const TemplateSniff = struct { present: bool = false, thinking: bool = false };
+
+/// Whether the model dir ships a chat template — a `chat_template.jinja` file,
+/// or a `tokenizer_config.json` that carries a `chat_template` key — and whether
+/// it can think. Cheap proxy used to gate capabilities on unloaded stubs.
+fn sniffChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) TemplateSniff {
+    if (dir.readFileAlloc(io, "chat_template.jinja", allocator, .limited(8 * 1024 * 1024))) |bytes| {
+        defer allocator.free(bytes);
+        return .{ .present = true, .thinking = templateSupportsThinking(bytes) };
     } else |_| {}
-    var f = dir.openFile(io, "tokenizer_config.json", .{}) catch return false;
-    defer f.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = f.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch return false;
+    const bytes = dir.readFileAlloc(io, "tokenizer_config.json", allocator, .limited(8 * 1024 * 1024)) catch return .{};
     defer allocator.free(bytes);
-    return std.mem.indexOf(u8, bytes, "\"chat_template\"") != null;
+    if (std.mem.indexOf(u8, bytes, "\"chat_template\"") == null) return .{};
+    // Only the template value: `added_tokens` name `<think>` on non-thinking packs too.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .{ .present = true };
+    defer parsed.deinit();
+    const tmpl = if (parsed.value == .object) parsed.value.object.get("chat_template") else null;
+    const v = tmpl orelse return .{ .present = true };
+    var sniff: TemplateSniff = .{ .present = true };
+    switch (v) {
+        .string => |t| sniff.thinking = templateSupportsThinking(t),
+        .array => |arr| for (arr.items) |item| {
+            if (item != .object) continue;
+            const t = item.object.get("template") orelse continue;
+            if (t == .string and templateSupportsThinking(t.string)) sniff.thinking = true;
+        },
+        else => {},
+    }
+    return sniff;
 }
 
 fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
@@ -2144,4 +2172,24 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
         \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
     });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "readStubMeta: has_thinking reads the template on disk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/tokenizer_config.json", .data = "{\"chat_template\":\"{% if enable_thinking %}x{% endif %}\"}" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "{{ messages[0].content }}" });
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "<|im_start|>assistant\n<think>\n" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
 }

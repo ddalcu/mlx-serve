@@ -28,6 +28,7 @@ const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("ane.zig");
+const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -186,6 +187,10 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
+        \\  --ple-gpu           Qwen3.8-Flash-Next: gather the n-gram table on the
+        \\                        GPU. Keeps the whole ~30 GB table resident beside
+        \\                        the weights for a few % faster prefill/decode;
+        \\                        off = rows read from the mmapped file on demand.
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
@@ -285,7 +290,9 @@ fn printUsage(io: std.Io) void {
         \\                        turns off SSM checkpoint capture, since
         \\                        checkpoints exist only to feed it.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
-        \\                      Hot prefix cache KV-bytes budget (default: 2GB).
+        \\                      Hot prefix cache KV-bytes budget (default: 2GB,
+        \\                        or one session at the working context on
+        \\                        qwen4_exp when that is larger).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
@@ -738,6 +745,8 @@ pub fn main(init: std.process.Init) !void {
             force_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
+        } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
+            ple_gpu.enabled = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
@@ -830,6 +839,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            server_mod.prefix_cache_mem_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts

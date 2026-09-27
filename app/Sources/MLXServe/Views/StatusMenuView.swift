@@ -481,7 +481,9 @@ struct StatusMenuView: View {
                         gpuBytes: mem.activeBytes,
                         gpuLabel: mem.gpuMemoryLabel,
                         availableBytes: mem.availableBytes,
-                        totalBytes: Int64(ProcessInfo.processInfo.physicalMemory)
+                        totalBytes: Int64(ProcessInfo.processInfo.physicalMemory),
+                        gpuLimitBytes: mem.gpuLimitBytes,
+                        breakdown: mem.gpuBreakdown
                     )
                 }
                 if let t = server.throughput {

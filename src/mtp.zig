@@ -2150,7 +2150,17 @@ fn ownWeightOpt(w: *const Weights, key: []const u8) mlx.mlx_array {
 
 /// Load a `<prefix>.{weight,scales?,biases?}` triple raw (no transpose) —
 /// the shape the trunk's gather/qmatmul paths expect for MoE tensors.
-fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
+const MoeTriple = struct {
+    w: mlx.mlx_array,
+    s: mlx.mlx_array,
+    b: mlx.mlx_array,
+
+    fn deinit(self: *MoeTriple) void {
+        for ([_]mlx.mlx_array{ self.w, self.s, self.b }) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+fn loadMoeTriple(w: *const Weights, prefix: []const u8) !MoeTriple {
     var key_buf: [256]u8 = undefined;
     return .{
         .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "{s}.weight", .{prefix})),
@@ -2239,6 +2249,19 @@ pub fn loadMtp(
         return loadHy3Mtp(allocator, s, &weights, p);
     }
 
+    return loadQwenMtp(allocator, s, &weights, p);
+}
+
+/// Qwen 3.5/3.6/3.8 native head (sidecar or in-checkpoint `mtp.*`): fc over
+/// [pre_fc_norm(emb), pre_fc_norm(h)], one decoder layer, the trunk's lm_head.
+fn loadQwenMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights, p: []const u8) !MtpModel {
+    var kb: [256]u8 = undefined;
+    const K = struct {
+        fn k(buf: []u8, pref: []const u8, rest: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, rest }) catch unreachable;
+        }
+    };
+
     // MLP flavor: a `switch_mlp` router/expert pack marks a MoE-trunk sidecar
     // (35B-A3B); plain gate/up/down is the dense one-layer head.
     const is_moe = weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.weight")) != null;
@@ -2246,83 +2269,65 @@ pub fn loadMtp(
     // Delta-encoded norms (Qwen original layout, oMLX OptiQ) need `+1` folded
     // in at load so the runtime `rmsnorm(x) * w` matches; a natively-folded
     // mlx-serve sidecar has strictly-positive norms and is left untouched.
-    const fold_norms = mtpNormsAreDeltaEncoded(&weights, p, s);
+    const fold_norms = mtpNormsAreDeltaEncoded(weights, p, s);
     if (fold_norms) log.info("[mtp] delta-encoded norms detected; folding +1 at load\n", .{});
 
     var hq_stats: HeadQuantStats = .{};
+    // Every tensor lands in a local that frees itself on error; `m` below is
+    // built with no fallible call and takes them all over.
+    // fc via loadLinear (never loadTrunkLinear — the m5Nax profile contract
+    // wants a bf16 fc): dense gets the pre-transpose, a quantized one (Alis)
+    // loads verbatim.
+    var fc = try loadLinear(weights, allocator, K.k(&kb, p, "fc"), s);
+    errdefer fc.deinit();
+    const pre_fc_norm_emb = try ownNorm(weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(pre_fc_norm_emb);
+    const pre_fc_norm_hidden = try ownNorm(weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(pre_fc_norm_hidden);
+    // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
+    // low (their raw HF means sit above 0.5): fold or repair per oMLX's
+    // norm_repair — the global delta-fold when it fired, else a reference
+    // anchor from the backbone counterpart. pre_fc_norm_* + input_norm are
+    // always converted correctly, so they stay on plain ownNorm.
+    const final_norm = try ownHeadNormWithRepair(weights, K.k(&kb, p, "norm.weight"), "model.norm.weight", s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(final_norm);
+    const input_norm = try ownNorm(weights, K.k(&kb, p, "layers.0.input_layernorm.weight"), s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(input_norm);
+    const post_attn_norm = try ownHeadNormWithRepair(weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(post_attn_norm);
+    const q_norm = try ownHeadNormWithRepair(weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(q_norm);
+    const k_norm = try ownHeadNormWithRepair(weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms);
+    errdefer _ = mlx.mlx_array_free(k_norm);
+    var q = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s, &hq_stats);
+    errdefer q.deinit();
+    var k = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s, &hq_stats);
+    errdefer k.deinit();
+    var v = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s, &hq_stats);
+    errdefer v.deinit();
+    var o = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s, &hq_stats);
+    errdefer o.deinit();
+    const mlp = try loadQwenMtpMlp(weights, allocator, s, p, is_moe, &hq_stats);
+
     var m = MtpModel{
         .allocator = allocator,
         .s = s,
         .quant_bits = 0, // inferred from tensor geometry below
         .quant_group_size = 0,
-        // fc via loadLinear (never loadTrunkLinear — the m5Nax profile
-        // contract wants a bf16 fc): dense gets the pre-transpose, a
-        // quantized one (Alis) loads verbatim.
-        .fc = try loadLinear(&weights, allocator, K.k(&kb, p, "fc"), s),
-        .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
-        .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
-        // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
-        // low (their raw HF means sit above 0.5): fold or repair per oMLX's
-        // norm_repair — the global delta-fold when it fired, else a reference
-        // anchor from the backbone counterpart. pre_fc_norm_* + input_norm are
-        // always converted correctly, so they stay on plain ownNorm.
-        .final_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "norm.weight"), "model.norm.weight", s, fold_norms),
-        .input_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight"), s, fold_norms),
-        .post_attn_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms),
-        .q_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms),
-        .k_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms),
-        .q = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s, &hq_stats),
-        .k = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s, &hq_stats),
-        .v = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s, &hq_stats),
-        .o = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s, &hq_stats),
-        .mlp = if (is_moe) blk: {
-            // Router (`mlp.gate`) via loadLinear: a bf16 router gets
-            // pre-transposed for the trunk's dense-matmul fallback, a
-            // quantized one loads verbatim.
-            const router = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate"), s);
-            // Packed 3D expert tensors load raw (the trunk's gather paths own
-            // the orientation); 2D shared/seg linears ride loadLinear so a
-            // bf16 build gets the dense pre-transpose, exactly like the trunk.
-            const sg = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
-            const su = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
-            const sd = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
-            const shg = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s, &hq_stats);
-            const shu = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s, &hq_stats);
-            const shd = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s, &hq_stats);
-            const seg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert_gate"), s);
-            break :blk .{ .moe = .{
-                .router_w = router.w,
-                .router_s = router.s,
-                .router_b = router.b,
-                .switch_gate_w = sg.w,
-                .switch_gate_s = sg.s,
-                .switch_gate_b = sg.b,
-                .switch_up_w = su.w,
-                .switch_up_s = su.s,
-                .switch_up_b = su.b,
-                .switch_down_w = sd.w,
-                .switch_down_s = sd.s,
-                .switch_down_b = sd.b,
-                .shared_gate_w = shg.w,
-                .shared_gate_s = shg.s,
-                .shared_gate_b = shg.b,
-                .shared_up_w = shu.w,
-                .shared_up_s = shu.s,
-                .shared_up_b = shu.b,
-                .shared_down_w = shd.w,
-                .shared_down_s = shd.s,
-                .shared_down_b = shd.b,
-                .shared_expert_gate_w = seg.w,
-                .shared_expert_gate_s = seg.s,
-                .shared_expert_gate_b = seg.b,
-            } };
-        } else .{ .dense = .{
-            .gate = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s, &hq_stats),
-            .up = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s, &hq_stats),
-            .down = try loadTrunkLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s, &hq_stats),
-        } },
+        .fc = fc,
+        .pre_fc_norm_emb = pre_fc_norm_emb,
+        .pre_fc_norm_hidden = pre_fc_norm_hidden,
+        .final_norm = final_norm,
+        .input_norm = input_norm,
+        .post_attn_norm = post_attn_norm,
+        .q_norm = q_norm,
+        .k_norm = k_norm,
+        .q = q,
+        .k = k,
+        .v = v,
+        .o = o,
+        .mlp = mlp,
     };
-    errdefer m.deinit();
 
     if (hq_stats.n > 0) {
         log.info("[mtp] head trunk quantized: {d} weights bf16→{d}b/g{d} ({d}→{d} MB)\n", .{
@@ -2400,6 +2405,78 @@ pub fn loadMtp(
     return m;
 }
 
+/// The Qwen head's MLP: dense gate/up/down, or the MoE-trunk sidecar's router,
+/// stacked experts and gated shared expert. Frees what it loaded on error.
+fn loadQwenMtpMlp(
+    weights: *const Weights,
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    p: []const u8,
+    is_moe: bool,
+    hq_stats: *HeadQuantStats,
+) !MtpMlp {
+    var kb: [256]u8 = undefined;
+    const K = struct {
+        fn k(buf: []u8, pref: []const u8, rest: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, rest }) catch unreachable;
+        }
+    };
+    if (!is_moe) {
+        var gate = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s, hq_stats);
+        errdefer gate.deinit();
+        var up = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s, hq_stats);
+        errdefer up.deinit();
+        const down = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s, hq_stats);
+        return .{ .dense = .{ .gate = gate, .up = up, .down = down } };
+    }
+    // Router (`mlp.gate`) via loadLinear: a bf16 router gets pre-transposed
+    // for the trunk's dense-matmul fallback, a quantized one loads verbatim.
+    var router = try loadLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.gate"), s);
+    errdefer router.deinit();
+    // Packed 3D expert tensors load raw (the trunk's gather paths own the
+    // orientation); 2D shared/seg linears ride loadLinear so a bf16 build
+    // gets the dense pre-transpose, exactly like the trunk.
+    var sg = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
+    errdefer sg.deinit();
+    var su = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
+    errdefer su.deinit();
+    var sd = try loadMoeTriple(weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
+    errdefer sd.deinit();
+    var shg = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s, hq_stats);
+    errdefer shg.deinit();
+    var shu = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s, hq_stats);
+    errdefer shu.deinit();
+    var shd = try loadTrunkLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s, hq_stats);
+    errdefer shd.deinit();
+    const seg = try loadLinear(weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert_gate"), s);
+    return .{ .moe = .{
+        .router_w = router.w,
+        .router_s = router.s,
+        .router_b = router.b,
+        .switch_gate_w = sg.w,
+        .switch_gate_s = sg.s,
+        .switch_gate_b = sg.b,
+        .switch_up_w = su.w,
+        .switch_up_s = su.s,
+        .switch_up_b = su.b,
+        .switch_down_w = sd.w,
+        .switch_down_s = sd.s,
+        .switch_down_b = sd.b,
+        .shared_gate_w = shg.w,
+        .shared_gate_s = shg.s,
+        .shared_gate_b = shg.b,
+        .shared_up_w = shu.w,
+        .shared_up_s = shu.s,
+        .shared_up_b = shu.b,
+        .shared_down_w = shd.w,
+        .shared_down_s = shd.s,
+        .shared_down_b = shd.b,
+        .shared_expert_gate_w = seg.w,
+        .shared_expert_gate_s = seg.s,
+        .shared_expert_gate_b = seg.b,
+    } };
+}
+
 /// Hy3 (hy_v3) MTP block loader — `model-mtp.safetensors` with post-sanitize
 /// names: mtp.{enorm,hnorm,eh_proj,final_layernorm} + mtp.layer.* holding a
 /// FULL hy3 decoder layer (8-bit attention with per-head QK norms, 2/3-bit
@@ -2420,13 +2497,48 @@ fn loadHy3Mtp(
         }
     };
 
-    const router = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.router.gate"), s);
-    const sg = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.gate_proj"));
-    const su = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.up_proj"));
-    const sd = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.down_proj"));
-    const shg = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.gate_proj"), s);
-    const shu = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.up_proj"), s);
-    const shd = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.down_proj"), s);
+    // Every tensor lands in a local that frees itself on error; `m` below is
+    // built with no fallible call and takes them all over.
+    var router = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.router.gate"), s);
+    errdefer router.deinit();
+    var sg = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.gate_proj"));
+    errdefer sg.deinit();
+    var su = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.up_proj"));
+    errdefer su.deinit();
+    var sd = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.down_proj"));
+    errdefer sd.deinit();
+    var shg = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.gate_proj"), s);
+    errdefer shg.deinit();
+    var shu = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.up_proj"), s);
+    errdefer shu.deinit();
+    var shd = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.down_proj"), s);
+    errdefer shd.deinit();
+    var eh_proj = try loadLinear(weights, allocator, K.k(&kb, p, "eh_proj"), s);
+    errdefer eh_proj.deinit();
+    const enorm = try ownWeight(weights, K.k(&kb, p, "enorm.weight"));
+    errdefer _ = mlx.mlx_array_free(enorm);
+    const hnorm = try ownWeight(weights, K.k(&kb, p, "hnorm.weight"));
+    errdefer _ = mlx.mlx_array_free(hnorm);
+    const final_norm = try ownWeight(weights, K.k(&kb, p, "final_layernorm.weight"));
+    errdefer _ = mlx.mlx_array_free(final_norm);
+    const input_norm = try ownWeight(weights, K.k(&kb, p, "layer.input_layernorm.weight"));
+    errdefer _ = mlx.mlx_array_free(input_norm);
+    const post_attn_norm = try ownWeight(weights, K.k(&kb, p, "layer.post_attention_layernorm.weight"));
+    errdefer _ = mlx.mlx_array_free(post_attn_norm);
+    const q_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.q_norm.weight"));
+    errdefer _ = mlx.mlx_array_free(q_norm);
+    const k_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.k_norm.weight"));
+    errdefer _ = mlx.mlx_array_free(k_norm);
+    var q = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.q_proj"), s);
+    errdefer q.deinit();
+    var k = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.k_proj"), s);
+    errdefer k.deinit();
+    var v = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.v_proj"), s);
+    errdefer v.deinit();
+    var o = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.o_proj"), s);
+    errdefer o.deinit();
+    const expert_bias = try ownWeight(weights, K.k(&kb, p, "layer.mlp.expert_bias"));
+    errdefer _ = mlx.mlx_array_free(expert_bias);
 
     var m = MtpModel{
         .allocator = allocator,
@@ -2434,18 +2546,18 @@ fn loadHy3Mtp(
         .quant_bits = 0,
         .quant_group_size = 0,
         .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
-        .eh_proj = try loadLinear(weights, allocator, K.k(&kb, p, "eh_proj"), s),
-        .pre_fc_norm_emb = try ownWeight(weights, K.k(&kb, p, "enorm.weight")),
-        .pre_fc_norm_hidden = try ownWeight(weights, K.k(&kb, p, "hnorm.weight")),
-        .final_norm = try ownWeight(weights, K.k(&kb, p, "final_layernorm.weight")),
-        .input_norm = try ownWeight(weights, K.k(&kb, p, "layer.input_layernorm.weight")),
-        .post_attn_norm = try ownWeight(weights, K.k(&kb, p, "layer.post_attention_layernorm.weight")),
-        .q_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.q_norm.weight")),
-        .k_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.k_norm.weight")),
-        .q = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.q_proj"), s),
-        .k = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.k_proj"), s),
-        .v = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.v_proj"), s),
-        .o = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.o_proj"), s),
+        .eh_proj = eh_proj,
+        .pre_fc_norm_emb = enorm,
+        .pre_fc_norm_hidden = hnorm,
+        .final_norm = final_norm,
+        .input_norm = input_norm,
+        .post_attn_norm = post_attn_norm,
+        .q_norm = q_norm,
+        .k_norm = k_norm,
+        .q = q,
+        .k = k,
+        .v = v,
+        .o = o,
         .layout = .hy3,
         .mlp = .{ .moe = .{
             .router_w = router.w,
@@ -2469,11 +2581,10 @@ fn loadHy3Mtp(
             .shared_down_w = shd.w,
             .shared_down_s = shd.s,
             .shared_down_b = shd.b,
-            .expert_bias = try ownWeight(weights, K.k(&kb, p, "layer.mlp.expert_bias")),
+            .expert_bias = expert_bias,
             .shared_ungated = true,
         } },
     };
-    errdefer m.deinit();
 
     // Fallback quant globals from the q projection geometry (hidden pinned by
     // the enorm length); every matmul re-solves per weight anyway.
@@ -2519,41 +2630,75 @@ fn loadHy3Mtp(
 /// BEFORE the trunk's final norm.
 fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights) !MtpModel {
     const has_shared = weights.get("moe.mixer.shared_experts.up_proj.weight") != null;
-    const fc1 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc1");
-    const fc2 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc2");
-    const router = try loadLinear(weights, allocator, "moe.mixer.gate", s);
-    const shared: ?transformer_mod.SimpleMlpWeights = if (has_shared) blk: {
-        const up = try loadLinear(weights, allocator, "moe.mixer.shared_experts.up_proj", s);
-        const down = try loadLinear(weights, allocator, "moe.mixer.shared_experts.down_proj", s);
-        break :blk .{ .up_w = up.w, .up_s = up.s, .up_b = up.b, .down_w = down.w, .down_s = down.s, .down_b = down.b };
-    } else null;
+    // Every tensor lands in a local that frees itself on error; `m` below is
+    // built with no fallible call and takes them all over.
+    var fc1 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc1");
+    errdefer fc1.deinit();
+    var fc2 = try loadMoeTriple(weights, "moe.mixer.switch_mlp.fc2");
+    errdefer fc2.deinit();
+    var router = try loadLinear(weights, allocator, "moe.mixer.gate", s);
+    errdefer router.deinit();
+    var shared_up: ?QLinear = if (has_shared) try loadLinear(weights, allocator, "moe.mixer.shared_experts.up_proj", s) else null;
+    errdefer if (shared_up) |*l| l.deinit();
+    var shared_down: ?QLinear = if (has_shared) try loadLinear(weights, allocator, "moe.mixer.shared_experts.down_proj", s) else null;
+    errdefer if (shared_down) |*l| l.deinit();
+    // Dense bf16 `[H, 2H]`, pre-transposed for the plain-matmul arm.
+    const eh_proj = try ownAndTranspose2D(weights, "eh_proj", s);
+    errdefer _ = mlx.mlx_array_free(eh_proj);
+    const enorm = try ownWeight(weights, "enorm");
+    errdefer _ = mlx.mlx_array_free(enorm);
+    const hnorm = try ownWeight(weights, "hnorm");
+    errdefer _ = mlx.mlx_array_free(hnorm);
+    const final_norm = try ownWeight(weights, "final_norm");
+    errdefer _ = mlx.mlx_array_free(final_norm);
+    const input_norm = try ownWeight(weights, "attn.norm.weight");
+    errdefer _ = mlx.mlx_array_free(input_norm);
+    const post_attn_norm = try ownWeight(weights, "moe.norm.weight");
+    errdefer _ = mlx.mlx_array_free(post_attn_norm);
+    var q = try loadLinear(weights, allocator, "attn.mixer.q_proj", s);
+    errdefer q.deinit();
+    var k = try loadLinear(weights, allocator, "attn.mixer.k_proj", s);
+    errdefer k.deinit();
+    var v = try loadLinear(weights, allocator, "attn.mixer.v_proj", s);
+    errdefer v.deinit();
+    var o = try loadLinear(weights, allocator, "attn.mixer.o_proj", s);
+    errdefer o.deinit();
+    const expert_bias = try ownWeight(weights, "moe.mixer.gate.e_score_correction_bias");
+    errdefer _ = mlx.mlx_array_free(expert_bias);
 
+    const shared: ?transformer_mod.SimpleMlpWeights = if (shared_up) |up| .{
+        .up_w = up.w,
+        .up_s = up.s,
+        .up_b = up.b,
+        .down_w = shared_down.?.w,
+        .down_s = shared_down.?.s,
+        .down_b = shared_down.?.b,
+    } else null;
     var m = MtpModel{
         .allocator = allocator,
         .s = s,
         .quant_bits = 0,
         .quant_group_size = 0,
         .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
-        // Dense bf16 `[H, 2H]`, pre-transposed for the plain-matmul arm.
-        .eh_proj = .{ .w = try ownAndTranspose2D(weights, "eh_proj", s), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() },
-        .pre_fc_norm_emb = try ownWeight(weights, "enorm"),
-        .pre_fc_norm_hidden = try ownWeight(weights, "hnorm"),
-        .final_norm = try ownWeight(weights, "final_norm"),
-        .input_norm = try ownWeight(weights, "attn.norm.weight"),
-        .post_attn_norm = try ownWeight(weights, "moe.norm.weight"),
+        .eh_proj = .{ .w = eh_proj, .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() },
+        .pre_fc_norm_emb = enorm,
+        .pre_fc_norm_hidden = hnorm,
+        .final_norm = final_norm,
+        .input_norm = input_norm,
+        .post_attn_norm = post_attn_norm,
         .q_norm = mlx.mlx_array_new(),
         .k_norm = mlx.mlx_array_new(),
-        .q = try loadLinear(weights, allocator, "attn.mixer.q_proj", s),
-        .k = try loadLinear(weights, allocator, "attn.mixer.k_proj", s),
-        .v = try loadLinear(weights, allocator, "attn.mixer.v_proj", s),
-        .o = try loadLinear(weights, allocator, "attn.mixer.o_proj", s),
+        .q = q,
+        .k = k,
+        .v = v,
+        .o = o,
         .layout = .nemotron,
         .has_qk_norm = false,
         .mlp = .{ .nemotron_moe = .{
             .router_w = router.w,
             .router_s = router.s,
             .router_b = router.b,
-            .expert_bias = try ownWeight(weights, "moe.mixer.gate.e_score_correction_bias"),
+            .expert_bias = expert_bias,
             .fc1_w = fc1.w,
             .fc1_s = fc1.s,
             .fc1_b = fc1.b,
@@ -2563,7 +2708,6 @@ fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *co
             .shared = shared,
         } },
     };
-    errdefer m.deinit();
 
     {
         const en_shape = mlx.getShape(m.pre_fc_norm_emb);
@@ -3932,6 +4076,172 @@ test "mtp: loadMtp detects the Nemotron-H layout (bare keys, mtp_head.safetensor
     try testing.expect(m.mlp.nemotron_moe.shared != null);
     try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w)); // [H, E]
     try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(m.mlp.nemotron_moe.expert_bias));
+}
+
+/// Builds a head's weights in memory (evaluated, so a leaked handle pins a
+/// live buffer) with tensor `skip` left out; `skip == cases.len` keeps all.
+const HeadLoadLeakProbe = struct {
+    const Case = struct { key: []const u8, shape: []const c_int, dt: mlx.mlx_dtype = .bfloat16 };
+
+    fn build(cases: []const Case, skip: usize, s: mlx.mlx_stream) !Weights {
+        const a = testing.allocator;
+        var w = Weights.init(a);
+        errdefer w.deinit();
+        for (cases, 0..) |c, i| {
+            if (i == skip) continue;
+            var total: usize = 1;
+            for (c.shape) |d| total *= @intCast(d);
+            const data = try a.alloc(f32, total);
+            defer a.free(data);
+            for (data, 0..) |*x, j| x.* = @as(f32, @floatFromInt(j % 7)) * 0.1;
+            const f32_arr = mlx.mlx_array_new_data(data.ptr, c.shape.ptr, @intCast(c.shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var arr = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(arr);
+            try mlx.check(mlx.mlx_astype(&arr, f32_arr, c.dt, s));
+            try mlx.check(mlx.mlx_array_eval(arr));
+            const key = try a.dupe(u8, c.key);
+            errdefer a.free(key);
+            try w.map.put(key, arr);
+        }
+        return w;
+    }
+
+    /// Every drop either fails with MissingMtpWeight or (only for `optional`)
+    /// loads; either way active memory returns to where it started.
+    fn expectNoLeak(
+        cases: []const Case,
+        comptime load: fn (std.mem.Allocator, mlx.mlx_stream, *const Weights) anyerror!MtpModel,
+        optional: ?[]const u8,
+    ) !void {
+        const s = mlx.gpuStream();
+        for (0..cases.len + 1) |skip| {
+            try mlx.check(mlx.mlx_synchronize(s));
+            var before: usize = 0;
+            try mlx.check(mlx.mlx_get_active_memory(&before));
+            {
+                var w = try build(cases, skip, s);
+                defer w.deinit();
+                const may_load = skip == cases.len or
+                    (optional != null and std.mem.eql(u8, cases[skip].key, optional.?));
+                if (load(testing.allocator, s, &w)) |loaded| {
+                    var m = loaded;
+                    m.deinit();
+                    try testing.expect(may_load);
+                } else |err| {
+                    try testing.expect(!may_load);
+                    try testing.expectEqual(error.MissingMtpWeight, err);
+                }
+            }
+            try mlx.check(mlx.mlx_synchronize(s));
+            var after: usize = 0;
+            try mlx.check(mlx.mlx_get_active_memory(&after));
+            if (after != before) std.debug.print("active memory {d} -> {d} with '{s}' missing\n", .{ before, after, if (skip < cases.len) cases[skip].key else "(none)" });
+            try testing.expectEqual(before, after);
+        }
+    }
+};
+
+test "mtp: a Nemotron-H head missing any one tensor fails to load and frees what it loaded" {
+    const C = HeadLoadLeakProbe.Case;
+    const cases = [_]C{
+        .{ .key = "eh_proj", .shape = &.{ 8, 16 } },
+        .{ .key = "enorm", .shape = &.{8} },
+        .{ .key = "hnorm", .shape = &.{8} },
+        .{ .key = "final_norm", .shape = &.{8} },
+        .{ .key = "attn.norm.weight", .shape = &.{8} },
+        .{ .key = "attn.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "attn.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "attn.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "attn.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "moe.norm.weight", .shape = &.{8} },
+        .{ .key = "moe.mixer.gate.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "moe.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
+        .{ .key = "moe.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 8 } },
+        .{ .key = "moe.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 8, 6 } },
+        .{ .key = "moe.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
+        .{ .key = "moe.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
+    };
+    const L = struct {
+        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
+            return loadNemotronMtp(a, s, w);
+        }
+    };
+    // Without the shared expert's up_proj the head is a valid no-shared-expert head.
+    try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, "moe.mixer.shared_experts.up_proj.weight");
+}
+
+test "mtp: a Hy3 head missing any one tensor fails to load and frees what it loaded" {
+    const C = HeadLoadLeakProbe.Case;
+    const cases = [_]C{
+        .{ .key = "mtp.enorm.weight", .shape = &.{8} },
+        .{ .key = "mtp.hnorm.weight", .shape = &.{8} },
+        .{ .key = "mtp.final_layernorm.weight", .shape = &.{8} },
+        .{ .key = "mtp.eh_proj.weight", .shape = &.{ 8, 16 } },
+        .{ .key = "mtp.layer.input_layernorm.weight", .shape = &.{8} },
+        .{ .key = "mtp.layer.post_attention_layernorm.weight", .shape = &.{8} },
+        .{ .key = "mtp.layer.self_attn.q_norm.weight", .shape = &.{4} },
+        .{ .key = "mtp.layer.self_attn.k_norm.weight", .shape = &.{4} },
+        .{ .key = "mtp.layer.self_attn.q_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "mtp.layer.self_attn.k_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "mtp.layer.self_attn.v_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "mtp.layer.self_attn.o_proj.weight", .shape = &.{ 8, 8 } },
+        .{ .key = "mtp.layer.mlp.router.gate.weight", .shape = &.{ 4, 8 } },
+        .{ .key = "mtp.layer.mlp.experts.gate_proj.weight", .shape = &.{ 4, 6, 8 } },
+        .{ .key = "mtp.layer.mlp.experts.up_proj.weight", .shape = &.{ 4, 6, 8 } },
+        .{ .key = "mtp.layer.mlp.experts.down_proj.weight", .shape = &.{ 4, 8, 6 } },
+        .{ .key = "mtp.layer.mlp.shared_mlp.gate_proj.weight", .shape = &.{ 6, 8 } },
+        .{ .key = "mtp.layer.mlp.shared_mlp.up_proj.weight", .shape = &.{ 6, 8 } },
+        .{ .key = "mtp.layer.mlp.shared_mlp.down_proj.weight", .shape = &.{ 8, 6 } },
+        .{ .key = "mtp.layer.mlp.expert_bias", .shape = &.{4}, .dt = .float32 },
+    };
+    const L = struct {
+        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
+            return loadHy3Mtp(a, s, w, "");
+        }
+    };
+    try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, null);
+}
+
+test "mtp: a Qwen head missing any one tensor fails to load and frees what it loaded" {
+    const C = HeadLoadLeakProbe.Case;
+    // Hidden 64 so the dense trunk linears take the head-requant path.
+    const common = [_]C{
+        .{ .key = "mtp.fc.weight", .shape = &.{ 64, 128 } },
+        .{ .key = "mtp.pre_fc_norm_embedding.weight", .shape = &.{64} },
+        .{ .key = "mtp.pre_fc_norm_hidden.weight", .shape = &.{64} },
+        .{ .key = "mtp.norm.weight", .shape = &.{64} },
+        .{ .key = "mtp.layers.0.input_layernorm.weight", .shape = &.{64} },
+        .{ .key = "mtp.layers.0.post_attention_layernorm.weight", .shape = &.{64} },
+        .{ .key = "mtp.layers.0.self_attn.q_norm.weight", .shape = &.{16} },
+        .{ .key = "mtp.layers.0.self_attn.k_norm.weight", .shape = &.{16} },
+        .{ .key = "mtp.layers.0.self_attn.q_proj.weight", .shape = &.{ 128, 64 } },
+        .{ .key = "mtp.layers.0.self_attn.k_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.self_attn.v_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.self_attn.o_proj.weight", .shape = &.{ 64, 64 } },
+    };
+    const dense = common ++ [_]C{
+        .{ .key = "mtp.layers.0.mlp.gate_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.up_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.down_proj.weight", .shape = &.{ 64, 32 } },
+    };
+    const moe = common ++ [_]C{
+        .{ .key = "mtp.layers.0.mlp.gate.weight", .shape = &.{ 4, 64 } },
+        .{ .key = "mtp.layers.0.mlp.switch_mlp.gate_proj.weight", .shape = &.{ 4, 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.switch_mlp.up_proj.weight", .shape = &.{ 4, 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.switch_mlp.down_proj.weight", .shape = &.{ 4, 64, 32 } },
+        .{ .key = "mtp.layers.0.mlp.shared_expert.gate_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.shared_expert.up_proj.weight", .shape = &.{ 32, 64 } },
+        .{ .key = "mtp.layers.0.mlp.shared_expert.down_proj.weight", .shape = &.{ 64, 32 } },
+        .{ .key = "mtp.layers.0.mlp.shared_expert_gate.weight", .shape = &.{ 1, 64 } },
+    };
+    const L = struct {
+        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
+            return loadQwenMtp(a, s, w, "");
+        }
+    };
+    try HeadLoadLeakProbe.expectNoLeak(&dense, L.load, null);
+    try HeadLoadLeakProbe.expectNoLeak(&moe, L.load, null);
 }
 
 test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {

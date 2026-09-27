@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(Metal)
-import Metal
-#endif
 
 /// This Mac's memory, framed the way a model picker needs it: how much RAM the
 /// machine HAS, and how much of it can actually be USED for a model.
@@ -40,18 +37,12 @@ struct SystemMemoryInfo: Equatable {
         return .comfortable
     }
 
-    /// Live machine values. Total = physical RAM; usable = Metal's
-    /// recommendedMaxWorkingSetSize, falling back to ~75% of RAM when Metal is
-    /// unavailable (headless/CI).
+    /// Live machine values. Total = physical RAM; usable = the GPU working-set
+    /// cap (`SystemMetrics.gpuMemoryLimitBytes`), falling back to ~75% of RAM
+    /// when nothing answers (headless/CI).
     static func current() -> SystemMemoryInfo {
         let total = ProcessInfo.processInfo.physicalMemory
-        var usable = total / 4 * 3
-        #if canImport(Metal)
-        if let device = MTLCreateSystemDefaultDevice() {
-            let workingSet = device.recommendedMaxWorkingSetSize
-            if workingSet > 0 { usable = workingSet }
-        }
-        #endif
+        let usable = SystemMetrics.gpuMemoryLimitBytes().map { UInt64($0) } ?? total / 4 * 3
         return SystemMemoryInfo(totalBytes: total, usableBytes: min(usable, total))
     }
 }

@@ -867,6 +867,17 @@ pub fn takeError(buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
+/// Consume the latch only when its message contains `needle`; any other error stays latched.
+pub fn takeErrorIf(needle: []const u8) bool {
+    if (!mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (std.mem.indexOf(u8, mlx_error_buf[0..mlx_error_len], needle) == null) return false;
+    mlx_error_len = 0;
+    mlx_error_latched.store(false, .release);
+    return true;
+}
+
 /// Drop a latch a best-effort op raised and its caller already reported, so an
 /// optional write or a diagnostic can never become an unrelated request's
 /// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:

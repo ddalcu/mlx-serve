@@ -1026,7 +1026,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
                          budget: AgentBudget.Budget, apiKey: String?,
                          entries: [AgentModelEntry] = [],
-                         workingDirectory: String? = nil) async throws -> CliSession {
+                         workingDirectory: String? = nil, resume: Bool = false) async throws -> CliSession {
         let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -1057,7 +1057,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
                             budget: budget, apiKey: apiKey, entries: entries,
-                            rootfsDir: rootfsDir, cwd: cwd)
+                            rootfsDir: rootfsDir, cwd: cwd, resume: resume)
                         remoteCommand = "sh \(bootstrap)"
                     } else {
                         // The image's shell is bash (agent-shell-mlxserve Dockerfile).

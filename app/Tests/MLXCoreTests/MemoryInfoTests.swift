@@ -110,3 +110,52 @@ final class MemoryInfoTests: XCTestCase {
         XCTAssertEqual(big.gpuFraction(ofTotal: 10), 1.0)
     }
 }
+
+/// The meter's free RAM splits at the GPU working-set limit (`iogpu.wired_limit_mb`).
+final class MemoryMeterSplitTests: XCTestCase {
+    private let gb: Int64 = 1 << 30
+
+    func testFreeRamPastTheGpuLimitIsItsOwnSegment() {
+        // 128 GB Mac, limit lowered to 64 GB, 20 GB model resident, 80 GB free RAM.
+        let s = MemoryMeter.Split(gpu: 20 * gb, available: 80 * gb, total: 128 * gb, gpuLimit: 64 * gb)
+        XCTAssertEqual(s.gpuFree, 44 * gb)
+        XCTAssertEqual(s.ramOnlyFree, 36 * gb)
+        XCTAssertEqual(s.other, 28 * gb)
+    }
+
+    func testWhenRamIsTighterThanTheLimitAllFreeIsGpuFree() {
+        let s = MemoryMeter.Split(gpu: 20 * gb, available: 30 * gb, total: 128 * gb, gpuLimit: 118 * gb)
+        XCTAssertEqual(s.gpuFree, 30 * gb)
+        XCTAssertEqual(s.ramOnlyFree, 0)
+    }
+
+    func testUnknownOrExceededLimitNeverGoesNegative() {
+        XCTAssertEqual(MemoryMeter.Split(gpu: 0, available: 50 * gb, total: 128 * gb, gpuLimit: nil).gpuFree, 50 * gb)
+        let over = MemoryMeter.Split(gpu: 70 * gb, available: 40 * gb, total: 128 * gb, gpuLimit: 64 * gb)
+        XCTAssertEqual(over.gpuFree, 0)
+        XCTAssertEqual(over.ramOnlyFree, 40 * gb)
+    }
+}
+
+/// The GPU footprint splits into loaded weights, the prefix KV cache and the rest.
+final class GpuBreakdownTests: XCTestCase {
+    private let gb: Int64 = 1 << 30
+
+    func testActiveSplitsIntoModelCacheAndWorking() throws {
+        let m = MemoryInfo.parse(["active_bytes": 30 * gb, "available_bytes": 0,
+                                  "weights_bytes": 20 * gb, "kv_cache_bytes": 6 * gb])
+        let b = try XCTUnwrap(m.gpuBreakdown)
+        XCTAssertEqual([b.model, b.kvCache, b.working], [20 * gb, 6 * gb, 4 * gb])
+    }
+
+    func testEstimatesNeverExceedWhatIsActive() throws {
+        // The weights figure is the on-disk size; it can read above MLX's own counter.
+        let m = MemoryInfo.parse(["active_bytes": 18 * gb, "weights_bytes": 20 * gb, "kv_cache_bytes": 6 * gb])
+        let b = try XCTUnwrap(m.gpuBreakdown)
+        XCTAssertEqual([b.model, b.kvCache, b.working], [18 * gb, 0, 0])
+    }
+
+    func testAnOlderServerHasNoBreakdown() {
+        XCTAssertNil(MemoryInfo.parse(["active_bytes": 18 * gb]).gpuBreakdown)
+    }
+}

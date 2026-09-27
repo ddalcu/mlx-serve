@@ -160,8 +160,7 @@ class AppState: ObservableObject {
     lazy var terminals = TerminalSessionStore(server: server,
                                               options: { [unowned self] in self.serverOptions })
     /// The sidebar's dragged order over conversations and terminals (ids in
-    /// visual order). Empty = newest first. Persisted; terminals' ids drop out
-    /// at quit like the terminals do.
+    /// visual order). Empty = newest first. Persisted.
     @Published var sidebarOrder: [UUID] = (UserDefaults.standard.stringArray(forKey: "sidebarRowOrder") ?? [])
         .compactMap(UUID.init) {
         didSet {
@@ -169,9 +168,20 @@ class AppState: ObservableObject {
         }
     }
 
+    /// The sidebar's user-made groups (Move to Group). Persisted.
+    @Published var sidebarGroups: SidebarGroups = UserDefaults.standard.data(forKey: "sidebarGroups")
+        .flatMap { try? JSONDecoder().decode(SidebarGroups.self, from: $0) } ?? SidebarGroups() {
+        didSet {
+            UserDefaults.standard.set(try? JSONEncoder().encode(sidebarGroups), forKey: "sidebarGroups")
+        }
+    }
+
     /// Drag-to-reorder: `visible` is the whole panel in its current visual
     /// order, so the result is a complete order and stale ids self-prune.
     func moveSidebarRow(_ id: UUID, onto target: UUID, visible: [UUID]) {
+        var groups = sidebarGroups
+        groups.join(id, groupOf: target)
+        if groups != sidebarGroups { sidebarGroups = groups }
         let next = SidebarChatRows.moved(id, onto: target, in: visible)
         if next != visible { sidebarOrder = next }
     }
@@ -405,24 +415,28 @@ class AppState: ObservableObject {
     /// hot-mounted into the guest. A coding agent asks which folder it works
     /// in; a plain shell opens on click in the Settings folder.
     /// The ONE door for every "… in Sandbox" entry (tray, chip, sidebar).
-    func startTerminal(agentId: String?) {
+    func startTerminal(agentId: String?, group: UUID? = nil) {
         let agent = SandboxAgentRegistry.all.first { $0.id == agentId }
         // Every caller is a MENU item. A modal panel run inside the menu's own
         // click handler races the menu's dismissal and sometimes never shows,
         // so the picker opens one run-loop turn later, once the menu is gone.
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: agent?.displayName) else { return }
-            showTerminal(terminals.start(agent: agent, workspace: workspace))
+            let id = terminals.start(agent: agent, workspace: workspace)
+            sidebarGroups.assign([id], to: group)
+            showTerminal(id)
         }
     }
 
     /// A host CLI (Claude Code, opencode, …) or a plain shell in a terminal
     /// row of the chat window — the same door shape as the sandbox one;
     /// Terminal.app is no longer involved.
-    func startTerminal(hostCLI cli: LauncherCLI) {
+    func startTerminal(hostCLI cli: LauncherCLI, group: UUID? = nil) {
         DispatchQueue.main.async { [self] in
             guard let workspace = terminalWorkspace(askingFor: cli == .shell ? nil : cli.displayName) else { return }
-            showTerminal(terminals.startHost(cli: cli, workspace: workspace))
+            let id = terminals.startHost(cli: cli, workspace: workspace)
+            sidebarGroups.assign([id], to: group)
+            showTerminal(id)
         }
     }
 
@@ -576,6 +590,8 @@ class AppState: ObservableObject {
             if storedCtx > 0 { opts.ctxSize = storedCtx }
             opts.save()
         }
+        opts.migrateLegacyPrefixCacheMem()
+        opts.save()
         self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
         self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
@@ -608,6 +624,7 @@ class AppState: ObservableObject {
             }
         }
         loadChatHistory()
+        sidebarGroups.retain(only: Set(chatSessions.map(\.id) + terminals.sessions.sessions.map(\.id)))
         // Start background task scheduling (catch-up + timer arming). Notifications
         // route back here to resume paused runs / deep-link into the Tasks window.
         TaskNotifier.shared.appState = self

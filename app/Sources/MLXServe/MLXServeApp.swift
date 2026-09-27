@@ -283,13 +283,13 @@ struct MLXCoreApp: App {
     .font(.app(.body)) }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
-                // Pull in the latest built-in default when ours has moved ahead of
-                // the on-disk copy. Backs up the user's current prompt first.
+                // Pull in the latest built-in prompt and skills when ours have moved
+                // ahead of the on-disk copies. Backs up the user's edits first.
                 Button {
                     AgentPrompt.runSystemPromptUpdateFlow()
-                } label: { Text("Update System Prompt to Latest…")
+                } label: { Text("Update System Prompt and Skills to Latest…")
     .font(.app(.body)) }
-                .disabled(!AgentPrompt.isSystemPromptOutdated())
+                .disabled(!AgentPrompt.isPromptOrSkillsOutdated())
 
                 Button {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath

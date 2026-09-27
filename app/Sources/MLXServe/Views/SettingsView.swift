@@ -514,14 +514,21 @@ private struct EngineAwareSections: View {
             }
         }
 
+        SettingsSection(
+            category: .memory,
+            subtitle: "How much memory the engine may use: resident models, the OS reserve, the KV cache and the hot prefix cache. Server-launch flags — restart to apply."
+        ) {
+            MemorySectionContent(showMLX: showMLX)
+        }
+
         // ONE Performance section. The universal rows always apply; the MLX-only
-        // ones (continuous batching, KV-quant, hot prefix cache) join them when
-        // an MLX model is serving — on GGUF/DSV4 they'd silently no-op, so they
-        // stay hidden rather than lie.
+        // ones (continuous batching, attention requant, SSD prefix cache) join
+        // them when an MLX model is serving — on GGUF/DSV4 they'd silently no-op,
+        // so they stay hidden rather than lie.
         SettingsSection(
             category: .performance,
             subtitle: showMLX
-                ? "Continuous batching, KV-cache quantization, and the cross-request hot prefix cache. Server-launch flags — restart to apply."
+                ? "Continuous batching, decode attention requant, and the SSD prefix cache. Server-launch flags — restart to apply."
                 : "Tunables that apply regardless of engine. Server-launch flags — restart to apply."
         ) {
             CommonPerformanceSectionContent()
@@ -1429,71 +1436,6 @@ private struct ServerSectionContent: View {
                     .toggleStyle(.switch).font(.app(.body))
             }
         }
-        if let m = meta["maxResidentMemGB"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.maxResidentMemGB)
-            ) {
-                let gb = appState.serverOptions.maxResidentMemGB
-                snappingSlider(
-                    presets: ServerOptions.residentMemPresets(
-                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
-                    current: gb,
-                    set: { appState.serverOptions.maxResidentMemGB = $0 },
-                    label: gb == 0 ? "Auto" : "\(gb) GB"
-                )
-            }
-        }
-        if let m = meta["maxResidentModels"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.maxResidentModels)
-            ) {
-                Stepper(value: $appState.serverOptions.maxResidentModels, in: 1...8) {
-                    Text("\(appState.serverOptions.maxResidentModels)")
-                        .font(.app(.body).monospacedDigit())
-                }
-            }
-        }
-        if let m = meta["idleEvictSecs"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.idleEvictSecs)
-            ) {
-                let secs = appState.serverOptions.idleEvictSecs
-                snappingSlider(
-                    presets: ServerOptions.idleEvictPresets,
-                    current: secs,
-                    set: { appState.serverOptions.idleEvictSecs = $0 },
-                    label: ServerOptions.idleEvictLabel(secs)
-                )
-            }
-        }
-        if let m = meta["skipMemPreflight"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.skipMemPreflight)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.skipMemPreflight)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
-            }
-        }
-        if let m = meta["osMemoryReserve"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.osMemoryReserve)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.osMemoryReserve)
-                    .labelsHidden()
-                    .toggleStyle(.switch).font(.app(.body))
-            }
-        }
     }
 }
 
@@ -1908,53 +1850,6 @@ private struct PerformanceSectionContent: View {
                 .toggleStyle(.switch).font(.app(.body))
             }
         }
-        if let m = meta["kvQuant"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.kvQuant)
-            ) {
-                Picker("", selection: opts.kvQuant) {
-                    ForEach(ServerOptions.KVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).font(.app(.body)).tag(q)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(minWidth: 220).font(.app(.body))
-            }
-        }
-        if let m = meta["prefixCacheEntries"] {
-            // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
-            // that the launcher will actually pass 1 (and why).
-            let ram = ProcessInfo.processInfo.physicalMemory
-            let set = appState.serverOptions.prefixCacheEntries
-            let effective = ServerOptions.ramCappedPrefixCacheEntries(set, physicalMemoryBytes: ram)
-            let capNote = effective < set
-                ? "  ·  This Mac (\(MemoryInfo.format(Int64(ram)))) launches with \(effective) to keep cache memory bounded."
-                : ""
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer + capNote,
-                isDirty: dirty.dirty(\.prefixCacheEntries)
-            ) {
-                Stepper(value: opts.prefixCacheEntries, in: 0...16) {
-                    Text("\(appState.serverOptions.prefixCacheEntries)")
-                        .font(.app(.body).monospacedDigit())
-                }
-            }
-        }
-        if let m = meta["prefixCacheMem"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.prefixCacheMem)
-            ) {
-                TextField("", text: opts.prefixCacheMem, prompt: Text("2GB"))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 110)
-            }
-        }
         if let m = meta["enablePrefixCacheDisk"] {
             SettingsRow(
                 title: m.title,
@@ -1975,6 +1870,154 @@ private struct PerformanceSectionContent: View {
                 TextField("", text: opts.prefixCacheDisk, prompt: Text("10GB"))
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 110)
+            }
+        }
+    }
+}
+
+// MARK: - Memory section
+
+/// Every engine memory knob in one place. The resident-model limits, the OS
+/// reserve and the preflight apply to every engine; the KV and prefix-cache rows
+/// and the n-gram table are MLX-only and hide when a GGUF/DSV4 model is serving.
+private struct MemorySectionContent: View {
+    let showMLX: Bool
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+
+        if let m = meta["maxResidentMemGB"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentMemGB)
+            ) {
+                let gb = appState.serverOptions.maxResidentMemGB
+                snappingSlider(
+                    presets: ServerOptions.residentMemPresets(
+                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
+                    current: gb,
+                    set: { appState.serverOptions.maxResidentMemGB = $0 },
+                    label: gb == 0 ? "Auto" : "\(gb) GB"
+                )
+            }
+        }
+        if let m = meta["maxResidentModels"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentModels)
+            ) {
+                Stepper(value: opts.maxResidentModels, in: 1...8) {
+                    Text("\(appState.serverOptions.maxResidentModels)")
+                        .font(.app(.body).monospacedDigit())
+                }
+            }
+        }
+        if let m = meta["idleEvictSecs"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.idleEvictSecs)
+            ) {
+                let secs = appState.serverOptions.idleEvictSecs
+                snappingSlider(
+                    presets: ServerOptions.idleEvictPresets,
+                    current: secs,
+                    set: { appState.serverOptions.idleEvictSecs = $0 },
+                    label: ServerOptions.idleEvictLabel(secs)
+                )
+            }
+        }
+        if let m = meta["skipMemPreflight"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.skipMemPreflight)
+            ) {
+                Toggle("", isOn: opts.skipMemPreflight)
+                    .labelsHidden()
+                    .toggleStyle(.switch).font(.app(.body))
+            }
+        }
+        if let m = meta["osMemoryReserve"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.osMemoryReserve)
+            ) {
+                Toggle("", isOn: opts.osMemoryReserve)
+                    .labelsHidden()
+                    .toggleStyle(.switch).font(.app(.body))
+            }
+        }
+        if showMLX {
+            if let m = meta["kvQuant"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.kvQuant)
+                ) {
+                    Picker("", selection: opts.kvQuant) {
+                        ForEach(ServerOptions.KVQuant.allCases) { q in
+                            Text(L10n.text(q.label)).font(.app(.body)).tag(q)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 220).font(.app(.body))
+                }
+            }
+            if let m = meta["prefixCacheEntries"] {
+                // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
+                // that the launcher will actually pass 1 (and why).
+                let ram = ProcessInfo.processInfo.physicalMemory
+                let set = appState.serverOptions.prefixCacheEntries
+                let effective = ServerOptions.ramCappedPrefixCacheEntries(set, physicalMemoryBytes: ram)
+                let capNote = effective < set
+                    ? "  ·  This Mac (\(MemoryInfo.format(Int64(ram)))) launches with \(effective) to keep cache memory bounded."
+                    : ""
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer + capNote,
+                    isDirty: dirty.dirty(\.prefixCacheEntries)
+                ) {
+                    Stepper(value: opts.prefixCacheEntries, in: 0...16) {
+                        Text("\(appState.serverOptions.prefixCacheEntries)")
+                            .font(.app(.body).monospacedDigit())
+                    }
+                }
+            }
+            if let m = meta["prefixCacheMem"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.prefixCacheMem)
+                ) {
+                    TextField("", text: opts.prefixCacheMem, prompt: Text("Auto"))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+                }
+            }
+            if let m = meta["pleGpu"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.pleGpu),
+                    cost: m.cost,
+                    costActive: appState.serverOptions.pleGpu
+                ) {
+                    Toggle("", isOn: opts.pleGpu)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
             }
         }
     }

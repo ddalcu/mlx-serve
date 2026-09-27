@@ -8,14 +8,16 @@ import Foundation
 /// them all). The model owns ordering, phases and stable display names. Which
 /// row is SHOWING is `ChatWorkspace.terminal(id)`; the processes live in
 /// `TerminalSessionStore`.
-struct TerminalSessionList: Equatable {
+struct TerminalSessionList: Equatable, Codable {
 
-    struct Session: Identifiable, Equatable {
+    struct Session: Identifiable, Equatable, Codable {
         /// Where the process runs: ssh into the guest VM, or a host CLI
         /// (Claude Code, opencode, …) spawned on this Mac.
-        enum Kind: Equatable { case sandbox, host }
+        enum Kind: String, Equatable, Codable { case sandbox, host }
 
         enum Phase: Equatable {
+            /// Restored after an app restart; starts when the row is opened.
+            case suspended
             case preparing
             case live
             case exited(Int32?)
@@ -28,7 +30,7 @@ struct TerminalSessionList: Equatable {
         /// A user rename ("Rename…" on the row); nil = `autoName`.
         var customName: String? = nil
         var displayName: String { customName ?? autoName }
-        let agentId: String?     // nil = plain shell
+        let agentId: String?     // sandbox agent or host CLI id; nil = sandbox shell
         let workspace: String    // host folder, hot-mounted in the guest
         let createdAt: Date
         var kind: Kind = .sandbox
@@ -39,12 +41,40 @@ struct TerminalSessionList: Equatable {
         /// chat window's detail column. The terminal view has ONE parent, so
         /// the row raises that window instead of showing the pane.
         var isInOwnWindow = false
+        /// Launches continue the agent's last conversation (a restored row).
+        var resumes = false
 
         var isActive: Bool {
             switch phase {
             case .preparing, .live: return true
-            case .exited, .failed: return false
+            case .suspended, .exited, .failed: return false
             }
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, label, autoName, customName, agentId, workspace, createdAt, kind, themeId
+        }
+
+        init(id: UUID, label: String, autoName: String, agentId: String?, workspace: String,
+             createdAt: Date, kind: Kind = .sandbox, phase: Phase) {
+            self.id = id; self.label = label; self.autoName = autoName; self.agentId = agentId
+            self.workspace = workspace; self.createdAt = createdAt; self.kind = kind; self.phase = phase
+        }
+
+        /// No process outlives a quit, so a decoded row waits to be opened.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decode(UUID.self, forKey: .id)
+            label = try c.decode(String.self, forKey: .label)
+            autoName = try c.decode(String.self, forKey: .autoName)
+            customName = try c.decodeIfPresent(String.self, forKey: .customName)
+            agentId = try c.decodeIfPresent(String.self, forKey: .agentId)
+            workspace = try c.decode(String.self, forKey: .workspace)
+            createdAt = try c.decode(Date.self, forKey: .createdAt)
+            kind = try c.decode(Kind.self, forKey: .kind)
+            themeId = try c.decodeIfPresent(String.self, forKey: .themeId)
+            phase = .suspended
+            resumes = true
         }
     }
 
@@ -103,11 +133,17 @@ struct TerminalSessionList: Equatable {
         sessions[i].phase = .preparing
     }
 
-    /// A failed row tries again in place (the fix button / Retry).
-    mutating func retry(_ id: UUID) {
-        guard let i = sessions.firstIndex(where: { $0.id == id }),
-              case .failed = sessions[i].phase else { return }
-        sessions[i].phase = .preparing
+    /// A failed or restored row starts again in place (the fix button / Retry / opening it).
+    @discardableResult
+    mutating func retry(_ id: UUID) -> Bool {
+        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return false }
+        switch sessions[i].phase {
+        case .failed, .suspended:
+            sessions[i].phase = .preparing
+            return true
+        case .preparing, .live, .exited:
+            return false
+        }
     }
 
     mutating func close(_ id: UUID) {

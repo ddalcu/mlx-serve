@@ -501,14 +501,14 @@ final class ChatWorkspaceTests: XCTestCase {
         // launcher list under it. Neither is a destination row any more.
         XCTAssertFalse(chat.contains("destinationRow(\"New Chat\""), "New Chat is the Sessions + now")
         XCTAssertFalse(chat.contains("destinationLabel(\"Code\""), "Code is the Sessions + now")
-        guard let menu = SourceScan.declarationBody(from: "private var newSessionMenu", in: chat) else {
+        guard let menu = SourceScan.declarationBody(from: "private func newSessionMenu", in: chat) else {
             return XCTFail("the Sessions + menu is gone")
         }
         XCTAssertTrue(menu.contains("\"New Chat\""), "the + offers a new chat first")
         XCTAssertTrue(menu.contains("CLILauncherMenuItems("), "the + offers the shared CLI list")
         XCTAssertLessThan(menu.range(of: "\"New Chat\"")!.lowerBound,
                           menu.range(of: "CLILauncherMenuItems(")!.lowerBound)
-        XCTAssertTrue(chat.contains("sectionHeader(\"Sessions\") { newSessionMenu }"),
+        XCTAssertTrue(chat.contains("sectionHeader(\"Sessions\") { newSessionMenu() }"),
                       "the + sits on the Sessions heading")
         // Two section headings now, and the Agents one renders only when it has
         // rows — a heading with nothing under it promises content that is not
@@ -519,7 +519,7 @@ final class ChatWorkspaceTests: XCTestCase {
                       "agent threads get their own section above the chats")
         XCTAssertFalse(chat.contains("Text(\"Recent\")"),
                        "\"Recent\" was renamed to \"Sessions\"")
-        XCTAssertTrue(chat.contains("if !agentRows.isEmpty"),
+        XCTAssertTrue(chat.contains("if !rows.agents.isEmpty"),
                       "the Agents section must be hidden when empty")
         // Pinned above the list, so no destination scrolls away.
         guard let inset = chat.range(of: "safeAreaInset(edge: .top)"),

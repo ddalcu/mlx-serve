@@ -296,6 +296,11 @@ Steps...
 - Skill index (name + description) always included
 - `SkillManager` re-scans on dir mtime change
 - No UI entry point — users manage `~/.mlx-serve/skills/` directly in Finder/editor (the old toolbar folder button was removed to keep the chat toolbar lean)
+- Folder skills (Agent Skills layout, `<name>/SKILL.md`, no `trigger`): the index lists the `SKILL.md` path and the agent loads it with `readFile`, which reads the skills dir read-only outside the workspace. `/name` injects the body.
+
+### The mlx-serve agent skill (`skills/mlx-serve/`)
+
+Teaches any agent to wire user code to our HTTP APIs (chat, embeddings, media, decisions). One source: embedded by `skills/agent_skills.zig` into the CLI, copied into the app bundle by `app/build.sh`. Both launchers install it into `~/.mlx-serve/skills/mlx-serve/` when a file is missing (never overwrite) and point the agent at it: a symlink in the dedicated agent dir (`pi`/`omp`/`codex`/`hermes` `skills/`), `claude --plugin-dir ~/.mlx-serve/claude/plugin` (a plugin whose `skills/` links the folder), opencode/opencode2 `skills.paths` in the inline config. Sandbox pi/hermes get copies in the guest. Every launch script exports `MLX_SERVE_URL`. "Update System Prompt and Skills to Latest…" restores the prompt and every shipped skill file, backing edits up to `~/.mlx-serve/skills-backup-<stamp>/` (outside the skills dir so no agent loads the copies).
 
 ## Resumable Downloads
 

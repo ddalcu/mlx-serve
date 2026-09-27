@@ -1,4 +1,4 @@
-//! Fused Mamba2 mixer step for short windows (decode and spec verify): the
+//! Fused Mamba2 mixer step for any window (decode, spec verify, prefill): the
 //! conv window, depthwise conv + bias + SiLU, dt softplus/clamp, the SSM
 //! recurrence, the D skip and the SiLU(z) gate run as ONE dispatch over R
 //! consecutive rows; the grouped RMS norm is a second. Same structure as
@@ -8,10 +8,12 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 
+/// Rows of B/C the step kernel stages per threadgroup pass; a wider window
+/// loops over passes. Also the decode/verify width `add_norm` keys on.
 pub const MAX_ROWS: c_int = 16;
 const TGY: c_int = 8;
 /// Threadgroup memory is an occupancy decision: the step kernel keeps B/C for
-/// a row BUCKET, never the 16-row maximum on a one-row decode step.
+/// a row BUCKET, never the 16-row pass on a one-row decode step.
 const TG_BYTES_MAX: usize = 16 * 1024;
 
 fn rowBucket(rows: c_int) c_int {
@@ -57,15 +59,19 @@ const STEP_SOURCE =
     \\    out = float(T(cv_ / (1.0f + metal::exp(-cv_)))); }
     \\threadgroup float bc[MAXR * 2 * DS];
     \\const uint tid = thread_position_in_threadgroup.y * 32 + lane;
-    \\for (int rr = 0; rr < R; rr++) {
+    \\// Passes of MAXR rows: stage their B/C, then run the recurrence over them.
+    \\for (int r0 = 0; r0 < R; r0 += MAXR) {
+    \\const int RB = metal::min(MAXR, R - r0);
+    \\for (int j = 0; j < RB; j++) {
     \\    for (uint c = tid; c < 2 * DS; c += 32 * TGY) {
     \\        const int ch = c < DS ? XD + int(g) * DS + int(c) : XD + NG * DS + int(g) * DS + int(c - DS);
-    \\        float v; CONV(ch, rr, v);
-    \\        bc[rr * 2 * DS + c] = v;
+    \\        float v; CONV(ch, r0 + j, v);
+    \\        bc[j * 2 * DS + c] = v;
     \\    }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int rr = 0; rr < R; rr++) {
+    \\for (int j = 0; j < RB; j++) {
+    \\    const int rr = r0 + j;
     \\    float xv = 0.0f;
     \\    if (lane == 0) { CONV(cx, rr, xv); }
     \\    xv = simd_broadcast(xv, 0);
@@ -76,9 +82,9 @@ const STEP_SOURCE =
     \\    const float xdt = xv * dt;
     \\    float acc = 0.0f;
     \\    for (int i = 0; i < NS; i++) {
-    \\        const float s = dA * st[i] + xdt * bc[rr * 2 * DS + int(lane) * NS + i];
+    \\        const float s = dA * st[i] + xdt * bc[j * 2 * DS + int(lane) * NS + i];
     \\        st[i] = s;
-    \\        acc += s * bc[rr * 2 * DS + DS + int(lane) * NS + i];
+    \\        acc += s * bc[j * 2 * DS + DS + int(lane) * NS + i];
     \\    }
     \\    acc = simd_sum(acc);
     \\    if (lane == 0) {
@@ -92,6 +98,8 @@ const STEP_SOURCE =
     \\        const size_t so = ALLROWS ? size_t(rr) * B * H * DH * DS : 0;
     \\        for (int i = 0; i < NS; i++) S_OUT[so + sbase + i] = st[i];
     \\    }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
     \\// conv state after the last row: its last KC-1 inputs, one thread per channel.
     \\if (lane == 0) {
@@ -212,7 +220,7 @@ fn buildStepConfig(g: Geometry, dt: mlx.mlx_dtype, all_rows: bool) !void {
 /// caller keeps the op chain).
 pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
     if (!mlx.streamIsGpu(s)) return null;
-    if (g.rows < 1 or g.rows > MAX_ROWS) return null;
+    if (g.rows < 1) return null;
     if (!stepFits(g.rows, g.state)) return null;
     if (@rem(g.state, 32) != 0 or @rem(g.head_dim, TGY) != 0 or @rem(g.heads, g.groups) != 0 or g.conv_kernel < 2) return null;
     const xd = g.heads * g.head_dim;

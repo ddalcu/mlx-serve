@@ -66,6 +66,7 @@ extension SandboxAgentSpec {
              SandboxAgentFile(
                 guestPath: "/root/.pi/agent/extensions/mlx-models.js",
                 content: AgentConfigs.piModelsExtensionJS(baseURL: base, apiKey: key))]
+                + SandboxAgentRegistry.skillFiles(under: "/root/.pi/agent/skills")
         },
         launchCommand: { model in "pi --provider mlx --model \(VzGuest.shellQuote(model))" }
     )
@@ -100,7 +101,7 @@ extension SandboxAgentSpec {
                 SandboxAgentFile(
                     guestPath: "/root/.hermes/.env",
                     content: AgentConfigs.hermesEnvFile(baseURL: base, apiKey: key)),
-            ]
+            ] + SandboxAgentRegistry.skillFiles(under: "/root/.hermes/skills")
         },
         launchCommand: { _ in "hermes" }
     )
@@ -124,12 +125,21 @@ enum SandboxAgentRegistry {
     /// as `/.vz-init`).
     static func bootstrapPath(agentId: String) -> String { "/.vz-bootstrap-\(agentId)" }
 
+    /// The mlx-serve skill in the guest agent's own skills dir.
+    static func skillFiles(under dir: String) -> [SandboxAgentFile] {
+        AgentSkills.files().map { SandboxAgentFile(guestPath: "\(dir)/\(AgentSkills.name)/\($0.name)", content: $0.content) }
+    }
+
     /// The session bootstrap. Runs under `ssh -t` as a plain (non-login)
     /// command, so it exports its own PATH rather than relying on `.profile`.
     /// `cwd` is the guest path of the session's workspace: `/workspace` for the
     /// Settings default, `/projects/<slug>` for a hot-mounted folder.
     static func bootstrapScript(for spec: SandboxAgentSpec, model: String,
-                                cwd: String = "/workspace") -> String {
+                                cwd: String = "/workspace", serverPort: UInt16 = 11234,
+                                resume: Bool = false) -> String {
+        let command = spec.launchCommand(model)
+        // pi and hermes both continue with --continue; nothing to continue fails, start fresh then.
+        let launch = resume ? "\(command) --continue || exec \(command)" : "exec \(command)"
         // Dummy args — only the guest PATHS matter here, and every spec's
         // path set is argument-independent (pinned by the registry tests).
         let configPaths = spec.configFiles(model, 0, AgentBudget.fallback, nil, [])
@@ -144,6 +154,7 @@ enum SandboxAgentRegistry {
           echo "mlx-serve: cannot resolve the host gateway (is guest networking on?)" >&2
           exit 1
         fi
+        export MLX_SERVE_URL="http://$GW:\(serverPort)"
         for f in \(configPaths); do
           [ -f "$f" ] && sed -i "s/__MLX_HOST__/$GW/g" "$f"
         done
@@ -152,7 +163,7 @@ enum SandboxAgentRegistry {
           \(spec.installScript) || { echo "mlx-serve: \(spec.displayName) install failed" >&2; exit 1; }
         fi
         cd \(VzGuest.shellQuote(cwd)) 2>/dev/null || echo "mlx-serve: workspace share missing — starting in $HOME" >&2
-        exec \(spec.launchCommand(model))
+        \(launch)
         """
     }
 
@@ -164,7 +175,7 @@ enum SandboxAgentRegistry {
     static func materialize(spec: SandboxAgentSpec, model: String, serverPort: UInt16,
                             budget: AgentBudget.Budget, apiKey: String?,
                             entries: [AgentModelEntry], rootfsDir: String,
-                            cwd: String = "/workspace") throws -> String {
+                            cwd: String = "/workspace", resume: Bool = false) throws -> String {
         let fm = FileManager.default
         for file in spec.configFiles(model, serverPort, budget, apiKey, entries) {
             let host = rootfsDir + file.guestPath
@@ -174,7 +185,7 @@ enum SandboxAgentRegistry {
         }
         let bootstrap = bootstrapPath(agentId: spec.id)
         let bootstrapHost = rootfsDir + bootstrap
-        try bootstrapScript(for: spec, model: model, cwd: cwd)
+        try bootstrapScript(for: spec, model: model, cwd: cwd, serverPort: serverPort, resume: resume)
             .write(toFile: bootstrapHost, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bootstrapHost)
         return bootstrap

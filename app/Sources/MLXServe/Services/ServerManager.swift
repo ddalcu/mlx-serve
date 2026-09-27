@@ -607,7 +607,9 @@ class ServerManager: ObservableObject {
 
     private func refreshStatus() async {
         if let props = try? await api.fetchProps(port: port) {
-            memoryInfo = props.memory
+            var memory = props.memory
+            memory.gpuLimitBytes = SystemMetrics.gpuMemoryLimitBytes()
+            memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
         }

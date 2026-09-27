@@ -9,7 +9,11 @@ const log = @import("log.zig");
 const qwen4 = @import("qwen4_exp.zig");
 
 /// Why the loader picked its arm. Everything but `.gpu` serves the host gather.
-pub const Arm = enum { gpu, env_off, bits, misaligned, too_large, low_memory };
+pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory };
+
+/// `--ple-gpu`, set once in `main()`. Off by default: the first GPU forward makes the whole
+/// table resident beside the weights, and the host gather faults in only the rows it reads.
+pub var enabled: bool = false;
 
 pub const Budget = struct {
     page: usize,
@@ -26,8 +30,8 @@ pub var dispatches: u64 = 0;
 /// Mappings unmapped by MLX dropping their buffer (MLX may drop it off the inference thread).
 pub var unmaps = std.atomic.Value(u64).init(0);
 
-pub fn chooseArm(env: ?[]const u8, bits: u32, base: usize, len: usize, b: Budget) Arm {
-    if (env) |v| if (std.mem.eql(u8, v, "0")) return .env_off;
+pub fn chooseArm(on: bool, bits: u32, base: usize, len: usize, b: Budget) Arm {
+    if (!on) return .off;
     if (!kernelBits(bits)) return .bits;
     // MLX falls back to a malloc + copy of the WHOLE table when Metal refuses the no-copy buffer.
     if (b.page == 0 or base % b.page != 0) return .misaligned;
@@ -106,9 +110,9 @@ fn gb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1073741824.0;
 }
 
-/// Load-time arm choice for `table`; logs one line naming the arm. `env` is `MLX_SERVE_PLE_GPU`,
+/// Load-time arm choice for `table`; logs one line naming the arm. `on` is `--ple-gpu`,
 /// `model_bytes` the weights already resident. Null = the host gather.
-pub fn load(table: *qwen4.NgramTable, env: ?[]const u8, model_bytes: u64) ?Table {
+pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     if (mlx.noGpuBackend()) {
         log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
         return null;
@@ -119,16 +123,20 @@ pub fn load(table: *qwen4.NgramTable, env: ?[]const u8, model_bytes: u64) ?Table
         .working_set = mlx.maxRecommendedWorkingSet(),
         .model_bytes = model_bytes,
     };
-    const arm = chooseArm(env, table.bits, @intFromPtr(table.map.ptr), table.map.len, b);
+    const arm = chooseArm(on, table.bits, @intFromPtr(table.map.ptr), table.map.len, b);
+    if (arm == .off) {
+        log.info("[qwen4] ple gather: cpu (--ple-gpu keeps the {d:.1} GB table resident for the GPU gather)\n", .{gb(table.map.len)});
+        return null;
+    }
     if (arm != .gpu) {
-        log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ @tagName(arm), gb(model_bytes), gb(table.map.len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
+        log.info("[qwen4] ple gather: cpu ({s}: weights {d:.1} GB + table {d:.1} GB + headroom {d:.0} GB vs working set {d:.1} GB, max buffer {d:.1} GB)\n", .{ @tagName(arm), gb(model_bytes), gb(table.map.len), gb(HEADROOM), gb(b.working_set), gb(b.max_buffer) });
         return null;
     }
     const tbl = wrap(table) catch |e| {
         log.warn("[qwen4] ple gather: cpu (no-copy wrap failed: {s})\n", .{@errorName(e)});
         return null;
     };
-    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB; MLX_SERVE_PLE_GPU=0 forces cpu)\n", .{ gb(table.map.len), gb(model_bytes), gb(b.working_set) });
+    log.info("[qwen4] ple gather: gpu (no-copy {d:.1} GB table buffer, weights {d:.1} GB, working set {d:.1} GB)\n", .{ gb(table.map.len), gb(model_bytes), gb(b.working_set) });
     return tbl;
 }
 
@@ -390,25 +398,25 @@ test "ple gpu: an 8192-token chunk that reaches the last table row matches the C
     try expectArmsEqual(tbl, &h, &fx.table, &[_]u32{ 1, 2 }, ids);
 }
 
-test "ple gpu arm gate: env off, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {
+test "ple gpu arm gate: off unless --ple-gpu, a width the kernel lacks, a misaligned base, an over-long buffer, a tight working set" {
     const GB: u64 = 1 << 30;
     const b: Budget = .{ .page = 16384, .max_buffer = 64 * GB, .working_set = 200 * GB, .model_bytes = 70 * GB };
     const len: usize = 32 * GB;
-    try testing.expectEqual(Arm.gpu, chooseArm(null, 4, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.gpu, chooseArm("1", 16, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.env_off, chooseArm("0", 4, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.bits, chooseArm(null, 7, 16384 * 7, len, b));
-    try testing.expectEqual(Arm.misaligned, chooseArm(null, 4, 16384 * 7 + 4096, len, b));
-    try testing.expectEqual(Arm.too_large, chooseArm(null, 4, 16384 * 7, 65 * GB, b));
+    try testing.expectEqual(Arm.gpu, chooseArm(true, 4, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.gpu, chooseArm(true, 16, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.off, chooseArm(false, 4, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.bits, chooseArm(true, 7, 16384 * 7, len, b));
+    try testing.expectEqual(Arm.misaligned, chooseArm(true, 4, 16384 * 7 + 4096, len, b));
+    try testing.expectEqual(Arm.too_large, chooseArm(true, 4, 16384 * 7, 65 * GB, b));
     // The length rounds up to the page before the maxBufferLength check.
-    try testing.expectEqual(Arm.too_large, chooseArm(null, 4, 16384 * 7, 64 * GB - 1, .{ .page = 16384, .max_buffer = 64 * GB - 1, .working_set = 200 * GB, .model_bytes = 0 }));
+    try testing.expectEqual(Arm.too_large, chooseArm(true, 4, 16384 * 7, 64 * GB - 1, .{ .page = 16384, .max_buffer = 64 * GB - 1, .working_set = 200 * GB, .model_bytes = 0 }));
     var tight = b;
     tight.working_set = 70 * GB + 32 * GB + HEADROOM - 1;
-    try testing.expectEqual(Arm.low_memory, chooseArm(null, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.low_memory, chooseArm(true, 4, 16384 * 7, len, tight));
     tight.working_set += 1;
-    try testing.expectEqual(Arm.gpu, chooseArm(null, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.gpu, chooseArm(true, 4, 16384 * 7, len, tight));
     tight.working_set = 0; // an unknown working set never pins 32 GB
-    try testing.expectEqual(Arm.low_memory, chooseArm(null, 4, 16384 * 7, len, tight));
+    try testing.expectEqual(Arm.low_memory, chooseArm(true, 4, 16384 * 7, len, tight));
 }
 
 test "ple gpu wrap: the buffer IS the mapping, and a misaligned base never reaches MLX" {

@@ -15,6 +15,8 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case lanSharing
     case providers
     case specDecode
+    /// Every engine memory knob; the MLX-only rows inside it hide on GGUF/DSV4.
+    case memory
     /// The universal knobs AND the MLX-only ones, in one section: two adjacent
     /// cards both called "Performance" was a distinction only the maintainers
     /// cared about. The MLX-only rows inside it still hide when a GGUF/DSV4
@@ -48,6 +50,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .server:            return "Server"
         case .lanSharing:        return "LAN Sharing"
         case .providers:         return "Providers"
+        case .memory:            return "Memory"
         case .performance:       return "Performance"
         case .neuralEngine:      return "Neural Engine"
         case .specDecode:        return "Speculative Decoding (MLX only)"
@@ -82,6 +85,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .server:            return "server.rack"
         case .lanSharing:        return "antenna.radiowaves.left.and.right"
         case .providers:         return "cloud"
+        case .memory:            return "memorychip"
         case .performance:       return "speedometer"
         case .neuralEngine:      return "cpu"
         case .specDecode:        return "hare"

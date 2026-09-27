@@ -294,6 +294,10 @@ if [ -d "$PLUGIN_SRC" ]; then
     done
 fi
 
+# The mlx-serve agent skill (AgentSkills.sourceDir); the CLI embeds the same files.
+mkdir -p "$CONTENTS/Resources/agent-skills"
+cp -R "$PROJECT_ROOT/skills/mlx-serve" "$CONTENTS/Resources/agent-skills/"
+
 # SwiftPM does not embed resource bundles when we assemble the .app by hand.
 # SwaTex loads its KaTeX fonts from this bundle at runtime.
 cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"

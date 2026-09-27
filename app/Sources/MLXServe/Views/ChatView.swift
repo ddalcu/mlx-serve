@@ -606,6 +606,22 @@ struct SidebarReorder: ViewModifier {
     }
 }
 
+/// A group heading (or the Sessions one, nil) as a drop target: the dragged
+/// row joins it as the drag enters, the same live idiom as `SidebarReorder`.
+struct SidebarGroupDrop: DropDelegate {
+    @Binding var dragging: UUID?
+    let assign: (UUID) -> Void
+
+    func dropEntered(info: DropInfo) {
+        if let id = dragging { assign(id) }
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
+    func performDrop(info: DropInfo) -> Bool {
+        dragging = nil
+        return true
+    }
+}
+
 /// A sidebar destination's chrome: nothing drawn until you hover it, and the
 /// SAME gray when it is the selected one.
 struct DestinationRowButton<Label: View>: View {
@@ -848,6 +864,18 @@ struct SidebarClearBandBottomKey: PreferenceKey {
 }
 
 struct ChatSidebar: View {
+    private enum GroupSheet: Identifiable {
+        case create(Set<UUID>)
+        case rename(UUID, String)
+
+        var id: String {
+            switch self {
+            case .create: return "create"
+            case .rename(let id, _): return id.uuidString
+            }
+        }
+    }
+
     /// The one coordinate space the three band measurements share.
     ///
     /// Load-bearing that it is the COLUMN's own space and not `.global`: a
@@ -876,6 +904,8 @@ struct ChatSidebar: View {
     @State private var draggingRowId: UUID?
     /// The rename dialog's text.
     @State private var renameDraft = ""
+    /// The group name sheet, nil when closed.
+    @State private var groupSheet: GroupSheet?
     /// Where a shift-click ranges FROM. Moved by every plain / cmd click, left
     /// alone by shift itself so dragging a range up and down keeps re-ranging
     /// from the same origin instead of walking away from it.
@@ -963,24 +993,30 @@ struct ChatSidebar: View {
         }
     }
 
-    /// The panel top to bottom: Agents rows, then Sessions rows (chats and
-    /// terminals interleaved), both in the ONE dragged order. `visible` is
-    /// what the ⌘ numbers and a drop read; `chats` is the conversation subset
-    /// a shift-range runs over — the split is a heading, not a wall.
-    private var panelRows: (agents: [SidebarChatRows.Row], sessions: [SidebarChatRows.Row],
-                            visible: [UUID], chats: [UUID]) {
-        let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-        let agents = SidebarChatRows.merge(chats: groups.agents, terminals: [],
-                                           order: appState.sidebarOrder)
-        let sessions = SidebarChatRows.merge(chats: groups.chats,
-                                             terminals: terminals.sessions.sessions,
-                                             order: appState.sidebarOrder)
-        let all = agents + sessions
-        let chats = all.compactMap { row -> UUID? in
+    /// The panel top to bottom: ungrouped Agents rows, the user's groups, then
+    /// ungrouped Sessions rows (chats and terminals interleaved), all in the
+    /// ONE dragged order. `visible` is what the ⌘ numbers read (collapsed
+    /// groups hide theirs); `all` is what a drop reorders, so a drag never
+    /// forgets a collapsed row's slot; `chats` is the conversation subset a
+    /// shift-range runs over — the split is a heading, not a wall.
+    private var panelRows: (agents: [SidebarChatRows.Row],
+                            groups: [(group: SidebarGroups.Group, rows: [SidebarChatRows.Row])],
+                            sessions: [SidebarChatRows.Row],
+                            visible: [UUID], all: [UUID], chats: [UUID]) {
+        let agentIds = Set(SidebarSessionGroups.split(appState.visibleChatSessions).agents.map(\.id))
+        let rows = SidebarChatRows.merge(chats: appState.visibleChatSessions,
+                                         terminals: terminals.sessions.sessions,
+                                         order: appState.sidebarOrder)
+        let parts = appState.sidebarGroups.partition(rows)
+        let agents = parts.ungrouped.filter { agentIds.contains($0.id) }
+        let sessions = parts.ungrouped.filter { !agentIds.contains($0.id) }
+        let shown = agents + parts.groups.flatMap { $0.group.collapsed ? [] : $0.rows } + sessions
+        let all = agents + parts.groups.flatMap(\.rows) + sessions
+        let chats = shown.compactMap { row -> UUID? in
             if case .chat(let s) = row { return s.id }
             return nil
         }
-        return (agents, sessions, all.map(\.id), chats)
+        return (agents, parts.groups, sessions, shown.map(\.id), all.map(\.id), chats)
     }
 
     /// Write a selection outcome back. Selection BEFORE `activeChatId`, for the
@@ -1020,29 +1056,20 @@ struct ChatSidebar: View {
             // Conversations and sandbox terminals, one list (`panelRows`).
             // Terminals take no part in multi-select; they do wear ⌘ numbers.
             let rows = panelRows
-            let agentRows = rows.agents, sessionRows = rows.sessions
-            let visible = rows.visible, ordered = rows.chats
             LazyVStack(alignment: .leading, spacing: 2) {
-                if !agentRows.isEmpty {
+                if !rows.agents.isEmpty {
                     sectionHeader("Agents")
-                    ForEach(agentRows) { row in
-                        if case .chat(let session) = row {
-                            sessionRow(session, ordered: ordered)
-                                .modifier(reorderable(session.id, visible: visible))
-                        }
+                    ForEach(rows.agents) { panelRow($0, ordered: rows.chats, all: rows.all) }
+                }
+                ForEach(rows.groups, id: \.group.id) { entry in
+                    groupHeader(entry.group)
+                    if !entry.group.collapsed {
+                        ForEach(entry.rows) { panelRow($0, ordered: rows.chats, all: rows.all) }
                     }
                 }
-                sectionHeader("Sessions") { newSessionMenu }
-                ForEach(sessionRows) { row in
-                    switch row {
-                    case .chat(let session):
-                        sessionRow(session, ordered: ordered)
-                            .modifier(reorderable(session.id, visible: visible))
-                    case .terminal(let t):
-                        terminalRow(t)
-                            .modifier(reorderable(t.id, visible: visible))
-                    }
-                }
+                sectionHeader("Sessions") { newSessionMenu() }
+                    .onDrop(of: [.text], delegate: groupDrop(nil))
+                ForEach(rows.sessions) { panelRow($0, ordered: rows.chats, all: rows.all) }
             }
             .padding(.horizontal, ChatMetrics.sidebarGutter)
             .padding(.bottom, 8)
@@ -1135,6 +1162,18 @@ struct ChatSidebar: View {
         // they cost no layout.
         .background(quickSwitchShortcuts)
         .background(renameDialog)
+        .sheet(item: $groupSheet) { sheet in
+            switch sheet {
+            case .create(let ids):
+                SidebarGroupSheet(title: "New Group", action: "Create", name: "") {
+                    appState.sidebarGroups.create($0, with: ids)
+                }
+            case .rename(let id, let name):
+                SidebarGroupSheet(title: "Rename Group", action: "Rename", name: name) {
+                    appState.sidebarGroups.rename(id, to: $0)
+                }
+            }
+        }
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -1382,6 +1421,72 @@ struct ChatSidebar: View {
         appState.deleteSessions(ids)
     }
 
+    @ViewBuilder
+    private func panelRow(_ row: SidebarChatRows.Row, ordered: [UUID], all: [UUID]) -> some View {
+        switch row {
+        case .chat(let session):
+            sessionRow(session, ordered: ordered)
+                .modifier(reorderable(session.id, visible: all))
+        case .terminal(let t):
+            terminalRow(t)
+                .modifier(reorderable(t.id, visible: all))
+        }
+    }
+
+    /// A user group's heading: the label folds it, the + adds a chat or
+    /// terminal straight into it, a row dropped on it joins it, right-click
+    /// renames or deletes it (its rows go back to their sections).
+    private func groupHeader(_ group: SidebarGroups.Group) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation { appState.sidebarGroups.toggleCollapsed(group.id) }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: group.collapsed ? "chevron.right" : "chevron.down")
+                        .frame(width: 10)
+                    Image(systemName: "folder")
+                    Text(verbatim: group.name)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .font(.app(.caption).weight(.semibold))
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            newSessionMenu(group: group.id)
+        }
+        .padding(.horizontal, ChatMetrics.sidebarRowInset)
+        .padding(.top, 10)
+        .padding(.bottom, 2)
+        .onDrop(of: [.text], delegate: groupDrop(group.id))
+        .contextMenu {
+            Button("Rename Group…") { groupSheet = .rename(group.id, group.name) }
+            Button("Delete Group", role: .destructive) { appState.sidebarGroups.delete(group.id) }
+        }
+    }
+
+    private func groupDrop(_ group: UUID?) -> SidebarGroupDrop {
+        SidebarGroupDrop(dragging: $draggingRowId) { appState.sidebarGroups.assign([$0], to: group) }
+    }
+
+    /// "Move to Group" for a row, or for the multi-selection it sits in.
+    @ViewBuilder
+    private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
+        Menu("Move to Group") {
+            ForEach(appState.sidebarGroups.groups) { group in
+                Button(group.name) { appState.sidebarGroups.assign(ids, to: group.id) }
+                    .disabled(ids.count == 1 && group.id == current)
+            }
+            if !appState.sidebarGroups.groups.isEmpty { Divider() }
+            Button("New Group…") { groupSheet = .create(ids) }
+        }
+        if current != nil {
+            Button("Remove from Group") { appState.sidebarGroups.assign(ids, to: nil) }
+        }
+        Divider()
+    }
+
     /// A section heading, sitting on the same left edge as the rows under it.
     private func sectionHeader(_ title: String) -> some View {
         sectionHeader(title) { EmptyView() }
@@ -1404,14 +1509,15 @@ struct ChatSidebar: View {
         .padding(.bottom, 2)
     }
 
-    /// The + beside Sessions: a new chat first, then the coding CLIs (the
-    /// tray's own list, shared, so the two cannot drift; DMG-only — the App
-    /// Store build can't detect or launch other apps' CLIs).
-    private var newSessionMenu: some View {
+    /// The + beside Sessions and each group: a new chat first, then the coding
+    /// CLIs (the tray's own list, shared, so the two cannot drift; DMG-only —
+    /// the App Store build can't detect or launch other apps' CLIs). A group's
+    /// + files the new row under it.
+    private func newSessionMenu(group: UUID? = nil) -> some View {
         Menu {
             Button {
                 appState.showConversation()
-                _ = appState.newChatSession()
+                appState.sidebarGroups.assign([appState.newChatSession()], to: group)
             } label: {
                 Label("New Chat", systemImage: "square.and.pencil").font(.app(.body))
             }
@@ -1423,8 +1529,8 @@ struct ChatSidebar: View {
                     servedModelId: appState.server.chatModelId ?? "mlx-serve",
                     serverContextLength: appState.server.chatModelInfo?.contextLength,
                     models: appState.server.allModels,
-                    openSandboxAgent: { appState.startTerminal(agentId: $0) },
-                    openHostCLI: { appState.startTerminal(hostCLI: $0) })
+                    openSandboxAgent: { appState.startTerminal(agentId: $0, group: group) },
+                    openHostCLI: { appState.startTerminal(hostCLI: $0, group: group) })
             }
         } label: {
             Image(systemName: "plus")
@@ -1570,12 +1676,15 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? session.id : nil
         }
         .contextMenu {
+            // Right-clicking INSIDE a multi-selection acts on all of it, and
+            // says how many; right-clicking outside one acts on the row.
+            let inSelection = appState.sidebarSelection.count > 1
+                && appState.sidebarSelection.contains(session.id)
             Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
     .font(.app(.body)) }
-            // Right-clicking INSIDE a multi-selection acts on all of it, and
-            // says how many; right-clicking outside one is a single delete.
-            if appState.sidebarSelection.count > 1,
-               appState.sidebarSelection.contains(session.id) {
+            groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
+                      current: appState.sidebarGroups.group(of: session.id))
+            if inSelection {
                 Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
                 } label: { Text(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)))
@@ -1651,6 +1760,7 @@ struct ChatSidebar: View {
         .contextMenu {
             Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
     .font(.app(.body)) }
+            groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
             if t.isInOwnWindow {
                 Button { showTerminal(t.id) } label: { Text("Show Window")
     .font(.app(.body)) }
@@ -1790,6 +1900,7 @@ struct ChatSidebar: View {
         switch phase {
         case .preparing: return .orange
         case .live: return .green
+        case .suspended: return .secondary
         case .exited: return .secondary
         case .failed: return .red
         }

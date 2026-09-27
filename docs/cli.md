@@ -77,7 +77,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-concurrent N` | `1` | Continuous-batch decode parallelism |
 | `--prefill-decode-share S` | `0` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile. Env `MLX_SERVE_PREFILL_DECODE_SHARE` |
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
-| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB` | Shared-prefix KV cache memory cap |
+| `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on qwen4_exp when larger | Shared-prefix KV cache memory cap |
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
 | `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |

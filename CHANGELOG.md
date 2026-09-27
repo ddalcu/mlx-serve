@@ -1,5 +1,28 @@
 # Changelog
 
+## v26.9.7 — Faster Small Models - Prefill That Shares - Qwen-Image Editing - UNRELEASED
+
+### Highlights
+
+- **Small dense and MoE models decode faster, same bytes out.** The per-layer op chains are fused into single kernels that reproduce MLX's arithmetic exactly, so greedy output is byte-identical to 26.9.6 on all 18 model packs we checked (Llama, Mistral, Qwen3, Qwen3.5/3.6, K2, Muse, Gemma 3/4, LFM2.5 text/vision/MoE, Ling, Flash Next). Prefill speed is unchanged everywhere. Decode tok/s vs the shipped 26.9.6 app, M4 Max:
+
+  | Model | 0.5k | 4k | 8k | 16k |
+  |---|---|---|---|---|
+  | Gemma 4 26B-A4B 4-bit | +8% | +11% | +9% | +9% |
+  | Gemma 4 E4B 4-bit | +7% | +8% | +7% | +7% |
+  | LFM2.5 2.6B | +3% | +2% | +2% | +4% |
+  | Spark-X2.5 4B 4-bit | +10% | · | · | · |
+
+- **Decoding streams keep moving through another request's prefill.** `--prefill-decode-share` gives decoders a share of wall time while a long prompt prefills, instead of freezing them for seconds on a 32k prompt (#568).
+- **Qwen3.8 Flash Next after long prompts.** Decode past 32k is about 12% faster with the default bf16 KV, the n-gram gather runs on the GPU (prefill 2-4% faster everywhere, decode +15% at 128k), and MTP rounds draft the next chain before the host read (#555, #539, #545, #554, #556).
+- **Qwen-Image-2.1 instruction editing.** One checkpoint serves text-to-image and `mode:"edit"` with an image plus up to 10 references (#512).
+- **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
+
+### Changes
+- Nemotron-H 3.5 MoE checkpoints load (#559).
+- A second server refuses a port already in use instead of silently sharing it (#569).
+- Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
+
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 
 ### Highlights

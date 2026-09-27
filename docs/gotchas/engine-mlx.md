@@ -5239,3 +5239,41 @@ only MTP slots draft and verify as a group.
 Fix: `server.requestSpecModes` takes `has_company` (`Scheduler.hasCompany`, any request in
 flight at admission) and hands a DFlash round to a loaded, enabled MTP head. Same cell: 122.
 Known gap: the first request of a burst sees no company and stays DFlash until it finishes.
+
+## Small dense models spent a third of a token on dependent launches (2026-09-26)
+
+- Defect: Spark-X2.5 4B, Gemma 4 E4B, Gemma 4 26B-A4B and LFM2.5 2.6B decoded at 55-65% of
+  the bandwidth floor while the 27B sat at 88%. A 4B forward was ~940 kernels; each dependent
+  small kernel costs ~3 us of GPU idle whatever it computes.
+- Cause: the standard/MoE/hybrid layer seams were op-for-op MLX chains: separate q/k/v and
+  gate/up matmuls, a 6-op exact-GELU, norm -> add -> norm residual seams, three per-head norms
+  plus two RoPEs, and Gemma's PLE gate as two compiled ops.
+- Fix, all bit-identical to the ops they replace: q|k|v(|gate) and gate|up rows JOINED at load
+  into one buffer whose axis-0 views the separate paths keep (`fuseRowGroup`, decode width only:
+  from M == 2 the verify lanes and MLX's split-K pick kernels by N); one residual kernel doing
+  pre-norm(s), add, scalar and post-norm(s) with MLX's own `rms_single_row` tree
+  (`fusedResidualNorm`); unary activations TABULATED once per dtype by running the op chain
+  itself over all 65536 patterns, then one multiply (`tableGateMul`: silu, erf-GELU, tanh-GELU);
+  the hd-256 norm+RoPE kernel grown to v rows, rd 256 and a no-norm form; LFM's gated conv step
+  as one kernel reproducing `depthwise_conv_1d`'s tap-order float loop; Gemma's PLE tail as
+  table-GELU x ple feeding an op-for-op replica of MLX's `qmv` (bf16 partial sums in
+  `load_vector`, masked-nibble products, `scale*accum + sum*bias`, `simd_sum`).
+- A `qmv` replica IS bit-identical to stock (0 mismatches over 10^5 outputs, plain or fma
+  forms alike: bf16 products are exact in f32). It only pays where nothing is recomputed:
+  a whole gate matmul redone per threadgroup, or the activation re-gathered per down-proj
+  threadgroup, both measured SLOWER than the separate dispatches.
+- What did NOT pay: joining independent matmuls alone (the GPU already overlapped them), and
+  cutting barriers inside the residual kernel. Only shortening the dependent chain moved the
+  clock. Decode: Spark +10%, Gemma E4B +9%, Gemma MoE +7%, LFM2.5 +4%; prefill untouched.
+- Bonsai's ternary codes carry log2(3) bits in 2-bit slots, so a base-3 repack (16 trits in
+  26 bits, decoded by one division and two 6561-entry lookups straight into the h2dec word
+  layout) reads 18.75% fewer bytes and IS bit-identical — and ran 20-30% SLOWER at
+  17408x5120 in a dependent chain: the 26-bit fields cost two unaligned word loads per lane
+  and the lookups compete with the weight stream. Prototype `~/claude-tmp/perf-0926/pack3.py`.
+- Guard: `fused row projections`, `fused residual norm chain`, `fused GELU-erf gate`,
+  `fused GELU-tanh gate`, `fused sigmoid gate`, `fused gated conv step`, `qk norm rope fused
+  hd-256 with v rows` tests, plus byte-identical 200-token greedy transcripts (top-5 logprobs)
+  on 17 packs across the standard, hybrid and MoE loops. The join only takes map-owned
+  handles (a copy would stay resident beside the joined buffer) and reports
+  `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
+

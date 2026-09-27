@@ -3600,6 +3600,15 @@ pub const Weights = struct {
         return self.map.get(name);
     }
 
+    /// Hand the map a new array under `name`, freeing the one it held (load-time
+    /// weight fusion parks its row views here so the originals go away).
+    pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
+        if (self.map.getPtr(name)) |p| {
+            _ = mlx.mlx_array_free(p.*);
+            p.* = arr;
+        }
+    }
+
     pub fn count(self: *const Weights) u32 {
         return @intCast(self.map.count());
     }
