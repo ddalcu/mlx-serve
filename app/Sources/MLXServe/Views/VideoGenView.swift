@@ -2,16 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import AVFoundation
-import ImageIO
 import UniformTypeIdentifiers
-
-/// One row of the "Set by starting frame" menu: a canvas and what to call it.
-private struct ClipSizeChoice: Identifiable {
-    let canvas: AspectCanvas
-    let name: String?
-    var isSourceSize: Bool = false
-    var id: String { canvas.id }
-}
 
 /// Video generation window — LTX-Video (2.3 / 2.5) and MiniMax-H3, run
 /// natively by the mlx-serve server. Uses the same Quality / Resolution preset
@@ -185,7 +176,7 @@ struct VideoGenView: View {
         // The menu offers canvases for the picture's shape, so the shape has
         // to be read when the picture changes, and forgotten when it goes.
         .onChange(of: firstFrameImageURL) { _, url in
-            firstFrameSize = url.flatMap { VideoGenView.pixelSize(of: $0) }
+            firstFrameSize = url.flatMap { AspectCanvases.pixelSize(of: $0) }
         }
         // TTS finished → attach the spoken line as the a2vid clip.
         .onChange(of: tts.phase) { _, phase in
@@ -304,43 +295,8 @@ struct VideoGenView: View {
         .font(.caption)
         .foregroundStyle(.orange)
         .hoverReveal(placement: .pointerClamped(width: bubbleWidth, container: promptRow)) {
-            Self.hoverBubble(L10n.text(hint))
+            RefTiles.hoverBubble(L10n.text(hint))
         }
-    }
-
-    /// The pane's floating-bubble surface, in one place: the prompt's format
-    /// advice and a reference tile's filename are the same kind of thing said
-    /// over the pointer, and two copies would drift. Static, so the tile —
-    /// its own view — can draw it too.
-    static func hoverBubble(_ text: String) -> some View {
-        hoverBubble(text) { EmptyView() }
-    }
-
-    /// A picture's size fitted into a square of `side`, never upscaled: a
-    /// small reference shown larger than it is would only be blurry. nil for
-    /// a size that is not a size.
-    static func previewSize(for size: CGSize, within side: CGFloat) -> CGSize? {
-        guard size.width > 0, size.height > 0, side > 0 else { return nil }
-        let scale = min(side / size.width, side / size.height, 1)
-        return CGSize(width: size.width * scale, height: size.height * scale)
-    }
-
-    /// The same bubble with something ABOVE the sentence — a reference tile
-    /// puts the whole picture there, uncropped, since the tile shows a square
-    /// cut from it.
-    static func hoverBubble<Above: View>(_ text: String,
-                                         @ViewBuilder above: () -> Above) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            above()
-            Text(text)
-                .font(.caption)
-                .foregroundStyle(.primary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(8)
-        .background(Color(nsColor: .textBackgroundColor),
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
     }
 
     /// H3's format is a multi-section document, so 110pt is a keyhole. The
@@ -767,7 +723,7 @@ struct VideoGenView: View {
 
     /// No ratio per row: every row has the same one, and the section heading
     /// above them already says which.
-    private func choiceLabel(_ choice: ClipSizeChoice) -> String {
+    private func choiceLabel(_ choice: SourceCanvasChoice) -> String {
         var out = "\(choice.canvas.width) × \(choice.canvas.height)"
         if let name = choice.name { out += " - \(name)" }
         return out
@@ -778,45 +734,13 @@ struct VideoGenView: View {
         return AspectCanvases.ratioLabel(width: size.width, height: size.height)
     }
 
-    /// The source's own size first (the one option that does not rescale the
-    /// picture at all), then the spread named by size. Recomputed with the
-    /// tier, because the grid tightens to /64 on the two-stage pipelines, and
-    /// with the picture, because it is the picture's shape being matched.
-    private var startingFrameCanvases: [ClipSizeChoice] {
+    /// Recomputed with the tier, because the grid tightens to /64 on the
+    /// two-stage pipelines, and with the picture, because it is the picture's
+    /// shape being matched.
+    private var startingFrameCanvases: [SourceCanvasChoice] {
         guard let size = firstFrameSize else { return [] }
         let grid = model.resolutionGrid(twoStage: effectiveMode != .oneStage)
-        let spread = AspectCanvases.options(sourceWidth: size.width, sourceHeight: size.height, grid: grid)
-        // Five names for five sizes; fewer candidates take the ends and the
-        // middle, because "Large" among two is not information.
-        let names: [String?] = {
-            switch spread.count {
-            case 5:  return ["largest", "large", "medium", "small", "smallest"]
-            case 4:  return ["largest", "large", "small", "smallest"]
-            case 3:  return ["largest", "medium", "smallest"]
-            case 2:  return ["largest", "smallest"]
-            default: return [nil]
-            }
-        }()
-        var out = spread.enumerated().map { i, c in
-            ClipSizeChoice(canvas: c, name: i < names.count ? names[i] : nil)
-        }
-        if let own = AspectCanvases.sourceSize(sourceWidth: size.width, sourceHeight: size.height, grid: grid) {
-            out.removeAll { $0.canvas == own }
-            out.insert(ClipSizeChoice(canvas: own, name: "source size", isSourceSize: true), at: 0)
-        }
-        return out
-    }
-
-    /// The file's pixel size from its metadata — ImageIO reads the header
-    /// without decoding the picture, which a 4000px photo would make a
-    /// noticeable pause.
-    private static func pixelSize(of url: URL) -> (width: Int, height: Int)? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-              let w = props[kCGImagePropertyPixelWidth] as? Int,
-              let h = props[kCGImagePropertyPixelHeight] as? Int,
-              w > 0, h > 0 else { return nil }
-        return (w, h)
+        return AspectCanvases.choices(sourceWidth: size.width, sourceHeight: size.height, grid: grid)
     }
 
     /// Written into the fields, over a focused one too: the user picked a size
@@ -1128,7 +1052,7 @@ struct VideoGenView: View {
                             .foregroundStyle(.orange)
                             .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                                     container: refHeaderRow)) {
-                                Self.hoverBubble(L10n.text("Some previously added references were not found on disk. Double-check the media identifiers in the prompt and adjust them if necessary."))
+                                RefTiles.hoverBubble(L10n.text("Some previously added references were not found on disk. Double-check the media identifiers in the prompt and adjust them if necessary."))
                             }
                     }
                     Text("optional, the model follows them")
@@ -1146,7 +1070,7 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                     .hoverReveal(placement: .pointerClamped(width: refCapBubbleWidth,
                                                             container: refHeaderRow)) {
-                        Self.hoverBubble(L10n.text(H3RefLimits.combinedCapNote))
+                        RefTiles.hoverBubble(L10n.text(H3RefLimits.combinedCapNote))
                     }
                 }
                 // Painted over the well below it — see the prompt heading.
@@ -1249,168 +1173,9 @@ struct VideoGenView: View {
         .help("How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step.")
     }
 
-    private enum RefTileKind {
-        case image
-        case icon(String)
-
-        var isImage: Bool { if case .image = self { return true } else { return false } }
-    }
-
-    /// Three per row at the pane's 340pt floor: 340 − 32 form gutters − 12
-    /// `MediaDropModifier` padding − 24 well padding = 272, less two 8pt gaps,
-    /// over three.
-    private static let refTileSide: CGFloat = 84
-    private static let refTileSpacing: CGFloat = 8
-
     private func refTileGrid(urls: Binding<[URL]>, marker: String,
                              kind: RefTileKind) -> some View {
-        RefTileGrid(urls: urls, marker: marker, kind: kind, insert: insertMarker)
-    }
-
-    /// Fixed cells: `adaptive(minimum:maximum:)` at ONE value packs 84pt
-    /// columns leading (a minimum alone stretches them). Its own view so the
-    /// rect the bubbles are clamped to is this view's state, not the pane's.
-    /// Identity is the FILE (every way in dedupes); the label is the position.
-    private struct RefTileGrid: View {
-        let urls: Binding<[URL]>
-        let marker: String
-        let kind: RefTileKind
-        /// Drops a tile's `<Marker n>` into the prompt.
-        let insert: (String) -> Void
-
-        @State private var rect: CGRect = .zero
-
-        var body: some View {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: VideoGenView.refTileSide,
-                                                   maximum: VideoGenView.refTileSide),
-                                         spacing: VideoGenView.refTileSpacing, alignment: .top)],
-                      alignment: .leading,
-                      spacing: VideoGenView.refTileSpacing) {
-                ForEach(Array(urls.wrappedValue.enumerated()), id: \.element) { idx, url in
-                    RefTile(url: url, index: idx, marker: marker, kind: kind, container: rect,
-                            insert: insert) {
-                        urls.wrappedValue.removeAll { $0 == url }
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // Quantised to 8pt: only `minX` and `width` are read
-            // (`HoverReveal.clampedX`), and an exact rect changes on every
-            // frame of a drag.
-            .onGeometryChange(for: CGRect.self) { proxy in
-                let r = proxy.frame(in: .global)
-                return CGRect(x: (r.minX / 8).rounded() * 8, y: 0,
-                              width: (r.width / 8).rounded() * 8, height: 0)
-            } action: { rect = $0 }
-        }
-    }
-
-    /// One reference, in the shape of the chat composer's attachment chips.
-    /// Hover floats the picture and its filename in the pane's bubble (the
-    /// 84pt caption would be dots). The label is the POSITION, so removing
-    /// one renumbers the rest — which is what the prompt's `<Picture n>` means.
-    private struct RefTile: View {
-        let url: URL
-        let index: Int
-        let marker: String
-        let kind: RefTileKind
-        let container: CGRect
-        let insert: (String) -> Void
-        let remove: () -> Void
-
-        /// What the prompt calls this reference.
-        private var promptMarker: String { "<\(marker) \(index + 1)>" }
-
-        /// Loaded once per tile, not in `body`: nine full-size photos re-read
-        /// on every change in the pane is a resize that drags.
-        @State private var image: NSImage?
-
-        /// Half the tile, so a clip or a track reads as an icon, not a mark.
-        private static let iconSize: CGFloat = 34
-        /// Long enough for a filename on one or two lines, never wider than
-        /// the grid it is kept inside.
-        private var bubbleWidth: CGFloat {
-            container.width > 0 ? min(220, container.width) : 220
-        }
-
-        var body: some View {
-            VStack(spacing: 4) {
-                ZStack(alignment: .topTrailing) {
-                    // `contentShape` beside `clipShape`: the clip cuts only the
-                    // DRAWING, and a `.fill` image's overflow still takes the
-                    // pointer — over the next tile's badge. The badge is a
-                    // SIBLING above the face, never a Button inside a Button.
-                    Button { insert(promptMarker) } label: {
-                        face
-                            .frame(width: VideoGenView.refTileSide, height: VideoGenView.refTileSide)
-                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                            .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                    Button(action: remove) {
-                        // The glyph sits on a photograph, so it carries its own
-                        // erased ring instead of trusting what is behind it.
-                        ZStack {
-                            Circle()
-                                .fill(Color(nsColor: .windowBackgroundColor))
-                                .frame(width: 17, height: 17)
-                            Image(systemName: "multiply.circle.fill")
-                                .font(.system(size: 14))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(3)
-                }
-                Text(promptMarker)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(width: VideoGenView.refTileSide)
-            .hoverReveal(placement: .pointerClamped(width: bubbleWidth, container: container)) {
-                VideoGenView.hoverBubble(url.lastPathComponent) {
-                    // The whole picture, fitted. Sized from its own aspect:
-                    // an overlay is proposed the tile's 84pt, so
-                    // `maxWidth`/`maxHeight` would cap it there.
-                    if let image,
-                       let fitted = VideoGenView.previewSize(for: image.size,
-                                                             within: bubbleWidth - 16) {
-                        Image(nsImage: image)
-                            .resizable()
-                            .frame(width: fitted.width, height: fitted.height)
-                            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-                            .frame(maxWidth: .infinity)
-                    }
-                }
-            }
-            .onAppear { if kind.isImage { image = NSImage(contentsOf: url) } }
-        }
-
-        @ViewBuilder
-        private var face: some View {
-            switch kind {
-            case .image:
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                } else {
-                    placeholder("photo")
-                }
-            case .icon(let name):
-                placeholder(name)
-            }
-        }
-
-        private func placeholder(_ name: String) -> some View {
-            ZStack {
-                Color.secondary.opacity(0.12)
-                Image(systemName: name)
-                    .font(.system(size: Self.iconSize))
-                    .foregroundStyle(.secondary)
-            }
-        }
+        RefTileGrid(urls: urls, label: { "<\(marker) \($0 + 1)>" }, kind: kind, insert: insertMarker)
     }
 
     private struct RefSlot: Identifiable {
@@ -1961,79 +1726,23 @@ struct VideoGenView: View {
         }
     }
 
-    /// Both LoRA wells take this, so the empty one and a filled one are the
-    /// same block rather than two sizes of the same idea. Thinner than the
-    /// image wells' 84: this one holds two lines of text, not a thumbnail.
-    private static let loraWellMinHeight: CGFloat = 64
-
     @ViewBuilder
     private var loraSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text("Style LoRAs").font(.caption.weight(.semibold))
-            ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
-                loraRow(index: index, lora: lora)
+            ForEach(Array(loras.enumerated()), id: \.element.id) { index, _ in
+                LoraAdapterRow(lora: $loras[index]) {
+                    loras.remove(at: index)
+                    persist()
+                }
+                .onChange(of: loras[index].scale) { _, _ in guard !hydrating else { return }; persist() }
             }
             // The way in is the well itself, and it comes back under the last
             // adapter so adding a second one needs no separate control. At the
             // cap there is nothing to offer, so it goes.
-            if loras.count < maxLoras { loraAddWell }
+            if loras.count < maxLoras { LoraAddWell(action: chooseLora) }
         }
-    }
-
-    /// Click-only: a LoRA is picked from a file panel, and a well that accepts
-    /// a drag is a promise this one does not keep.
-    private var loraAddWell: some View {
-        Button(action: chooseLora) {
-            MediaWellAction(title: "Choose .safetensors…",
-                            systemImage: "paintpalette",
-                            caption: "Add LoRA adapter for custom style. Several can stack at once.")
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: Self.loraWellMinHeight, alignment: .center)
-            .background(MediaDropWellBackground(isTargeted: false))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func loraRow(index: Int, lora: LoraAdapter) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Image(systemName: "paintpalette")
-                    .foregroundStyle(.secondary)
-                Text(URL(fileURLWithPath: lora.path).lastPathComponent)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(lora.path)
-                Spacer()
-                Button {
-                    loras.remove(at: index)
-                    persist()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .help("Remove this LoRA")
-            }
-            HStack(spacing: 8) {
-                Text("Scale").font(.caption)
-                Slider(value: $loras[index].scale, in: 0...2, step: 0.05)
-                // Fixed width: a readout that sizes to its digits drags the
-                // slider's right edge every time the value crosses a width.
-                Text(String(format: "%.2f", lora.scale))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 34, alignment: .trailing)
-            }
-            .onChange(of: loras[index].scale) { _, _ in guard !hydrating else { return }; persist() }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, minHeight: Self.loraWellMinHeight, alignment: .leading)
-        .background(MediaDropWellBackground(isTargeted: false))
     }
 
     /// Live "is the model resident, and what does the GPU hold" line under the

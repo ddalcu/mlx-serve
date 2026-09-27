@@ -17,14 +17,43 @@ final class MediaGenSettingsTests: XCTestCase {
         s.steps = 33
         s.seed = 7
         s.keepResident = true
+        s.prompt = "a copper moka pot"
+        s.negativePrompt = "blurry"
+        s.promptHeight = 240
+        s.showAdvanced = true
+        s.sourcePath = "/tmp/source.png"
+        s.refPaths = ["/tmp/ref1.png", "/tmp/ref2.png"]
         let decoded = try JSONDecoder().decode(ImageGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
     }
 
-    /// Settings saved by an older build still carry `guidance`, `negativePrompt`
-    /// and `safeMode` — all retired. The tolerant decoder must ignore the
-    /// leftovers rather than throwing, or every existing user's image settings
-    /// reset on upgrade.
+    /// A blob from before the draft was persisted decodes to the defaults for
+    /// the new keys: empty prompts, no source, Advanced closed.
+    func testImageBlobWithoutTheDraftKeysStillDecodes() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(ImageGenSettings())) as! [String: Any]
+        for key in ["prompt", "negativePrompt", "promptHeight", "showAdvanced", "sourcePath", "refPaths"] {
+            obj.removeValue(forKey: key)
+        }
+        let decoded = try JSONDecoder().decode(
+            ImageGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded, ImageGenSettings())
+    }
+
+    func testImageSettingsClampAStalePromptHeightOnDecode() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(ImageGenSettings())) as! [String: Any]
+        obj["promptHeight"] = 9999.0
+        let decoded = try JSONDecoder().decode(
+            ImageGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.promptHeight, PromptEditorHeight.maxHeight)
+    }
+
+    /// Settings saved by an older build still carry `guidance` and `safeMode`,
+    /// both retired. The tolerant decoder must ignore the leftovers rather than
+    /// throwing, or every existing user's image settings reset on upgrade.
+    /// `negativePrompt` is read again since the draft is persisted, so an old
+    /// value comes back as what it was: the user's own text.
     func testImageSettingsIgnoresRetiredKeysFromOlderBuilds() throws {
         let legacy = Data("""
         {"modelId":"mflux/flux2-klein-4b-q4","quality":"Quality","resolutionId":"1216x832",
@@ -38,6 +67,7 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertTrue(s.keepResident)
         XCTAssertEqual(s.strength, 0.4)
         XCTAssertFalse(s.editMode)
+        XCTAssertEqual(s.negativePrompt, "blurry")
     }
 
     func testAudioSettingsRoundTrips() throws {

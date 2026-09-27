@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 
 /// A canvas the model can actually sample: both sides on its grid and inside
 /// its range.
@@ -8,6 +9,14 @@ struct AspectCanvas: Equatable, Identifiable {
 
     var id: String { "\(width)x\(height)" }
     var area: Int { width * height }
+}
+
+/// One row of a "Set by source" menu: a canvas and what to call it.
+struct SourceCanvasChoice: Identifiable, Equatable {
+    let canvas: AspectCanvas
+    let name: String?
+    var isSourceSize: Bool = false
+    var id: String { canvas.id }
 }
 
 /// Canvases that match a starting frame's shape.
@@ -72,6 +81,31 @@ enum AspectCanvases {
         return AspectCanvas(width: w, height: h)
     }
 
+    /// The menu rows for a source picture: its own size first (the one option
+    /// that does not rescale it, when it fits the grid), then the spread named
+    /// largest to smallest. Fewer candidates take the ends and the middle,
+    /// because "large" among two says nothing.
+    static func choices(sourceWidth: Int, sourceHeight: Int, grid: ResolutionGrid) -> [SourceCanvasChoice] {
+        let spread = options(sourceWidth: sourceWidth, sourceHeight: sourceHeight, grid: grid)
+        let names: [String?] = {
+            switch spread.count {
+            case 5:  return ["largest", "large", "medium", "small", "smallest"]
+            case 4:  return ["largest", "large", "small", "smallest"]
+            case 3:  return ["largest", "medium", "smallest"]
+            case 2:  return ["largest", "smallest"]
+            default: return [nil]
+            }
+        }()
+        var out = spread.enumerated().map { i, c in
+            SourceCanvasChoice(canvas: c, name: i < names.count ? names[i] : nil)
+        }
+        if let own = sourceSize(sourceWidth: sourceWidth, sourceHeight: sourceHeight, grid: grid) {
+            out.removeAll { $0.canvas == own }
+            out.insert(SourceCanvasChoice(canvas: own, name: "source size", isSourceSize: true), at: 0)
+        }
+        return out
+    }
+
     /// `count` canvases spread by AREA, largest first: the two ends, then the
     /// ones nearest to evenly spaced areas between them. Area is what drives
     /// both time and memory, so it is the axis the choice is made on.
@@ -120,5 +154,17 @@ enum AspectCanvases {
         var x = abs(a), y = abs(b)
         while y != 0 { (x, y) = (y, x % y) }
         return max(x, 1)
+    }
+
+    /// The file's pixel size from its metadata: ImageIO reads the header
+    /// without decoding the picture, which a 4000px photo would make a
+    /// noticeable pause.
+    static func pixelSize(of url: URL) -> (width: Int, height: Int)? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0 else { return nil }
+        return (w, h)
     }
 }

@@ -83,4 +83,29 @@ final class AspectCanvasesTests: XCTestCase {
         XCTAssertEqual(AspectCanvases.ratioLabel(width: 1090, height: 1070), "1:1")
         XCTAssertEqual(AspectCanvases.ratioLabel(width: 3841, height: 2159), "16:9")
     }
+
+    // MARK: - Named choices (the "Set by source" menus)
+
+    /// The source's own size leads and is listed once: here it is also the
+    /// largest canvas of the spread, so that row goes and the spread keeps the
+    /// names it was given.
+    func testChoicesLeadWithTheSourceSizeAndListItOnce() {
+        let choices = AspectCanvases.choices(sourceWidth: 1920, sourceHeight: 1088, grid: ltx)
+        XCTAssertEqual(choices.first?.canvas, AspectCanvas(width: 1920, height: 1088))
+        XCTAssertEqual(choices.first?.isSourceSize, true)
+        XCTAssertEqual(choices.first?.name, "source size")
+        let rest = choices.dropFirst()
+        XCTAssertFalse(rest.contains { $0.isSourceSize })
+        XCTAssertFalse(rest.contains { $0.canvas == choices.first?.canvas })
+        XCTAssertEqual(rest.map(\.name), ["large", "medium", "small", "smallest"])
+    }
+
+    /// A source that does not fit the grid has no source-size row; the spread
+    /// still comes named.
+    func testChoicesWithoutAFittingSourceSizeStillNameTheSpread() {
+        let choices = AspectCanvases.choices(sourceWidth: 4096, sourceHeight: 2304, grid: ltx)
+        XCTAssertFalse(choices.contains { $0.isSourceSize })
+        XCTAssertEqual(choices.count, 5)
+        XCTAssertEqual(choices.map(\.name), ["largest", "large", "medium", "small", "smallest"])
+    }
 }
