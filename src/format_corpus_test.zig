@@ -236,6 +236,19 @@ const corpus = [_]Expect{
         .tool_arg_key = "content",
         .tool_arg_value = "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}",
     },
+    .{
+        // Real capture (src/fixtures/tool_traffic.jsonl): the call follows a template-opened thought.
+        .family = "qwen",
+        .name = "function-tag call after a template-opened thought",
+        .raw = "\n\nI will now verify the current state of calc.js:\n</think>\n\n<tool_call>\n<function=read>\n" ++
+            "<parameter=limit>\n15\n</parameter>\n<parameter=path>\n./calc.js\n</parameter>\n</function>\n</tool_call>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "verify the current state",
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "./calc.js",
+    },
     // ── Qwen 3.6 MoE (broken-JSON repair paths) ─────────────────────────────
     .{
         // Real broken output from Qwen3.6-35B-A3B-6bit: `, {` instead of
@@ -2331,6 +2344,57 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     }
     // The guard is worthless if it silently matched nothing.
     try std.testing.expect(checked > 0);
+}
+
+test "format corpus: an early tool-call header names the call the final parse emits first" {
+    // The SSE tools-path order (hold, then think gate, a split restarts the buffer); a sent header is final.
+    const allocator = testing.allocator;
+    var announced: usize = 0;
+    for (corpus) |entry| {
+        var scan: chat.ThinkScan = .{};
+        var start: usize = 0;
+        var think_closed = false;
+        var resolved = false;
+        var header: ?[]const u8 = null;
+        var i: usize = 0;
+        while (i < entry.raw.len) {
+            i += specialMarkerLenAt(entry.raw[i..]) orelse 1;
+            const buf = entry.raw[start..i];
+            if (chat.streamShouldBufferForTools(buf)) {
+                if (!resolved and (think_closed or !entry.opened_by_template)) {
+                    switch (chat.toolCallHeader(buf)) {
+                        .pending => {},
+                        .none => resolved = true,
+                        .name => |n| {
+                            header = n;
+                            resolved = true;
+                        },
+                    }
+                }
+                continue;
+            }
+            if (chat.streamThinkGateScan(buf, entry.thinking, think_closed, entry.opened_by_template, &scan) == .split_think) {
+                start = i;
+                think_closed = true;
+                scan.reset();
+            }
+        }
+        const name = header orelse continue;
+        announced += 1;
+        const norm = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw[start..]);
+        defer if (norm) |n| allocator.free(n);
+        const calls = try chat.parseToolCalls(allocator, norm orelse entry.raw[start..]);
+        defer if (calls) |cs| {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        };
+        const first = if (calls) |cs| cs[0].name else "(no call)";
+        if (!std.mem.eql(u8, first, name)) try fail(entry, "early header names another call than the final parse", first);
+    }
+    try testing.expect(announced > 0);
 }
 
 test "format corpus: history round-trip serialization survives any byte content" {

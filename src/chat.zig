@@ -2925,6 +2925,80 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     return false;
 }
 
+/// The NAME a streamed tool call can announce before its arguments: only for a Qwen/Hermes
+/// `<tool_call>` (XML or JSON) that `parseToolCalls` reads first, with no thought or other
+/// dialect's call before it. A longer buffer never changes `.none` or `.name`.
+pub const ToolCallHeader = union(enum) { pending, none, name: []const u8 };
+
+pub fn toolCallHeader(buf: []const u8) ToolCallHeader {
+    const at = firstToolOpener(buf) orelse return if (toolHeaderRuledOut(buf)) .none else .pending;
+    if (toolHeaderRuledOut(buf[0..at])) return .none;
+    const opener = "<tool_call>";
+    const rest = buf[at..];
+    if (!std.mem.startsWith(u8, rest, opener)) {
+        return if (rest.len < opener.len and std.mem.startsWith(u8, opener, rest)) .pending else .none;
+    }
+    const body = std.mem.trimStart(u8, rest[opener.len..], " \t\r\n");
+    if (body.len == 0) return .pending;
+    switch (body[0]) {
+        '<' => {
+            const tag = "<function=";
+            if (!std.mem.startsWith(u8, body, tag)) {
+                return if (body.len < tag.len and std.mem.startsWith(u8, tag, body)) .pending else .none;
+            }
+            return toolHeaderName(body[tag.len..], '>', " \n");
+        },
+        '{' => {
+            var j: usize = 1;
+            for ([_][]const u8{ "\"name\"", ":", "\"" }) |want| {
+                while (j < body.len and std.ascii.isWhitespace(body[j])) j += 1;
+                const got = body[j..@min(body.len, j + want.len)];
+                if (!std.mem.startsWith(u8, want, got)) return .none;
+                if (got.len < want.len) return .pending;
+                j += want.len;
+            }
+            return toolHeaderName(body[j..], '"', "");
+        },
+        else => return .none,
+    }
+}
+
+/// Where `parseToolCalls` starts reading: the first `<tool` a tag terminator follows.
+fn firstToolOpener(buf: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, from, "<tool")) |at| {
+        const after = at + "<tool".len;
+        if (after < buf.len and std.mem.indexOfScalar(u8, "> \t\n_|", buf[after]) != null) return at;
+        from = after;
+    }
+    return null;
+}
+
+/// A thought, or a call in a dialect the header never reads, is open in `text`. The parse
+/// may then read something else first, and a held call would be rescanned every token.
+fn toolHeaderRuledOut(text: []const u8) bool {
+    if (text.len > 0 and text[0] == '{') return true;
+    const markers = [_][]const u8{ "<think", "<|channel", "<|content_thinking|>", "to=self", "<|tool_call", "<｜DSML｜", "<atem:", INKLING_INVOKE_TAG, "to=functions.", "<function " };
+    for (markers) |m| {
+        if (std.mem.indexOf(u8, text, m) != null) return true;
+    }
+    return false;
+}
+
+/// The name running to `end`, trimmed as the parser trims it, when it is a plain
+/// identifier: a header interpolates it without escaping.
+fn toolHeaderName(s: []const u8, end: u8, trim: []const u8) ToolCallHeader {
+    const max = 128;
+    const stop = std.mem.indexOfScalar(u8, s[0..@min(s.len, max + 1)], end) orelse
+        return if (s.len > max) .none else .pending;
+    const name = std.mem.trim(u8, s[0..stop], trim);
+    if (name.len == 0) return .none;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "_-.:", c) == null) return .none;
+    }
+    return .{ .name = name };
+}
+
 /// Inkling streaming NAME hold: true when the text after the last message
 /// boundary (<|end_message|> / <|message_model|> / <|content_text|>) is a
 /// NON-EMPTY bare identifier run — the shape of a tool NAME right before its
@@ -11002,6 +11076,47 @@ test "streamShouldBufferForTools: raw JSON shape" {
     // Just `{` or JSON without `"name"` shouldn't false-trigger.
     try testing.expect(!streamShouldBufferForTools("{"));
     try testing.expect(!streamShouldBufferForTools("{\"foo\":1}"));
+}
+
+test "toolCallHeader: names a call once its opener is complete and never changes its mind" {
+    const Case = struct { text: []const u8, name: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>", .name = "write_file" },
+        .{ .text = "Let me look.\n\n<tool_call>\n<function=read>\n<parameter=path>\n/tmp/<tool_call>\n</parameter>", .name = "read" },
+        .{ .text = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>", .name = "get_weather" },
+        .{ .text = "<tool_call>{\"name\":\"mcp__fs__read.v2\",\"arguments\":{}}</tool_call>", .name = "mcp__fs__read.v2" },
+        .{ .text = "a <toolkit> first, then <tool_call>\n<function=shell>\n", .name = "shell" },
+        // Dialects the header does not read: the whole call still arrives at the end.
+        .{ .text = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>", .name = null },
+        .{ .text = "<|tool_call>call:shell{command:<|\"|>ls<|\"|>}<tool_call|>", .name = null },
+        .{ .text = "<tool_call name=\"shell\">{\"command\":\"ls\"}</tool_call>", .name = null },
+        .{ .text = "<tool_calls>\n<tool_call>\n<function=shell>\n</function>\n</tool_call>", .name = null },
+        .{ .text = "<tool_call>{\"arguments\": {}, \"name\": \"shell\"}</tool_call>", .name = null },
+        .{ .text = "<tool_call>{{\"name\": \"shell\", \"arguments\": {}}}</tool_call>", .name = null },
+        .{ .text = "{\"name\": \"get_time\", \"arguments\": {}}", .name = null },
+        .{ .text = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"shell\">\n", .name = null },
+        .{ .text = "<function name=\"shell\"><param name=\"command\">ls</param></function>", .name = null },
+        // Names the parser would read as something else, and openers inside a thought.
+        .{ .text = "<tool_call>\n<function=grep o data.txt>\n</function>\n</tool_call>", .name = null },
+        .{ .text = "<tool_call>\n<function=ls\n</parameter>\n</function>", .name = null },
+        .{ .text = "<tool_call>{\"name\": \"a\\\"b\"}</tool_call>", .name = null },
+        .{ .text = "<think>plan<tool_call>\n<function=shell>\n</function>\n</tool_call></think>", .name = null },
+        .{ .text = "<|channel>thought\nI'll call <tool_call>\n<function=shell>\n", .name = null },
+        .{ .text = "<|channel|>analysis<|message|>Maybe <tool_call>\n<function=shell>\n", .name = null },
+    };
+    for (cases) |c| {
+        for (1..c.text.len + 1) |n| {
+            switch (toolCallHeader(c.text[0..n])) {
+                .pending => {},
+                .none => if (c.name != null) return error.GaveUpOnARealHeader,
+                .name => |got| try testing.expectEqualStrings(c.name orelse return error.UnexpectedHeader, got),
+            }
+        }
+        switch (toolCallHeader(c.text)) {
+            .name => |got| try testing.expectEqualStrings(c.name orelse return error.UnexpectedHeader, got),
+            else => try testing.expect(c.name == null),
+        }
+    }
 }
 
 test "streamThinkGate: template-opened thinking holds tag-free prose" {
