@@ -493,10 +493,11 @@ and they are listed because they made that work possible.
     LoRA weights it loads (larryvrh/MiniMax-H3-Turbo-Lora, Apache-2.0) are
     downloaded at runtime and not redistributed here.
   * Layr-Labs/mlxfast-bonsai2-27b-engine (MIT), the reference for the opt-in
-    int8 prefill in `src/qmm_int8.zig`: its int8-staged prompt matmul (2-bit
-    codes expanded to int8 in threadgroup memory, signed per-group activation
-    codes) and the factored ternary epilogue. Written as a JIT `metal_kernel`
-    here, not shipped as their source.
+    int8 prefill in `src/qmm_int8.zig`: its register-staged prompt matmul (2-bit
+    codes expanded to int8 straight into the tensor op's operand, the plane
+    re-layout of the weight, signed per-group activation codes quantized with
+    the rotation) and the factored ternary epilogue. Written as a JIT
+    `metal_kernel` here, not shipped as their source.
   * filipstrand/mflux (MIT), the reference for stacking several LoRA adapters
     at once — summing per-adapter deltas at forward time rather than merging
     them into the base weight, the `lora_paths`/`lora_scales` request shape,
