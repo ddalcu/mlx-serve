@@ -2395,3 +2395,19 @@ Fix: `server.listenExclusive` clears SO_REUSEPORT on the bound socket. The kerne
 flag on the socket already bound, so the later bind fails with `AddressInUse` and logs the
 same "Port N is already in use" line. SO_REUSEADDR stays for rebinding over TIME_WAIT.
 Guard: `listenExclusive: a second server cannot bind a port that is already listening`.
+
+## A model that failed to load was answered by the default model (#585)
+
+Defect: after a pack failed to load (`MissingWeight`), a chat request that named it by its
+absolute path got HTTP 200 from the model already resident, with the path echoed as `model`.
+Users read that as "the new pack works".
+
+Cause: `/v1/load-model` registers a path under an `org/name` id, but inference routes only
+`peek`ed the raw string. A path matched no key, so it took the "unknown id -> default model"
+branch meant for SDK names like `gpt-4`.
+
+Fix: `server.resolveRequestModelId` resolves a path through `peekByPath`, so a failed entry
+reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN gate reads
+the same helper. Startup was already loud: a failed `--model` load exits 1.
+Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
+`tests/test_load_failure_no_fallback.sh`.

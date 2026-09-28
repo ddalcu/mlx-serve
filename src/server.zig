@@ -825,6 +825,29 @@ fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     }) catch "Request body too large";
 }
 
+pub const RequestModel = union(enum) {
+    /// A registered id, or "" / "mlx-serve" (the default), passed through.
+    id: []const u8,
+    /// Not registered: dispatch serves the default so SDK names like "gpt-4" work.
+    unknown_name,
+    /// An absolute path no entry lives at.
+    unknown_path,
+};
+
+/// Which model a request's `model` field names. The dispatch site and the LAN
+/// gate both read this. The registry is NOT locked here.
+fn resolveRequestModelId(registry: *ModelRegistry, id: []const u8) RequestModel {
+    if (id.len == 0 or std.mem.eql(u8, id, "mlx-serve")) return .{ .id = id };
+    if (registry.peek(id)) |e| return .{ .id = e.id };
+    // A path is never an SDK marketing name, and a default-model answer to it
+    // would serve a pack that failed to load with another model's weights.
+    if (std.fs.path.isAbsolute(id)) {
+        if (registry.peekByPath(id)) |e| return .{ .id = e.id };
+        return .unknown_path;
+    }
+    return .unknown_name;
+}
+
 /// The requested model id from a request body of EITHER shape.
 ///
 /// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
@@ -2397,8 +2420,13 @@ fn handleConnection(
         try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
         return;
     }
-    if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
-        if (registry.peek(requested_model_id) == null) {
+    switch (resolveRequestModelId(registry, requested_model_id)) {
+        .id => |id| requested_model_id = id,
+        .unknown_path => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; load it first with POST /v1/load-model", 404);
+            return;
+        },
+        .unknown_name => {
             // Ollama clients send tagged/short names ("qwen3.6:latest");
             // resolve them against registry ids before giving up. Scoped to
             // /api/ paths so /v1 fallback semantics stay pinned.
@@ -2411,7 +2439,7 @@ fn handleConnection(
             // clients that care about routing precision pass an exact id
             // we registered (and `peek` will find it).
             requested_model_id = resolved orelse "";
-        }
+        },
     }
     // Text-gen route aimed at a KNOWN non-text model: reject before
     // ensureLoaded, or the request cold-loads a multi-GB media model just
@@ -12136,10 +12164,12 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
         return null;
     }
-    const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
-        mid
-    else
-        registry.default_id;
+    const effective = switch (resolveRequestModelId(registry, mid)) {
+        .id => |id| if (id.len > 0 and !std.mem.eql(u8, id, "mlx-serve")) id else registry.default_id,
+        .unknown_name => registry.default_id,
+        // Dispatch answers 404 and runs nothing.
+        .unknown_path => return null,
+    };
     if (!l.sharedAllows(effective)) return "Model not shared on this host";
     return null;
 }
@@ -12398,6 +12428,8 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     // dispatch will — here the default is shared, so both pass.
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", "application/json", false) == null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
+    // A PATH names its own entry, never the default: the unshared model's dir is denied.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"/m/q\"}", "application/json", false) != null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
@@ -12415,6 +12447,24 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "resolveRequestModelId: a path names its own entry, never the default model" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    const good = try reg.registerStub("org/good", "/m/org/good", 1);
+    reg.default_id = good.id;
+    _ = try reg.registerStub("org/broken", "/m/org/broken", 1);
+
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, "/m/org/broken").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, "/m/org/broken/").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, "org/broken").id);
+    try std.testing.expect(resolveRequestModelId(reg, "/m/org/missing") == .unknown_path);
+    // Plain unknown names and the alias keep the default-model fallback.
+    try std.testing.expect(resolveRequestModelId(reg, "gpt-4") == .unknown_name);
+    try std.testing.expectEqualStrings("mlx-serve", resolveRequestModelId(reg, "mlx-serve").id);
+    try std.testing.expectEqualStrings("", resolveRequestModelId(reg, "").id);
 }
 
 test "the route-existence 404 is answered BEFORE the model is resolved" {

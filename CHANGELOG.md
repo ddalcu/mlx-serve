@@ -27,6 +27,7 @@
 - Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
+- A request that names a model by its path no longer gets another model's answer: a pack that failed to load returns its load error, and an unknown path returns 404 (#585).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
 - `--mtp-greedy-tail` (or `"mtp_greedy_tail": true` for one model in model-settings.json) drafts only the first speculative token of a sampled request by sampling and the rest by argmax, which lets `--mtp-typical` accept longer runs; off by default.
 - Sidebar groups put chats, agent threads and terminals into named folders, and terminal sessions come back where you left them.
