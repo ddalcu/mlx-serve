@@ -169,8 +169,11 @@ const NARROW_SOURCE =
     \\    const int g = gb + gh;
     \\    if (g >= n_groups) break;
     \\    float s0[4], s1[4], s2[4], s3[4], bz[4];
+    \\    half2 hs[4], hb[4];
     \\#pragma unroll
     \\    for (int j = 0; j < 4; ++j) {
+    \\      hs[j] = half2(half(scales[wrow[j] * K_g + g]));
+    \\      hb[j] = half2(half(biases[wrow[j] * K_g + g]));
     \\      const float sv = float(scales[wrow[j] * K_g + g]);
     \\      bz[j] = float(biases[wrow[j] * K_g + g]);
     \\      s0[j] = sv;
@@ -187,10 +190,22 @@ const NARROW_SOURCE =
     \\      for (int j = 0; j < 4; ++j) {
     \\        const uint word = simd_shuffle(ring[0][j][st & 3], qlane[st >> 2]);
     \\        const uint by = (word >> bsh) & 0xffu;
-    \\        const float v0 = s0[j] * float(by & 0x03u) + bz[j];
-    \\        const float v1 = s1[j] * float(by & 0x0cu) + bz[j];
-    \\        const float v2 = s2[j] * float(by & 0x30u) + bz[j];
-    \\        const float v3 = s3[j] * float(by & 0xc0u) + bz[j];
+    \\        float v0, v1, v2, v3;
+    \\        if (HDQ) {
+    \\          // Codes 0..3 dropped into the mantissa of 1024.0h come out as
+    \\          // exact halves: no int->float conversion, one rounding as before.
+    \\          const uint u = by | (by << 14);
+    \\          const half2 h01 = as_type<half2>((u & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+    \\          const half2 h23 = as_type<half2>(((u >> 4) & 0x00030003u) | 0x64006400u) - half2(1024.0h);
+    \\          const half2 d01 = fma(h01, hs[j], hb[j]);
+    \\          const half2 d23 = fma(h23, hs[j], hb[j]);
+    \\          v0 = d01.x; v1 = d01.y; v2 = d23.x; v3 = d23.y;
+    \\        } else {
+    \\          v0 = s0[j] * float(by & 0x03u) + bz[j];
+    \\          v1 = s1[j] * float(by & 0x0cu) + bz[j];
+    \\          v2 = s2[j] * float(by & 0x30u) + bz[j];
+    \\          v3 = s3[j] * float(by & 0xc0u) + bz[j];
+    \\        }
     \\        if (j < 2) {
     \\          B0[4 * j + 0] = T(v0);
     \\          B0[4 * j + 1] = T(v1);
@@ -262,7 +277,11 @@ const NARROW_SOURCE =
 
 var narrow_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
-const NarrowKey = struct { n: c_int, m: c_int, dt: mlx.mlx_dtype };
+/// f16 packs dequantize in half2 (output-identical to the f32 form); the
+/// f32 form stays for bf16 and as the test's reference.
+pub var half_dq: bool = true;
+
+const NarrowKey = struct { n: c_int, m: c_int, dt: mlx.mlx_dtype, hdq: c_int };
 var narrow_cfg: std.AutoHashMapUnmanaged(NarrowKey, mlx.mlx_fast_metal_kernel_config) = .{};
 
 fn narrowConfig(key: NarrowKey) !mlx.mlx_fast_metal_kernel_config {
@@ -276,6 +295,7 @@ fn narrowConfig(key: NarrowKey) !mlx.mlx_fast_metal_kernel_config {
     const row_blocks = @divTrunc(key.m + 15, 16);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 128, tiles, row_blocks));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "HDQ", key.hdq));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", key.dt));
     try narrow_cfg.put(std.heap.c_allocator, key, config);
     return config;
@@ -311,7 +331,7 @@ fn launchNarrow(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.m
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
     logEngagedOnce(.narrow, m, n, mlx.getShape(x)[mlx.getShape(x).len - 1]);
-    const cfg = try narrowConfig(.{ .n = n, .m = m, .dt = dt });
+    const cfg = try narrowConfig(.{ .n = n, .m = m, .dt = dt, .hdq = @intFromBool(dt == .float16 and half_dq) });
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try narrowKernel(), in_vec, cfg, s));
     var y = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y);
@@ -536,4 +556,72 @@ test "qmv_nax2 narrow: row tiling holds across and past a 16-row block" {
     max_rows_override = 64;
     defer max_rows_override = null;
     try parityAgainstStock(&.{ 17, 24, 32, 40, 64 });
+}
+
+test "qmv_nax2 narrow: the half dequant is bit-identical to the f32 dequant" {
+    const s = mlx.gpuStream();
+    const n: c_int = 1024;
+    const k: c_int = 1536;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const nu: usize = @intCast(n);
+    const ku: usize = @intCast(k);
+    const codes = try std.testing.allocator.alloc(u32, nu * ku / 16);
+    defer std.testing.allocator.free(codes);
+    for (codes) |*wd| wd.* = rnd.int(u32);
+    // General affine, not just ternary: independent scales and biases.
+    const sb = try std.testing.allocator.alloc(f32, 2 * nu * ku / 128);
+    defer std.testing.allocator.free(sb);
+    for (sb, 0..) |*e, i| e.* = if (i % 2 == 0) 1e-4 + 0.05 * rnd.float(f32) else 0.1 * rnd.floatNorm(f32);
+    const wq = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(wq);
+    const g = @divExact(k, 128);
+    const sbf = mlx.mlx_array_new_data(sb.ptr, &[_]c_int{ 2, n, g }, 3, .float32);
+    defer _ = mlx.mlx_array_free(sbf);
+    var sbh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sbh);
+    try mlx.check(mlx.mlx_astype(&sbh, sbf, .float16, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_slice(&sc, sbh, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, n, g }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try mlx.check(mlx.mlx_slice(&bi, sbh, &[_]c_int{ 1, 0, 0 }, 3, &[_]c_int{ 2, n, g }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    var sc2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc2);
+    var bi2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi2);
+    try mlx.check(mlx.mlx_reshape(&sc2, sc, &[_]c_int{ n, g }, 2, s));
+    try mlx.check(mlx.mlx_reshape(&bi2, bi, &[_]c_int{ n, g }, 2, s));
+    var scc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scc);
+    var bic = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bic);
+    try mlx.check(mlx.mlx_contiguous(&scc, sc2, false, s));
+    try mlx.check(mlx.mlx_contiguous(&bic, bi2, false, s));
+    gen_override = 17;
+    defer gen_override = null;
+    defer half_dq = true;
+    for ([_]c_int{ 6, 12, 16 }) |m| {
+        const mu: usize = @intCast(m);
+        const xv = try std.testing.allocator.alloc(f32, mu * ku);
+        defer std.testing.allocator.free(xv);
+        for (xv) |*e| e.* = rnd.floatNorm(f32);
+        const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ m, k }, 2, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, x32, .float16, s));
+        var outs: [2][]u16 = undefined;
+        for ([_]bool{ false, true }, 0..) |h, i| {
+            half_dq = h;
+            const o = (try qmm(x, wq, scc, bic, 2, 128, s)) orelse return error.RouteDeclined;
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_array_eval(o));
+            const p16: [*]const u16 = @ptrCast(@alignCast(mlx.mlx_array_data_float16(o).?));
+            outs[i] = try std.testing.allocator.dupe(u16, p16[0 .. mu * nu]);
+        }
+        defer for (outs) |o| std.testing.allocator.free(o);
+        try std.testing.expectEqualSlices(u16, outs[0], outs[1]);
+    }
 }
