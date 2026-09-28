@@ -2,25 +2,23 @@
 //!
 //! Default OFF. `MLX_SERVE_BONSAI_INT8_PREFILL=1` turns it on. Unlike every
 //! other 2-bit route in this tree it is NOT lossless: the activation is
-//! quantized to uint8 per 128-group, so committed tokens can differ from the
+//! quantized to int8 per 128-group, so committed tokens can differ from the
 //! stock path and greedy serial/speculative byte-equality no longer holds.
 //!
 //! Why it can win at all: at prompt width the packed projections are
-//! COMPUTE-bound, and the tensor unit runs int8 x 4-bit about 1.39x its fp16
-//! rate (MEASURED: 85.6 TOP/s vs 61.5 TFLOP/s dense f16, same process). At
-//! verify width the same projection is MEMORY-bound on the 2-bit weights, so
-//! quantizing the activation buys nothing there and this route declines.
+//! COMPUTE-bound, and the tensor unit's int8 x int8 rate is about twice its
+//! f16 rate on M5.
 //!
-//! `x[m,k] = as[m,g] * (xq[m,k] - 128)` and `w[n,k] = s[n,g]*c[n,k] + b[n,g]`:
-//!   y[m,n] = SUM_g as[m,g] * (s[n,g]*(C[m,n,g] - 128*colsum[n,g]) + b[n,g]*rs[m,g])
-//! with C the int32 product of shifted codes against weight codes, `colsum` a
-//! per-weight derived constant, and `rs[m,g] = SUM_k xq[m,k] - 128*128`.
+//! `x[m,k] = as[m,g] * xq[m,k]` (signed) and `w[n,k] = s[n,g]*c[n,k] + b[n,g]`:
+//!   y[m,n] = SUM_g as[m,g] * (s[n,g]*C[m,n,g] + b[n,g]*rs[m,g])
+//! with C the int32 product of activation codes against weight codes and
+//! `rs[m,g] = SUM_k xq[m,k]`.
 //!
 //! Arrangement follows the Bonsai speedup engine's prompt-width kernel
 //! (Layr-Labs/mlxfast-bonsai2-27b-engine, MIT). Theirs feeds the tensor unit
-//! `uint2b_format` directly; this toolchain has no such format, so the 2-bit
-//! codes are expanded to 4-bit in threadgroup memory first (MEASURED at 4% of
-//! the kernel, so the expansion is not what costs).
+//! `uint2b_format` directly where it exists; this toolchain has no such format,
+//! so the 2-bit codes are expanded to int8 in threadgroup memory, as their
+//! staged8 form does.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = std.log.scoped(.qmm_int8);
@@ -43,8 +41,8 @@ pub const HEADER =
     \\
 ;
 
-/// 64x64 output tile, one 64x64x128 int8 multiply-accumulate per 128-group,
-/// weights expanded 2->4 bit into threadgroup memory double-buffered.
+/// 64x64 output tile, one 64x64x128 int8 multiply per 128-group, weights
+/// expanded 2-bit -> int8 into threadgroup memory, double-buffered.
 pub const SOURCE =
     \\const int K = xq_shape[xq_ndim - 1];
     \\const int N = w_shape[0];
@@ -58,10 +56,10 @@ pub const SOURCE =
     \\    64, 64, 128, false, true, false,
     \\    mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
     \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
-    \\tensor<device uint8_t, dextents<int, 2>, tensor_inline> A((device uint8_t*)xq, dextents<int, 2>(K, MPAD));
-    \\threadgroup uint32_t bs[2][64 * 128 / 8];
-    \\tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B0((threadgroup uchar*)bs[0], dextents<int, 2>(128, 64));
-    \\tensor<threadgroup uint4b_format, dextents<int, 2>, tensor_inline> B1((threadgroup uchar*)bs[1], dextents<int, 2>(128, 64));
+    \\tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, MPAD));
+    \\threadgroup uint32_t bs[2][64 * 128 / 4];
+    \\tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
+    \\tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
     \\auto tA0 = A.template slice<128, 64>(0, m0);
     \\auto cT = op.template get_destination_cooperative_tensor<
     \\    metal::remove_addrspace_t<decltype(tA0)>,
@@ -79,14 +77,16 @@ pub const SOURCE =
     \\const device uint32_t* wrow = w + (size_t)min(n0 + sc, N - 1) * (K / 16) + sh * 4;
     \\auto stage = [&](int g, int buf) {
     \\  const uint4 v = *((const device uint4*)(wrow + g * 8));
-    \\  threadgroup uint32_t* dst = bs[buf] + sc * 16 + sh * 8;
+    \\  // One 2-bit code per byte: byte b of a word holds codes 4b..4b+3.
+    \\  threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
     \\#pragma clang loop unroll(full)
     \\  for (int j = 0; j < 4; j++) {
     \\    const uint32_t wv = v[j];
-    \\    uint32_t lo = wv & 0xFFFFu, hi = wv >> 16;
-    \\    lo = (lo | (lo << 8)) & 0x00FF00FFu; lo = (lo | (lo << 4)) & 0x0F0F0F0Fu; lo = (lo | (lo << 2)) & 0x33333333u;
-    \\    hi = (hi | (hi << 8)) & 0x00FF00FFu; hi = (hi | (hi << 4)) & 0x0F0F0F0Fu; hi = (hi | (hi << 2)) & 0x33333333u;
-    \\    dst[2 * j] = lo; dst[2 * j + 1] = hi;
+    \\#pragma clang loop unroll(full)
+    \\    for (int b = 0; b < 4; b++) {
+    \\      const uint32_t t = (wv >> (8 * b)) & 0xFFu;
+    \\      dst[4 * j + b] = (t | (t << 6) | (t << 12) | (t << 18)) & 0x03030303u;
+    \\    }
     \\  }
     \\};
     \\stage(0, 0);
@@ -97,7 +97,7 @@ pub const SOURCE =
     \\  if (g + 1 < Kg) stage(g + 1, cur ^ 1);
     \\  auto tA = A.template slice<128, 64>(g * 128, m0);
     \\  if (cur == 0) op.run(tA, B0, cT); else op.run(tA, B1, cT);
-    \\  float sv[2][4], bv[2][4], cs[2][4], av[4], rv[4];
+    \\  float sv[2][4], bv[2][4], av[4], rv[4];
     \\#pragma clang loop unroll(full)
     \\  for (int nh = 0; nh < 2; nh++) {
     \\#pragma clang loop unroll(full)
@@ -105,7 +105,6 @@ pub const SOURCE =
     \\      const int nn = min(nb + c + 32 * nh, N - 1);
     \\      sv[nh][c] = float(scales[(size_t)g * N + nn]);
     \\      bv[nh][c] = float(biases[(size_t)g * N + nn]);
-    \\      cs[nh][c] = colsum[(size_t)g * N + nn];
     \\    }
     \\  }
     \\#pragma clang loop unroll(full)
@@ -118,7 +117,7 @@ pub const SOURCE =
     \\    const int c = i & 3;
     \\    const int nh = (i >> 3) & 1;
     \\    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-    \\    const float t = fma(sv[nh][c], float(cT[i]) - 128.0f * cs[nh][c], bv[nh][c] * rv[mh]);
+    \\    const float t = fma(sv[nh][c], float(cT[i]), bv[nh][c] * rv[mh]);
     \\    acc[i] = fma(av[mh], t, acc[i]);
     \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -150,15 +149,14 @@ pub const QUANT_SOURCE =
     \\const float sc = max(a / 127.0f, 1.0e-20f);
     \\float rs = 0.0f;
     \\for (int i = 0; i < 4; ++i) {
-    \\  float q = rint(v[i] / sc) + 128.0f;
-    \\  q = clamp(q, 0.0f, 255.0f);
+    \\  const float q = clamp(rint(v[i] / sc), -127.0f, 127.0f);
     \\  rs += q;
-    \\  xq[(size_t)row * K + g * 128 + lane * 4 + i] = (uint8_t)q;
+    \\  xq[(size_t)row * K + g * 128 + lane * 4 + i] = (int8_t)q;
     \\}
     \\rs = simd_sum(rs);
     \\if (lane == 0) {
     \\  ascale[(size_t)row * Kg + g] = sc;
-    \\  rsum[(size_t)row * Kg + g] = rs - 128.0f * 128.0f;
+    \\  rsum[(size_t)row * Kg + g] = rs;
     \\}
 ;
 
@@ -185,7 +183,7 @@ fn quantConfig(key: QKey) !mlx.mlx_fast_metal_kernel_config {
     const kg = @divExact(key.k, GS);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, key.k }, 2, .uint8));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, key.k }, 2, .int8));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, kg }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.m, kg }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * kg, key.m, 1));
@@ -201,7 +199,7 @@ fn f32Scalar(v: f32) mlx.mlx_array {
     return mlx.mlx_array_new_float(v);
 }
 
-/// `xq = round(x / as) + 128` per 128-group, with `as = amax/127`, plus the
+/// `xq = round(x / as)` per 128-group, with `as = amax/127`, plus the
 /// per-group code sum the bias term needs. A group that is entirely zero would
 /// divide by zero, so the scale is floored at a tiny positive value.
 pub const Quantized = struct {
@@ -235,101 +233,10 @@ pub fn quantizeRows(x2: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Q
     return .{ .xq = xq, .ascale = ascale, .rsum = rsum };
 }
 
-pub fn quantizeRowsComposed(x2: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
-    const kg = @divExact(k, GS);
-    var x32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x32);
-    try mlx.check(mlx.mlx_astype(&x32, x2, .float32, s));
-    var grouped = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(grouped);
-    try mlx.check(mlx.mlx_reshape(&grouped, x32, &[_]c_int{ m, kg, GS }, 3, s));
-
-    var absx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(absx);
-    try mlx.check(mlx.mlx_abs(&absx, grouped, s));
-    var amax = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(amax);
-    try mlx.check(mlx.mlx_max_axis(&amax, absx, 2, true, s));
-    const c127 = f32Scalar(127.0);
-    defer _ = mlx.mlx_array_free(c127);
-    var asc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(asc);
-    try mlx.check(mlx.mlx_divide(&asc, amax, c127, s));
-    const tiny = f32Scalar(1.0e-20);
-    defer _ = mlx.mlx_array_free(tiny);
-    var asc_safe = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(asc_safe);
-    try mlx.check(mlx.mlx_maximum(&asc_safe, asc, tiny, s));
-
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_divide(&scaled, grouped, asc_safe, s));
-    var rounded = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rounded);
-    try mlx.check(mlx.mlx_round(&rounded, scaled, 0, s));
-    const c128 = f32Scalar(128.0);
-    defer _ = mlx.mlx_array_free(c128);
-    var shifted = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(shifted);
-    try mlx.check(mlx.mlx_add(&shifted, rounded, c128, s));
-    const lo = f32Scalar(0.0);
-    defer _ = mlx.mlx_array_free(lo);
-    const hi = f32Scalar(255.0);
-    defer _ = mlx.mlx_array_free(hi);
-    var clipped = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(clipped);
-    try mlx.check(mlx.mlx_clip(&clipped, shifted, lo, hi, s));
-
-    var rs_g = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rs_g);
-    try mlx.check(mlx.mlx_sum_axis(&rs_g, clipped, 2, false, s));
-    const shiftsum = f32Scalar(128.0 * @as(f32, @floatFromInt(GS)));
-    defer _ = mlx.mlx_array_free(shiftsum);
-    var rsum = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(rsum);
-    try mlx.check(mlx.mlx_subtract(&rsum, rs_g, shiftsum, s));
-
-    var xq_g = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xq_g);
-    try mlx.check(mlx.mlx_astype(&xq_g, clipped, .uint8, s));
-    var xq = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(xq);
-    try mlx.check(mlx.mlx_reshape(&xq, xq_g, &[_]c_int{ m, k }, 2, s));
-    var ascale = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(ascale);
-    try mlx.check(mlx.mlx_reshape(&ascale, asc_safe, &[_]c_int{ m, kg }, 2, s));
-    return .{ .xq = xq, .ascale = ascale, .rsum = rsum };
-}
-
-/// `colsum[n,g] = SUM_{k in g} c[n,k]`, the per-weight derived constant the
-/// shift correction needs. Dequantizing with scale 1 and bias 0 yields the raw
-/// codes, so this costs one pass over the weight ONCE per weight, not per call.
-pub fn colSums(w: mlx.mlx_array, bits: u32, group_size: u32, n: c_int, k: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const kg = @divExact(k, GS);
-    var ones = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ones);
-    var zeros = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(zeros);
-    const sshape = [_]c_int{ n, @divExact(k, @as(c_int, @intCast(group_size))) };
-    try mlx.check(mlx.mlx_ones(&ones, &sshape, 2, .float32, s));
-    try mlx.check(mlx.mlx_zeros(&zeros, &sshape, 2, .float32, s));
-    var codes = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(codes);
-    try mlx.check(mlx.mlx_dequantize(&codes, w, ones, zeros, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
-    var grouped = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(grouped);
-    try mlx.check(mlx.mlx_reshape(&grouped, codes, &[_]c_int{ n, kg, GS }, 3, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_sum_axis(&out, grouped, 2, false, s));
-    return out;
-}
-
-/// `colsum` is a derived constant OF THE WEIGHT, so it is computed once and
-/// kept. Recomputing it per call dequantizes the whole pack every time, which
-/// MEASURED at ~0.9 ms/call and alone turned a 1.42x kernel into 0.71x.
-const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array, csT: mlx.mlx_array };
-var colsum_cache: std.AutoHashMapUnmanaged(usize, Derived) = .{};
+/// The kernel reads scales and biases group-major; the transposed copies are
+/// derived constants of the weight, made once and kept.
+const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array };
+var derived_cache: std.AutoHashMapUnmanaged(usize, Derived) = .{};
 
 fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var t = mlx.mlx_array_new();
@@ -343,17 +250,11 @@ fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return c;
 }
 
-fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, n: c_int, k: c_int, s: mlx.mlx_stream) !Derived {
+fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !Derived {
     const key = @intFromPtr(w.ctx);
-    if (colsum_cache.get(key)) |c| return c;
-    const cs = try colSums(w, bits, group_size, n, k, s);
-    defer _ = mlx.mlx_array_free(cs);
-    const d = Derived{
-        .scT = try transposed(sc, s),
-        .biT = try transposed(bi, s),
-        .csT = try transposed(cs, s),
-    };
-    try colsum_cache.put(std.heap.c_allocator, key, d);
+    if (derived_cache.get(key)) |c| return c;
+    const d = Derived{ .scT = try transposed(sc, s), .biT = try transposed(bi, s) };
+    try derived_cache.put(std.heap.c_allocator, key, d);
     return d;
 }
 
@@ -364,7 +265,7 @@ var engaged_logged = false;
 
 fn kernel() !mlx.mlx_fast_metal_kernel {
     if (kernel_cache) |k| return k;
-    const in_names = [_][*:0]const u8{ "xq", "w", "scales", "biases", "colsum", "ascale", "rsum" };
+    const in_names = [_][*:0]const u8{ "xq", "w", "scales", "biases", "ascale", "rsum" };
     const out_names = [_][*:0]const u8{"y"};
     const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
     defer _ = mlx.mlx_vector_string_free(iv);
@@ -390,7 +291,7 @@ fn configFor(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     return cfg;
 }
 
-/// `x @ w.T` with the activation quantized to uint8 per 128-group, or null when
+/// `x @ w.T` with the activation quantized to int8 per 128-group, or null when
 /// the shape/dtype is outside the route (caller keeps whatever it would do).
 /// LOSSY BY CONSTRUCTION — see the module comment.
 pub fn qmm(
@@ -433,13 +334,13 @@ pub fn qmm(
     }
     var q = try quantizeRows(xp, mpad, k, s);
     defer q.deinit();
-    const d = try derivedCached(w, sc, bi, bits, group_size, n, k, s);
+    const d = try derivedCached(w, sc, bi, s);
 
     if (!engaged_logged) {
         engaged_logged = true;
-        log.info("[int8-prefill] engaged (LOSSY: activations quantized to uint8): first call M={d} N={d} K={d}\n", .{ m, n, k });
+        log.info("[int8-prefill] engaged (LOSSY: activations quantized to int8): first call M={d} N={d} K={d}\n", .{ m, n, k });
     }
-    const inputs = [_]mlx.mlx_array{ q.xq, w, d.scT, d.biT, d.csT, q.ascale, q.rsum };
+    const inputs = [_]mlx.mlx_array{ q.xq, w, d.scT, d.biT, q.ascale, q.rsum };
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var outs = mlx.mlx_vector_array_new();
