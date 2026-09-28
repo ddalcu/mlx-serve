@@ -270,7 +270,7 @@ Opt-in, performance-safe. Design contract: **zero cost when off** (a single `?*M
 ### Server (Zig)
 - **Detection**: when `tools` present, server buffers tokens, checks `<tool_call>`, Hermes XML, Gemma 4 `<|tool_call>`, raw JSON. Gemma 4 double-brace args (`{{...}}`) unwrapped before parse. Thinking tokens buffered separately if enabled.
 - **Serialization** (`chat.serializeMessagesJson`): `role: "tool"` passed natively (Gemma 4 templates render `<|turn>tool` directly). Tool call `arguments` serialized as JSON strings, not objects.
-- **Streaming**: full args sent in one SSE delta (avoids client accumulation bugs). Thinking buffered until close tag, emitted as `reasoning_content`.
+- **Streaming**: with `--tool-call-stream early` (opt-in) call 0's id + name go out as soon as `chat.toolCallHeader` reads them (a `<tool_call>` XML or JSON opener, outside a thought; never through the Ollama sink), and every call's full args in one delta at the end; clients join `tool_calls` by `index`, as OpenAI's wire requires. `/v1/messages` starts that `tool_use` block early the same way. `end`, the default, sends whole calls only. Thinking buffered until close tag, emitted as `reasoning_content`.
 - **Fallback** (`chat.fallbackFormatChat`): ChatML, Llama (`ipython` role), Gemma (`Tool result:` in user turn).
 - **KV cache**: `reuseKVCache()` token-by-token prefix compare; auto-invalidated after tool calls and pad-only gens. Sliding-window layers keep full buffer; views slice to last `sw` during decode.
 

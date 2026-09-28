@@ -90,5 +90,6 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-warmup-eager` | 关闭 | 跳过启动时的立即预热（用于基准测试 / 最小占用部署） |
 | `--skip-mem-preflight` | 关闭 | 加载时跳过空闲内存预检（上面的上限先检查，并且仍然适用） |
 | `--no-tool-autocorrect` | 关闭 | 关闭对模型输出的工具参数所做的 schema 驱动修复 |
+| `--tool-call-stream {early,end}` | `end` | `end` 在生成结束后一次性发送完整的流式工具调用；`early` 在模型写出函数名后立即发送其 id 和名称，生成结束时再发送参数（Qwen/Hermes 的 `<tool_call>` 格式） |
 | `--log-level` | `info` | 日志级别（error、warn、info、debug） |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | 服务器日志的落盘位置 |

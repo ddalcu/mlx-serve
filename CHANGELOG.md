@@ -34,6 +34,7 @@
 - The tray's memory meter splits weights, KV cache and the rest, and the KV figure counts live requests too.
 - The Image pane is laid out like the other Create panes and keeps its draft across panes and relaunches; app text never drops below 12pt (#587, #572).
 - Models from `mlx-serve pull` register under their org/name id, and Ollama's `/api/show` reports thinking and vision on models that aren't loaded yet (#578, #579).
+- `--tool-call-stream early` (opt-in) makes a streamed tool call name itself as soon as the model has written the tool name, with the arguments following at the end, so clients see the call start and time the stream correctly. The default, `end`, keeps whole calls at the end.
 
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 
