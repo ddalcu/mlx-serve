@@ -5329,3 +5329,15 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   `rowqmv`. The test prints and drops its own latch.
 - Guard: `simd_qmm: mma over half the simdgroups per threadgroup gives the same bits`;
   `simd_qmm: a shape whose probe fails on this GPU declines by name and leaves no latch`.
+
+## Agents looped once prompt lookup ran under typical acceptance (2026-09-28)
+
+- Defect: from v26.9.6, Flash Next agent sessions under `--mtp-typical` cut by the loop guard
+  (`[loop-stop] ... tier=long_cycle`) far more often: 11 of 19 voxel-task runs against 0 of 4 on
+  v26.9.5. Sampled replies repeated their own context until the guard cut them.
+- Cause: a lookup draft is a point mass copied from the context, and `typicalPrefix` keeps any
+  draft whose probability clears `0.2 * e^-H` with no draw. At H = 2 a copy the model gives 3%
+  becomes certain, and once the output echoes itself lookup keeps proposing the echo.
+- Fix: lookup rounds verify with exact acceptance whatever the installed mode
+  (`acceptGraphFor` / `acceptPrefixFor`), keeping a copy with probability p. MTP drafts keep typical.
+- Guard: `a prompt-lookup draft is kept only as often as sampling would keep it under typical acceptance`.

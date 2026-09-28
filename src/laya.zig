@@ -273,16 +273,7 @@ fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value,
         .bool => |b| try out.appendSlice(a, if (b) "true" else "false"),
         .integer => |i| try out.print(a, "{d}", .{i}),
         .float => |f| try pyFloat(a, out, f),
-        .number_string => |s| {
-            if (std.mem.eql(u8, s, "-0")) {
-                try out.append(a, '0');
-            } else if (std.json.isNumberFormattedLikeAnInteger(s)) {
-                // JSON integers have no leading zeros: the text is Python's `int` repr.
-                try out.appendSlice(a, s);
-            } else {
-                try pyFloat(a, out, std.fmt.parseFloat(f64, s) catch return error.NonFiniteNumber);
-            }
-        },
+        .number_string => |s| try pyNumber(a, out, s),
         .string => |s| try pyJsonString(a, out, s, ascii),
         .array => |arr| {
             try out.append(a, '[');
@@ -307,10 +298,22 @@ fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value,
     }
 }
 
+/// A JSON number's text as Python writes the value `json.loads` makes of it (`-0` -> `0`, `1e5` -> `100000.0`).
+pub fn pyNumber(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    if (std.mem.eql(u8, s, "-0")) {
+        try out.append(a, '0');
+    } else if (std.json.isNumberFormattedLikeAnInteger(s)) {
+        // JSON integers have no leading zeros: the text is Python's `int` repr.
+        try out.appendSlice(a, s);
+    } else {
+        try pyFloat(a, out, std.fmt.parseFloat(f64, s) catch return error.NonFiniteNumber);
+    }
+}
+
 /// Python `float.__repr__`: shortest round-trip digits; exponent form (`1e-05`,
 /// `1.5e+300`) when the decimal point position is <= -4 or > 16, else fixed
 /// notation with at least one fraction digit (`1.0`, `-0.0`).
-fn pyFloat(a: std.mem.Allocator, out: *std.ArrayList(u8), f: f64) !void {
+pub fn pyFloat(a: std.mem.Allocator, out: *std.ArrayList(u8), f: f64) !void {
     if (!std.math.isFinite(f)) return error.NonFiniteNumber;
     var buf: [std.fmt.float.min_buffer_size]u8 = undefined;
     var sci = std.fmt.float.render(&buf, f, .{ .mode = .scientific }) catch unreachable; // "[-]D[.DDD]e[-]X"
@@ -392,7 +395,7 @@ fn pyJsonString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, as
 
 /// A string in the response body: raw UTF-8, except a string holding a lone surrogate (a
 /// question id sent as `"\ud800"`), which goes out `\u`-escaped as Python's `json.dumps` writes it.
-fn wireString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+pub fn wireString(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
     return pyJsonString(a, out, s, !std.unicode.utf8ValidateSlice(s));
 }
 
@@ -874,11 +877,11 @@ pub fn buildSequence(a: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, 
 
 // ── MLX primitives ──
 
-fn free(x: A) void {
+pub fn free(x: A) void {
     _ = mlx.mlx_array_free(x);
 }
 
-fn matmul(x: A, w_t: A, s: S) !A {
+pub fn matmul(x: A, w_t: A, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_matmul(&out, x, w_t, s));
     return out;
@@ -891,7 +894,7 @@ fn add(x: A, y: A, s: S) !A {
 }
 
 /// `x @ w^T + b` with `w_t` already stored as `[in, out]`.
-fn linear(x: A, w_t: A, b: ?A, s: S) !A {
+pub fn linear(x: A, w_t: A, b: ?A, s: S) !A {
     const y = try matmul(x, w_t, s);
     if (b) |bias| {
         defer free(y);
@@ -958,13 +961,13 @@ fn relu(x: A, s: S) !A {
     return out;
 }
 
-fn reshape(x: A, shape: []const c_int, s: S) !A {
+pub fn reshape(x: A, shape: []const c_int, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, x, shape.ptr, shape.len, s));
     return out;
 }
 
-fn transposeAxes(x: A, axes: []const c_int, s: S) !A {
+pub fn transposeAxes(x: A, axes: []const c_int, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_transpose_axes(&out, x, axes.ptr, axes.len, s));
     return out;
@@ -1014,13 +1017,13 @@ fn sdpa(q: A, k: A, v: A, scale: f32, mask: A, s: S) !A {
     return out;
 }
 
-fn take(x: A, idx: A, axis: c_int, s: S) !A {
+pub fn take(x: A, idx: A, axis: c_int, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_take_axis(&out, x, idx, axis, s));
     return out;
 }
 
-fn astype(x: A, dt: mlx.mlx_dtype, s: S) !A {
+pub fn astype(x: A, dt: mlx.mlx_dtype, s: S) !A {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, x, dt, s));
     return out;
@@ -2081,13 +2084,6 @@ pub const BatchPlan = struct {
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     model: Model,
-    /// Per-request bounds, checked before any forward: one request runs to
-    /// completion on the inference thread, so these bound how long it holds it.
-    max_questions: usize = DEFAULT_MAX_QUESTIONS,
-    max_input_tokens: usize = DEFAULT_MAX_INPUT_TOKENS,
-
-    pub const DEFAULT_MAX_QUESTIONS: usize = 64;
-    pub const DEFAULT_MAX_INPUT_TOKENS: usize = 32 * 1024;
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
@@ -2095,27 +2091,13 @@ pub const Engine = struct {
         self.* = .{
             .allocator = allocator,
             .model = try Model.load(io, allocator, model_dir, s, Model.embedInt8Enabled()),
-            .max_questions = envLimit("MLX_SERVE_LAYA_MAX_QUESTIONS", DEFAULT_MAX_QUESTIONS),
-            .max_input_tokens = envLimit("MLX_SERVE_LAYA_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS),
         };
         return self;
     }
 
-    fn envLimit(name: [*:0]const u8, default: usize) usize {
-        const raw = std.c.getenv(name) orelse return default;
-        const v = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
-        if (v == 0) {
-            log.warn("[laya] ignoring {s}={s} (want a positive integer)\n", .{ name, raw });
-            return default;
-        }
-        return v;
-    }
-
-    /// 400 text for a limit error, naming the limit in force; null for other errors.
+    /// 400 text for this checkpoint's option limit; null for other errors.
     pub fn limitMessage(self: *const Engine, buf: []u8, err: anyerror) ?[]const u8 {
         return switch (err) {
-            error.TooManyQuestions => std.fmt.bufPrint(buf, "too many questions in one request (limit {d}, MLX_SERVE_LAYA_MAX_QUESTIONS)", .{self.max_questions}) catch null,
-            error.TooManyInputTokens => std.fmt.bufPrint(buf, "the questions total more than {d} input tokens (MLX_SERVE_LAYA_MAX_INPUT_TOKENS); split them over several requests", .{self.max_input_tokens}) catch null,
             error.TooManyOptions => std.fmt.bufPrint(buf, "a question has more options than fit in the {d}-token input (never more than {d})", .{ self.model.cfg.max_len, maxOptions(&self.model.cfg) }) catch null,
             else => null,
         };
@@ -2126,23 +2108,23 @@ pub const Engine = struct {
         self.allocator.destroy(self);
     }
 
-    /// `questions` validated against this engine's limits (`limitMessage`).
-    pub fn parseQuestions(self: *const Engine, a: std.mem.Allocator, questions: std.json.Value) !Questions {
-        return Questions.init(a, questions, self.max_questions, maxOptions(&self.model.cfg));
+    /// `questions` validated against the request limits and this checkpoint's option limit.
+    pub fn parseQuestions(self: *const Engine, a: std.mem.Allocator, questions: std.json.Value, max_questions: usize) !Questions {
+        return Questions.init(a, questions, max_questions, maxOptions(&self.model.cfg));
     }
 
     /// `parseQuestions` + `predict`.
-    pub fn predictJson(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: std.json.Value) ![]u8 {
-        var q = try self.parseQuestions(a, questions);
+    pub fn predictJson(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: std.json.Value, max_questions: usize, max_input_tokens: usize) ![]u8 {
+        var q = try self.parseQuestions(a, questions, max_questions);
         defer q.deinit(a);
-        return self.predict(a, model_id, state, &q);
+        return self.predict(a, model_id, state, &q, max_input_tokens);
     }
 
     /// Run the reference `predict` for one state and validated questions;
     /// returns the response JSON (caller frees). Validation errors are the
     /// named `error.*` values in `errorMessage` and `limitMessage`.
-    pub fn predict(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: *const Questions) ![]u8 {
-        var jobs = [_]Job{.{ .a = a, .model_id = model_id, .state = state, .questions = questions }};
+    pub fn predict(self: *Engine, a: std.mem.Allocator, model_id: []const u8, state: std.json.Value, questions: *const Questions, max_input_tokens: usize) ![]u8 {
+        var jobs = [_]Job{.{ .a = a, .model_id = model_id, .state = state, .questions = questions, .max_input_tokens = max_input_tokens }};
         self.predictMany(&jobs);
         return jobs[0].result;
     }
@@ -2154,6 +2136,7 @@ pub const Engine = struct {
         model_id: []const u8,
         state: std.json.Value,
         questions: *const Questions,
+        max_input_tokens: usize,
         result: anyerror![]u8 = error.NotRun,
     };
 
@@ -2224,7 +2207,7 @@ pub const Engine = struct {
             if (sq.markers.len != q.optionCount()) return error.TooManyOptions;
             w.input_tokens += sq.ids.len;
         }
-        if (w.input_tokens > self.max_input_tokens) return error.TooManyInputTokens;
+        if (w.input_tokens > job.max_input_tokens) return error.TooManyInputTokens;
         w.seqs = seqs;
         return w;
     }
@@ -2398,6 +2381,8 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
 // ── Tests ──
 
 const testing = std.testing;
+/// Tests that are not about the request limits run without them.
+const no_limit = std.math.maxInt(usize);
 
 fn testIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -2820,7 +2805,7 @@ test "laya: predict reproduces laya_mlx answers for the en/fr/hi states (toleran
     var states = root.get("states").?.object.iterator();
     var max_diff: f64 = 0;
     while (states.next()) |st| {
-        const json = try engine.predictJson(a, "laya-test", st.value_ptr.*, questions);
+        const json = try engine.predictJson(a, "laya-test", st.value_ptr.*, questions, no_limit, no_limit);
         defer a.free(json);
         var got = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer got.deinit();
@@ -2881,12 +2866,12 @@ test "laya: int8 embedding table keeps every top choice and moves probabilities 
         for (fp16) |o| a.free(o);
         a.free(fp16);
     }
-    for (states, fp16) |st, *o| o.* = try engine.predictJson(a, "m", st, questions);
+    for (states, fp16) |st, *o| o.* = try engine.predictJson(a, "m", st, questions, no_limit, no_limit);
     var int8 = Engine{ .allocator = a, .model = try Model.load(testIo(), a, dir, s, true) };
     defer int8.model.deinit();
     var worst: f64 = 0;
     for (states, fp16) |st, want| {
-        const got = try int8.predictJson(a, "m", st, questions);
+        const got = try int8.predictJson(a, "m", st, questions, no_limit, no_limit);
         defer a.free(got);
         var pw = try std.json.parseFromSlice(std.json.Value, a, want, .{});
         defer pw.deinit();
@@ -2950,16 +2935,16 @@ test "laya: requests answered in one pass match their serial answers; errors sta
     defer req.deinit();
     const items = req.value.array.items;
     var qs: [3]Questions = undefined;
-    for (items, &qs) |it, *q| q.* = try engine.parseQuestions(a, it.object.get("questions").?);
+    for (items, &qs) |it, *q| q.* = try engine.parseQuestions(a, it.object.get("questions").?, no_limit);
     defer for (&qs) |*q| q.deinit(a);
     var jobs: [3]Engine.Job = undefined;
-    for (items, &qs, &jobs) |it, *q, *j| j.* = .{ .a = a, .model_id = "m", .state = it.object.get("state").?, .questions = q };
+    for (items, &qs, &jobs) |it, *q, *j| j.* = .{ .a = a, .model_id = "m", .state = it.object.get("state").?, .questions = q, .max_input_tokens = no_limit };
     engine.predictMany(&jobs);
     defer for (jobs) |j| if (j.result) |out| a.free(out) else |_| {};
     try testing.expectError(error.TooManyOptions, jobs[1].result);
     for (items, &qs, jobs, 0..) |it, *q, j, i| {
         if (i == 1) continue;
-        const serial = try engine.predict(a, "m", it.object.get("state").?, q);
+        const serial = try engine.predict(a, "m", it.object.get("state").?, q, no_limit);
         defer a.free(serial);
         var ps = try std.json.parseFromSlice(std.json.Value, a, serial, .{});
         defer ps.deinit();
@@ -3080,15 +3065,9 @@ test "laya: question and input-token limits reject a request before any forward"
     , .{});
     defer qs.deinit();
     const state = std.json.Value{ .string = "some state" };
-    engine.max_questions = 2;
-    try testing.expectError(error.TooManyQuestions, engine.predictJson(a, "m", state, qs.value));
-    engine.max_questions = 3;
-    engine.max_input_tokens = 10;
-    try testing.expectError(error.TooManyInputTokens, engine.predictJson(a, "m", state, qs.value));
-    var buf: [160]u8 = undefined;
-    try testing.expect(std.mem.indexOf(u8, engine.limitMessage(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
-    engine.max_input_tokens = Engine.DEFAULT_MAX_INPUT_TOKENS;
-    a.free(try engine.predictJson(a, "m", state, qs.value));
+    try testing.expectError(error.TooManyQuestions, engine.predictJson(a, "m", state, qs.value, 2, no_limit));
+    try testing.expectError(error.TooManyInputTokens, engine.predictJson(a, "m", state, qs.value, 3, 10));
+    a.free(try engine.predictJson(a, "m", state, qs.value, 3, no_limit));
 }
 
 test "laya: request serialization matches Python json.dumps text and token ids" {
@@ -3161,7 +3140,7 @@ test "laya: predict answers {} for no question and refuses lone surrogates the t
     // No question: Python never serializes the state, so even an unrenderable one answers.
     var empty = try parseRequestJson(a, "{\"state\": {\"x\": 1e999}, \"questions\": {}}");
     defer empty.deinit();
-    const ej = try engine.predictJson(a, "m", empty.value.object.get("state").?, empty.value.object.get("questions").?);
+    const ej = try engine.predictJson(a, "m", empty.value.object.get("state").?, empty.value.object.get("questions").?, no_limit, no_limit);
     defer a.free(ej);
     try testing.expectEqualStrings("{\"model\":\"m\",\"answers\":{},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}", ej);
 
@@ -3172,11 +3151,11 @@ test "laya: predict answers {} for no question and refuses lone surrogates the t
     );
     defer req.deinit();
     const o = req.value.object;
-    const json = try engine.predictJson(a, "m", .{ .string = "x" }, o.get("ok").?);
+    const json = try engine.predictJson(a, "m", .{ .string = "x" }, o.get("ok").?, no_limit, no_limit);
     defer a.free(json);
     try testing.expect(std.mem.startsWith(u8, json, "{\"model\":\"m\",\"answers\":{\"\\ud800\":{\"type\":\"noul\""));
-    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", .{ .string = "x" }, o.get("bad_ins").?));
-    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", o.get("bad_state").?, o.get("ok").?));
+    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", .{ .string = "x" }, o.get("bad_ins").?, no_limit, no_limit));
+    try testing.expectError(error.LoneSurrogate, engine.predictJson(a, "m", o.get("bad_state").?, o.get("ok").?, no_limit, no_limit));
 }
 
 test "laya: a compiled-path failure reruns the batch on the lazy graph and is never retried" {

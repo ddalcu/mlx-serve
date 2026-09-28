@@ -1981,7 +1981,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya)\n", .{});
+    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -7130,7 +7130,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
-        .weight = @max(1, d.questions.qs.len),
+        .weight = @max(1, d.count()),
         .window_us = lm.decision_engine.?.batch_window_us,
     };
     scheduler.runGeneration(&req) catch |err| switch (err) {

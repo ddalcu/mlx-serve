@@ -81,7 +81,7 @@ brew bundle install --file=Brewfile   # cmake + webp
 | 带自动下载 + REPL 的 `run <model>` CLI | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | 🟡 部分² | ❌ | ❌ |
 | DeepSeek V4 Flash（284B） | ✅ 经 ds4 | ❌ | ❌ | ❌ |
-| 类型化决策（Laya，`POST /v1/decisions`） | ✅ | ❌ | ❌ | ❌ |
+| 类型化决策（Laya、Kev，`POST /v1/decisions`） | ✅ | ❌ | ❌ | ❌ |
 | 投机解码（PLD + 草稿模型 + 原生 MTP） | ✅ | ❌ | 部分 | 仅草稿模型 |
 | 解码速度（相对 LM Studio 的几何均值，相同权重） | **+26%**（MLX，默认设置） | 基线 | 约 −15%（GGUF，估算¹） | +11%（MLX） |
 | KV cache 量化（4/8-bit） | ✅ | ❌ | 部分 | ✅ |

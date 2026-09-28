@@ -222,6 +222,7 @@
 "Another provider already uses this name" = "另一个提供商已使用此名称";
 "Answer as agent" = "以 Agent 身份回答";
 "Answer in as few words as the question needs — usually one to three sentences. Lead with the answer, skip preamble and sign-offs, and add detail only when asked." = "用回答问题所需的最少字数作答 —— 通常一到三句话。先给出答案，省略开场白和客套结尾，只在被要求时才补充细节。";
+"Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`. Kev has no `action` field." = "答案里包含被选中的值和各选项的 `probabilities`；choice 和 score 还带 `confidence`。Kev 没有 `action` 字段。";
 "Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right)." = "答案里包含被选中的值、各选项的 `probabilities`、一个 `confidence`，以及 `action.act_probability`（模型对「按此答案行动是正确的」有多大把握）。";
 "Anything you want on the row: your name, a nickname, what else was running." = "想写在这一行的任何内容：你的名字、昵称、当时还在运行什么。";
 "App" = "应用";
@@ -477,6 +478,7 @@
 "Dark" = "深色";
 "Date" = "日期";
 "Debug (verbose)" = "调试（详细）";
+"Decisions" = "决策";
 "Decode" = "解码";
 "Decode attn quant" = "解码注意力量化";
 "Decode speed" = "解码速度";
@@ -836,6 +838,8 @@
 "Keep a subject (image reference)" = "保留主体（图片参考）";
 "Keep model loaded after generating" = "生成后保持模型常驻";
 "Keep writing from where this left off" = "从中断处继续写";
+"Kev Decisions" = "Kev 决策";
+"Kev is not a chat model. It reads the state once, then scores every option of each question with a small head on a Qwen3.5 model. About 60 ms per question on an M4 Max: slower than Laya, and often more accurate on nuanced text. Suits triage, routing and labeling where getting it right matters more than speed." = "Kev 不是聊天模型。它先读一遍 state，再用 Qwen3.5 模型上的一个小头为每个问题的每个选项打分。在 M4 Max 上每个问题约 60 毫秒：比 Laya 慢，但对细微的文本通常更准确。适合准确比速度更重要的分诊、分流与标注。";
 "Key" = "调性";
 "Keys are stored in plain text in ~/.mlx-serve/providers.json. Prefer an environment variable name for a shared machine. Provider models are never shared over the LAN." = "令牌以明文形式保存在 ~/.mlx-serve/providers.json 中。共用机器建议改用环境变量名。提供商的模型不会通过局域网共享。";
 "Kill Process" = "终止进程";
@@ -1151,7 +1155,7 @@
 "Only use tools when I ask" = "仅在我要求时使用工具";
 "Open" = "打开";
 "Open %@ in %@" = "打开 %@（%@）";
-"Open %@ in Laya Decisions" = "在 Laya 决策中打开 %@";
+"Open %@ in Decisions" = "在决策中打开 %@";
 "Open @BotFather ↗" = "打开 @BotFather ↗";
 "Open GitHub ↗" = "打开 GitHub ↗";
 "Open Keyboard Settings" = "打开键盘设置";
@@ -1205,7 +1209,7 @@
 "Personal Access Token (PAT) — optional" = "个人访问令牌（PAT）—— 可选";
 "Photo" = "照片";
 "Photographic portrait" = "摄影人像";
-"Pick a Laya model in Models → Downloaded and press Use." = "在「模型 → 已下载」中选一个 Laya 模型，然后点「使用」。";
+"Pick a Laya or Kev model in Models → Downloaded and press Use." = "在「模型 → 已下载」中选一个 Laya 或 Kev 模型，然后点「使用」。";
 "Pick a task to see its runs, or create a new one." = "选择一个任务查看其运行记录，或新建一个。";
 "Pick an agent, or create one from a type." = "选择一个 Agent，或按类型创建一个。";
 "Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above." = "精确指定此 Agent 可以调用哪些工具。开启后会冻结上方的粗粒度开关。";

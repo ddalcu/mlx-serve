@@ -196,6 +196,25 @@ extension MediaBundle {
         )
     }
 
+    /// Kev typed decisions: a Qwen3.5 trunk plus the pointer head. Markers
+    /// are the head, its config, the trunk's config and weight index, and the
+    /// tokenizer; the weights index covers both one-file and sharded packs.
+    static func kev(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "kev:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["kev_config.json", "kev_head.safetensors", "config.json",
+                                   "model.safetensors.index.json", "tokenizer.json"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// LTX-Video: pull ONLY the safetensors the engine reads (allowlist) plus
     /// the small json configs — the repo also carries ~50 GB of LoRAs /
     /// upscalers / alternate transformers we never touch. Depends on the

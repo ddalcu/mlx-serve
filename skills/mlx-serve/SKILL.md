@@ -1,6 +1,6 @@
 ---
 name: mlx-serve
-description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, video and 3D generation, and Laya typed decisions. Use when code should call mlx-serve.
+description: Hook an app, game or script up to the local mlx-serve server for LLM chat, embeddings, image, speech, music, video and 3D generation, and Laya/Kev typed decisions. Use when code should call mlx-serve.
 ---
 
 # mlx-serve

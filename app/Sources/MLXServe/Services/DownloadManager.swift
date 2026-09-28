@@ -336,7 +336,7 @@ class DownloadManager: ObservableObject {
         for marker in ["config.json", "model_index.json"] {
             if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) { return true }
         }
-        if configlessModelType(inDir: dir) != nil { return true }
+        if markerModelType(inDir: dir) != nil { return true }
         // A `transformer/` holding real weights. Deliberately not "has the
         // subdir": a download that got as far as creating the folder must still
         // read as incomplete, and an in-flight transfer's `.partial` is not a
@@ -374,13 +374,15 @@ class DownloadManager: ObservableObject {
     /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
 
-    /// The model_type of a checkpoint that has no root config.json to read
-    /// it from, or nil when the dir is not one of those shapes.
-    nonisolated static func configlessModelType(inDir dir: String) -> String? {
+    /// The model_type a marker file decides, or nil. Laya has no root config.json;
+    /// a Kev pack's names its Qwen trunk, so `kev_config.json` wins. Twin of
+    /// `model_discovery.peekKevPack`.
+    nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
         if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
             return "laya"
         }
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         return nil
     }
 
@@ -1230,6 +1232,11 @@ class DownloadManager: ObservableObject {
         for marker in comp.readyMarkers {
             guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
         }
+        // A pack that names its weight index as a marker (Kev) is ready only
+        // with every shard the index declares; its head alone is a .safetensors.
+        if comp.readyMarkers.contains("model.safetensors.index.json"), missingIndexedShards(inDir: dir) != false {
+            return false
+        }
         return hasSafetensorsRecursive(dir)
     }
 
@@ -1791,8 +1798,8 @@ class DownloadManager: ObservableObject {
         }
 
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
-        let configless = configlessModelType(inDir: resolved)
-        guard FileManager.default.fileExists(atPath: configPath) || configless != nil else { return [] }
+        let marked = markerModelType(inDir: resolved)
+        guard FileManager.default.fileExists(atPath: configPath) || marked != nil else { return [] }
 
         // A defect does NOT drop the directory. Dropping it is how two junk
         // folders stayed invisible in the app while the server registered them
@@ -1801,7 +1808,7 @@ class DownloadManager: ObservableObject {
         let defect = weightDefect(inDir: resolved, entries: entries)
 
         var meta = parseConfigMetadata(atPath: configPath)
-        if let configless { meta.modelType = configless }
+        if let marked { meta.modelType = marked }
         let modelType = meta.modelType
 
         let size = directorySize(resolved)
@@ -1853,6 +1860,18 @@ class DownloadManager: ObservableObject {
     /// use the floor at all — a shard index is exact.
     nonisolated static let minimumWeightBytes: UInt64 = 1024 * 1024
 
+    /// Whether a shard named by `model.safetensors.index.json` is absent; nil
+    /// when the dir has no usable index to say.
+    nonisolated static func missingIndexedShards(inDir dir: String) -> Bool? {
+        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
+        guard let data = FileManager.default.contents(atPath: indexPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = obj["weight_map"] as? [String: String] else { return nil }
+        let declared = Set(map.values)
+        if declared.isEmpty { return nil }
+        return declared.contains { !FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }
+    }
+
     /// Classify a safetensors directory: nil when it holds a loadable
     /// checkpoint, else why it does not.
     ///
@@ -1865,19 +1884,7 @@ class DownloadManager: ObservableObject {
         }
 
         // Exact path: the index names every shard the checkpoint needs.
-        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
-        if let data = FileManager.default.contents(atPath: indexPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let map = obj["weight_map"] as? [String: String] {
-            let declared = Set(map.values)
-            if !declared.isEmpty {
-                let missing = declared.contains {
-                    !FileManager.default.fileExists(
-                        atPath: (dir as NSString).appendingPathComponent($0))
-                }
-                return missing ? .missingShards : nil
-            }
-        }
+        if let missing = missingIndexedShards(inDir: dir) { return missing ? .missingShards : nil }
 
         // Inexact path: no index, so all we can say is whether the bytes on
         // disk could possibly be a checkpoint. Media packs (FLUX.2 klein's

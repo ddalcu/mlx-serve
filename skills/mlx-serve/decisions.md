@@ -1,11 +1,21 @@
-# mlx-serve decisions (Laya): `POST /v1/decisions`
+# mlx-serve decisions (Laya, Kev): `POST /v1/decisions`
 
-A Laya model (capability `decisions`) answers typed questions about a STATE in
-milliseconds, with calibrated probabilities instead of free text. Use it for game
-logic an LLM is too slow or too unpredictable for: NPC intent, dialogue routing,
-moderation, "is the player stuck", "which quest fits this situation",
-difficulty scoring. It never generates text; pair it with a chat model when you
-also need words.
+A decision model (capability `decisions`) answers typed questions about a STATE
+with probabilities instead of free text. Use it for game logic an LLM is too
+slow or too unpredictable for: NPC intent, dialogue routing, moderation, "is
+the player stuck", "which quest fits this situation", difficulty scoring. It
+never generates text; pair it with a chat model when you also need words.
+
+Two families take the same request:
+
+- **Laya** (model type `laya`, ~0.35 GB): a few milliseconds per request.
+  Pick it when you call often and speed matters most.
+- **Kev** (model type `kev`, ~4 GB): about 60 ms per question on an M4 Max,
+  and often more accurate on nuanced text (on one 2,394-headline news-labeling
+  test: Laya 55%, Kev-4B 79%). Pick it when getting the answer right matters
+  more than speed.
+
+`GET /v1/models` shows which one a model is in `meta.architecture`; use whichever is installed.
 
 ## Request
 
@@ -36,7 +46,8 @@ also need words.
     object `{label: description}` (descriptions improve accuracy).
   - `score`: ordinal scale. `criteria` is a list from low to high; items may be
     strings or objects.
-- `instructions`: the question, in plain words. Required.
+- `instructions`: the question, in plain words. Required for Laya; Kev
+  accepts a question without it, but always send it.
 
 ## Response
 
@@ -59,12 +70,15 @@ also need words.
   its probability that the answer is safe to act on rather than escalate. Gate
   game behavior on them: act above a threshold you tune, fall back to a default
   below it.
+- Kev answers have no `action`, and its `noul` answers no `confidence`; gate
+  on the probability itself (`noul`, or the chosen label's probability).
 - The numbers are illustrative; always read them from the response.
 
 ## Usage notes
 
 - Fast enough for per-event calls (NPC turn, room enter, chat message), not per
-  frame. Debounce and cache by state hash.
+  frame. Debounce and cache by state hash. Kev answers questions one after
+  another, so its request time grows with the number of questions.
 - Same state + same questions = same answers. Change the wording of
   `instructions` or add criteria descriptions to steer it, then re-test.
 - Errors are 400s naming the problem (`question 'type' must be one of choice,

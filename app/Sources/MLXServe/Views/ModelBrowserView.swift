@@ -1214,7 +1214,7 @@ private struct UseDecisionModelButton: View {
         } label: { Text("Use")
             .font(.app(.body)) }
         .controlSize(.small)
-        .help("Open \(name) in Laya Decisions")
+        .help("Open \(name) in Decisions")
     }
 }
 
@@ -2060,7 +2060,7 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
-                } else if model.modelType == "laya" {
+                } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
                 } else if let modality = MediaModality(modelType: model.modelType) {
                     // A media checkpoint is a real, loadable, servable model —
