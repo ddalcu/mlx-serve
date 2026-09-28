@@ -492,6 +492,12 @@ and they are listed because they made that work possible.
     delta-sigma at low step counts (`minimax_h3.audioStepFactor`). The Turbo
     LoRA weights it loads (larryvrh/MiniMax-H3-Turbo-Lora, Apache-2.0) are
     downloaded at runtime and not redistributed here.
+  * Layr-Labs/mlxfast-bonsai2-27b-engine (MIT), the reference for the few-row
+    2-bit tensor path in `src/qmv_nax2.zig`: its `qmm_m16_block` fragment
+    coordinate mapping, the 256-k weight line loaded across a fragment quad and
+    exchanged with `simd_shuffle`, the dequantize-into-the-right-operand
+    arrangement, and the two-slice threadgroup reduction. Transcribed into a
+    JIT `metal_kernel` here, not shipped as their source.
   * filipstrand/mflux (MIT), the reference for stacking several LoRA adapters
     at once — summing per-adapter deltas at forward time rather than merging
     them into the base weight, the `lora_paths`/`lora_scales` request shape,
