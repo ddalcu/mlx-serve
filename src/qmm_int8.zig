@@ -338,7 +338,8 @@ pub fn qmm(
     group_size: u32,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
-    if (bits != 2 or group_size != GS or bi.ctx == null) return null;
+    if (bits != 2 or group_size != GS or bi.ctx == null or !mlx.streamIsGpu(s)) return null;
+    if (!@import("transformer.zig").naxAvailable()) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .float16 and dt != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -533,6 +534,20 @@ test "qmm_int8: sibling projections of one activation quantize it once" {
         _ = mlx.mlx_array_free(y);
     }
     try std.testing.expectEqual(before + 1, quantize_calls);
+}
+
+test "qmm_int8: a CPU-stream call declines" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ MIN_ROWS, 256 }, 2, .float16, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 128, 16 }, 2, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 128, 2 }, 2, .float16, s));
+    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(x, w, sc, sc, 2, 128, s));
 }
 
 test "qmm_int8: declines below its row floor" {

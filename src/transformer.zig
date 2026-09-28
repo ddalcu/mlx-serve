@@ -1715,6 +1715,13 @@ fn computeNaxAvailable() bool {
     return naxAvailableFrom(force, arch, ver);
 }
 
+var nax_avail_cache: ?bool = null;
+/// MLX's own NAX gate (M5-class GPU AND macOS >= 26.2), read once.
+pub fn naxAvailable() bool {
+    if (nax_avail_cache == null) nax_avail_cache = computeNaxAvailable();
+    return nax_avail_cache.?;
+}
+
 var nax_sdpa_avail_cache: ?bool = null;
 pub var nax_sdpa_override: ?bool = null; // test seam
 var nax_sdpa_env: ?bool = null;

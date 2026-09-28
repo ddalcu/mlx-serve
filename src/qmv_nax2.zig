@@ -28,44 +28,20 @@ const log = std.log.scoped(.qmv_nax2);
 pub const MIN_ROWS: c_int = 6;
 /// The widest call this route takes. The kernel tiles rows in 16-high blocks,
 /// so it is not a tile height but a measured ceiling: each block re-reads the
-/// weights, so past some width stock's own tiling wins. `MLX_SERVE_BONSAI_NAX2_MAXM`
-/// overrides it for a sweep.
+/// weights, so past some width stock's own tiling wins.
 pub const NARROW_MAX_ROWS_DEFAULT: c_int = 16;
-var max_rows_cache: ?c_int = null;
 /// Test seam: pin the ceiling so the row tiling is covered whatever ships.
 pub var max_rows_override: ?c_int = null;
 
 pub fn narrowMaxRows() c_int {
-    if (max_rows_override) |v| return v;
-    if (max_rows_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_BONSAI_NAX2_MAXM");
-    max_rows_cache = if (raw) |r|
-        std.fmt.parseInt(c_int, std.mem.span(r), 10) catch NARROW_MAX_ROWS_DEFAULT
-    else
-        NARROW_MAX_ROWS_DEFAULT;
-    return max_rows_cache.?;
-}
-/// The generation that has the tensor unit this route needs (M5).
-pub const MIN_GEN: u32 = 17;
-
-var env_enabled: ?bool = null;
-
-/// `MLX_SERVE_BONSAI_NAX2=0` puts every width back on the old routing.
-fn enabled() bool {
-    if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_BONSAI_NAX2");
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
+    return max_rows_override orelse NARROW_MAX_ROWS_DEFAULT;
 }
 
-/// Test seam: pin the generation the route reads (null = the device's).
-pub var gen_override: ?u32 = null;
+/// Test seam: pin whether the tensor unit is there (null = the device's).
+pub var nax_override: ?bool = null;
 
-fn deviceGen() u32 {
-    if (gen_override) |g| return g;
-    const xfm = @import("transformer.zig");
-    var buf: [128]u8 = undefined;
-    return xfm.naxArchGeneration(xfm.gpuArchitecture(&buf) orelse "").gen;
+fn naxHere() bool {
+    return nax_override orelse @import("transformer.zig").naxAvailable();
 }
 
 /// `#include` for the tensor-op primitives; the JIT compiles at Metal 4 on a
@@ -320,7 +296,7 @@ var engaged_logged = false;
 fn logEngagedOnce(form: Form, m: c_int, n: c_int, k: c_int) void {
     if (engaged_logged) return;
     engaged_logged = true;
-    log.info("[nax2] engaged: {s} form, first call M={d} N={d} K={d} (MLX_SERVE_BONSAI_NAX2=0 disables)\n", .{ @tagName(form), m, n, k });
+    log.info("[nax2] engaged: {s} form, first call M={d} N={d} K={d}\n", .{ @tagName(form), m, n, k });
 }
 
 fn launchNarrow(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, m: c_int, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -361,9 +337,9 @@ pub const Form = enum { decline, narrow };
 /// this route came from avoids the expansion with `uint2b_format`, and its
 /// expanding variant pays for the staging by quantizing the activation to
 /// int8 -- which is not lossless. Re-test if `uint2b_format` ever appears.
-pub fn formFor(gen: u32, bits: u32, group_size: u32, m: c_int, n: c_int, k: c_int) Form {
+pub fn formFor(nax: bool, bits: u32, group_size: u32, m: c_int, n: c_int, k: c_int) Form {
     if (bits != 2 or group_size != 128) return .decline;
-    if (gen < MIN_GEN) return .decline;
+    if (!nax) return .decline;
     if (m < MIN_ROWS) return .decline;
     if (m > narrowMaxRows()) return .decline;
     if (@rem(k, 128) != 0 or @rem(n, 32) != 0) return .decline;
@@ -381,7 +357,7 @@ pub fn qmm(
     group_size: u32,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
-    if (!enabled() or bi.ctx == null) return null;
+    if (bi.ctx == null or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .float16 and dt != .bfloat16) return null;
     if (mlx.mlx_array_dtype(sc) != dt or mlx.mlx_array_dtype(bi) != dt) return null;
@@ -395,7 +371,7 @@ pub fn qmm(
     // The kernels read the packed row as uint32 words and index scales by
     // group, so the pack has to be the plain [n, k / 16] affine layout.
     if (ws[1] * 16 != k) return null;
-    switch (formFor(deviceGen(), bits, group_size, m, n, k)) {
+    switch (formFor(naxHere(), bits, group_size, m, n, k)) {
         .decline => return null,
         .narrow => return try launchNarrow(x, w, sc, bi, m, n, s),
     }
@@ -405,17 +381,33 @@ test "qmv_nax2.formFor: routes 6..16 narrow and declines everything else" {
     const K: c_int = 5120;
     const N: c_int = 17408;
     // Below 6 rows qmv2 owns it.
-    for ([_]c_int{ 1, 4, 5 }) |m| try std.testing.expectEqual(Form.decline, formFor(17, 2, 128, m, N, K));
+    for ([_]c_int{ 1, 4, 5 }) |m| try std.testing.expectEqual(Form.decline, formFor(true, 2, 128, m, N, K));
     // 6..16 is the narrow tile; above it stock keeps prompt width.
-    for ([_]c_int{ 6, 9, 12, 16 }) |m| try std.testing.expectEqual(Form.narrow, formFor(17, 2, 128, m, N, K));
-    for ([_]c_int{ 17, 64, 512, 2048 }) |m| try std.testing.expectEqual(Form.decline, formFor(17, 2, 128, m, N, K));
-    // Not our format, and not a generation with the tensor unit.
-    try std.testing.expectEqual(Form.decline, formFor(17, 4, 128, 12, N, K));
-    try std.testing.expectEqual(Form.decline, formFor(17, 2, 64, 12, N, K));
-    try std.testing.expectEqual(Form.decline, formFor(16, 2, 128, 12, N, K));
+    for ([_]c_int{ 6, 9, 12, 16 }) |m| try std.testing.expectEqual(Form.narrow, formFor(true, 2, 128, m, N, K));
+    for ([_]c_int{ 17, 64, 512, 2048 }) |m| try std.testing.expectEqual(Form.decline, formFor(true, 2, 128, m, N, K));
+    // Not our format, and no tensor unit.
+    try std.testing.expectEqual(Form.decline, formFor(true, 4, 128, 12, N, K));
+    try std.testing.expectEqual(Form.decline, formFor(true, 2, 64, 12, N, K));
+    try std.testing.expectEqual(Form.decline, formFor(false, 2, 128, 12, N, K));
     // Shapes the kernel cannot tile.
-    try std.testing.expectEqual(Form.decline, formFor(17, 2, 128, 12, N, 5120 + 64));
-    try std.testing.expectEqual(Form.decline, formFor(17, 2, 128, 12, 17408 + 16, K));
+    try std.testing.expectEqual(Form.decline, formFor(true, 2, 128, 12, N, 5120 + 64));
+    try std.testing.expectEqual(Form.decline, formFor(true, 2, 128, 12, 17408 + 16, K));
+}
+
+test "qmv_nax2: a CPU-stream call declines" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    nax_override = true;
+    defer nax_override = null;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ 8, 256 }, 2, .float16, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 64, 16 }, 2, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 64, 2 }, 2, .float16, s));
+    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(x, w, sc, sc, 2, 128, s));
 }
 
 test "qmv_nax2: every real Bonsai projection shape routes at verify width" {
@@ -426,7 +418,7 @@ test "qmv_nax2: every real Bonsai projection shape routes at verify width" {
     };
     for (shapes) |nk| {
         for ([_]c_int{ 6, 9, 12, 16 }) |m| {
-            const f = formFor(17, 2, 128, m, nk[0], nk[1]);
+            const f = formFor(true, 2, 128, m, nk[0], nk[1]);
             try std.testing.expect(f != .decline);
         }
     }
@@ -501,8 +493,8 @@ fn parityAgainstStock(widths: []const c_int) !void {
     defer _ = mlx.mlx_array_free(w_tt);
     try mlx.check(mlx.mlx_transpose(&w_tt, w_t, s));
 
-    gen_override = 17;
-    defer gen_override = null;
+    nax_override = true;
+    defer nax_override = null;
 
     for (widths) |m| {
         const mu: usize = @intCast(m);
@@ -531,7 +523,7 @@ fn parityAgainstStock(widths: []const c_int) !void {
 
         // The route claims this width, so it must produce a result.
         const got = (try qmm(x, wq, sc, bi, 2, 128, s)) orelse {
-            std.debug.print("[qmv_nax2] declined at M={d} while formFor says {s}\n", .{ m, @tagName(formFor(17, 2, 128, m, n, k)) });
+            std.debug.print("[qmv_nax2] declined at M={d} while formFor says {s}\n", .{ m, @tagName(formFor(true, 2, 128, m, n, k)) });
             return error.RouteDeclined;
         };
         defer _ = mlx.mlx_array_free(got);
@@ -599,8 +591,8 @@ test "qmv_nax2 narrow: the half dequant is bit-identical to the f32 dequant" {
     defer _ = mlx.mlx_array_free(bic);
     try mlx.check(mlx.mlx_contiguous(&scc, sc2, false, s));
     try mlx.check(mlx.mlx_contiguous(&bic, bi2, false, s));
-    gen_override = 17;
-    defer gen_override = null;
+    nax_override = true;
+    defer nax_override = null;
     defer half_dq = true;
     for ([_]c_int{ 6, 12, 16 }) |m| {
         const mu: usize = @intCast(m);
