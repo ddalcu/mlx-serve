@@ -17908,6 +17908,9 @@ pub const Transformer = struct {
         // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {
             const signs = reg.get(w);
+            // Prompt width with int8 on: the rotation rides the quantizer, so the
+            // rotated activation is never written (the narrow routes stop at 16 rows).
+            if (self.int8_prefill) if (signs) |sg| if (try qmm_int8.qmmRotated(x, sg, reg.block, w, sc, bi, qp.bits, qp.group_size, reg.bias_is_neg_scale, self.s)) |y| return y;
             const xr = if (signs) |sg| try reg.applyIn(x, sg, self.s) else x;
             defer if (signs != null) {
                 _ = mlx.mlx_array_free(xr);
