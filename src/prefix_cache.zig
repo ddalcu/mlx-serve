@@ -166,6 +166,9 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// Did a disk restore hand the slot rows it owns outright? The restore copies its chunks
+    /// into slot-held arrays, so those rows are the slot's own without a RAM entry moving.
+    slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
 };
@@ -1192,6 +1195,7 @@ pub const HotPrefixCache = struct {
                     // length, `hm` by restorable checkpoint, so they routinely differ.
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
+                    .slot_owned = true,
                 };
             }
 
@@ -1224,6 +1228,7 @@ pub const HotPrefixCache = struct {
                 .full_match = full_match,
                 .dflash_base = diskRestoreSpec(d, dm.idx, dflash_target, final_len, s, .dflash),
                 .mtp_base = disk_mtp,
+                .slot_owned = true,
             };
         }
 
@@ -3287,6 +3292,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         // Full match: identical re-issue semantics — truncate to len-1 and
         // re-forward the last token, exactly like a RAM full-match hit.
         try testing.expect(res.full_match);
+        try testing.expect(res.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 599), res.matched);
         try testing.expectEqual(@as(usize, 599), cache2.step);
         try testing.expectEqual(@as(usize, 599), moe_off);
@@ -3304,6 +3310,7 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         var moe_off3: usize = 0;
         const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false, &.{}, null, null);
         try testing.expect(!res3.full_match);
+        try testing.expect(res3.slot_owned); // a disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
         // A diverged short prefix must read ONLY the chunks covering the
@@ -4280,6 +4287,7 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         var moe_off: usize = 0;
         const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false, &.{}, null, null);
         try testing.expect(!res.full_match);
+        try testing.expect(res.slot_owned); // a hybrid disk restore's rows are the slot's own
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
     }
