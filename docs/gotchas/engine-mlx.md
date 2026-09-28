@@ -28,7 +28,7 @@ A 27B 8-bit agent turn on a 64 GB Mac, 46k of 47.7k tokens warm, got `PrefillDoe
 - Same pass: a repeated ONE-token prompt fully matched its own entry and restored it whole, leaving nothing to forward; `Generator.initWithOptions` segfaulted. The lookup now declines it (cold prefill).
 - Guards: `restore by move ON DEMAND` and `a one-token prompt that hits its own entry` unit tests; live `~/claude-tmp/rel-2696-20260923/move/move_repro.py` (red 400 on the old binary, green 200 with byte-equal output vs the share on Qwen3.5-2B, gemma-4-e4b, kv8).
 
-### A disk restore was billed as a cold prompt
+### A disk restore was billed as a cold prompt (PR #621)
 The SSD tier restores into arrays the SLOT owns, but both disk-restore returns in `lookupAndRestoreWithMedia` leave `LookupResult.checked_out` false — that field means a RAM entry moved. `scheduler` took `warm_will_donate` straight from it, so `WarmPrefix.creditedRows` returned 0 and the estimator billed the WHOLE prompt instead of the new tail.
 Live (M5 Pro 48 GB, 27B Q5, 26.9.3, single stream): 78,156 of 78,475 tokens already persisted, billed 4,790 MB, refused by 1,218 MB; a 128k turn restored 121,833/123,689 and was refused by **93 MB**. Every one reported `reclaimable=0 MB` with an EMPTY hot cache, so eviction could not help — the bill was the whole problem, and the refusal had already cost the entries eviction dropped on the way in. 48 refusals in one log, at 40k-128k prompts.
 - Fix: a disk restore sets `slot_owned`; the scheduler credits `checked_out or slot_owned` and skips `checkoutRestored` for a disk restore (there is no RAM entry to take over).
