@@ -17,8 +17,8 @@
 //! Arrangement follows the Bonsai speedup engine's prompt-width kernel
 //! (Layr-Labs/mlxfast-bonsai2-27b-engine, MIT). Theirs feeds the tensor unit
 //! `uint2b_format` directly where it exists; this toolchain has no such format,
-//! so the 2-bit codes are expanded to int8 in threadgroup memory, as their
-//! staged8 form does.
+//! so the 2-bit codes are expanded to int8 straight into the tensor op's right
+//! operand in registers, as their register-staged form does.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = std.log.scoped(.qmm_int8);
@@ -42,71 +42,73 @@ pub const HEADER =
     \\
 ;
 
-/// 64x64 output tile, one 64x64x128 int8 multiply per 128-group, weights
-/// expanded 2-bit -> int8 into threadgroup memory, double-buffered.
+/// Four simdgroups, each one 32x32x128 int8 multiply per 128-group over a
+/// 32-row x 32-column tile. The right operand is built in REGISTERS from the
+/// row-major 2-bit words: lane l holds columns nl + 8c and, from every word,
+/// the plane `(w >> 2kq) & 0x03030303` (codes kq, kq+4, kq+8, kq+12). That is a
+/// fixed 4x4 transpose of K inside each 16-block, which the quantizer applies
+/// to the activation too, so the integer products are unchanged.
 pub const SOURCE =
     \\const int K = xq_shape[xq_ndim - 1];
     \\const int N = w_shape[0];
     \\const int Kg = K / 128;
-    \\const int n0 = int(threadgroup_position_in_grid.x) * 64;
-    \\const int m0 = int(threadgroup_position_in_grid.y) * 64;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const int ms = int(threadgroup_position_in_grid.y) * 32;
+    \\const int ns = int(threadgroup_position_in_grid.x) * 128 + 32 * int(sg);
     \\constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-    \\    64, 64, 128, false, true, false,
+    \\    32, 32, 128, false, true, false,
     \\    mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-    \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroups<4>> op;
+    \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
     \\tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, MPAD));
-    \\threadgroup uint32_t bs[2][64 * 128 / 4];
-    \\tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B0((threadgroup int8_t*)bs[0], dextents<int, 2>(128, 64));
-    \\tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline> B1((threadgroup int8_t*)bs[1], dextents<int, 2>(128, 64));
-    \\auto tA0 = A.template slice<128, 64>(0, m0);
+    \\auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    \\thread uint32_t* bw = (thread uint32_t*)&bT;
+    \\auto tA0 = A.template slice<128, 32>(0, ms);
     \\auto cT = op.template get_destination_cooperative_tensor<
-    \\    metal::remove_addrspace_t<decltype(tA0)>,
-    \\    metal::remove_addrspace_t<decltype(B0)>, int32_t>();
+    \\    metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
     \\constexpr int CAP = 32;
     \\const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
     \\const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-    \\const int nb = n0 + 16 * int(sg & 1) + fn;
-    \\const int mb = m0 + 16 * int(sg >> 1) + fm;
+    \\const int nb = ns + fn;
+    \\const int mb = ms + fm;
     \\float acc[CAP];
     \\#pragma clang loop unroll(full)
     \\for (int i = 0; i < CAP; i++) acc[i] = 0.0f;
-    \\const int sc = int(tid >> 1);
-    \\const int sh = int(tid & 1);
-    \\const device uint32_t* wrow = w + (size_t)min(n0 + sc, N - 1) * (K / 16) + sh * 4;
-    \\auto stage = [&](int g, int buf) {
-    \\  const uint4 v = *((const device uint4*)(wrow + g * 8));
-    \\  // One 2-bit code per byte: byte b of a word holds codes 4b..4b+3.
-    \\  threadgroup uint32_t* dst = bs[buf] + sc * 32 + sh * 16;
+    \\const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
+    \\const uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));
+    \\const device uint4* wc[4];
     \\#pragma clang loop unroll(full)
-    \\  for (int j = 0; j < 4; j++) {
-    \\    const uint32_t wv = v[j];
-    \\#pragma clang loop unroll(full)
-    \\    for (int b = 0; b < 4; b++) {
-    \\      const uint32_t t = (wv >> (8 * b)) & 0xFFu;
-    \\      dst[4 * j + b] = (t | (t << 6) | (t << 12) | (t << 18)) & 0x03030303u;
-    \\    }
-    \\  }
-    \\};
-    \\stage(0, 0);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const int mrow[4] = {mb, mb + 8, mb + 32, mb + 40};
+    \\for (int c = 0; c < 4; c++) wc[c] = (const device uint4*)(w + (size_t)min(ns + nl + 8 * c, N - 1) * (K / 16));
+    \\const int mrow[4] = {mb, mb + 8, mb + 16, mb + 24};
     \\for (int g = 0; g < Kg; g++) {
-    \\  const int cur = g & 1;
-    \\  if (g + 1 < Kg) stage(g + 1, cur ^ 1);
-    \\  auto tA = A.template slice<128, 64>(g * 128, m0);
-    \\  if (cur == 0) op.run(tA, B0, cT); else op.run(tA, B1, cT);
-    \\  float sv[2][4], bv[2][4], av[4], rv[4];
-    \\  // Ternary packs (bias == -scale): acc += s * (as * C - as * rs).
+    \\  uint4 wv[8];
     \\#pragma clang loop unroll(full)
-    \\  for (int nh = 0; nh < 2; nh++) {
+    \\  for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
     \\#pragma clang loop unroll(full)
-    \\    for (int c = 0; c < 4; c++) {
-    \\      const int nn = min(nb + c + 32 * nh, N - 1);
-    \\      sv[nh][c] = float(scales[(size_t)g * N + nn]);
-    \\      bv[nh][c] = NEG ? 0.0f : float(biases[(size_t)g * N + nn]);
+    \\  for (int c = 0; c < 4; c++) {
+    \\    const uint4 lo = wv[2 * c];
+    \\    const uint4 hi = wv[2 * c + 1];
+    \\    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;
+    \\    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;
+    \\    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;
+    \\    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;
+    \\  }
+    \\  auto tA = A.template slice<128, 32>(g * 128, ms);
+    \\  op.run(tA, bT, cT);
+    \\  float4 sv[2], bv[2];
+    \\  float av[4], rv[4];
+    \\#pragma clang loop unroll(full)
+    \\  for (int h = 0; h < 2; h++) {
+    \\    if (FULL) {
+    \\      sv[h] = float4(*(const device vec<ST, 4>*)(scales + (size_t)g * N + nb + 16 * h));
+    \\      bv[h] = NEG ? float4(0.0f) : float4(*(const device vec<ST, 4>*)(biases + (size_t)g * N + nb + 16 * h));
+    \\    } else {
+    \\#pragma clang loop unroll(full)
+    \\      for (int c = 0; c < 4; c++) {
+    \\        const size_t e = (size_t)g * N + min(nb + c + 16 * h, N - 1);
+    \\        sv[h][c] = float(scales[e]);
+    \\        bv[h][c] = NEG ? 0.0f : float(biases[e]);
+    \\      }
     \\    }
     \\  }
     \\#pragma clang loop unroll(full)
@@ -115,6 +117,7 @@ pub const SOURCE =
     \\    rv[q] = rsum[(size_t)mrow[q] * Kg + g];
     \\    if (NEG) rv[q] *= av[q];
     \\  }
+    \\  // Ternary packs (bias == -scale): acc += s * (as * C - as * rs).
     \\#pragma clang loop unroll(full)
     \\  for (int i = 0; i < CAP; i++) {
     \\    const int c = i & 3;
@@ -127,15 +130,17 @@ pub const SOURCE =
     \\      acc[i] = fma(av[mh], t, acc[i]);
     \\    }
     \\  }
-    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\}
     \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < CAP; i++) {
-    \\  const int c = i & 3;
-    \\  const int nh = (i >> 3) & 1;
-    \\  const int mm = mb + 8 * ((i >> 2) & 1) + 32 * ((i >> 4) & 1);
-    \\  const int nn = nb + c + 32 * nh;
-    \\  if (nn < N) y[(size_t)mm * N + nn] = static_cast<T>(acc[i]);
+    \\for (int i = 0; i < CAP; i += 4) {
+    \\  const int nn = nb + 16 * ((i >> 3) & 1);
+    \\  const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
+    \\  if (FULL) {
+    \\    *(device vec<T, 4>*)(y + (size_t)mm * N + nn) = vec<T, 4>(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
+    \\  } else {
+    \\#pragma clang loop unroll(full)
+    \\    for (int c = 0; c < 4; c++) if (nn + c < N) y[(size_t)mm * N + nn + c] = static_cast<T>(acc[i + c]);
+    \\  }
     \\}
 ;
 
@@ -148,17 +153,21 @@ pub const QUANT_SOURCE =
     \\const uint row = threadgroup_position_in_grid.y;
     \\const uint g = threadgroup_position_in_grid.x;
     \\const uint lane = thread_index_in_simdgroup;
-    \\const device T* xr = x + (size_t)row * K + g * 128;
+    \\// Rows past the input's are the tile's padding: they quantize as zeros.
+    \\const bool live = int(row) < x_shape[0];
+    \\const device T* xr = x + (size_t)(live ? row : 0) * K + g * 128;
     \\float v[4];
     \\float a = 0.0f;
-    \\for (int i = 0; i < 4; ++i) { v[i] = float(xr[lane * 4 + i]); a = max(a, abs(v[i])); }
+    \\for (int i = 0; i < 4; ++i) { v[i] = live ? float(xr[lane * 4 + i]) : 0.0f; a = max(a, abs(v[i])); }
     \\a = simd_max(a);
     \\const float sc = max(a / 127.0f, 1.0e-20f);
     \\float rs = 0.0f;
     \\for (int i = 0; i < 4; ++i) {
     \\  const float q = clamp(rint(v[i] / sc), -127.0f, 127.0f);
     \\  rs += q;
-    \\  xq[(size_t)row * K + g * 128 + lane * 4 + i] = (int8_t)q;
+    \\  // Kernel K order: position 4b + kq of a 16-block is stored at 4kq + b.
+    \\  const uint p = lane * 4 + i;
+    \\  xq[(size_t)row * K + g * 128 + (p & ~15u) + (p & 3u) * 4 + ((p >> 2) & 3u)] = (int8_t)q;
     \\}
     \\rs = simd_sum(rs);
     \\if (lane == 0) {
@@ -224,14 +233,15 @@ pub const Quantized = struct {
 /// Quantize launches, for the memo test.
 pub var quantize_calls: u64 = 0;
 
-pub fn quantizeRows(x2: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
+/// `rows` may exceed x2's row count: the extra rows are the kernel tile's padding.
+pub fn quantizeRows(x2: mlx.mlx_array, rows: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
     quantize_calls += 1;
     const inputs = [_]mlx.mlx_array{x2};
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try quantKernel(), iv, try quantConfig(.{ .m = m, .k = k, .dt = mlx.mlx_array_dtype(x2) }), s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try quantKernel(), iv, try quantConfig(.{ .m = rows, .k = k, .dt = mlx.mlx_array_dtype(x2) }), s));
     var xq = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(xq);
     var ascale = mlx.mlx_array_new();
@@ -260,11 +270,11 @@ fn retainedQ(q: Quantized) !Quantized {
 var memo_x: mlx.mlx_array = .{ .ctx = null };
 var memo_q: ?Quantized = null;
 
-fn quantizedFor(x: mlx.mlx_array, xp: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
+fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rows: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
     if (memo_q) |mq| {
         if (mlx.mlx_array_shape(memo_x) == mlx.mlx_array_shape(x)) return retainedQ(mq);
     }
-    var q = try quantizeRows(xp, m, k, s);
+    var q = try quantizeRows(x2, rows, k, s);
     errdefer q.deinit();
     if (memo_q) |*mq| mq.deinit();
     if (memo_x.ctx != null) _ = mlx.mlx_array_free(memo_x);
@@ -300,7 +310,7 @@ fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.
 }
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
-const CfgKey = struct { n: c_int, mpad: c_int, dt: mlx.mlx_dtype, neg: bool };
+const CfgKey = struct { n: c_int, mpad: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, neg: bool };
 var cfg_cache: std.AutoHashMapUnmanaged(CfgKey, mlx.mlx_fast_metal_kernel_config) = .{};
 var engaged_logged = false;
 
@@ -324,11 +334,13 @@ fn configFor(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const out_shape = [_]c_int{ key.mpad, key.n };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, 2, key.dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * @divTrunc(key.n + 63, 64), @divExact(key.mpad, 64), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * @divTrunc(key.n + 127, 128), @divExact(key.mpad, 32), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", key.dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "MPAD", key.mpad));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "NEG", key.neg));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "ST", key.st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "FULL", @rem(key.n, 128) == 0));
     try cfg_cache.put(std.heap.c_allocator, key, cfg);
     return cfg;
 }
@@ -360,24 +372,11 @@ pub fn qmm(
     const n = ws[0];
     if (m < MIN_ROWS or @rem(k, GS) != 0 or ws[1] * 16 != k) return null;
 
-    const mpad = @divTrunc(m + 63, 64) * 64;
+    const mpad = @divTrunc(m + 31, 32) * 32;
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, k }, 2, s));
-    var xp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xp);
-    if (mpad == m) {
-        try mlx.check(mlx.mlx_array_set(&xp, x2));
-    } else {
-        var zero = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(zero);
-        try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{ mpad - m, k }, 2, dt, s));
-        const parts = [_]mlx.mlx_array{ x2, zero };
-        const pv = mlx.mlx_vector_array_new_data(&parts, parts.len);
-        defer _ = mlx.mlx_vector_array_free(pv);
-        try mlx.check(mlx.mlx_concatenate_axis(&xp, pv, 0, s));
-    }
-    var q = try quantizedFor(x, xp, mpad, k, s);
+    var q = try quantizedFor(x, x2, mpad, k, s);
     defer q.deinit();
     const d = try derivedCached(w, sc, bi, s);
 
@@ -390,7 +389,7 @@ pub fn qmm(
     defer _ = mlx.mlx_vector_array_free(iv);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try kernel(), iv, try configFor(.{ .n = n, .mpad = mpad, .dt = dt, .neg = bneg }), s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, try kernel(), iv, try configFor(.{ .n = n, .mpad = mpad, .dt = dt, .st = mlx.mlx_array_dtype(d.scT), .neg = bneg }), s));
     var yy = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(yy);
     try mlx.check(mlx.mlx_vector_array_get(&yy, outs, 0));
@@ -435,10 +434,19 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
 // step it introduces, i.e. error within a small multiple of stock's, never
 // NaN/Inf, and the shape/dtype contract preserved.
 test "qmm_int8: error stays within a small multiple of stock at prompt width" {
+    try expectWithinBar(512, 1536, 128);
+}
+
+test "qmm_int8: a width that is not a whole tile keeps the bar (GDN b/a projections)" {
+    try expectWithinBar(48, 1024, 96);
+}
+
+test "qmm_int8: a row count that is not a whole tile keeps the bar" {
+    try expectWithinBar(256, 1024, 100);
+}
+
+fn expectWithinBar(n: c_int, k: c_int, m: c_int) !void {
     const s = mlx.gpuStream();
-    const n: c_int = 512;
-    const k: c_int = 1536;
-    const m: c_int = 128;
     const nu: usize = @intCast(n);
     const ku: usize = @intCast(k);
     const mu: usize = @intCast(m);
