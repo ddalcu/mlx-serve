@@ -79,19 +79,27 @@ pub const SOURCE =
     \\const device uint4* wc[4];
     \\#pragma clang loop unroll(full)
     \\for (int c = 0; c < 4; c++) wc[c] = (const device uint4*)(w + (size_t)min(ns + nl + 8 * c, N - 1) * (K / 16));
+    \\const device uint4* wp = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256) + lane * 2;
     \\const int mrow[4] = {mb, mb + 8, mb + 16, mb + 24};
     \\for (int g = 0; g < Kg; g++) {
     \\  uint4 wv[8];
+    \\  if (FULL) {
+    \\    // Plane copy (`PLANE_SOURCE`): this lane's 32 bytes, plane c at shift 2c.
+    \\    wv[0] = wp[(size_t)g * 64];
+    \\    wv[1] = wp[(size_t)g * 64 + 1];
+    \\  } else {
     \\#pragma clang loop unroll(full)
-    \\  for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
+    \\    for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
+    \\  }
     \\#pragma clang loop unroll(full)
     \\  for (int c = 0; c < 4; c++) {
-    \\    const uint4 lo = wv[2 * c];
-    \\    const uint4 hi = wv[2 * c + 1];
-    \\    bw[c + 0] = (lo.x >> sh) & 0x03030303u; bw[c + 4] = (lo.y >> sh) & 0x03030303u;
-    \\    bw[c + 8] = (lo.z >> sh) & 0x03030303u; bw[c + 12] = (lo.w >> sh) & 0x03030303u;
-    \\    bw[c + 16] = (hi.x >> sh) & 0x03030303u; bw[c + 20] = (hi.y >> sh) & 0x03030303u;
-    \\    bw[c + 24] = (hi.z >> sh) & 0x03030303u; bw[c + 28] = (hi.w >> sh) & 0x03030303u;
+    \\    const uint s2 = FULL ? 2 * uint(c) : sh;
+    \\    const uint4 lo = FULL ? wv[0] : wv[2 * c];
+    \\    const uint4 hi = FULL ? wv[1] : wv[2 * c + 1];
+    \\    bw[c + 0] = (lo.x >> s2) & 0x03030303u; bw[c + 4] = (lo.y >> s2) & 0x03030303u;
+    \\    bw[c + 8] = (lo.z >> s2) & 0x03030303u; bw[c + 12] = (lo.w >> s2) & 0x03030303u;
+    \\    bw[c + 16] = (hi.x >> s2) & 0x03030303u; bw[c + 20] = (hi.y >> s2) & 0x03030303u;
+    \\    bw[c + 24] = (hi.z >> s2) & 0x03030303u; bw[c + 28] = (hi.w >> s2) & 0x03030303u;
     \\  }
     \\  auto tA = A.template slice<128, 32>(g * 128, ms);
     \\  op.run(tA, bT, cT);
@@ -142,6 +150,27 @@ pub const SOURCE =
     \\    for (int c = 0; c < 4; c++) if (nn + c < N) y[(size_t)mm * N + nn + c] = static_cast<T>(acc[i + c]);
     \\  }
     \\}
+;
+
+/// The weight re-laid out for FULL widths: per 32-column block and 128-group,
+/// lane l's 8 words hold at shift 2c the plane kq(l) of column nl(l) + 8c's word
+/// j, so a lane's operand is one contiguous 32-byte read. One thread per word.
+pub const PLANE_SOURCE =
+    \\const uint o = thread_position_in_grid.x;
+    \\const int W = w_shape[1];
+    \\const int Kg = W / 8;
+    \\const uint j = o & 7;
+    \\const uint lane = (o >> 3) & 31;
+    \\const uint g = (o >> 8) % uint(Kg);
+    \\const uint blk = (o >> 8) / uint(Kg);
+    \\const uint nl = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+    \\const uint kq = (lane & 1) + 2 * ((lane >> 3) & 1);
+    \\uint32_t v = 0;
+    \\for (uint c = 0; c < 4; c++) {
+    \\  const uint32_t word = w[(size_t)(blk * 32 + nl + 8 * c) * W + g * 8 + j];
+    \\  v |= ((word >> (2 * kq)) & 0x03030303u) << (2 * c);
+    \\}
+    \\wp[o] = v;
 ;
 
 /// amax, scale, quantize and code-sum for one 128-group in ONE pass. Eight
@@ -286,7 +315,9 @@ fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rows: c_int, k: c_int, s: m
 
 /// The kernel reads scales and biases group-major; the transposed copies are
 /// derived constants of the weight, made once and kept.
-const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array };
+/// `wp` is the plane copy the kernel reads on FULL widths (a second copy of the
+/// 2-bit weight, int8 route only); other widths read `w` itself.
+const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array, wp: ?mlx.mlx_array };
 var derived_cache: std.AutoHashMapUnmanaged(usize, Derived) = .{};
 
 fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -301,10 +332,47 @@ fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return c;
 }
 
-fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !Derived {
+var plane_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn planeCopy(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (plane_kernel == null) {
+        const in_names = [_][*:0]const u8{"w"};
+        const out_names = [_][*:0]const u8{"wp"};
+        const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_int8_plane", iv, ov, PLANE_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        plane_kernel = k;
+    }
+    const shape = mlx.getShape(w);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, 2, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, shape[0] * shape[1], 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    const inputs = [_]mlx.mlx_array{w};
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, plane_kernel.?, iv, cfg, s));
+    var wp = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(wp);
+    try mlx.check(mlx.mlx_vector_array_get(&wp, outs, 0));
+    try mlx.check(mlx.mlx_array_eval(wp));
+    return wp;
+}
+
+fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bneg: bool, s: mlx.mlx_stream) !Derived {
     const key = @intFromPtr(w.ctx);
     if (derived_cache.get(key)) |c| return c;
-    const d = Derived{ .scT = try transposed(sc, s), .biT = try transposed(bi, s) };
+    const n = mlx.getShape(w)[0];
+    const scT = try transposed(sc, s);
+    // The factored epilogue never reads the biases of a bias == -scale pack.
+    const biT = if (bneg) try retained(scT) else try transposed(bi, s);
+    const d = Derived{ .scT = scT, .biT = biT, .wp = if (@rem(n, 128) == 0) try planeCopy(w, s) else null };
     try derived_cache.put(std.heap.c_allocator, key, d);
     return d;
 }
@@ -378,13 +446,13 @@ pub fn qmm(
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, k }, 2, s));
     var q = try quantizedFor(x, x2, mpad, k, s);
     defer q.deinit();
-    const d = try derivedCached(w, sc, bi, s);
+    const d = try derivedCached(w, sc, bi, bneg, s);
 
     if (!engaged_logged) {
         engaged_logged = true;
         log.info("[int8-prefill] engaged (LOSSY: activations quantized to int8): first call M={d} N={d} K={d}\n", .{ m, n, k });
     }
-    const inputs = [_]mlx.mlx_array{ q.xq, w, d.scT, d.biT, q.ascale, q.rsum };
+    const inputs = [_]mlx.mlx_array{ q.xq, d.wp orelse w, d.scT, d.biT, q.ascale, q.rsum };
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var outs = mlx.mlx_vector_array_new();
