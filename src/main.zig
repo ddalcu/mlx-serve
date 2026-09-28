@@ -389,6 +389,12 @@ fn printUsage(io: std.Io) void {
         \\                        declared types (e.g. Python `False` -> JSON
         \\                        `false`). Args then pass through as the model
         \\                        emitted them (still valid JSON). Default: on.
+        \\  --tool-call-stream <early|end>
+        \\                      How a streamed tool call reaches the client.
+        \\                        `end` (default) sends each call whole after
+        \\                        generation; `early` sends its id and name as
+        \\                        soon as the model has written them and the
+        \\                        arguments when generation ends.
         \\  --api-key <token>   Require this key on every request (OpenAI/
         \\                        Anthropic/Ollama APIs + index page + metrics).
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
@@ -693,6 +699,12 @@ pub fn main(init: std.process.Init) !void {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
+        } else if (std.mem.eql(u8, args[i], "--tool-call-stream") and i + 1 < args.len) {
+            i += 1;
+            server_mod.g_tool_call_stream = std.meta.stringToEnum(server_mod.ToolCallStream, args[i]) orelse {
+                log.err("--tool-call-stream: expected 'early' or 'end'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             enable_pld = false;
         } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {

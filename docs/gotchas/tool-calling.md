@@ -848,3 +848,22 @@ has tools and otherwise pass the text through.
 Fix: the non-stream split keeps markup when the request has no tools (chat,
 messages, responses), matching the stream and the other engines.
 Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+## A tools stream said nothing until the model finished, so clients timed it wrong (2026-09-28)
+
+With `tools`, a thinking-off reply that opens with a call streamed nothing until
+generation ended, then sent each call as one delta. Clients that time a stream
+from its first token reported absurd rates, and nothing signalled a call had begun.
+Cause: the tool gate holds text for the end-of-stream parse, which needs the whole call.
+
+Fix: `--tool-call-stream early` (opt-in) sends call 0's id + name once
+`chat.toolCallHeader` reads them and the arguments at the end, keyed by index;
+`/v1/messages` starts the `tool_use` block then. A header cannot be retracted, so
+it goes out only for a Qwen/Hermes `<tool_call>` the parser reads first, never
+through the Ollama sink (it renders every delta as a whole call). An unconfirmed
+header, a repetition-loop cut included, closes with `{}` and the parsed calls
+follow at index 1+. A client that runs every call would run that `{}` call, so
+`end`, the default, keeps whole calls.
+Guards: the `toolCallHeader` prefix test (chat.zig), the corpus replay `an early
+tool-call header names the call the final parse emits first`, and
+`tests/test_tool_call_stream.sh`.

@@ -92,5 +92,6 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
 | `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies) |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
+| `--tool-call-stream {early,end}` | `end` | `end` sends each streamed tool call whole after generation. `early` sends its id and name as soon as the model has written them and its arguments when generation ends (Qwen/Hermes `<tool_call>` formats) |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 | `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |

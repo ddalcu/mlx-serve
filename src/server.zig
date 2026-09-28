@@ -84,6 +84,12 @@ pub var g_api_key_strict: bool = false;
 /// mistyped value reaches the client verbatim, which strict clients reject.
 pub var g_tool_autocorrect: bool = true;
 
+/// `--tool-call-stream`. `end` (default): every call goes out whole after generation.
+/// `early` (opt-in): a streamed tool call's id + name go out once the model has written
+/// them (`chat.toolCallHeader`), its arguments at the end.
+pub const ToolCallStream = enum { early, end };
+pub var g_tool_call_stream: ToolCallStream = .end;
+
 /// LAN model sharing (src/lan.zig). Started by `serve()` when `--lan-share`
 /// and/or `--lan-discover` are set (the three `g_lan_*` config globals below
 /// are written by main.zig, mirroring the `g_api_key` pattern). When sharing
@@ -1517,6 +1523,14 @@ fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
 /// ("you sent no content"), and the model re-emits the same doomed mega-call.
 fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
+}
+
+/// An early tool-call header cannot be retracted. The end-of-stream parse stays the
+/// truth: it confirms the header only when its first call carries the announced name.
+fn earlyToolConfirmed(announced: ?[]const u8, calls: ?[]const chat_mod.ParsedToolCall) bool {
+    const name = announced orelse return false;
+    const cs = calls orelse return false;
+    return cs.len > 0 and std.mem.eql(u8, name, cs[0].name);
 }
 
 /// A repetition-loop cut may land inside an otherwise recognizable tool call.
@@ -10762,6 +10776,10 @@ fn handleStreamingGeneration(
     var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
+    // The Ollama sink renders every delta as a whole call, so a bridged stream keeps them whole.
+    var early_tool = has_tools and g_tool_call_stream == .early and stream.ollama_sink == null;
+    var early_tool_name: ?[]u8 = null; // call 0, already announced with id + name
+    defer if (early_tool_name) |n| allocator.free(n);
 
     // Generate tokens via the adapter — yields one decoded token id per call
     // regardless of whether the underlying decode is regular, PLD, or drafter.
@@ -10878,6 +10896,22 @@ fn handleStreamingGeneration(
 
             const buf = text_buf.items;
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
+
+            if (maybe_tool and early_tool and (think_closed or !opens_think)) {
+                switch (chat_mod.toolCallHeader(buf)) {
+                    .pending => {},
+                    .none => early_tool = false,
+                    .name => |name| {
+                        early_tool = false;
+                        early_tool_name = try allocator.dupe(u8, name);
+                        const header = try std.fmt.allocPrint(allocator,
+                            \\[{{"index":0,"id":"call_{d}_0","type":"function","function":{{"name":"{s}","arguments":""}}}}]
+                        , .{ chat_id, name });
+                        defer allocator.free(header);
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = header }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    },
+                }
+            }
 
             if (!maybe_tool) {
                 // No tool call pattern — ask the shared gate (chat.streamThinkGate,
@@ -11329,6 +11363,12 @@ fn handleStreamingGeneration(
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
         const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const early_confirmed = earlyToolConfirmed(early_tool_name, found_calls);
+        if (early_tool_name != null and !early_confirmed) {
+            log.info("  [tool-stream] early header '{s}' not confirmed by the parse, closed with {{}}\n", .{early_tool_name.?});
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = "[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]" }, null, null, null, .{ .logprobs_json = try lps.take() });
+            if (found_calls == null and shouldParseToolCalls(ts.finish_details)) finish_reason = toolCallFinishReason(finish_reason);
+        }
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -11363,10 +11403,12 @@ fn handleStreamingGeneration(
                 }
             }
 
-            // Emit tool call deltas in OpenAI streaming format
+            // Emit tool call deltas in OpenAI streaming format. An unconfirmed
+            // header holds index 0, so the parsed calls move up one, even past a
+            // parallel_tool_calls:false clamp: the placeholder is not the model's call.
+            const shift: usize = @intFromBool(early_tool_name != null and !early_confirmed);
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
-                defer allocator.free(tc_id);
+                const index = i + shift;
 
                 // Escape the full arguments string for embedding in JSON
                 const escaped_args = try jsonEscape(allocator, tc.arguments);
@@ -11377,12 +11419,18 @@ fn handleStreamingGeneration(
                 else
                     escaped_args;
 
-                // First delta: name + id + full arguments (clients accumulate these)
-                const first_delta = try std.fmt.allocPrint(allocator,
-                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
-                , .{ i, tc_id, tc.name, args_inner });
-                defer allocator.free(first_delta);
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
+                // One delta per call: id + name + full arguments, or only the
+                // arguments of the call the early header already named.
+                const delta = if (early_confirmed and i == 0)
+                    try std.fmt.allocPrint(allocator,
+                        \\[{{"index":0,"function":{{"arguments":"{s}"}}}}]
+                    , .{args_inner})
+                else
+                    try std.fmt.allocPrint(allocator,
+                        \\[{{"index":{d},"id":"call_{d}_{d}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
+                    , .{ index, chat_id, index, tc.name, args_inner });
+                defer allocator.free(delta);
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = delta }, null, null, null, .{ .logprobs_json = try lps.take() });
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
@@ -15713,6 +15761,10 @@ fn handleAnthropicStreaming(
     var skipped_think_open = false;
     var think_tokens: i32 = 0;
     var budget_exhausted = false;
+    var early_tool = has_tools and g_tool_call_stream == .early;
+    var early_tool_name: ?[]u8 = null; // call 0, its tool_use block already started
+    defer if (early_tool_name) |n| allocator.free(n);
+    var early_tool_block: u32 = 0;
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
@@ -15830,6 +15882,28 @@ fn handleAnthropicStreaming(
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
+
+            if (maybe_tool and early_tool and (think_closed or !opens_think)) {
+                switch (chat_mod.toolCallHeader(buf)) {
+                    .pending => {},
+                    .none => early_tool = false,
+                    .name => |name| {
+                        early_tool = false;
+                        early_tool_name = try allocator.dupe(u8, name);
+                        try endAnthropicThinking(allocator, stream, &block_index, &thinking_block_open);
+                        if (text_block_open) {
+                            const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
+                            defer allocator.free(sd);
+                            try sendAnthropicEvent(stream, "content_block_stop", sd);
+                            block_index += 1;
+                            text_block_open = false;
+                        }
+                        early_tool_block = block_index;
+                        block_index += 1;
+                        try startAnthropicToolUse(allocator, stream, early_tool_block, 0, name);
+                    },
+                }
+            }
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -16240,6 +16314,12 @@ fn handleAnthropicStreaming(
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
         const found_calls = if (has_tools and shouldParseToolCalls(ts.finish_details)) try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools) else null;
+        const early_confirmed = earlyToolConfirmed(early_tool_name, found_calls);
+        if (early_tool_name) |name| {
+            if (!early_confirmed) log.info("  [tool-stream] early header '{s}' not confirmed by the parse, closed with {{}}\n", .{name});
+            try finishAnthropicToolUse(allocator, stream, early_tool_block, if (early_confirmed) found_calls.?[0].arguments else "{}");
+            if (found_calls == null and shouldParseToolCalls(ts.finish_details)) finish_reason = toolCallFinishReason(finish_reason);
+        }
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -16275,33 +16355,13 @@ fn handleAnthropicStreaming(
                 try endAnthropicThinking(allocator, stream, &block_index, &thinking_block_open);
             }
 
+            // The early block already carries call 0 when the parse confirmed it;
+            // an unconfirmed one keeps its own block and the parsed calls follow.
+            const shift: usize = @intFromBool(early_tool_name != null and !early_confirmed);
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), i });
-                defer allocator.free(tc_id);
-                const esc_name = try jsonEscape(allocator, tc.name);
-                defer allocator.free(esc_name);
-
-                // content_block_start
-                const start = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":{s},"input":{{}}}}}}
-                , .{ block_index, tc_id, esc_name });
-                defer allocator.free(start);
-                try sendAnthropicEvent(stream, "content_block_start", start);
-
-                // input_json_delta
-                const esc_args_full = try jsonEscape(allocator, tc.arguments);
-                defer allocator.free(esc_args_full);
-                const args_inner = esc_args_full[1 .. esc_args_full.len - 1];
-                const delta = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
-                , .{ block_index, args_inner });
-                defer allocator.free(delta);
-                try sendAnthropicEvent(stream, "content_block_delta", delta);
-
-                // content_block_stop
-                const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
-                defer allocator.free(stop);
-                try sendAnthropicEvent(stream, "content_block_stop", stop);
+                if (early_confirmed and i == 0) continue;
+                try startAnthropicToolUse(allocator, stream, block_index, i + shift, tc.name);
+                try finishAnthropicToolUse(allocator, stream, block_index, tc.arguments);
                 block_index += 1;
             }
             finish_reason = toolCallFinishReason(finish_reason);
@@ -16382,6 +16442,34 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+}
+
+/// content_block_start of a tool_use block; `finishAnthropicToolUse` sends its input.
+fn startAnthropicToolUse(allocator: std.mem.Allocator, stream: *Conn, index: u32, call: usize, name: []const u8) !void {
+    const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ nowMs(stream.io), call });
+    defer allocator.free(tc_id);
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const start = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":{s},"input":{{}}}}}}
+    , .{ index, tc_id, esc_name });
+    defer allocator.free(start);
+    try sendAnthropicEvent(stream, "content_block_start", start);
+}
+
+/// The whole input as one input_json_delta, then content_block_stop.
+fn finishAnthropicToolUse(allocator: std.mem.Allocator, stream: *Conn, index: u32, arguments: []const u8) !void {
+    const esc_args_full = try jsonEscape(allocator, arguments);
+    defer allocator.free(esc_args_full);
+    const args_inner = esc_args_full[1 .. esc_args_full.len - 1];
+    const delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
+    , .{ index, args_inner });
+    defer allocator.free(delta);
+    try sendAnthropicEvent(stream, "content_block_delta", delta);
+    const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{index});
+    defer allocator.free(stop);
+    try sendAnthropicEvent(stream, "content_block_stop", stop);
 }
 
 /// Emit a text_delta event for Anthropic streaming.
