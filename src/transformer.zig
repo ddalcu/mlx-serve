@@ -16256,6 +16256,9 @@ pub const Transformer = struct {
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
+    /// LOSSY int8-activation prefill (`qmm_int8`), per model: its
+    /// `int8_prefill` setting, else the process default.
+    int8_prefill: bool = false,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -17058,6 +17061,7 @@ pub const Transformer = struct {
             .moe_owned_bf16 = moe_owned_bf16,
             .rht = rht_registry,
             .ternary_2bit = ternary_2bit,
+            .int8_prefill = config.int8_prefill_override orelse qmm_int8.enabled(),
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -17908,7 +17912,7 @@ pub const Transformer = struct {
             if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
             // OPT-IN and LOSSY (activations to uint8); declines unless the
             // switch is set, and below prompt width.
-            if (try qmm_int8.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
+            if (self.int8_prefill) if (try qmm_int8.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
         }
         if (self.ternary_2bit) {

@@ -27,6 +27,7 @@ pub const MIN_ROWS: c_int = 64;
 pub const GS: c_int = 128;
 
 var env_enabled: ?bool = null;
+/// The process default (a model's `int8_prefill` setting overrides it).
 /// DEFAULT OFF: this route changes numerics.
 pub fn enabled() bool {
     if (env_enabled) |v| return v;
@@ -337,7 +338,7 @@ pub fn qmm(
     group_size: u32,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
-    if (!enabled() or bits != 2 or group_size != GS or bi.ctx == null) return null;
+    if (bits != 2 or group_size != GS or bi.ctx == null) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .float16 and dt != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -489,8 +490,6 @@ test "qmm_int8: error stays within a small multiple of stock at prompt width" {
     try mlx.check(mlx.mlx_quantized_matmul(&stock, x, wq, sc, bi, true, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(2), "affine", s));
     const es = try errVsTruth(stock, truth, mu, nu, s);
 
-    env_enabled = true;
-    defer env_enabled = null;
     const got = (try qmm(x, wq, sc, bi, 2, 128, s)) orelse {
         std.debug.print("[qmm_int8] declined a shape it should take (M={d})\n", .{m});
         return error.RouteDeclined;
@@ -528,8 +527,6 @@ test "qmm_int8: sibling projections of one activation quantize it once" {
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ n, @divExact(k, 128) }, 2, .float16, s));
-    env_enabled = true;
-    defer env_enabled = null;
     const before = quantize_calls;
     for (0..2) |_| {
         const y = (try qmm(x, w, sc, sc, 2, 128, s)) orelse return error.RouteDeclined;
@@ -538,10 +535,16 @@ test "qmm_int8: sibling projections of one activation quantize it once" {
     try std.testing.expectEqual(before + 1, quantize_calls);
 }
 
-test "qmm_int8: declines below its row floor and when disabled" {
+test "qmm_int8: declines below its row floor" {
     const s = mlx.gpuStream();
-    env_enabled = false;
-    defer env_enabled = null;
-    const dummy = mlx.mlx_array_new();
-    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(dummy, dummy, dummy, dummy, 2, 128, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ MIN_ROWS - 1, 256 }, 2, .float16, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 128, 16 }, 2, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 128, 2 }, 2, .float16, s));
+    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(x, w, sc, sc, 2, 128, s));
 }

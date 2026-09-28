@@ -14,6 +14,8 @@ pub const Override = struct {
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
+    /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
+    int8_prefill: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -27,7 +29,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -92,6 +94,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         .string => |name| o.mtp_acceptance = mtp_acceptance.fromName(name),
         else => {},
     };
+    if (obj.get("int8_prefill")) |m| switch (m) {
+        .bool => |b| o.int8_prefill = b,
+        else => {},
+    };
     if (obj.get("mtp_greedy_tail")) |g| switch (g) {
         .bool => |b| o.mtp_greedy_tail = b,
         else => {},
@@ -151,13 +157,14 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
+        if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
     });
@@ -220,6 +227,18 @@ test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else
     const t = std.testing.allocator;
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").mtp_greedy_tail);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").mtp_greedy_tail);
+    try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: int8_prefill is a boolean, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"int8_prefill": true}, "/m/b": {"int8_prefill": false}, "/m/c": {"int8_prefill": "yes"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").int8_prefill);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").int8_prefill);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }
