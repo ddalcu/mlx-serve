@@ -19283,6 +19283,42 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_eval(vec));
     }
 
+    /// Pipelined prefill cadence: a point submits its segment without blocking
+    /// and waits on the PREVIOUS one, so the GPU runs segment i while the CPU
+    /// builds i+1 (same graph, same order). Two segments of `cadence / 2`
+    /// layers hold what one blocking segment of `cadence` did; a cadence
+    /// already forced to 1 by a large transient stays blocking.
+    pub const PrefillCadence = struct { every: u32, pipelined: bool };
+    pub fn prefillCadencePlan(cadence: u32) PrefillCadence {
+        if (cadence < 2) return .{ .every = @max(cadence, 1), .pipelined = false };
+        return .{ .every = cadence / 2, .pipelined = true };
+    }
+
+    const CadencePipe = struct {
+        prev: mlx.mlx_array = .{ .ctx = null },
+        fn point(self: *CadencePipe, h: mlx.mlx_array, ssm_entries: ?[]SSMCacheEntry) !void {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, h);
+            if (ssm_entries) |entries| {
+                for (entries) |*e| {
+                    if (e.initialized and e.conv_state.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, e.conv_state);
+                }
+            }
+            try mlx.check(mlx.mlx_async_eval(vec));
+            if (self.prev.ctx != null) {
+                try mlx.check(mlx.mlx_array_eval(self.prev));
+                _ = mlx.mlx_array_free(self.prev);
+            }
+            self.prev = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&self.prev, h);
+        }
+        fn deinit(self: *CadencePipe) void {
+            if (self.prev.ctx != null) _ = mlx.mlx_array_free(self.prev);
+            self.prev = .{ .ctx = null };
+        }
+    };
+
     /// Decode-side intra-step async-eval ladder.
     ///
     /// A decode step builds ~40 layers of graph on the CPU before anything is
@@ -25028,7 +25064,9 @@ pub const Transformer = struct {
         // Eval cadence: drop to per-layer when this chunk's score/dequant
         // transients are large (unfused head_dim > 128 at long ctx, or a
         // quantized cache's dense rebuild) — see prefillEvalCadence.
-        const moe_eval_cadence = prefillEvalCadence(
+        var cad_pipe = CadencePipe{};
+        defer cad_pipe.deinit();
+        const moe_cadence_plan = prefillCadencePlan(prefillEvalCadence(
             PREFILL_EVAL_CADENCE_DEFAULT,
             cfg.head_dim,
             cfg.num_attention_heads,
@@ -25036,7 +25074,8 @@ pub const Transformer = struct {
             @intCast(seq_len),
             @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
             ctx.cache.config.scheme != .off,
-        );
+        ));
+        const moe_eval_cadence = moe_cadence_plan.every;
 
         // DIAGNOSTIC (MLX_SERVE_LAYER_CAP=N): run only the first N layers, so a
         // ms-vs-N sweep separates the forward's per-layer slope from its fixed
@@ -25232,7 +25271,7 @@ pub const Transformer = struct {
             }
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
-                try evalCadencePoint(h, ctx.ssm_entries);
+                if (moe_cadence_plan.pipelined) try cad_pipe.point(h, ctx.ssm_entries) else try evalCadencePoint(h, ctx.ssm_entries);
             } else if (ctx.pipeline_build > 0 and (layer_idx + 1) % ctx.pipeline_build == 0 and layer_idx + 1 < n_layers) {
                 const v = mlx.mlx_vector_array_new_value(h);
                 defer _ = mlx.mlx_vector_array_free(v);
@@ -29059,7 +29098,7 @@ pub const Transformer = struct {
         var beta_fused: ?mlx.mlx_array = null;
 
         // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
-        const prefill_fused = cfg.longCtxGated() and is_prefill and gdnPrefillFusedFor(seq_len, batch);
+        const prefill_fused = gdnWidePreworkArch(cfg.longCtxGated(), cfg.hadamard_block > 0) and is_prefill and gdnPrefillFusedFor(seq_len, batch);
         if (!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and
             (batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
             kernel == 4 and (ssm.initialized or prefill_fused))
@@ -36106,6 +36145,12 @@ var gdn_prefill_fused_override: ?bool = null;
 var gdn_prefill_fused_env: ?bool = null;
 var gdn_prefill_engaged = false;
 
+/// Archs whose prefill-width packed prework was A/B'd: qwen4_exp, and the
+/// Hadamard (Bonsai 2) packs (+1% prefill on M5 Max, greedy output unchanged).
+pub fn gdnWidePreworkArch(long_ctx_gated: bool, hadamard: bool) bool {
+    return long_ctx_gated or hadamard;
+}
+
 fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("hc_prefill.zig").max_seq, batch)) return false;
     if (gdn_prefill_fused_override) |on| return on;
@@ -40752,7 +40797,7 @@ fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: mlx.
 // allocator cache recycles it; numerics differ from in-kernel dequant only
 // by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
 // Decode (M=1) and spec-verify widths never route. Kill switch:
-// MLX_SERVE_PREFILL_DQ_GEMM=0.
+// MLX_SERVE_PREFILL_DQ_GEMM=0 (=1 forces it on a NAX GPU).
 pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
 
 /// Rows from which `prefillDqGemm` takes over from stock qmm. 2-bit qmm loses
@@ -40766,11 +40811,18 @@ pub fn prefillDqGemmMinRows(bits: u32) usize {
 pub var prefill_dq_gemm_override: ?bool = null;
 var prefill_dq_gemm_env_cached: ?bool = null;
 
+/// The route answers a small qmm tile, which NAX GPUs do not have: there stock
+/// qmm matches or beats dequant+GEMM at every width (M5 Max, 2- and 4-bit).
+pub fn prefillDqGemmEnabledFrom(nax_available: bool, raw: ?[]const u8) bool {
+    if (raw) |v| return !std.mem.eql(u8, v, "0");
+    return !nax_available;
+}
+
 pub fn prefillDqGemmEnabled() bool {
     if (prefill_dq_gemm_override) |v| return v;
     if (prefill_dq_gemm_env_cached) |v| return v;
     const raw = std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    const enabled = prefillDqGemmEnabledFrom(computeNaxAvailable(), if (raw) |v| std.mem.sliceTo(v, 0) else null);
     prefill_dq_gemm_env_cached = enabled;
     return enabled;
 }
@@ -49619,9 +49671,29 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
     }
 }
 
+test "prefillCadencePlan: pipelines at half the cadence, a forced per-layer cadence stays blocking" {
+    try std.testing.expectEqual(Transformer.PrefillCadence{ .every = 2, .pipelined = true }, Transformer.prefillCadencePlan(4));
+    try std.testing.expectEqual(Transformer.PrefillCadence{ .every = 1, .pipelined = false }, Transformer.prefillCadencePlan(1));
+}
+
+test "gdnWidePreworkArch: qwen4_exp and Hadamard packs only" {
+    try std.testing.expect(gdnWidePreworkArch(true, false));
+    try std.testing.expect(gdnWidePreworkArch(false, true));
+    try std.testing.expect(!gdnWidePreworkArch(false, false));
+}
+
+test "prefillDqGemm: off by default on NAX GPUs, on elsewhere, env forces either way" {
+    try std.testing.expect(!prefillDqGemmEnabledFrom(true, null));
+    try std.testing.expect(prefillDqGemmEnabledFrom(false, null));
+    try std.testing.expect(!prefillDqGemmEnabledFrom(false, "0"));
+    try std.testing.expect(prefillDqGemmEnabledFrom(true, "1"));
+}
+
 test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other widths from 2048" {
     // Measured on the M4 Max: 2-bit qmm loses to dequant+GEMM from 384 rows
     // (+5%, +10% at 1024); the 2048 floor stays for the widths it was tuned on.
+    prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm_override = null;
     const s = mlx.gpuStream();
     const K: c_int = 256;
     const N: c_int = 128;

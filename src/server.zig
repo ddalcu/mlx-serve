@@ -19271,6 +19271,8 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     // Bar: a checked-out restore credits the rows it holds even when the append outgrows the
     // buffer; the grow bills the new capacity plus one eval window of old buffers.
     const t = std.testing;
+    transformer_mod.prefill_dq_gemm_override = true; // recorded with the dequant route on
+    defer transformer_mod.prefill_dq_gemm_override = null;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
@@ -21740,6 +21742,8 @@ test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for pla
 
 test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the route's kill switch" {
     const t = std.testing;
+    transformer_mod.prefill_dq_gemm_override = true; // recorded with the dequant route on
+    defer transformer_mod.prefill_dq_gemm_override = null;
     var cfg = model_mod.ModelConfig{ .model_type = "muse_glimmer" };
     cfg.hidden_size = 6656;
     cfg.intermediate_size = 19968;
@@ -23818,6 +23822,8 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints
     // the incident's own numbers (Turn A admitted at 16,233 MB; Turn B refused at 13,664 MB).
     const t = std.testing;
+    transformer_mod.prefill_dq_gemm_override = true; // recorded with the dequant route on
+    defer transformer_mod.prefill_dq_gemm_override = null;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
