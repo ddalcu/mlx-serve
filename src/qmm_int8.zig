@@ -214,7 +214,11 @@ pub const Quantized = struct {
     }
 };
 
+/// Quantize launches, for the memo test.
+pub var quantize_calls: u64 = 0;
+
 pub fn quantizeRows(x2: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
+    quantize_calls += 1;
     const inputs = [_]mlx.mlx_array{x2};
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -231,6 +235,36 @@ pub fn quantizeRows(x2: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Q
     try mlx.check(mlx.mlx_vector_array_get(&ascale, outs, 1));
     try mlx.check(mlx.mlx_vector_array_get(&rsum, outs, 2));
     return .{ .xq = xq, .ascale = ascale, .rsum = rsum };
+}
+
+fn retained(a: mlx.mlx_array) !mlx.mlx_array {
+    var r = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&r, a));
+    return r;
+}
+
+fn retainedQ(q: Quantized) !Quantized {
+    return .{ .xq = try retained(q.xq), .ascale = try retained(q.ascale), .rsum = try retained(q.rsum) };
+}
+
+/// Sibling projections (gate/up, q/k/v/z) read ONE rotated activation, so its
+/// quantization is kept for the next call on the same underlying array
+/// (keyed like `rht.Registry`'s memo: the shape storage a retained handle pins).
+var memo_x: mlx.mlx_array = .{ .ctx = null };
+var memo_q: ?Quantized = null;
+
+fn quantizedFor(x: mlx.mlx_array, xp: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
+    if (memo_q) |mq| {
+        if (mlx.mlx_array_shape(memo_x) == mlx.mlx_array_shape(x)) return retainedQ(mq);
+    }
+    var q = try quantizeRows(xp, m, k, s);
+    errdefer q.deinit();
+    if (memo_q) |*mq| mq.deinit();
+    if (memo_x.ctx != null) _ = mlx.mlx_array_free(memo_x);
+    memo_q = null;
+    memo_x = try retained(x);
+    memo_q = try retainedQ(q);
+    return q;
 }
 
 /// The kernel reads scales and biases group-major; the transposed copies are
@@ -332,7 +366,7 @@ pub fn qmm(
         defer _ = mlx.mlx_vector_array_free(pv);
         try mlx.check(mlx.mlx_concatenate_axis(&xp, pv, 0, s));
     }
-    var q = try quantizeRows(xp, mpad, k, s);
+    var q = try quantizedFor(x, xp, mpad, k, s);
     defer q.deinit();
     const d = try derivedCached(w, sc, bi, s);
 
@@ -478,6 +512,30 @@ test "qmm_int8: error stays within a small multiple of stock at prompt width" {
     std.debug.print("[qmm_int8] truth rms={d:.5} | stock rms={d:.5} | int8 rms={d:.5} -> {d:.3}% relative\n", .{ truth_rms, es.rms, eg.rms, rel * 100.0 });
     try std.testing.expect(rel < 0.015);
     try std.testing.expect(es.rms / truth_rms < 0.015);
+}
+
+test "qmm_int8: sibling projections of one activation quantize it once" {
+    const s = mlx.gpuStream();
+    const n: c_int = 128;
+    const k: c_int = 256;
+    const m: c_int = 64;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_uniform(&x, mlx.mlx_array_new_float(-1.0), mlx.mlx_array_new_float(1.0), &[_]c_int{ m, k }, 2, .float16, .{ .ctx = null }, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32, s));
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ n, @divExact(k, 128) }, 2, .float16, s));
+    env_enabled = true;
+    defer env_enabled = null;
+    const before = quantize_calls;
+    for (0..2) |_| {
+        const y = (try qmm(x, w, sc, sc, 2, 128, s)) orelse return error.RouteDeclined;
+        _ = mlx.mlx_array_free(y);
+    }
+    try std.testing.expectEqual(before + 1, quantize_calls);
 }
 
 test "qmm_int8: declines below its row floor and when disabled" {
