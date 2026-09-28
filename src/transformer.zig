@@ -15,6 +15,7 @@ const qmv2 = @import("qmv2.zig");
 const rowqmv = @import("rowqmv.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
+const qmm_int8 = @import("qmm_int8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -1711,6 +1712,13 @@ fn computeNaxAvailable() bool {
     var ver_buf: [64]u8 = undefined;
     const ver = macosProductVersion(&ver_buf) orelse "";
     return naxAvailableFrom(force, arch, ver);
+}
+
+var nax_avail_cache: ?bool = null;
+/// MLX's own NAX gate (M5-class GPU AND macOS >= 26.2), read once.
+pub fn naxAvailable() bool {
+    if (nax_avail_cache == null) nax_avail_cache = computeNaxAvailable();
+    return nax_avail_cache.?;
 }
 
 var nax_sdpa_avail_cache: ?bool = null;
@@ -16254,6 +16262,9 @@ pub const Transformer = struct {
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
+    /// LOSSY int8-activation prefill (`qmm_int8`), per model: its
+    /// `int8_prefill` setting, else the process default.
+    int8_prefill: bool = false,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -17056,6 +17067,7 @@ pub const Transformer = struct {
             .moe_owned_bf16 = moe_owned_bf16,
             .rht = rht_registry,
             .ternary_2bit = ternary_2bit,
+            .int8_prefill = config.int8_prefill_override orelse qmm_int8.enabled(),
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -17901,6 +17913,9 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(xr);
             };
             if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
+            // OPT-IN and LOSSY (activations to int8); declines unless the
+            // model or process enables it, and below prompt width.
+            if (self.int8_prefill) if (try qmm_int8.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, self.s)) |y| return y;
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
         }
         if (self.ternary_2bit) {

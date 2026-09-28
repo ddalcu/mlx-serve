@@ -40,6 +40,17 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertEqual(ModelOverride(json: ["mtp_acceptance": "fast"]).mtpAcceptance, nil)
     }
 
+    func testInt8PrefillRoundTripsAsABoolean() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        file.set(ModelOverride(int8Prefill: true), for: "/m/a")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"int8_prefill\" : true"), text)
+        XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.int8Prefill, true)
+        XCTAssertNil(ModelOverride(json: ["int8_prefill": "yes"]).int8Prefill)
+    }
+
     /// `chat_template_kwargs` round-trips as one object: the rows the sheet
     /// edits are exactly what the server reads, typed values kept.
     func testChatTemplateKwargsRoundTripAsOneObject() throws {

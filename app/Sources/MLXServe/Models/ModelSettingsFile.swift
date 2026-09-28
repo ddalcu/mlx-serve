@@ -42,17 +42,20 @@ struct ModelOverride: Equatable {
     var mtpAcceptance: MtpAcceptanceChoice?
     /// `drafter`: "off", "auto" or a drafter dir (the speculation socket, `DrafterSocket`).
     var drafter: String?
+    /// `int8_prefill`: LOSSY int8-activation prefill (2-bit Prism packs only).
+    var int8Prefill: Bool?
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
     var extra: [String: Any] = [:]
 
     init(ctxSize: Int? = nil, kvQuant: KvQuantChoice? = nil, mtp: Bool? = nil,
-         mtpAcceptance: MtpAcceptanceChoice? = nil, templateKwargs: [String: Any] = [:]) {
+         mtpAcceptance: MtpAcceptanceChoice? = nil, int8Prefill: Bool? = nil, templateKwargs: [String: Any] = [:]) {
         self.ctxSize = ctxSize
         self.kvQuant = kvQuant
         self.mtp = mtp
         self.mtpAcceptance = mtpAcceptance
+        self.int8Prefill = int8Prefill
         self.templateKwargs = templateKwargs
     }
 
@@ -72,6 +75,9 @@ struct ModelOverride: Equatable {
             if let s = a as? String { mtpAcceptance = MtpAcceptanceChoice(rawValue: s) }
         }
         if let d = rest.removeValue(forKey: "drafter") { drafter = d as? String }
+        if let i = rest.removeValue(forKey: "int8_prefill") {
+            if let b = i as? Bool { int8Prefill = b }
+        }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
         extra = rest
     }
@@ -79,7 +85,8 @@ struct ModelOverride: Equatable {
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
-        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || drafter != nil || !templateKwargs.isEmpty
+        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || drafter != nil || int8Prefill != nil
+            || !templateKwargs.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
@@ -90,12 +97,14 @@ struct ModelOverride: Equatable {
         if let mtp { out["mtp"] = mtp }
         if let mtpAcceptance { out["mtp_acceptance"] = mtpAcceptance.rawValue }
         if let drafter { out["drafter"] = drafter }
+        if let int8Prefill { out["int8_prefill"] = int8Prefill }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
         return out
     }
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.drafter == b.drafter
+            && a.int8Prefill == b.int8Prefill
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }

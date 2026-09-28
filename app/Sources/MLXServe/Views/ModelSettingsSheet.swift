@@ -89,7 +89,7 @@ struct ModelSettingsSheet: View {
     }
 
     private var formHeight: CGFloat {
-        var n = isGguf ? 1 : 2
+        var n = isGguf ? 1 : 3
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
@@ -187,6 +187,16 @@ struct ModelSettingsSheet: View {
                     Text("Default").tag("").font(.app(.body))
                     ForEach(MtpAcceptanceChoice.allCases, id: \.rawValue) { Text(L10n.text($0.label)).tag($0.rawValue) }
                 }
+                }
+                if !isGguf {
+                Picker("Int8 prefill (lossy)", selection: Binding(
+                    get: { override.int8Prefill.map { $0 ? 1 : 0 } ?? -1 },
+                    set: { override.int8Prefill = $0 < 0 ? nil : $0 == 1 })) {
+                    Text("Default").font(.app(.body)).tag(-1)
+                    Text("On").font(.app(.body)).tag(1)
+                    Text("Off").font(.app(.body)).tag(0)
+                }
+                .help("Faster prompt processing on 2-bit Prism packs (Bonsai) by quantizing activations to int8. Changes numerics; other models ignore it.")
                 }
                 if !isGguf {
                     Section {
