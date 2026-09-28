@@ -18,6 +18,7 @@ const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
 const dflash_tree = @import("dflash_tree.zig");
+const dflash_copy = @import("dflash_copy.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const ane_mod = @import("ane.zig");
@@ -1468,6 +1469,11 @@ pub const Generator = struct {
     dflash_tree_rounds: u64 = 0,
     dflash_tree_nodes: u64 = 0,
     dflash_tree_last_width: ?usize = null,
+    /// Suffix-copy proposer state (TensorFold copy-match port).
+    dflash_copy: dflash_copy.SuffixCopy = .{},
+    dflash_copy_rounds: u64 = 0,
+    dflash_copy_tokens: u64 = 0,
+    dflash_copy_accepted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
@@ -5059,6 +5065,15 @@ pub const Generator = struct {
             self.dflash_gap_watch = null;
         }
 
+        // Suffix-copy round (TensorFold's copy-match): a verbatim copy of the
+        // context's own earlier span, when backed by a long-enough match,
+        // replaces the whole draft — no assistant forward, no tree build.
+        // Falls through to the normal round whenever no copy is backed.
+        if (dflashCopyEnabled() and xfm.specTreeSupported()) {
+            const copy_serial = self.sampling.keyed and self.sampling.temperature > 0.01 and self.sampling.seed != null;
+            if (try self.dflashCopyRound(allocator, model, dctx, t1, m, anchor_pos, kv_step_snap, copy_serial)) |res| return res;
+        }
+
         // ── Phase 1: one assistant forward drafts all m tokens ──
         // Row mapping is the export's convention (`anchor_row_drafts`):
         // DFlash reads mask rows 1..bs-1 (anchor row dropped), DSpark reads
@@ -5544,6 +5559,194 @@ pub const Generator = struct {
             out[d * lat.k + j] = keyed_sample.gumbel(self.sampling.seed.?, base + d, @intCast(lat.cands[d * lat.k + j]));
         };
         return out;
+    }
+
+    /// One suffix-copy round: propose a verbatim continuation of the context's
+    /// own earlier span (longest trigram-anchored backward match). When the
+    /// match is backed (>= copy_match tokens) the copy replaces the draft as a
+    /// CHAIN — a degenerate tree — and rides the exact tree-verify machinery
+    /// (SpecTree over a linear parents/depth/path, same commit path). Whole-
+    /// taken copies double the next window; a reject streak silences the
+    /// proposer (see dflash_copy.zig). Returns null when no copy is backed so
+    /// the caller falls through to the assistant-forward round.
+    fn dflashCopyRound(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        model: *DflashModel,
+        dctx: *dflash_mod.DflashCtx,
+        t1: u32,
+        m: u32,
+        anchor_pos: usize,
+        kv_step_snap: usize,
+        serial: bool,
+    ) !?DrafterStepResult {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const MAX_W = dflash_tree.MAX_NODES + 1;
+        // The copy's window: base budget doubled per whole-taken copy level.
+        const budget: usize = @min(@as(usize, m) << @intCast(@min(self.dflash_copy.copy_level, 4)), MAX_W - 1);
+
+        // Committed stream = prompt + generated + the pending token t1.
+        const prompt = self.prompt_ids_owned;
+        const generated = self.generated_ids.items;
+        const total_len = prompt.len + generated.len + 1;
+        var committed = try allocator.alloc(u32, total_len);
+        defer allocator.free(committed);
+        @memcpy(committed[0..prompt.len], prompt);
+        @memcpy(committed[prompt.len .. prompt.len + generated.len], generated);
+        committed[total_len - 1] = t1;
+
+        const copy = self.dflash_copy.propose(committed, budget) orelse return null;
+        // Confident or >= copy_match backed: replace the tree this round.
+        const backed = dflash_copy.SuffixCopy.last_confident or dflash_copy.SuffixCopy.last_match >= self.dflash_copy.copy_match;
+        if (!backed or copy.len == 0) return null;
+
+        self.dflash_copy_rounds += 1;
+        self.dflash_copy_tokens += copy.len;
+        log.info("[dflash-copy] match={d} proposal={d}/{d} level={d} state=chain\n", .{ dflash_copy.SuffixCopy.last_match, copy.len, budget, self.dflash_copy.copy_level });
+
+        // Build the chain: row 0 = t1, rows 1..n = copy tokens in order.
+        const n = copy.len;
+        const w: usize = 1 + n;
+        var parents: [MAX_W]i32 = undefined;
+        var depth: [MAX_W]i32 = undefined;
+        var toks: [MAX_W]i32 = undefined;
+        parents[0] = -1;
+        depth[0] = 0;
+        toks[0] = @intCast(t1);
+        var max_depth: i32 = 0;
+        for (copy, 1..) |tok, row| {
+            parents[row] = @intCast(row - 1);
+            depth[row] = @intCast(row);
+            toks[row] = @intCast(tok);
+            max_depth = @max(max_depth, depth[row]);
+        }
+        const maxd: usize = @intCast(max_depth + 1);
+        var path: [MAX_W * MAX_W]i32 = @splat(0);
+        for (0..w) |r| {
+            var cur: i32 = @intCast(r);
+            var d = depth[r];
+            while (cur >= 0) : (d -= 1) {
+                path[r * maxd + @as(usize, @intCast(d))] = cur;
+                cur = parents[@intCast(cur)];
+            }
+        }
+        const wc: c_int = @intCast(w);
+        var table: [5 * MAX_W]i32 = undefined;
+        gdn_decode.treeTable(parents[0..w], table[0 .. 5 * w]);
+        const par_arr = mlx.mlx_array_new_data(&table, &[_]c_int{5 * wc}, 1, .int32);
+        defer _ = mlx.mlx_array_free(par_arr);
+        const dep_arr = mlx.mlx_array_new_data(&depth, &[_]c_int{wc}, 1, .int32);
+        defer _ = mlx.mlx_array_free(dep_arr);
+        const path_arr = mlx.mlx_array_new_data(&path, &[_]c_int{ wc, @intCast(maxd) }, 2, .int32);
+        defer _ = mlx.mlx_array_free(path_arr);
+        const spec_tree = transformer_mod.SpecTree{ .parents = par_arr, .attn = .{ .depth = dep_arr, .path = path_arr, .max_depth = max_depth } };
+        const verify_input = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, wc }, 2, .int32);
+        defer _ = mlx.mlx_array_free(verify_input);
+
+        const cap_out = try allocator.alloc(mlx.mlx_array, model.config.target_layer_ids.len);
+        defer {
+            for (cap_out) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(cap_out);
+        }
+        for (cap_out) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = model.config.target_layer_ids, .out = cap_out };
+        self.ctx.capture_layers = &cl;
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        self.ctx.tree = &spec_tree;
+        self.ctx.pipeline_build = if (std.c.getenv("MLX_SERVE_DFLASH_PIPELINE")) |raw|
+            @min(std.fmt.parseInt(u32, std.mem.span(raw), 10) catch VERIFY_PIPELINE_LAYERS, 64)
+        else
+            VERIFY_PIPELINE_LAYERS;
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
+        const verify_logits = xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_layers = null;
+        self.ctx.capture_ssm_seq = false;
+        self.ctx.tree = null;
+        self.ctx.pipeline_build = 0;
+        const logits = try verify_logits;
+        self.dflash_attempted += 1;
+
+        var targets = blk: {
+            defer _ = mlx.mlx_array_free(logits);
+            break :blk if (serial)
+                try self.verifySerialSamplesAt(logits, w, depth[0..w])
+            else
+                try verifyArgmax(logits, self.sampling.suppress_mask, s);
+        };
+        defer targets.deinit();
+        try mlx.check(mlx.mlx_array_eval(targets.lazy()));
+        const ids = try targets.ids(w);
+
+        // Walk: a chain accepts while the target's token equals the copy's.
+        var accepted: u32 = 0;
+        while (accepted < n and ids[accepted + 1] == toks[accepted + 1]) accepted += 1;
+        accepted = capAcceptedForTokenBudget(accepted, self.completion_tokens, self.max_tokens);
+        const next_pending: u32 = @intCast(ids[accepted]);
+        if (serial) self.sampling.draw = self.generated_ids.items.len + accepted + 2;
+
+        self.dflash_copy.observe(n, accepted);
+        self.dflash_copy_accepted += accepted;
+        self.dflash_round_width = @intCast(n);
+        self.dflash_tree_round = true; // rides the tree-verify cost table
+        self.dflash_tree_sampled = serial;
+
+        // Commit: identical to the tree round (rows are already consecutive
+        // in a chain, so compactRows is a no-op move check).
+        const n_commit: usize = 1 + @as(usize, accepted);
+        try self.ctx.cache.truncate(anchor_pos + n_commit, s);
+        self.ctx.cache.step = kv_step_snap;
+        if (self.ctx.ssm_entries) |entries| {
+            var path_rows_buf: [MAX_W]u32 = undefined;
+            for (0..n_commit) |j| path_rows_buf[j] = @intCast(j);
+            var conv_rows: [3]i32 = undefined;
+            for (0..3) |i| {
+                const dd: i32 = @as(i32, @intCast(accepted)) - 2 + @as(i32, @intCast(i));
+                conv_rows[i] = if (dd < 0) dd + 3 else 3 + @as(i32, @intCast(path_rows_buf[@intCast(dd)]));
+            }
+            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, path_rows_buf[0..n_commit], conv_rows, s);
+        }
+        self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+        if (accepted + 1 < w) self.partial_rounds += 1;
+
+        // The assistant context grows by the kept rows' captures.
+        {
+            var idx_buf: [MAX_W]i32 = undefined;
+            for (0..n_commit) |j| idx_buf[j] = @intCast(j);
+            const idx = mlx.mlx_array_new_data(&idx_buf, &[_]c_int{@intCast(n_commit)}, 1, .int32);
+            defer _ = mlx.mlx_array_free(idx);
+            const kept = try allocator.alloc(mlx.mlx_array, cap_out.len);
+            var kept_n: usize = 0;
+            defer {
+                for (kept[0..kept_n]) |a| _ = mlx.mlx_array_free(a);
+                allocator.free(kept);
+            }
+            for (cap_out, kept) |full, *out| {
+                out.* = mlx.mlx_array_new();
+                kept_n += 1;
+                try mlx.check(mlx.mlx_take_axis(out, full, idx, 1, s));
+            }
+            try dflash_mod.appendContext(model, dctx, kept, anchor_pos);
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            dctx.appendEvalArrays(eval_vec);
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+        }
+
+        const tokens = try allocator.alloc(u32, n_commit);
+        for (0..n_commit) |j| tokens[j] = @intCast(toks[j]);
+        for (tokens) |t| try self.generated_ids.append(allocator, t);
+        self.dflash_accepted_tokens += accepted;
+        self.next_token_id = next_pending;
+        self.advanceStep(@intCast(n_commit));
+        self.checkDflashRuntimeGate();
+        if (self.completion_tokens >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+        }
+        return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
     }
 
     /// One DFlash2 round over a best-first draft TREE instead of the selector's
@@ -10208,6 +10411,18 @@ pub const Generator = struct {
             if (val.len > 0 and val[0] == '0') on = false;
         }
         dflash_selector_cache = on;
+        return on;
+    }
+
+    var dflash_copy_cache: ?bool = null;
+    fn dflashCopyEnabled() bool {
+        if (dflash_copy_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_DFLASH_COPY")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '0') on = false;
+        }
+        dflash_copy_cache = on;
         return on;
     }
 
