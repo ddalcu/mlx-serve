@@ -106,6 +106,42 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertNil(ModelSettingsFile.load(path: path).override(for: "/m/a"))
     }
 
+    /// `alias` is the server's request name for the model: it round-trips,
+    /// an alias alone keeps the entry, and a taken or malformed name is refused.
+    func testAliasRoundTripsAndIsValidated() throws {
+        let path = tempPath()
+        var file = ModelSettingsFile()
+        var o = ModelOverride()
+        o.alias = "qwen"
+        XCTAssertTrue(o.hasSettings)
+        file.set(o, for: "/m/a/")
+        try file.save(path: path)
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(text.contains("\"alias\" : \"qwen\""), text)
+        let back = ModelSettingsFile.load(path: path)
+        XCTAssertEqual(back.override(for: "/m/a")?.alias, "qwen")
+        XCTAssertEqual(back.pathUsingAlias("qwen", except: "/m/b"), "/m/a")
+        XCTAssertNil(back.pathUsingAlias("qwen", except: "/m/a/"))
+
+        for bad in ["", "mlx-serve", "x@peer", "org/x", "two words", "a\"b"] {
+            XCTAssertFalse(ModelOverride.isValidAlias(bad), bad)
+        }
+        XCTAssertTrue(ModelOverride.isValidAlias("qwen3.6-27b:4bit"))
+    }
+
+    /// The server reads the alias per request, so an alias-only edit never
+    /// reloads the model.
+    func testAnAliasOnlyEditNeedsNoReload() {
+        var before = ModelOverride(ctxSize: 8192)
+        var after = before
+        after.alias = "q"
+        XCTAssertFalse(after.changesLoad(from: before))
+        after.ctxSize = 4096
+        XCTAssertTrue(after.changesLoad(from: before))
+        before.extra["future"] = 1
+        XCTAssertTrue(ModelOverride(ctxSize: 8192).changesLoad(from: before))
+    }
+
     /// The overflow card's button goes to the per-model sheet only when that
     /// model already has overrides; otherwise Settings, as before.
     func testContextIncreaseTarget() {

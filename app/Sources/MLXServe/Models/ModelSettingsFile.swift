@@ -36,6 +36,9 @@ enum MtpAcceptanceChoice: String, CaseIterable {
 /// keys are its keys. nil = the process default. Unknown keys are kept in
 /// `extra` so a future server field survives an app-side edit.
 struct ModelOverride: Equatable {
+    /// `alias`: a short request name for the model, read by the server per
+    /// request (`resolveRequestModelId`), so it needs no reload.
+    var alias: String?
     var ctxSize: Int?
     var kvQuant: KvQuantChoice?
     var mtp: Bool?
@@ -58,6 +61,7 @@ struct ModelOverride: Equatable {
 
     init(json: [String: Any]) {
         var rest = json
+        if let a = rest.removeValue(forKey: "alias") { alias = a as? String }
         if let c = rest.removeValue(forKey: "ctx_size") {
             if let n = c as? Int, n > 0 { ctxSize = n }
         }
@@ -79,12 +83,13 @@ struct ModelOverride: Equatable {
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
-        ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || drafter != nil || !templateKwargs.isEmpty
+        alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || drafter != nil || !templateKwargs.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
 
     var json: [String: Any] {
         var out = extra
+        if let alias { out["alias"] = alias }
         if let ctxSize { out["ctx_size"] = ctxSize }
         if let kvQuant { out["kv_quant"] = kvQuant.rawValue }
         if let mtp { out["mtp"] = mtp }
@@ -94,8 +99,23 @@ struct ModelOverride: Equatable {
         return out
     }
 
+    /// Mirrors the server's `validAlias`: `@` routes to a peer or provider, `/`
+    /// reads as an org/repo id, and "mlx-serve" names the default model.
+    static func isValidAlias(_ name: String) -> Bool {
+        guard !name.isEmpty, name.utf8.count <= 128, name != "mlx-serve" else { return false }
+        return name.utf8.allSatisfy { $0 > 0x20 && $0 != 0x7f && !"@/\"\\".utf8.contains($0) }
+    }
+
+    /// True when a field the server reads at LOAD differs; the alias does not count.
+    func changesLoad(from old: ModelOverride) -> Bool {
+        var a = self, b = old
+        a.alias = nil
+        b.alias = nil
+        return a != b
+    }
+
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
-        a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.drafter == b.drafter
+        a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.drafter == b.drafter
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }
@@ -119,6 +139,11 @@ struct ModelSettingsFile {
 
     func override(for path: String) -> ModelOverride? {
         entries[Self.key(path)]
+    }
+
+    /// Another model that already answers to `alias`, if any.
+    func pathUsingAlias(_ alias: String, except path: String) -> String? {
+        entries.first { $0.key != Self.key(path) && $0.value.alias == alias }?.key
     }
 
     /// Replaces the edited fields; keys the app does not know stay.

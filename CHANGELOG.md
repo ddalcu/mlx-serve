@@ -22,6 +22,7 @@
 - **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
 
 ### Changes
+- A model can have a short alias (Model Settings, or `"alias"` in model-settings.json) that works wherever a request names a model, including Ollama, load and unload; `/v1/models` lists it beside the full id (#520).
 - DFlash on Nemotron-H and dense Qwen3.5/3.8 emits exactly what serial decoding would, sampled requests included, on 4, 6 and 8-bit packs; seeded output with a DFlash drafter differs from earlier versions.
 - A seeded request gives the same text whether or not its prompt hit the prefix cache.
 - Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
