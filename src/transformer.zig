@@ -16,6 +16,7 @@ const rowqmv = @import("rowqmv.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
+const qmm_int8 = @import("qmm_int8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -17905,6 +17906,9 @@ pub const Transformer = struct {
             // 6 rows up it beats qmv2 on every 27B projection shape.
             if (try qmv_nax2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
+            // OPT-IN and LOSSY (activations to uint8); declines unless the
+            // switch is set, and below prompt width.
+            if (try qmm_int8.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
         }
         if (self.ternary_2bit) {
