@@ -79,23 +79,16 @@ pub const SOURCE =
     \\const device uint4* wc[4];
     \\#pragma clang loop unroll(full)
     \\for (int c = 0; c < 4; c++) wc[c] = (const device uint4*)(w + (size_t)min(ns + nl + 8 * c, N - 1) * (K / 16));
-    \\const device uint4* wp = (const device uint4*)(w + (size_t)(ns >> 5) * (size_t)Kg * 256) + lane * 2;
     \\const int mrow[4] = {mb, mb + 8, mb + 16, mb + 24};
     \\for (int g = 0; g < Kg; g++) {
     \\  uint4 wv[8];
-    \\  if (FULL) {
-    \\    // Plane copy (`PLANE_SOURCE`): this lane's 32 bytes, plane c at shift 2c.
-    \\    wv[0] = wp[(size_t)g * 64];
-    \\    wv[1] = wp[(size_t)g * 64 + 1];
-    \\  } else {
     \\#pragma clang loop unroll(full)
-    \\    for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
-    \\  }
+    \\  for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
     \\#pragma clang loop unroll(full)
     \\  for (int c = 0; c < 4; c++) {
-    \\    const uint s2 = FULL ? 2 * uint(c) : sh;
-    \\    const uint4 lo = FULL ? wv[0] : wv[2 * c];
-    \\    const uint4 hi = FULL ? wv[1] : wv[2 * c + 1];
+    \\    const uint s2 = sh;
+    \\    const uint4 lo = wv[2 * c];
+    \\    const uint4 hi = wv[2 * c + 1];
     \\    bw[c + 0] = (lo.x >> s2) & 0x03030303u; bw[c + 4] = (lo.y >> s2) & 0x03030303u;
     \\    bw[c + 8] = (lo.z >> s2) & 0x03030303u; bw[c + 12] = (lo.w >> s2) & 0x03030303u;
     \\    bw[c + 16] = (hi.x >> s2) & 0x03030303u; bw[c + 20] = (hi.y >> s2) & 0x03030303u;
@@ -150,27 +143,6 @@ pub const SOURCE =
     \\    for (int c = 0; c < 4; c++) if (nn + c < N) y[(size_t)mm * N + nn + c] = static_cast<T>(acc[i + c]);
     \\  }
     \\}
-;
-
-/// The weight re-laid out for FULL widths: per 32-column block and 128-group,
-/// lane l's 8 words hold at shift 2c the plane kq(l) of column nl(l) + 8c's word
-/// j, so a lane's operand is one contiguous 32-byte read. One thread per word.
-pub const PLANE_SOURCE =
-    \\const uint o = thread_position_in_grid.x;
-    \\const int W = w_shape[1];
-    \\const int Kg = W / 8;
-    \\const uint j = o & 7;
-    \\const uint lane = (o >> 3) & 31;
-    \\const uint g = (o >> 8) % uint(Kg);
-    \\const uint blk = (o >> 8) / uint(Kg);
-    \\const uint nl = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-    \\const uint kq = (lane & 1) + 2 * ((lane >> 3) & 1);
-    \\uint32_t v = 0;
-    \\for (uint c = 0; c < 4; c++) {
-    \\  const uint32_t word = w[(size_t)(blk * 32 + nl + 8 * c) * W + g * 8 + j];
-    \\  v |= ((word >> (2 * kq)) & 0x03030303u) << (2 * c);
-    \\}
-    \\wp[o] = v;
 ;
 
 /// amax, scale, quantize and code-sum for one 128-group in ONE pass. Eight
@@ -429,10 +401,34 @@ fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rot: ?Rotation, rows: c_int
 
 /// The kernel reads scales and biases group-major; the transposed copies are
 /// derived constants of the weight, made once and kept.
-/// `wp` is the plane copy the kernel reads on FULL widths (a second copy of the
-/// 2-bit weight, int8 route only); other widths read `w` itself.
-const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array, wp: ?mlx.mlx_array };
-var derived_cache: std.AutoHashMapUnmanaged(usize, Derived) = .{};
+const Derived = struct { scT: mlx.mlx_array, biT: mlx.mlx_array };
+
+/// The route's per-weight constants, owned by the model whose weights they
+/// derive from: the owner frees them in its `deinit` (on the inference thread),
+/// so a key can never outlive the weight it names.
+pub const Cache = struct {
+    map: std.AutoHashMapUnmanaged(usize, Derived) = .{},
+
+    pub fn deinit(self: *Cache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |d| {
+            _ = mlx.mlx_array_free(d.scT);
+            _ = mlx.mlx_array_free(d.biT);
+        }
+        self.map.deinit(std.heap.c_allocator);
+        self.* = .{};
+        dropMemo();
+    }
+};
+
+/// Frees the memoized quantization (it retains the last activation).
+pub fn dropMemo() void {
+    if (memo_q) |*mq| mq.deinit();
+    if (memo_x.ctx != null) _ = mlx.mlx_array_free(memo_x);
+    memo_q = null;
+    memo_x = .{ .ctx = null };
+    memo_signs = null;
+}
 
 fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var t = mlx.mlx_array_new();
@@ -446,48 +442,14 @@ fn transposed(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return c;
 }
 
-var plane_kernel: ?mlx.mlx_fast_metal_kernel = null;
-
-fn planeCopy(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (plane_kernel == null) {
-        const in_names = [_][*:0]const u8{"w"};
-        const out_names = [_][*:0]const u8{"wp"};
-        const iv = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
-        defer _ = mlx.mlx_vector_string_free(iv);
-        const ov = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
-        defer _ = mlx.mlx_vector_string_free(ov);
-        const k = mlx.mlx_fast_metal_kernel_new("msv_int8_plane", iv, ov, PLANE_SOURCE, "", true, false);
-        if (k.ctx == null) return error.MetalKernelCompileFailed;
-        plane_kernel = k;
-    }
-    const shape = mlx.getShape(w);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, 2, .uint32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, shape[0] * shape[1], 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    const inputs = [_]mlx.mlx_array{w};
-    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(iv);
-    var outs = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, plane_kernel.?, iv, cfg, s));
-    var wp = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(wp);
-    try mlx.check(mlx.mlx_vector_array_get(&wp, outs, 0));
-    try mlx.check(mlx.mlx_array_eval(wp));
-    return wp;
-}
-
-fn derivedCached(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bneg: bool, s: mlx.mlx_stream) !Derived {
+fn derivedCached(cache: *Cache, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bneg: bool, s: mlx.mlx_stream) !Derived {
     const key = @intFromPtr(w.ctx);
-    if (derived_cache.get(key)) |c| return c;
-    const n = mlx.getShape(w)[0];
+    if (cache.map.get(key)) |c| return c;
     const scT = try transposed(sc, s);
     // The factored epilogue never reads the biases of a bias == -scale pack.
     const biT = if (bneg) try retained(scT) else try transposed(bi, s);
-    const d = Derived{ .scT = scT, .biT = biT, .wp = if (@rem(n, 128) == 0) try planeCopy(w, s) else null };
-    try derived_cache.put(std.heap.c_allocator, key, d);
+    const d = Derived{ .scT = scT, .biT = biT };
+    try cache.map.put(std.heap.c_allocator, key, d);
     return d;
 }
 
@@ -531,6 +493,7 @@ fn configFor(key: CfgKey) !mlx.mlx_fast_metal_kernel_config {
 /// the shape/dtype is outside the route (caller keeps whatever it would do).
 /// LOSSY BY CONSTRUCTION — see the module comment.
 pub fn qmm(
+    cache: *Cache,
     x: mlx.mlx_array,
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
@@ -541,12 +504,13 @@ pub fn qmm(
     bneg: bool,
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
-    return qmmImpl(x, null, w, sc, bi, bits, group_size, bneg, s);
+    return qmmImpl(cache, x, null, w, sc, bi, bits, group_size, bneg, s);
 }
 
 /// `qmm(H(signs * x), ...)` with the rotation fused into the quantizer; null
 /// (caller rotates and takes `qmm`) outside it, e.g. a block other than 1024.
 pub fn qmmRotated(
+    cache: *Cache,
     x: mlx.mlx_array,
     signs: mlx.mlx_array,
     block: c_int,
@@ -560,10 +524,11 @@ pub fn qmmRotated(
 ) !?mlx.mlx_array {
     const xs = mlx.getShape(x);
     if (block != 1024 or xs.len == 0 or @rem(xs[xs.len - 1], 1024) != 0) return null;
-    return qmmImpl(x, .{ .signs = signs }, w, sc, bi, bits, group_size, bneg, s);
+    return qmmImpl(cache, x, .{ .signs = signs }, w, sc, bi, bits, group_size, bneg, s);
 }
 
 fn qmmImpl(
+    cache: *Cache,
     x: mlx.mlx_array,
     rot: ?Rotation,
     w: mlx.mlx_array,
@@ -593,13 +558,13 @@ fn qmmImpl(
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, k }, 2, s));
     var q = try quantizedFor(x, x2, rot, mpad, k, s);
     defer q.deinit();
-    const d = try derivedCached(w, sc, bi, bneg, s);
+    const d = try derivedCached(cache, w, sc, bi, bneg, s);
 
     if (!engaged_logged) {
         engaged_logged = true;
         log.info("[int8-prefill] engaged (LOSSY: activations quantized to int8): first call M={d} N={d} K={d}\n", .{ m, n, k });
     }
-    const inputs = [_]mlx.mlx_array{ q.xq, d.wp orelse w, d.scT, d.biT, q.ascale, q.rsum };
+    const inputs = [_]mlx.mlx_array{ q.xq, w, d.scT, d.biT, q.ascale, q.rsum };
     const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var outs = mlx.mlx_vector_array_new();
@@ -731,7 +696,9 @@ fn expectWithinBar(n: c_int, k: c_int, m: c_int) !void {
     try mlx.check(mlx.mlx_quantized_matmul(&stock, x, wq, sc, bi, true, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(2), "affine", s));
     const es = try errVsTruth(stock, truth, mu, nu, s);
 
-    const got = (try qmm(x, wq, sc, bi, 2, 128, true, s)) orelse {
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const got = (try qmm(&cache, x, wq, sc, bi, 2, 128, true, s)) orelse {
         std.debug.print("[qmm_int8] declined a shape it should take (M={d})\n", .{m});
         return error.RouteDeclined;
     };
@@ -769,9 +736,11 @@ test "qmm_int8: sibling projections of one activation quantize it once" {
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ n, @divExact(k, 128) }, 2, .float16, s));
+    var cache: Cache = .{};
+    defer cache.deinit();
     const before = quantize_calls;
     for (0..2) |_| {
-        const y = (try qmm(x, w, sc, sc, 2, 128, false, s)) orelse return error.RouteDeclined;
+        const y = (try qmm(&cache, x, w, sc, sc, 2, 128, false, s)) orelse return error.RouteDeclined;
         _ = mlx.mlx_array_free(y);
     }
     try std.testing.expectEqual(before + 1, quantize_calls);
@@ -788,7 +757,9 @@ test "qmm_int8: a CPU-stream call declines" {
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 128, 2 }, 2, .float16, s));
-    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(x, w, sc, sc, 2, 128, false, s));
+    var cache: Cache = .{};
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(&cache, x, w, sc, sc, 2, 128, false, s));
 }
 
 test "qmm_int8: declines below its row floor" {
@@ -802,7 +773,9 @@ test "qmm_int8: declines below its row floor" {
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
     try mlx.check(mlx.mlx_ones(&sc, &[_]c_int{ 128, 2 }, 2, .float16, s));
-    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(x, w, sc, sc, 2, 128, false, s));
+    var cache: Cache = .{};
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(?mlx.mlx_array, null), try qmm(&cache, x, w, sc, sc, 2, 128, false, s));
 }
 
 test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
@@ -837,9 +810,11 @@ test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
 
     const xr = try @import("rht.zig").transform(x, signs, 1024, false, s);
     defer _ = mlx.mlx_array_free(xr);
-    const want = (try qmm(xr, wu, sc, bi, 2, 128, true, s)) orelse return error.RouteDeclined;
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const want = (try qmm(&cache, xr, wu, sc, bi, 2, 128, true, s)) orelse return error.RouteDeclined;
     defer _ = mlx.mlx_array_free(want);
-    const got = (try qmmRotated(x, signs, 1024, wu, sc, bi, 2, 128, true, s)) orelse return error.RouteDeclined;
+    const got = (try qmmRotated(&cache, x, signs, 1024, wu, sc, bi, 2, 128, true, s)) orelse return error.RouteDeclined;
     defer _ = mlx.mlx_array_free(got);
     var eq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(eq);
@@ -848,4 +823,50 @@ test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
     var ok: bool = false;
     try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
     try std.testing.expect(ok);
+}
+
+// The bar: a weight's constants come from the cache that owns them, so a new
+// model (a fresh cache) never reads another model's scales off a reused handle.
+test "qmm_int8: a fresh cache derives its own constants for a reused weight handle" {
+    try requireNax();
+    const s = mlx.gpuStream();
+    const n: c_int = 256;
+    const k: c_int = 512;
+    const m: c_int = 64;
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_random_uniform(&x, mlx.mlx_array_new_float(-1.0), mlx.mlx_array_new_float(1.0), &[_]c_int{ m, k }, 2, .float16, .{ .ctx = null }, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_bits(&w, &[_]c_int{ n, @divExact(k, 16) }, 2, 4, .{ .ctx = null }, s));
+    var sc1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc1);
+    try mlx.check(mlx.mlx_ones(&sc1, &[_]c_int{ n, @divExact(k, 128) }, 2, .float16, s));
+    var sc2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc2);
+    var sc_twice = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc_twice);
+    try mlx.check(mlx.mlx_add(&sc_twice, sc1, sc1, s));
+    try mlx.check(mlx.mlx_add(&sc2, sc_twice, sc1, s));
+    var y: [2]mlx.mlx_array = undefined;
+    for ([_]mlx.mlx_array{ sc1, sc2 }, 0..) |sc, i| {
+        var cache: Cache = .{};
+        defer cache.deinit();
+        y[i] = (try qmm(&cache, x, w, sc, sc, 2, 128, false, s)) orelse return error.RouteDeclined;
+    }
+    defer for (y) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var y0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y0);
+    var y1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y1);
+    try mlx.check(mlx.mlx_astype(&y0, y[0], .float32, s));
+    try mlx.check(mlx.mlx_astype(&y1, y[1], .float32, s));
+    try mlx.check(mlx.mlx_array_eval(y0));
+    try mlx.check(mlx.mlx_array_eval(y1));
+    const v0 = mlx.mlx_array_data_float32(y0).?;
+    const v1 = mlx.mlx_array_data_float32(y1).?;
+    // Scales tripled, so every output triples (to f16 rounding).
+    for (0..@intCast(m * n)) |i| try std.testing.expectApproxEqAbs(3.0 * v0[i], v1[i], 0.02 * @abs(v1[i]) + 0.05);
 }
