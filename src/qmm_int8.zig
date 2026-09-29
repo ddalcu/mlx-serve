@@ -620,9 +620,23 @@ fn requireNax() !void {
     if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
 }
 
+/// A kernel failure is its test's: name it and drop its latch, or the next test inherits it.
+fn dropOwnLatch() void {
+    var buf: [512]u8 = undefined;
+    if (mlx.takeError(&buf)) |msg| std.debug.print("[qmm_int8] mlx: {s}\n", .{msg});
+}
+
 test "qmm_int8: error stays within a small multiple of stock at prompt width" {
     try requireNax();
     try expectWithinBar(512, 1536, 128);
+}
+
+test "qmm_int8: a failing kernel test leaves no latch for the next test" {
+    try requireNax();
+    mlx.armLatchingFaultForTest(1);
+    defer mlx.armLatchingFaultForTest(0);
+    try std.testing.expectError(error.MlxError, expectWithinBar(512, 1536, 128));
+    try std.testing.expect(!mlx.errorPending());
 }
 
 test "qmm_int8: a width that is not a whole tile keeps the bar (GDN b/a projections)" {
@@ -636,6 +650,7 @@ test "qmm_int8: a row count that is not a whole tile keeps the bar" {
 }
 
 fn expectWithinBar(n: c_int, k: c_int, m: c_int) !void {
+    errdefer dropOwnLatch();
     const s = mlx.gpuStream();
     const nu: usize = @intCast(n);
     const ku: usize = @intCast(k);
@@ -725,6 +740,7 @@ fn expectWithinBar(n: c_int, k: c_int, m: c_int) !void {
 
 test "qmm_int8: sibling projections of one activation quantize it once" {
     try requireNax();
+    errdefer dropOwnLatch();
     const s = mlx.gpuStream();
     const n: c_int = 128;
     const k: c_int = 256;
@@ -782,6 +798,7 @@ test "qmm_int8: declines below its row floor" {
 
 test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
     try requireNax();
+    errdefer dropOwnLatch();
     const s = mlx.gpuStream();
     const n: c_int = 256;
     const k: c_int = 2048;
@@ -831,6 +848,7 @@ test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
 // model (a fresh cache) never reads another model's scales off a reused handle.
 test "qmm_int8: a fresh cache derives its own constants for a reused weight handle" {
     try requireNax();
+    errdefer dropOwnLatch();
     const s = mlx.gpuStream();
     const n: c_int = 256;
     const k: c_int = 512;
