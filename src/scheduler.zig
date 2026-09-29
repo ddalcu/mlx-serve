@@ -5131,6 +5131,10 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         sch.registry.finalizeEvictionLocked(victim);
         sch.registry.mutex.unlock(sch.io);
     }
+    // unloadResident freed the victims into MLX's allocator cache — clear it
+    // BEFORE the load: its preflight reads OS-level availability, and the
+    // parked pool would make it refuse a load that fits.
+    _ = mlx.mlx_clear_cache();
 
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on
