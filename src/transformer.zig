@@ -462,7 +462,7 @@ pub const GdnRoute = enum { stock, blocked, pipelined };
 
 var gdn_pipelined_cached: ?mlx.mlx_fast_metal_kernel = null;
 pub var gdn_pipelined_override: ?bool = null; // test seam
-var gdn_pipelined_route: ?bool = null;
+var gdn_pipelined_env: ??[]const u8 = null; // MLX_SERVE_GDN_PIPELINED, read once
 
 /// Archs whose prefill was A/B'd against the blocked kernel on an M5 Ultra: Flash Next
 /// (`qwen4_exp`, +2.6%) and dense Qwen3.8-27B (`qwen3_5`, +1.1 to 1.5%), both 48 value heads.
@@ -483,13 +483,15 @@ pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool
     return false;
 }
 
+/// Decided per call, since the registry serves several model types in one process; only
+/// the env read is cached.
 fn gdnPipelinedEnabled(model_type: []const u8) bool {
     if (gdn_pipelined_override) |v| return v;
-    if (gdn_pipelined_route) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
-    const on = gdnPipelinedFor(raw, model_type, naxAvailable());
-    gdn_pipelined_route = on;
-    return on;
+    if (gdn_pipelined_env == null) {
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
+        gdn_pipelined_env = raw;
+    }
+    return gdnPipelinedFor(gdn_pipelined_env.?, model_type, naxAvailable());
 }
 
 fn getGdnKernelPipelined() !mlx.mlx_fast_metal_kernel {
@@ -52685,6 +52687,17 @@ test "GDN pipelined route: measured archs on NAX by default, the env forces eith
     try testing.expect(!gdnPipelinedFor(null, "prism_hadamard_qwen35", true));
     try testing.expect(gdnPipelinedFor("1", "prism_hadamard_qwen35", false));
     try testing.expect(!gdnPipelinedFor("0", "qwen4_exp", true));
+}
+
+test "GDN pipelined route: each model type gets its own verdict in one process" {
+    // Flash Next first, then an unmeasured MoE pack: the second call must not inherit the first's route.
+    const order = [_][]const u8{ "qwen4_exp", "qwen3_5_moe", "prism_hadamard_qwen35", "qwen3_5" };
+    for (order) |t| {
+        _ = gdnPipelinedEnabled(t);
+    }
+    for (order) |t| {
+        try testing.expectEqual(gdnPipelinedFor(gdn_pipelined_env.?, t, naxAvailable()), gdnPipelinedEnabled(t));
+    }
 }
 
 test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
