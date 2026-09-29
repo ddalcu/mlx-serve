@@ -65,7 +65,7 @@ pub const SOURCE =
     \\thread uint32_t* bw = (thread uint32_t*)&bT;
     \\auto tA0 = A.template slice<128, 32>(0, ms);
     \\auto cT = op.template get_destination_cooperative_tensor<
-    \\    metal::remove_addrspace_t<decltype(tA0)>, decltype(bT), int32_t>();
+    \\    metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
     \\constexpr int CAP = 32;
     \\const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
     \\const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
