@@ -31323,12 +31323,57 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_astype(&indexed_lhs, lhs_idx, .uint32, self.s));
                 break :blk try verifyIndexedExpertInput(self.s, x_flat, indexed_lhs, mlx.getShape(mw.switch_gate_w)[0]);
             } else null;
+            var fused_act: ?mlx.mlx_array = null;
+            var mapped_gate: ?mlx.mlx_array = null;
+            var mapped_up: ?mlx.mlx_array = null;
+            errdefer {
+                if (mapped_gate) |value| _ = mlx.mlx_array_free(value);
+                if (mapped_up) |value| _ = mlx.mlx_array_free(value);
+            }
+            const nax_available = verifyQmmNaxAvailable();
+            const gate_experts = mlx.getShape(mw.switch_gate_w)[0];
+            const row_block = total_inds >= 16 and gate_experts > 0 and @divTrunc(total_inds, gate_experts) >= 4;
+            if (input_view == null and !self.verifyFeatureEnabled(.routing, skip_shared, B, S) and
+                row_block and nax_available and gather_qmm_nax.enabled() and gate_qp.mode == .affine and up_qp.mode == .affine)
+            {
+                var x_tok = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x_tok);
+                try mlx.check(mlx.mlx_reshape(&x_tok, x_flat, &.{ B * S, 1, D }, 3, self.s));
+                var row_map = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(row_map);
+                try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
+                if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and cfg.swiglu_limit <= 0.0 and
+                    mw.switch_gate_bias.ctx == null and mw.switch_up_bias.ctx == null and
+                    gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
+                {
+                    const sigtab = try @import("hc_prefill.zig").sigmoidTable(self.s);
+                    if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, gate_qp.bits, gate_qp.group_size, nax_available, self.s)) |act3| {
+                        // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
+                        defer _ = mlx.mlx_array_free(act3);
+                        var act = mlx.mlx_array_new();
+                        errdefer _ = mlx.mlx_array_free(act);
+                        const a3 = mlx.getShape(act3);
+                        try mlx.check(mlx.mlx_reshape(&act, act3, &.{ a3[0], a3[2] }, 2, self.s));
+                        fused_act = act;
+                    }
+                }
+                if (fused_act == null) {
+                    mapped_gate = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, sorted_inds, gate_qp.bits, gate_qp.group_size, nax_available, self.s);
+                    mapped_up = try gather_qmm_nax.sortedGatherMapped(x_tok, row_map, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, up_qp.bits, up_qp.group_size, nax_available, self.s);
+                    if (mapped_gate == null or mapped_up == null) {
+                        if (mapped_gate) |value| _ = mlx.mlx_array_free(value);
+                        if (mapped_up) |value| _ = mlx.mlx_array_free(value);
+                        mapped_gate = null;
+                        mapped_up = null;
+                    }
+                }
+            }
             var x_gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x_gathered);
-            if (input_view == null) try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
+            if (fused_act == null and mapped_gate == null and input_view == null) try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
             var x_rep = input_view orelse mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x_rep);
-            if (input_view == null) try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &.{ total_inds, 1, D }, 3, self.s));
+            if (fused_act == null and mapped_gate == null and input_view == null) try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &.{ total_inds, 1, D }, 3, self.s));
             const projection_lhs = if (input_view != null) indexed_lhs else no_idx;
             if (input_view != null) {
                 mtp_verify_indexed_input_calls +%= 1;
@@ -31341,21 +31386,25 @@ pub const Transformer = struct {
                 }
             }
 
-            const expert_act = if (self.verify_paired_gu_installed and B == 1 and S == 4 and
+            const expert_act = if (fused_act) |act| act else if (self.verify_paired_gu_installed and B == 1 and S == 4 and
                 self.verifyFeatureEnabled(.routing, skip_shared, B, S))
                 try verifyPairedGateUp(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs_idx, sorted_inds)
             else blk: {
-                var gate_out_3d = mlx.mlx_array_new();
+                const use_mapped_gate = mapped_gate != null;
+                var gate_out_3d = mapped_gate orelse mlx.mlx_array_new();
+                mapped_gate = null;
                 defer _ = mlx.mlx_array_free(gate_out_3d);
-                try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, projection_lhs, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
+                if (!use_mapped_gate) try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, projection_lhs, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
                 var gate_out = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(gate_out);
                 try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
                 try self.addExpertBias(&gate_out, mw.switch_gate_bias, sorted_inds);
 
-                var up_out_3d = mlx.mlx_array_new();
+                const use_mapped_up = mapped_up != null;
+                var up_out_3d = mapped_up orelse mlx.mlx_array_new();
+                mapped_up = null;
                 defer _ = mlx.mlx_array_free(up_out_3d);
-                try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, projection_lhs, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
+                if (!use_mapped_up) try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, projection_lhs, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
                 var up_out = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(up_out);
                 try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));

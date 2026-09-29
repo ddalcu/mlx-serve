@@ -114,7 +114,8 @@ Used in mlx-serve (`src/transformer.zig`):
     body itself derives from our own `msv_attn_p256`, not from their source.
     thank you Jonathan Spangler.
   * The segmented sorted NAX gather_qmm tile scan and affine matmul schedules,
-    ported from `omlx/patches/m5_gather_qmm_nax.py` at d6b2b92.
+    with row-mapped inputs and paired gate/up SwiGLU epilogue, ported from
+    `omlx/patches/m5_gather_qmm_nax.py` at d6b2b92.
     
 Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
 

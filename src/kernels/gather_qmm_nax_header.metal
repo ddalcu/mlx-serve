@@ -191,7 +191,7 @@ struct AffineQ {
 // them into threadgroup memory (row stride BKP). The *_tail variants
 // cover a K tail of k_valid (a multiple of 32) columns and never touch a
 // word or group at or past it.
-template <typename Q, typename G>
+template <typename Q, typename G, bool PAIR = false>
 struct TileLoader {
   using WT = typename Q::WT;
   using P = typename Q::P;
@@ -224,6 +224,24 @@ struct TileLoader {
         col(short((lid % G::kTPR) * kVPT)) {
     const size_t w_off = size_t(row);
     src = (const device uint32_t*)(w_tile + w_off * (K * kBits / 8) +
+                                   col * kBits / 8);
+    q.advance(w_off * (K / Q::kGroup));
+  }
+
+  METAL_FUNC TileLoader(
+      const device uint8_t* gate_tile,
+      const device uint8_t* up_tile,
+      const int K,
+      thread const Q& gate_q,
+      thread const Q& up_q,
+      const uint lid) thread
+      : q(gate_q),
+        row(short(lid / G::kTPR)),
+        col(short((lid % G::kTPR) * kVPT)) {
+    const size_t w_off = PAIR ? size_t(((row >> 5) << 4) + (row & 15)) : size_t(row);
+    const bool use_up = PAIR && ((row >> 4) & 1);
+    q = use_up ? up_q : gate_q;
+    src = (const device uint32_t*)((use_up ? up_tile : gate_tile) + w_off * (K * kBits / 8) +
                                    col * kBits / 8);
     q.advance(w_off * (K / Q::kGroup));
   }
@@ -691,5 +709,3 @@ METAL_FUNC void msv_gqmm_tile_scan(
     tile_count[0] = min(running, max_tiles);
   }
 }
-
-
