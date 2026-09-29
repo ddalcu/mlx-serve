@@ -386,6 +386,8 @@ pub const Rotation = struct { signs: mlx.mlx_array };
 fn quantizedFor(x: mlx.mlx_array, x2: mlx.mlx_array, rot: ?Rotation, rows: c_int, k: c_int, s: mlx.mlx_stream) !Quantized {
     const sig: ?*anyopaque = if (rot) |r| r.signs.ctx else null;
     if (memo_q) |mq| {
+        // Identity, not shape: the shape pointer names the array itself, and the memo
+        // retains `memo_x`, so its address cannot be reused by another activation.
         if (mlx.mlx_array_shape(memo_x) == mlx.mlx_array_shape(x) and memo_signs == sig) return retainedQ(mq);
     }
     var q = if (rot) |r| try rotateQuantizeRows(x2, r.signs, rows, k, s) else try quantizeRows(x2, rows, k, s);
