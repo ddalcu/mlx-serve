@@ -28,6 +28,7 @@
 - Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - Qwen-Image-2.1 packs whose text or vision embedding tables are quantized at a group size other than 64 load them at the right width instead of misreading them silently (#496).
+- Qwen-Image-2.1 packs that store their VAE in MLX layout, like `mlx-community/Qwen-Image-2.1-MLX-4bit`, generate and edit instead of failing at the first VAE conv (#496).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - A request that names a model by its path no longer gets another model's answer: a pack that failed to load returns its load error, and an unknown path returns 404 (#585).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).

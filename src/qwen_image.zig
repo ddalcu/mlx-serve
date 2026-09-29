@@ -1311,9 +1311,16 @@ const Conv = struct {
         const wk = try std.fmt.allocPrint(a, fmt ++ ".weight", args);
         defer a.free(wk);
         const raw = w.get(wk) orelse return null;
-        const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 1 }, s); // OIHW → OHWI
-        defer free(t);
-        const tc = try contig(t, s);
+        // Diffusers stores OIHW, mlx-community's VAE OHWI (square kernel in the
+        // middle, channels last). Only in == k reads either way; taken as OIHW,
+        // and no conv here has it (RGBA in, >= 64 channels after).
+        const shape = mlx.getShape(raw);
+        const already_ohwi = shape.len == 4 and shape[1] == shape[2] and shape[3] != shape[1];
+        const tc = if (already_ohwi) try contig(raw, s) else blk: {
+            const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 1 }, s); // OIHW → OHWI
+            defer free(t);
+            break :blk try contig(t, s);
+        };
         defer free(tc);
         const wf = try astype(tc, .float32, s);
         errdefer free(wf);
@@ -2562,6 +2569,36 @@ test "QwenImage strip conv equals the whole-image conv" {
     const strips = try conv.forwardStrips(x, 4, s);
     defer free(strips);
     try expectParity("strip conv", strips, whole, s);
+}
+
+test "QwenImage VAE convs load the same from OIHW and OHWI packs" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    const a = testing.allocator;
+    var key = mlx.mlx_array_new();
+    defer free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 2));
+    // Bar: a 3x3 RGBA stem and a 1x1 conv, stored either way, load as the same OHWI weight.
+    for ([_][4]c_int{ .{ 8, 3, 3, 4 }, .{ 64, 1, 1, 64 } }) |ohwi| {
+        var want = mlx.mlx_array_new();
+        defer free(want);
+        try mlx.check(mlx.mlx_random_normal(&want, &ohwi, ohwi.len, .float32, 0.0, 1.0, key, s));
+        const oihw = try transpose(want, &[_]c_int{ 0, 3, 1, 2 }, s);
+        defer free(oihw);
+        for ([_]A{ want, oihw }) |stored| {
+            var w = Weights.init(a);
+            defer w.deinit();
+            var sw = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&sw, stored));
+            try w.map.put(try a.dupe(u8, "c.weight"), sw);
+            var bias = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&bias, &[_]c_int{ohwi[0]}, 1, .float32, s));
+            try w.map.put(try a.dupe(u8, "c.bias"), bias);
+            var conv = try Conv.load(&w, a, s, "c", .{});
+            defer conv.deinit();
+            try testing.expectEqualSlices(c_int, &ohwi, mlx.getShape(conv.w));
+            try testing.expectEqual(@as(f32, 0), try maxAbsDiff(conv.w, want, s));
+        }
+    }
 }
 
 test "QwenImage stages band only when their activations are large" {
