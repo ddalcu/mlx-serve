@@ -19,7 +19,9 @@ and line counts are counted, not judged), and the eval's own noise measured befo
 
 ## Run it
 
-Needs `pi`, `node`, `agent-browser` (`npm i -g agent-browser`) and the `claude` CLI.
+Needs `pi`, `node`, `agent-browser` (`npm i -g agent-browser`) and the `claude` CLI. `run.sh`
+writes pi's config per run with `mlx-serve launch pi` (set `MLX_SERVE` to use a build that isn't on
+`PATH`), so pi's context window and compaction match what the server advertises.
 
 ```sh
 mlx-serve --serve --port 8080 --model <arm A> <flags>        # start the first arm
@@ -34,28 +36,19 @@ A voxel-pagoda run takes 20 to 90 minutes on an M5 Ultra (`TIMEOUT_MIN` caps it)
 about $0.10 per run-rep on Sonnet 5.5. Everything lands in `tests/agent_eval/out/` (ignored).
 Rerunning `capture.sh` or `judge.py` skips what is already done.
 
-## What it showed
+## Reading results
 
-The first use compared two Qwen3.8 Flash-Next packs on the voxel-pagoda task: the published
-mixed-4-8bit and mid48, which moves more non-expert projections to 4-bit and is 11% faster per
-forward with no loss on MMLU-Pro-400.
+The first use, comparing two Flash-Next packs, is written up in #628. Two lessons from it:
 
-| 5 runs each, bug-free builds | mid48 | mixed-4-8bit |
-|---|---:|---:|
-| scene score | 0.82 ± 0.06 | 0.86 ± 0.15 |
-| median turns | 129 | 226 |
-| median source lines the agent wrote | 2,130 | 4,779 |
-| runs that ended on an empty reply | 2 of 5 | 0 of 5 |
-
-Scene quality didn't separate the packs, but scope did: every mid48 project was smaller than every
-mixed-4-8bit one. MMLU never showed that. Two lessons on reading it:
-
-- **Runs from a buggy build are not signal.** 13 of the first 23 scenes came from builds where prompt
+- **Runs from a buggy build are not signal.** Most of the first scenes came from builds where prompt
   lookup drafts ran under typical acceptance (fixed in #614). Those runs loop-stopped far more often,
-  and including them more than doubled the apparent quality gap (0.16 against 0.07).
+  and including them more than doubled the apparent quality gap between the arms.
 - **Read the claims, not only the score.** The first rubric scored 1.00 on most working scenes, and a
   later one passed signs whose text hung off the board. Both were caught by checking the judge's
   per-claim reasons against the frames; a pilot on a handful of runs before the full set is cheap.
+
+Scene score alone can hide a difference: the counted columns (turns, source lines, how runs ended)
+separated those packs when the score didn't.
 
 ## Use it again
 
