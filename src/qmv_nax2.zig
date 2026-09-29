@@ -447,7 +447,14 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
     return out;
 }
 
+/// The kernel runs on a NAX GPU only; the routing tests above force the
+/// predicate with `nax_override` and never execute it.
+fn requireNax() !void {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+}
+
 fn parityAgainstStock(widths: []const c_int) !void {
+    try requireNax();
     const s = mlx.gpuStream();
     const n: c_int = 1024;
     const k: c_int = 1536; // 12 whole 128-groups
@@ -551,6 +558,7 @@ test "qmv_nax2 narrow: row tiling holds across and past a 16-row block" {
 }
 
 test "qmv_nax2 narrow: the half dequant is bit-identical to the f32 dequant" {
+    try requireNax();
     const s = mlx.gpuStream();
     const n: c_int = 1024;
     const k: c_int = 1536;
