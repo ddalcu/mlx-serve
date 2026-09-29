@@ -21,42 +21,6 @@ SCALE = 1.0 / 16.0
 INT_MAX = np.iinfo(np.int32).max
 BF16_STORE_FLOOR = 2.0e-3
 
-THREE_BLOCK = """      NAXTile<T,1,1> Shi, Slo, Stail;
-      for(short j=0;j<8;++j) {
-        Shi.frag_at(0,0)[j]=T(S.frag_at(0,ik)[j]);
-        float residual=S.frag_at(0,ik)[j]-float(Shi.frag_at(0,0)[j]);
-        Slo.frag_at(0,0)[j]=T(residual);
-        Stail.frag_at(0,0)[j]=T(residual-float(Slo.frag_at(0,0)[j]));
-      }
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Shi.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Slo.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Stail.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-"""
-
-ONE_BLOCK = """      NAXTile<T,1,1> Shi;
-      for(short j=0;j<8;++j) {
-        Shi.frag_at(0,0)[j]=T(S.frag_at(0,ik)[j]);
-      }
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Shi.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-"""
-
-TWO_BLOCK = """      NAXTile<T,1,1> Shi, Slo;
-      for(short j=0;j<8;++j) {
-        Shi.frag_at(0,0)[j]=T(S.frag_at(0,ik)[j]);
-        float residual=S.frag_at(0,ik)[j]-float(Shi.frag_at(0,0)[j]);
-        Slo.frag_at(0,0)[j]=T(residual);
-      }
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Shi.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-      BaseNAXFrag::mma(O.frag_at(0,d),O.frag_at(0,d+1),Slo.frag_at(0,0),
-        metal::false_type{},V.frag_at(0,0),V.frag_at(0,1),metal::false_type{});
-"""
-
-
 def zig_metal(name: str, path: str | None = None) -> str:
     text = open(path or os.path.join(ROOT, "src/transformer.zig")).read()
     start = text.find("const " + name + " =")
@@ -71,29 +35,17 @@ def zig_metal(name: str, path: str | None = None) -> str:
     return "\n".join(out) + "\n"
 
 
-def nax_source(terms: int) -> str:
-    src = open(os.path.join(ROOT, "src/kernels/qsa_nax.metal")).read()
-    if THREE_BLOCK in src:
-        block = THREE_BLOCK
-    elif TWO_BLOCK in src:
-        block = TWO_BLOCK
-    elif ONE_BLOCK in src:
-        block = ONE_BLOCK
-    else:
-        raise RuntimeError("PV term block not found in qsa_nax.metal")
-    replacement = {1: ONE_BLOCK, 2: TWO_BLOCK, 3: THREE_BLOCK}[terms]
-    if block == replacement:
-        return src
-    return src.replace(block, replacement)
+def nax_source() -> str:
+    return open(os.path.join(ROOT, "src/kernels/qsa_nax.metal")).read()
 
 
 def f32_out(src: str) -> str:
-    return (
-        src.replace("device T* Op=out", "device float* Op=out")
-        .replace("device T* Optr = out", "device float* Optr = out")
-        .replace("T(Ofrag[id].x * inv)", "(Ofrag[id].x * inv)")
-        .replace("T(Ofrag[id].y * inv)", "(Ofrag[id].y * inv)")
-    )
+    return (src.replace("device bfloat* o = (device bfloat*)out", "device float* o = (device float*)out")
+            .replace("vec<bfloat, 8> w;", "vec<float, 8> w;")
+            .replace("bfloat(e0 * rr)", "e0 * rr")
+            .replace("bfloat(e1 * rr)", "e1 * rr")
+            .replace("*(device vec<bfloat, 8>*)(o + 32 * jj)",
+                     "*(device vec<float, 8>*)(o + 32 * jj)"))
 
 
 _KERNELS: dict = {}
@@ -104,8 +56,11 @@ def kernel(kind: str, terms: int = 3, out_f32: bool = True):
     if key in _KERNELS:
         return _KERNELS[key]
     if kind == "nax":
-        src = nax_source(terms)
+        src = nax_source()
         header = open(os.path.join(ROOT, "src/kernels/qsa_nax_header.metal")).read()
+        header = header.replace("PV_TERMS = 2", f"PV_TERMS = {terms}")
+        if terms == 3:
+            header = header.replace("using PT = half;", "using PT = bfloat;")
         name = f"qsa_nax_t{terms}_{'f32' if out_f32 else 'bf16'}"
     else:
         src = zig_metal("ATTN_QSA256_KERNEL_SOURCE")
@@ -142,11 +97,15 @@ def run_kernel(k, q, kv_k, kv_v, blocks, out_f32, B, S, nax=False):
     return np.array(out.astype(mx.float32))
 
 
-def make_blocks(B, S, KV, KB, rng):
+def make_blocks(B, S, KV, KB, rng, *, recent=False):
     ids = np.full((B, S, KB), INT_MAX, dtype=np.int32)
     for b in range(B):
         for s in range(S):
             complete = (KV - S + s + 1) // RATIO
+            if recent:
+                n = min(KB, complete)
+                ids[b, s, :n] = np.arange(complete - n, complete, dtype=np.int32)
+                continue
             choices = np.arange(complete, dtype=np.int32)
             rng.shuffle(choices)
             n = min(KB, complete)
@@ -227,9 +186,9 @@ def errors_vs_f64(y, indices, reference):
     return float(np.max(err)), float(np.sqrt(np.mean(err * err))), err
 
 
-def eval_case(B, S, KV, KB, seed, kind, terms, rows=None, heads=None):
+def eval_case(B, S, KV, KB, seed, kind, terms, rows=None, heads=None, *, recent=False):
     rng = np.random.default_rng(seed)
-    ids = make_blocks(B, S, KV, KB, np.random.RandomState(seed))
+    ids = make_blocks(B, S, KV, KB, np.random.RandomState(seed), recent=recent)
     q, k, v, q_t, k_t, v_t = make_qkv(B, S, KV, rng, kind)
     blocks = mx.array(ids)
     mx.eval(q, k, v, blocks)
@@ -273,6 +232,22 @@ def eval_case(B, S, KV, KB, seed, kind, terms, rows=None, heads=None):
         "nb_err": nb_err,
         "sb_err": sb_err,
     }
+
+
+def cmd_prefill_shapes() -> int:
+    # Full dispatch geometry, with an independent fp64 oracle on causal-edge rows.
+    for kv in (8192, 16384, 65536):
+        r = eval_case(1, 8192, kv, 512, 4020 + kv, "uniform", 2,
+                      rows=[0, 1, 2, 3, 4, 5, 8190, 8191], recent=True)
+        bar = max(1.5 * r["stock_bf16_max"], 4.9e-4)
+        f32_bar = max(1.5 * r["stock_max"], 4.9e-4)
+        print(f"S=8192 KV={kv} checked={r['checked']} stock={r['stock_bf16_max']:.3e} "
+              f"nax={r['nax_bf16_max']:.3e} bar={bar:.3e} "
+              f"f32={r['nax_max']:.3e}/{f32_bar:.3e}")
+        if (not np.isfinite(r["nax_bf16_max"]) or r["nax_bf16_max"] > bar
+                or not np.isfinite(r["nax_max"]) or r["nax_max"] > f32_bar):
+            return 1
+    return 0
 
 
 def med_ms(f, reps=9, warm=4):
@@ -337,9 +312,9 @@ def step_for(kind, terms, q, k, v, B, S):
 
 CASES = [
     (2, 17, 17, 512, 4289 + 17, "uniform"),
-    (1, 40, 101, 6, 4289 + 40, "uniform"),
+    (1, 40, 101, 512, 4289 + 40, "uniform"),
     (1, 65, 65599, 512, 4289 + 65, "uniform"),
-    (1, 40, 101, 6, 99, "relu_zero"),
+    (1, 40, 101, 512, 99, "relu_zero"),
 ]
 
 
@@ -434,12 +409,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sweep-terms", action="store_true")
     p.add_argument("--bench", action="store_true")
+    p.add_argument("--prefill-shapes", action="store_true")
     p.add_argument("--terms", type=int, default=2, choices=(1, 2, 3))
     args = p.parse_args()
     if args.sweep_terms:
         return cmd_sweep()
     if args.bench:
         return cmd_bench(args.terms)
+    if args.prefill_shapes:
+        return cmd_prefill_shapes()
     return cmd_parity(args.terms)
 
 

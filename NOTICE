@@ -229,12 +229,13 @@ variant) so a fused kernel stays bit-identical to the op chain it replaces.
 Those are our own implementations written against MLX's observable behaviour,
 not copies of its source.
 
-`src/kernels/qsa_nax_header.metal` adapts the cooperative NAX fragment layout
-and MMA helpers from MLX's `steel/attn/nax.h` (Copyright (c) 2025 Apple
-Inc., MIT License, the same license as this project's LICENSE), and
-`src/kernels/qsa_nax.metal` adapts the split-head-dimension attention
-algorithm to per-query sparse block selection with a two-term bf16 PV.
-Contributed by Nikolai V.
+The original QSA NAX kernel adapted MLX's `steel/attn/nax.h` (Copyright
+(c) 2025 Apple Inc., MIT License). The current `src/kernels/qsa_nax.metal`
+and `src/kernels/qsa_nax_header.metal` port oMLX's occupancy-tuned QSA
+kernel from `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/
+qwen4_exp/qsa_nax.py` at d6b2b92 (Apache-2.0).
+https://github.com/jundot/omlx/pull/4020
+Original mlx-serve QSA NAX implementation contributed by Nikolai V.
 
 --------------------------------------------------------------------------------
 mlx-lm
