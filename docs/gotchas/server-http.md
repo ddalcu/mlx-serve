@@ -106,6 +106,11 @@ Found 2026-07-19 by the integration run's SafeAllocator right after adding the `
 ### A READY model must never advertise LESS capability than its unloaded stub (empty-caps class, second bite)
 Live 2026-07-21 (two-Mac LAN session): the app tray showed "No models yet" while the user was actively chatting on the peer's DeepSeek-V4-Flash GGUF — the loaded model itself rendered `capabilities:[]` in `/v1/models`. The ready path gated `has_chat` on `chat_config.chat_template.len > 0`, but embedded-engine GGUFs (ds4/llama) can ship NO chat_template in the header and still serve chat via fallback formatting. Ironically the UNLOADED gguf stub path already advertised `["chat","tool_use","streaming","json_schema"]` unconditionally — only loading the model made it vanish from every capability-driven client (the tray's LAN chat count, the "On Your Network" pickers). Same class as the ready-path `.mesh`/"3d" hole the `ReadyCaps` comment documents. Fix: `readyHasChat(is_encoder_only, chat_template_len, has_embedded_lm)` — template presence is NOT the gate for ds4/llama entries; used by BOTH renderModelEntry and the index page. App side: `ModelInfo.lanAdvertises(capability)` treats an empty capabilities array on a `lan_peer` entry as chat (old-peer tolerance — media entries always advertise their modality, so empty == this bug). Guards: `readyHasChat` test (server.zig), `LanModelCapabilityTests` (app).
 
+### The LAN gate must resolve a model name exactly like dispatch (alias bypass)
+Found while adding Model Settings aliases (#520), before release. The keyless LAN gate read the body's `model` and, for any name that was not a registry id, checked the DEFAULT model against the share list. Dispatch then resolved the same name as an alias and served a different model. With the default shared and the aliased model not shared, a LAN client reached the unshared model by its alias (200, and the model cold-loaded).
+Fix: one resolver, `resolveRequestModelId` (exact id, path, then alias, then on `/api/` the untagged alias and Ollama's short-name match), called by dispatch, `lanShareDenial`, `/v1/load-model`, `/v1/unload-model` and `/api/show`. It also closes the older Ollama short-name case on the gate.
+Guard: `tests/test_model_alias.sh` [2] (a shared symlinked twin as the default; red on revert: 200 and the unshared model loaded) + the `resolveRequestModelId` alias unit test.
+
 ### @peer proxying is bounded by the TUNNEL MARKER, not by loopback-ness (sandbox 403 class)
 Live 2026-07-21: pi/hermes running in the Agent Sandbox VM got `403 "Remote (@peer) model ids are host-local"` for the model the host app was happily chatting on. The guest reaches the host over the VM NAT interface (`192.168.64.1`), so it is non-loopback BY CONSTRUCTION — and both the keyless LAN gate (`lanShareDenial`) and the proxy dispatch required loopback to initiate an @peer hop. Worse, with `--api-key` set the gate is skipped but dispatch still required loopback, so a keyed guest request naming @peer fell through to the unknown-id strip and would have been answered by the LOCAL default model silently. The loop/amplification bound never actually needed loopback: `lan.tunnel` has always stamped `X-MLX-LAN: 1` on every request it forwards, and the forwarded body carries the BARE id. New rule: any DIRECT client (loopback app, sandbox guest, phone on the LAN) may initiate exactly ONE hop; a request carrying the tunnel marker is never proxied again (`isTunneledRequest` at the gate AND at dispatch). Access-wise this exposes nothing new — the peer's own share gate still governs its models, and a LAN client could always ask the peer directly. Guards: `lanShareDenial` + `isTunneledRequest` tests (server.zig); `tests/test_lan_share.sh` "tunneled request never hops again" / "direct @peer id proxies" / "non-loopback client of B chats on @peer model".
 
@@ -2395,3 +2400,19 @@ Fix: `server.listenExclusive` clears SO_REUSEPORT on the bound socket. The kerne
 flag on the socket already bound, so the later bind fails with `AddressInUse` and logs the
 same "Port N is already in use" line. SO_REUSEADDR stays for rebinding over TIME_WAIT.
 Guard: `listenExclusive: a second server cannot bind a port that is already listening`.
+
+## A model that failed to load was answered by the default model (#585)
+
+Defect: after a pack failed to load (`MissingWeight`), a chat request that named it by its
+absolute path got HTTP 200 from the model already resident, with the path echoed as `model`.
+Users read that as "the new pack works".
+
+Cause: `/v1/load-model` registers a path under an `org/name` id, but inference routes only
+`peek`ed the raw string. A path matched no key, so it took the "unknown id -> default model"
+branch meant for SDK names like `gpt-4`.
+
+Fix: `server.resolveRequestModelId` resolves a path through `peekByPath`, so a failed entry
+reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN gate reads
+the same helper. Startup was already loud: a failed `--model` load exits 1.
+Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
+`tests/test_load_failure_no_fallback.sh`.

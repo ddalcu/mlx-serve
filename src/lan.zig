@@ -246,6 +246,8 @@ pub fn parsePeerModels(alloc: std.mem.Allocator, body: []const u8, peer: []const
         const full = try std.fmt.allocPrint(arena, "{s}@{s}", .{ bare, peer });
         try item.object.put(arena, "id", .{ .string = full });
         try item.object.put(arena, "lan_peer", .{ .string = peer });
+        // A peer's alias resolves only on that peer.
+        _ = item.object.orderedRemove("alias");
         const entry_json = try std.json.Stringify.valueAlloc(alloc, item.*, .{});
         errdefer alloc.free(entry_json);
         try out.append(alloc, .{ .id = bare, .entry_json = entry_json });
@@ -1165,7 +1167,7 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     const body =
         \\{"object":"list","data":[
         \\ {"id":"gemma-4-e4b-it-4bit","object":"model","loaded":true,"capabilities":["chat","vision"],"meta":{"context_length":94000}},
-        \\ {"id":"flux2-klein-4bit","object":"model","loaded":false,"capabilities":["image"]},
+        \\ {"alias":"klein","id":"flux2-klein-4bit","object":"model","loaded":false,"capabilities":["image"]},
         \\ {"id":"qwen3.6-27b@SomeoneElse","object":"model","loaded":true,"lan_peer":"SomeoneElse"},
         \\ {"id":42,"object":"junk"}
         \\]}
@@ -1184,6 +1186,8 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"lan_peer\":\"Studio\"") != null);
     try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"context_length\":94000") != null);
     try t.expect(std.mem.indexOf(u8, models[1].entry_json, "\"id\":\"flux2-klein-4bit@Studio\"") != null);
+    // The peer's alias resolves only on the peer, so the mirror does not list it.
+    try t.expect(std.mem.indexOf(u8, models[1].entry_json, "alias") == null);
     // Not an mlx-serve shape → error, not a crash.
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "{\"nope\":true}", "x"));
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "not json", "x"));

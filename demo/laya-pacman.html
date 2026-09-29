@@ -78,7 +78,8 @@ const $ = id => document.getElementById(id);
 const cv = $("c"), ctx = cv.getContext("2d");
 cv.width = W*T; cv.height = H*T;
 
-let G, running = false;
+// `looping` keeps one loop alive; a tick whose board was reset meanwhile is dropped.
+let G, running = false, looping = false;
 
 const wrap = x => (x + W) % W;
 const wall = (x, y) => y < 0 || y >= H || MAP[y][wrap(x)] === "#";
@@ -95,7 +96,7 @@ function reset() {
   }));
   G = { pel, ghosts, tick:0, fright:0, over:false,
     players: ["1","2"].map((k, i) => ({ ...spawns[k], home:spawns[k], dir:i ? "right" : "left", score:0, lives:3, color:COLORS[i], last:null, ms:0, trail:[], moves:[], streak:0 })) };
-  $("msg").textContent = ""; draw(); panels();
+  say(""); draw(); panels();
 }
 
 // BFS distance from `from` to the nearest cell satisfying `hit`, never stepping onto `block`.
@@ -232,8 +233,10 @@ function collide() {
 }
 
 async function tick() {
+  const board = G;
   const alive = G.players.map((p, i) => [p, i]).filter(([p]) => p.lives > 0);
   const moves = await Promise.all(alive.map(([p, i]) => decide(p, i)));
+  if (board !== G) return;
   alive.forEach(([pl], k) => {
     const d = moves[k];
     if (!legal(pl).includes(d)) return;
@@ -251,7 +254,7 @@ async function tick() {
   if (!G.pel.size || G.players.every(p => p.lives <= 0)) {
     G.over = true;
     const [a, b] = G.players;
-    $("msg").textContent = a.score === b.score ? `Draw at ${a.score}` : `${a.score > b.score ? "P1 yellow" : "P2 cyan"} wins ${Math.max(a.score, b.score)} to ${Math.min(a.score, b.score)}`;
+    say(a.score === b.score ? `Draw at ${a.score}` : `${a.score > b.score ? "P1 yellow" : "P2 cyan"} wins ${Math.max(a.score, b.score)} to ${Math.min(a.score, b.score)}`);
   }
 }
 
@@ -297,15 +300,21 @@ const api = () => $("api").value.replace(/\/$/, "");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function loop() {
-  while (running && !G.over) {
-    const t0 = performance.now();
-    try { await tick(); }
-    catch (e) { $("msg").innerHTML = `<span class="err">${e.message}</span>`; running = false; break; }
-    draw(); panels();
-    await sleep(Math.max(0, +$("speed").value - (performance.now() - t0)));
+  looping = true;
+  try {
+    while (running && !G.over) {
+      const t0 = performance.now(), board = G;
+      try { await tick(); draw(); panels(); }
+      catch (e) { if (board === G) { say(e.message, true); running = false; break; } }
+      await sleep(Math.max(0, +$("speed").value - (performance.now() - t0)));
+    }
+  } finally {
+    looping = false; running = false; $("go").textContent = "Start";
   }
-  running = false; $("go").textContent = "Start";
 }
+
+// Server and URL text is shown as text, never parsed as HTML.
+function say(text, err = false) { $("msg").textContent = text; $("msg").classList.toggle("err", err); }
 
 async function loadModels() {
   $("model").innerHTML = "";
@@ -313,9 +322,9 @@ async function loadModels() {
     const j = await (await fetch(api() + "/v1/models")).json();
     const ids = j.data.filter(m => (m.capabilities || []).includes("decisions")).map(m => m.id);
     ids.sort((a, b) => b.endsWith("/laya-mlx") - a.endsWith("/laya-mlx"));
-    $("model").innerHTML = ids.map(id => `<option>${id}</option>`).join("");
-    $("msg").textContent = ids.length ? "" : "No Laya model found on this server.";
-  } catch (e) { $("msg").innerHTML = `<span class="err">Cannot reach ${api()}: ${e.message}</span>`; }
+    $("model").replaceChildren(...ids.map(id => new Option(id, id)));
+    say(ids.length ? "" : "No Laya model found on this server.");
+  } catch (e) { say(`Cannot reach ${api()}: ${e.message}`, true); }
 }
 
 const qs = new URLSearchParams(location.search);
@@ -325,7 +334,7 @@ $("speed").oninput();
 $("go").onclick = () => {
   running = !running; $("go").textContent = running ? "Pause" : "Start";
   if (G.over) reset();
-  if (running) loop();
+  if (running && !looping) loop();
 };
 $("reset").onclick = () => { running = false; reset(); };
 // First candidate that answers /v1/models as JSON wins: ?api=, same origin, then the default ports.

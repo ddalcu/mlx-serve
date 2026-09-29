@@ -195,7 +195,7 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 1040, height: 680)
 
-        Window("Laya Decisions", id: "layaDecisions") {
+        Window("Decisions", id: "layaDecisions") {
             LayaDecisionsWindow()
                 .environmentObject(appState)
                 .environmentObject(appState.server)

@@ -190,6 +190,7 @@ const providers_mod = @import("providers.zig");
 const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
+const model_settings_mod = @import("model_settings.zig");
 const cli_mod = @import("cli.zig");
 const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
@@ -823,6 +824,42 @@ fn payloadTooLargeMessage(buf: []u8, got: usize, cap: usize) []const u8 {
     return std.fmt.bufPrint(buf, "Request body too large: {d} MB exceeds this endpoint's {d} MB limit", .{
         (got + mb - 1) / mb, cap / mb,
     }) catch "Request body too large";
+}
+
+pub const RequestModel = union(enum) {
+    /// A registered id, or "" / "mlx-serve" (the default), passed through.
+    id: []const u8,
+    /// Not registered: dispatch serves the default so SDK names like "gpt-4" work.
+    unknown_name,
+    /// An absolute path no entry lives at.
+    unknown_path,
+};
+
+/// Model Settings aliases, parsed once and re-read when the file changes.
+var g_model_aliases_path: [std.fs.max_path_bytes]u8 = undefined;
+var g_model_aliases: model_settings_mod.Cache = .{ .path = "" };
+
+/// Which model a request's `model` field names: an id, a path, a Model Settings
+/// alias, then on `/api/` the untagged alias and Ollama's short name. Dispatch,
+/// the LAN gate, load, unload and `/api/show` all read this. The registry is
+/// NOT locked here.
+fn resolveRequestModelId(registry: *ModelRegistry, aliases: *model_settings_mod.Cache, id: []const u8, path: []const u8) RequestModel {
+    if (id.len == 0 or std.mem.eql(u8, id, "mlx-serve")) return .{ .id = id };
+    if (registry.peek(id)) |e| return .{ .id = e.id };
+    // A path is never an SDK marketing name, and a default-model answer to it
+    // would serve a pack that failed to load with another model's weights.
+    if (std.fs.path.isAbsolute(id)) {
+        if (registry.peekByPath(id)) |e| return .{ .id = e.id };
+        return .unknown_path;
+    }
+    const ollama = std.mem.startsWith(u8, path, "/api/");
+    const untagged = if (ollama) id[0 .. std.mem.lastIndexOfScalar(u8, id, ':') orelse id.len] else id;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ id, untagged }) |n| {
+        if (aliases.pathForAlias(registry.io, n, &buf)) |p| if (registry.peekByPath(p)) |e| return .{ .id = e.id };
+    }
+    if (ollama) if (ollamaResolveRegistryId(registry.io, registry, id)) |r| return .{ .id = r };
+    return .unknown_name;
 }
 
 /// The requested model id from a request body of EITHER shape.
@@ -1766,6 +1803,8 @@ pub fn serve(
 
     global_registry = scheduler.registry;
     defer global_registry = null;
+    g_model_aliases.alloc = scheduler.registry.allocator;
+    g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
 
     // Plan 05: the hot prefix cache lives on the LoadedModel
     // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
@@ -1942,7 +1981,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya)\n", .{});
+    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2397,21 +2436,15 @@ fn handleConnection(
         try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
         return;
     }
-    if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
-        if (registry.peek(requested_model_id) == null) {
-            // Ollama clients send tagged/short names ("qwen3.6:latest");
-            // resolve them against registry ids before giving up. Scoped to
-            // /api/ paths so /v1 fallback semantics stay pinned.
-            var resolved: ?[]const u8 = null;
-            if (std.mem.startsWith(u8, path, "/api/")) {
-                resolved = ollamaResolveRegistryId(stream.io, registry, requested_model_id);
-            }
-            // Unknown id — fall back to the default model rather than 404,
-            // so off-the-shelf SDK clients keep working. Multi-model
-            // clients that care about routing precision pass an exact id
-            // we registered (and `peek` will find it).
-            requested_model_id = resolved orelse "";
-        }
+    switch (resolveRequestModelId(registry, &g_model_aliases, requested_model_id, path)) {
+        .id => |id| requested_model_id = id,
+        .unknown_path => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No model is registered at that path; load it first with POST /v1/load-model", 404);
+            return;
+        },
+        // Unknown name — fall back to the default model rather than 404, so
+        // off-the-shelf SDK clients keep working.
+        .unknown_name => requested_model_id = "",
     }
     // Text-gen route aimed at a KNOWN non-text model: reject before
     // ensureLoaded, or the request cold-loads a multi-GB media model just
@@ -2864,6 +2897,10 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     if (requested.len == 0) {
         try sendOllamaError(allocator, stream, "400 Bad Request", "model is required");
         return;
+    }
+    switch (resolveRequestModelId(registry, &g_model_aliases, requested, "/api/show")) {
+        .id => |id| requested = id,
+        else => {},
     }
 
     var rendered: ?[]u8 = null;
@@ -6772,6 +6809,9 @@ fn handleModels(
     // Sort: default first, then by last_used_ns desc.
     var ordered = std.ArrayList(*LoadedModel).empty;
     defer ordered.deinit(allocator);
+    var alias_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // Any re-read happens here, not under the registry lock below.
+    g_model_aliases.refreshNow(stream.io);
     {
         registry.mutex.lockUncancelable(stream.io);
         defer registry.mutex.unlock(stream.io);
@@ -6794,7 +6834,7 @@ fn handleModels(
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, stream.io, entry);
             defer allocator.free(json);
-            try entries_buf.appendSlice(allocator, json);
+            try appendAliasedRow(allocator, &entries_buf, json, g_model_aliases.aliasForPath(stream.io, entry.path, &alias_buf));
         }
     }
 
@@ -6808,6 +6848,15 @@ fn handleModels(
     , .{entries_buf.items});
     defer allocator.free(body);
     try sendModelsResponse(stream, body);
+}
+
+/// A `/v1/models` row with its Model Settings `alias` as the first field; `id`
+/// stays the canonical registry id.
+fn appendAliasedRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), row: []const u8, alias: ?[]const u8) !void {
+    const a = alias orelse return out.appendSlice(allocator, row);
+    const esc = try jsonEscape(allocator, a);
+    defer allocator.free(esc);
+    try out.print(allocator, "{{\"alias\":{s},{s}", .{ esc, row[1..] });
 }
 
 /// `/v1/models` responses carry the per-process LAN token
@@ -6930,7 +6979,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             },
             else => return err,
         };
-    }
+    } else if (global_registry) |r| switch (resolveRequestModelId(r, &g_model_aliases, requested_id, "/v1/load-model")) {
+        .id => |id| requested_id = id,
+        else => {},
+    };
     const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -7078,7 +7130,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
-        .weight = @max(1, d.questions.qs.len),
+        .weight = @max(1, d.count()),
         .window_us = lm.decision_engine.?.batch_window_us,
     };
     scheduler.runGeneration(&req) catch |err| switch (err) {
@@ -7162,7 +7214,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         // A discovered entry is keyed `org/name`, so the path is the only exact handle.
         const by_path = if (global_registry) |r| r.peekByPath(trimmed) else null;
         requested_id = if (by_path) |e| e.id else std.fs.path.basename(trimmed);
-    }
+    } else if (global_registry) |r| switch (resolveRequestModelId(r, &g_model_aliases, requested_id, "/v1/unload-model")) {
+        .id => |id| requested_id = id,
+        else => {},
+    };
 
     // Remote ids hold no residency on THIS host — idempotent 200, matching
     // the load-model no-op (the peer's owner controls its memory).
@@ -12136,10 +12191,12 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
         return null;
     }
-    const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
-        mid
-    else
-        registry.default_id;
+    const effective = switch (resolveRequestModelId(registry, &g_model_aliases, mid, path)) {
+        .id => |id| if (id.len > 0 and !std.mem.eql(u8, id, "mlx-serve")) id else registry.default_id,
+        .unknown_name => registry.default_id,
+        // Dispatch answers 404 and runs nothing.
+        .unknown_path => return null,
+    };
     if (!l.sharedAllows(effective)) return "Model not shared on this host";
     return null;
 }
@@ -12359,6 +12416,36 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
 }
 
+test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("org/Qwen3.6-27B-4bit", "/m/q", 1);
+    _ = try reg.registerStub("qwen", "/m/other", 1);
+    _ = try reg.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    var aliases: model_settings_mod.Cache = .{ .path = "", .settings = try model_settings_mod.parse(a,
+        \\{"/m/q/": {"alias": "q"}, "/m/g": {"alias": "qwen"}, "/m/gone": {"alias": "ghost"}}
+    ) };
+    defer aliases.deinit();
+    const chat = "/v1/chat/completions";
+    try std.testing.expectEqualStrings("org/Qwen3.6-27B-4bit", resolveRequestModelId(reg, &aliases, "q", chat).id);
+    try std.testing.expectEqualStrings("qwen", resolveRequestModelId(reg, &aliases, "qwen", chat).id);
+    try std.testing.expectEqualStrings("org/Qwen3.6-27B-4bit", resolveRequestModelId(reg, &aliases, "q:latest", "/api/chat").id);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "q:latest", chat) == .unknown_name);
+    // An alias for a path nothing registered falls back like any unknown name.
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "ghost", chat) == .unknown_name);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "gpt-4", chat) == .unknown_name);
+}
+
+test "appendAliasedRow: the alias rides the row, the id stays canonical" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    try appendAliasedRow(a, &out, "{\"id\":\"org/Q\"}", "q");
+    try appendAliasedRow(a, &out, "{\"id\":\"g\"}", null);
+    try std.testing.expectEqualStrings("{\"alias\":\"q\",\"id\":\"org/Q\"}{\"id\":\"g\"}", out.items);
+}
+
 test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const a = std.testing.allocator;
     const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
@@ -12398,6 +12485,8 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     // dispatch will — here the default is shared, so both pass.
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", "application/json", false) == null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
+    // A PATH names its own entry, never the default: the unshared model's dir is denied.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"/m/q\"}", "application/json", false) != null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
@@ -12415,6 +12504,26 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "resolveRequestModelId: a path names its own entry, never the default model" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    const good = try reg.registerStub("org/good", "/m/org/good", 1);
+    reg.default_id = good.id;
+    _ = try reg.registerStub("org/broken", "/m/org/broken", 1);
+    var aliases: model_settings_mod.Cache = .{ .path = "" };
+    defer aliases.deinit();
+
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "/m/org/broken", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "/m/org/broken/", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("org/broken", resolveRequestModelId(reg, &aliases, "org/broken", "/v1/chat/completions").id);
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "/m/org/missing", "/v1/chat/completions") == .unknown_path);
+    // Plain unknown names and the alias keep the default-model fallback.
+    try std.testing.expect(resolveRequestModelId(reg, &aliases, "gpt-4", "/v1/chat/completions") == .unknown_name);
+    try std.testing.expectEqualStrings("mlx-serve", resolveRequestModelId(reg, &aliases, "mlx-serve", "/v1/chat/completions").id);
+    try std.testing.expectEqualStrings("", resolveRequestModelId(reg, &aliases, "", "/v1/chat/completions").id);
 }
 
 test "the route-existence 404 is answered BEFORE the model is resolved" {

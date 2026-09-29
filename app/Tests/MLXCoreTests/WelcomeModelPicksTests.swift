@@ -10,12 +10,23 @@ final class WelcomeModelPicksTests: XCTestCase {
         SystemMemoryInfo(totalBytes: total * gib, usableBytes: usable * gib)
     }
 
-    func testTwentyFourGBMacGetsGemma12BAndQwen9B() {
+    func testTwentyFourGBMacGetsGemma12BAndBonsai() {
         let picks = WelcomeModelPicks.forMemory(mac(total: 24, usable: 16))
         // General → Gemma 4 12B (26B-A4B needs ~17 GB, exceeds 16 usable).
         XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-12b")
-        // Coding & agents → Qwen 9B (27B needs ~18 GB, exceeds).
-        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen35-9b")
+        // Coding & agents → Bonsai 2 (the 27B packs need ~19-22 GB, exceed).
+        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "bonsai2-27b")
+        XCTAssertEqual(picks.count, 2)
+    }
+
+    /// A 32 GB Mac (usable ~27): Gemma 4 31B and Qwen 3.8 27B are the
+    /// biggest COMFORTABLE fits. The 8-bit Gemma and the 35B-A3B land tight
+    /// there, and the welcome leads with comfort — a tight fit is what fails
+    /// under real memory pressure.
+    func testThirtyTwoGBMacGetsGemma31BAndQwen27B() {
+        let picks = WelcomeModelPicks.forMemory(mac(total: 32, usable: 27))
+        XCTAssertEqual(picks.first { $0.category == "General" }?.pick.id, "gemma-4-31b")
+        XCTAssertEqual(picks.first { $0.category == "Coding & agents" }?.pick.id, "qwen38-27b")
         XCTAssertEqual(picks.count, 2)
     }
 

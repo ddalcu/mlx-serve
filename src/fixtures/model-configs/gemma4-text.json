@@ -1,0 +1,77 @@
+{
+  "architectures": [
+    "Gemma4DSparkModel"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attention_k_eq_v": true,
+  "block_size": 7,
+  "bos_token_id": 2,
+  "confidence_head_with_markov": true,
+  "dtype": "bfloat16",
+  "enable_confidence_head": true,
+  "enable_moe_block": false,
+  "eos_token_id": 1,
+  "final_logit_softcapping": 30.0,
+  "global_head_dim": 512,
+  "head_dim": 256,
+  "hidden_activation": "gelu_pytorch_tanh",
+  "hidden_size": 3840,
+  "hidden_size_per_layer_input": 0,
+  "initializer_range": 0.02,
+  "intermediate_size": 15360,
+  "layer_types": [
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention",
+    "full_attention"
+  ],
+  "markov_head_type": "vanilla",
+  "markov_rank": 256,
+  "mask_token_id": 4,
+  "max_position_embeddings": 262144,
+  "model_type": "gemma4_text",
+  "moe_intermediate_size": null,
+  "num_anchors": 512,
+  "num_attention_heads": 16,
+  "num_experts": null,
+  "num_global_key_value_heads": 1,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_kv_shared_layers": 0,
+  "num_target_layers": 48,
+  "pad_token_id": 0,
+  "rms_norm_eps": 1e-06,
+  "rope_parameters": {
+    "full_attention": {
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 1000000.0,
+      "rope_type": "proportional"
+    },
+    "rope_theta": null,
+    "rope_type": "default",
+    "sliding_attention": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    }
+  },
+  "sliding_window": 1024,
+  "target_layer_ids": [
+    5,
+    17,
+    29,
+    41,
+    46
+  ],
+  "target_model_type": "gemma4_unified",
+  "target_text_model_type": "gemma4_unified_text",
+  "tie_word_embeddings": false,
+  "top_k_experts": null,
+  "transformers_version": "5.10.2",
+  "use_bidirectional_attention": "vision",
+  "use_cache": true,
+  "use_double_wide_mlp": false,
+  "vocab_size": 262144,
+  "vocab_size_per_layer_input": 262144
+}

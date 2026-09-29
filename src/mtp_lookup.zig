@@ -12,7 +12,9 @@ pub const MIN_SUFFIX: u32 = 8;
 pub const MAX_DRAFT: u32 = 7;
 /// S=16 verifies disproportionately slower than S=15.
 pub const MAX_DRAFT_STRONG: u32 = 14;
-pub const STRONG_SUFFIX: u32 = 32;
+/// A 16-token agreement already marks a quoted span; waiting for 32 spent the
+/// quote's first rounds at the short cap.
+pub const STRONG_SUFFIX: u32 = 16;
 const SUFFIX_CAP: u32 = 64;
 /// Per-draft MTP head cost, in `verifyCost` units; lookup drafts are free.
 const MTP_DRAFT_COST: f32 = 0.75;
@@ -139,6 +141,13 @@ test "lookup: latest earlier continuation, keyed on the tail plus t1, with how f
     try testing.expectEqualSlices(u32, &.{ 77, 5, 60 }, m.draft);
     try testing.expectEqual(@as(u32, 8), m.suffix);
     try testing.expect(idx.match(9, 3) == null);
+}
+
+test "lookup gate: a 16-token agreement takes the strong cap" {
+    var d: [20]u32 = undefined;
+    for (&d, 0..) |*x, i| x.* = @intCast(i);
+    try testing.expectEqual(MAX_DRAFT_STRONG, gate(.{ .draft = &d, .suffix = 16 }, 100, 8.4, 4.6, 6, true, .{}));
+    try testing.expectEqual(MAX_DRAFT, gate(.{ .draft = &d, .suffix = 15 }, 100, 8.4, 4.6, 6, true, .{}));
 }
 
 test "lookup gate: short matches, weak lookups and exhausted budgets run MTP" {

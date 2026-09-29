@@ -71,6 +71,7 @@
     tr:last-child td { border-bottom: 0; }
     .num { text-align: right; font-variant-numeric: tabular-nums; }
     .model-cell { white-space: normal; min-width: 220px; word-break: break-word; }
+    .model-cell a { color: inherit; text-decoration: underline dotted; text-underline-offset: 2px; }
 
     .badge {
       display: inline-block; font-size: 11px; font-weight: 600;
@@ -420,6 +421,31 @@
 
   /// One row per family with a column per ladder rung; `pick` reads the
   /// figure to show, `fmt` renders it.
+  // Submitted model ids that have a tier-list row (the page gives every row
+  // id="tier-<id>"). Strips GGUF `#file` and LAN `@peer` suffixes before
+  // matching; anything else renders as plain text. Mirror of the app's
+  // TierListLinks anchors — keep the two in step.
+  const TIER_ANCHOR_FOR_REPO = {
+    "mlx-community/gemma-4-e4b-it-4bit": "gemma-4-e4b",
+    "mlx-community/gemma-4-12b-it-4bit": "gemma-4-12b",
+    "mlx-community/gemma-4-26b-a4b-it-4bit": "gemma-4-26b-a4b",
+    "mlx-community/gemma-4-26b-a4b-it-8bit": "gemma-4-26b-a4b",
+    "mlx-community/gemma-4-31b-it-4bit": "gemma-4-31b",
+    "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve": "qwen3.6-27b-mtp",
+    "ddalcu/Qwen3.8-27B-MLX-Serve-4bit": "qwen3.8-27b",
+    "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit": "mimo-v2.6-9b",
+    "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit": "ternary-bonsai-2-27b",
+    "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw": "deepseek-v4-flash",
+    "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit": "deepseek-v4-flash",
+    "ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit": "qwen3.6-35b-a3b",
+    "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit": "qwen3.8-flash-next",
+  };
+  function tierLinkFor(modelId) {
+    const base = String(modelId || "").split("#")[0].split("@")[0];
+    const anchor = TIER_ANCHOR_FOR_REPO[base];
+    if (!anchor) return esc(modelId);
+    return `<a href="../llm-tier-list/#tier-${anchor}">${esc(modelId)}</a>`;
+  }
   function renderFamilies(families, columnsTitle, pick, fmt, note) {
     const columns = LADDER;
     $("board-head").innerHTML = `
@@ -431,7 +457,7 @@
     $("board-body").innerHTML = families.map((f) => `
       <tr>
         <td>${esc(machineLabel(f.hardware))}</td>
-        <td class="model-cell">${esc(f.modelId)}${f.notes.length ? `<div class="note-cell">${esc(f.notes.join(" · "))}</div>` : ""}</td>
+        <td class="model-cell">${tierLinkFor(f.modelId)}${f.notes.length ? `<div class="note-cell">${esc(f.notes.join(" · "))}</div>` : ""}</td>
         <td class="chips">${chipsHtml(f)}</td>
         ${columns.map((t) => {
           const r = f.rungs.get(t);

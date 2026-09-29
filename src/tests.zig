@@ -24,6 +24,7 @@ test {
     _ = @import("simd_qmm.zig");
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
+    _ = @import("qmv_nax2.zig");
     _ = @import("qmm_int8.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
@@ -46,6 +47,7 @@ test {
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
+    _ = @import("kev.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");

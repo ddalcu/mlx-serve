@@ -19,6 +19,7 @@
 | **Llama** | `llama` | Llama 3、Llama 3.1、Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral 轮次 | -- |
 | **Laya**（类型化决策） | `laya` | `aac6fef/laya-multilingual-mlx`（mmBERT-base 编码器 + 决策头；`POST /v1/decisions`） | n/a | -- |
+| **Kev**（类型化决策） | `kev` | `aselea/Kev-4B-MLX-Serve-8bit`（Qwen3.5-4B + 指针头；`POST /v1/decisions`；由 `tests/convert_kev_weights.py` 生成） | n/a | -- |
 | **嵌入** | `bert`, `gemma3_text`, `qwen3` | bge、mxbai、EmbeddingGemma、Qwen3-Embedding（池化方式从检查点读取） | n/a | -- |
 | **其它一切以 GGUF 形式** | 通过内置 llama.cpp | HuggingFace 上任何 `.gguf` | 按模板 | -- |
 

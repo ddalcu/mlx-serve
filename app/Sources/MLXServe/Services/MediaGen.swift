@@ -1480,6 +1480,20 @@ struct MusicModelPreset: Identifiable, Hashable {
         description: "Generates full songs — instrumental or with sung lyrics — from a style description in just 8 steps. One self-contained download."
     )
 
+    /// ACE-Step v1.5 XL Turbo, 4-bit — the same bundle at half the download
+    /// size (4.0 GB of blobs), for Macs that want the music model without
+    /// the 8-bit payload.
+    static let acestepXLTurbo4bit = MusicModelPreset(
+        id: "acestep-v15-xl-turbo-4bit",
+        name: "ACE-Step 1.5 XL Turbo (4-bit)",
+        repo: "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-4bit",
+        approxRAMGB: 6,
+        approxDownloadGB: 4.0,
+        fixedSteps: 8,
+        supportsLyrics: true,
+        description: "The 8-bit ACE-Step bundle above, requantized to 4-bit — same 8-step songs at half the download size, trading a little consistency for a lighter footprint."
+    )
+
     /// MiniMax Music 3, 8-bit — hierarchical AR (8B LLM + depth decoder)
     /// driving a flow-matching DiT; full songs with sung lyrics at 44.1 kHz.
     static let miniMaxMusic3_8bit = MusicModelPreset(
@@ -1495,7 +1509,7 @@ struct MusicModelPreset: Identifiable, Hashable {
     )
 
     /// Catalog, best-first per family.
-    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .miniMaxMusic3_8bit]
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit, .acestepXLTurbo4bit, .miniMaxMusic3_8bit]
 }
 
 extension MusicGenRequest {

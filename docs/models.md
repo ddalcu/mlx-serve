@@ -19,6 +19,7 @@
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
 | **Laya** (typed decisions) | `laya` | `aac6fef/laya-multilingual-mlx` (mmBERT-base encoder + decision head; `POST /v1/decisions`) | n/a | -- |
+| **Kev** (typed decisions) | `kev` | `aselea/Kev-4B-MLX-Serve-8bit` (Qwen3.5-4B + pointer head; `POST /v1/decisions`; packs from `tests/convert_kev_weights.py`) | n/a | -- |
 | **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, mxbai, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 

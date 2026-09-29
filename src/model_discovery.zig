@@ -97,6 +97,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "laya") or
+        std.mem.eql(u8, model_type, "kev") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -145,6 +146,8 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
+    // A Kev pack carries its base model's config.json (qwen3_5): the marker must win before it is read.
+    if (peekKevPack(io, sub)) return .{ .supported = allocator.dupe(u8, "kev") catch return .missing_or_unparseable };
     var file = sub.openFile(io, "config.json", .{}) catch {
         // No root config.json: a MageFlow diffusers repo carries only
         // model_index.json (`_class_name`=="MageFlowPipeline"). Classify it so
@@ -174,6 +177,7 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .missing_or_unparseable;
     defer parsed.deinit();
+    if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
@@ -206,6 +210,14 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         }
     }
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+}
+
+/// True when `sub` holds a Kev typed-decision pack (tests/convert_kev_weights.py). The marker alone decides,
+/// so a pack with a missing or broken part fails its load by name instead of serving as a chat model.
+/// Twin of gen.isKevPack, which delegates here.
+pub fn peekKevPack(io: std.Io, sub: std.Io.Dir) bool {
+    const st = sub.statFile(io, "kev_config.json", .{}) catch return false;
+    return st.kind == .file;
 }
 
 /// True when `sub` holds a Laya typed-decision checkpoint (no root config.json;
@@ -536,7 +548,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev")) return .decision;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -1123,7 +1135,7 @@ pub const StubMeta = struct {
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
     if (obj.get(key)) |v| {
-        if (v == .integer and v.integer > 0) return @intCast(v.integer);
+        if (v == .integer and v.integer > 0) return std.math.cast(u32, v.integer) orelse 0;
     }
     return 0;
 }
@@ -2192,4 +2204,40 @@ test "readStubMeta: has_thinking reads the template on disk" {
     try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_thinking);
     try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "<|im_start|>assistant\n<think>\n" });
     try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+}
+
+test "config discovery tolerates invalid roots and oversized metadata" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const meta = parseStubMeta(allocator, "{\"hidden_size\":4294967297}", false);
+    try testing.expectEqual(@as(u32, 0), meta.hidden_size);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "[]", "null", "false", "17", "\"bad\"", "[{}]" }) |content| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
+        try testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
+    }
+}
+
+test "a Kev pack is a decision model even though its root config.json is its qwen3_5 base" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "org/kev-pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/kev-pack/config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/kev-pack/kev_config.json", .data = "{\"format\":\"kev\"}" });
+    try tmp.dir.createDirPath(io, "org/plain-qwen");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/plain-qwen/config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("org/kev-pack", result.models[0].id);
+    try testing.expectEqualStrings("kev", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
+    try testing.expectEqualStrings("qwen3_5", result.models[1].model_type);
+    try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
 }

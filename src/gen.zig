@@ -25,6 +25,7 @@ const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
+const kev = @import("kev.zig");
 const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
@@ -55,8 +56,8 @@ pub const Modality = enum {
     audio,
     video,
     mesh,
-    /// Laya typed decisions (`/v1/decisions`): an encoder, not a generator,
-    /// but it rides the media plumbing (engine slot, inference-thread job).
+    /// Typed decisions (`/v1/decisions`, Laya or Kev): scorers, not generators,
+    /// but they ride the media plumbing (engine slot, inference-thread job).
     decision,
 
     pub fn capability(self: Modality) []const u8 {
@@ -101,6 +102,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image", "laya",
+    "kev",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -115,7 +117,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev")) return .decision;
     return null;
 }
 
@@ -174,6 +176,8 @@ pub const AudioBackendKind = enum {
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    // A Kev pack's root config.json is its qwen3_5 base: the marker is checked first (discovery agrees).
+    if (isKevPack(io, model_dir)) return allocator.dupe(u8, "kev") catch null;
     if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
     // Diffusers-style repos (Mage-Flow) have no root config.json / model_type —
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
@@ -190,6 +194,12 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
     return null;
+}
+
+fn isKevPack(io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekKevPack(io, dir);
 }
 
 fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
@@ -900,15 +910,52 @@ pub const AudioEngine = struct {
     }
 };
 
-/// Decision engine: Laya typed decisions over `POST /v1/decisions`.
+/// Per-request bounds for every decision backend, checked before any forward: one request
+/// holds the inference thread until it is answered.
+pub const DecisionLimits = struct {
+    max_questions: usize = 64,
+    max_input_tokens: usize = 32 * 1024,
+
+    fn fromEnv() DecisionLimits {
+        const d: DecisionLimits = .{};
+        return .{
+            .max_questions = envLimit("MLX_SERVE_LAYA_MAX_QUESTIONS", d.max_questions),
+            .max_input_tokens = envLimit("MLX_SERVE_LAYA_MAX_INPUT_TOKENS", d.max_input_tokens),
+        };
+    }
+
+    fn envLimit(name: [*:0]const u8, default: usize) usize {
+        const raw = std.c.getenv(name) orelse return default;
+        const v = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (v == 0) {
+            log.warn("[decision] ignoring {s}={s} (want a positive integer)\n", .{ name, raw });
+            return default;
+        }
+        return v;
+    }
+
+    /// 400 text for a limit error, naming the limit in force; null for other errors.
+    fn message(self: DecisionLimits, buf: []u8, err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.TooManyQuestions => std.fmt.bufPrint(buf, "too many questions in one request (limit {d}, MLX_SERVE_LAYA_MAX_QUESTIONS)", .{self.max_questions}) catch null,
+            error.TooManyInputTokens => std.fmt.bufPrint(buf, "the questions total more than {d} input tokens (MLX_SERVE_LAYA_MAX_INPUT_TOKENS); split them over several requests", .{self.max_input_tokens}) catch null,
+            else => null,
+        };
+    }
+};
+
+/// Decision engine over `POST /v1/decisions`: a Laya encoder or a Kev pack, chosen by the model dir.
 pub const DecisionEngine = struct {
     allocator: std.mem.Allocator,
-    engine: *laya.Engine,
+    backend: Backend,
     stream: mlx.mlx_stream,
     /// How long the inference thread waits for more decision requests to
     /// answer in the same pass (`MLX_SERVE_LAYA_BATCH_WINDOW_US`, default 0:
     /// only requests already queued are merged).
     batch_window_us: u32 = 0,
+    limits: DecisionLimits = .{},
+
+    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine };
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
@@ -916,7 +963,11 @@ pub const DecisionEngine = struct {
         self.allocator = allocator;
         self.stream = mlx.mlx_default_gpu_stream_new();
         errdefer _ = mlx.mlx_stream_free(self.stream);
-        self.engine = try laya.Engine.load(io, allocator, model_dir, self.stream);
+        self.backend = if (isKevPack(io, model_dir))
+            .{ .kev = try kev.Engine.load(io, allocator, model_dir, self.stream) }
+        else
+            .{ .laya = try laya.Engine.load(io, allocator, model_dir, self.stream) };
+        self.limits = DecisionLimits.fromEnv();
         self.batch_window_us = if (std.c.getenv("MLX_SERVE_LAYA_BATCH_WINDOW_US")) |raw|
             std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch blk: {
                 log.warn("[decision] ignoring MLX_SERVE_LAYA_BATCH_WINDOW_US={s} (want microseconds)\n", .{raw});
@@ -924,14 +975,24 @@ pub const DecisionEngine = struct {
             }
         else
             0;
-        log.info("[decision] Laya engine ready\n", .{});
+        log.info("[decision] {s} engine ready\n", .{if (self.backend == .kev) "Kev" else "Laya"});
         return self;
     }
 
     pub fn deinit(self: *DecisionEngine) void {
-        self.engine.deinit();
+        switch (self.backend) {
+            inline else => |e| e.deinit(),
+        }
         _ = mlx.mlx_stream_free(self.stream);
         self.allocator.destroy(self);
+    }
+
+    fn limitMessage(self: *const DecisionEngine, buf: []u8, err: anyerror) ?[]const u8 {
+        if (self.limits.message(buf, err)) |msg| return msg;
+        return switch (self.backend) {
+            .laya => |e| e.limitMessage(buf, err),
+            .kev => null,
+        };
     }
 };
 
@@ -940,11 +1001,21 @@ pub const DecisionEngine = struct {
 pub const DecisionRequest = struct {
     parsed: std.json.Parsed(std.json.Value),
     state: std.json.Value,
-    questions: laya.Questions,
+    questions: Questions,
+
+    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions };
 
     pub fn deinit(self: *DecisionRequest, allocator: std.mem.Allocator) void {
-        self.questions.deinit(allocator);
+        switch (self.questions) {
+            inline else => |*q| q.deinit(allocator),
+        }
         self.parsed.deinit();
+    }
+
+    pub fn count(self: *const DecisionRequest) usize {
+        return switch (self.questions) {
+            inline else => |q| q.qs.len,
+        };
     }
 };
 
@@ -974,9 +1045,15 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
         try sendError(conn, 400, "missing 'questions'");
         return null;
     };
-    const qs = engine.engine.parseQuestions(allocator, questions) catch |err| {
-        try sendDecisionError(conn, engine, err);
-        return null;
+    const qs: DecisionRequest.Questions = switch (engine.backend) {
+        .laya => |e| .{ .laya = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
+        .kev => |e| .{ .kev = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
     };
     keep = true;
     return .{ .parsed = parsed, .state = state, .questions = qs };
@@ -985,7 +1062,11 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
 /// 400 naming a validation or limit error; 500 for any other.
 fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void {
     var limit_buf: [160]u8 = undefined;
-    if (engine.engine.limitMessage(&limit_buf, err) orelse laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
+    const named = engine.limitMessage(&limit_buf, err) orelse switch (engine.backend) {
+        .laya => laya.errorMessage(err),
+        .kev => kev.errorMessage(err),
+    };
+    if (named) |msg| return sendError(conn, 400, msg);
     log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
     return sendError(conn, 500, "decision forward failed");
 }
@@ -997,31 +1078,44 @@ pub const DecisionJob = struct {
     req: *const DecisionRequest,
 };
 
-/// Laya's `predict` JSON for prepared requests, answered in one pass and sent
-/// to each connection. Runs on the inference thread like every gen job; one
-/// request's error is that request's response only.
+/// The backend's `predict` JSON for prepared requests, sent to each connection.
+/// Runs on the inference thread like every gen job; one request's error is that
+/// request's response only. Laya answers merged requests in one pass; Kev one
+/// request at a time.
 pub fn handleDecisions(engine: *DecisionEngine, model_id: []const u8, jobs: []const DecisionJob) void {
     const t0 = std.Io.Timestamp.now(jobs[0].conn.io, .boot);
-    var buf: [16]laya.Engine.Job = undefined;
-    const pj = if (jobs.len <= buf.len) buf[0..jobs.len] else engine.allocator.alloc(laya.Engine.Job, jobs.len) catch {
-        for (jobs) |j| sendError(j.conn, 500, "out of memory") catch {};
-        return;
-    };
-    defer if (jobs.len > buf.len) engine.allocator.free(pj);
     var nq: usize = 0;
-    for (pj, jobs) |*p, j| {
-        p.* = .{ .a = j.allocator, .model_id = model_id, .state = j.req.state, .questions = &j.req.questions };
-        nq += j.req.questions.qs.len;
+    for (jobs) |j| nq += j.req.count();
+    switch (engine.backend) {
+        .laya => |e| {
+            var buf: [16]laya.Engine.Job = undefined;
+            const pj = if (jobs.len <= buf.len) buf[0..jobs.len] else engine.allocator.alloc(laya.Engine.Job, jobs.len) catch {
+                for (jobs) |j| sendError(j.conn, 500, "out of memory") catch {};
+                return;
+            };
+            defer if (jobs.len > buf.len) engine.allocator.free(pj);
+            for (pj, jobs) |*p, j| p.* = .{ .a = j.allocator, .model_id = model_id, .state = j.req.state, .questions = &j.req.questions.laya, .max_input_tokens = engine.limits.max_input_tokens };
+            e.predictMany(pj);
+            logDecisionPass(jobs, nq, t0);
+            for (pj, jobs) |p, j| sendDecision(engine, j, p.result) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+        },
+        .kev => |e| {
+            for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.kev, engine.limits.max_input_tokens)) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+            logDecisionPass(jobs, nq, t0);
+        },
     }
-    engine.engine.predictMany(pj);
+}
+
+fn logDecisionPass(jobs: []const DecisionJob, nq: usize, t0: std.Io.Timestamp) void {
     const ms = @as(f64, @floatFromInt(t0.untilNow(jobs[0].conn.io, .boot).nanoseconds)) / 1e6;
     if (jobs.len > 1)
         log.info("[decision] {d} requests merged, {d} question(s) in {d:.1} ms\n", .{ jobs.len, nq, ms })
     else
         log.info("[decision] {d} question(s) in {d:.1} ms\n", .{ nq, ms });
-    for (pj, jobs) |p, j| sendDecision(engine, j, p.result) catch |err| {
-        log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
-    };
 }
 
 fn sendDecision(engine: *DecisionEngine, job: DecisionJob, result: anyerror![]u8) !void {
@@ -6117,4 +6211,12 @@ test "videoRgbTransportReason: chained windows are billed into the response cap 
     try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
     // One window of the same shape fits.
     try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
+}
+
+test "decision limits: one set for every backend, named in the 400 text" {
+    var buf: [160]u8 = undefined;
+    const l: DecisionLimits = .{ .max_questions = 3, .max_input_tokens = 10 };
+    try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyQuestions).?, "limit 3") != null);
+    try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
+    try testing.expect(l.message(&buf, error.TooManyOptions) == null);
 }

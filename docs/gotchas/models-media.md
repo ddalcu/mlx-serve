@@ -1984,3 +1984,13 @@ Cause: `mamba2Mixer` keeps the SSM state in f32 (correct — `mamba_ssm_cache_dt
 Fix: cast `y` to the SSM input's dtype before the gated norm. Greedy text diverges after a few words (bf16 vs f32 near-tie); both fluent.
 
 Guard: `mamba2Mixer keeps a bf16 residual stream bf16` (one bf16 Mamba2 layer through `forward`, asserts a bf16 result). Hybrid test setup is shared in `testHybridXfm`.
+
+## Malformed model configs reached unchecked reads and casts
+
+Symptom: wrong-typed or out-of-range config fields could cause illegal behavior in ReleaseFast instead of a named load error.
+
+Cause: bare JSON union reads and unchecked integer narrowing or derived dimensions trusted checkpoint input.
+
+Fix: `parseConfigFromJson` checks consumed values and arithmetic. `jsonField` treats optional nulls as absent; explicit disables such as `sliding_window:null`, negative BOS sentinels and guarded skips keep their semantics. Discovery checks root types and metadata ranges. Tensor shapes need separate validation.
+
+Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves optional nulls and skipped fields`, `accepts real checkpoint configs`; `config discovery tolerates invalid roots and oversized metadata`.

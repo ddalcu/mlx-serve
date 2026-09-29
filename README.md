@@ -79,7 +79,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
-| Typed decisions (Laya, `POST /v1/decisions`) | ✅ | ❌ | ❌ | ❌ |
+| Typed decisions (Laya, Kev, `POST /v1/decisions`) | ✅ | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit) | ✅ | ❌ | partial | ✅ |

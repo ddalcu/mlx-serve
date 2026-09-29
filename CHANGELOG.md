@@ -22,11 +22,13 @@
 - **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
 
 ### Changes
+- A model can have a short alias (Model Settings, or `"alias"` in model-settings.json) that works wherever a request names a model, including Ollama, load and unload; `/v1/models` lists it beside the full id (#520).
 - DFlash on Nemotron-H and dense Qwen3.5/3.8 emits exactly what serial decoding would, sampled requests included, on 4, 6 and 8-bit packs; seeded output with a DFlash drafter differs from earlier versions.
 - A seeded request gives the same text whether or not its prompt hit the prefix cache.
 - Qwen3.8-27B with a DFlash2 drafter verifies a tree of drafts each round instead of one path.
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
+- A request that names a model by its path no longer gets another model's answer: a pack that failed to load returns its load error, and an unknown path returns 404 (#585).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
 - `--mtp-greedy-tail` (or `"mtp_greedy_tail": true` for one model in model-settings.json) drafts only the first speculative token of a sampled request by sampling and the rest by argmax, which lets `--mtp-typical` accept longer runs; off by default.
 - Sidebar groups put chats, agent threads and terminals into named folders, and terminal sessions come back where you left them.

@@ -29,11 +29,9 @@ enum WelcomeModelPicks {
         Category(label: "General",
                  strength: "Best all-rounder for everyday chat, writing, and quick questions.",
                  catalog: RecommendedModelPick.gemmaCatalog),
-        // Bonsai is listed in the browser only: first-run surfaces keep the
-        // faster plain-quant picks.
         Category(label: "Coding & agents",
                  strength: "Strong at coding and multi-step agent work like using tools.",
-                 catalog: RecommendedModelPick.qwenCatalog.filter { $0 != .bonsai2_27b }),
+                 catalog: RecommendedModelPick.qwenCatalog),
     ]
 
     /// The best model of each type for this Mac's usable memory, with its

@@ -15,6 +15,7 @@ const qmv2 = @import("qmv2.zig");
 const rowqmv = @import("rowqmv.zig");
 const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
+const qmv_nax2 = @import("qmv_nax2.zig");
 const qmm_int8 = @import("qmm_int8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
@@ -17915,6 +17916,9 @@ pub const Transformer = struct {
             defer if (signs != null) {
                 _ = mlx.mlx_array_free(xr);
             };
+            // nax2 first: it declines below its measured crossover, and from
+            // 6 rows up it beats qmv2 on every 27B projection shape.
+            if (try qmv_nax2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
             // OPT-IN and LOSSY (activations to int8); declines unless the
             // model or process enables it, and below prompt width.
@@ -17922,6 +17926,7 @@ pub const Transformer = struct {
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
         }
         if (self.ternary_2bit) {
+            if (try qmv_nax2.qmm(x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
         }
         if (self.config.rowExactDecode() and qp.mode == .affine) {

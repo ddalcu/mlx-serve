@@ -1,25 +1,33 @@
 import SwiftUI
 
-/// The Laya Decisions window: shows the pane for `appState.decisionsModelPath`.
+/// The Decisions window: shows the pane for `appState.decisionsModelPath`.
 struct LayaDecisionsWindow: View {
     @EnvironmentObject var appState: AppState
     var body: some View {
         if let path = appState.decisionsModelPath {
             LayaDecisionsPane(modelPath: path).id(path)
         } else {
-            Text("Pick a Laya model in Models \u{2192} Downloaded and press Use.")
+            Text("Pick a Laya or Kev model in Models \u{2192} Downloaded and press Use.")
                 .font(.app(.callout))
                 .padding(40)
         }
     }
 }
 
-/// Demo page for a Laya typed-decision model: a state, a few questions, one
-/// `POST /v1/decisions`, the answers as probability bars. Opened by the Use
-/// button on a `laya` row; loads the model the way the gen panes do.
+/// Demo page for a typed-decision model (Laya or Kev): a state, a few
+/// questions, one `POST /v1/decisions`, the answers as probability bars.
+/// Opened by the Use button on a decision row; loads the model the way the
+/// gen panes do. Both take the same request; only the docs differ.
 struct LayaDecisionsPane: View {
     let modelPath: String
+    /// Read once from the dir's marker files, the way the browser row was typed.
+    private let isKev: Bool
     @EnvironmentObject var server: ServerManager
+
+    init(modelPath: String) {
+        self.modelPath = modelPath
+        isKev = DownloadManager.markerModelType(inDir: modelPath) == "kev"
+    }
 
     @State private var state = "Refund me now or I cancel my subscription. Second time this month your app charged me twice."
     @State private var questions: [Question] = [
@@ -77,7 +85,7 @@ struct LayaDecisionsPane: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Laya Decisions").font(.app(.title2).bold())
+                    Text(isKev ? "Kev Decisions" : "Laya Decisions").font(.app(.title2).bold())
                     Text((modelPath as NSString).lastPathComponent).font(.app(.caption)).foregroundStyle(.secondary)
 
                     Text("State").font(.app(.headline))
@@ -178,7 +186,11 @@ struct LayaDecisionsPane: View {
     private var docs: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("What this is").font(.app(.headline))
-            Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
+            if isKev {
+                Text("Kev is not a chat model. It reads the state once, then scores every option of each question with a small head on a Qwen3.5 model. About 60 ms per question on an M4 Max: slower than Laya, and often more accurate on nuanced text. Suits triage, routing and labeling where getting it right matters more than speed.")
+            } else {
+                Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
+            }
             Text("Question types").font(.app(.headline))
             Text("**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`")
             Text("**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`")
@@ -187,7 +199,11 @@ struct LayaDecisionsPane: View {
             Text("API").font(.app(.headline))
             Text("`POST /v1/decisions` with `model`, `state` and `questions`. Chat endpoints refuse this model and point here.")
             codeBlock("curl -X POST http://localhost:\(server.port)/v1/decisions \\\n  -H 'content-type: application/json' \\\n  -d '\(requestJSON.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "  ", with: ""))'")
-            Text("Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right).")
+            if isKev {
+                Text("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`. Kev has no `action` field.")
+            } else {
+                Text("Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right).")
+            }
         }
         .font(.app(.callout))
         .frame(maxWidth: .infinity, alignment: .leading)

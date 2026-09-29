@@ -255,22 +255,26 @@ extension RecommendedModelPick {
         activeParamsB: 4.0
     )
 
-    /// Qwen 3.5 9B — the entry-level Qwen pick. Replaces the earlier 0.8B
-    /// entry, which was too small to be a meaningful comparison against the
-    /// Gemma lineup.
-    static let qwen35_9b = RecommendedModelPick(
-        id: "qwen35-9b",
-        name: "Qwen 3.5 (9B)",
-        tagline: "A capable everyday pick",
-        blurb: "A well-rounded Qwen model — good at chatting, coding help, and following instructions, while staying quick to respond. A solid alternative to Gemma if you want to compare styles.",
-        repoId: "mlx-community/Qwen3.5-9B-MLX-4bit",
-        sizeGB: 5.5,
+    /// MiMo-V2.6 distilled to 9B on ddalcu's 4-bit pack — the entry-level
+    /// Qwen pick. A dense 9B with a vision tower (the repo is tagged
+    /// image-text-to-text) and a 256K window, small enough for a 16 GB Mac.
+    ///
+    /// `intelligence` is ESTIMATED: the index has no entry for the distill.
+    /// Placed a notch above the retired Qwen 9B's 35 on the maintainer's
+    /// read. `speed` is the 9B-class rate (no benchmarks.md row yet).
+    static let mimo9b = RecommendedModelPick(
+        id: "mimo-9b",
+        name: "MiMo 9B",
+        tagline: "Small, sharp, and quick",
+        blurb: "A smaller model that punches above its size — good at everyday chat, coding help, and following instructions, and it reads images too. The lightest Qwen here, so it fits Macs with less memory while still replying quickly.",
+        repoId: "ddalcu/MiMo-V2.6-Distill-Qwen-9B-MLX-Serve-4bit",
+        sizeGB: 7.1,
         family: .qwen,
-        intelligence: 35,
-        intelligenceIsEstimated: false,
+        intelligence: 38,
+        intelligenceIsEstimated: true,
         speed: 28,
         contextTokens: 262_144,
-        activeParamsB: 9.0
+        activeParamsB: 9.7
     )
 
     /// Qwen 3.8 27B, the pick this app leads with on any Mac that can hold it.
@@ -413,9 +417,11 @@ extension RecommendedModelPick {
     ]
 
     /// Qwen picks, ascending by size — the Recommended pane's other family
-    /// section.
+    /// section. The 6/8-bit and iQ variants of these checkpoints live in
+    /// Discover search instead, and the 3.6 27B MTP pack stays out on the
+    /// maintainer's call (the 3.8 is better for the same RAM).
     static let qwenCatalog: [RecommendedModelPick] = [
-        .qwen35_9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
+        .mimo9b, .bonsai2_27b, .qwen38_27b, .qwen36_35bA3b,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
