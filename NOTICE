@@ -113,6 +113,8 @@ Used in mlx-serve (`src/transformer.zig`):
     (`qsa_fast.py`, `qwen4_qsa_sparse_gqa`). The `msv_attn_qsa256` kernel
     body itself derives from our own `msv_attn_p256`, not from their source.
     thank you Jonathan Spangler.
+  * The segmented sorted NAX gather_qmm tile scan and affine matmul schedules,
+    ported from `omlx/patches/m5_gather_qmm_nax.py` at d6b2b92.
     
 Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
 
@@ -235,6 +237,10 @@ Inc., MIT License, the same license as this project's LICENSE), and
 `src/kernels/qsa_nax.metal` adapts the split-head-dimension attention
 algorithm to per-query sparse block selection with a two-term bf16 PV.
 Contributed by Nikolai V.
+
+`src/kernels/gather_qmm_nax_header.metal` adapts the NAX matmul fragment and
+MMA helpers from MLX's `steel/gemm/nax.h` (Copyright (c) 2025 Apple Inc., MIT
+License).
 
 --------------------------------------------------------------------------------
 mlx-lm

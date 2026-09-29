@@ -18,6 +18,7 @@ const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const qmv_nax2 = @import("qmv_nax2.zig");
+const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
@@ -40720,6 +40721,13 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
     } else {
+        if (sorted and lhs_idx.ctx == null and mode == .affine) {
+            if (try gather_qmm_nax.sortedGather(x, w, sc, bi, rhs_idx, bits, group_size, verifyQmmNaxAvailable(), s)) |out| {
+                _ = mlx.mlx_array_free(res.*);
+                res.* = out;
+                return;
+            }
+        }
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
 }

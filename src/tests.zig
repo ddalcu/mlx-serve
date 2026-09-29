@@ -31,6 +31,7 @@ test {
     _ = @import("row_attn.zig");
     _ = @import("keyed_sample.zig");
     _ = @import("qmv_nax2.zig");
+    _ = @import("gather_qmm_nax.zig");
     _ = @import("qmm_int8.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
