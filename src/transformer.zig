@@ -23517,9 +23517,12 @@ pub const Transformer = struct {
                 }
             }
         }
+        const prof = Qwen4AttnProf.begin(x, seq_len);
+        defer Qwen4AttnProf.active = false;
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
+        if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
         if (ctx.head_place) |p| {
             const vis = try headPlaceVisibility(self.s, ctx.qsa_mask, p, @intCast(self.config.indexer_compress_ratio), cache_len + seq_len);
             if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
@@ -23534,7 +23537,9 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.qsa_mask, m);
             }
         };
-        return self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        const out = try self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        if (prof) Qwen4AttnProf.lap(out, .tail);
+        return out;
     }
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
@@ -24978,6 +24983,7 @@ pub const Transformer = struct {
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
+        Qwen4AttnProf.flush(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)));
         if (ctx.capture_stream_all) |target| _ = mlx.mlx_array_set(target, h);
         // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
         // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
@@ -27373,7 +27379,13 @@ pub const Transformer = struct {
             // (causal folded in). Prefill gathers them by index; decode/
             // verify widths (and a declined gather) run under the bool mask.
             const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
+            if (Qwen4AttnProf.active) {
+                Qwen4AttnProf.sync(full_k);
+                Qwen4AttnProf.sync(full_v);
+                Qwen4AttnProf.lap(q_rope, .proj);
+            }
             const served = try qsaSlotAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, &ctx.qsa_mask, &ctx.qsa_arms, seq_len, ratio, attn_scale);
+            if (Qwen4AttnProf.active) Qwen4AttnProf.lap(served.out, .qsa);
             if (self.cost_trace_active) self.cost_attention |= served.cost_bit;
             _ = mlx.mlx_array_free(attn_out);
             attn_out = served.out;
@@ -35356,6 +35368,52 @@ const ProfClock = struct {
         const d = cum - self.mark_ns;
         self.mark_ns = cum;
         return d;
+    }
+};
+
+/// QWEN4_PROFILE_ATTN=1: split every qwen4_exp full-attention layer of a prefill forward (S > 16)
+/// into the QSA indexer, q/k/v projection + rope + KV append, the QSA kernel, and the gate + o_proj
+/// tail, with a sync at each boundary. Summed over the forward's layers and logged once per
+/// forward next to `[qwen4-prof]`. Diagnostic only, never on by default.
+const Qwen4AttnProf = struct {
+    const Stage = enum(u2) { indexer, proj, qsa, tail };
+    var on: ?bool = null;
+    var active = false;
+    var clock: ProfClock = undefined;
+    var ns: [4]u64 = @splat(0);
+    var layers: u32 = 0;
+
+    fn sync(arr: mlx.mlx_array) void {
+        if (arr.ctx == null) return;
+        mlx.check(mlx.mlx_array_eval(arr)) catch {};
+    }
+
+    /// Syncs `x` and starts the clock when profiling this layer; false otherwise.
+    fn begin(x: mlx.mlx_array, seq_len: c_int) bool {
+        if (on == null) on = diagEnvOn("QWEN4_PROFILE_ATTN");
+        if (!on.? or seq_len <= 16) return false;
+        sync(x);
+        clock = ProfClock.init();
+        active = true;
+        layers += 1;
+        return true;
+    }
+
+    fn lap(arr: mlx.mlx_array, stage: Stage) void {
+        sync(arr);
+        ns[@intFromEnum(stage)] += clock.lap();
+    }
+
+    fn flush(seq_len: c_int, kv: usize) void {
+        if (layers == 0) return;
+        const ms = struct {
+            fn f(n: u64) f64 {
+                return @as(f64, @floatFromInt(n)) / 1e6;
+            }
+        }.f;
+        log.info("[qwen4-attn] S={d} kv={d} layers={d} indexer {d:.3} ms  proj+rope+kv {d:.3} ms  qsa {d:.3} ms  gate+o_proj {d:.3} ms\n", .{ seq_len, kv, layers, ms(ns[0]), ms(ns[1]), ms(ns[2]), ms(ns[3]) });
+        ns = @splat(0);
+        layers = 0;
     }
 };
 
