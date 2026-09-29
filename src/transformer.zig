@@ -462,16 +462,33 @@ pub const GdnRoute = enum { stock, blocked, pipelined };
 
 var gdn_pipelined_cached: ?mlx.mlx_fast_metal_kernel = null;
 pub var gdn_pipelined_override: ?bool = null; // test seam
-var gdn_pipelined_env: ?bool = null;
+var gdn_pipelined_route: ?bool = null;
 
-/// The pipelined kernel sums the recurrence's two 128-wide dots in another fp32 order than
-/// the blocked one, so greedy text can move; `MLX_SERVE_GDN_PIPELINED=0` keeps the blocked kernel.
-fn gdnPipelinedEnabled() bool {
+/// Archs whose prefill was A/B'd against the blocked kernel on an M5 Ultra: Flash Next
+/// (`qwen4_exp`, +2.6%) and dense Qwen3.8-27B (`qwen3_5`, +1.1 to 1.5%), both 48 value heads.
+/// The kernel is issue- and latency-bound, so an unmeasured arch or chip keeps the blocked
+/// kernel until someone measures it.
+const GDN_PIPELINED_MEASURED = [_][]const u8{ "qwen4_exp", "qwen3_5" };
+
+/// Whether a GDN prefill takes the pipelined kernel. It sums the recurrence's two 128-wide
+/// dots in another fp32 order than the blocked one, so greedy text can move.
+/// `MLX_SERVE_GDN_PIPELINED=1` forces it on for any arch and chip, `=0` keeps the blocked
+/// kernel; unset, only a measured arch on an M5-class GPU takes it.
+pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool {
+    if (raw) |v| return !std.mem.eql(u8, v, "0");
+    if (!nax) return false;
+    for (GDN_PIPELINED_MEASURED) |t| {
+        if (std.mem.eql(u8, t, model_type)) return true;
+    }
+    return false;
+}
+
+fn gdnPipelinedEnabled(model_type: []const u8) bool {
     if (gdn_pipelined_override) |v| return v;
-    if (gdn_pipelined_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_PIPELINED");
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_pipelined_env = on;
+    if (gdn_pipelined_route) |v| return v;
+    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
+    const on = gdnPipelinedFor(raw, model_type, naxAvailable());
+    gdn_pipelined_route = on;
     return on;
 }
 
@@ -29641,7 +29658,7 @@ pub const Transformer = struct {
                 gdnBlockTFor(gdnBlockT(), dk, gdn_in_itemsize)
             else
                 null;
-            const route: GdnRoute = if (blocked_tb == null) .stock else if (gdnPipelinedEnabled()) .pipelined else .blocked;
+            const route: GdnRoute = if (blocked_tb == null) .stock else if (gdnPipelinedEnabled(cfg.model_type)) .pipelined else .blocked;
             try gdnSetGrid(config, route, dv, num_v_heads, batch);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
@@ -52496,7 +52513,8 @@ fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx
     const config = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
+    // The state leaves at the width it came in (f32 for Hadamard packs), as in the forward.
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, st_dtype));
     try gdnSetGrid(config, route, Dv, Hv, B);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", in_dtype));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", st_dtype));
@@ -52543,7 +52561,7 @@ fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
 /// case; an f16 checkpoint promotes its activations to f32 (f16 ⊕ f32 scalar),
 /// which is a different kernel specialization AND a different threadgroup
 /// budget — both covered by the sweep below.
-const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32, in_dtype: mlx.mlx_dtype = .bfloat16 };
+const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32, in_dtype: mlx.mlx_dtype = .bfloat16, state_dtype: mlx.mlx_dtype = .bfloat16 };
 
 /// Runs one geometry through host ref + stock + blocked and asserts the
 /// blocked kernel is no less accurate than the stock kernel it replaces.
@@ -52617,14 +52635,14 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     // Mirrors the live dtype signature: q/k/v/beta follow the ACTIVATION width
     // (bf16 checkpoints stay bf16; f16 checkpoints promote to f32), `g` is
     // always bf16 because it comes out of our fused gate kernel, and the SSM
-    // state buffer is always bf16 because we allocate it that way. The mixed
+    // state buffer is bf16 unless the case asks for f32 (Hadamard packs). The mixed
     // set is the point — the kernel must read each input at its own width.
     try mlx.check(mlx.mlx_astype(&q, q32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&kk, k32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&v, v32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
     try mlx.check(mlx.mlx_astype(&beta, b32, case.in_dtype, s));
-    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, case.state_dtype, s));
 
     const stock = try gdnRunYState(.stock, 16, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(stock.y);
@@ -52659,6 +52677,16 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     }
 }
 
+test "GDN pipelined route: measured archs on NAX by default, the env forces either way" {
+    try testing.expect(gdnPipelinedFor(null, "qwen4_exp", true));
+    try testing.expect(gdnPipelinedFor(null, "qwen3_5", true));
+    try testing.expect(!gdnPipelinedFor(null, "qwen4_exp", false)); // unmeasured chip
+    try testing.expect(!gdnPipelinedFor(null, "qwen3_5_moe", true)); // unmeasured arch
+    try testing.expect(!gdnPipelinedFor(null, "prism_hadamard_qwen35", true));
+    try testing.expect(gdnPipelinedFor("1", "prism_hadamard_qwen35", false));
+    try testing.expect(!gdnPipelinedFor("0", "qwen4_exp", true));
+}
+
 test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
     const s = mlx.gpuStream();
     // T deliberately hits non-multiples of every supported TB (16/32/48);
@@ -52677,6 +52705,10 @@ test "GDN blocked-seq and pipelined kernels: no worse than stock vs f64 ground t
         .{ .B = 2, .T = 64, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16, .in_dtype = .float32 },
         // f16 activations: same 2-byte staging as bf16, different kernel.
         .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 64, .tb = 32, .in_dtype = .float16 },
+        // f32 GDN state (`ssmStateDtype` for Hadamard packs, Bonsai 2): the kernels'
+        // StT = float instantiation, with bf16 and with f32 activations.
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 32, .state_dtype = .float32 },
+        .{ .B = 1, .T = 65, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16, .in_dtype = .float32, .state_dtype = .float32 },
     };
     for (cases) |case| try gdnBlockedParityCase(case, s);
 }
