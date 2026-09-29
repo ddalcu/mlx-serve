@@ -648,15 +648,23 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
 // error. It is: the int8 activation must not cost more than the quantization
 // step it introduces, i.e. error within a small multiple of stock's, never
 // NaN/Inf, and the shape/dtype contract preserved.
+/// The route runs only on a NAX GPU; elsewhere it declines by design.
+fn requireNax() !void {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+}
+
 test "qmm_int8: error stays within a small multiple of stock at prompt width" {
+    try requireNax();
     try expectWithinBar(512, 1536, 128);
 }
 
 test "qmm_int8: a width that is not a whole tile keeps the bar (GDN b/a projections)" {
+    try requireNax();
     try expectWithinBar(48, 1024, 96);
 }
 
 test "qmm_int8: a row count that is not a whole tile keeps the bar" {
+    try requireNax();
     try expectWithinBar(256, 1024, 100);
 }
 
@@ -747,6 +755,7 @@ fn expectWithinBar(n: c_int, k: c_int, m: c_int) !void {
 }
 
 test "qmm_int8: sibling projections of one activation quantize it once" {
+    try requireNax();
     const s = mlx.gpuStream();
     const n: c_int = 128;
     const k: c_int = 256;
@@ -797,6 +806,7 @@ test "qmm_int8: declines below its row floor" {
 }
 
 test "qmm_int8: the fused rotation equals rotating first, bit for bit" {
+    try requireNax();
     const s = mlx.gpuStream();
     const n: c_int = 256;
     const k: c_int = 2048;
