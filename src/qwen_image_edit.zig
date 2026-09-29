@@ -885,7 +885,7 @@ test "QwenImage edit loader takes the mlx-community pack spelling (env-gated)" {
     const pe = mlx.getShape(loaded.vit.pos_embed);
     try testing.expectEqual(@as(c_int, @intCast(VIT_POS_TABLE)), pe[0]);
     try testing.expectEqual(@as(c_int, 128), pe[1]); // vision_config hidden_size
-    // The quantized embed dequantized; hidden derived from scales*64.
+    // The quantized embed dequantized; hidden read off the final norm.
     try testing.expectEqual(@as(c_int, 64), loaded.te.hidden);
 }
 

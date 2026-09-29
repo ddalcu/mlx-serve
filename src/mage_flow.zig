@@ -508,9 +508,9 @@ fn ownOpt(w: *const Weights, key: []const u8) ?mlx.mlx_array {
     return o;
 }
 
-/// Affine-quantized matrix back to a dense `[rows, in_features]` tensor.
-/// `group_size` is 64 on every Qwen-Image MLX pack we load; `bits` falls out
-/// of the packed width. Caller frees the result.
+/// Affine-quantized matrix back to a dense `[rows, in_features]` tensor; bits and
+/// group size are solved against `in_features`, which the caller must KNOW: the
+/// packed shapes alone read 4-bit/group-32 as 2-bit/group-64. Caller frees.
 fn dequantizeAffine(weight: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, in_features: u32, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     const w_cols: u32 = @intCast(mlx.getShape(weight)[1]);
     const s_cols: u32 = @intCast(mlx.getShape(scales)[1]);
@@ -3170,8 +3170,7 @@ pub const VisionTower = struct {
             defer _ = mlx.mlx_array_free(pe);
             const pb = try ownWeight(w, pos_bk);
             defer _ = mlx.mlx_array_free(pb);
-            const s_cols: u32 = @intCast(mlx.getShape(raw_scales)[1]);
-            self.pos_embed = try dequantizeAffine(pe, raw_scales, pb, s_cols * 64, dtype, s);
+            self.pos_embed = try dequantizeAffine(pe, raw_scales, pb, @intCast(cfg.hidden), dtype, s);
         } else {
             const pe = try ownWeight(w, pos_key);
             defer _ = mlx.mlx_array_free(pe);
@@ -3704,10 +3703,10 @@ pub const TextEncoder = struct {
             defer _ = mlx.mlx_array_free(raw_w);
             const raw_b = try ownWeight(w, ebk);
             defer _ = mlx.mlx_array_free(raw_b);
-            // group 64 is the pack's own quantization; the dequantized width
-            // IS the LM hidden size.
-            const s_cols: u32 = @intCast(mlx.getShape(raw_scales)[1]);
-            const in_features: u32 = s_cols * 64;
+            // The final norm is never quantized: its length is the LM hidden
+            // size, the dense width the packed table cannot state itself.
+            const norm = w.get(pfx ++ "norm.weight") orelse return error.MissingMageFlowWeight;
+            const in_features: u32 = @intCast(mlx.getShape(norm)[0]);
             self.embed_table = try dequantizeAffine(raw_w, raw_scales, raw_b, in_features, dtype, s);
             self.hidden = @intCast(in_features);
         } else {
@@ -5206,7 +5205,7 @@ test "VisionTower pos_embed dequantizes a packed table to the dense shape" {
     defer _ = mlx.mlx_stream_free(s);
     const a = testing.allocator;
 
-    const H: usize = 64; // tower hidden; /64 so the table packs at group 64
+    const H: usize = 128; // tower hidden; every MLX group size divides it
     const I: usize = 128; // mlp inter
     const ROWS: usize = 16; // pos-table rows
     var w = model_mod.Weights.init(a);
@@ -5238,26 +5237,15 @@ test "VisionTower pos_embed dequantizes a packed table to the dense shape" {
         }
     }.f;
 
-    // pos_embed: packed 4-bit gs64 + sidecars — the mlx-community pack shape.
+    // pos_embed: packed 4-bit + sidecars (the mlx-community shape), per group below.
     const pos_host = try a.alloc(f32, ROWS * H);
     defer a.free(pos_host);
     for (pos_host, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 11)) * 0.02 - 0.1;
     const pos_sh = [_]c_int{ @intCast(ROWS), @intCast(H) };
     const pos_dense = mlx.mlx_array_new_data(pos_host.ptr, &pos_sh, 2, .float32);
     defer _ = mlx.mlx_array_free(pos_dense);
-    var qv = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(qv);
     const null_gscale = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_quantize(&qv, pos_dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gscale, s));
-    var qw = mlx.mlx_array_new();
-    var qs = mlx.mlx_array_new();
-    var qb = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&qw, qv, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&qs, qv, 1));
-    try mlx.check(mlx.mlx_vector_array_get(&qb, qv, 2));
-    try put(&w, a, "vision_tower.pos_embed.weight", qw);
-    try put(&w, a, "vision_tower.pos_embed.scales", qs);
-    try put(&w, a, "vision_tower.pos_embed.biases", qb);
+    const pos_keys = [_][]const u8{ "vision_tower.pos_embed.weight", "vision_tower.pos_embed.scales", "vision_tower.pos_embed.biases" };
 
     // Patch embed: OITHW [hidden, 3, 2, 16, 16].
     {
@@ -5303,8 +5291,89 @@ test "VisionTower pos_embed dequantizes a packed table to the dense shape" {
     }
 
     const cfg = VitConfig{ .hidden = @intCast(H), .heads = 4, .inter = @intCast(I), .depth = 1, .out = @intCast(H), .deepstack = .{ 0, 0, 0 }, .prefix = "vision_tower" };
-    var vit = try VisionTower.loadFrom(a, s, &w, cfg, .float32);
-    defer vit.deinit();
-    // The packed [16, 8] table loads as its DENSE logical [16, 64] shape.
-    try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(ROWS), @intCast(H) }, mlx.getShape(vit.pos_embed));
+    // Bar: every group loads at the DENSE [ROWS, H] shape, equal to the stock dequantize.
+    for ([_]c_int{ 32, 64, 128 }, 0..) |gs, gi| {
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, pos_dense, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", null_gscale, s));
+        var q: [3]mlx.mlx_array = undefined;
+        for (&q, 0..) |*t, ti| {
+            t.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(t, qv, ti));
+        }
+        for (pos_keys, q) |k, t| {
+            if (gi == 0) try put(&w, a, k, t) else w.replace(k, t);
+        }
+
+        var vit = try VisionTower.loadFrom(a, s, &w, cfg, .float32);
+        defer vit.deinit();
+        try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(ROWS), @intCast(H) }, mlx.getShape(vit.pos_embed));
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_dequantize(&want, q[0], q[1], q[2], mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", null_gscale, .{ .value = .float32, .has_value = true }, s));
+        try testing.expectEqual(@as(f32, 0), try maxAbsDiff(vit.pos_embed, want, s));
+    }
+}
+
+test "TextEncoder dequantizes a packed embed table at the LM's hidden width" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+
+    const H: usize = 128; // LM hidden; every MLX group size divides it
+    const V: usize = 8; // vocab rows
+    const pfx = "model.language_model.";
+    const emb_host = try a.alloc(f32, V * H);
+    defer a.free(emb_host);
+    for (emb_host, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 13)) * 0.02 - 0.12;
+    const emb_sh = [_]c_int{ @intCast(V), @intCast(H) };
+    const emb_dense = mlx.mlx_array_new_data(emb_host.ptr, &emb_sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(emb_dense);
+    const norm_host = try a.alloc(f32, H);
+    defer a.free(norm_host);
+    @memset(norm_host, 1.0);
+    const norm_sh = [_]c_int{@intCast(H)};
+    // Dense linears load unchecked, so one tiny matrix stands in for every layer tensor.
+    const tiny_host = [_]f32{ 1, 0, 0, 1 };
+    const tiny_sh = [_]c_int{ 2, 2 };
+    const tiny = mlx.mlx_array_new_data(&tiny_host, &tiny_sh, 2, .float32);
+    defer _ = mlx.mlx_array_free(tiny);
+    const layer_keys = [_][]const u8{
+        "input_layernorm",  "post_attention_layernorm", "self_attn.q_norm", "self_attn.k_norm",
+        "self_attn.q_proj", "self_attn.k_proj",         "self_attn.v_proj", "self_attn.o_proj",
+        "mlp.gate_proj",    "mlp.up_proj",              "mlp.down_proj",
+    };
+    const null_gscale = mlx.mlx_array{ .ctx = null };
+
+    // Bar: every group loads at the LM's hidden width, equal to the stock dequantize.
+    for ([_]c_int{ 32, 64, 128 }) |gs| {
+        var w = model_mod.Weights.init(a);
+        defer w.deinit();
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, emb_dense, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", null_gscale, s));
+        var q: [3]mlx.mlx_array = undefined;
+        for (&q, [_][]const u8{ "weight", "scales", "biases" }, 0..) |*t, sfx, ti| {
+            t.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(t, qv, ti));
+            try w.map.put(try std.fmt.allocPrint(a, pfx ++ "embed_tokens.{s}", .{sfx}), t.*);
+        }
+        try w.map.put(try a.dupe(u8, pfx ++ "norm.weight"), mlx.mlx_array_new_data(norm_host.ptr, &norm_sh, 1, .float32));
+        for (0..TE_LAYERS) |i| {
+            for (layer_keys) |k| {
+                var h = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_array_set(&h, tiny));
+                try w.map.put(try std.fmt.allocPrint(a, pfx ++ "layers.{d}.{s}.weight", .{ i, k }), h);
+            }
+        }
+
+        var te = try TextEncoder.loadFrom(a, s, &w, .float32);
+        defer te.deinit();
+        try testing.expectEqual(@as(c_int, @intCast(H)), te.hidden);
+        try testing.expectEqualSlices(c_int, &[_]c_int{ @intCast(V), @intCast(H) }, mlx.getShape(te.embed_table));
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_dequantize(&want, q[0], q[1], q[2], mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", null_gscale, .{ .value = .float32, .has_value = true }, s));
+        try testing.expectEqual(@as(f32, 0), try maxAbsDiff(te.embed_table, want, s));
+    }
 }
