@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const mlx = @import("mlx.zig");
+pub const mlx = @import("mlx.zig"); // pub: lib/mlx-serve-gguf reaches MLX through its host root
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
@@ -60,6 +61,9 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
+// --mlx-gguf: opt-in, experimental. Lets lib/mlx-serve-gguf claim the GGUFs it
+// supports; off, every .gguf goes to ds4 or llama.cpp as before.
+var mlx_gguf_enabled: bool = false;
 // Auto-load the ds4 MTP draft head (beside the model) for speculative decode.
 // Default on; `--no-ds4-mtp` disables it, and it's forced off under
 // `--ssd-streaming` (ds4 refuses the combination). Read by the same ds4 paths.
@@ -353,6 +357,11 @@ fn printUsage(io: std.Io) void {
         \\                        Override when auto-detection is wrong
         \\                        (e.g. an unusual ds4 quant whose metadata
         \\                        layout differs).
+        \\  --mlx-gguf          EXPERIMENTAL: serve supported .gguf files on MLX
+        \\                        itself (lib/mlx-serve-gguf) instead of
+        \\                        llama.cpp. Files it cannot serve fall back to
+        \\                        the embedded engines. --engine ds4|llama
+        \\                        still wins.
         \\  --ssd-streaming     ds4 / DeepSeek-V4-Flash only: stream expert
         \\                        weights from SSD instead of holding the whole
         \\                        model in RAM (skips full residency + warmup).
@@ -981,6 +990,8 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--engine: expected one of {{auto, ds4, llama}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--mlx-gguf")) {
+            mlx_gguf_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--ssd-streaming")) {
             ds4_ssd_streaming = true;
         } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
@@ -1171,7 +1182,11 @@ pub fn main(init: std.process.Init) !void {
     // containing one) bypasses the MLX safetensors path entirely. Both offline
     // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
     // LoadedModel whose request handlers route through the engine.
-    if (isGgufPath(io, model_dir)) {
+    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null;
+    const mlx_gguf_path = mlx_gguf.servablePath(io, allocator, model_dir);
+    defer if (mlx_gguf_path) |p| allocator.free(p);
+    if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (lib/mlx-serve-gguf)\n", .{});
+    if (mlx_gguf_path == null and isGgufPath(io, model_dir)) {
         const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
             switch (chosen) {

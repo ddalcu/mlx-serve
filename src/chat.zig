@@ -5,6 +5,7 @@ const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.z
 const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 
@@ -297,15 +298,17 @@ test "chat_template accepts HF's list-of-named-templates shape" {
 
 /// Load chat template configuration from tokenizer_config.json.
 pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
-    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
-    defer allocator.free(path);
+    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .tokenizer_config)) orelse blk: {
+        const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
+        defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var reader_state = file.reader(io, &read_buf);
-    const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+    };
     defer allocator.free(content);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});

@@ -555,6 +555,7 @@ struct ModelInfo {
     var engine: ServerEngine {
         switch engineName {
         case "mlx": return .mlx
+        case "mlx-gguf": return .mlxGguf
         case "ds4": return .dsv4
         case "llama", "gguf": return .llama
         default: break // pre-field server or unknown future value → infer
@@ -644,15 +645,22 @@ enum ServerEngine: String, CaseIterable {
     case llama
     /// Embedded ds4 engine (DeepSeek-V4-Flash GGUF).
     case dsv4
+    /// A `.gguf` served on the MLX path by lib/mlx-serve-gguf (`--mlx-gguf`).
+    case mlxGguf
 
     /// Short human label for the running-model badge / section headings.
     var label: String {
         switch self {
-        case .mlx:   return "MLX"
-        case .llama: return "llama.cpp (GGUF)"
-        case .dsv4:  return "ds4 (DSV4-Flash)"
+        case .mlx:     return "MLX"
+        case .llama:   return "llama.cpp (GGUF)"
+        case .dsv4:    return "ds4 (DSV4-Flash)"
+        case .mlxGguf: return "mlx-serve-gguf (GGUF on MLX)"
         }
     }
+
+    /// The MLX forward, whatever the weights' container: MLX-only knobs
+    /// (spec decode, kv-quant, prefix cache) apply here.
+    var isMlxPath: Bool { self == .mlx || self == .mlxGguf }
 }
 
 /// The `/props` "batching" object: does the loaded model share one decode

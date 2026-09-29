@@ -483,7 +483,6 @@
 "Decode attn quant" = "解码注意力量化";
 "Decode speed" = "解码速度";
 "Deep house" = "深浩室";
-"DeepSeek-V4 (ds4 engine)" = "DeepSeek-V4（ds4 引擎）";
 "DeepSeek-V4-Flash (iQ-MLX 3.3 bpw)" = "DeepSeek-V4-Flash（iQ-MLX 3.3 bpw）";
 "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. For DeepSeek‑V4 GGUF files this arms the embedded ds4 engine's DSpark runtime instead, using the DSpark support GGUF downloaded beside the model (nothing happens without that file). Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only." = "DeepSeek‑V4‑Flash 自带 3 阶段的投机草稿（DSpark）。启用后会在启动时额外加载约 11 GB 的草稿权重，所以除非你主动开启，它都保持关闭 —— 而当这台 Mac 没有足够内存容纳模型 + 草稿 + 工作余量时，服务器仍会拒绝启用，转而正常提供服务。对于 DeepSeek‑V4 的 GGUF 文件，这改为启用内置 ds4 引擎的 DSpark 运行时，并使用随模型一同下载的 DSpark 支持 GGUF（没有该文件则不会有任何效果）。仅影响 DeepSeek‑V4 模型；且仅限贪心（temperature 0）请求。";
 "Default" = "默认";
@@ -686,8 +685,13 @@
 "Frontier model, native MLX" = "前沿模型，原生 MLX";
 "Frontier-class, still quick" = "前沿级，依然迅速";
 "GET STARTED" = "开始使用";
-"GGUF Performance" = "GGUF 性能";
-"GGUF Performance (llama.cpp)" = "GGUF 性能（llama.cpp）";
+"Engines" = "引擎";
+"Launch flags for each embedded engine. A .gguf file goes to llama.cpp, or to ds4 for DeepSeek-V4-Flash; mlx-serve-gguf can take the ones it supports instead. Restart the server to apply." = "每个内置引擎的启动参数。.gguf 文件默认交给 llama.cpp，DeepSeek-V4-Flash 交给 ds4；mlx-serve-gguf 可以接管它支持的文件。重启服务器后生效。";
+"GGUF files on MLX itself. Experimental." = "直接在 MLX 上运行 GGUF 文件。实验性功能。";
+"Serves every other .gguf file. Its own kernels and KV layout, so the MLX rows do not apply." = "运行其余所有 .gguf 文件。使用自己的内核和 KV 布局，MLX 的选项对其无效。";
+"Serves DeepSeek-V4-Flash GGUF files." = "运行 DeepSeek-V4-Flash 的 GGUF 文件。";
+"Serve GGUF files on MLX (experimental)" = "在 MLX 上运行 GGUF 文件（实验性）";
+"Let mlx-serve-gguf serve the .gguf files it supports on MLX itself, with the MLX prefix cache and spec decode, instead of handing every .gguf to llama.cpp. Files it cannot serve still go to llama.cpp or ds4. Experimental: turn it off if a GGUF model misbehaves. Passes --mlx-gguf." = "让 mlx-serve-gguf 直接在 MLX 上运行它支持的 .gguf 文件，并使用 MLX 的前缀缓存和投机解码，而不是把所有 .gguf 都交给 llama.cpp。它无法运行的文件仍交给 llama.cpp 或 ds4。实验性功能：如果某个 GGUF 模型表现异常，请关闭它。传递 --mlx-gguf。";
 "GGUF file-format version the engine reads." = "引擎读取的 GGUF 文件格式版本。";
 "GGUF format" = "GGUF 格式";
 "GPU %lld%%" = "GPU 占用 %lld%%";
@@ -843,7 +847,6 @@
 "Key" = "调性";
 "Keys are stored in plain text in ~/.mlx-serve/providers.json. Prefer an environment variable name for a shared machine. Provider models are never shared over the LAN." = "令牌以明文形式保存在 ~/.mlx-serve/providers.json 中。共用机器建议改用环境变量名。提供商的模型不会通过局域网共享。";
 "Kill Process" = "终止进程";
-"Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines." = "内置 ds4 引擎（服务 DeepSeek-V4-Flash）的调节项。MLX 和 llama.cpp 引擎会忽略它们。";
 "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout." = "内置 llama.cpp 引擎服务 `.gguf` 模型时生效的调节项。与 MLX 性能部分不同 —— 内核不同，KV 布局也不同。";
 "Kokoro (fast, built-in voices)" = "Kokoro（快速，内置音色）";
 "Kokoro 82M (fastest, ~330 MB)" = "Kokoro 82M（最快，约 330 MB）";

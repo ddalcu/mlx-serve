@@ -70,7 +70,7 @@ final class ServerOptionsTests: XCTestCase {
         for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
                      "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
                      "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
-                     "--ssd-streaming", "--top-k", "--drafter"] {
+                     "--ssd-streaming", "--mlx-gguf", "--top-k", "--drafter"] {
             XCTAssertFalse(args.contains(flag),
                 "\(flag) appeared at default — its Swift default or emit-guard drifted from the server")
         }
@@ -385,6 +385,12 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(info.engine, .mlx)
         info.architecture = ""  // older server build that omits the field
         XCTAssertEqual(info.engine, .mlx, "empty arch must default to .mlx (the most common path)")
+        // A GGUF on the MLX path is its own engine, and an MLX one for the
+        // settings that key on the forward.
+        info.engineName = "mlx-gguf"
+        XCTAssertEqual(info.engine, .mlxGguf)
+        XCTAssertTrue(info.engine.isMlxPath)
+        XCTAssertFalse(ServerEngine.llama.isMlxPath)
     }
 
     func testEngineFromServerReport() {
@@ -584,6 +590,16 @@ extension ServerOptionsTests {
     // full model resident (skips warmup + residency). ds4-only — the MLX and
     // llama.cpp engines ignore it. Same bare-boolean shape as --skip-mem-preflight,
     // so it shows in --help, in `ps`, and in the launch-command echo.
+
+    func testMlxGgufIsOptIn() {
+        // Mirrors main.zig `mlx_gguf_enabled = false`: the experimental engine
+        // never claims a GGUF unless the user turned it on.
+        XCTAssertFalse(ServerOptions().mlxGguf)
+        XCTAssertFalse(ServerOptions().toCLIArgs().contains("--mlx-gguf"))
+        var opts = ServerOptions()
+        opts.mlxGguf = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--mlx-gguf"))
+    }
 
     func testSsdStreamingDefaultsOff() {
         // Mirrors main.zig `var ds4_ssd_streaming: bool = false` — the Swift

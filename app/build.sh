@@ -52,6 +52,18 @@ relaunch_app() {
 if [ "${1:-}" = "ko" ]; then
     trap '[ $? -eq 0 ] && relaunch_app' EXIT
 fi
+# MLX_GGUF_DIR=<checkout> builds mlx-serve against that mlx-serve-gguf tree
+# instead of the lib/ submodule pin (zig `-Dgguf-dir`). `ko` is the local dev
+# loop, so it defaults to the sibling checkout when one exists; MLX_GGUF_DIR=""
+# keeps the pin.
+if [ "${1:-}" = "ko" ] && [ -z "${MLX_GGUF_DIR+x}" ] && [ -f "$PROJECT_ROOT/../mlx-serve-gguf/src/root.zig" ]; then
+    MLX_GGUF_DIR="$(cd "$PROJECT_ROOT/../mlx-serve-gguf" && pwd)"
+fi
+ZIG_GGUF_FLAGS=()
+if [ -n "${MLX_GGUF_DIR:-}" ]; then
+    ZIG_GGUF_FLAGS=(-Dgguf-dir="$MLX_GGUF_DIR")
+    echo "→ mlx-serve-gguf from $MLX_GGUF_DIR (not the lib/ pin)"
+fi
 
 # Signing identity from env (set in ~/.zshrc or CI). Unset = ad-hoc ("-"), so
 # anyone can build without an Apple Developer account; a release sets the real
@@ -223,7 +235,7 @@ if [ "$ZIG_DEBUG" = "1" ]; then
 fi
 DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build "${ZIG_OPT[@]}" -Dversion="$MLX_SERVE_VERSION" \
   -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
-  ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
+  ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} ${ZIG_GGUF_FLAGS[@]+"${ZIG_GGUF_FLAGS[@]}"} 2>&1 | tail -3
 # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
 DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1
 MLX_BIN="zig-out/bin/mlx-serve"

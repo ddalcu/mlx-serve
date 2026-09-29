@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -26,6 +27,9 @@ pub const QuantMode = enum {
     nvfp4,
     mxfp4,
     mxfp8,
+    /// Raw ggml blocks (lib/mlx-serve-gguf). Never reaches an MLX quantized op:
+    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
+    gguf,
 
     pub fn fromString(name: []const u8) ?QuantMode {
         return std.meta.stringToEnum(QuantMode, name);
@@ -38,6 +42,7 @@ pub const QuantMode = enum {
             .nvfp4 => "nvfp4",
             .mxfp4 => "mxfp4",
             .mxfp8 => "mxfp8",
+            .gguf => "gguf",
         };
     }
 
@@ -1075,6 +1080,16 @@ pub const ModelConfig = struct {
             std.mem.eql(u8, self.model_type, "diffusion_gemma");
     }
 
+    /// Takes the sampling recommendations + extra eos ids of a generation_config.json.
+    fn applyGenerationDefaults(self: *ModelConfig, gen_content: []const u8) void {
+        const gd = parseGenerationDefaultsFromJson(gen_content);
+        self.gen_temperature = gd.temperature;
+        self.gen_top_p = gd.top_p;
+        self.gen_top_k = gd.top_k;
+        self.gen_enable_thinking = gd.enable_thinking;
+        self.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+    }
+
     /// Additive + dedup-guarded, like every terminator merge here.
     pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
         for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
@@ -1358,15 +1373,17 @@ pub const ModelConfig = struct {
 };
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
-    const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
-    defer allocator.free(path);
+    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
+        const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
+        defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var reader_state = file.reader(io, &read_buf);
-    const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
+    };
     defer allocator.free(content);
 
     var config = try parseConfigFromJson(allocator, content);
@@ -1378,18 +1395,17 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // any failure (missing file, bad JSON) leaves the fields null.
     const gen_path = try std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir});
     defer allocator.free(gen_path);
-    if (std.Io.Dir.openFileAbsolute(io, gen_path, .{})) |gen_file| {
+    const gen_sidecar: ?[]u8 = mlx_gguf.sidecar(io, allocator, model_dir, .generation_config) catch null;
+    if (gen_sidecar) |gen_content| {
+        defer allocator.free(gen_content);
+        config.applyGenerationDefaults(gen_content);
+    } else if (std.Io.Dir.openFileAbsolute(io, gen_path, .{})) |gen_file| {
         defer gen_file.close(io);
         var gen_buf: [4096]u8 = undefined;
         var gen_reader = gen_file.reader(io, &gen_buf);
         if (gen_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_content| {
             defer allocator.free(gen_content);
-            const gd = parseGenerationDefaultsFromJson(gen_content);
-            config.gen_temperature = gd.temperature;
-            config.gen_top_p = gd.top_p;
-            config.gen_top_k = gd.top_k;
-            config.gen_enable_thinking = gd.enable_thinking;
-            config.mergeEosTokens(gd.eos_token_ids[0..gd.num_eos]);
+            config.applyGenerationDefaults(gen_content);
         } else |_| {}
     } else |_| {}
     // Pooling (issue #116), priority: explicit config.json `pooling_mode`
@@ -3769,6 +3785,9 @@ pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+    var gguf_weights = Weights.init(allocator);
+    errdefer gguf_weights.deinit();
+    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
 }
 

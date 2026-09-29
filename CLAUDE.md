@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/mlx-serve-gguf` (own repo, pure Zig + Metal) serves the GGUFs it knows on MLX itself.
 
 ## Layout (`src/`)
 
@@ -68,13 +68,14 @@ Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds)
 | `round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`), persisted |
 | `model_discovery.zig` / `model_registry.zig` | Discovery (two-level org/name, multi-root, GGUF classification, stub meta), multi-model registry |
 | `arch/ds4.zig` / `arch/llama.zig` (+ `*_ffi.zig`, `lib/llama_shim`) | Embedded-engine bridges |
+| `arch/mlx_gguf.zig` (+ `lib/mlx-serve-gguf`, own repo) | GGUF served on the REGULAR MLX path, no llama.cpp: the file stands in for a model dir (config/tokenizer/chat-template/generation_config JSON rebuilt from its metadata, hooks in `parseConfig`/`loadTokenizer`/`loadChatConfig`/`loadModelWeights`), tensors stay raw ggml blocks (`QuantMode.gguf`, uint8 weight + a bool "scales" sentinel whose SHAPE carries the ggml type) and `qmatmul`/`qmatmulBits`/`rawEmbedding`/`dequantTake` (Gemma PLE)/`gatherExpertMm` (MoE banks `[E, rows, row_bytes]`) run them through the module's Metal kernels. Archs: `qwen35`, `qwen35moe`, `gemma4`. Detail: `docs/reference.md` "MLX GGUF engine" |
 | `ane.zig` + `lib/ane/` | ANE prefill offload (`--ane-prefill`, opt-in, LOSSY int8/fp16, M4-and-below): SwiGLU-MLP + fused GDN in-proj MIL programs on the private AppleNeuralEngine framework (`msv_ane_*`, attribution in NOTICE), `/props` `"ane"` + `mlx_serve:ane_*`. Rules: `docs/reference.md` "ANE prefill rules" |
 | `rht.zig` / `qmv2.zig` / `gdn_decode.zig` / `mtp_graft.zig` | Prism Hadamard packs (`prism_hadamard_qwen35`): `<linear>.signs` bound to weight handles, `qmatmul` reads `H_block(signs*x)`, the embedding gather gets the inverse; exact 2-bit GEMVs (`qmv2`: M 1..8 over ternary weights, geometry per GPU generation via `planFor`, also non-Hadamard ternary packs via `ternary_2bit`); 2-dispatch GDN decode step; MTP head grafted from the Qwen3.8-27B pack |
 | `lora.zig` | Runtime unfused STACKED LoRA (8 max, summed never merged) across QLinear/MixedLinear/MfLinear |
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --model-dir --log-level --log-file --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --mlx-gguf --model-dir --log-level --log-file --version --help`
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
@@ -118,7 +119,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 
 ## Supported architectures
 
-Dispatch on `config.json` `model_type`. GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next` → ds4, else llama.cpp).
+Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental; app: Settings → Engines) a GGUF that `mlx_gguf.servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as `qwen3_5`/`qwen3_5_moe`/`gemma4`; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next` → ds4, else llama.cpp).
 
 | model_type | Notes |
 |---|---|

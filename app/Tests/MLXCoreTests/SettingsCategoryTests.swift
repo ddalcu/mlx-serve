@@ -15,29 +15,21 @@ final class SettingsCategoryTests: XCTestCase {
 
     // MARK: - Which categories exist for which engine
 
-    /// The sidebar mirrors what the form actually renders — the engine-specific
-    /// sections already hide themselves (flipping `--kv-quant` on a GGUF model
-    /// silently no-ops), so offering them in the sidebar would be a dead end.
-    func testMLXEngineHidesGgufAndDs4Categories() {
-        let visible = SettingsCategory.visible(engine: .mlx, selfUpdate: true)
-        XCTAssertTrue(visible.contains(.specDecode))
-        XCTAssertTrue(visible.contains(.performance))
-        XCTAssertFalse(visible.contains(.ggufPerformance))
-        XCTAssertFalse(visible.contains(.ds4))
+    /// Engines is ONE section and always listed: its rows are launch flags for
+    /// engines that are not loaded yet, so hiding them by the active engine
+    /// left the user unable to opt into the next one.
+    func testEnginesIsListedForEveryEngine() {
+        for engine: ServerEngine? in [nil, .mlx, .llama, .dsv4] {
+            XCTAssertTrue(SettingsCategory.visible(engine: engine, selfUpdate: true).contains(.engines),
+                          "Engines must stay reachable on \(String(describing: engine))")
+        }
     }
 
     func testGgufEngineHidesMlxOnlyCategories() {
         let visible = SettingsCategory.visible(engine: .llama, selfUpdate: true)
-        XCTAssertTrue(visible.contains(.ggufPerformance))
         XCTAssertFalse(visible.contains(.specDecode), "PLD/drafter/MTP are MLX-only kernels")
-        XCTAssertFalse(visible.contains(.ds4))
-    }
-
-    func testDs4EngineShowsOnlyItsOwnEngineCategory() {
-        let visible = SettingsCategory.visible(engine: .dsv4, selfUpdate: true)
-        XCTAssertTrue(visible.contains(.ds4))
-        XCTAssertFalse(visible.contains(.specDecode))
-        XCTAssertFalse(visible.contains(.ggufPerformance))
+        XCTAssertTrue(SettingsCategory.visible(engine: .mlxGguf, selfUpdate: true).contains(.specDecode),
+                      "a GGUF on the MLX path gets the MLX knobs")
     }
 
     /// Performance is ONE section now (the universal knobs merged with the
@@ -54,7 +46,7 @@ final class SettingsCategoryTests: XCTestCase {
     /// The sidebar must offer them all, or those sections become unreachable.
     func testNoModelLoadedOffersEveryEngineCategory() {
         let visible = SettingsCategory.visible(engine: nil, selfUpdate: true)
-        for c in [SettingsCategory.specDecode, .performance, .ggufPerformance, .ds4] {
+        for c in [SettingsCategory.specDecode, .performance, .engines] {
             XCTAssertTrue(visible.contains(c), "\(c) must be reachable before a model loads")
         }
     }
@@ -71,7 +63,7 @@ final class SettingsCategoryTests: XCTestCase {
     func testSidebarOrderMatchesRenderOrder() {
         XCTAssertEqual(SettingsCategory.visible(engine: .mlx, selfUpdate: true), [
             .modelFolders, .server, .lanSharing, .providers, .specDecode, .memory, .performance,
-            .neuralEngine, .requestDefaults, .interface, .voice, .sandbox, .messaging, .updates, .about,
+            .neuralEngine, .engines, .requestDefaults, .interface, .voice, .sandbox, .messaging, .updates, .about,
         ])
     }
 

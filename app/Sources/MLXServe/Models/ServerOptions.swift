@@ -217,7 +217,12 @@ struct ServerOptions: Codable, Equatable {
     /// macOS (an eighth of RAM, 2 to 8 GB) when it plans context and admits requests.
     var osMemoryReserve: Bool = true
 
-    // MARK: GGUF-only (llama.cpp engine)
+    // MARK: Engines
+    /// `--mlx-gguf`. EXPERIMENTAL: lib/mlx-serve-gguf claims the `.gguf` files
+    /// it can serve on MLX itself; the rest still go to ds4 / llama.cpp. Off,
+    /// mirroring main.zig `mlx_gguf_enabled = false`.
+    var mlxGguf: Bool = false
+
     /// KV-cache quantization for the embedded llama.cpp engine. MLX's
     /// `--kv-quant` does NOT apply to the llama path (different kernels);
     /// this is the GGUF-equivalent knob. `off` keeps F16 (libllama
@@ -531,6 +536,7 @@ struct ServerOptions: Codable, Equatable {
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
         ssdStreaming == other.ssdStreaming &&
+        mlxGguf == other.mlxGguf &&
         tokenizeCacheEntries == other.tokenizeCacheEntries &&
         // Sampling defaults are ALSO launch flags (server-side defaults for
         // clients that omit sampling, e.g. Claude Code) — changing them must
@@ -778,6 +784,9 @@ struct ServerOptions: Codable, Equatable {
         if ssdStreaming {
             args += ["--ssd-streaming"]
         }
+        if mlxGguf {
+            args += ["--mlx-gguf"]
+        }
         return args
     }
 
@@ -918,6 +927,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .mlxGguf) { mlxGguf = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .defaultMaxTokens) { defaultMaxTokens = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTemperature) { defaultTemperature = v }
@@ -1173,6 +1183,10 @@ extension ServerOptions {
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
             explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight.",
+            needsRestart: true),
+        "mlxGguf": .init(
+            title: "Serve GGUF files on MLX (experimental)",
+            explainer: "Let mlx-serve-gguf serve the .gguf files it supports on MLX itself, with the MLX prefix cache and spec decode, instead of handing every .gguf to llama.cpp. Files it cannot serve still go to llama.cpp or ds4. Experimental: turn it off if a GGUF model misbehaves. Passes --mlx-gguf.",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",

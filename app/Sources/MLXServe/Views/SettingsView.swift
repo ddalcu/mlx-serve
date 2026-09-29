@@ -483,8 +483,8 @@ private struct RestartBanner: View {
 
 /// Renders the engine-specific section set for the active model:
 ///   - MLX target:   Common Performance + MLX Performance + MLX Spec Decode
-///   - GGUF target:  Common Performance + GGUF Performance
-///   - DSV4 target:  Common Performance + DeepSeek-V4 (ds4) section
+///   - GGUF / DSV4:  Common Performance
+///   Engines (every engine's own flags) always renders.
 ///   - No model yet: All sections shown (so users can pre-tune before
 ///                   loading); a banner clarifies that some controls only
 ///                   apply once a matching engine is loaded.
@@ -501,9 +501,7 @@ private struct EngineAwareSections: View {
     var body: some View {
         // Engine-specific sections. Show all when no model is loaded so
         // the user can pre-tune; otherwise show only the matching set.
-        let showMLX = (engine == nil || engine == .mlx)
-        let showLlama = (engine == nil || engine == .llama)
-        let showDs4 = (engine == nil || engine == .dsv4)
+        let showMLX = engine?.isMlxPath ?? true
 
         if showMLX {
             SettingsSection(
@@ -546,22 +544,14 @@ private struct EngineAwareSections: View {
             NeuralEngineSectionContent()
         }
 
-        if showLlama {
-            SettingsSection(
-                category: .ggufPerformance,
-                subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
-            ) {
-                LlamaPerformanceSectionContent()
-            }
-        }
-
-        if showDs4 {
-            SettingsSection(
-                category: .ds4,
-                subtitle: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines."
-            ) {
-                Ds4PerformanceSectionContent()
-            }
+        // Always on screen: these rows configure engines that are NOT loaded
+        // yet, so gating them on the active engine hid the way to opt into
+        // the next one.
+        SettingsSection(
+            category: .engines,
+            subtitle: "Launch flags for each embedded engine. A .gguf file goes to llama.cpp, or to ds4 for DeepSeek-V4-Flash; mlx-serve-gguf can take the ones it supports instead. Restart the server to apply."
+        ) {
+            EnginesSectionContent()
         }
 
         // The pre-tune banner explains why EVERY engine section is on screen —
@@ -2115,28 +2105,36 @@ private struct CommonPerformanceSectionContent: View {
 
 // MARK: - GGUF (llama.cpp) performance section
 
-/// Knobs specific to the embedded llama.cpp engine — surfaced only when
-/// the active model loaded through that path (or pre-load, when no
-/// engine has been chosen yet). MLX's `--kv-quant` and `--prefix-cache-*`
-/// don't apply here; llama.cpp has its own KV scheme and its own
-/// multi-session LRU.
-private struct LlamaPerformanceSectionContent: View {
+/// Every embedded engine's launch flags, grouped by engine.
+private struct EnginesSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @Environment(\.settingsSearchQuery) private var query
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
+    /// Group labels are not rows: a search narrows to rows, so they step aside.
+    private var showLabels: Bool { SettingsSearch.tokens(query).isEmpty }
 
     var body: some View {
         let opts = $appState.serverOptions
+        if showLabels {
+            EngineGroupLabel(name: "mlx-serve-gguf", blurb: "GGUF files on MLX itself. Experimental.")
+        }
+        if let m = meta["mlxGguf"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.mlxGguf)) {
+                Toggle("", isOn: opts.mlxGguf)
+                    .labelsHidden()
+                    .toggleStyle(.switch).font(.app(.body))
+            }
+        }
+        if showLabels {
+            EngineGroupLabel(name: "llama.cpp", blurb: "Serves every other .gguf file. Its own kernels and KV layout, so the MLX rows do not apply.")
+        }
         if let m = meta["llamaKvQuant"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.llamaKvQuant)
-            ) {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaKvQuant)) {
                 Picker("", selection: opts.llamaKvQuant) {
                     ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
                         Text(L10n.text(q.label)).font(.app(.body)).tag(q)
@@ -2148,48 +2146,36 @@ private struct LlamaPerformanceSectionContent: View {
             }
         }
         if let m = meta["llamaCacheEntries"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.llamaCacheEntries)
-            ) {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaCacheEntries)) {
                 Stepper(value: opts.llamaCacheEntries, in: 1...8) {
                     Text("\(appState.serverOptions.llamaCacheEntries)")
                         .font(.app(.body).monospacedDigit())
                 }
             }
         }
-    }
-}
-
-// MARK: - ds4 (DeepSeek-V4-Flash) performance section
-
-/// Knobs specific to the embedded ds4 engine — surfaced only when the active
-/// model loaded through that path (DeepSeek-V4-Flash GGUF), or pre-load when
-/// no engine has been chosen yet. Today this is just SSD weight streaming:
-/// the lever that lets a model larger than RAM load by streaming experts off
-/// disk instead of OOMing at warmup (issue #39).
-private struct Ds4PerformanceSectionContent: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-
-    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
-    private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
-    }
-
-    var body: some View {
+        if showLabels {
+            EngineGroupLabel(name: "ds4", blurb: "Serves DeepSeek-V4-Flash GGUF files.")
+        }
         if let m = meta["ssdStreaming"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.ssdStreaming)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.ssdStreaming)
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.ssdStreaming)) {
+                Toggle("", isOn: opts.ssdStreaming)
                     .labelsHidden()
                     .toggleStyle(.switch).font(.app(.body))
             }
         }
+    }
+}
+
+private struct EngineGroupLabel: View {
+    let name: String
+    let blurb: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name).font(.app(.headline))
+            Text(L10n.text(blurb)).font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+        .padding(.top, 8)
     }
 }
 

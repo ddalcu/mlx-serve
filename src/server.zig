@@ -27,6 +27,7 @@ const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
@@ -2795,11 +2796,24 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time.
-fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+fn modelEngineName(has_ds4: bool, has_llama: bool, mlx_gguf_served: bool, path: []const u8, arch_hint: []const u8) []const u8 {
     if (has_ds4) return "ds4";
     if (has_llama) return "llama";
+    if (mlx_gguf_served) return "mlx-gguf";
     if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
     return "mlx";
+}
+
+/// Would lib/mlx-serve-gguf claim this unloaded entry? Answered once per
+/// entry: the header read behind `servablePath` is too slow for a poll.
+fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
+    if (entry.mlx_gguf_claim == null) {
+        const allocator = std.heap.page_allocator;
+        const p = mlx_gguf.servablePath(io, allocator, entry.path);
+        defer if (p) |v| allocator.free(v);
+        entry.mlx_gguf_claim = p != null;
+    }
+    return entry.mlx_gguf_claim.?;
 }
 
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
@@ -6622,7 +6636,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -6745,10 +6759,11 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
-    // Unloaded entries have no engine attached yet — "gguf" (undetermined
+    // Unloaded entries have no engine attached yet — "mlx-gguf" where the
+    // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, entry.path, entry.arch_hint),
+        modelEngineName(false, false, mlxGgufClaims(io, entry), entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -22450,15 +22465,18 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, "/m/qwen.gguf", ""));
+    // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
+    // reads "gguf" as llama.cpp.
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, true, "/m/qwen.gguf", ""));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, "/m/gemma-4-12b", "gemma4"));
 }
 
 test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tokens" {

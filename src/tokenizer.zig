@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = @import("log.zig");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const io_util = @import("io_util.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
@@ -1276,15 +1277,17 @@ fn buildBytesToUnicode() [256]u21 {
 
 /// Parse tokenizer.json and return a Tokenizer.
 pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
-    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
-    defer allocator.free(path);
+    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .tokenizer)) orelse blk: {
+        const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
+        defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close(io);
+        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+        defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
-    var reader_state = file.reader(io, &read_buf);
-    const content = try reader_state.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+    };
     defer allocator.free(content);
     return parseTokenizerContent(io, allocator, content);
 }

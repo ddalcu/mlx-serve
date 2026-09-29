@@ -435,13 +435,17 @@ struct StatusMenuView: View {
                 .controlSize(.mini)
                 .help("Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server.")
             Spacer()
-            // Which embedded engine the selected model routes to (MLX
-            // safetensors, llama.cpp GGUF, or ds4 GGUF).
-            if let engine = appState.localModels
+            // The engine the resident chat model runs on, as the SERVER
+            // reports it; before a load, the file-type guess for the
+            // selected model.
+            if let engine = server.residentChatModel?.engine {
+                EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
+                    .help("Engine the loaded model runs on")
+            } else if let engine = appState.localModels
                 .first(where: { $0.path == appState.selectedModelPath })?.engine
             {
-                Text(L10n.text(engine.displayName))
-                    .help("Engine the selected model runs on")
+                EngineBadge(text: engine.displayName, tint: .secondary)
+                    .help("Engine the selected model will run on")
             }
         }
         .font(.app(.caption))
@@ -1352,3 +1356,26 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
+/// The engine name as a tinted capsule, so it reads at a glance.
+struct EngineBadge: View {
+    let text: String
+    let tint: Color
+
+    var body: some View {
+        Text(text)
+            .font(.app(.caption).weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(tint.opacity(0.15), in: Capsule())
+    }
+
+    static func tint(_ engine: ServerEngine) -> Color {
+        switch engine {
+        case .mlx:     return .accentColor
+        case .mlxGguf: return .teal
+        case .llama:   return .orange
+        case .dsv4:    return .purple
+        }
+    }
+}

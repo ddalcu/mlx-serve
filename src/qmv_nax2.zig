@@ -447,7 +447,14 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
     return out;
 }
 
+/// The kernel is Metal 4 tensor ops: off a tensor unit it compiles and
+/// answers garbage, so a GPU dispatch is only a test where the hardware is.
+fn skipWithoutNax() !void {
+    if (!@import("transformer.zig").naxAvailable()) return error.SkipZigTest;
+}
+
 fn parityAgainstStock(widths: []const c_int) !void {
+    try skipWithoutNax();
     const s = mlx.gpuStream();
     const n: c_int = 1024;
     const k: c_int = 1536; // 12 whole 128-groups
@@ -591,6 +598,7 @@ test "qmv_nax2 narrow: the half dequant is bit-identical to the f32 dequant" {
     defer _ = mlx.mlx_array_free(bic);
     try mlx.check(mlx.mlx_contiguous(&scc, sc2, false, s));
     try mlx.check(mlx.mlx_contiguous(&bic, bi2, false, s));
+    try skipWithoutNax();
     nax_override = true;
     defer nax_override = null;
     defer half_dq = true;

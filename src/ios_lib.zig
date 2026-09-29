@@ -32,7 +32,7 @@ const build_options = @import("build_options");
 // engine panics (ds4/llama unavailable on iOS) are never reached at runtime
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
-const mlx = @import("mlx.zig");
+pub const mlx = @import("mlx.zig"); // pub: lib/mlx-serve-gguf reaches MLX through its host root
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const model_discovery = @import("model_discovery.zig");

@@ -27,8 +27,8 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     /// Always listed — the media rows apply to generation models, which are
     /// not the text `engine` the other gates key on.
     case neuralEngine
-    case ggufPerformance
-    case ds4
+    /// Every embedded engine's launch flags: mlx-serve-gguf, llama.cpp, ds4.
+    case engines
     case requestDefaults
     case interface
     case voice
@@ -54,8 +54,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .performance:       return "Performance"
         case .neuralEngine:      return "Neural Engine"
         case .specDecode:        return "Speculative Decoding (MLX only)"
-        case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
-        case .ds4:               return "DeepSeek-V4 (ds4 engine)"
+        case .engines:           return "Engines"
         case .requestDefaults:   return "Per-Request Defaults"
         case .interface:         return "Interface"
         case .voice:             return "Voice"
@@ -71,8 +70,6 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     var sidebarLabel: String {
         switch self {
         case .specDecode:        return "Speculative Decoding"
-        case .ggufPerformance:   return "GGUF Performance"
-        case .ds4:               return "DeepSeek-V4"
         case .messaging:         return "Messaging"
         default:                 return title
         }
@@ -89,8 +86,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .performance:       return "speedometer"
         case .neuralEngine:      return "cpu"
         case .specDecode:        return "hare"
-        case .ggufPerformance:   return "shippingbox"
-        case .ds4:               return "cube"
+        case .engines:           return "engine.combustion"
         case .requestDefaults:   return "slider.horizontal.3"
         case .interface:         return "paintbrush"
         case .voice:             return "waveform"
@@ -111,9 +107,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     static func visible(engine: ServerEngine?, selfUpdate: Bool) -> [SettingsCategory] {
         allCases.filter { category in
             switch category {
-            case .specDecode:      return engine == nil || engine == .mlx
-            case .ggufPerformance: return engine == nil || engine == .llama
-            case .ds4:             return engine == nil || engine == .dsv4
+            case .specDecode:      return engine?.isMlxPath ?? true
             case .updates:         return selfUpdate
             // `.performance` is always listed: its universal rows apply to every
             // engine. Only the MLX-only rows INSIDE it come and go.

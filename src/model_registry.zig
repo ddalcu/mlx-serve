@@ -240,6 +240,9 @@ pub const LoadedModel = struct {
     /// `LlamaEngine` / `LlamaSession`. Mutually exclusive with the safetensors
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
+    /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
+    /// once, on the first `/v1/models` render.
+    mlx_gguf_claim: ?bool = null,
 
     /// Native media-generation engines, named by MODALITY (not by the FLUX/
     /// Qwen3-TTS/LTX implementations, which are swappable internals). When one

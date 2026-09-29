@@ -108,14 +108,11 @@ enum SettingsReset {
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
             ]
 
-        case .ggufPerformance:
+        case .engines:
             return [
+                f("mlxGguf") { $0.mlxGguf = $1.mlxGguf },
                 f("llamaKvQuant") { $0.llamaKvQuant = $1.llamaKvQuant },
                 f("llamaCacheEntries") { $0.llamaCacheEntries = $1.llamaCacheEntries },
-            ]
-
-        case .ds4:
-            return [
                 f("ssdStreaming") { $0.ssdStreaming = $1.ssdStreaming },
             ]
 
