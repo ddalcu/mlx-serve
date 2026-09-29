@@ -1,0 +1,105 @@
+{
+  "capture": {
+    "frames": 7,
+    "interval_s": 8.6,
+    "settle_s": 5
+  },
+  "claims": [
+    {
+      "id": "pagoda",
+      "label": "pagoda",
+      "weight": 2,
+      "text": "A multi-tier pagoda (a tower with at least three stacked roof tiers) is present and recognizable in at least one frame."
+    },
+    {
+      "id": "pagoda_clear",
+      "label": "pagoda clear",
+      "weight": 2,
+      "text": "In the default view the pagoda is not mostly hidden in ANY daytime frame: in every daytime frame more than half of it is visible, not blocked by the sign, trees, UI panels, or the frame edge."
+    },
+    {
+      "id": "pagoda_big",
+      "label": "pagoda big",
+      "weight": 2,
+      "text": "In at least one daytime frame the pagoda spans at least 25% of the image height."
+    },
+    {
+      "id": "trees",
+      "label": "5+ trees",
+      "weight": 1,
+      "text": "A garden with at least 5 distinct trees is visible."
+    },
+    {
+      "id": "cherry",
+      "label": "cherry tree",
+      "weight": 1,
+      "text": "At least one cherry blossom tree (a tree with a pink or pale-pink canopy) is visible."
+    },
+    {
+      "id": "plant_types",
+      "label": "4+ plant types",
+      "weight": 1,
+      "text": "At least 4 visibly different kinds of tree or plant appear (for example cherry, pine, maple, bamboo, shrubs, flowers), judged by shape or color, not by HUD text."
+    },
+    {
+      "id": "extras",
+      "label": "4+ extras",
+      "weight": 1,
+      "text": "At least 4 distinct garden features beyond trees and the pagoda are visible in the scene itself: water or a pond, a bridge, lanterns, a path, rocks, a gate or torii, a fence, a wall, flower beds."
+    },
+    {
+      "id": "sign_text",
+      "label": "sign legible",
+      "weight": 2,
+      "text": "A sign in the scene (not a HUD or UI overlay) shows the full string 'MLX-Serve 26.9.7' in order, legible in at least one frame. Letter case does not matter. Misspelled, partly hidden, cut off by the frame, mirrored, or unreadable text fails."
+    },
+    {
+      "id": "sign_big",
+      "label": "sign big",
+      "weight": 2,
+      "text": "The in-scene sign is big: in at least one frame it spans at least 15% of the image width."
+    },
+    {
+      "id": "sign_fit",
+      "label": "sign text fits",
+      "weight": 2,
+      "text": "The sign's text is visible in at least one frame, and in every frame where it is visible every glyph sits inside the sign board: no letter or digit extends past the board's edges or hangs off it."
+    },
+    {
+      "id": "day_night",
+      "label": "day/night",
+      "weight": 1,
+      "text": "The frames show a clear day/night change: at least one frame is clearly daytime and at least one is clearly night or dusk, with the sky and scene lighting visibly different."
+    },
+    {
+      "id": "sky_color",
+      "label": "colorful sky",
+      "weight": 1,
+      "text": "In at least one daytime or dusk frame the sky has a visible gradient or more than one hue; a single flat color fails."
+    },
+    {
+      "id": "dusk_sky",
+      "label": "dusk sky",
+      "weight": 1,
+      "text": "At least one dawn or dusk frame shows a sky with 3 or more clearly distinct hues."
+    },
+    {
+      "id": "night_readable",
+      "label": "night readable",
+      "weight": 1,
+      "text": "In the darkest frame the pagoda, trees, or sign can still be made out; a frame that is almost entirely black fails."
+    },
+    {
+      "id": "night_lights",
+      "label": "night lights",
+      "weight": 1,
+      "text": "In a night or dusk frame at least one light source in the scene visibly glows: lanterns, lit windows, a lit sign, or fireflies."
+    },
+    {
+      "id": "no_defects",
+      "label": "no defects",
+      "weight": 1,
+      "text": "No obvious render defects in any frame: surfaces rendered solid black or magenta by mistake, missing or broken geometry, large z-fighting, or a blank or error screen."
+    }
+  ]
+}

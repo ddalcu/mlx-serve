@@ -1,0 +1,4 @@
+Design and create a very creative, elaborate, and detailed voxel art scene of a pagoda in a beautiful garden with trees, including some cherry
+blossoms. Make the scene impressive and varied and use colorful voxels, and have a fast day/night sun cycle that reaches noon every minute, make it
+have a colorful sky. Use whatever libraries to get this done, use typescript, npm, modular files, test cases, use TDD red test first before code,
+green after. And use Vite. High voxel count for extra detail. Add a big sign that says MLX-Serve 26.9.7.

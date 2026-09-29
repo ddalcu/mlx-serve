@@ -91,3 +91,6 @@ containers/agent-shell-mlxserve/rootfs.tar.gz.sha256
 /missionlog.md
 /.mc.json
 tests/soak_log.csv
+
+# Agent eval runs (tests/agent_eval): projects, sessions, frames, verdicts
+/tests/agent_eval/out/
