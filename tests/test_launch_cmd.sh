@@ -8,9 +8,9 @@
 #   [3] launch omp --print against a live server: script exports the pi-spelled
 #       agent dir var, targets the served model, and the written models.yml
 #       carries the server's ADVERTISED context (never a hardcoded one)
-#   [4] launch codex --print: the generated --profile mlx-serve layer
-#       ($CODEX_HOME/mlx-serve.config.toml) targets our /v1/responses
-#       (wire_api = "responses") with the advertised context
+#   [4] launch codex --print: the launch line rides -c key=value overrides
+#       (model_providers.mlx.* → /v1/responses, wire_api = "responses") with
+#       the advertised context, and NOTHING is written into CODEX_HOME
 #   [5] launch claude --print: env-only script, no config file, ADVERTISED
 #       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
 #       Claude Code assumes 200k and auto-compacts there) + the derived output
@@ -21,16 +21,16 @@
 #
 # Most configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
-# codex is the exception: it writes only mlx-serve.config.toml into the
-# effective CODEX_HOME (default ~/.codex) and launches with --profile
-# mlx-serve, so the user's MCP/plugins/auth survive.
+# codex is the exception: it writes NOTHING into the effective CODEX_HOME
+# (default ~/.codex) and rides -c overrides on the launch line, so the user's
+# MCP/plugins/auth/trusts survive untouched.
 #
-# CODEX_HOME is force-set for the WHOLE run: if this ever regresses to
-# writing a bare config.toml into the effective home, the trap below catches
-# it with a loud fail instead of silently clobbering the user's real
-# ~/.codex. A temp home is used either way so the real profile is untouched.
-# A caller-supplied TEST_CODEX_HOME is cleaned of its own files but NEVER
-# removed — only a home this script mktemp'd gets rm -rf'd.
+# CODEX_HOME is force-set for the WHOLE run: if this ever regresses to writing
+# anything into the effective home, the trap below catches it with a loud fail
+# instead of silently clobbering the user's real ~/.codex. A temp home is used
+# either way so the real one is untouched. A caller-supplied TEST_CODEX_HOME is
+# cleaned of its own files but NEVER removed — only a home this script mktemp'd
+# gets rm -rf'd.
 
 set -u
 
@@ -46,10 +46,10 @@ mkdir -p "$CODEX_HOME"
 printf '# sentinel\n' > "$CODEX_HOME/config.toml"
 codex_home_guard() {
     if [ -f "$CODEX_HOME/config.toml" ] && ! grep -q "^# sentinel$" "$CODEX_HOME/config.toml" 2>/dev/null; then
-        echo "FAIL: $CODEX_HOME/config.toml was modified — a writer is ignoring the profile"
+        echo "FAIL: $CODEX_HOME/config.toml was modified — a writer is ignoring -c overrides"
         exit 1
     fi
-    if [ "$OWN_CODEX_HOME" = 1 ]; then rm -rf "$CODEX_HOME"; else rm -f "$CODEX_HOME/config.toml" "$CODEX_HOME/mlx-serve.config.toml"; fi
+    if [ "$OWN_CODEX_HOME" = 1 ]; then rm -rf "$CODEX_HOME"; else rm -f "$CODEX_HOME/config.toml"; fi
 }
 
 MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
@@ -127,20 +127,21 @@ OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
 OK=1
 # no dedicated home export: the user's CODEX_HOME survives into the launch
 echo "$OUT" | grep -q 'export CODEX_HOME=' && OK=0
-# the launch line rides the generated profile layer
-echo "$OUT" | grep -q -- '--profile mlx-serve' || OK=0
+# the launch line rides -c overrides, never a --profile layer
+echo "$OUT" | grep -q -- '--profile' && OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"'" || OK=0
+echo "$OUT" | grep -q -- "-c model_context_window=$ADV_CTX" || OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.base_url=\"$BASE/v1\"'" || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
-grep -q 'wire_api = "responses"' "$CODEX_HOME/mlx-serve.config.toml" || OK=0
-grep -q "model_context_window = $ADV_CTX" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
-grep -q "base_url = \"$BASE/v1\"" "$CODEX_HOME/mlx-serve.config.toml" || OK=0
-# the user's own config.toml is never written
+# NOTHING is written into the Codex home: no profile file, base config untouched
+[ ! -f "$CODEX_HOME/mlx-serve.config.toml" ] || OK=0
 grep -q "^# sentinel$" "$CODEX_HOME/config.toml" || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "codex profile targets /v1/responses with the advertised context" PASS
+    run_test "codex -c overrides target /v1/responses with the advertised context" PASS
 else
-    run_test "codex profile targets /v1/responses with the advertised context" FAIL "$OUT"
+    run_test "codex -c overrides target /v1/responses with the advertised context" FAIL "$OUT"
 fi
 
 # ── [5] claude --print ──
@@ -164,7 +165,7 @@ fi
 
 # ── [6] passthrough args ──
 OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
-if echo "$OUT" | grep -q -- "\"\$CODEX_BIN\" --profile mlx-serve 'resume'"; then
+if echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"

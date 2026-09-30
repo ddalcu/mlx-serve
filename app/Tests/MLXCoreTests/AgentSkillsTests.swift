@@ -26,6 +26,25 @@ final class AgentSkillsTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root + "/claude/plugin/.claude-plugin/plugin.json"))
     }
 
+    // Codex has no dedicated home — its link rides the user's own Codex home
+    // and NOTHING else is ever written there (twin of launch.zig codex skill test).
+    func testCodexLinksIntoItsOwnHomeAndWritesNothingElse() throws {
+        let root = try tempDir()
+        let home = try tempDir()
+        let old = ProcessInfo.processInfo.environment["CODEX_HOME"]
+        setenv("CODEX_HOME", home, 1)
+        addTeardownBlock {
+            if let old { setenv("CODEX_HOME", old, 1) } else { unsetenv("CODEX_HOME") }
+        }
+
+        AgentSkills.install(agentId: "codex", root: root)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: home + "/skills/mlx-serve"),
+                       root + "/skills/mlx-serve")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/config.toml"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home + "/mlx-serve.config.toml"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root + "/codex"), "no dedicated codex dir")
+    }
+
     // The update menu restores every shipped skill file, backing up the edited ones where no scan finds them as skills.
     func testRefreshBacksUpEditsOutsideTheSkillsDir() throws {
         let root = try tempDir()
