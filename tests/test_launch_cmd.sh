@@ -8,8 +8,9 @@
 #   [3] launch omp --print against a live server: script exports the pi-spelled
 #       agent dir var, targets the served model, and the written models.yml
 #       carries the server's ADVERTISED context (never a hardcoded one)
-#   [4] launch codex --print: config.toml targets our /v1/responses
-#       (wire_api = "responses") with the advertised context
+#   [4] launch codex --print: the launch line rides -c key=value overrides
+#       (model_providers.mlx.* → /v1/responses, wire_api = "responses") with
+#       the advertised context, and NOTHING is written into CODEX_HOME
 #   [5] launch claude --print: env-only script, no config file, ADVERTISED
 #       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
 #       Claude Code assumes 200k and auto-compacts there) + the derived output
@@ -18,10 +19,38 @@
 #   [7] launch opencode2 --print: XDG_CONFIG_HOME under the dedicated dir,
 #       cli.json carries metricsUrl = base + /metrics.json, plugin has tui.tsx
 #
-# The configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
+# Most configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
 # launcher writes (never a user's real agent config) — asserted per agent.
+# codex is the exception: it writes NOTHING into the effective CODEX_HOME
+# (default ~/.codex) and rides -c overrides on the launch line, so the user's
+# MCP/plugins/auth/trusts survive untouched.
+#
+# CODEX_HOME is force-set for the WHOLE run: if this ever regresses to writing
+# anything into the effective home, the trap below catches it with a loud fail
+# instead of silently clobbering the user's real ~/.codex. A temp home is used
+# either way so the real one is untouched. A caller-supplied TEST_CODEX_HOME is
+# cleaned of its own files but NEVER removed — only a home this script mktemp'd
+# gets rm -rf'd.
 
 set -u
+
+if [ -n "${TEST_CODEX_HOME:-}" ]; then
+    export CODEX_HOME="$TEST_CODEX_HOME"
+    OWN_CODEX_HOME=0
+else
+    CODEX_HOME=$(mktemp -d)
+    export CODEX_HOME
+    OWN_CODEX_HOME=1
+fi
+mkdir -p "$CODEX_HOME"
+printf '# sentinel\n' > "$CODEX_HOME/config.toml"
+codex_home_guard() {
+    if [ -f "$CODEX_HOME/config.toml" ] && ! grep -q "^# sentinel$" "$CODEX_HOME/config.toml" 2>/dev/null; then
+        echo "FAIL: $CODEX_HOME/config.toml was modified — a writer is ignoring -c overrides"
+        exit 1
+    fi
+    if [ "$OWN_CODEX_HOME" = 1 ]; then rm -rf "$CODEX_HOME"; else rm -f "$CODEX_HOME/config.toml"; fi
+}
 
 MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8097}
@@ -66,10 +95,10 @@ echo "Starting server..."
 "$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >/tmp/mlx-serve-launch-test.log 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
+trap 'cleanup; codex_home_guard' EXIT
 for i in $(seq 1 40); do
     curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; exit 1; }
+    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; codex_home_guard; exit 1; }
     sleep 1
 done
 
@@ -93,25 +122,36 @@ else
     run_test "omp script + models.yml carry the advertised context" FAIL "$OUT"
 fi
 
-# ── [4] codex --print ──
+# ── [4] codex --print ──  (CODEX_HOME already exported for the whole run)
 OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
 OK=1
-echo "$OUT" | grep -q 'export CODEX_HOME="$HOME/.mlx-serve/codex"' || OK=0
+# no dedicated home export: the user's CODEX_HOME survives into the launch
+echo "$OUT" | grep -q 'export CODEX_HOME=' && OK=0
+# the launch line rides -c overrides, never a --profile layer
+echo "$OUT" | grep -q -- '--profile' && OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"'" || OK=0
+echo "$OUT" | grep -q -- "-c model_context_window=$ADV_CTX" || OK=0
+echo "$OUT" | grep -q -- "-c 'model_providers.mlx.base_url=\"$BASE/v1\"'" || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
-grep -q 'wire_api = "responses"' ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "model_context_window = $ADV_CTX" ~/.mlx-serve/codex/config.toml || OK=0
-grep -q "base_url = \"$BASE/v1\"" ~/.mlx-serve/codex/config.toml || OK=0
+# NOTHING is written into the Codex home: no profile file, base config
+# untouched, no skill link (codex gets no skill: codex has no -c skills root).
+[ ! -f "$CODEX_HOME/mlx-serve.config.toml" ] || OK=0
+[ ! -e "$CODEX_HOME/skills" ] || OK=0
+grep -q "^# sentinel$" "$CODEX_HOME/config.toml" || OK=0
 if [ "$OK" = 1 ]; then
-    run_test "codex config targets /v1/responses with the advertised context" PASS
+    run_test "codex -c overrides target /v1/responses with the advertised context" PASS
 else
-    run_test "codex config targets /v1/responses with the advertised context" FAIL "$OUT"
+    run_test "codex -c overrides target /v1/responses with the advertised context" FAIL "$OUT"
 fi
 
 # ── [5] claude --print ──
 OUT=$("$BIN" launch claude --print --url "$BASE" 2>&1)
-EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 4)))")
+# The agent output share is ctx/2 (launch.budgetForContext) — a //4 here
+# was main's stale twin, masked on 262144-ctx defaults where both clamp to
+# 65536 and only surfacing at ctx values like 131072.
+EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 2)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
 echo "$OUT" | grep -q "export CLAUDE_CODE_MAX_OUTPUT_TOKENS=$EXPECT_OUT" || OK=0
@@ -127,7 +167,7 @@ fi
 
 # ── [6] passthrough args ──
 OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
-if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
+if echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"

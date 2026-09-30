@@ -331,23 +331,49 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
-/// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
-/// variant), pointing at our /v1/responses. Keyless: no `env_key` and
-/// `requires_openai_auth` unset means codex skips login; the loopback server
-/// ignores keys anyway.
-pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        \\# written by mlx-serve — dedicated CODEX_HOME, regenerated at each launch.
-        \\model = "{s}"
-        \\model_provider = "mlx"
-        \\model_context_window = {d}
-        \\
-        \\[model_providers.mlx]
-        \\name = "MLX Serve (local)"
-        \\base_url = "{s}/v1"
-        \\wire_api = "responses"
-        \\
-    , .{ model, budget.context, base_url });
+/// One `-c key="value"` override arg: the value is TOML-escaped (`\"` —
+/// codex parses the value as TOML), then the whole arg is single-quoted for
+/// the shell with the extras helper (a `'` survives as `'\\''`). A plain
+/// key/value keeps the exact bytes the old single-quote splice emitted.
+fn appendCodexOverride(out: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    var arg = std.ArrayList(u8).empty;
+    defer arg.deinit(allocator);
+    try arg.appendSlice(allocator, key);
+    try arg.appendSlice(allocator, "=\"");
+    for (value) |c| {
+        if (c == '"') try arg.appendSlice(allocator, "\\\"") else try arg.append(allocator, c);
+    }
+    try arg.append(allocator, '"');
+    if (out.items.len != 0) try out.append(allocator, ' ');
+    try out.appendSlice(allocator, "-c ");
+    try appendQuoted(out, allocator, arg.items);
+}
+
+/// The `-c key=value` config overrides for the codex launch line — codex
+/// merges them over the user's own config.toml (dotted paths create nested
+/// tables), so mlx-serve WRITES NOTHING into the user's Codex home and MCP
+/// servers, plugins, auth, and project trusts carry over. Responses wire API
+/// only (codex-rs `WireApi` has one variant), pointing at our /v1/responses.
+/// Keyless: no `env_key` and `requires_openai_auth` unset means codex skips
+/// login; the loopback server ignores keys anyway. A zero advertised context
+/// omits the two size keys (like claude's CLAUDE_CODE_MAX_CONTEXT_TOKENS —
+/// codex's own fallback metadata is better than a declared 0).
+pub fn codexConfigOverrides(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var url = std.ArrayList(u8).empty;
+    defer url.deinit(allocator);
+    try url.appendSlice(allocator, base_url);
+    try url.appendSlice(allocator, "/v1");
+    try appendCodexOverride(&out, allocator, "model", model);
+    try appendCodexOverride(&out, allocator, "model_provider", "mlx");
+    if (budget.context > 0) {
+        try out.print(allocator, " -c model_context_window={d} -c model_max_output_tokens={d}", .{ budget.context, budget.output });
+    }
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.name", "MLX Serve (local)");
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.base_url", url.items);
+    try appendCodexOverride(&out, allocator, "model_providers.mlx.wire_api", "responses");
+    return out.toOwnedSlice(allocator);
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -434,6 +460,21 @@ fn appendExtras(out: *std.ArrayList(u8), allocator: std.mem.Allocator, extras: [
     }
 }
 
+fn needsShellQuoting(arg: []const u8) bool {
+    for (arg) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, ".-_/+:@=", c) != null)) return true;
+    }
+    return arg.len == 0;
+}
+
+/// An agent argument derived from a model id: quoted only when it carries
+/// shell-significant bytes, so ordinary ids keep the exact script bytes.
+fn appendModelArg(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: []const u8) !void {
+    try out.append(allocator, ' ');
+    if (needsShellQuoting(arg)) return appendQuoted(out, allocator, arg);
+    return out.appendSlice(allocator, arg);
+}
+
 /// The script body run through `/bin/zsh -l -c` (login shell = the user's
 /// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
 /// script only exports env and execs the agent — same split as the app's
@@ -474,28 +515,36 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             if (budget.context > 0) {
                 try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
             }
-            try out.print(allocator, "claude --plugin-dir \"$HOME/.mlx-serve/{s}\" --model {s}", .{ claude_plugin_dir, model });
+            try out.print(allocator, "claude --plugin-dir \"$HOME/.mlx-serve/{s}\" --model", .{claude_plugin_dir});
+            try appendModelArg(&out, allocator, model);
         },
         .pi => {
-            try out.print(allocator,
+            try out.appendSlice(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
-                \\pi --provider mlx --model {s}
-            , .{model});
+                \\pi --provider mlx --model
+            );
+            try appendModelArg(&out, allocator, model);
         },
         .omp => {
             // omp still reads pi's env spelling (measured on v17 — the OMP_
             // rename reached only its help text); export both.
-            try out.print(allocator,
+            try out.appendSlice(allocator,
                 \\export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
                 \\export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
-                \\omp --model mlx/{s}
-            , .{model});
+                \\omp --model
+            );
+            const omp_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
+            defer allocator.free(omp_model);
+            try appendModelArg(&out, allocator, omp_model);
         },
         .opencode => {
             try out.print(allocator,
                 \\export OPENCODE_CONFIG_CONTENT='{s}'
-                \\opencode --model mlx/{s}
-            , .{ opencode_config.?, model });
+                \\opencode --model
+            , .{opencode_config.?});
+            const oc_model = try std.fmt.allocPrint(allocator, "mlx/{s}", .{model});
+            defer allocator.free(oc_model);
+            try appendModelArg(&out, allocator, oc_model);
         },
         .opencode2 => {
             try out.print(allocator,
@@ -506,13 +555,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             , .{opencode_config.?});
         },
         .codex => {
-            // PATH first, then the CLI the desktop app bundles (codex's
-            // rebranded app installs as ChatGPT.app or Codex.app, bundle id
-            // com.openai.codex, CLI at Contents/Resources/codex) — a
-            // desktop-app-only user has no codex on PATH. Mirrors the Swift
-            // AgentConfigs.codexBinResolver.
+            // No CODEX_HOME export and nothing written: the user's own home
+            // (MCP servers, plugins, auth) is used as-is and the settings
+            // ride `-c` overrides on the launch line. PATH first, then the
+            // CLI the desktop app bundles (codex's rebranded app installs as
+            // ChatGPT.app or Codex.app, bundle id com.openai.codex, CLI at
+            // Contents/Resources/codex) — a desktop-app-only user has no
+            // codex on PATH. Mirrors the Swift AgentConfigs.codexBinResolver.
             try out.appendSlice(allocator,
-                \\export CODEX_HOME="$HOME/.mlx-serve/codex"
                 \\CODEX_BIN="$(command -v codex)"
                 \\if [ -z "$CODEX_BIN" ]; then
                 \\  for app in "/Applications/ChatGPT.app" "/Applications/Codex.app" "$HOME/Applications/ChatGPT.app" "$HOME/Applications/Codex.app"; do
@@ -520,8 +570,10 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\  done
                 \\fi
                 \\if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
-                \\"$CODEX_BIN"
             );
+            const overrides = try codexConfigOverrides(allocator, base_url, model, budget);
+            defer allocator.free(overrides);
+            try out.print(allocator, "\n\"$CODEX_BIN\" {s}", .{overrides});
         },
         .hermes => {
             try out.appendSlice(allocator,
@@ -533,8 +585,14 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
             try out.print(allocator,
                 \\export OPENAI_API_BASE='{s}/v1'
                 \\export OPENAI_API_KEY=mlx-serve
-                \\aider --model openai/{s} --weak-model openai/{s} --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
-            , .{ base_url, model, model });
+                \\aider --model
+            , .{base_url});
+            const aider_model = try std.fmt.allocPrint(allocator, "openai/{s}", .{model});
+            defer allocator.free(aider_model);
+            try appendModelArg(&out, allocator, aider_model);
+            try out.appendSlice(allocator, " --weak-model");
+            try appendModelArg(&out, allocator, aider_model);
+            try out.appendSlice(allocator, " --model-metadata-file ~/.mlx-serve/aider/model-metadata.json");
         },
     }
     try appendExtras(&out, allocator, extras);
@@ -704,14 +762,18 @@ const claude_plugin_dir = "claude/plugin";
 
 /// Where each agent discovers skills inside its dedicated config dir; opencode
 /// reads `skills.paths` from its inline config instead, aider has no skills.
+/// Codex has no dedicated dir and no config key for a skills search path
+/// (`skills.*` in config.toml, checked on codex-cli 0.158; the extra_roots of
+/// its app-server API is a request parameter, not a `-c` key) — a symlink
+/// into the user's own homes would teach every codex session about a server
+/// only this launch wired up, so codex gets no skill.
 fn agentSkillLink(kind: AgentKind) ?[]const u8 {
     return switch (kind) {
         .pi => "pi/skills/" ++ agent_skills.name,
         .omp => "omp/skills/" ++ agent_skills.name,
-        .codex => "codex/skills/" ++ agent_skills.name,
         .hermes => "hermes/skills/" ++ agent_skills.name,
         .claude => claude_plugin_dir ++ "/skills/" ++ agent_skills.name,
-        .opencode, .opencode2, .aider => null,
+        .codex, .opencode, .opencode2, .aider => null,
     };
 }
 
@@ -790,11 +852,7 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             defer allocator.free(yml);
             try writeAgentFile(allocator, io, "omp", "models.yml", yml);
         },
-        .codex => {
-            const toml = try codexConfigToml(allocator, base_url, model, budget);
-            defer allocator.free(toml);
-            try writeAgentFile(allocator, io, "codex", "config.toml", toml);
-        },
+        .codex => {}, // settings ride -c overrides; nothing is written
         .hermes => {
             const yaml = try hermesConfigYaml(allocator, base_url, model, entries);
             defer allocator.free(yaml);
@@ -1006,6 +1064,17 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
 const t = std.testing;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
+    _ = setenv(name, value, 1);
+}
+
+fn restoreEnv(name: [*:0]const u8, value: ?[*:0]const u8) void {
+    if (value) |v| setEnv(name, v) else _ = unsetenv(name);
+}
+
 test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = fallback" {
     // Thinking shares the response cap: a 24k window at ctx/4 gave pi 6144,
     // which one xhigh design turn on Qwen3.8 spent entirely on thinking.
@@ -1032,13 +1101,85 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
     try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: qwen") != null);
 }
 
-test "codex config: responses wire API, keyless, context at the root" {
-    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 22528 });
-    defer t.allocator.free(toml);
-    try t.expect(std.mem.indexOf(u8, toml, "wire_api = \"responses\"") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "model_context_window = 90112") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:11234/v1\"") != null);
-    try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
+test "codex overrides: responses wire API, keyless, advertised sizes" {
+    const ov = try codexConfigOverrides(t.allocator, "http://127.0.0.1:11234", "m1", .{ .context = 90112, .output = 45056 });
+    defer t.allocator.free(ov);
+    try t.expectEqualStrings(
+        "-c 'model=\"m1\"' -c 'model_provider=\"mlx\"' -c model_context_window=90112" ++
+            " -c model_max_output_tokens=45056 -c 'model_providers.mlx.name=\"MLX Serve (local)\"'" ++
+            " -c 'model_providers.mlx.base_url=\"http://127.0.0.1:11234/v1\"'" ++
+            " -c 'model_providers.mlx.wire_api=\"responses\"'",
+        ov,
+    );
+    try t.expect(std.mem.indexOf(u8, ov, "env_key") == null);
+}
+
+test "codex overrides: a zero advertised context omits the size keys" {
+    // Codex's own fallback metadata beats a declared 0; claude's
+    // CLAUDE_CODE_MAX_CONTEXT_TOKENS is omitted the same way.
+    const ov = try codexConfigOverrides(t.allocator, "http://x:1", "m1", .{ .context = 0, .output = 0 });
+    defer t.allocator.free(ov);
+    try t.expect(std.mem.indexOf(u8, ov, "model_context_window") == null);
+    try t.expect(std.mem.indexOf(u8, ov, "model_max_output_tokens") == null);
+    try t.expect(std.mem.indexOf(u8, ov, "-c 'model=\"m1\"'") != null);
+    try t.expect(std.mem.indexOf(u8, ov, "-c 'model_providers.mlx.base_url=\"http://x:1/v1\"'") != null);
+}
+
+/// Temp CODEX_HOME + `<tmp>/mlxroot` as the mlx-serve root; asserts run
+/// against the tmp dir's own handle (sub_path "cx/…" / "mlxroot/…").
+fn codexHomeProbe(comptime body: fn (root: []const u8, dir: *std.testing.TmpDir) anyerror!void) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = buf[0..try tmp.dir.realPath(io, &buf)];
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_z = try std.fmt.bufPrint(&root_buf, "{s}/mlxroot", .{real});
+    try tmp.dir.createDirPath(io, "mlxroot");
+    var home_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const home_t = try std.fmt.bufPrint(&home_buf, "{s}/cx", .{real});
+    home_buf[home_t.len] = 0;
+
+    const old = std.c.getenv("CODEX_HOME");
+    defer restoreEnv("CODEX_HOME", old);
+    setEnv("CODEX_HOME", &home_buf);
+    try body(root_z, &tmp);
+}
+
+fn codexSkillWritesNothingToItsHome(root: []const u8, dir: *std.testing.TmpDir) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try installSkill(t.allocator, io, root, .codex);
+    try installSkill(t.allocator, io, root, .codex);
+    // The shared body lands under the mlx-serve root (every agent gets it)…
+    try dir.dir.access(io, "mlxroot/skills/mlx-serve/SKILL.md", .{});
+    // …and the Codex home is untouched: no skills dir, no config, no home
+    // created for a user who never ran codex.
+    try t.expect(dir.dir.access(io, "cx", .{}) == error.FileNotFound);
+}
+
+test "codex gets no skill link: the effective Codex home stays untouched" {
+    try codexHomeProbe(codexSkillWritesNothingToItsHome);
+}
+
+test "codex overrides quote a model id carrying shell and TOML quotes" {
+    const ov = try codexConfigOverrides(t.allocator, "http://x:1", "o'ne\"il/m", .{ .context = 0, .output = 0 });
+    defer t.allocator.free(ov);
+    try t.expectEqualStrings(
+        "-c 'model=\"o'\\''ne\\\"il/m\"' -c 'model_provider=\"mlx\"'" ++
+            " -c 'model_providers.mlx.name=\"MLX Serve (local)\"'" ++
+            " -c 'model_providers.mlx.base_url=\"http://x:1/v1\"'" ++
+            " -c 'model_providers.mlx.wire_api=\"responses\"'",
+        ov,
+    );
+}
+
+test "model args ride the invocation quoted only when they need it" {
+    const odd = try scriptFor(t.allocator, .claude, "http://x:1", "a b'c", .{ .context = 65536, .output = 32768 }, null, &.{});
+    defer t.allocator.free(odd);
+    try t.expect(std.mem.indexOf(u8, odd, "--model 'a b'\\''c'") != null);
+    const plain = try scriptFor(t.allocator, .omp, "http://x:1", "ok/m1", .{ .context = 65536, .output = 32768 }, null, &.{});
+    defer t.allocator.free(plain);
+    try t.expect(std.mem.indexOf(u8, plain, "omp --model mlx/ok/m1\n") != null);
 }
 
 test "pi models.json and opencode config parse as JSON and stay single-quote-free" {
@@ -1165,8 +1306,9 @@ test "launch args: passthrough after --, unknown agent named, url trailing slash
 test "script assembly: extras are shell-quoted onto the invocation line" {
     const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{ "resume", "it's" });
     defer t.allocator.free(script);
-    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" 'resume' 'it'\\''s'") != null);
-    try t.expect(std.mem.indexOf(u8, script, "export CODEX_HOME=\"$HOME/.mlx-serve/codex\"") != null);
+    try t.expect(std.mem.indexOf(u8, script, "\"$CODEX_BIN\" -c 'model=\"m1\"'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume' 'it'\\''s'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
 test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebrand)" {
@@ -1179,6 +1321,19 @@ test "codex script falls back to the desktop app's bundled CLI (ChatGPT.app rebr
     // Never exec an empty resolution — refuse with the install hint.
     try t.expect(std.mem.indexOf(u8, script, "exit 127") != null);
     try t.expect(std.mem.indexOf(u8, script, "\n\"$CODEX_BIN\"") != null);
+}
+
+test "codex script rides -c overrides, never a profile file or dedicated home" {
+    // `-c` values are parsed as TOML by codex, and the whole settings set
+    // lives on the invocation — so nothing is written to the user's home and
+    // no `--profile` layer can go stale.
+    const script = try scriptFor(t.allocator, .codex, "http://x:1", "m1", .{ .context = 4096, .output = 1024 }, null, &.{});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.name=\"MLX Serve (local)\"'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.base_url=\"http://x:1/v1\"'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "-c 'model_providers.mlx.wire_api=\"responses\"'") != null);
+    try t.expect(std.mem.indexOf(u8, script, "--profile") == null);
+    try t.expect(std.mem.indexOf(u8, script, "CODEX_HOME") == null);
 }
 
 test "AgentKind.fromName recognizes opencode2" {

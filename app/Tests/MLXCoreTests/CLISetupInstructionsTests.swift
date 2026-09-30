@@ -220,17 +220,50 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(yml.contains("thinkingFormat: qwen"), yml)
     }
 
-    /// codex only speaks the Responses wire API (WireApi has one variant) and
-    /// honors CODEX_HOME for its whole config tree — dedicated dir, keyless
-    /// provider (no env_key: the loopback server ignores keys).
-    func testCodexTabWritesAnIsolatedCodexHome() throws {
+    /// codex only speaks the Responses wire API (WireApi has one variant).
+    /// The settings ride `-c` overrides on the launch line — codex merges
+    /// them over the user's own config.toml, so the instructions write
+    /// NOTHING anywhere. Keyless provider (no env_key: the loopback server
+    /// ignores keys).
+    func testCodexTabLaunchesWithOverridesAndWritesNothing() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
-        XCTAssertTrue(tab.command.contains("mkdir -p ~/.mlx-serve/codex"))
-        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/codex/config.toml <<'EOF'"))
-        XCTAssertTrue(tab.command.contains(#"export CODEX_HOME="$HOME/.mlx-serve/codex""#))
-        XCTAssertTrue(tab.command.contains(AgentConfigs.codexConfigTOML(
-            baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)))
-        XCTAssertFalse(tab.command.contains("~/.codex"), "must never touch the user's real codex config")
+        XCTAssertTrue(tab.command.contains(#""$CODEX_BIN" -c 'model="gemma-4-e4b-it-4bit"'"#), tab.command)
+        XCTAssertTrue(tab.command.contains("-c 'model_provider=\"mlx\"'"), tab.command)
+        XCTAssertTrue(tab.command.contains("-c model_context_window=\(budget.context)"), tab.command)
+        XCTAssertTrue(tab.command.contains("-c model_max_output_tokens=\(budget.output)"), tab.command)
+        XCTAssertTrue(tab.command.contains(#"-c 'model_providers.mlx.base_url="http://localhost:11234/v1"'"#), tab.command)
+        XCTAssertTrue(tab.command.contains(#"-c 'model_providers.mlx.wire_api="responses"'"#), tab.command)
+        XCTAssertFalse(tab.command.contains("env_key"), tab.command)
+        // nothing is written: no file, no directory, no profile layer
+        XCTAssertFalse(tab.command.contains("mkdir"), tab.command)
+        XCTAssertFalse(tab.command.contains("cat >"), tab.command)
+        XCTAssertFalse(tab.command.contains("--profile"), tab.command)
+        XCTAssertFalse(tab.command.contains("mlx-serve.config.toml"), tab.command)
+        XCTAssertFalse(tab.command.contains("~/.mlx-serve/codex"), "no dedicated CODEX_HOME")
+    }
+
+    /// A zero advertised context omits the two size keys — codex's own
+    /// fallback metadata beats a declared 0 (claude's
+    /// CLAUDE_CODE_MAX_CONTEXT_TOKENS is omitted the same way).
+    func testCodexConfigArgsOmitsTheSizesForAnUnknownContext() {
+        let zero = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: "m1",
+                                                budget: AgentBudget.Budget(context: 0, output: 0))
+        XCTAssertFalse(zero.contains("model_context_window"), zero)
+        XCTAssertFalse(zero.contains("model_max_output_tokens"), zero)
+        XCTAssertTrue(zero.contains("-c 'model=\"m1\"'"), zero)
+        XCTAssertTrue(zero.contains(#"-c 'model_providers.mlx.base_url="http://x:1/v1"'"#), zero)
+    }
+
+    /// The copy-paste tab and the launcher script must carry the SAME
+    /// override builder — a hand-duplicated arg list is the drift class.
+    func testCodexTabReusesTheLaunchOverrideBuilder() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
+        let args = AgentConfigs.codexConfigArgs(baseURL: "http://localhost:11234",
+                                                model: "gemma-4-e4b-it-4bit", budget: budget)
+        XCTAssertTrue(tab.command.contains(args), tab.command)
+        let script = LauncherCLI.codex.scriptBody("http://localhost:11234",
+                                                  "gemma-4-e4b-it-4bit", "", budget, [])
+        XCTAssertTrue(script.contains("\"$CODEX_BIN\" \(args)"), script)
     }
 
     /// The ChatGPT desktop app (codex's rebranded app; bundle id
@@ -245,7 +278,7 @@ final class CLISetupInstructionsTests: XCTestCase {
                                                   "", budget, [])
         for surface in [tab.command, script] {
             XCTAssertTrue(surface.contains(AgentConfigs.codexBinResolver), surface)
-            XCTAssertTrue(surface.contains("\"$CODEX_BIN\""), surface)
+            XCTAssertTrue(surface.contains("-c 'model_providers.mlx.wire_api=\"responses\"'"), surface)
             XCTAssertFalse(surface.contains("\ncodex\n"), "bare codex would miss the bundled binary")
         }
         XCTAssertTrue(AgentConfigs.codexBinResolver.contains("/Applications/ChatGPT.app"))
@@ -267,14 +300,14 @@ final class CLISetupInstructionsTests: XCTestCase {
     }
 
     func testCodexConfigTargetsOurResponsesAPIAndCarriesTheContext() {
-        let toml = AgentConfigs.codexConfigTOML(
+        let args = AgentConfigs.codexConfigArgs(
             baseURL: "http://localhost:11234", model: "m1", budget: budget)
-        XCTAssertTrue(toml.contains(#"wire_api = "responses""#), toml)
-        XCTAssertTrue(toml.contains(#"base_url = "http://localhost:11234/v1""#), toml)
-        XCTAssertTrue(toml.contains("model_context_window = \(budget.context)"), toml)
-        XCTAssertTrue(toml.contains(#"model = "m1""#), toml)
-        XCTAssertTrue(toml.contains(#"model_provider = "mlx""#), toml)
-        XCTAssertFalse(toml.contains("env_key"), "keyless — loopback is exempt from --api-key")
+        XCTAssertTrue(args.contains(#"-c 'model_providers.mlx.wire_api="responses"'"#), args)
+        XCTAssertTrue(args.contains(#"-c 'model_providers.mlx.base_url="http://localhost:11234/v1"'"#), args)
+        XCTAssertTrue(args.contains("-c model_context_window=\(budget.context)"), args)
+        XCTAssertTrue(args.contains(#"-c 'model="m1"'"#), args)
+        XCTAssertTrue(args.contains(#"-c 'model_provider="mlx"'"#), args)
+        XCTAssertFalse(args.contains("env_key"), "keyless — loopback is exempt from --api-key")
     }
 
     /// hermes reads its whole tree from HERMES_HOME (hermes_constants.py) —

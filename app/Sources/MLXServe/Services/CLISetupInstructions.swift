@@ -29,7 +29,7 @@ enum CLISetupInstructions {
                 installHint: "Requires the claude CLI: npm install -g @anthropic-ai/claude-code",
                 command: """
                 \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: servedModelId, budget: budget))
-                claude --model \(servedModelId)
+                claude --model \(AgentConfigs.shellArg(servedModelId))
                 """),
             // pi has no env-var/flag route for a custom base URL (a models.json
             // is required), but PI_CODING_AGENT_DIR relocates the config dir —
@@ -44,7 +44,7 @@ enum CLISetupInstructions {
                 \(AgentConfigs.piModelsJSON(baseURL: baseURL, model: servedModelId, budget: budget))
                 EOF
                 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
-                pi --provider mlx --model \(servedModelId)
+                pi --provider mlx --model \(AgentConfigs.shellArg(servedModelId))
                 """),
             // omp (oh-my-pi) — pi fork, own config tree: models.yml under the
             // agent dir. The env read is still pi's PI_CODING_AGENT_DIR
@@ -60,7 +60,7 @@ enum CLISetupInstructions {
                 EOF
                 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
                 export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
-                omp --model mlx/\(servedModelId)
+                omp --model \(AgentConfigs.shellArg("mlx/" + servedModelId))
                 """),
             // opencode needs no file at all: OPENCODE_CONFIG_CONTENT carries
             // the config inline and MERGES over the user's global/project
@@ -70,7 +70,7 @@ enum CLISetupInstructions {
                 installHint: "Requires the opencode CLI: curl -fsSL https://opencode.ai/install | bash",
                 command: """
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: servedModelId, budget: budget))'
-                opencode --model mlx/\(servedModelId)
+                opencode --model \(AgentConfigs.shellArg("mlx/" + servedModelId))
                 """),
             Tab(id: "opencode2",
                 title: "OpenCode 2",
@@ -86,21 +86,19 @@ enum CLISetupInstructions {
                 if ! command -v opencode2 >/dev/null 2>&1; then echo "opencode2 is not installed: npm install -g @opencode/cli"; exit 127; fi
                 opencode2 --standalone
                 """),
-            // codex honors CODEX_HOME for its whole config tree; the dir must
-            // exist before codex runs. Responses wire API — our /v1/responses.
-            // The resolver line also finds the CLI the ChatGPT/Codex desktop
-            // app bundles, for installs with no codex on PATH.
+            // codex settings ride `-c` overrides on the launch line — codex
+            // merges them over the user's own config.toml, so nothing is
+            // written into the user's Codex home and MCP servers, plugins,
+            // auth, and project trusts carry over. Responses wire API — our
+            // /v1/responses. The resolver line also finds the CLI the
+            // ChatGPT/Codex desktop app bundles, for installs with no codex
+            // on PATH.
             Tab(id: "codex",
                 title: "Codex",
                 installHint: "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it",
                 command: """
-                mkdir -p ~/.mlx-serve/codex
-                cat > ~/.mlx-serve/codex/config.toml <<'EOF'
-                \(AgentConfigs.codexConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget))
-                EOF
-                export CODEX_HOME="$HOME/.mlx-serve/codex"
                 \(AgentConfigs.codexBinResolver)
-                "$CODEX_BIN"
+                "$CODEX_BIN" \(AgentConfigs.codexConfigArgs(baseURL: baseURL, model: servedModelId, budget: budget))
                 """),
             // hermes reads its whole tree from HERMES_HOME; the .env is the
             // first-run wizard kill switch (OPENAI_BASE_URL set = configured).
@@ -131,7 +129,7 @@ enum CLISetupInstructions {
                 EOF
                 export OPENAI_API_BASE='\(baseURL)/v1'
                 export OPENAI_API_KEY=mlx-serve
-                aider --model openai/\(servedModelId) --weak-model openai/\(servedModelId) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
+                aider --model \(AgentConfigs.shellArg("openai/" + servedModelId)) --weak-model \(AgentConfigs.shellArg("openai/" + servedModelId)) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
         ]
     }

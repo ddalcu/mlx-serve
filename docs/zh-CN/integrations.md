@@ -149,26 +149,21 @@ opencode2 --model mlx/MODEL_ID
 
 ### Codex
 
-当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。`CODEX_HOME` 会改变它整棵配置树的位置（该文件夹必须在 codex 运行前就存在）。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。
+当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 既不搬迁你的配置，也不往里写任何东西：你真正的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）原样使用，所以你的 MCP 服务器、插件、登录和项目信任全部照常工作。mlx-serve 的设置以 `-c key=value` 覆盖参数的形式搭载在启动行上，由 codex 合并到你自己的 `config.toml` 之上（点号的 `model_providers.mlx.*` 路径会自动创建该表）。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。有一点你拿不到：codex 启动不携带 mlx-serve skill —— codex 只从它自己永久的目录（`~/.codex/skills`、`~/.agents/skills`）发现 skill，且没有额外搜索路径的配置项（`-c` 无法指向 `~/.mlx-serve/skills`），所以一次性的 skill 在不写你 home 的前提下无处安放。
 
 PATH 里没有 `codex`，但你有 ChatGPT 桌面应用？它把 CLI 打包在 `/Applications/ChatGPT.app/Contents/Resources/codex`（启动器会自动在那里找到它；`mlx-serve launch chatgpt` 同样可用）。
 
-Codex 每一轮都会打印 `Model metadata for <id> not found. Defaulting to fallback metadata`。那是它内部维护的 OpenAI 模型 id 目录，任何自定义提供商的模型都会触发；这只是表面现象。真正要紧的部分 —— 上下文窗口 —— 来自配置里的 `model_context_window`，它会覆盖那个回退值。
+Codex 每一轮都会打印 `Model metadata for <id> not found. Defaulting to fallback metadata`。那是它内部维护的 OpenAI 模型 id 目录，任何自定义提供商的模型都会触发；这只是表面现象。真正要紧的部分 —— 上下文窗口 —— 来自下面那条 `-c model_context_window=…` 覆盖参数，它会覆盖那个回退值（advertised context 为 0 时会省略尺寸相关的覆盖参数，改用 codex 自己的回退值）。
 
 ```bash
-mkdir -p ~/.mlx-serve/codex
-cat > ~/.mlx-serve/codex/config.toml <<'EOF'
-model = "MODEL_ID"
-model_provider = "mlx"
-model_context_window = CTX
-
-[model_providers.mlx]
-name = "MLX Serve (local)"
-base_url = "http://127.0.0.1:11234/v1"
-wire_api = "responses"
-EOF
-export CODEX_HOME="$HOME/.mlx-serve/codex"
-codex
+codex \
+  -c 'model="MODEL_ID"' \
+  -c 'model_provider="mlx"' \
+  -c model_context_window=CTX \
+  -c model_max_output_tokens=OUT \
+  -c 'model_providers.mlx.name="MLX Serve (local)"' \
+  -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
+  -c 'model_providers.mlx.wire_api="responses"'
 ```
 
 ### Hermes

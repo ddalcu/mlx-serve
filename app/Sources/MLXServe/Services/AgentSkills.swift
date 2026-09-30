@@ -32,10 +32,14 @@ enum AgentSkills {
     }
 
     /// Where an agent discovers skills in its dedicated config dir; opencode
-    /// reads `skills.paths` from its inline config instead.
+    /// reads `skills.paths` from its inline config instead. Codex has no
+    /// dedicated dir and no config key for a skills search path — a symlink
+    /// into the user's own homes would teach every codex session about a
+    /// server only this launch wired up, so codex gets no skill (twin of
+    /// launch.zig `agentSkillLink`).
     static func linkPath(agentId: String) -> String? {
         switch agentId {
-        case "pi", "omp", "codex", "hermes": return "\(agentId)/skills/\(name)"
+        case "pi", "omp", "hermes": return "\(agentId)/skills/\(name)"
         case "claude": return "\(claudePluginDir)/skills/\(name)"
         default: return nil
         }
