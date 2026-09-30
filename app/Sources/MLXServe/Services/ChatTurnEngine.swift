@@ -47,6 +47,8 @@ struct TurnLedger {
     struct Turn {
         let token: UUID
         var liveTokens: Int = 0
+        /// The user switched Tools off while this turn ran.
+        var toolsRevoked = false
     }
 
     private(set) var turns: [UUID: Turn] = [:]
@@ -81,6 +83,14 @@ struct TurnLedger {
 
     func liveTokens(session: UUID) -> Int {
         turns[session]?.liveTokens ?? 0
+    }
+
+    mutating func revokeTools(session: UUID) {
+        turns[session]?.toolsRevoked = true
+    }
+
+    func toolsRevoked(session: UUID) -> Bool {
+        turns[session]?.toolsRevoked ?? false
     }
 
     /// Turns whose session no longer exists (the ghost-turn class): deleting
@@ -178,12 +188,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// composer.
     private func resumeWithSteeringNote(sessionId: UUID, token: UUID, config: TurnConfig,
                                         approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        // Read before `endTurn` drops the turn that carries it.
+        let revoked = ledger.toolsRevoked(session: sessionId)
         guard endTurn(sessionId: sessionId, token: token),
               session(sessionId) != nil,
               Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
               let note = steering.take(for: sessionId) else { return }
         runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
-                config: config, approval: approval)
+                config: config.revokingTools(revoked), approval: approval)
     }
 
     /// The turn table: token-identified turn per session (see `TurnLedger`)
@@ -362,10 +374,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             return d
         }
 
-        /// The tools to ADVERTISE: none unless the loop is actually running.
-        /// (`tools` itself stays the dispatch allow-list, which must keep
-        /// `searchDocuments` for docs-only turns.)
+        /// The tools to ADVERTISE: none unless the Tools toggle is on.
         var advertisedTools: Set<AgentToolKind> { agentMode ? tools : [] }
+
+        /// The tools this turn may RUN. With Tools off the loop still runs for
+        /// MCP or an attached folder, and a model re-calls built-ins it saw in
+        /// history — so only the document search survives.
+        var dispatchTools: Set<AgentToolKind> {
+            agentMode ? tools : tools.intersection([.searchDocuments])
+        }
+
+        /// This turn with the Tools switch off; MCP and an attached folder keep
+        /// their say.
+        func revokingTools(_ revoked: Bool) -> TurnConfig {
+            guard revoked else { return self }
+            var c = self
+            c.agentMode = false
+            return c
+        }
     }
 
     // MARK: - Per-turn sampling
@@ -461,6 +487,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// "silence everything"; per-chat Stop buttons use `stop(sessionId:)`.
     func stop() {
         for sid in ledger.activeSessionIds { stop(sessionId: sid) }
+    }
+
+    /// Tools switched off mid-turn: the running turn's next round and next
+    /// tool call see it (the turn itself keeps going for MCP or a folder).
+    func revokeTools(sessionId: UUID) {
+        ledger.revokeTools(session: sessionId)
     }
 
     /// Stop one session's in-flight turn; other sessions keep streaming.
@@ -858,7 +890,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
     /// Stops when the model responds with content (no tool calls) or after 150 iterations.
-    private func runAgentLoop(api: APIClient, sessionId: UUID, config: TurnConfig,
+    private func runAgentLoop(api: APIClient, sessionId: UUID, config turnConfig: TurnConfig,
                               workingDirectory initialWorkDir: String?,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) async throws {
         var workingDirectory = initialWorkDir
@@ -890,6 +922,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
+            // Tools switched off mid-turn withdraw the OFFER; the system prompt
+            // stays the turn's, so it never claims a folder that is not there.
+            let config = turnConfig.revokingTools(ledger.toolsRevoked(session: sessionId))
 
             // Session deleted mid-turn → the turn is orphaned. Bail before
             // issuing another request: with the session gone every append
@@ -921,7 +956,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // Volatile context that changes mid-session — kept OUT of the
             // stable prefix and appended at the very end (see composeSystemPrompt).
             var agentVolatileTail = ""
-            if config.agentMode {
+            if turnConfig.agentMode {
                 let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
                 // Stable, cacheable core: base instructions + execution
                 // environment + memory instructions + MCP listing. The model's
@@ -968,12 +1003,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // A skill invoked by NAME (`/music3 …`) works in every mode: the
             // user asked for it explicitly, so it does not wait for the agent
             // loop's trigger matching (which also covers it, above).
-            if !config.agentMode {
+            if !turnConfig.agentMode {
                 agentVolatileTail += AgentPrompt.skillManager.invokedSkill(for: userMsg)
             }
             // Attached-docs section for the modes whose base prompt doesn't
             // already explain the searchDocuments tool.
-            if let index = config.documentIndex, config.agentMode || config.mcpMode {
+            if let index = config.documentIndex, turnConfig.agentMode || turnConfig.mcpMode {
                 systemPrompt += AgentPrompt.attachedDocumentsSection(
                     folderName: index.folderName, fileCount: indexedFileCount(index))
             }
@@ -1332,7 +1367,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId,
-                    allowedTools: config.tools
+                    // Re-read: Tools can go off while this round streamed.
+                    allowedTools: config.revokingTools(ledger.toolsRevoked(session: sessionId)).dispatchTools
                 )
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }

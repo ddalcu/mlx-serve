@@ -2405,7 +2405,10 @@ struct ChatDetailView: View {
         // Re-arm the approval gate every time the user re-enters Agent mode.
         // "Always allow this session" decays here — for THIS tab only; other
         // tabs keep their decision.
-        if !on { toolAllowList.rearm(sessionId) }
+        if !on {
+            toolAllowList.rearm(sessionId)
+            chatEngine.revokeTools(sessionId: sessionId)
+        }
     }
 
     // MARK: Per-chat tool switches

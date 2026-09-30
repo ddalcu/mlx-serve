@@ -164,6 +164,79 @@ final class AgentCapabilityGateTests: XCTestCase {
                        "a gated tool must be refused BEFORE it runs")
     }
 
+    func testToolsOffRefusesABuiltInToolWhileMcpKeepsTheLoopRunning() async throws {
+        // Bar: with Tools off, a built-in call re-read from history must not run.
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("acg-\(UUID().uuidString)")
+        let victim = (dir as NSString).appendingPathComponent("test-folder")
+        try FileManager.default.createDirectory(atPath: victim, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        var wd: String? = dir
+
+        let r = AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot(
+            toolsEnabled: false, mcpEnabled: true, thinkingEnabled: false,
+            autoApprove: false, workingDirectory: dir))
+        let config = ChatTurnEngine.TurnConfig.from(r)
+        XCTAssertTrue(config.mcpMode, "MCP on keeps the tool loop running")
+
+        let tc = APIClient.ToolCall(id: "1", name: "shell",
+                                    arguments: ["command": "rm -rf test-folder"], rawArguments: "")
+        let result = await AgentEngine.executeToolCall(tc, workingDirectory: &wd,
+                                                      repetition: AgentEngine.RepetitionTracker(),
+                                                      iteration: 0, agentMemory: AgentMemory(),
+                                                      allowedTools: config.dispatchTools)
+        XCTAssertTrue(result.output.contains("was not run"), result.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: victim),
+                      "Tools off must refuse the built-in shell tool")
+    }
+
+    func testRevokingToolsMidTurnRefusesTheNextBuiltInCall() async throws {
+        // Bar: Tools switched off during a running turn stops its next shell call.
+        let dir = (NSTemporaryDirectory() as NSString).appendingPathComponent("acg-\(UUID().uuidString)")
+        let victim = (dir as NSString).appendingPathComponent("test-folder")
+        try FileManager.default.createDirectory(atPath: victim, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        var wd: String? = dir
+
+        let r = AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot(
+            toolsEnabled: true, mcpEnabled: false, thinkingEnabled: false,
+            autoApprove: false, workingDirectory: dir))
+        let config = ChatTurnEngine.TurnConfig.from(r).revokingTools(true)
+        XCTAssertTrue(config.advertisedTools.isEmpty, "the next round advertises no built-in tool")
+
+        let tc = APIClient.ToolCall(id: "1", name: "shell",
+                                    arguments: ["command": "rm -rf test-folder"], rawArguments: "")
+        let result = await AgentEngine.executeToolCall(tc, workingDirectory: &wd,
+                                                      repetition: AgentEngine.RepetitionTracker(),
+                                                      iteration: 0, agentMemory: AgentMemory(),
+                                                      allowedTools: config.dispatchTools)
+        XCTAssertTrue(result.output.contains("was not run"), result.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: victim))
+    }
+
+    func testAnUnrevokedTurnKeepsItsConfig() {
+        let r = AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot(
+            toolsEnabled: true, mcpEnabled: true, thinkingEnabled: false,
+            autoApprove: false, workingDirectory: nil))
+        let config = ChatTurnEngine.TurnConfig.from(r)
+        XCTAssertEqual(config.revokingTools(false).dispatchTools, config.dispatchTools)
+        XCTAssertTrue(config.revokingTools(true).mcpMode, "the Tools switch leaves MCP alone")
+    }
+
+    func testToolsOffStillDispatchesTheDocumentSearch() {
+        let r = AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot(
+            toolsEnabled: false, mcpEnabled: false, thinkingEnabled: false,
+            autoApprove: false, workingDirectory: nil))
+        XCTAssertEqual(ChatTurnEngine.TurnConfig.from(r).dispatchTools, [.searchDocuments])
+    }
+
+    func testToolsOnDispatchesEveryAllowedTool() {
+        let r = AgentResolution.resolve(agent: nil, defaults: AppDefaultsSnapshot(
+            toolsEnabled: true, mcpEnabled: false, thinkingEnabled: false,
+            autoApprove: false, workingDirectory: nil))
+        let config = ChatTurnEngine.TurnConfig.from(r)
+        XCTAssertEqual(config.dispatchTools, config.tools)
+    }
+
     func testMetaToolsAreGatedToo() async {
         // createTask / generate_image aren't ToolHandlers — they're dispatched
         // ahead of the handler registry, so the gate has to sit ahead of THEM.

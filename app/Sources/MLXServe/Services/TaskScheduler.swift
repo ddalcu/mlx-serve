@@ -543,7 +543,7 @@ final class TaskScheduler: ObservableObject {
                 tc, workingDirectory: &wd, repetition: repetition, iteration: 0,
                 agentMemory: appState.agentMemory, mcpRouter: appState.mcpManager,
                 mcpEnabled: task.useMCP,
-                allowedTools: resolved.tools)
+                allowedTools: ChatTurnEngine.TurnConfig.from(resolved).dispatchTools)
             appendToolResult(sessionId: sessionId, id: result.id, name: result.name,
                              display: "**\(result.name)** → \(String(result.output.prefix(500)))",
                              content: AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name))
