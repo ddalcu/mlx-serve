@@ -149,7 +149,7 @@ opencode2 --model mlx/MODEL_ID
 
 ### Codex
 
-Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve does NOT relocate your config and writes NOTHING into it: your real Codex home (`${CODEX_HOME:-$HOME/.codex}`) is used as-is, so your MCP servers, plugins, auth, and project trusts all work. The mlx-serve settings ride `-c key=value` overrides on the launch line, which codex merges over your own `config.toml` (the dotted `model_providers.mlx.*` paths create the table). No key setup: with no `env_key` configured, codex skips the login screen.
+Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve does NOT relocate your config and writes NOTHING into it: your real Codex home (`${CODEX_HOME:-$HOME/.codex}`) is used as-is, so your MCP servers, plugins, auth, and project trusts all work. The mlx-serve settings ride `-c key=value` overrides on the launch line, which codex merges over your own `config.toml` (the dotted `model_providers.mlx.*` paths create the table). No key setup: with no `env_key` configured, codex skips the login screen. One thing you don't get: codex launches carry no mlx-serve skill — codex only discovers skills from permanent folders of its own (`~/.codex/skills`, `~/.agents/skills`) and has no config key for an extra search path (`-c` can't point at `~/.mlx-serve/skills`), so a launch-scoped skill has nowhere to live without writing into your home.
 
 No `codex` on PATH but you have the ChatGPT desktop app? It bundles the CLI at `/Applications/ChatGPT.app/Contents/Resources/codex` (the launchers find it there automatically; `mlx-serve launch chatgpt` works too).
 

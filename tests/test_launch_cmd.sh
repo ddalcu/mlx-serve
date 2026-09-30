@@ -135,8 +135,10 @@ echo "$OUT" | grep -q -- "-c 'model_providers.mlx.base_url=\"$BASE/v1\"'" || OK=
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
-# NOTHING is written into the Codex home: no profile file, base config untouched
+# NOTHING is written into the Codex home: no profile file, base config
+# untouched, no skill link (codex gets no skill: codex has no -c skills root).
 [ ! -f "$CODEX_HOME/mlx-serve.config.toml" ] || OK=0
+[ ! -e "$CODEX_HOME/skills" ] || OK=0
 grep -q "^# sentinel$" "$CODEX_HOME/config.toml" || OK=0
 if [ "$OK" = 1 ]; then
     run_test "codex -c overrides target /v1/responses with the advertised context" PASS

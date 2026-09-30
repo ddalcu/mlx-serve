@@ -477,6 +477,27 @@ enum AgentConfigs {
                      entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
     }
 
+    /// Quote an agent argument only when it carries shell-significant bytes,
+    /// so a plain model id keeps the exact command bytes (mirrors launch.zig
+    /// `needsShellQuoting`/`appendModelArg`).
+    static func shellArg(_ s: String) -> String {
+        let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/+:@=")
+        guard !s.isEmpty, s.unicodeScalars.allSatisfy({ safe.contains($0) }) else {
+            return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        return s
+    }
+
+    /// One `-c key="value"` override arg: the value is TOML-escaped (`\"` —
+    /// codex parses the value as TOML), then the whole arg is single-quoted
+    /// for the shell (mirrors launch.zig `appendCodexOverride`).
+    static func codexOverride(key: String, value: String) -> String {
+        var toml = ""
+        for c in value { toml += c == "\"" ? "\\\"" : String(c) }
+        let arg = "\(key)=\"\(toml)\""
+        return "-c '" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// The `-c key=value` config overrides for the codex launch line — codex
     /// merges them over the user's own config.toml (dotted paths create
     /// nested tables), so mlx-serve WRITES NOTHING into the user's Codex home
@@ -485,19 +506,19 @@ enum AgentConfigs {
     /// variant in codex-rs), so this points at our `/v1/responses`. No
     /// `env_key`: with `requires_openai_auth` false (the default) and no key
     /// var, codex skips login entirely — the loopback server ignores keys
-    /// anyway. Each argument is single-quoted whole: the values carry TOML
-    /// double quotes, never a single quote. A zero advertised context omits
-    /// the two size keys — codex's own fallback metadata beats a declared 0.
+    /// anyway. A zero advertised context omits the two size keys — codex's
+    /// own fallback metadata beats a declared 0.
     /// Mirrors launch.zig `codexConfigOverrides`.
     static func codexConfigArgs(baseURL: String, model: String,
                                 budget: AgentBudget.Budget) -> String {
-        var args = "-c 'model=\"\(model)\"' -c 'model_provider=\"mlx\"'"
+        var args = codexOverride(key: "model", value: model)
+            + " " + codexOverride(key: "model_provider", value: "mlx")
         if budget.context > 0 {
             args += " -c model_context_window=\(budget.context) -c model_max_output_tokens=\(budget.output)"
         }
-        args += " -c 'model_providers.mlx.name=\"MLX Serve (local)\"'"
-        args += " -c 'model_providers.mlx.base_url=\"\(baseURL)/v1\"'"
-        args += " -c 'model_providers.mlx.wire_api=\"responses\"'"
+        args += " " + codexOverride(key: "model_providers.mlx.name", value: "MLX Serve (local)")
+        args += " " + codexOverride(key: "model_providers.mlx.base_url", value: "\(baseURL)/v1")
+        args += " " + codexOverride(key: "model_providers.mlx.wire_api", value: "responses")
         return args
     }
 

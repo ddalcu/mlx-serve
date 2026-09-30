@@ -149,7 +149,7 @@ opencode2 --model mlx/MODEL_ID
 
 ### Codex
 
-当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 既不搬迁你的配置，也不往里写任何东西：你真正的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）原样使用，所以你的 MCP 服务器、插件、登录和项目信任全部照常工作。mlx-serve 的设置以 `-c key=value` 覆盖参数的形式搭载在启动行上，由 codex 合并到你自己的 `config.toml` 之上（点号的 `model_providers.mlx.*` 路径会自动创建该表）。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。
+当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 既不搬迁你的配置，也不往里写任何东西：你真正的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）原样使用，所以你的 MCP 服务器、插件、登录和项目信任全部照常工作。mlx-serve 的设置以 `-c key=value` 覆盖参数的形式搭载在启动行上，由 codex 合并到你自己的 `config.toml` 之上（点号的 `model_providers.mlx.*` 路径会自动创建该表）。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。有一点你拿不到：codex 启动不携带 mlx-serve skill —— codex 只从它自己永久的目录（`~/.codex/skills`、`~/.agents/skills`）发现 skill，且没有额外搜索路径的配置项（`-c` 无法指向 `~/.mlx-serve/skills`），所以一次性的 skill 在不写你 home 的前提下无处安放。
 
 PATH 里没有 `codex`，但你有 ChatGPT 桌面应用？它把 CLI 打包在 `/Applications/ChatGPT.app/Contents/Resources/codex`（启动器会自动在那里找到它；`mlx-serve launch chatgpt` 同样可用）。
 

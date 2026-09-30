@@ -201,14 +201,6 @@ struct LauncherCLI: Identifiable, Equatable {
     var resolvedPath: String = ""
 
     static func == (lhs: LauncherCLI, rhs: LauncherCLI) -> Bool { lhs.id == rhs.id }
-
-    /// Effective Codex home: `${CODEX_HOME:-$HOME/.codex}`, empty = unset.
-    /// Mirrors launch.zig `codexHome()`; only the skill symlink lands there
-    /// and the launched codex inherits the same environment, so the two agree.
-    nonisolated static func codexHome() -> String {
-        if let v = ProcessInfo.processInfo.environment["CODEX_HOME"], !v.isEmpty { return v }
-        return (NSHomeDirectory() as NSString).appendingPathComponent(".codex")
-    }
 }
 
 extension LauncherCLI {
@@ -227,7 +219,7 @@ extension LauncherCLI {
             """
             \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
             \(cdLine)
-            claude --dangerously-skip-permissions --plugin-dir "$HOME/.mlx-serve/\(AgentSkills.claudePluginDir)" --model \(model) "$@"
+            claude --dangerously-skip-permissions --plugin-dir "$HOME/.mlx-serve/\(AgentSkills.claudePluginDir)" --model \(AgentConfigs.shellArg(model)) "$@"
             """
         }
     )
@@ -276,7 +268,7 @@ extension LauncherCLI {
             """
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
-            pi --provider mlx --model \(model) "$@"
+            pi --provider mlx --model \(AgentConfigs.shellArg(model)) "$@"
             """
         }
     )
@@ -306,7 +298,7 @@ extension LauncherCLI {
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
             export OMP_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"
             \(cdLine)
-            omp --model mlx/\(model) "$@"
+            omp --model \(AgentConfigs.shellArg("mlx/" + model)) "$@"
             """
         }
     )
@@ -391,7 +383,7 @@ extension LauncherCLI {
             export OPENAI_API_BASE='\(baseURL)/v1'
             export OPENAI_API_KEY=mlx-serve
             \(cdLine)
-            aider --model openai/\(model) --weak-model openai/\(model) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
+            aider --model \(AgentConfigs.shellArg("openai/" + model)) --weak-model \(AgentConfigs.shellArg("openai/" + model)) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
             """
         }
     )
@@ -421,7 +413,7 @@ extension LauncherCLI {
             return """
             export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
             \(cdLine)
-            opencode --model mlx/\(model) "$@"
+            opencode --model \(AgentConfigs.shellArg("mlx/" + model)) "$@"
             """
         }
     )

@@ -26,7 +26,7 @@
 - **Recommended models refreshed:** MiMo 9B replaces Qwen 3.5 9B as the small pick, Qwen 3.6 27B is retired in favor of 3.8, and tier-list pages get one-click Run buttons (#577). Thanks @Fe2-O3.
 
 ### Fixes
-- `mlx-serve launch codex` (and the app's Codex launcher) now runs codex against your real Codex home with its settings passed as command-line overrides, so your MCP servers, plugins, login, and folder trusts carry over instead of being dropped by a separate config folder (an old `~/.mlx-serve/codex/` folder is no longer used and can be deleted). Thanks @kmahara (#409).
+- `mlx-serve launch codex` (and the app's Codex launcher) now runs codex against your real Codex home with its settings passed as command-line overrides, so your MCP servers, plugins, login, and folder trusts carry over instead of being dropped by a separate config folder (an old `~/.mlx-serve/codex/` folder and the `~/.codex/skills/mlx-serve` link older builds created are no longer used and can be deleted); a launched codex no longer carries the mlx-serve skill, since codex can only discover skills from a permanent folder of its own. Thanks @kmahara (#409).
 - Model config files with the wrong field type or an out-of-range value are rejected with a clear error instead of loading a broken model (#608). Thanks @alinselea.
 - Prompt-lookup drafting (when the reply quotes the prompt back) no longer gets stuck repeating itself under typical acceptance — a long-standing cause of agent loops — and can now draft more tokens sooner after a shorter match (#614). Thanks @STRML.
 - The SSD cache tier's disk usage accounting matches what it actually stores (#601). Thanks @brandondyal.

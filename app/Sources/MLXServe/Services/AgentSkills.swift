@@ -32,9 +32,11 @@ enum AgentSkills {
     }
 
     /// Where an agent discovers skills in its dedicated config dir; opencode
-    /// reads `skills.paths` from its inline config instead, and codex has no
-    /// dedicated dir — its link goes into the user's own Codex home (see
-    /// `install`).
+    /// reads `skills.paths` from its inline config instead. Codex has no
+    /// dedicated dir and no config key for a skills search path — a symlink
+    /// into the user's own homes would teach every codex session about a
+    /// server only this launch wired up, so codex gets no skill (twin of
+    /// launch.zig `agentSkillLink`).
     static func linkPath(agentId: String) -> String? {
         switch agentId {
         case "pi", "omp", "hermes": return "\(agentId)/skills/\(name)"
@@ -51,16 +53,6 @@ enum AgentSkills {
         try? fm.createDirectory(atPath: skill, withIntermediateDirectories: true)
         for f in files() where !fm.fileExists(atPath: "\(skill)/\(f.name)") {
             try? f.content.write(toFile: "\(skill)/\(f.name)", atomically: true, encoding: .utf8)
-        }
-        if agentId == "codex" {
-            // Codex has no dedicated home: it scans `$CODEX_HOME/skills`
-            // recursively and follows symlinked skill dirs (measured on
-            // codex-cli 0.158), so the skill rides ONE symlink there and
-            // nothing else is ever written to the user's Codex home.
-            let link = "\(LauncherCLI.codexHome())/skills/\(name)"
-            try? fm.createDirectory(atPath: (link as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            try? fm.createSymbolicLink(atPath: link, withDestinationPath: skill)
-            return
         }
         guard let link = linkPath(agentId: agentId) else { return }
         if agentId == "claude" {
