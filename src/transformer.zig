@@ -31903,21 +31903,28 @@ pub const Transformer = struct {
             // indexes — the bias must be added before the inverse permutation.
             try self.addExpertBias(&down_squeezed, mw.switch_down_bias, sorted_inds);
 
-            const fused_sum = if (self.verifyFeatureEnabled(.down_reduce, skip_shared, B, S))
+            const verify_reduce = self.verifyFeatureEnabled(.down_reduce, skip_shared, B, S);
+            const fused_sum = if (verify_reduce)
                 try verifyExpertReduce(self.s, down_squeezed, inv_order, norm_scores)
             else
-                null;
+                try moePrefillExpertReduce(self.s, down_squeezed, inv_order, norm_scores);
             if (fused_sum) |value| {
                 _ = mlx.mlx_array_free(down_out);
                 down_out = value;
                 moe_reduced = true;
-                mtp_verify_expert_reduce_calls +%= 1;
                 const Once = struct {
-                    var logged = false;
+                    var verify_logged = false;
+                    var prefill_logged = false;
                 };
-                if (!Once.logged) {
-                    Once.logged = true;
-                    log.info("[mtp-verify] fused expert reduction verify engaged (tokens={d})\n", .{B * S});
+                if (verify_reduce) {
+                    mtp_verify_expert_reduce_calls +%= 1;
+                    if (!Once.verify_logged) {
+                        Once.verify_logged = true;
+                        log.info("[mtp-verify] fused expert reduction verify engaged (tokens={d})\n", .{B * S});
+                    }
+                } else if (!Once.prefill_logged) {
+                    Once.prefill_logged = true;
+                    log.info("[moe] fused prefill weighted sum engaged (tokens={d})\n", .{B * S});
                 }
             } else {
                 // Inverse permute → original order, then reshape back to [B,S,K,hidden].
@@ -41984,18 +41991,38 @@ const VERIFY_EXPERT_REDUCE_SOURCE =
     \\y[p] = total;
 ;
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var verify_expert_reduce_cfgs = QsaCfgCache(c_int, 1){};
+const ExpertReduceCfgs = QsaCfgCache([2]c_int, 1);
+var verify_expert_reduce_cfgs = ExpertReduceCfgs{};
+var prefill_expert_reduce_cfgs = ExpertReduceCfgs{};
 
 fn verifyExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !verifySharedHardware()) return null;
+    if (!verifySharedHardware() or scores.ctx == null) return null;
+    const ss = mlx.getShape(scores);
+    if (ss.len != 3 or ss[0] != 1 or ss[1] > 32) return null;
+    return expertReduceApply(s, down, inverse, scores, &verify_expert_reduce_cfgs);
+}
+
+/// The verify reduction at prefill widths, on every GPU: it only removes the
+/// [B*S*K, hidden] unsorted and weighted intermediates.
+fn moePrefillExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array) !?mlx.mlx_array {
+    if (scores.ctx == null) return null;
+    const ss = mlx.getShape(scores);
+    // Verify widths (<= 32 tokens) keep verifyExpertReduce's own gates.
+    if (ss.len != 3 or ss[0] * ss[1] <= 32) return null;
+    return expertReduceApply(s, down, inverse, scores, &prefill_expert_reduce_cfgs);
+}
+
+fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array, cfgs: *ExpertReduceCfgs) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     if (down.ctx == null or inverse.ctx == null or scores.ctx == null) return null;
     if (mlx.mlx_array_dtype(down) != .bfloat16 or mlx.mlx_array_dtype(scores) != .bfloat16 or mlx.mlx_array_dtype(inverse) != .uint32) return null;
     const ds = mlx.getShape(down);
     const ss = mlx.getShape(scores);
     const ix = mlx.getShape(inverse);
-    if (ds.len != 2 or ds[1] != 2560 or ss.len != 3 or ss[0] != 1 or ss[2] != 10 or ix.len != 1) return null;
+    if (ds.len != 2 or ds[1] != 2560 or ss.len != 3 or ss[2] != 10 or ix.len != 1) return null;
+    const batch = ss[0];
     const tokens = ss[1];
-    if (tokens < 2 or tokens > 32 or ds[0] != tokens * 10 or ix[0] != ds[0]) return null;
+    if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * 10 or ix[0] != ds[0]) return null;
     const kernel = blk: {
         if (verify_expert_reduce_kernel) |value| break :blk value;
         const ins = [_][*:0]const u8{ "down", "inverse", "scores" };
@@ -42009,15 +42036,16 @@ fn verifyExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_a
         verify_expert_reduce_kernel = value;
         break :blk value;
     };
+    const key = [2]c_int{ batch, tokens };
     const cfg = blk: {
-        if (verify_expert_reduce_cfgs.get(tokens)) |hit| break :blk hit[0];
+        if (cfgs.get(key)) |hit| break :blk hit[0];
         const value = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(value);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ 1, tokens, 2560 }, 3, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, tokens * 2560, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(value, &.{ batch, tokens, 2560 }, 3, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(value, batch * tokens * 2560, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(value, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(value, "T", .bfloat16));
-        verify_expert_reduce_cfgs.put(tokens, .{value});
+        cfgs.put(key, .{value});
         break :blk value;
     };
     const values = [_]mlx.mlx_array{ down, inverse, scores };
@@ -69205,13 +69233,14 @@ test "verify expert reuse preserves stock gather reductions" {
 }
 
 fn expertReduceReference(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array) !mlx.mlx_array {
+    const batch = mlx.getShape(scores)[0];
     const tokens = mlx.getShape(scores)[1];
     var unsorted = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(unsorted);
     try mlx.check(mlx.mlx_take_axis(&unsorted, down, inverse, 0, s));
     var rows = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_reshape(&rows, unsorted, &.{ 1, tokens, 10, 2560 }, 4, s));
+    try mlx.check(mlx.mlx_reshape(&rows, unsorted, &.{ batch, tokens, 10, 2560 }, 4, s));
     var expanded = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(expanded);
     try mlx.check(mlx.mlx_expand_dims(&expanded, scores, -1, s));
@@ -69262,6 +69291,83 @@ test "verify expert reduction preserves unsort multiply and sum" {
         const actual = (try verifyExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
         defer _ = mlx.mlx_array_free(actual);
         try testing.expect(try qsaArraysAllEqual(expected, actual, s));
+    }
+}
+
+fn bf16BitsEqual(a: mlx.mlx_array, b: mlx.mlx_array) !bool {
+    try mlx.check(mlx.mlx_array_eval(a));
+    try mlx.check(mlx.mlx_array_eval(b));
+    if (!std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+    const n = mlx.mlx_array_size(a);
+    const pa = mlx.mlx_array_data_bfloat16(a) orelse return error.NoData;
+    const pb = mlx.mlx_array_data_bfloat16(b) orelse return error.NoData;
+    return std.mem.eql(u16, pa[0..n], pb[0..n]);
+}
+
+test "prefill expert reduction is bit-identical to unsort multiply and sum" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
+    for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
+        const count = shape[0] * shape[1] * 10;
+        const down = try testRandWeightBf16(prng.random(), &.{ count, 2560 }, s);
+        defer _ = mlx.mlx_array_free(down);
+        const scores = try testRandUniformBf16(prng.random(), &.{ shape[0], shape[1], 10 }, 0.0, 1.0, s);
+        defer _ = mlx.mlx_array_free(scores);
+        const perm = try testing.allocator.alloc(u32, @intCast(count));
+        defer testing.allocator.free(perm);
+        for (perm, 0..) |*id, i| id.* = @intCast(i);
+        prng.random().shuffle(u32, perm);
+        const inverse = mlx.mlx_array_new_data(perm.ptr, &.{count}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(inverse);
+        const expected = try expertReduceReference(s, down, inverse, scores);
+        defer _ = mlx.mlx_array_free(expected);
+        const actual = (try moePrefillExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
+        defer _ = mlx.mlx_array_free(actual);
+        try testing.expect(try bf16BitsEqual(expected, actual));
+    }
+}
+
+test "prefill expert reduction µbench (MLX_SERVE_MOE_WSUM_UBENCH=1)" {
+    // Bar: chained marginal GPU ms per call, stock take+multiply+sum vs the fused kernel, at an 8192-token chunk.
+    if (!diagEnvOn("MLX_SERVE_MOE_WSUM_UBENCH") or mlx.noGpuBackend()) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xBE7C);
+    const tokens: c_int = 8192;
+    const count = tokens * 10;
+    const down = try testRandWeightBf16(prng.random(), &.{ count, 2560 }, s);
+    defer _ = mlx.mlx_array_free(down);
+    const scores = try testRandUniformBf16(prng.random(), &.{ 1, tokens, 10 }, 0.0, 1.0, s);
+    defer _ = mlx.mlx_array_free(scores);
+    const perm = try testing.allocator.alloc(u32, @intCast(count));
+    defer testing.allocator.free(perm);
+    for (perm, 0..) |*id, i| id.* = @intCast(i);
+    prng.random().shuffle(u32, perm);
+    const inverse = mlx.mlx_array_new_data(perm.ptr, &.{count}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(inverse);
+    for ([_]mlx.mlx_array{ down, scores, inverse }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    var sw = io_util.Stopwatch.init(testing.io);
+    const reps = 7;
+    for ([_]bool{ false, true }) |fused| {
+        var best = [2]u64{ std.math.maxInt(u64), std.math.maxInt(u64) };
+        for (0..reps) |_| {
+            for ([_]usize{ 1, 21 }, 0..) |n, slot| {
+                const outs = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(outs);
+                for (0..n) |_| {
+                    const y = if (fused) (try moePrefillExpertReduce(s, down, inverse, scores)).? else try expertReduceReference(s, down, inverse, scores);
+                    defer _ = mlx.mlx_array_free(y);
+                    try mlx.check(mlx.mlx_vector_array_append_value(outs, y));
+                }
+                sw.reset();
+                try mlx.check(mlx.mlx_eval(outs));
+                best[slot] = @min(best[slot], sw.read());
+            }
+        }
+        const one_ms = @as(f64, @floatFromInt(best[0])) / 1e6;
+        const marginal_ms = (@as(f64, @floatFromInt(best[1])) - @as(f64, @floatFromInt(best[0]))) / 1e6 / 20.0;
+        std.debug.print("\n[moe-wsum-ubench] {s}: single {d:.3} ms, chained marginal {d:.3} ms/call\n", .{ if (fused) "fused" else "stock", one_ms, marginal_ms });
     }
 }
 
