@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/mlx-serve-gguf` (own repo, pure Zig + Metal) serves the GGUFs it knows on MLX itself. `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/mlx-serve-gguf` (own repo, pure Zig + Metal) serves the GGUFs it knows on MLX itself. `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`).
 
 ## Layout (`src/`)
 
@@ -118,6 +118,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 - **Diffs are read by a human. Keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract, a unit), in one to three lines. Never: bug history, measurements, audit trails, review item numbers, dates, "PR #NNN", what an older commit did, or a restatement of the code. That belongs in the commit message and, if it is a rule, in `docs/gotchas/*.md`.
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour, and pass against their own needles. Test the behaviour or state the rule in a comment. A test comment is one line saying what the bar is.
 - **One story per gotcha, one line per rule.** A gotcha entry is the defect, the cause, the fix and the guard in under 20 lines, written once after the work lands. No round-by-round logs, no ledgers, no "what the reviewer said". CHANGELOG: one user-facing sentence per change, no provisional numbers.
+- When contribuiting, keep things in one big PR, the only time you want multiple PR's is if you are working on two features that are very different. Keep UI + Zig code in same PR, dont split performance PR's it makes it easier to code review.
 
 ## Supported architectures
 
@@ -401,6 +402,7 @@ Sampling:
 - **`top_p` 0 is GREEDY** (`applyTopP` floors at `floatMin`). Filters cut by RANK with lowest-id tie break (`ranksDescending`, `topRanksDescending`); cumsum in f32; top-k + top-p are ONE pass (`filterTopKTopP`). Block helpers use `_axis` ops.
 
 Kernels + numerics:
+- **A weight tiled in place is read ONLY through `lane_qmm`** (`tileInPlace` at DFlash bind; `PREFILL` past 128 rows gives MLX's qmm bits): MLX would misread its buffer. The caller passes bits and group size, since 8-bit g32 has 4-bit g64's shapes.
 - **Slice-born weights into gather_qmm/quantized_matmul are `mlx_contiguous`-materialized at load**. mlx `Copy`/`contiguous` are VIEW ops: a slice outliving its parent goes through `materializedOwnedCopy` + eval; a raw data-pointer read PROVES row-major contiguity. A view-materializing helper owns the view (`sliceContig`).
 - **`mx.quantize` packs DENSELY** (element i at bit `i*bits`, straddling words at 3/5/6 bits, #305): every hand-rolled unpack is tested at EVERY shipped width. Fused MoE kernels take 3-bit as a BYTE TRIPLE (`mlxserve_qpack`).
 - **An f32 SCALAR promotes every bf16 operand** — scalars via `scalarOf(v, dtype)`; a load-time const table in the wrong dtype widens every read (`constTableAs`); a chain that returns f32 by design makes the CALLER own the dtype (Mamba2's f32 SSM `y` too: cast back like mlx-lm's `ssm_attn`, else the whole residual runs f32); a quantized KV cache returns the dtype it was FED (bf16 scales widened f16 Bonsai under `--kv-quant`). Tell: `[dtype-trace] residual widened`.

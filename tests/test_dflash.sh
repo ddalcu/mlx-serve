@@ -333,14 +333,36 @@ dc = cfg.get("dflash_config") or cfg
 print(dc.get("block_size", ""))
 ' "$DRAFTER/config.json")
 BLINE=$(grep -o "DFlash drafter ready (block_size=[0-9]*[^)]*" "$LOG" | head -1)
+# Trees on the tensor units draft past the trained block (dflash.TREE_NAX_BLOCK).
+TREE_NAX_BLOCK=16
 if echo "$BLINE" | grep -q ", capped ("; then
     ok "block capped for this machine's verify lanes ($BLINE)"
 elif echo "$BLINE" | grep -q "wide_verify_lane=true" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
     ok "wide verify lane present, checkpoint block ($DECLARED_BLOCK) kept ($BLINE)"
-elif grep -q "draft trees engaged" "$LOG" && echo "$BLINE" | grep -q "block_size=$DECLARED_BLOCK,"; then
-    ok "draft tree cap keeps the checkpoint block ($DECLARED_BLOCK) ($BLINE)"
+elif grep -q "draft trees engaged" "$LOG" && echo "$BLINE" | grep -q "block_size=$TREE_NAX_BLOCK,"; then
+    ok "draft trees on NAX draft $TREE_NAX_BLOCK positions past the checkpoint block ($DECLARED_BLOCK) ($BLINE)"
 else
     bad "block resolves against the machine's verify lanes (declared=$DECLARED_BLOCK)" "$BLINE"
+fi
+
+# [10b] A draft-tree verify on a hybrid trunk runs the GDN tree kernels and,
+# on NAX, one joined q|k|v matmul per attention layer.
+if grep -q "draft trees engaged" "$LOG" && grep -q "\[gdn\]" "$LOG"; then
+    if grep -q "\[gdn\] verify tree engaged" "$LOG"; then ok "GDN tree verify engaged"; else bad "GDN tree verify engaged" "$(grep "\[gdn\]" "$LOG" | head -3)"; fi
+    if grep -q "lane kernels\|\[lane\]" "$LOG"; then
+        if grep -q "\[attn\] joined q|k|v engaged" "$LOG"; then ok "joined q|k|v engaged"; else bad "joined q|k|v engaged" "$(grep "\[attn\]" "$LOG" | head -3)"; fi
+    fi
+fi
+
+# [10c] A continuation the context backs is verified as a copied chain, and
+# the greedy output matches the drafter-off run.
+if grep -q "draft trees engaged" "$LOG"; then
+    COPY_TEXT="The lighthouse keeper climbed the spiral stairs at dusk, trimmed the wick, polished the great lens until it shone, and wrote in the logbook that the wind had backed to the southwest and the sea was rising."
+    copy_body() { printf '{"model":"mlx-serve","temperature":0,"max_tokens":120,"chat_template_kwargs":{"enable_thinking":false},%s"messages":[{"role":"user","content":"Repeat this paragraph exactly, twice, with nothing else: %s"}]}' "$1" "$COPY_TEXT"; }
+    ON=$(curl -s -m 180 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$(copy_body '')" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+    OFF=$(curl -s -m 180 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$(copy_body '"enable_drafter":false,')" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])')
+    if grep -q "context copy verified" "$LOG"; then ok "context copy verified as a chain"; else bad "context copy verified as a chain" "$(grep "\[dflash\]" "$LOG" | tail -3)"; fi
+    if [ -n "$ON" ] && [ "$ON" = "$OFF" ]; then ok "copied rounds keep the drafter-off bytes"; else bad "copied rounds keep the drafter-off bytes" "$(printf '%s\n---\n%s' "$ON" "$OFF" | head -c 400)"; fi
 fi
 
 # [11] The assistant context rides the prefix cache. A restore forwards no

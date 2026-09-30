@@ -1189,10 +1189,9 @@ private struct UseModelButton: View {
                     .controlSize(.small)
                     .frame(width: 30)
             } else {
-                Text("Use")
+                Text("Use").font(.app(.body))
             }
         }
-        .font(.app(.callout))
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")
@@ -1754,9 +1753,9 @@ private struct GgufQuantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .task {
@@ -1863,9 +1862,9 @@ private struct MlxVariantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .alert("Delete Quantization", isPresented: .init(

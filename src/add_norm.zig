@@ -6,31 +6,35 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 
-// Mirrors MLX's single-row `rms_norm` kernel so the normed output is
-// bit-equal to `add -> fast::rms_norm`: TN = ceil(D/4) threads per row, each
-// owning FOUR consecutive elements, per-simdgroup sums folded through a
-// 32-slot table, precise rsqrt, `w * T(x * inv)` in the output dtype.
+// Mirrors MLX's `rms_norm` kernels so the normed output is bit-equal to
+// `add -> fast::rms_norm`: FOUR consecutive elements per thread per pass,
+// per-simdgroup sums folded through a 32-slot table, precise rsqrt,
+// `w * T(x * inv)` in the output dtype. Up to 4096 wide that is MLX's
+// single-row kernel (TN = ceil(D/4) threads, one pass); wider, its looped one
+// (1024 threads striding 4096 elements a pass).
 fn source(comptime moe: bool) [:0]const u8 {
     return std.fmt.comptimePrint(
         \\const uint t = thread_position_in_threadgroup.x;
         \\const uint r = threadgroup_position_in_grid.x;
         \\const uint lane = thread_index_in_simdgroup;
         \\const uint sg = simdgroup_index_in_threadgroup;
+        \\constexpr int NC = (D + TN * 4 - 1) / (TN * 4);
         \\threadgroup float local_sums[32];
-        \\float hv[4];
+        \\float hv[NC * 4];
         \\float acc = 0.0f;
+        \\for (int p = 0; p < NC; p++)
         \\for (int i = 0; i < 4; i++) {{
-        \\    const int c = int(t) * 4 + i;
-        \\    hv[i] = 0.0f;
+        \\    const int c = p * TN * 4 + int(t) * 4 + i;
+        \\    hv[p * 4 + i] = 0.0f;
         \\    if (c < D) {{
         \\        const size_t at = size_t(r) * D + c;
         \\        float delta;
         \\        {s}
         \\        const T hn = T(float(H[at]) + delta);
         \\        H_NEW[at] = hn;
-        \\        hv[i] = float(hn);
+        \\        hv[p * 4 + i] = float(hn);
         \\    }}
-        \\    acc += hv[i] * hv[i];
+        \\    acc += hv[p * 4 + i] * hv[p * 4 + i];
         \\}}
         \\acc = simd_sum(acc);
         \\if (sg == 0) local_sums[lane] = 0.0f;
@@ -39,9 +43,10 @@ fn source(comptime moe: bool) [:0]const u8 {
         \\threadgroup_barrier(mem_flags::mem_threadgroup);
         \\const float total = simd_sum(local_sums[lane]);
         \\const float inv = metal::precise::rsqrt(total / float(D) + eps);
+        \\for (int p = 0; p < NC; p++)
         \\for (int i = 0; i < 4; i++) {{
-        \\    const int c = int(t) * 4 + i;
-        \\    if (c < D) HN[size_t(r) * D + c] = T(float(W[c]) * float(T(hv[i] * inv)));
+        \\    const int c = p * TN * 4 + int(t) * 4 + i;
+        \\    if (c < D) HN[size_t(r) * D + c] = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));
         \\}}
     , .{if (moe)
         // The chain's own rounding points: f32 multiply-adds over the K slots
@@ -69,10 +74,10 @@ var moe_key: ?CfgKey = null;
 var moe_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
 
 // MLX's single-row kernel serves widths up to its looped limit (4096) with
-// ceil(D/4) threads; wider rows take a different reduction and decline here.
+// ceil(D/4) threads; its looped one runs 1024 (two passes cover 8192).
 fn threadsFor(d: c_int) ?c_int {
-    if (d <= 0 or d > 4096) return null;
-    return @divTrunc(d + 3, 4);
+    if (d <= 0 or d > 8192) return null;
+    return if (d <= 4096) @divTrunc(d + 3, 4) else 1024;
 }
 
 /// Whether the fused add+norm serves this width and dtype (callers decide the
@@ -176,4 +181,47 @@ pub fn moeCombineAddNorm(h: mlx.mlx_array, y: mlx.mlx_array, wt: mlx.mlx_array, 
     }
     // With no shared expert `h` stands in for XS; SHARED=0 never reads it.
     return try apply(moe_kernel.?, moe_cfg, &[_]mlx.mlx_array{ h, y, wt, shared orelse h, w, eps }, s);
+}
+
+test "addNorm is bit-equal to add -> fast::rms_norm on both sides of MLX's looped limit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    for ([_]c_int{ 2688, 4096, 4100, 5120, 8192 }) |d| for ([_]c_int{ 1, 16 }) |rows| {
+        var arrs: [3]mlx.mlx_array = undefined;
+        for (&arrs, 0..) |*a, i| {
+            var key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(key);
+            try mlx.check(mlx.mlx_random_key(&key, 11 + i));
+            var f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f);
+            const shape: []const c_int = if (i == 2) &.{d} else &.{ 1, rows, d };
+            try mlx.check(mlx.mlx_random_normal(&f, shape.ptr, shape.len, .float32, 0.0, 3.0, key, s));
+            a.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(a, f, .bfloat16, s));
+        }
+        defer for (arrs) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        const got = (try addNorm(arrs[0], arrs[1], arrs[2], eps, s)) orelse return error.Declined;
+        defer _ = mlx.mlx_array_free(got.h);
+        defer _ = mlx.mlx_array_free(got.normed);
+        var sum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum);
+        try mlx.check(mlx.mlx_add(&sum, arrs[0], arrs[1], s));
+        var normed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(normed);
+        try mlx.check(mlx.mlx_fast_rms_norm(&normed, sum, arrs[2], 1e-6, s));
+        for ([_][2]mlx.mlx_array{ .{ sum, got.h }, .{ normed, got.normed } }) |pair| {
+            var e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(e);
+            try mlx.check(mlx.mlx_array_equal(&e, pair[0], pair[1], false, s));
+            try mlx.check(mlx.mlx_array_eval(e));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, e));
+            if (!same) std.debug.print("add_norm differs at D={d} rows={d}\n", .{ d, rows });
+            try std.testing.expect(same);
+        }
+    };
 }

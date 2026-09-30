@@ -306,7 +306,7 @@ ARCH=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1] + '/config.
 if [ "$ARCH" = "nemotron_h" ]; then
     ENGAGE_LINES=("\[mamba2\] fused step engaged")
 else
-    ENGAGE_LINES=("\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur) engaged")
+    ENGAGE_LINES=("\[attn\] fused QK-norm\+RoPE \(hd-256\) engaged" "\[gdn\] (packed prework|verify recur|verify fold) engaged")
 fi
 for ENGAGE_LINE in "${ENGAGE_LINES[@]}"; do
     if grep -qE "$ENGAGE_LINE" "$LOG"; then

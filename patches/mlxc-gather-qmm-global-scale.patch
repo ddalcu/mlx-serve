@@ -1,4 +1,4 @@
-The fork (mlx-omarchy, MLX 0.32.3 + Omarchy patches) inserted a
+MLX 0.32.3 (and the Linux fork mlx-omarchy, 0.32.3 + Omarchy patches) inserted a
 `const std::optional<array>& global_scale` parameter into gather_qmm before
 `sorted_indices`; the pinned mlx-c @56b2d39 predates that and passes
 `sorted_indices` (bool) in its place, which fails to compile. Every other

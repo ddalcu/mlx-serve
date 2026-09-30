@@ -244,6 +244,11 @@ Original mlx-serve QSA NAX implementation contributed by Nikolai V.
 MMA helpers from MLX's `steel/gemm/nax.h` (Copyright (c) 2025 Apple Inc., MIT
 License).
 
+`src/lane_qmm.zig`'s `PREFILL` kernel ports MLX's affine `qmm_t_nax`
+(`quantized_nax.h`) to a tiled weight layout and inlines `steel/gemm/nax.h`
+with the headers it includes, embedded from the pinned submodule (Copyright
+(c) 2023-2025 Apple Inc., MIT License).
+
 --------------------------------------------------------------------------------
 mlx-lm
 https://github.com/ml-explore/mlx-lm
@@ -377,6 +382,12 @@ Ported into mlx-serve:
     kernels of `rows.py` (one simdgroup per input row, MLX's qmv_fast loop).
   - `src/simd_qmm.zig`: the `simd_qmm` fixed-order matmul kernels.
   - `src/row_attn.zig`: the fixed-split row attention of `row_attention`.
+  - `src/lane_qmm.zig`: the row-exact tensor-unit lane matmul of `lane_qmm.py`
+    and the 5/6/8-bit group widening of `lane_widen.py`.
+  - `src/gdn_decode.zig`: the draft-tree GDN launch layout of `stream_gdn.py`.
+  - `src/generate.zig`: the backed context-copy rounds of the DFlash proposer.
+  - `src/lane_attn.zig`: the lane/stream attention of `lane_attention.py` and
+    `stream_attention.py`.
   - `src/keyed_sample.zig`: the keyed Gumbel-max GPU sampler of
     `gpu_sampling.py` (Metal source reproduced unchanged).
   - `src/dflash.zig`: the best-first draft-tree parameters and the
