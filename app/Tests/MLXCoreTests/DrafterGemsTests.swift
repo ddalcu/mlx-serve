@@ -152,11 +152,15 @@ final class DrafterGemsTests: XCTestCase {
 
     private func entry(_ path: String, _ size: Int) -> [String: Any] { ["path": path, "type": "file", "size": size] }
 
-    func testThePackDrafterIsItsOwnSelectionAndKeepsItsPrefix() {
+    func testAPackDownloadBringsItsDrafterAndTheSocketCanLeaveItOut() {
         let entries = [entry("config.json", 10), entry("model.safetensors", 20), entry("mtp/weights.safetensors", 5),
-                       entry("drafter/config.json", 1), entry("drafter/model.safetensors", 30), entry("drafter/README.md", 1)]
+                       entry("drafter/config.json", 1), entry("drafter/model.safetensors", 30), entry("drafter/README.md", 1),
+                       entry("drafter/assets/figure.png", 1)]
         XCTAssertEqual(DownloadManager.selectNeededFiles(from: entries).map(\.0),
-                       ["config.json", "model.safetensors", "mtp/weights.safetensors"], "the chat default leaves drafter/ to the socket")
+                       ["config.json", "model.safetensors", "mtp/weights.safetensors", "drafter/config.json", "drafter/model.safetensors"],
+                       "the whole pack, as mlx-serve pull fetches it")
+        XCTAssertEqual(DownloadManager.selectNeededFiles(from: entries, selection: .chatWithoutDrafter).map(\.0),
+                       ["config.json", "model.safetensors", "mtp/weights.safetensors"])
         let selection = FileSelection.packFolder("drafter")
         let drafter = DownloadManager.selectNeededFiles(from: entries, selection: selection)
         XCTAssertEqual(drafter.map(\.0), ["drafter/config.json", "drafter/model.safetensors"])

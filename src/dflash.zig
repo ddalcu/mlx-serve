@@ -1730,9 +1730,10 @@ pub const Lattice = struct {
 
 // Top K of each row in one threadgroup: every thread keeps its own sorted K
 // (a compare-and-select chain), each simdgroup merges its lanes' lists, then
-// simdgroup 0 merges the 32 lists. Equal values go to the lower index.
+// simdgroup 0 merges the NT / 32 lists. Equal values go to the lower index.
+// 256 threads: M1/M2 cap threadgroups below 1024 for kernels this heavy.
 const TOPK_SOURCE =
-    \\constexpr int NT = 1024;
+    \\constexpr int NT = 256, NSG = NT / 32;
     \\const uint row = threadgroup_position_in_grid.y;
     \\const uint tid = thread_position_in_threadgroup.x;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
@@ -1751,8 +1752,8 @@ const TOPK_SOURCE =
     \\    c = gt ? tv : c; ci = gt ? ti : ci;
     \\  }
     \\}
-    \\threadgroup float sv[32 * K];
-    \\threadgroup int si[32 * K];
+    \\threadgroup float sv[NSG * K];
+    \\threadgroup int si[NSG * K];
     \\for (int r = 0; r < K; ++r) {
     \\  const float best = simd_max(v[0]);
     \\  const uint win = simd_min(v[0] == best ? lane : 64u);
@@ -1762,7 +1763,7 @@ const TOPK_SOURCE =
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\if (sg != 0) return;
-    \\for (int j = 0; j < K; ++j) { v[j] = sv[lane * K + j]; id[j] = si[lane * K + j]; }
+    \\for (int j = 0; j < K; ++j) { v[j] = lane < NSG ? sv[lane * K + j] : -INFINITY; id[j] = lane < NSG ? si[lane * K + j] : 0; }
     \\for (int r = 0; r < K; ++r) {
     \\  const float best = simd_max(v[0]);
     \\  const uint win = simd_min(v[0] == best ? lane : 64u);
@@ -1782,7 +1783,7 @@ fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_arr
     if (!mlx.streamIsGpu(s) or k == 0 or k > 32) return null;
     const sh = mlx.getShape(logits);
     const dt = mlx.mlx_array_dtype(logits);
-    if (sh.len != 3 or sh[0] != 1 or sh[2] < 1024 * @as(c_int, @intCast(k)) or (dt != .bfloat16 and dt != .float16 and dt != .float32)) return null;
+    if (sh.len != 3 or sh[0] != 1 or sh[2] < 256 * @as(c_int, @intCast(k)) or (dt != .bfloat16 and dt != .float16 and dt != .float32)) return null;
     const key = TopKKey{ .m = sh[1], .v = sh[2], .k = @intCast(k), .dt = dt };
     if (topk_kernel == null) {
         const ins = [_][*:0]const u8{"logits"};
@@ -1802,8 +1803,8 @@ fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_arr
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .int32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024, key.m, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, key.m, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", key.v));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", key.k));
