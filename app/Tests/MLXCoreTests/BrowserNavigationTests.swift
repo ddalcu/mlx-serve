@@ -47,4 +47,18 @@ final class BrowserPublishedStateTests: XCTestCase {
         XCTAssertEqual(m.currentURL, file.absoluteString + "?tab=2")
         XCTAssertEqual(m.pageTitle, "Pushy 2")
     }
+
+    func testLoadReturnsTheNewPagesTitleWhenTheTitleObserverIsLate() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let m = BrowserManager.shared
+        m.dropsTitleKVOForTest = true
+        defer { m.dropsTitleKVOForTest = false }
+        for title in ["First", "Second"] {
+            let file = dir.appendingPathComponent("\(title).html")
+            try "<html><head><title>\(title)</title></head><body></body></html>".write(to: file, atomically: true, encoding: .utf8)
+            _ = try await m.load(file)
+            XCTAssertEqual(m.pageTitle, title)
+        }
+    }
 }
