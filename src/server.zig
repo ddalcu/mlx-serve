@@ -9929,6 +9929,14 @@ fn nonStreamingViaScheduler(
             .done => break :wait,
             .err => return slotFailure(slot),
         }
+        if (conn) |c| {
+            if (c.peerClosed()) {
+                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                slot.cancel();
+                client_gone = true;
+                break :wait;
+            }
+        }
     }
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
@@ -11195,7 +11203,7 @@ fn handleStreamingGeneration(
             // Many templates (e.g. Qwen 3.5/3.6, some Gemma 4 variants) pre-inject
             // the opener into the prompt so the model's first tokens are already
             // INSIDE the thinking block — no opener appears in the streamed text.
-            if (!skipped_think_open and think_buf.items.len >= 7) {
+            if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     // Remove the opener (<think> or the Hy3-suffixed form) and
                     // any leading newline.
@@ -16286,7 +16294,7 @@ fn handleAnthropicStreaming(
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
 
-            if (!skipped_think_open and think_buf.items.len >= 7) {
+            if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -17724,7 +17732,7 @@ fn handleResponsesInner(
                 try think_buf.appendSlice(allocator, token_text);
 
                 // Skip a literal think opener if the template did not pre-inject one.
-                if (!skipped_think_open and think_buf.items.len >= 7) {
+                if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                     if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
                         var skip: usize = 7;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;

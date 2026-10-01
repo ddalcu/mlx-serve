@@ -29,6 +29,35 @@ final class MultiTurnEngineTests: XCTestCase {
 
     // MARK: - TurnLedger
 
+    func testRevokingToolsMarksOnlyThatSessionsRunningTurn() {
+        var ledger = TurnLedger()
+        let a = UUID(), b = UUID()
+        _ = ledger.begin(session: a)
+        _ = ledger.begin(session: b)
+        ledger.revokeTools(session: a)
+        XCTAssertTrue(ledger.toolsRevoked(session: a))
+        XCTAssertFalse(ledger.toolsRevoked(session: b), "another chat's turn keeps its tools")
+    }
+
+    func testARevocationDiesWithItsTurn() {
+        // Bar: the next turn runs under the toggles it was sent with.
+        var ledger = TurnLedger()
+        let s = UUID()
+        let token = ledger.begin(session: s)
+        ledger.revokeTools(session: s)
+        ledger.end(session: s, token: token)
+        _ = ledger.begin(session: s)
+        XCTAssertFalse(ledger.toolsRevoked(session: s))
+    }
+
+    func testRevokingWithNoTurnRunningIsANoOp() {
+        var ledger = TurnLedger()
+        let s = UUID()
+        ledger.revokeTools(session: s)
+        XCTAssertFalse(ledger.isBusy)
+        XCTAssertFalse(ledger.toolsRevoked(session: s))
+    }
+
     func testBeginTracksSessionAndEndClears() {
         var ledger = TurnLedger()
         let s = UUID()

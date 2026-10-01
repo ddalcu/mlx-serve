@@ -63,12 +63,10 @@ struct UpdateCheck: Equatable {
 enum PackUpdateCheck {
     static let interval: TimeInterval = 24 * 3600
 
-    /// What a pack's download would fetch: the chat selection, plus its
-    /// `drafter/` unless the socket is switched off.
+    /// What a pack's download would fetch: the whole pack, less its `drafter/`
+    /// when the socket is switched off.
     static func wanted(_ entries: [[String: Any]], withDrafter: Bool) -> [(String, Int64)] {
-        var files = DownloadManager.selectNeededFiles(from: entries)
-        if withDrafter { files += DownloadManager.selectNeededFiles(from: entries, selection: .packFolder(DrafterGems.packFolder)) }
-        return files
+        DownloadManager.selectNeededFiles(from: entries, selection: withDrafter ? .chatDefault : .chatWithoutDrafter)
     }
 
     /// An HF tree listing as path -> size.

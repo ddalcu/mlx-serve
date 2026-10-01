@@ -468,8 +468,15 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\export ANTHROPIC_DEFAULT_HAIKU_MODEL={s}
                 \\export CLAUDE_CODE_SUBAGENT_MODEL={s}
                 \\export CLAUDE_CODE_MAX_OUTPUT_TOKENS={d}
+                \\export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
+                \\export API_TIMEOUT_MS=3600000
+                \\export CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000
+                \\export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000
+                \\export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000
                 \\
             , .{ base_url, model, model, model, model, budget.output });
+            // A long prefill and a long think on a local model outlast Claude Code's stream watchdogs; a fallback
+            // re-sends the whole prompt as a non-stream request, which then times out and retries.
             // Claude Code assumes 200k for a model outside its catalog; declare the advertised context verbatim.
             if (budget.context > 0) {
                 try out.print(allocator, "export CLAUDE_CODE_MAX_CONTEXT_TOKENS={d}\n", .{budget.context});
@@ -1298,6 +1305,18 @@ test "opencodeJson pins the default model only when asked" {
     const pinned = try opencodeJson(t.allocator, "http://127.0.0.1:11234", &entries, "m1", true);
     defer t.allocator.free(pinned);
     try t.expect(std.mem.indexOf(u8, pinned, "\"model\": \"mlx/m1\"") != null);
+}
+
+test "claude script keeps a slow local turn on one streamed request" {
+    const script = try scriptFor(t.allocator, .claude, "http://x:1", "m1", budgetForContext(786432), null, &.{});
+    defer t.allocator.free(script);
+    for ([_][]const u8{
+        "export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1\n",
+        "export API_TIMEOUT_MS=3600000\n",
+        "export CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS=1800000\n",
+        "export CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000\n",
+        "export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000\n",
+    }) |line| try t.expect(std.mem.indexOf(u8, script, line) != null);
 }
 
 test "claude script declares the advertised context window (CLAUDE_CODE_MAX_CONTEXT_TOKENS)" {

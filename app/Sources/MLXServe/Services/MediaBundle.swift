@@ -7,7 +7,7 @@ import Foundation
 /// reads. This lets each download pull EXACTLY what's needed — no more.
 struct FileSelection: Equatable {
     /// Descend into subdirectories (FLUX/TTS). When false, only top-level files
-    /// + the `mtp/` sidecar are kept (the chat-model default).
+    /// + the `mtp/` and `drafter/` sidecars are kept (the chat-model default).
     var recursive: Bool = false
     /// Skip any file whose path contains one of these (belt-and-suspenders for
     /// junk a recursive scan would otherwise grab).
@@ -26,8 +26,11 @@ struct FileSelection: Equatable {
     /// `drafter/` lands at `<model_dir>/drafter/`, where the server finds it.
     var packFolder: String? = nil
 
-    /// Chat-model default: top-level files + `mtp/`, all needed extensions.
+    /// Chat-model default: the whole pack, as `mlx-serve pull` fetches it —
+    /// top-level files + `mtp/` + `drafter/`, all needed extensions.
     static let chatDefault = FileSelection()
+    /// The pack without its `drafter/` (a drafter socket switched off).
+    static let chatWithoutDrafter = FileSelection(excludeSubstrings: [DrafterGems.packFolder + "/"])
 
     static func packFolder(_ folder: String) -> FileSelection {
         FileSelection(packFolder: folder)

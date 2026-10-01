@@ -249,8 +249,8 @@ pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile
 }
 
 /// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
-/// top-level files + the `mtp/` spec-decode sidecar; repo housekeeping and
-/// demo assets are skipped.
+/// the whole pack — top-level files + the `mtp/` and `drafter/` spec-decode
+/// sidecars; repo housekeeping and demo assets are skipped.
 /// `pytorch_model.bin` / `pytorch_model-0000N-of-0000M.bin` — the HF torch
 /// weights that sit beside the safetensors copy. Shared rule with the app's
 /// `DownloadManager.selectNeededFiles`; keep them in sync.

@@ -229,13 +229,16 @@ const SCALAR_ROWS =
     \\
 ;
 
-const MMA =
+// `mma` is split where the fragment variant differs: how R is read, and
+// where each group's input values and sums come from.
+const MMA_HEAD =
     \\  const uint lane = thread_index_in_simdgroup;
     \\  const int sg = int(simdgroup_index_in_threadgroup);
     \\  const int qid = int(lane) / 4;
     \\  const int fm = (qid & 4) + ((int(lane) / 2) % 4);
     \\  const int fn = (qid & 2) * 2 + (int(lane) % 2) * 2;
-    \\  const int R = X_shape[0];
+;
+const MMA_MID =
     \\  constexpr int G = K / 64;
     \\  const float one = ONE[0];
     \\  const int nb = int(threadgroup_position_in_grid.x) * (8 * NT);
@@ -258,18 +261,8 @@ const MMA =
     \\      else if (BITS == 8) { const uint4 v = *(const device uint4*)wp; wv[t][0] = v.x; wv[t][1] = v.y; wv[t][2] = v.z; wv[t][3] = v.w; }
     \\      else { wv[t][0] = wp[0]; wv[t][1] = wp[1]; wv[t][2] = wp[2]; }
     \\    }
-    \\    uint4 xa[RT], xb[RT];
-    \\    float xs0[RT], xs1[RT];
-    \\    PRAGMA_UNROLL
-    \\    for (int rt = 0; rt < RT; rt++) {
-    \\      xa[rt] = LOAD8(xr0[rt], 8 * g + fm);
-    \\      xb[rt] = LOAD8(xr1[rt], 8 * g + fm);
-    \\      float v = sum8(xa[rt], one), u = sum8(xb[rt], one);
-    \\      v = fma(simd_shuffle_xor(v, ushort(2)), one, v); u = fma(simd_shuffle_xor(u, ushort(2)), one, u);
-    \\      v = fma(simd_shuffle_xor(v, ushort(4)), one, v); u = fma(simd_shuffle_xor(u, ushort(4)), one, u);
-    \\      v = fma(simd_shuffle_xor(v, ushort(16)), one, v); u = fma(simd_shuffle_xor(u, ushort(16)), one, u);
-    \\      xs0[rt] = v; xs1[rt] = u;
-    \\    }
+;
+const MMA_BM =
     \\    simdgroup_matrix<float, 8, 8> P[RT][NT];
     \\    PRAGMA_UNROLL
     \\    for (int rt = 0; rt < RT; rt++)
@@ -280,8 +273,8 @@ const MMA =
     \\      simdgroup_matrix<float, 8, 8> bm[RT];
     \\      PRAGMA_UNROLL
     \\      for (int rt = 0; rt < RT; rt++) {
-    \\        bm[rt].thread_elements()[0] = bf8(xa[rt], s) * ps;
-    \\        bm[rt].thread_elements()[1] = bf8(xb[rt], s) * ps;
+;
+const MMA_TAIL =
     \\      }
     \\      PRAGMA_UNROLL
     \\      for (int t = 0; t < NT; t++) {
@@ -329,8 +322,76 @@ const MMA =
     \\  }
     \\
 ;
+const MMA = MMA_HEAD ++ "\n" ++
+    \\  const int R = X_shape[0];
+++ "\n" ++ MMA_MID ++ "\n" ++
+    \\    uint4 xa[RT], xb[RT];
+    \\    float xs0[RT], xs1[RT];
+    \\    PRAGMA_UNROLL
+    \\    for (int rt = 0; rt < RT; rt++) {
+    \\      xa[rt] = LOAD8(xr0[rt], 8 * g + fm);
+    \\      xb[rt] = LOAD8(xr1[rt], 8 * g + fm);
+    \\      float v = sum8(xa[rt], one), u = sum8(xb[rt], one);
+    \\      v = fma(simd_shuffle_xor(v, ushort(2)), one, v); u = fma(simd_shuffle_xor(u, ushort(2)), one, u);
+    \\      v = fma(simd_shuffle_xor(v, ushort(4)), one, v); u = fma(simd_shuffle_xor(u, ushort(4)), one, u);
+    \\      v = fma(simd_shuffle_xor(v, ushort(16)), one, v); u = fma(simd_shuffle_xor(u, ushort(16)), one, u);
+    \\      xs0[rt] = v; xs1[rt] = u;
+    \\    }
+++ "\n" ++ MMA_BM ++ "\n" ++
+    \\        bm[rt].thread_elements()[0] = bf8(xa[rt], s) * ps;
+    \\        bm[rt].thread_elements()[1] = bf8(xb[rt], s) * ps;
+++ "\n" ++ MMA_TAIL;
 
-const Kind = enum { scalar, rows, mma };
+/// `mma` over pre-scaled input fragments (`PREP`): the same values from the
+/// same float ops, read instead of rebuilt by every threadgroup.
+const MMA_FRAG = MMA_HEAD ++ "\n" ++
+    \\  const int R = XS_shape[0];
+    \\  const int T8 = (R + 7) / 8;
+    \\  const device float2* XF2 = (const device float2*)XF;
+++ "\n" ++ MMA_MID ++ "\n" ++
+    \\    float xs0[RT], xs1[RT];
+    \\    PRAGMA_UNROLL
+    \\    for (int rt = 0; rt < RT; rt++) { xs0[rt] = XS[size_t(xr0[rt]) * G + g]; xs1[rt] = XS[size_t(xr1[rt]) * G + g]; }
+++ "\n" ++ MMA_BM ++ "\n" ++
+    \\        const float2 f = XF2[(size_t(min(rb / 8 + rt, T8 - 1)) * G + g) * 256 + 32 * s + lane];
+    \\        bm[rt].thread_elements()[0] = f.x;
+    \\        bm[rt].thread_elements()[1] = f.y;
+++ "\n" ++ MMA_TAIL;
+
+/// One simdgroup a (row tile, group): the `mma` fragments of x pre-scaled by
+/// wpre (XF[tile][g][s][lane]; rows past R copy row R - 1) and each row's
+/// group sum by the kernels' tree (XS[r][g]).
+const PREP =
+    \\  const uint lane = thread_index_in_simdgroup;
+    \\  const int unit = int(threadgroup_position_in_grid.x) * 4 + int(simdgroup_index_in_threadgroup);
+    \\  const int R = X_shape[0];
+    \\  constexpr int G = K / 64;
+    \\  const int T8 = (R + 7) / 8;
+    \\  if (unit >= T8 * G) return;
+    \\  const int tile = unit / G, g = unit % G;
+    \\  const int qid = int(lane) / 4;
+    \\  const int fm = (qid & 4) + ((int(lane) / 2) % 4);
+    \\  const int fn = (qid & 2) * 2 + (int(lane) % 2) * 2;
+    \\  const float one = ONE[0];
+    \\  const int r0 = min(8 * tile + fn, R - 1), r1 = min(8 * tile + fn + 1, R - 1);
+    \\  const uint4 xa = LOAD8(r0, 8 * g + fm), xb = LOAD8(r1, 8 * g + fm);
+    \\  device float2* xf = (device float2*)XF + (size_t(tile) * G + g) * 256 + lane;
+    \\  PRAGMA_UNROLL
+    \\  for (int s = 0; s < 8; s++) xf[32 * s] = float2(bf8(xa, s) * wpre<BITS>(s), bf8(xb, s) * wpre<BITS>(s));
+    \\  float v = sum8(xa, one), u = sum8(xb, one);
+    \\  v = fma(simd_shuffle_xor(v, ushort(2)), one, v); u = fma(simd_shuffle_xor(u, ushort(2)), one, u);
+    \\  v = fma(simd_shuffle_xor(v, ushort(4)), one, v); u = fma(simd_shuffle_xor(u, ushort(4)), one, u);
+    \\  v = fma(simd_shuffle_xor(v, ushort(16)), one, v); u = fma(simd_shuffle_xor(u, ushort(16)), one, u);
+    \\  if (fm == 0) {
+    \\    if (8 * tile + fn < R) XS[size_t(8 * tile + fn) * G + g] = v;
+    \\    if (8 * tile + fn + 1 < R) XS[size_t(8 * tile + fn + 1) * G + g] = u;
+    \\  }
+    \\
+;
+
+/// `frag` is `mma` over inputs `prep` wrote once; only 2..FRAGMENT_ROWS rows take it.
+const Kind = enum { scalar, rows, mma, frag, prep };
+pub const FRAGMENT_ROWS = 8;
 /// Widest window `rows` serves: past it `mma` is cheaper. At 6 and 8 bits
 /// `mma` is cheaper from two rows.
 pub const SCALAR_ROWS_MAX = 3;
@@ -379,7 +440,9 @@ var one_arr: mlx.mlx_array = .{ .ctx = null };
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     if (kernels.get(key)) |k| return k;
     const a = std.heap.c_allocator;
-    const consts = if (key.kind != .mma)
+    const consts = if (key.kind == .prep)
+        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int BITS = {d};\n", .{ key.k, key.bits })
+    else if (key.kind != .mma and key.kind != .frag)
         try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int SGS = {d};\n  constexpr int NR = {d};\n  constexpr int XB = {d};\n  constexpr int RR = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b, key.xb, key.rr })
     else
         try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int NT = {d};\n  constexpr int RT = {d};\n  constexpr int SG = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b, key.sg });
@@ -388,16 +451,22 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
         .scalar => SCALAR,
         .rows => SCALAR_ROWS,
         .mma => MMA,
+        .frag => MMA_FRAG,
+        .prep => PREP,
     };
     const source = try std.mem.concatWithSentinel(a, u8, &.{ consts, LOAD8, body, "  #undef LOAD8\n" }, 0);
     defer a.free(source);
     const name = try std.fmt.allocPrintSentinel(a, "msv_simd_qmm_{s}_k{d}_n{d}_b{d}_s{d}_{d}_{d}_r{d}_x{d}_g{d}", .{ @tagName(key.kind), key.k, key.n, key.bits, key.s, key.a, key.b, key.rr, key.xb, key.sg }, 0);
     defer a.free(name);
-    const in_names = [_][*:0]const u8{ "X", "W", "SC", "BI", "ONE" };
-    const out_names = [_][*:0]const u8{"OUT"};
-    const in_vec = mlx.mlx_vector_string_new_data(&in_names, in_names.len);
+    const in_names: []const [*:0]const u8 = switch (key.kind) {
+        .frag => &.{ "XF", "XS", "W", "SC", "BI", "ONE" },
+        .prep => &.{ "X", "ONE" },
+        else => &.{ "X", "W", "SC", "BI", "ONE" },
+    };
+    const out_names: []const [*:0]const u8 = if (key.kind == .prep) &.{ "XF", "XS" } else &.{"OUT"};
+    const in_vec = mlx.mlx_vector_string_new_data(in_names.ptr, in_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
+    const out_vec = mlx.mlx_vector_string_new_data(out_names.ptr, out_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const k = mlx.mlx_fast_metal_kernel_new(name.ptr, in_vec, out_vec, source.ptr, HEADER, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
@@ -411,9 +480,21 @@ fn planFor(kind: Kind, rows: c_int, n: c_int, k: c_int, bits: c_int) !Plan {
     const s = splits(n);
     const config = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ rows, n }, 2, .bfloat16));
     var kkey: KernelKey = undefined;
-    if (kind != .mma) {
+    if (kind == .prep) {
+        const g = @divExact(k, 64);
+        const units = @divTrunc(rows + 7, 8) * g;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{units * 512}, 1, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ rows, g }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(units + 3, 4) * 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 128, 1, 1));
+        kkey = .{ .kind = kind, .k = k, .n = 0, .bits = bits, .s = 0, .a = 0, .b = 0 };
+        const p = Plan{ .kernel = try kernelFor(kkey), .config = config };
+        try plans.put(std.heap.c_allocator, pk, p);
+        return p;
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ rows, n }, 2, .bfloat16));
+    if (kind != .mma and kind != .frag) {
         const nr: c_int = if (n > 2048) NR else 1;
         const sgs: c_int = if (n > 2048) SGS else 8;
         const per = sgs * @divExact(32, s) * nr;
@@ -452,11 +533,30 @@ fn launch(kind: Kind, x2: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi
         one_arr = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32);
     }
     const pk = PlanKey{ .kind = kind, .rows = rows, .n = n, .k = k, .bits = bits };
+    var frags: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (frags) |f| if (f.ctx != null) {
+        _ = mlx.mlx_array_free(f);
+    };
+    if (kind == .frag) {
+        const pp = try planFor(.prep, rows, 0, k, bits);
+        const pin = [_]mlx.mlx_array{ x2, one_arr };
+        const pin_vec = mlx.mlx_vector_array_new_data(&pin, pin.len);
+        defer _ = mlx.mlx_vector_array_free(pin_vec);
+        var pouts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(pouts);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&pouts, pp.kernel, pin_vec, pp.config, s));
+        for (&frags, 0..) |*f, i| {
+            f.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(f, pouts, i));
+        }
+    }
     while (true) {
-        const fresh = kind == .mma and !plans.contains(pk);
+        const fresh = (kind == .mma or kind == .frag) and !plans.contains(pk);
         const p = try planFor(kind, rows, n, k, bits);
-        const inputs = [_]mlx.mlx_array{ x2, w, sc, bi, one_arr };
-        const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+        const direct = [_]mlx.mlx_array{ x2, w, sc, bi, one_arr };
+        const fragged = [_]mlx.mlx_array{ frags[0], frags[1], w, sc, bi, one_arr };
+        const inputs: []const mlx.mlx_array = if (kind == .frag) &fragged else &direct;
+        const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var outs = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outs);
@@ -514,7 +614,9 @@ fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, 
         return null;
     };
     const rows_max: c_int = if (bits == 4) SCALAR_ROWS_MAX else 1;
-    const kind: Kind = force orelse if (mma_one_row.contains(shape) or rows > rows_max or !rowsFit(rows, n)) .mma else if (rows == 1) .scalar else .rows;
+    const kind: Kind = force orelse if (mma_one_row.contains(shape) or rows > rows_max or !rowsFit(rows, n))
+        (if (rows >= 2 and rows <= FRAGMENT_ROWS) Kind.frag else Kind.mma)
+    else if (rows == 1) .scalar else .rows;
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
     try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ rows, k }, 2, s));
@@ -750,5 +852,39 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         try mlx.check(mlx.mlx_array_item_float32(&a, sd));
         try mlx.check(mlx.mlx_array_item_float32(&b, st));
         try testing.expect(@sqrt(a / b) < 1e-2);
+    };
+}
+
+test "simd_qmm: reading pre-scaled input fragments gives the direct mma's bits at 2..8 rows and 4, 6 and 8 bits" {
+    const s = mlx.gpuStream();
+    errdefer {
+        var buf: [512]u8 = undefined;
+        if (mlx.takeError(&buf)) |msg| std.debug.print("[simd_qmm] mlx: {s}\n", .{msg});
+    }
+    for ([_]u32{ 4, 6, 8 }) |bits| for ([_][2]c_int{ .{ 1024, 5120 }, .{ 4104, 1024 } }, 0..) |sh, si| {
+        const wf = try randBf16(&.{ sh[0], sh[1] }, 0.02, 200 + si, s);
+        defer _ = mlx.mlx_array_free(wf);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        var bi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bi);
+        try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+        var rows: c_int = 2;
+        while (rows <= FRAGMENT_ROWS) : (rows += 1) {
+            const x = try randBf16(&.{ rows, sh[1] }, 1.0, 30 + si, s);
+            defer _ = mlx.mlx_array_free(x);
+            const direct = (try qmmKind(.mma, x, w, sc, bi, bits, 64, s)).?;
+            defer _ = mlx.mlx_array_free(direct);
+            const frag = (try qmmKind(.frag, x, w, sc, bi, bits, 64, s)).?;
+            defer _ = mlx.mlx_array_free(frag);
+            try expectSame(frag, direct, s);
+        }
     };
 }

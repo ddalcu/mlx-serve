@@ -380,6 +380,16 @@ pub const Table = struct {
         return self.serial[bucket].msPerTok();
     }
 
+    /// Whether a round at `width` is measured to emit tokens cheaper than a plain
+    /// step at this KV length: the width-0 cell (plain rounds) or the serial row
+    /// (MTP's probe ticks); null until both sides are trusted.
+    pub fn roundBeatsSerial(self: *const Table, width: u32, kv_len: u32) ?bool {
+        const b = self.bucketOf(kv_len);
+        const round = self.msPerTok(width, b) orelse return null;
+        const serial = self.msPerTok(0, b) orelse self.serialMsPerTok(b) orelse return null;
+        return round < serial;
+    }
+
     /// The bucket resolver for anything holding a table: the layout is the table's.
     pub fn bucketOf(self: *const Table, kv_len: u32) usize {
         return bucketForLayout(kv_len, self.layout);
@@ -1207,6 +1217,21 @@ test "round_cost: EMA folds, first sample seeds, a cell counts at MIN_SAMPLES, a
     try testing.expectEqual(Verdict.reseeded, t.observe(4, 1000, 58.0, 4.0, true, false));
     try testing.expectApproxEqAbs(before + RESEED_WEIGHT * (58.0 - before), t.cells[4][0].ms, 1e-3);
     try testing.expect(t.measuredMs(4, 0) != null);
+}
+
+test "round_cost: a round measured cheaper per token than a serial step beats it, unmeasured is unknown" {
+    var t = Table{};
+    try testing.expect(t.roundBeatsSerial(15, 1000) == null);
+    for (0..MIN_SAMPLES) |_| _ = t.observe(15, 1000, 28.0, 2.3, true, false);
+    try testing.expect(t.roundBeatsSerial(15, 1000) == null); // nothing plain measured yet
+    for (0..MIN_SAMPLES) |_| _ = t.observeSerial(1000, 21.0, true, false);
+    try testing.expect(t.roundBeatsSerial(15, 1000).?); // 12.2 ms/tok vs the serial row's 21
+    for (0..MIN_SAMPLES) |_| _ = t.observe(0, 1000, 11.0, 1.0, true, false);
+    try testing.expect(!t.roundBeatsSerial(15, 1000).?); // plain rounds measured at 11 win
+    try testing.expect(t.roundBeatsSerial(7, 1000) == null); // width never measured
+    for (0..MIN_SAMPLES) |_| _ = t.observe(7, 1000, 25.0, 1.1, true, false);
+    try testing.expect(!t.roundBeatsSerial(7, 1000).?); // 22.7 ms/tok vs 21
+    try testing.expect(t.roundBeatsSerial(15, 3000) == null); // another bucket
 }
 
 test "round_cost: a contended, transition or bad sample never moves the estimate" {

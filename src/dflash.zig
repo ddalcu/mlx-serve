@@ -35,6 +35,8 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
+const simd_qmm = @import("simd_qmm.zig");
+const lane_qmm = @import("lane_qmm.zig");
 const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
@@ -149,6 +151,17 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     if (c.get("mask_token_id") == null) return null;
     if (c.get("target_layer_ids") == null) return null;
     return c;
+}
+
+/// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
+/// not one, ships packed already (`quantization` in its config) or loads dense.
+pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u32 {
+    const content = readConfigFile(io, allocator, dir) catch return 0;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
+    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -372,6 +385,8 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
 pub const TREE_BLOCK_CAP: u32 = 8;
+/// Positions a draft tree's lattice spans on the tensor units.
+pub const TREE_NAX_BLOCK: u32 = 16;
 
 /// A no-wide-lane block cap with the machine row it came from, for the
 /// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
@@ -509,6 +524,18 @@ pub const DflashLinear = struct {
         if (!self.isQuantized()) {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
+        }
+        // Up to the lane kernels' row cap (a draft block, a round's kept
+        // captures, a window of context rows) they read each weight once for
+        // every row, where MLX's matmul falls off at 4..16 rows; drafts need
+        // speed, not bits.
+        const row = if (transformer_mod.naxAvailable())
+            try lane_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)
+        else
+            try simd_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s);
+        if (row) |y| {
+            _ = mlx.mlx_array_free(out);
+            return y;
         }
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,
@@ -711,6 +738,7 @@ pub const DflashModel = struct {
 
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
+        lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
         if (self.draft_head) |*dh| dh.deinit();
@@ -720,6 +748,33 @@ pub const DflashModel = struct {
         for (self.layers) |*lw| lw.deinit();
         allocator.free(self.layers);
         self.config.deinit(allocator);
+    }
+
+    /// Re-orders every 4-bit linear into the lane kernel's tiled layout in its
+    /// own buffer (NAX only; no copy stays resident). From then on they are
+    /// read through `lane_qmm` alone, as `DflashLinear.apply` does, and that
+    /// read is bf16-only: a trunk in another activation dtype (`act`) keeps
+    /// MLX's layout.
+    pub fn tileLaneWeights(self: *DflashModel, act: mlx.mlx_dtype, s: mlx.mlx_stream) !u64 {
+        if (!transformer_mod.naxAvailable() or act != .bfloat16) return 0;
+        try mlx.check(mlx.mlx_synchronize(s));
+        const owner = @intFromPtr(self);
+        var bytes: u64 = 0;
+        const Tile = struct {
+            fn one(own: usize, lin: *const DflashLinear, st: mlx.mlx_stream) !u64 {
+                return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, lin.bits, lin.group_size, &.{}, st);
+            }
+        };
+        bytes += try Tile.one(owner, &self.fc, s);
+        for (self.layers) |*lw| {
+            for ([_]*const DflashLinear{ &lw.q, &lw.k, &lw.v, &lw.o, &lw.gate, &lw.up, &lw.down }) |lin| bytes += try Tile.one(owner, lin, s);
+            inline for (.{ lw.attention_conv, lw.mlp_conv }) |conv| if (conv) |c| {
+                bytes += try Tile.one(owner, &c.kernel_projection, s);
+            };
+        }
+        if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
+        if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        return bytes;
     }
 
     /// Validate compatibility with the target trunk. The assistant borrows
@@ -1399,11 +1454,89 @@ fn buildBlockMask(
 /// block. `base` is per-CHANNEL `[ksize, H]`; `dynamic` is per-GROUP
 /// `[1, L, ksize, groups]`, each coefficient broadcasting over `group_size`
 /// channels. Two separate multiply-adds per tap keep the reference's bf16
-/// rounding order.
+/// rounding order. One kernel on the GPU (`dynConvFused`), the op chain
+/// elsewhere.
 pub fn groupedDynConv(
     hidden: mlx.mlx_array, // [1, L, H]
     dynamic: mlx.mlx_array, // [1, L, ksize, groups]
     base: mlx.mlx_array, // [ksize, H]
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    if (try dynConvFused(hidden, dynamic, base, group_size, s)) |y| return y;
+    return groupedDynConvOps(hidden, dynamic, base, group_size, s);
+}
+
+// Each tap adds base[tap] * x_{t-tap}, then dyn_t[tap] * x_{t-tap}, every
+// product and sum rounded to T as the op chain's elementwise kernels do.
+const DYN_CONV_SOURCE =
+    \\uint i = thread_position_in_grid.x;
+    \\if (i >= uint(L * H)) return;
+    \\const int t = int(i) / H, c = int(i) % H;
+    \\T acc = T(0);
+    \\for (int tap = 0; tap < KS; ++tap) {
+    \\  const T v = t >= tap ? x[(t - tap) * H + c] : T(0);
+    \\  acc = T(float(acc) + float(T(float(base[tap * H + c]) * float(v))));
+    \\  acc = T(float(acc) + float(T(float(dyn[(t * KS + tap) * (H / GS) + c / GS]) * float(v))));
+    \\}
+    \\y[i] = acc;
+;
+var dyn_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const DynConvKey = struct { l: c_int, h: c_int, ks: c_int, gs: c_int, dt: mlx.mlx_dtype };
+var dyn_conv_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var dyn_conv_key: ?DynConvKey = null;
+
+fn dynConvFused(hidden: mlx.mlx_array, dynamic: mlx.mlx_array, base: mlx.mlx_array, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(hidden);
+    if (mlx.mlx_array_dtype(dynamic) != dt or mlx.mlx_array_dtype(base) != dt) return null;
+    const hsh = mlx.getShape(hidden);
+    const bsh = mlx.getShape(base);
+    const dsh = mlx.getShape(dynamic);
+    if (hsh.len != 3 or hsh[0] != 1 or bsh.len != 2 or dsh.len != 4) return null;
+    const gs: c_int = @intCast(group_size);
+    const key = DynConvKey{ .l = hsh[1], .h = hsh[2], .ks = bsh[0], .gs = gs, .dt = dt };
+    if (@rem(key.h, gs) != 0 or bsh[1] != key.h or dsh[0] != 1 or dsh[1] != key.l or dsh[2] != key.ks or dsh[3] != @divExact(key.h, gs)) return null;
+    if (dyn_conv_kernel == null) {
+        const ins = [_][*:0]const u8{ "x", "dyn", "base" };
+        const outs = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_dflash_dyn_conv", in_vec, out_vec, DYN_CONV_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        dyn_conv_kernel = k;
+    }
+    if (dyn_conv_key == null or !std.meta.eql(dyn_conv_key.?, key)) {
+        if (dyn_conv_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        dyn_conv_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.l, key.h }, 3, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, key.l * key.h, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        inline for (.{ .{ "L", key.l }, .{ "H", key.h }, .{ "KS", key.ks }, .{ "GS", key.gs } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+        dyn_conv_cfg = cfg;
+        dyn_conv_key = key;
+    }
+    const ins = [_]mlx.mlx_array{ hidden, dynamic, base };
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, dyn_conv_kernel.?, vec, dyn_conv_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    return y;
+}
+
+fn groupedDynConvOps(
+    hidden: mlx.mlx_array,
+    dynamic: mlx.mlx_array,
+    base: mlx.mlx_array,
     group_size: u32,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
@@ -1609,6 +1742,105 @@ pub const Lattice = struct {
     }
 };
 
+// Top K of each row in one threadgroup: every thread keeps its own sorted K
+// (a compare-and-select chain), each simdgroup merges its lanes' lists, then
+// simdgroup 0 merges the NT / 32 lists. Equal values go to the lower index
+// within a thread's own list; across lanes the lower lane wins, so a tie can
+// pick the higher id (drafts only).
+// 256 threads: M1/M2 cap threadgroups below 1024 for kernels this heavy.
+const TOPK_SOURCE =
+    \\constexpr int NT = 256, NSG = NT / 32;
+    \\const uint row = threadgroup_position_in_grid.y;
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    \\const device T* x = logits + size_t(row) * V;
+    \\float v[K];
+    \\int id[K];
+    \\for (int j = 0; j < K; ++j) { v[j] = -INFINITY; id[j] = 0; }
+    \\for (int i = int(tid); i < V; i += NT) {
+    \\  float c = float(x[i]);
+    \\  if (!(c > v[K - 1])) continue;
+    \\  int ci = i;
+    \\  for (int j = 0; j < K; ++j) {
+    \\    const bool gt = c > v[j];
+    \\    const float tv = v[j]; const int ti = id[j];
+    \\    v[j] = gt ? c : tv; id[j] = gt ? ci : ti;
+    \\    c = gt ? tv : c; ci = gt ? ti : ci;
+    \\  }
+    \\}
+    \\threadgroup float sv[NSG * K];
+    \\threadgroup int si[NSG * K];
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { sv[sg * K + r] = best; si[sg * K + r] = bid; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg != 0) return;
+    \\for (int j = 0; j < K; ++j) { v[j] = lane < NSG ? sv[lane * K + j] : -INFINITY; id[j] = lane < NSG ? si[lane * K + j] : 0; }
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { idx[row * K + r] = bid; val[row * K + r] = best; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+;
+var topk_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const TopKKey = struct { m: c_int, v: c_int, k: c_int, dt: mlx.mlx_dtype };
+var topk_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var topk_key: ?TopKKey = null;
+
+/// Each row's top `k` of `logits` [1, M, V]: ids [1, M, k] int32 and values
+/// [1, M, k] f32, largest first. Null off the GPU or past 32 per row.
+fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or k == 0 or k > 32) return null;
+    const sh = mlx.getShape(logits);
+    const dt = mlx.mlx_array_dtype(logits);
+    if (sh.len != 3 or sh[0] != 1 or sh[2] < 256 * @as(c_int, @intCast(k)) or (dt != .bfloat16 and dt != .float16 and dt != .float32)) return null;
+    const key = TopKKey{ .m = sh[1], .v = sh[2], .k = @intCast(k), .dt = dt };
+    if (topk_kernel == null) {
+        const ins = [_][*:0]const u8{"logits"};
+        const outs = [_][*:0]const u8{ "idx", "val" };
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kern = mlx.mlx_fast_metal_kernel_new("msv_dflash_topk_rows", in_vec, out_vec, TOPK_SOURCE, "", true, false);
+        if (kern.ctx == null) return error.MetalKernelCompileFailed;
+        topk_kernel = kern;
+    }
+    if (topk_key == null or !std.meta.eql(topk_key.?, key)) {
+        if (topk_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        topk_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, key.m, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", key.v));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", key.k));
+        topk_cfg = cfg;
+        topk_key = key;
+    }
+    const ins = [_]mlx.mlx_array{logits};
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, topk_kernel.?, vec, topk_cfg.?, s));
+    var out: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, outs, i));
+    return out;
+}
+
 pub fn lattice(
     allocator: std.mem.Allocator,
     sel: *const Selector,
@@ -1630,7 +1862,12 @@ pub fn lattice(
     defer _ = mlx.mlx_array_free(cands_i32);
     var unary_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(unary_f32);
-    {
+    if (try topKRows(draft_logits, k, s)) |top| {
+        _ = mlx.mlx_array_free(cands_i32);
+        _ = mlx.mlx_array_free(unary_f32);
+        cands_i32 = top[0];
+        unary_f32 = top[1];
+    } else {
         var part = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_argpartition_axis(&part, draft_logits, vocab - @as(c_int, @intCast(k)), 2, s));
@@ -2151,8 +2388,30 @@ pub fn forwardBlock(
 
         // Append block K/V into spare capacity; the view spans ctx + block.
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
+        // A sliding layer never sees context before the first query's window:
+        // attend over the rest, so the cost stops growing with the context.
+        const skip: usize = if (lw.layer_type == .sliding_attention)
+            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
+        else
+            0;
+        var kv_k = view.k;
+        var kv_v = view.v;
+        var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
+        defer for (cut) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (skip > 0) {
+            const sh = mlx.getShape(view.k);
+            const lo: c_int = @intCast(skip);
+            for ([_]mlx.mlx_array{ view.k, view.v }, &cut) |src, *dst| {
+                dst.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            }
+            kv_k = cut[0];
+            kv_v = cut[1];
+        }
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -2160,9 +2419,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, .{ .ctx = null }, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
@@ -3070,6 +3329,28 @@ fn tinyBlockHidden(m: *DflashModel, allocator: std.mem.Allocator, s: mlx.mlx_str
     return TinyFix.readF32(hidden, allocator, s);
 }
 
+test "dflash: tiling the 4-bit drafter in place leaves its forward unchanged" {
+    if (mlx.noGpuBackend() or !transformer_mod.naxAvailable()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    try TinyFix.writeAssistant(io, tmp_dir.dir, path_buf[0..root_len], s);
+    var m = try loadDflashQuant(io, allocator, s, path_buf[0..root_len], 4);
+    defer m.deinit();
+    const before = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(before);
+    // The tiled read is bf16-only: an f16-activation trunk keeps MLX's layout.
+    try testing.expectEqual(@as(u64, 0), try m.tileLaneWeights(.float16, s));
+    try testing.expect(try m.tileLaneWeights(.bfloat16, s) > 0);
+    const after = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(after);
+    try testing.expectEqualSlices(f32, before, after);
+}
+
 test "dflash: load-time quantization packs every matmul weight and tracks the dense forward" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -3228,6 +3509,92 @@ test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
         want[t * 4 + c] = tap0 + tap1;
     };
     for (got, want) |a, b| try testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "dflash2: topKRows picks each row's k largest logits, each id at its value" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const m: c_int = 3;
+    const v: c_int = 98304;
+    const k: usize = 16;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x70B));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_random_normal(&f, &[_]c_int{ 1, m, v }, 3, .float32, 0.0, 4.0, key, s));
+    // Row 0 also holds 20 descending spikes all in one thread's stride.
+    const spikes = try allocator.alloc(f32, @intCast(m * v));
+    defer allocator.free(spikes);
+    @memset(spikes, 0);
+    for (0..20) |j| spikes[j * 1024] = 50.0 - @as(f32, @floatFromInt(j));
+    const sp = mlx.mlx_array_new_data(spikes.ptr, &[_]c_int{ 1, m, v }, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp);
+    var fs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fs);
+    try mlx.check(mlx.mlx_add(&fs, f, sp, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, fs, .bfloat16, s));
+    const top = (try topKRows(x, k, s)) orelse return error.TopKDeclined;
+    defer for (top) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
+    const all = try TinyFix.readF32(xf, allocator, s);
+    defer allocator.free(all);
+    const vals = try TinyFix.readF32(top[1], allocator, s);
+    defer allocator.free(vals);
+    var ids_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_f);
+    try mlx.check(mlx.mlx_astype(&ids_f, top[0], .float32, s));
+    const ids = try TinyFix.readF32(ids_f, allocator, s);
+    defer allocator.free(ids);
+    const vu: usize = @intCast(v);
+    for (0..@intCast(m)) |r| {
+        const row = try allocator.dupe(f32, all[r * vu .. (r + 1) * vu]);
+        defer allocator.free(row);
+        std.mem.sort(f32, row, {}, std.sort.desc(f32));
+        for (0..k) |j| {
+            try testing.expectEqual(row[j], vals[r * k + j]);
+            const id: usize = @intFromFloat(ids[r * k + j]);
+            try testing.expectEqual(all[r * vu + id], vals[r * k + j]);
+        }
+    }
+}
+
+test "dflash2: the one-kernel dyn conv equals the op chain bit for bit" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const shapes = [_][]const c_int{ &.{ 1, 16, 5120 }, &.{ 1, 16, 2, 320 }, &.{ 2, 5120 } };
+    var in: [3]mlx.mlx_array = undefined;
+    for (&in, shapes, 0..) |*a, sh, i| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 0xD7C + i));
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_random_normal(&f, sh.ptr, sh.len, .float32, 0.0, 1.0, key, s));
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(a, f, .bfloat16, s));
+    }
+    defer for (in) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const fused = (try dynConvFused(in[0], in[1], in[2], 16, s)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ops = try groupedDynConvOps(in[0], in[1], in[2], 16, s);
+    defer _ = mlx.mlx_array_free(ops);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, fused, ops, false, s));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_eval(eq));
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
 }
 
 test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels from the INPUT" {

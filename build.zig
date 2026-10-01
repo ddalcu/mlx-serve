@@ -135,6 +135,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
         .target = target,
@@ -154,6 +159,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -245,6 +251,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -398,6 +405,11 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .target = target,
         .optimize = optimize,
     });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -406,6 +418,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },

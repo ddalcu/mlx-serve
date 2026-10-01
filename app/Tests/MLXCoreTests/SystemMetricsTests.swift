@@ -57,11 +57,12 @@ final class SystemMetricsTests: XCTestCase {
             guard let line = text.split(separator: "\n").first(where: { $0.contains(key) }) else { return 0 }
             return Int(line.filter(\.isNumber)) ?? 0
         }
-        // This machine must actually be holding speculative pages, else the
-        // assertion below proves nothing.
-        try XCTSkipIf(pages("Pages speculative") < 1000, "no speculative pages to distinguish the two formulas")
-
         let pageSize = Int(vm_kernel_page_size)
+        // Half the speculative bytes must clear the drift between the two samples
+        // (the 256 MB floor above), else the assertion below measures the drift.
+        try XCTSkipIf(pages("Pages speculative") * pageSize < 512 * 1024 * 1024,
+                      "too few speculative pages to distinguish the two formulas")
+
         let naive = UInt64((pages("Pages free") + pages("Pages speculative") + pages("Pages inactive")) * pageSize)
         let actual = SystemMetrics.availableBytes()
         let delta = actual > naive ? actual - naive : naive - actual

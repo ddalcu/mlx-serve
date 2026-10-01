@@ -592,6 +592,8 @@ pub const Slot = struct {
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
     prefill_ns: u64,
+    /// The prefill's sampled token, already published; its next push is swallowed.
+    early_first: ?u32 = null,
     /// Wall-clock nanoseconds of interleaved decode ticks hosted INSIDE this
     /// slot's prefill (chunk-boundary yields). Charged to the decoding slots
     /// that received the tokens; subtracted from this slot's `prefill_ns` so
@@ -870,6 +872,11 @@ pub const Slot = struct {
     /// gap survived: it is invisible to output-equality tests AND to llmprobe,
     /// which probes logprobs non-streaming only.
     fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+        // The prefill's token went out early (`publishFirstToken`): the decoder's own push of it is swallowed.
+        if (self.early_first) |e| {
+            self.early_first = null;
+            if (e == t and lp == null) return;
+        }
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (lp) |entry| {
@@ -3505,6 +3512,24 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     return avail_bytes < loadRequirementBytes(weights_bytes);
 }
 
+/// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
+/// (scale, bias) pair per group of 64 for a dense DFlash assistant quantized
+/// at load; its file size otherwise (`bits == 0`).
+pub fn drafterResidentBytes(disk_bytes: u64, bits: u32) u64 {
+    if (bits == 0) return disk_bytes;
+    return disk_bytes * (2 * bits + 1) / 32;
+}
+
+const PreflightVerdict = enum { fits, drop_drafter, refuse };
+
+/// The load preflight over the model AND its sidecar: a sidecar the checkpoint
+/// brought along (`drafter_optional`) is dropped before the model is refused.
+fn preflightVerdict(weights_bytes: u64, drafter_bytes: u64, avail_bytes: u64, drafter_optional: bool) PreflightVerdict {
+    if (!memInsufficientForLoad(weights_bytes + drafter_bytes, avail_bytes)) return .fits;
+    if (drafter_optional and drafter_bytes > 0 and !memInsufficientForLoad(weights_bytes, avail_bytes)) return .drop_drafter;
+    return .refuse;
+}
+
 /// Total free memory a load demands: the model's own peak plus the headroom the
 /// guard wants for warmup buffers and a baseline KV cache.
 ///
@@ -3634,6 +3659,21 @@ test "a media model commits the residency the gate reserved" {
     try testing.expectEqual(@as(u64, 0), genLoadResidentBytes(0, 0));
 }
 
+test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // A dense bf16 assistant quantized at load: bits per weight plus a bf16
+    // (scale, bias) pair per group of 64; a packed or dense-loaded one its own bytes.
+    try std.testing.expectEqual(@as(u64, 32 * 9), drafterResidentBytes(32 * 32, 4));
+    try std.testing.expectEqual(@as(u64, 32 * 17), drafterResidentBytes(32 * 32, 8));
+    try std.testing.expectEqual(@as(u64, 1000), drafterResidentBytes(1000, 0));
+    // 20 GB of weights want ~23.5 GB; a 3 GB drafter pushes that past 26 GB.
+    try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 3 * GB, 30 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.drop_drafter, preflightVerdict(20 * GB, 3 * GB, 25 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 25 * GB, false));
+    try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 20 * GB, true));
+    try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
+}
+
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3723,21 +3763,50 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
+    // The sidecar is resolved here so the preflight bills it with the weights:
+    // launch flags, then the per-model setting; otherwise the checkpoint's own
+    // `drafter/` subdir (dflash.resolveInDirDrafter). That is what makes the
+    // drafter a LOAD-time dependency rather than a launch flag: a hot model
+    // switch brings its own, and no pairing table has to decide which sidecar
+    // goes with which checkpoint.
+    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
+    var in_dir_drafter: ?[]u8 = if (chosen_drafter == null)
+        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir)
+    else
+        null;
+    defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
-        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        const model_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
+        const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
+        const weights_bytes = model_bytes + drafter_bytes;
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
-            @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(model_bytes)) / gb,
+            @as(f64, @floatFromInt(avail_bytes)) / gb,
         });
-        if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
-            const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
-                @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
-                @as(f64, @floatFromInt(weights_bytes)) / gb,
-                @as(f64, @floatFromInt(avail_bytes)) / gb,
-            });
-            return error.InsufficientMemory;
+        if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
+        switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
+            .fits => {},
+            .drop_drafter => {
+                log.warn("[dflash] sidecar at {s} skipped: model + drafter need ~{d:.1} GB free, {d:.1} GB available; the model loads without it\n", .{
+                    sidecar,
+                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
+                    @as(f64, @floatFromInt(avail_bytes)) / gb,
+                });
+                sch.allocator.free(in_dir_drafter.?);
+                in_dir_drafter = null;
+            },
+            .refuse => {
+                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
+                    @as(f64, @floatFromInt(weights_bytes)) / gb,
+                    if (drafter_bytes > 0) " and drafter" else "",
+                    @as(f64, @floatFromInt(avail_bytes)) / gb,
+                });
+                return error.InsufficientMemory;
+            },
         }
     }
 
@@ -3836,6 +3905,184 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
+
+    // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
+    // (model declares vision in config but the safetensors didn't ship the
+    // tower); other errors fail the whole load.
+    var vision_ptr: ?*VisionEncoder = null;
+    if (params.load_vision) {
+        const v = try sch.allocator.create(VisionEncoder);
+        if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
+            v.* = encoder;
+            vision_ptr = v;
+        } else |err| {
+            sch.allocator.destroy(v);
+            if (err == error.MissingVisionWeights) {
+                log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
+            } else {
+                return err;
+            }
+        }
+    }
+    errdefer if (vision_ptr) |v| {
+        v.deinit();
+        sch.allocator.destroy(v);
+    };
+
+    // The measured round-cost table (`round_cost.zig`) is keyed per (chip,
+    // model, quant, OS build); restored here, written at request end.
+    {
+        var quant_buf: [32]u8 = undefined;
+        const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
+            params.config.quant_bits,
+            params.config.quant_group_size,
+        }) catch "q?";
+        var os_buf: [64]u8 = undefined;
+        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
+        // The measured round-cost table rides the same identity: restored
+        // here, written at the end of any request that folded new samples.
+        // The bucket grid and store version are the arch's (only qwen4_exp gets the long
+        // grid); every other arch keeps the `rc1` table 26.9.1 wrote and boots warm.
+        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
+        xfm_ptr.round_cost.layout = rc_layout;
+        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout, round_cost_mod.engineBuildId());
+        xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
+        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
+            xfm_ptr.round_cost = t;
+            log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
+            if (t.restored_dropped > 0) log.info("[spec-cost] dropped {d} implausible persisted cell(s)\n", .{t.restored_dropped});
+        }
+    }
+
+    // Assistant sidecar (optional). Loaded only when `drafter_dir` is
+    // non-empty. The sidecar KIND is decided by its config CONTRACT: a
+    // config declaring block_size + mask_token_id + target_layer_ids is a
+    // DFlash block-drafter (any `*_assistant` family); anything else goes
+    // to the Gemma cross-attention drafter loader.
+    var drafter_ptr: ?*DrafterModel = null;
+    var dflash_ptr: ?*DflashModel = null;
+    errdefer if (drafter_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
+    errdefer if (dflash_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
+    const drafter_dir: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
+    if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
+        const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
+        if (env_off) {
+            log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
+        } else {
+            const d = try sch.allocator.create(DflashModel);
+            d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
+                sch.allocator.destroy(d);
+                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+                return err;
+            };
+            d.bind(xfm_ptr) catch |err| {
+                d.deinit();
+                sch.allocator.destroy(d);
+                log.err(
+                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
+                        "  (assistant+target must share hidden_size, the mask token and\n" ++
+                        "  target_layer_ids must exist in the target, and the target must\n" ++
+                        "  run the standard dense-attention forward path)\n",
+                    .{ drafter_dir, @errorName(err) },
+                );
+                return err;
+            };
+            dflash_ptr = d;
+            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
+            sch.drafter_block_size = dflash_mod.resolveBlockSize(
+                d.config.block_size,
+                params.draft_block_size,
+                params.draft_block_size_explicit,
+                wide_lane,
+                block_cap.cap,
+            );
+            if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
+                log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
+            // Trees on the tensor units draft past the drafter's trained block (TensorFold's
+            // tree_block): the lattice reaches depth 15 and a 16-row window costs about an 8-row one.
+            if (!params.draft_block_size_explicit and d.selector != null and xfm_ptr.specTreeSupported() and transformer_mod.naxAvailable())
+                sch.drafter_block_size = dflash_mod.TREE_NAX_BLOCK;
+            var cap_note_buf: [96]u8 = undefined;
+            const cap_note: []const u8 = if (params.draft_block_size_explicit)
+                ", user-clamped"
+            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                    block_cap.label,
+                    block_cap.cap,
+                }) catch ", capped"
+            else
+                "";
+            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
+                sch.drafter_block_size,
+                cap_note,
+                wide_lane,
+                d.config.target_layer_ids,
+            });
+            const tiled_bytes = try xfm_ptr.tileLaneWeights();
+            if (tiled_bytes > 0) log.info("[lane] trunk projections tiled in place ({d:.1} GB, no copy)\n", .{@as(f64, @floatFromInt(tiled_bytes)) / (1 << 30)});
+            const drafter_tiled = try d.tileLaneWeights(xfm_ptr.actDtype(), mlx.gpuStream());
+            if (drafter_tiled > 0) log.info("[lane] drafter projections tiled in place ({d:.2} GB, no copy)\n", .{@as(f64, @floatFromInt(drafter_tiled)) / (1 << 30)});
+        }
+    } else if (drafter_dir.len > 0) {
+        const d = try sch.allocator.create(DrafterModel);
+        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
+            sch.allocator.destroy(d);
+            log.err("Failed to load drafter at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+            return err;
+        };
+        d.bind(xfm_ptr) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err(
+                "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
+                    "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
+                    "  matching layer types in the target's non-shared K/V layers)\n",
+                .{ drafter_dir, @errorName(err) },
+            );
+            return err;
+        };
+        drafter_ptr = d;
+
+        // Auto-detect block_size unless the user pinned it explicitly.
+        if (!params.draft_block_size_explicit) {
+            const auto_bs = drafter_mod.recommendedBlockSize(params.config);
+            sch.drafter_block_size = auto_bs;
+            log.info(
+                "Drafter ready (block_size={d}, auto-detected for {s}/{d}-layer{s}).\n",
+                .{
+                    auto_bs,
+                    params.config.model_type,
+                    params.config.num_hidden_layers,
+                    if (params.config.isMoe()) ",moe" else "",
+                },
+            );
+        } else {
+            log.info("Drafter ready (block_size={d}, user override).\n", .{params.draft_block_size});
+        }
+
+        if (params.config.isMoe()) {
+            log.warn(
+                "Drafter loaded but target is MoE ({s}); per-request " ++
+                    "enable_drafter defaults to OFF — drafter+MoE regresses " ++
+                    "at single-stream batch=1 (verify forward expert-routing " ++
+                    "penalty). Pass enable_drafter:true per request to opt-in.\n",
+                .{params.config.model_type},
+            );
+        }
+    }
+    params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
+    params.config.dflash_bound = xfm_ptr.config.dflash_bound;
+    if (params.config.dflash_bound and std.meta.activeTag(params.config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default) != .exact)
+        log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
+
+    // After the drafter binds: an exact-mode arch runs its row kernels only then.
     // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
     // cache bookkeeping around them. The server reports `predicted_ms` around
@@ -3883,6 +4130,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
             ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
+            // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
+            const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
+            var tree_depth: [16]i32 = undefined;
+            for (tree_parents, 0..) |p, i| tree_depth[i] = if (p < 0) 0 else tree_depth[@intCast(p)] + 1;
+            const spec_tree = generate_mod.Generator.specTreeFor(&tree_parents, &tree_depth, 8);
+            defer spec_tree.deinit();
+            if (rows == 16 and std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_TREE") != null) ctx.tree = &spec_tree;
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
@@ -3983,185 +4238,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             xfm_ptr.resetCache() catch {};
         }
     }
-
-    // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
-    // (model declares vision in config but the safetensors didn't ship the
-    // tower); other errors fail the whole load.
-    var vision_ptr: ?*VisionEncoder = null;
-    if (params.load_vision) {
-        const v = try sch.allocator.create(VisionEncoder);
-        if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
-            v.* = encoder;
-            vision_ptr = v;
-        } else |err| {
-            sch.allocator.destroy(v);
-            if (err == error.MissingVisionWeights) {
-                log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
-            } else {
-                return err;
-            }
-        }
-    }
-    errdefer if (vision_ptr) |v| {
-        v.deinit();
-        sch.allocator.destroy(v);
-    };
-
-    // The measured round-cost table (`round_cost.zig`) is keyed per (chip,
-    // model, quant, OS build); restored here, written at request end.
-    {
-        var quant_buf: [32]u8 = undefined;
-        const quant = std.fmt.bufPrint(&quant_buf, "q{d}g{d}", .{
-            params.config.quant_bits,
-            params.config.quant_group_size,
-        }) catch "q?";
-        var os_buf: [64]u8 = undefined;
-        const os_build = transformer_mod.macosProductVersion(&os_buf) orelse "";
-        // The measured round-cost table rides the same identity: restored
-        // here, written at the end of any request that folded new samples.
-        // The bucket grid and store version are the arch's (only qwen4_exp gets the long
-        // grid); every other arch keeps the `rc1` table 26.9.1 wrote and boots warm.
-        const rc_layout: round_cost_mod.Layout = round_cost_mod.layoutFor(params.config);
-        xfm_ptr.round_cost.layout = rc_layout;
-        const rc_key = round_cost_mod.cacheKey(&xfm_ptr.round_cost_key_buf, ane_mod.chipBrand(), params.model_dir, quant, os_build, rc_layout, round_cost_mod.engineBuildId());
-        xfm_ptr.round_cost_key_len = @intCast(rc_key.len);
-        if (round_cost_mod.loadCached(sch.allocator, sch.io, rc_key, rc_layout)) |t| {
-            xfm_ptr.round_cost = t;
-            log.info("[spec-cost] round-cost table restored ({d} width cells, {d} serial cells)\n", .{ t.restored, t.restored_serial });
-            if (t.restored_dropped > 0) log.info("[spec-cost] dropped {d} implausible persisted cell(s)\n", .{t.restored_dropped});
-        }
-    }
-
-    // Assistant sidecar (optional). Loaded only when `drafter_dir` is
-    // non-empty. The sidecar KIND is decided by its config CONTRACT: a
-    // config declaring block_size + mask_token_id + target_layer_ids is a
-    // DFlash block-drafter (any `*_assistant` family); anything else goes
-    // to the Gemma cross-attention drafter loader.
-    var drafter_ptr: ?*DrafterModel = null;
-    var dflash_ptr: ?*DflashModel = null;
-    // Launch flags, then the per-model setting; otherwise the checkpoint's own
-    // `drafter/` subdir is the sidecar (dflash.resolveInDirDrafter). That is
-    // what makes the drafter a LOAD-time dependency rather than a launch
-    // flag: a hot model switch brings its own, and no pairing table has to
-    // decide which sidecar goes with which checkpoint.
-    const chosen_drafter = drafterFor(params.no_drafter, params.drafter_dir, params.config.drafter_override);
-    const in_dir_drafter: ?[]u8 = if (chosen_drafter == null)
-        dflash_mod.resolveInDirDrafter(sch.io, sch.allocator, params.model_dir)
-    else
-        null;
-    defer if (in_dir_drafter) |p| sch.allocator.free(p);
-    const drafter_dir: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
-    if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
-        const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
-        if (env_off) {
-            log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
-        } else {
-            const d = try sch.allocator.create(DflashModel);
-            d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
-                sch.allocator.destroy(d);
-                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
-                return err;
-            };
-            d.bind(xfm_ptr) catch |err| {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err(
-                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
-                        "  (assistant+target must share hidden_size, the mask token and\n" ++
-                        "  target_layer_ids must exist in the target, and the target must\n" ++
-                        "  run the standard dense-attention forward path)\n",
-                    .{ drafter_dir, @errorName(err) },
-                );
-                return err;
-            };
-            dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
-            sch.drafter_block_size = dflash_mod.resolveBlockSize(
-                d.config.block_size,
-                params.draft_block_size,
-                params.draft_block_size_explicit,
-                wide_lane,
-                block_cap.cap,
-            );
-            if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
-                log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
-            var cap_note_buf: [96]u8 = undefined;
-            const cap_note: []const u8 = if (params.draft_block_size_explicit)
-                ", user-clamped"
-            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
-                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
-                    block_cap.label,
-                    block_cap.cap,
-                }) catch ", capped"
-            else
-                "";
-            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
-                sch.drafter_block_size,
-                cap_note,
-                wide_lane,
-                d.config.target_layer_ids,
-            });
-        }
-    } else if (drafter_dir.len > 0) {
-        const d = try sch.allocator.create(DrafterModel);
-        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
-            sch.allocator.destroy(d);
-            log.err("Failed to load drafter at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
-            return err;
-        };
-        d.bind(xfm_ptr) catch |err| {
-            d.deinit();
-            sch.allocator.destroy(d);
-            log.err(
-                "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
-                    "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
-                    "  matching layer types in the target's non-shared K/V layers)\n",
-                .{ drafter_dir, @errorName(err) },
-            );
-            return err;
-        };
-        drafter_ptr = d;
-
-        // Auto-detect block_size unless the user pinned it explicitly.
-        if (!params.draft_block_size_explicit) {
-            const auto_bs = drafter_mod.recommendedBlockSize(params.config);
-            sch.drafter_block_size = auto_bs;
-            log.info(
-                "Drafter ready (block_size={d}, auto-detected for {s}/{d}-layer{s}).\n",
-                .{
-                    auto_bs,
-                    params.config.model_type,
-                    params.config.num_hidden_layers,
-                    if (params.config.isMoe()) ",moe" else "",
-                },
-            );
-        } else {
-            log.info("Drafter ready (block_size={d}, user override).\n", .{params.draft_block_size});
-        }
-
-        if (params.config.isMoe()) {
-            log.warn(
-                "Drafter loaded but target is MoE ({s}); per-request " ++
-                    "enable_drafter defaults to OFF — drafter+MoE regresses " ++
-                    "at single-stream batch=1 (verify forward expert-routing " ++
-                    "penalty). Pass enable_drafter:true per request to opt-in.\n",
-                .{params.config.model_type},
-            );
-        }
-    }
-    params.config.row_exact_covered = xfm_ptr.config.row_exact_covered;
-    params.config.dflash_bound = xfm_ptr.config.dflash_bound;
-    if (params.config.dflash_bound and std.meta.activeTag(params.config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default) != .exact)
-        log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
-    errdefer if (drafter_ptr) |d| {
-        d.deinit();
-        sch.allocator.destroy(d);
-    };
-    errdefer if (dflash_ptr) |d| {
-        d.deinit();
-        sch.allocator.destroy(d);
-    };
 
     // Qwen native MTP head (optional). Auto-loaded when the model dir ships
     // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
@@ -4861,6 +4937,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 publishPrefillForwardedTo(sch, slot, @as(u64, slot.prompt_tokens) -| slot.cached_tokens);
                 slot.accountPrefillTime(prefill_sw.read());
+                publishFirstToken(slot);
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,
                 });
@@ -5346,13 +5423,14 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
     // Construct the full token sequence: the original prompt + everything
-    // generated this turn. The cache reflects exactly this state — Generator
-    // forwarded each emitted token into slot.cache as it was sampled.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    // generated this turn that the cache holds — Generator forwarded each
+    // emitted token into slot.cache as it was sampled, except an
+    // `unforwarded_tail` the key must not claim.
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items[0 .. total_len - slot.full_prompt.len]);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
@@ -7291,6 +7369,18 @@ fn plannerOutputClock(slot: *Slot, gen: *Generator) void {
     slot.mtp_publish_gap_ms = if (slot.mtp_publish_ns > 0 and now >= slot.mtp_publish_ns) @as(f32, @floatFromInt(now - slot.mtp_publish_ns)) / std.time.ns_per_ms else 0;
     slot.mtp_publish_ns = now;
     if (Planner.enabled() and gen.mtp_planner_owned) gen.mtp_planner_max_gap_ms = @max(gen.mtp_planner_max_gap_ms, slot.mtp_publish_gap_ms);
+}
+
+/// The prefill already sampled the first token: send it now instead of with the
+/// first decode step or speculative round, which would hold it a forward longer.
+/// The count stays with the decoder that emits it (its push is swallowed).
+fn publishFirstToken(slot: *Slot) void {
+    const gen = if (slot.legacy_gen) |*g| g else return;
+    if (gen.done or gen.completion_tokens != 0 or slot.logprobs_n > 0 or gen.sampling.constraint != null) return;
+    const t1 = gen.next_token_id;
+    if (t1 == 0 or generate_mod.isEosId(t1, slot.eos_token_ids)) return;
+    slot.pushTokenWithLogprob(t1, null);
+    slot.early_first = t1;
 }
 
 fn publishSpeculativeBlock(sch: *Scheduler, slot: *Slot, gen: *Generator, tokens: []const u32) void {

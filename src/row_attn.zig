@@ -1,6 +1,7 @@
 //! Decode attention whose every row has the bits of the one-row step at its
 //! position, ported from TensorFold's `row_attention.py` (MIT, see NOTICE).
-//! Keys are cut into CK-position chunks counted from 0 and a chunk's keys
+//! One threadgroup per (kv head, window row, key chunk). Keys are cut into
+//! CK-position chunks counted from 0 and a chunk's keys
 //! interleave over SPLIT simdgroups; per simdgroup an online softmax in
 //! ascending position, the simdgroups merged in order, then the chunks. What
 //! rides in the window changes nothing a row computes, so serial decoding
@@ -22,15 +23,15 @@ const PARTIAL =
     \\  const uint sgi = simdgroup_index_in_threadgroup;
     \\  const int g = int(sgi) / SPLIT, s = int(sgi) % SPLIT;
     \\  const int c = int(threadgroup_position_in_grid.y);
-    \\  const int h = int(threadgroup_position_in_grid.z);
     \\  const int P = dims[0], W = dims[1], NCH = dims[2], MAXD = dims[3];
+    \\  const int h = int(threadgroup_position_in_grid.z) / W, w = int(threadgroup_position_in_grid.z) % W;
     \\  constexpr int DPL = D / 32;
     \\  const int qh = h * G + g;
     \\  const size_t kh = size_t(h) * size_t(K_strides[1]), kp = size_t(K_strides[2]);
     \\  const size_t vh = size_t(h) * size_t(V_strides[1]), vp = size_t(V_strides[2]);
     \\  threadgroup float sm[G * SPLIT], sl[G * SPLIT];
     \\  threadgroup float so[G * SPLIT][D];
-    \\  for (int w = 0; w < W; w++) {
+    \\  {
     \\    const int last = P + depth[w];
     \\    const int k0 = c * CK;
     \\    const int k1 = min(k0 + CK, last + 1);
@@ -190,7 +191,7 @@ pub fn sdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{slots}, 1, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{slots}, 1, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ slots, d }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * g * SPLIT, nch, hkv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * g * SPLIT, nch, hkv * w));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32 * g * SPLIT, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", d));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "G", g));

@@ -67,7 +67,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: lib/mlx
-          key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ steps.mlxpin.outputs.xcode }}
+          key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ hashFiles('patches/mlxc-gather-qmm-global-scale.patch') }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx + mlx-c (NAX-enabled)
         run: |

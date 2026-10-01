@@ -39,7 +39,10 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA target=$DEPLOYMENT_TARGET"
+# The mlx-c patch below is part of the build: an edited patch must rebuild.
+MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
+PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
 if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
@@ -78,6 +81,12 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
+# MLX 0.32.3's gather_qmm takes a global_scale before sorted_indices; the
+# pinned mlx-c predates it (the same patch the Linux build applies). The files
+# the patch touches are reset first, so an edited patch replaces the old one;
+# local edits anywhere else in the submodule are kept.
+git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
+git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
