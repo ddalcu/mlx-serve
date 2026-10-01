@@ -34065,6 +34065,30 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         var flat_inds = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat_inds);
         try mlx.check(mlx.mlx_reshape(&flat_inds, routing.inds, &[_]c_int{total_inds}, 1, s));
+        const n_experts = mlx.getShape(nm.fc1_w)[0];
+        const pad = gatherRhsPadRows(total_inds, n_experts);
+        if (pad > 0) {
+            // Pad rows spread over the experts; they read x row 0 and are dropped after.
+            var pad_i = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_i);
+            try mlx.check(mlx.mlx_arange(&pad_i, 0, @floatFromInt(pad), 1, .int32, s));
+            const e_arr = mlx.mlx_array_new_int(n_experts);
+            defer _ = mlx.mlx_array_free(e_arr);
+            var pad_e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_e);
+            try mlx.check(mlx.mlx_remainder(&pad_e, pad_i, e_arr, s));
+            var pad_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_t);
+            try mlx.check(mlx.mlx_astype(&pad_t, pad_e, mlx.mlx_array_dtype(flat_inds), s));
+            const pair = [_]mlx.mlx_array{ flat_inds, pad_t };
+            const vec = mlx.mlx_vector_array_new_data(&pair, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var joined = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+            _ = mlx.mlx_array_free(flat_inds);
+            flat_inds = joined;
+        }
+        const rows_all: c_int = total_inds + pad;
         var order = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(order);
         try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, s));
@@ -34079,12 +34103,20 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         var lhs_idx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lhs_idx);
         try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, s));
+        if (pad > 0) {
+            const last = mlx.mlx_array_new_int(t_count - 1);
+            defer _ = mlx.mlx_array_free(last);
+            var clamped = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_minimum(&clamped, lhs_idx, last, s));
+            _ = mlx.mlx_array_free(lhs_idx);
+            lhs_idx = clamped;
+        }
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
         try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, s));
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
-        try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ total_inds, 1, d_dim }, 3, s));
+        try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ rows_all, 1, d_dim }, 3, s));
 
         const fc1_qp = quantParamsOrDense(cfg, nm.fc1_w, nm.fc1_s, @intCast(d_dim));
         var h_3d = mlx.mlx_array_new();
@@ -34098,6 +34130,12 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, sorted_inds, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
         var y_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_unsorted);
+        if (pad > 0) {
+            var head = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&head, inv_order, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
+            _ = mlx.mlx_array_free(inv_order);
+            inv_order = head;
+        }
         try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, inv_order, 0, s));
         try mlx.check(mlx.mlx_reshape(&y_tkh, y_unsorted, &[_]c_int{ t_count, k_count, d_dim }, 3, s));
     }
@@ -34173,6 +34211,15 @@ var nemotron_gqmv_engaged = false;
 /// spec-decode verify windows); wider windows take the sorted gather_qmm
 /// path, which streams each expert once. Test seam.
 pub var nemotron_gather_max_rows: c_int = 8;
+
+/// MLX streams each expert once (`gather_qmm_rhs`) only at 4+ sorted rows per expert
+/// (`B / E >= 4`, quantized.cpp); below it every row re-reads its expert. From 2 rows per
+/// expert, padding up to 4 is cheaper than the re-reads. Test seam.
+pub var nemotron_rhs_pad_min: c_int = 2;
+
+fn gatherRhsPadRows(rows: c_int, experts: c_int) c_int {
+    return if (nemotron_rhs_pad_min > 0 and rows >= nemotron_rhs_pad_min * experts and rows < 4 * experts) 4 * experts - rows else 0;
+}
 
 /// A short window of T tokens: every (token, expert) pair is one `gatherQmv`
 /// row (fc1 with ReLU^2 fused, then fc2), falling back to UNSORTED
@@ -45734,6 +45781,18 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         var max_err_sorted: f32 = 0;
         for (0..T * D) |i| max_err_sorted = @max(max_err_sorted, @abs(gp[i] - gs_p[i]));
         try t.expect(max_err_sorted < 2e-3 * max_ref);
+
+        // Padded up to 4 rows per expert for MLX's streaming kernel; the pad rows are dropped.
+        nemotron_rhs_pad_min = 1;
+        defer nemotron_rhs_pad_min = 2;
+        try t.expectEqual(@as(c_int, 4 * E - T * K), gatherRhsPadRows(T * K, E));
+        const got_pad = try nemotronMoe(x, &nm, &cfg, s);
+        defer _ = mlx.mlx_array_free(got_pad);
+        try mlx.check(mlx.mlx_array_eval(got_pad));
+        const gpad = mlx.mlx_array_data_float32(got_pad) orelse return error.MlxArrayDataNull;
+        var max_err_pad: f32 = 0;
+        for (0..T * D) |i| max_err_pad = @max(max_err_pad, @abs(gp[i] - gpad[i]));
+        try t.expect(max_err_pad < 2e-3 * max_ref);
     }
 }
 
